@@ -1,119 +1,81 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Staging (unpack → verify → publish) and application (lock → re-verify →
-//! atomic swap → re-exec) of an update. The ordering here is the
-//! security-critical part; see the per-step comments and the crate-level trust
-//! model.
+//! Staging (unpack → verify → publish) and application (lock → re-verify → atomic
+//! swap → re-exec) of an update. The ordering is the security-critical part; see
+//! the per-step comments and the crate-level trust model.
 //!
-//! Unpacking has two shapes for the same signed bundle: [`stage_from_zip`]
-//! (`ditto -x -k`, preferred) and [`stage_from_dmg`] (`hdiutil attach`, for
-//! releases published before the zip existed). They share
-//! `verify_and_publish_incoming`, so the container never changes what is proved.
-//! What IS container-specific is the cost of unpacking: the zip path reads the
-//! archive's central directory and refuses one that would fill the volume before
-//! `ditto` is spawned — see [`checked_zip_extraction_claim`].
+//! The same signed bundle unpacks two ways: [`stage_from_zip`] (`ditto -x -k`,
+//! preferred) and [`stage_from_dmg`] (`hdiutil attach`, for releases without a
+//! zip). Both go through `verify_and_publish_incoming`, so the container never
+//! changes what is proved. The zip path reads the archive's central directory and
+//! refuses one that would fill the volume before `ditto` runs
+//! ([`checked_zip_extraction_claim`]).
 
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, same_volume};
+use aterm_update_core::{FileLock, LaunchName, Sentinel, ensure_private_dir, same_volume};
 
 use crate::manifest::{Manifest, Ready};
 use crate::paths::Staging;
 use crate::sys::rename_swap;
 use crate::{ApplyOutcome, bundle, verify};
 
-/// A freshly-swapped build is auto-reverted after this many consecutive launches
-/// that observe the boot sentinel still unconfirmed (a crash loop). `arm` records
-/// 0; the first launch observes 1; the revert fires when attempts reach this. A
-/// healthy build clears the sentinel via [`confirm_boot_health`] on its first boot,
-/// so this only bites a build that never reaches the health checkpoint.
+/// A freshly swapped build is auto-reverted after this many consecutive launches
+/// that find the boot sentinel still unconfirmed (a crash loop). `arm` records 0,
+/// the first launch observes 1, and the revert fires at this count. A healthy build
+/// clears the sentinel via [`confirm_boot_health`] on its first boot.
 pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 
-/// How long a LAUNCH waits for the apply lock before giving up and starting on
-/// the installed build.
-///
-/// Deliberately short. Every legitimate holder either returns in milliseconds or
-/// is itself bounded, so reaching this means the holder is wedged — and a wedged
-/// holder must not be able to stop a terminal from opening. Deferring costs one
-/// launch's update; hanging costs the application.
+/// How long a launch waits for the apply lock before starting on the installed
+/// build. Short: every legitimate holder returns in milliseconds or is itself
+/// bounded, so reaching this means the holder is wedged, and a wedged holder must
+/// not stop a terminal from opening.
 pub(crate) const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long the BACKGROUND lane — the update checker's stage and publish, and the
-/// floor ratchet under them — waits for the stage, apply or floor lock before giving
-/// the cycle up (the 2026-09-22/23 update audit, plan P2-1).
-///
-/// Every one of those waits was a blocking `flock` on the checker thread, so one
-/// stopped or hung holder in any aterm process parked the thread that finds and
-/// stages updates, silently, for as long as the holder stayed stopped. Generous,
-/// because nothing here is on a launch or a frozen screen: every legitimate holder
-/// of the apply and floor locks is itself bounded well inside it, and the stage lock
-/// is held across a sibling's download — which this cycle could only have waited
-/// for, and the next cycle finds staged. A timeout is that cycle's ordinary failure,
-/// retried on the loop's backoff, never a wedge.
+/// How long the background lane (the checker's stage and publish, and the floor
+/// ratchet under them) waits for the stage, apply or floor lock before giving the
+/// cycle up, so a stopped or hung holder in another aterm process cannot park the
+/// checker thread. Generous, because nothing here is on a launch: every legitimate
+/// apply/floor lock holder is bounded well inside it, and the stage lock is held
+/// across a sibling's download, which the next cycle finds staged. A timeout is
+/// that cycle's ordinary failure, retried on the loop's backoff.
 pub(crate) const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Ceiling on the cross-volume `ditto` of the candidate bundle.
-///
-/// Generous, because unlike the verification helpers this one's honest duration
-/// is a property of the hardware: a several-hundred-megabyte bundle onto a slow
-/// external disk. It exists to bound the pathological case — a volume that has
-/// gone away mid-copy — not to hurry a real one.
+/// Ceiling on the cross-volume `ditto` of the candidate bundle. Generous: a
+/// several-hundred-megabyte bundle onto a slow external disk is legitimate; this
+/// bounds only a volume that went away mid-copy.
 const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
-// Unpacking from a provenance-TRACKED app (2026-09-14).
+// Unpacking from a provenance-tracked app.
 //
 // macOS stamps `com.apple.provenance` on every file a tracked process writes, and a
 // process is tracked when its executable carries the tag or its parent is tracked
-// (`crates/atpkg/src/provenance.rs` holds the measured law). This updater writes the
-// SUCCESSOR bundle — so a tracked aterm hands the tag to the app that replaces it, and
-// to every app after that, forever: measured on m16, the 0.85.0 laid down by a tracked
-// 0.84.0 carried the tag on `Contents/MacOS/aterm` and `Info.plist`, which is exactly
-// what made atpkg's untracked lanes (deleted 2026-09-24) take their copy plan.
+// (`crates/atpkg/src/provenance.rs`). This updater writes the successor bundle, so
+// a tracked aterm would hand the tag to every app that replaces it.
 //
-// The one thing that escapes is a job LAUNCHD spawns from an untagged executable:
-// launchd is the job's parent, not us, and `/usr/bin/ditto` is a base-OS binary
-// (measured the same day: ditto of a clean tree by a launchd job → clean; by this
-// process → tagged). So when this process measures itself tracked, the unpacks run as
-// one-shot launchd jobs.
+// A job launchd spawns from an untagged executable escapes: launchd is its parent,
+// and `/usr/bin/ditto` is a base-OS binary. So when this process measures itself
+// tracked, the unpacks run as one-shot launchd jobs.
 //
-// CORRECTED 2026-09-20. This block used to end "the renames that follow are safe as
-// they are: a tracked rename tags the DIRECTORY it moves, not the files inside it".
-// Both halves were true and the conclusion was still wrong, because the tag on a
-// bundle's ROOT DIRECTORY is by itself enough: measured on m16, the live
-// `/Applications/aterm.app` had a clean `Contents/MacOS/aterm` and a tagged root, and
-// a launchd job exec'ing that binary still wrote a TAGGED file, while a byte-identical
-// copy with only the root tag stripped wrote a clean one. So an untracked unpack
-// followed by a tracked rename produces exactly the bundle this machinery exists to
-// avoid — which is what shipped, and why every installed aterm stayed tracked.
+// The tag on a bundle's root directory alone is enough to make its processes
+// tracked, and a tracked rename tags the directory it moves. So the moves that
+// place the unpacked bundle take their own lane, [`rename_untagged`], which
+// exchanges rather than renames and needs no helper process.
 //
-// The moves that PLACE the unpacked bundle therefore take their own lane,
-// [`rename_untagged`], which exchanges rather than renames. See its documentation for
-// why that needs no helper process, and `tests/provenance_rename_probe.rs` for the
-// measurement of each operation involved.
-//
-// AND THE LANE DOES NOT LAUNDER. It is easy to read "the copy runs as a launchd job, so
-// its output is clean" as a property of the JOB; it is not. `ditto` preserves extended
-// attributes — the reason this updater uses it at all, so the sequestered resource
-// forks and the codesign seal survive — and the provenance tag is an extended attribute
-// like any other, so an untracked job copying a TAGGED tree writes a tagged one
-// (measured 2026-09-21, `an_untracked_job_does_not_launder_a_tagged_source`). The
-// property the lane actually has is narrower: it does not ADD the tag to output that
-// would otherwise have been clean. Everything upstream of it must already be clean,
-// which is exactly why the placement moves were worth fixing, and which is the
-// condition atpkg's since-deleted lanes recorded as "the untracked lane ran, but the first
-// file it laid still carried com.apple.provenance".
+// The lane does not launder: `ditto` preserves extended attributes (so the
+// resource forks and the codesign seal survive), and the provenance tag is one, so
+// an untracked job copying a tagged tree writes a tagged one (measured). It only
+// does not ADD the tag, so everything upstream of it must already be clean.
 // ---------------------------------------------------------------------------
 
-/// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
+/// Whether this process is provenance-tracked, measured by writing a probe file into
 /// `scratch` and reading the attribute back, never inferred from the binary's own
-/// attributes (a clean binary under a tracked parent is tracked, which is the whole
-/// point). `false` when the probe cannot be written or inspected: a lane that cannot
-/// measure must not route an unpack through machinery it has no evidence it needs. The
-/// probe is removed before returning.
+/// attributes (a clean binary under a tracked parent is tracked). `false` when the
+/// probe cannot be written or inspected: a lane that cannot measure must not route
+/// an unpack through machinery it has no evidence it needs. The probe is removed.
 #[cfg(target_os = "macos")]
 fn process_is_tracked(scratch: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
@@ -151,7 +113,7 @@ fn process_is_tracked(scratch: &Path) -> bool {
     verdict.unwrap_or(false)
 }
 
-/// Move `from` onto `to` without handing the moved directory this process's
+/// Moves `from` onto `to` without handing the moved directory this process's
 /// `com.apple.provenance` tag.
 ///
 /// A tracked process tags every directory it RENAMES, and the tag on a bundle's ROOT
@@ -159,44 +121,35 @@ fn process_is_tracked(scratch: &Path) -> bool {
 /// so a tracked updater that renames the successor into place hands the tag to the app
 /// that replaces it, and to every app after that, forever. Unpacking already escapes
 /// through launchd; the moves that place the unpacked bundle did not, and they are the
-/// carrier (`tests/provenance_rename_probe.rs` measures each operation).
+/// carrier.
 ///
-/// The escape needs no helper process. `renamex_np(RENAME_SWAP)` tags NEITHER side
-/// (measured), so creating the destination and EXCHANGING it with the clean payload
-/// lands the clean inode at the destination and leaves the tagged one — the empty
-/// directory this process just made — at the source, where it is dropped. Three
-/// syscalls, no launchd job, no deadline, no sidecar, nothing that can outlive us.
+/// `renamex_np(RENAME_SWAP)` tags neither side, so creating the destination and
+/// exchanging it with the clean payload lands the clean inode at the destination
+/// and leaves the tagged empty directory at the source, where it is dropped. Three
+/// syscalls, no helper process.
 ///
-/// It DEGRADES TO A PLAIN RENAME, deliberately, in every case where an exchange would
-/// change what the caller's error handling was written against:
+/// It degrades to a plain rename whenever an exchange would change what the
+/// caller's error handling expects:
 ///
-/// * `to` already exists — `rename` replaces an empty directory and fails `ENOTEMPTY`
-///   on a full one, semantics an exchange does not share. (`stage_from_zip` creates its
-///   extract directory before the `ditto`, so this is a real case, not a theoretical
-///   one.)
-/// * `from` and `to` are on different volumes — `RENAME_SWAP` is in-volume only, and
-///   `EXDEV` here is not an error to route around but a documented INSTANT failure that
-///   three restore paths read as "the bytes cannot reach the staging path"; turning it
-///   into anything slower or destructive is how this repair was got wrong once already.
-/// * this process is untracked — then a plain rename already lands clean, and it keeps
-///   the single-syscall move with no window of any kind.
+/// * `to` already exists: `rename` replaces an empty directory and fails
+///   `ENOTEMPTY` on a full one (`stage_from_zip` creates its extract directory
+///   before the `ditto`, so this is real).
+/// * `from` and `to` are on different volumes: `RENAME_SWAP` is in-volume only, and
+///   three restore paths read an instant `EXDEV` as "the bytes cannot reach the
+///   staging path".
+/// * this process is untracked: a plain rename already lands clean.
 ///
-/// The exchange therefore only ever replaces a move that was GUARANTEED to tag its
-/// result. Its one cost is a crash window of two adjacent syscalls, and there are TWO of
-/// them, at opposite ends: between the create and the exchange an empty directory sits
-/// at `to`, and between the exchange and the drop it sits at `from`. Both shapes are
-/// real on the staging path — `from` is `staged_app` on the main same-volume carrier,
-/// `to` is `staged_app` on all four restores.
+/// The exchange's cost is two crash windows: between create and exchange an empty
+/// directory sits at `to`, and between exchange and drop at `from`. Both occur on
+/// the staging path (`from` is `staged_app` on the main same-volume carrier, `to`
+/// is `staged_app` on all four restores). Most readers verify what they find
+/// ([`Ready::is_publishable`], [`verified_bundle_identity`]) and an empty directory
+/// fails; [`recover_orphaned_prepared_candidate`]'s opening guard asks only for
+/// presence, so it tests [`holds_a_stage`]. Read it before adding another
+/// presence-only check against these paths.
 ///
-/// Most readers of those paths VERIFY what they find ([`Ready::is_publishable`],
-/// [`verified_bundle_identity`]) and an empty directory simply fails. The one that asks
-/// only whether something is there is [`recover_orphaned_prepared_candidate`]'s opening
-/// guard, which is why that guard tests [`holds_a_stage`] and not mere shape: read it
-/// before adding another presence-only check against these paths.
-///
-/// NOTE it can only stop a tag being ADDED, never remove one already present — which is
-/// why every move in the chain from unpack to installed bundle takes this lane, not
-/// just the last.
+/// It can only stop a tag being added, never remove one, so every move from unpack
+/// to installed bundle takes this lane.
 fn rename_untagged(from: &Path, to: &Path, scratch: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     if exchange_is_needed(from, to, scratch) && exchange_move(from, to).is_ok() {
@@ -207,14 +160,12 @@ fn rename_untagged(from: &Path, to: &Path, scratch: &Path) -> std::io::Result<()
     std::fs::rename(from, to)
 }
 
-/// WHETHER to exchange — the three conditions from [`rename_untagged`]'s documentation,
-/// kept apart from the mechanism so each can be read and changed on its own.
+/// Whether to exchange: the three conditions from [`rename_untagged`], kept apart
+/// from the mechanism.
 ///
-/// The volume test compares the two PARENT directories, not `from` against the
-/// destination's parent. `rename(2)`'s `EXDEV` is a property of the directory ENTRIES
-/// being moved, and [`same_volume`] resolves through symlinks: asking it about `from`
-/// would measure whatever a symlinked source POINTS at, which on a bundle laid beside a
-/// link to another disk is the wrong volume and the wrong answer. `same_volume` fails
+/// The volume test compares the two parent directories: `EXDEV` is a property of
+/// the entries being moved, and [`same_volume`] resolves symlinks, so asking about
+/// `from` would measure what a symlinked source points at. `same_volume` fails
 /// closed on a path it cannot stat, so a missing parent declines the exchange.
 #[cfg(target_os = "macos")]
 fn exchange_is_needed(from: &Path, to: &Path, scratch: &Path) -> bool {
@@ -226,16 +177,13 @@ fn exchange_is_needed(from: &Path, to: &Path, scratch: &Path) -> bool {
         && process_is_tracked(scratch)
 }
 
-/// THE EXCHANGE itself: create the destination, swap the two entries, drop the emptied
-/// source. Assumes its caller has already decided the exchange applies.
+/// The exchange itself: create the destination, swap the two entries, drop the
+/// emptied source. The caller has already decided the exchange applies; kept apart
+/// from [`exchange_is_needed`] so it is testable on hosts where this process is
+/// untracked.
 ///
-/// Separate from [`exchange_is_needed`] so this can be tested on EVERY host. The
-/// decision depends on the test process being provenance-tracked, which is true on a
-/// developer's tagged machine and false in CI, and a mechanism that only runs where the
-/// policy happens to fire is a mechanism nothing pins.
-///
-/// `Err` means nothing moved AND nothing was left behind, so the caller can fall back to
-/// a plain rename and hand the caller's own error back.
+/// `Err` means nothing moved and nothing was left behind, so the caller can fall
+/// back to a plain rename.
 #[cfg(target_os = "macos")]
 fn exchange_move(from: &Path, to: &Path) -> std::io::Result<()> {
     // Exclusive create: never adopt a directory that raced into existence, because the
@@ -243,10 +191,8 @@ fn exchange_move(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().create(to)?;
     match rename_swap(from, to) {
         Ok(()) => {
-            // `from` now holds the empty directory we made, and the move HAS happened —
-            // so this cannot fail the call. Say so in the log rather than reporting a
-            // clean rename that left its source name behind, which `rename(2)` never
-            // does.
+            // `from` now holds the empty directory we made and the move has
+            // happened, so this cannot fail the call; log the leftover name.
             if let Err(error) = std::fs::remove_dir(from) {
                 crate::warn(&format!(
                     "moved {} to {} but could not drop the emptied \
@@ -266,11 +212,10 @@ fn exchange_move(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Each copy owns a fresh private directory on the destination volume. A helper
-/// that outlives its deadline can write only here, never into a later attempt,
-/// the published stage, or the fixed rollback path. Unconfirmed attempts retain
-/// their directory; its random name is never handed to another copy or swept as
-/// legacy `zx-*` scratch.
+/// Each copy owns a fresh private directory on the destination volume, so a helper
+/// that outlives its deadline can write only here, never into a later attempt, the
+/// published stage, or the fixed rollback path. Unconfirmed attempts keep their
+/// directory; its random name is never reused or swept as `zx-*` scratch.
 struct IsolatedCopy {
     root: PathBuf,
     payload: PathBuf,
@@ -294,8 +239,8 @@ impl IsolatedCopy {
             return Err(format!("record isolated copy layout: {error}"));
         }
         // Who started this attempt, for the reaper's lapsed rule
-        // ([`reap_abandoned_copy_attempts`]). Best effort: an attempt without it is
-        // read as a live caller's, the conservative reading.
+        // ([`reap_abandoned_copy_attempts`]). Best effort: an attempt without it
+        // reads as a live caller's, the conservative reading.
         let _ = std::fs::write(root.join(COPY_OWNER), format!("{}\n", std::process::id()));
         Ok(Self {
             payload: root.join("payload"),
@@ -308,15 +253,14 @@ impl IsolatedCopy {
 /// ([`IsolatedCopy::create`]).
 const COPY_OWNER: &str = "owner";
 
-/// How long a copy attempt must have existed before the reaper's LAPSED rule may
-/// reclaim it ([`reap_abandoned_copy_attempts`]): a day, against copy ceilings of
-/// minutes ([`STAGE_UNPACK_TIMEOUT`], [`CROSS_VOLUME_COPY_TIMEOUT`]). A writer
-/// still running that long after its caller's deadline is wedged for good.
+/// How long a copy attempt must exist before the reaper's lapsed rule may reclaim
+/// it ([`reap_abandoned_copy_attempts`]): a day, against copy ceilings of minutes
+/// ([`STAGE_UNPACK_TIMEOUT`], [`CROSS_VOLUME_COPY_TIMEOUT`]).
 const STALE_COPY_ATTEMPT_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-/// Whether the process an attempt's [`COPY_OWNER`] names is gone. Only a
-/// definite `ESRCH` is gone: a missing or unreadable record, or a pid that
-/// exists (possibly reused — the conservative direction), is a live caller.
+/// Whether the process an attempt's [`COPY_OWNER`] names is gone. Only a definite
+/// `ESRCH` is gone: a missing or unreadable record, or a pid that exists (possibly
+/// reused, the conservative direction), is a live caller.
 fn copy_owner_gone(root: &Path) -> bool {
     let Some(pid) = crate::read_ledger_text(&root.join(COPY_OWNER))
         .and_then(|text| text.trim().parse::<i32>().ok())
@@ -330,7 +274,7 @@ fn copy_owner_gone(root: &Path) -> bool {
 }
 
 /// Whether an attempt has existed past [`STALE_COPY_ATTEMPT_AFTER`], by its
-/// `copy-layout` marker, written once at creation. A stamp from the future (a
+/// `copy-layout` marker (written once at creation). A stamp from the future (a
 /// clock stepped back) is young.
 fn copy_attempt_lapsed(root: &Path) -> bool {
     std::fs::symlink_metadata(root.join("copy-layout"))
@@ -340,24 +284,20 @@ fn copy_attempt_lapsed(root: &Path) -> bool {
         .is_some_and(|age| age >= STALE_COPY_ATTEMPT_AFTER)
 }
 
-/// Reclaim copy attempts no writer and no caller can still use.
+/// Reclaims copy attempts no writer and no caller can still use.
 ///
-/// SETTLED: an explicitly abandoned attempt whose fenced writer published a
-/// terminal status. A live caller may have finished copying but not promoted yet;
-/// completion alone is therefore not permission to remove its directory.
+/// Settled: an explicitly abandoned attempt whose fenced writer published a
+/// terminal status. Completion alone is not enough: a live caller may have finished
+/// copying but not promoted yet.
 ///
-/// LAPSED (round six, finding 50): an attempt past [`STALE_COPY_ATTEMPT_AFTER`]
-/// that its caller gave up (`abandoned`) or whose caller is gone
-/// ([`copy_owner_gone`]). The settled rule alone leaked an app-sized directory for
-/// good on two ordinary cuts: a caller killed mid-copy (a force-quit launch, a
-/// reboot) never marks its attempt abandoned, and a launchd copy stopped by the
-/// timeout's `launchctl remove` never publishes its status. The age stands in for
-/// the writer's end, which neither cut records: every copy's own ceiling is
-/// minutes. A live caller's attempt that it has not given up — it may be stopped,
-/// and will still promote it — is never reclaimed, however old.
+/// Lapsed: an attempt past [`STALE_COPY_ATTEMPT_AFTER`] that its caller abandoned,
+/// or whose caller is gone ([`copy_owner_gone`]). This covers a caller killed
+/// mid-copy (never marks abandoned) and a launchd copy stopped by `launchctl
+/// remove` (never publishes status); the age stands in for the writer's end. A
+/// live caller's attempt it has not given up is never reclaimed, however old.
 ///
-/// The background checker owns this recursive maintenance. Copy allocation creates
-/// only its own directory and marker, regardless of abandoned payloads nearby.
+/// The background checker owns this sweep; copy allocation creates only its own
+/// directory and marker.
 pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -382,7 +322,7 @@ pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
         let Some(nonce) = name.strip_prefix(".aterm-copy-") else {
             continue;
         };
-        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !aterm_codec::hex::is_hex(nonce, 32) {
             continue;
         }
         let root = entry.path();
@@ -411,7 +351,7 @@ pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
         let Some(nonce) = label.strip_prefix("systems.alab.aterm-update.unpack-") else {
             continue;
         };
-        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !aterm_codec::hex::is_hex(nonce, 32) {
             continue;
         }
         let status = root.join(format!(".{label}.status"));
@@ -496,7 +436,7 @@ fn ditto_bounded_clean(
             });
         }
         crate::verify::status_bounded_with_stderr_observed(
-            Command::new("/usr/bin/ditto").args(args),
+            aterm_uds::spawnfd::command("/usr/bin/ditto").args(args),
             what,
             limit,
         )
@@ -553,8 +493,8 @@ fn ditto_via_launchd_using(
     scratch: &Path,
     launchctl: &Path,
 ) -> Result<(std::process::ExitStatus, String), String> {
+    use aterm_uds::spawnfd::Stdio;
     use std::os::unix::process::ExitStatusExt as _;
-    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let budget = LaunchdCopyBudget::new(Instant::now(), limit);
     let work_deadline = budget.deadline(false);
@@ -569,7 +509,7 @@ fn ditto_via_launchd_using(
         "aterm-update: this process is provenance-tracked — running {what} as a launchd job \
          so the bundle it lays carries no com.apple.provenance"
     );
-    let run_until = |cmd: &mut Command, operation: &str, until: Instant| {
+    let run_until = |cmd: &mut aterm_uds::spawnfd::Command, operation: &str, until: Instant| {
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(crate::verify::mark_passing(format!(
@@ -580,7 +520,7 @@ fn ditto_via_launchd_using(
     };
     let result = (|| {
         let (status, stderr) = run_until(
-            Command::new(launchctl)
+            aterm_uds::spawnfd::command(launchctl)
                 .arg("submit")
                 .args(["-l", &label])
                 .arg("-e")
@@ -608,8 +548,8 @@ fn ditto_via_launchd_using(
         loop {
             let remaining = work_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // The disk's afternoon, like the direct helper's own ceiling —
-                // passing (round four, plan item 2).
+                // Out of the job budget, like the direct helper's own ceiling: a
+                // passing refusal.
                 return Err(crate::verify::mark_passing(format!(
                     "{what} did not finish within its {}s launchd job budget; treating as a failure",
                     limit.as_secs()
@@ -639,7 +579,7 @@ fn ditto_via_launchd_using(
             // A timed-out submit may already have created the job. Try removal
             // even on that path, using only the original budget's remaining time.
             match run_until(
-                Command::new(launchctl).args(["remove", &label]),
+                aterm_uds::spawnfd::command(launchctl).args(["remove", &label]),
                 &format!("launchctl remove for {what}"),
                 budget.deadline(true),
             ) {
@@ -688,20 +628,68 @@ fn launchd_stderr_tail(path: &Path) -> String {
 }
 
 /// Ceiling on one staging unpack (the DMG copy or the zip extract). A release is
-/// ~100 MB; minutes is a wedged volume, not a slow one. Before 2026-09-14 these
-/// two `ditto`s had no ceiling at all.
+/// ~100 MB; minutes means a wedged volume, not a slow one.
 const STAGE_UNPACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Slack the free-space check demands over the declared size: filesystem
 /// metadata, the extract's own scratch dir, and the verify step's writes.
-const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
+pub(crate) const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
 
-/// A `ditto` failure that says WHY, from the tail of its stderr (2026-09-14).
+/// The one action a full disk's refusal names — the same words for the download,
+/// the unpack and the free-space check. A disk that STAYS full gets the re-download
+/// memo (scheduled checks skip the release for 15 min up to 4 h); a check a person
+/// asks for passes it (`github::stage_backoff`), so that is the action named.
+pub(crate) const FREE_SPACE_REMEDY: &str =
+    "free some space and check for updates, which retries it at once";
+
+/// A `ditto` failure that says WHY, from the tail of its stderr.
 fn ditto_failure(what: &str, status: std::process::ExitStatus, stderr: &str) -> String {
     match crate::verify::last_stderr_line(stderr) {
         Some(line) => format!("{what} ({status}): {line}"),
         None => format!("{what} ({status})"),
     }
+}
+
+/// A staging unpack's `ditto` failure ([`ditto_failure`]). A volume that filled
+/// while it copied — [`refuse_without_room`] passed, and something else wrote in
+/// the meantime — is a PASSING refusal like that one's (design law L4), worded as
+/// that one is: the volume holding `dir`, what it has free, and the one action.
+/// It is recognised by the `strerror` words of `ENOSPC` or `EDQUOT` on any line of
+/// its stderr (a zip extract that hit the full disk goes on to print "Couldn't
+/// read pkzip signature." LAST, measured on a full volume, which blames the
+/// archive); `ditto`'s own line goes to the log. Anything else keeps the verdict
+/// it always had.
+pub(crate) fn unpack_failure(
+    dir: &Path,
+    what: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    let full = stderr.lines().rev().map(str::trim).find(|line| {
+        ["No space left on device", "Disc quota exceeded"]
+            .iter()
+            .any(|words| line.contains(words))
+    });
+    let Some(line) = full else {
+        return ditto_failure(what, status, stderr);
+    };
+    crate::warn(&format!("{what} ({status}): {line}"));
+    // A quota stop does not fill the disk, and `statvfs`'s free figure need not
+    // reflect the quota, so its words name the quota and quote no figure.
+    if line.contains("Disc quota exceeded") {
+        return crate::verify::mark_passing(format!(
+            "this user's disk quota ran out while unpacking the update into {}; \
+             {FREE_SPACE_REMEDY}",
+            dir.display()
+        ));
+    }
+    let room = free_bytes_at(dir).map_or_else(String::new, |free| {
+        format!(" ({} MiB free there)", free.div_ceil(1024 * 1024))
+    });
+    crate::verify::mark_passing(format!(
+        "the disk holding {} filled while unpacking the update{room}; {FREE_SPACE_REMEDY}",
+        dir.display()
+    ))
 }
 
 /// Bytes still available to this user on the volume holding `path`, or `None`
@@ -721,14 +709,22 @@ pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
 }
 
 /// Refuse to unpack `needed` bytes into `dir` when the volume cannot hold them plus
-/// [`STAGE_FREE_SPACE_HEADROOM`] (2026-09-14). The message names both numbers and
+/// [`STAGE_FREE_SPACE_HEADROOM`]. The message names both numbers and
 /// the volume, so a full disk reads as a full disk in the ledger and the pull-down
 /// instead of "ditto zip extract failed (exit status: 1)" — and no container is
 /// re-unpacked (or, on the zip lane, extracted at all) to learn what `statvfs`
 /// already knows. Not a size ceiling: `checked_zip_extraction_claim` bounds the
 /// fleet-wide cost; this bounds THIS machine's. A volume that will not report its
 /// free space is let through — `ditto` then decides, with its stderr kept.
-fn refuse_without_room(dir: &Path, needed: u64, what: &str) -> Result<(), String> {
+///
+/// A PASSING refusal (design law L4, as the install-location probe's `ENOSPC` is):
+/// a full disk says nothing about the release, so the stage lane books it as a
+/// moment (`github::book_stage_failure`): the first costs nothing, a disk that stays
+/// full is re-downloaded on the moment's gentler schedule, and a check a person asks
+/// for passes that memo ([`FREE_SPACE_REMEDY`]). Booked as a verdict it opened the
+/// 15 min to 24 h backoff, and a disk freed after four full checks still skipped the
+/// release for a day.
+pub(crate) fn refuse_without_room(dir: &Path, needed: u64, what: &str) -> Result<(), String> {
     let Some(free) = free_bytes_at(dir) else {
         return Ok(());
     };
@@ -737,21 +733,20 @@ fn refuse_without_room(dir: &Path, needed: u64, what: &str) -> Result<(), String
         return Ok(());
     }
     let mib = |bytes: u64| bytes.div_ceil(1024 * 1024);
-    Err(format!(
+    Err(crate::verify::mark_passing(format!(
         "not enough free space to unpack {what}: {} MiB free on the volume holding {}, \
-         {} MiB needed ({} MiB declared plus {} MiB headroom); free some space and the \
-         next check retries",
+         {} MiB needed ({} MiB declared plus {} MiB headroom); {FREE_SPACE_REMEDY}",
         mib(free),
         dir.display(),
         mib(wanted),
         mib(needed),
         mib(STAGE_FREE_SPACE_HEADROOM)
-    ))
+    )))
 }
 
 /// Bytes a copy of the tree at `root` writes: every regular file's length, links
-/// and directories counted as nothing. Symlinks are NOT followed — the mounted
-/// image controls them.
+/// and directories counting nothing. Symlinks are not followed (the mounted image
+/// controls them).
 fn tree_bytes(root: &Path) -> u64 {
     let mut total = 0_u64;
     let mut stack = vec![root.to_path_buf()];
@@ -822,9 +817,9 @@ fn startup_authority_decision(
 
 fn take_reexec_nonce() -> Option<std::ffi::OsString> {
     // Apply runs before any thread spawn. Clear even malformed authority before
-    // health verification helpers can launch codesign/spctl children. Read and
-    // clear are ONE critical section (`aterm_log::env::take`) so a one-shot
-    // re-exec authority can never be observed twice.
+    // health verification helpers can launch codesign/spctl children. Read and clear
+    // are one critical section (`aterm_log::env::take`), so a one-shot re-exec
+    // authority can never be observed twice.
     aterm_log::env::take("ATERM_UPDATE_REEXEC")
 }
 
@@ -852,9 +847,8 @@ fn classify_reexec_authority(
 
 fn take_expected_artifact() -> Result<Option<ExpectedArtifact>, String> {
     // Apply runs at the top of main before any thread is spawned. Each key is read
-    // and cleared in ONE critical section (`aterm_log::env::take`), so handoff
-    // authority is consumed exactly once and verification helpers and user shells
-    // never inherit it.
+    // and cleared in one critical section (`aterm_log::env::take`), so handoff
+    // authority is consumed exactly once and helpers and user shells never inherit it.
     let raw_build = aterm_log::env::take(EXPECTED_BUILD_ENV);
     let raw_commit = aterm_log::env::take(EXPECTED_COMMIT_ENV);
     let raw_digest = aterm_log::env::take(EXPECTED_DIGEST_ENV);
@@ -924,6 +918,11 @@ fn rearm_or_close_handoff_fd(fd: i32) {
 /// Clear CLOEXEC only for the final same-process image replacement. All update
 /// verification helpers ran while these descriptors were closed-on-exec. If
 /// exec returns, re-arm every surviving fd before any rollback helper can spawn.
+///
+/// The exec is `exec_keeping_sigpipe`: `Command::exec` resets SIGPIPE to its default and
+/// leaves it there when the exec fails, and the rollback arm that follows a failed exec
+/// carries on in this process, which would then die on its next write to a peer that has
+/// gone.
 fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> std::io::Error {
     let mut exact = handoff_fds.to_vec();
     exact.sort_unstable();
@@ -946,7 +945,7 @@ fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> st
         }
         cleared.push(fd);
     }
-    let error = command.exec();
+    let error = crate::exec_plain::exec_keeping_sigpipe(command);
     for fd in cleared {
         rearm_or_close_handoff_fd(fd);
     }
@@ -955,22 +954,17 @@ fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> st
 
 // The relaunch argv filter lives in `crate::relaunch` — every platform
 // relaunches aterm, so it cannot live inside this macOS-only module.
-use crate::relaunch::reexec_forwarded_args;
+use crate::relaunch::window_successor_args;
 
-/// The post-swap re-exec command: the NEW binary at the canonical path, the
-/// forwarded argv, the single-use re-exec nonce — and the caller's handoff
-/// authority variables restored onto the exec image ONLY. The GUI's prearm
-/// consumed those variables out of the ambient environment (so no
-/// codesign/PlistBuddy/spctl helper this process spawned could observe them),
-/// but the successor image re-runs prearm and must re-validate the inherited
-/// handoff: without the restored pairs it classifies the handoff malformed and
-/// exits before writing the readiness proof, the parked parent reads EOF
-/// (`ChildDied`), and the seamless lane can never succeed.
+/// The post-swap re-exec command: the new binary at the canonical path, the
+/// forwarded argv, the single-use re-exec nonce, and the caller's handoff authority
+/// variables restored onto the exec image only. The GUI's prearm removed those
+/// from the environment (so no codesign/PlistBuddy/spctl helper could observe
+/// them), but the successor re-runs prearm and must re-validate the inherited
+/// handoff; without them it classifies the handoff malformed and exits.
 ///
-/// `ATERM_UPDATED_FROM` names the build this image was (2026-09-14, audit BA-6):
-/// the successor's `main` reads it for the quiet post-update "leveled-up" notice
-/// and clears it. Only the in-session lane used to set it, so a Finder-launch
-/// fallback apply came up with no notice at all.
+/// `ATERM_UPDATED_FROM` names the build this image was: the successor's `main`
+/// reads it for the post-update notice and clears it.
 fn boot_reexec_command(
     new_exe: &std::path::Path,
     reexec_value: &str,
@@ -979,16 +973,14 @@ fn boot_reexec_command(
 ) -> Command {
     let mut reexec = Command::new(new_exe);
     reexec
-        .arg("--window")
-        // The swap re-exec targets the canonical Mach-O, losing any argv0
-        // alias identity; this code only runs from the WINDOW entry, so pin
-        // the mode for the one-binary router BEFORE the forwarded args — the
-        // router's scan stops at the first -e/--command/--, so an appended
-        // flag would be invisible (or pollute the -e payload). A headless
-        // instance's `--headless` rides the forwarded args. The forwarded args are
-        // stripped of the leading pins earlier swaps prepended, so exactly ONE
-        // `--window` survives however many updates this process has ridden.
-        .args(reexec_forwarded_args(std::env::args_os().skip(1)))
+        // The swap re-exec targets the canonical Mach-O, losing any argv0 alias, and
+        // only runs from the window entry, so pin the mode for the one-binary router
+        // before the forwarded args (the router's scan stops at the first
+        // -e/--command/--, so an appended flag would be invisible). A headless
+        // instance's `--headless` rides the forwarded args, which are stripped of
+        // earlier swaps' pins, so exactly one `--window` survives any number of
+        // updates.
+        .args(window_successor_args(std::env::args_os().skip(1)))
         .env("ATERM_UPDATE_REEXEC", reexec_value)
         .env("ATERM_UPDATED_FROM", updated_from.to_string());
     for (key, value) in handoff_env {
@@ -997,25 +989,22 @@ fn boot_reexec_command(
     reexec
 }
 
-/// The boot-health sentinel for this install (a small file under the private
+/// The boot-health sentinel for this install: a small file under the private
 /// staging root, so the pre-swap old process and the post-swap new process resolve
-/// the identical path).
+/// the same path.
 fn boot_sentinel(staging: &Staging) -> Sentinel {
     Sentinel::new(staging.root.join("boot.sentinel"))
 }
 
 /// Consecutive launches that observed a boot sentinel armed for a build this
-/// process is NOT running and could not recover.
+/// process is not running and could not recover.
 ///
-/// Deliberately its OWN file rather than [`Sentinel::observe_launch`] on the boot
-/// sentinel: that attempt count belongs to the TRIALED build, and incrementing it
-/// from another build's launches would push a healthy build toward
-/// [`Sentinel::should_revert`] on its next launch — two installs (say
-/// `/Applications` and `~/Applications`) share one staging root, so a spurious
-/// crash-loop revert of a build that never crashed is reachable, not theoretical.
-/// Reusing the `Sentinel` TYPE is free and gives the atomic write shape: `arm`
-/// records `"<build> 0"`, `observe_launch` counts only while the recorded build
-/// still matches, `confirm` deletes it.
+/// Its own file, not [`Sentinel::observe_launch`] on the boot sentinel: that count
+/// belongs to the trialed build, and two installs (e.g. `/Applications` and
+/// `~/Applications`) share one staging root, so counting another build's launches
+/// there could crash-loop-revert a build that never crashed. Reuses the `Sentinel`
+/// type for its atomic write shape: `arm` records `"<build> 0"`, `observe_launch`
+/// counts only while the recorded build matches, `confirm` deletes it.
 fn foreign_trial_counter(staging: &Staging) -> Sentinel {
     Sentinel::new(foreign_trial_path(staging))
 }
@@ -1030,31 +1019,625 @@ fn foreign_trial_path(staging: &Staging) -> PathBuf {
 /// sibling's budgeted escape may disarm it (see `escape_wedged_foreign_trial`).
 const FOREIGN_TRIAL_OWNER_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Last-modified time of `path`, or `None` when it does not exist / cannot be
-/// stat'd. Used to compare two files in the SAME directory against each other (a
-/// system clock jump moves both or neither), and — for the present-owner idle test
-/// in `escape_wedged_foreign_trial` only — against the wall clock, where a future
-/// stamp (skew, a restored backup) reads as "not idle", the fail-safe direction.
+/// Last-modified time of `path`, or `None` when missing or unstat-able. Compares
+/// two files in the same directory (a clock jump moves both or neither), and, only
+/// for the present-owner idle test in `escape_wedged_foreign_trial`, against the
+/// wall clock, where a future stamp reads as "not idle", the fail-safe direction.
 fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Launches of the trialed build closer together than this count as ONE
-/// (2026-09-14, audit BA-3). The sentinel counted every launch of the trial from
-/// the owning install, so three processes of the new build started inside the
-/// trial window — parallel headless engines from agent tooling, `open -n -a aterm`
-/// three times, a launcher script — were three counted launches with zero
-/// crashes, the third reverted, and the quarantine poisoned a healthy release for
-/// good. A real crash loop is user- or launcher-driven and every relaunch passes
-/// dyld and GPU init, so its launches are seconds apart and still reach the budget.
+/// Launches of the trialed build closer together than this count as one. Parallel
+/// starts (headless engines from agent tooling, `open -n -a aterm`, a launcher
+/// script) are not crashes; a real crash loop's relaunches each pass dyld and GPU
+/// init, so they are seconds apart and still reach the budget.
 const BOOT_LAUNCH_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Whether this launch is part of a burst the sentinel already counted: an
-/// OBSERVED trial (attempts > 0 — the arm itself is never a burst, so the first
-/// launch always counts) whose file was written inside
-/// [`BOOT_LAUNCH_BURST_WINDOW`]. Pure, so the law is testable without a bundle.
+/// Whether this launch is part of a burst the sentinel already counted: an observed
+/// trial (attempts > 0; the arm itself is never a burst, so the first launch always
+/// counts) whose file was written inside [`BOOT_LAUNCH_BURST_WINDOW`]. Pure.
 fn launch_is_burst(attempts: u32, sentinel_age: Option<std::time::Duration>) -> bool {
     attempts > 0 && sentinel_age.is_some_and(|age| age < BOOT_LAUNCH_BURST_WINDOW)
+}
+
+/// A process that launched the trialed build, named by pid AND start time so a
+/// reused pid never reads as the launch it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrialLauncher {
+    pid: u32,
+    started: (i64, i64),
+}
+
+impl TrialLauncher {
+    /// `pid` as it runs now, or `None` when it is gone (or a zombie).
+    fn of(pid: u32) -> Option<Self> {
+        process_start(pid).map(|started| Self { pid, started })
+    }
+
+    /// This launch's process, or `None` when the kernel will not say.
+    fn this_process() -> Option<Self> {
+        Self::of(std::process::id())
+    }
+
+    /// Whether the process that made this launch is still running — the same pid
+    /// with the same start time, and not a zombie.
+    fn is_alive(&self) -> bool {
+        Self::of(self.pid) == Some(*self)
+    }
+
+    /// The name the sentinel counts this launch under ([`Sentinel::observe_launch_by`]).
+    fn name(self) -> LaunchName {
+        LaunchName {
+            pid: self.pid,
+            started: self.started,
+        }
+    }
+}
+
+/// `pid`'s start time from the kernel, or `None` when there is no such process,
+/// it is a zombie, or the answer is about some other pid.
+fn process_start(pid: u32) -> Option<(i64, i64)> {
+    /// `SZOMB` in `<sys/proc.h>`: exited, not yet reaped — a death, for this rule.
+    const SZOMB: u32 = 5;
+    let raw_pid = i32::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid || info.pbi_status == SZOMB {
+        return None;
+    }
+    Some((
+        i64::try_from(info.pbi_start_tvsec).ok()?,
+        i64::try_from(info.pbi_start_tvusec).ok()?,
+    ))
+}
+
+/// Where the processes that launched the armed trial are recorded, beside the
+/// sentinel: `<build>` on the first line, then `<pid> <seconds> <micros>` per launch,
+/// followed by ` headless` for a launch that opened no window. A separate file on
+/// purpose: the sentinel's own `"<build> <attempts>"` line is what every build reads
+/// and writes, and an older one keeps doing exactly that. An older build reads the
+/// first three fields of a line and ignores the rest; a line without the fourth (an
+/// older build's) reads as a window's launch, the meaning every launch had before.
+fn trial_launchers_path(staging: &Staging) -> PathBuf {
+    staging.root.join("boot.sentinel.launchers")
+}
+
+/// The most launches the record keeps; the oldest go first.
+const MAX_TRIAL_LAUNCHERS: usize = 32;
+
+/// The fourth field of a launcher's line that marks a launch that opened no window.
+const HEADLESS_LAUNCHER_MARK: &str = "headless";
+
+/// A launch of the armed trial as the record keeps it: the process, and what it can
+/// prove about the trial ([`crate::TrialWitness`]) — which decides whose overlap it
+/// exempts ([`count_trial_launch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordedLauncher {
+    launcher: TrialLauncher,
+    witness: crate::TrialWitness,
+}
+
+fn read_trial_launchers(staging: &Staging, build: u64) -> Vec<RecordedLauncher> {
+    let Some(text) = crate::read_ledger_text(&trial_launchers_path(staging)) else {
+        return Vec::new();
+    };
+    let mut lines = text.lines();
+    if lines
+        .next()
+        .and_then(|line| line.trim().parse::<u64>().ok())
+        != Some(build)
+    {
+        return Vec::new();
+    }
+    lines
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let launcher = TrialLauncher {
+                pid: fields.next()?.parse().ok()?,
+                started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+            };
+            let witness = if fields.next() == Some(HEADLESS_LAUNCHER_MARK) {
+                crate::TrialWitness::Headless
+            } else {
+                crate::TrialWitness::Window
+            };
+            Some(RecordedLauncher { launcher, witness })
+        })
+        .collect()
+}
+
+fn write_trial_launchers(staging: &Staging, build: u64, launchers: &[RecordedLauncher]) {
+    let skip = launchers.len().saturating_sub(MAX_TRIAL_LAUNCHERS);
+    let mut text = format!("{build}\n");
+    for RecordedLauncher { launcher, witness } in &launchers[skip..] {
+        let mark = match witness {
+            crate::TrialWitness::Window => String::new(),
+            crate::TrialWitness::Headless => format!(" {HEADLESS_LAUNCHER_MARK}"),
+        };
+        text.push_str(&format!(
+            "{} {} {}{mark}\n",
+            launcher.pid, launcher.started.0, launcher.started.1
+        ));
+    }
+    if let Err(error) = write_private_file(&trial_launchers_path(staging), text.as_bytes()) {
+        crate::warn(&format!(
+            "could not record the launches of build {build}'s trial: {error}; overlapping \
+             launches of it may be counted as relaunches"
+        ));
+    }
+}
+
+/// Where a trial records that a WINDOW has launched it:
+/// `<build> <artifact digest> <unix seconds of the latest window launch>`,
+/// written under the apply lock by every launch that opens windows.
+///
+/// KEYED BY THE TRIAL'S IDENTITY, never by the build number alone: a record reads
+/// as the ARMED trial's only while the sentinel is armed for that build AND the
+/// trial marker (`trial.toml`) names the same build and digest. Every end of a
+/// trial — a confirm, a revert, any disarm — leaves the record naming a trial that
+/// is no longer armed, so it reads as no record whether or not it was removed; and
+/// a later trial of the same build number under another digest (a re-publish,
+/// armed by an older image that does not know this file) is not mistaken for the
+/// one a window launched. The file is also removed where a trial is armed, and at
+/// every end of a trial this crate owns ([`clear_trial_identity`]).
+fn trial_window_launch_path(staging: &Staging) -> PathBuf {
+    staging.root.join("boot.sentinel.windowed")
+}
+
+/// How long a trial a WINDOW has launched waits for a window to settle it — confirm
+/// it at a first frame, or count the launches that crash before one — before a
+/// headless launch counts toward it and confirms it again (law L5: no wait without
+/// a deadline). Measured from the LATEST window launch of
+/// the trial, and longer than any gap the window lane's own schedule leaves between
+/// two of its launches (its structural re-sample waits a day), so a window lane
+/// still at work always launches again inside it. What it bounds is a machine
+/// where windows stopped launching the build — a person who quit the app and runs
+/// only harnesses — whose trial would otherwise stay armed for ever, and with it
+/// every later update. Said on each such headless launch, with this deadline, where
+/// `update status` reads it.
+pub(crate) const WINDOW_TRIAL_HEADLESS_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(48 * 60 * 60);
+
+/// What the window-launch record says about the armed trial of `build`, at `now`
+/// (unix seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowLaunch {
+    /// No window has launched the armed trial: a headless launch counts toward it
+    /// and settles it, as it always did — the headless self-update lane.
+    None,
+    /// A window has, within [`WINDOW_TRIAL_HEADLESS_WAIT`]: a headless launch
+    /// neither counts nor settles it, until `until` (unix seconds).
+    Waiting { until: u64 },
+    /// A window has, but none for [`WINDOW_TRIAL_HEADLESS_WAIT`]: headless launches
+    /// count and settle it again.
+    Lapsed,
+}
+
+fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch {
+    let Some(text) = crate::read_ledger_text(&trial_window_launch_path(staging)) else {
+        return WindowLaunch::None;
+    };
+    let mut fields = text.split_whitespace();
+    let (Some(recorded), Some(digest), Some(at)) = (
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next(),
+        fields.next().and_then(|field| field.parse::<u64>().ok()),
+    ) else {
+        return WindowLaunch::None;
+    };
+    let armed = matches!(boot_sentinel(staging).read_state(), Some((armed, _)) if armed == build);
+    let this_trial = crate::manifest::FailedMark::read(&staging.trial())
+        .is_some_and(|trial| trial.matches(build, digest));
+    if recorded != build || !armed || !this_trial {
+        return WindowLaunch::None;
+    }
+    // A record from further ahead than the wait itself (a clock set back since it
+    // was written) is one the clock cannot place, and holds nothing: the wait is
+    // bounded either way.
+    if now.abs_diff(at) < WINDOW_TRIAL_HEADLESS_WAIT.as_secs() {
+        WindowLaunch::Waiting {
+            until: at.saturating_add(WINDOW_TRIAL_HEADLESS_WAIT.as_secs()),
+        }
+    } else {
+        WindowLaunch::Lapsed
+    }
+}
+
+/// Record that a launch that opens windows booted `build`'s trial, now. A record
+/// that cannot be written — or no trial identity to key it by — is said: a
+/// headless launch then counts and confirms as before.
+fn record_window_launch(staging: &Staging, build: u64) {
+    let Some(trial) = crate::manifest::FailedMark::read(&staging.trial())
+        .filter(|trial| trial.build_number == build && !trial.sha256.is_empty())
+    else {
+        crate::warn(&format!(
+            "build {build}'s trial has no identity to record a window launch against; a \
+             headless launch of it may count toward it and confirm it"
+        ));
+        return;
+    };
+    if let Err(error) = write_private_file(
+        &trial_window_launch_path(staging),
+        format!("{build} {} {}\n", trial.sha256, unix_now_secs()).as_bytes(),
+    ) {
+        crate::warn(&format!(
+            "could not record that a window launched build {build}'s trial: {error}; a \
+             headless launch of it may count toward it and confirm it"
+        ));
+    }
+}
+
+/// A trial ENDS: its identity marker goes, and with it the record of the windows
+/// that launched it. Every path that clears the trial marker calls this.
+fn clear_trial_identity(staging: &Staging) {
+    crate::manifest::FailedMark::clear(&staging.trial());
+    let _ = std::fs::remove_file(trial_window_launch_path(staging));
+}
+
+/// What `update status` says while `build`'s trial waits for a window (law L5).
+fn window_trial_wait_notice(build: u64, until: u64) -> String {
+    format!(
+        "build {build} is on trial after its update and no window of it has confirmed it \
+         yet: open aterm. After {}, a headless start confirms it instead",
+        aterm_types::rfc3339::format_rfc3339(until)
+    )
+}
+
+/// The trial of `build` WAITING FOR A WINDOW, as `update status` says it
+/// ([`window_trial_wait_notice`]), or `None` when it is not waiting.
+///
+/// COMPUTED FROM THE TRIAL'S OWN RECORDS, NEVER STORED: written into the health
+/// ledger's one apply-refusal slot it would replace the older build's standing
+/// reason and book a "refusal" where nothing failed. Read from the sentinel, the
+/// trial's identity and the window-launch record, it is exactly as current as the
+/// wait and touches nothing another process wrote.
+pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> Option<String> {
+    match trial_window_launch(staging, build, now) {
+        WindowLaunch::Waiting { until } => Some(window_trial_wait_notice(build, until)),
+        WindowLaunch::None | WindowLaunch::Lapsed => None,
+    }
+}
+
+/// Where a trial a HEADLESS launch settled keeps its window lane open:
+/// `<build> <artifact digest> <unix seconds of the settle>` on
+/// the first line, the install the trial was settled on (`app_root`) on the second.
+///
+/// WHY. A headless launch (a harness, `aterm --headless`) can reach the trial
+/// before any window does. Confirming the whole trial then would delete the
+/// predecessor, leaving nothing to count or revert to if the windows later crash
+/// before their first frame.
+///
+/// So a headless confirmation settles the trial for the headless path only: the
+/// sentinel disarms and the success is booked as before — later updates are not
+/// held, and headless launches stop counting — but the predecessor stays at the
+/// fixed rollback path and this record says whose it is. The next WINDOW launch of
+/// the build from that install puts it back on trial ([`rearm_window_unproven_trial`]):
+/// its crashes are counted and revert to the predecessor, and its first frame
+/// confirms the build and deletes the predecessor, exactly as for a trial a window
+/// started. With no window launch within [`WINDOW_TRIAL_HEADLESS_WAIT`] the record
+/// lapses; the predecessor is then replaced by the next update's swap.
+///
+/// A separate file an older build neither reads nor writes: without it, a
+/// headless confirmation is the whole trial's.
+fn window_unproven_path(staging: &Staging) -> PathBuf {
+    staging.root.join("boot.sentinel.window-unproven")
+}
+
+/// The record at [`window_unproven_path`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowUnproven {
+    build: u64,
+    digest: String,
+    at: u64,
+    install_root: PathBuf,
+}
+
+impl WindowUnproven {
+    /// The record, or `None` when there is none or it does not parse — which is
+    /// read as no record: the window lane then settles as it did before it existed.
+    fn read(staging: &Staging) -> Option<Self> {
+        let text = crate::read_ledger_text(&window_unproven_path(staging))?;
+        let mut lines = text.lines();
+        let mut fields = lines.next()?.split_whitespace();
+        let build = fields
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .filter(|build| *build != 0)?;
+        let digest = canonical_digest(fields.next()?)?;
+        let at = fields.next()?.parse::<u64>().ok()?;
+        let install_root = PathBuf::from(lines.next()?);
+        install_root.is_absolute().then_some(Self {
+            build,
+            digest,
+            at,
+            install_root,
+        })
+    }
+
+    fn record(&self, staging: &Staging) -> std::io::Result<()> {
+        write_private_file(
+            &window_unproven_path(staging),
+            format!(
+                "{} {} {}\n{}\n",
+                self.build,
+                self.digest,
+                self.at,
+                self.install_root.display()
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Whether the record has lapsed at `now` (unix seconds): past
+    /// [`WINDOW_TRIAL_HEADLESS_WAIT`] since the settle, or written further ahead than
+    /// that (a clock set back since), which the clock cannot place.
+    fn lapsed(&self, now: u64) -> bool {
+        now.abs_diff(self.at) >= WINDOW_TRIAL_HEADLESS_WAIT.as_secs()
+    }
+}
+
+fn clear_window_unproven(staging: &Staging) {
+    let _ = std::fs::remove_file(window_unproven_path(staging));
+}
+
+/// Whether a window launch of `build` may find its window lane open — the cheap,
+/// lock-free peek [`check_boot_health_with_lock_wait`] takes before it takes the
+/// apply lock for a re-trial.
+fn window_unproven_names(staging: &Staging, build: u64) -> bool {
+    WindowUnproven::read(staging).is_some_and(|record| record.build == build)
+}
+
+/// PUT A BUILD A HEADLESS LAUNCH SETTLED BACK ON TRIAL for this window launch (see
+/// [`window_unproven_path`]): arm `build`'s trial again over the retained
+/// predecessor, as `prepare_trial` arms one — the identity marker, then the
+/// sentinel — so the caller counts this launch against it. Runs under the apply
+/// lock; `true` once the trial is armed.
+///
+/// Nothing is armed, and the launch goes on as any launch of a settled build, when:
+/// * another trial is armed (it owns the fixed rollback path);
+/// * the record is another build's, or another install's;
+/// * a publication is ready (`ready.toml`): the next swap supersedes this build, and
+///   its trial takes this build as its predecessor — a crash cut of that swap may
+///   also have left the NEW candidate at the fixed path, which must never be
+///   mistaken for this build's predecessor;
+/// * the record has lapsed, or its predecessor, or the installed receipt naming
+///   exactly this artifact, is gone — then the record is dropped.
+fn rearm_window_unproven_trial(
+    staging: &Staging,
+    sentinel: &Sentinel,
+    build: u64,
+    app_root: &Path,
+    now: u64,
+) -> bool {
+    let Some(record) = WindowUnproven::read(staging).filter(|record| record.build == build) else {
+        return false;
+    };
+    if sentinel.read_state().is_some() || record.install_root != app_root || staging.ready.exists()
+    {
+        return false;
+    }
+    let drop_record = |why: &str| {
+        crate::log(&format!(
+            "build {build} was settled by a headless launch, and this window launch does not \
+             put it back on trial: {why}"
+        ));
+        clear_window_unproven(staging);
+        false
+    };
+    if record.lapsed(now) {
+        return drop_record(&format!(
+            "no window launched it within {} h",
+            WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600
+        ));
+    }
+    let fixed = rollback_path(app_root);
+    if !is_non_symlink_dir(&fixed) || !same_volume(&fixed, app_root) {
+        return drop_record("its retained predecessor is gone");
+    }
+    if !crate::manifest::InstalledReceipt::read(&staging.installed_receipt()).is_some_and(
+        |receipt| {
+            receipt.build_number == build && receipt.dmg_sha256.eq_ignore_ascii_case(&record.digest)
+        },
+    ) {
+        return drop_record("the installed receipt no longer names that artifact");
+    }
+    if let Err(error) = crate::manifest::FailedMark::record_required(
+        &staging.trial(),
+        build,
+        &record.digest,
+        Some(app_root),
+    ) {
+        crate::warn(&format!(
+            "could not put build {build} back on trial for a window launch (persist trial \
+             identity: {error}); this launch is not counted against it"
+        ));
+        return false;
+    }
+    // A re-trial has no launches yet — the headless launchers of the settled trial
+    // least of all — and no window has launched it until this one is counted.
+    let _ = std::fs::remove_file(trial_launchers_path(staging));
+    let _ = std::fs::remove_file(trial_window_launch_path(staging));
+    if let Err(error) = sentinel.arm(build) {
+        crate::manifest::FailedMark::clear(&staging.trial());
+        crate::warn(&format!(
+            "could not put build {build} back on trial for a window launch (arm: {error}); \
+             this launch is not counted against it"
+        ));
+        return false;
+    }
+    clear_window_unproven(staging);
+    crate::log(&format!(
+        "build {build} was settled by a headless launch, which proves nothing about its \
+         windows: this window launch puts it back on trial over the retained predecessor \
+         at {}",
+        fixed.display()
+    ));
+    true
+}
+
+/// Count this launch of the armed trial `current_build`, or say why it is not
+/// counted. Runs under the apply lock.
+///
+/// The sentinel counts launches while the trial is unconfirmed, as the crash
+/// signal. Two kinds of launch are not that signal:
+///
+/// * a burst ([`launch_is_burst`]): one launch event that started several processes
+///   within [`BOOT_LAUNCH_BURST_WINDOW`];
+/// * an overlapping handoff target: the live parent's authorized handoff target of
+///   this build (`handoff_target`), launched while an earlier launch of this trial
+///   is still running. It has not crashed; it is waiting for its own Commit, which
+///   is when a handoff candidate confirms (several windows of one build each run a
+///   candidate).
+///
+/// Only a handoff target is exempted by an overlap: otherwise an earlier launcher
+/// that stays alive and unconfirmed would shield every later launch from the count,
+/// the budget-exhausted escape in `check_boot_health` would never be reached, and no
+/// later release would install while it lives. Each window hands off to at most one
+/// target of a build, so the exemption is bounded.
+///
+/// A crash loop still counts every launch: each dies before the next begins.
+///
+/// A HEADLESS LAUNCH (`witness`) of a trial a WINDOW has launched is neither counted
+/// nor recorded as a launcher: it proves nothing about the window path. Counted, a
+/// harness's healthy instances would push a healthy build toward its revert;
+/// recorded, a live one would exempt the window's candidates as overlapping handoff
+/// targets so their crashes went uncounted. A headless launch of a trial no window
+/// has launched — the headless self-update lane — counts, and is recorded as a
+/// HEADLESS launcher, whose overlap exempts only a headless target
+/// ([`overlap_exempts`]).
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "Boots",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingBoots",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingLaunchedCold",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+fn count_trial_launch(
+    staging: &Staging,
+    sentinel: &Sentinel,
+    current_build: u64,
+    launcher: Option<TrialLauncher>,
+    handoff_target: bool,
+    witness: crate::TrialWitness,
+) -> Result<(), String> {
+    match witness {
+        crate::TrialWitness::Headless => {
+            match trial_window_launch(staging, current_build, unix_now_secs()) {
+                WindowLaunch::Waiting { until } => {
+                    crate::log(&format!(
+                        "boot sentinel for build {current_build}: a window has launched this \
+                         trial, and a headless launch proves nothing about the window path, so \
+                         it is not counted (attempt {} stands) — until {}, when headless \
+                         launches count again",
+                        sentinel.read_state().map_or(0, |(_, attempts)| attempts),
+                        aterm_types::rfc3339::format_rfc3339(until)
+                    ));
+                    return Ok(());
+                }
+                WindowLaunch::Lapsed => crate::log(&format!(
+                    "boot sentinel for build {current_build}: no window has launched this \
+                     trial for {} h, so this headless launch counts toward it again",
+                    WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600
+                )),
+                WindowLaunch::None => {}
+            }
+        }
+        crate::TrialWitness::Window => record_window_launch(staging, current_build),
+    }
+    let mut launchers = read_trial_launchers(staging, current_build);
+    launchers.retain(|recorded| recorded.launcher.is_alive());
+    let overlapped = launchers
+        .iter()
+        .find(|live| {
+            handoff_target
+                && launcher.is_none_or(|this| this.pid != live.launcher.pid)
+                && overlap_exempts(witness, live.witness)
+        })
+        .map(|live| live.launcher);
+    // The age of the last COUNTED launch, read before a payment below rewrites the
+    // line: a give-back is no launch, and must not make this one read as its burst.
+    let sentinel_age = mtime(&staging.root.join("boot.sentinel")).and_then(|t| t.elapsed().ok());
+    // What a give-back that met a held lock owes is paid before this launch is
+    // counted: the count a revert reads never stands on a launch its killer gave
+    // back.
+    pay_owed_trial_launches(staging, sentinel);
+    let attempts_now = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
+    if launch_is_burst(attempts_now, sentinel_age) {
+        crate::log(&format!(
+            "boot sentinel for build {current_build}: a launch {} ms after the last counted \
+             one is the same burst and is not counted (attempt {attempts_now} stands)",
+            sentinel_age.map_or(0, |age| age.as_millis())
+        ));
+    } else if let Some(live) = overlapped {
+        crate::log(&format!(
+            "boot sentinel for build {current_build}: this handoff target launched while an \
+             earlier launch of it (pid {}) is still running, so it is not a relaunch after a \
+             crash and is not counted (attempt {attempts_now} stands)",
+            live.pid
+        ));
+    } else {
+        // NAMED, so exactly this launch can be given back, once
+        // (`forgive_trial_launch_of_at`); one the kernel will not name stays counted.
+        sentinel
+            .observe_launch_by(current_build, launcher.map(TrialLauncher::name))
+            .map_err(|error| format!("trial launch observation: {error}"))?;
+    }
+    if let Some(this) = launcher
+        && !launchers.iter().any(|recorded| recorded.launcher == this)
+    {
+        launchers.push(RecordedLauncher {
+            launcher: this,
+            witness,
+        });
+    }
+    write_trial_launchers(staging, current_build, &launchers);
+    Ok(())
+}
+
+/// Whether a live launch of the trial by `live` exempts an overlapping handoff
+/// target launched by `target` from the count ([`count_trial_launch`]).
+///
+/// A WINDOW's target is exempted only beside a live WINDOW launch. The exemption
+/// exists because several windows each run their own candidate of the one build; a
+/// headless instance is no such sibling, and exempting beside it (a harness alive
+/// for hours) would leave every crashing window candidate uncounted and the build
+/// never reverted. A headless target is exempted beside any live launch.
+fn overlap_exempts(target: crate::TrialWitness, live: crate::TrialWitness) -> bool {
+    target == crate::TrialWitness::Headless || live == crate::TrialWitness::Window
 }
 
 fn prepare_trial(
@@ -1072,40 +1655,46 @@ fn prepare_trial(
     ) {
         return Err(format!("persist trial identity: {error}"));
     }
-    // Sentinel is the transaction commit marker and is published LAST. A crash
-    // after trial.toml but before arm leaves no active authority and is harmless;
-    // the reverse order could wedge forever with an armed build but no exact digest.
+    // The sentinel is the transaction's commit marker and is published last. A
+    // crash after trial.toml but before arm leaves no active authority; the reverse
+    // order could wedge forever with an armed build but no exact digest.
     if let Err(error) = sentinel.arm(ready.build_number) {
-        crate::manifest::FailedMark::clear(&staging.trial());
+        clear_trial_identity(staging);
         return Err(format!("arm boot-health trial: {error}"));
     }
-    // A fresh trial owns the sentinel now, so any launches counted against the
-    // PREVIOUS armed build are answered; the budget must never accumulate across
-    // unrelated trials.
+    // A fresh trial owns the sentinel now, so launches counted against the previous
+    // armed build are answered; the budget never accumulates across trials.
     let _ = foreign_trial_counter(staging).confirm();
+    // A fresh trial has no launches yet: the record of an earlier one of the same
+    // build must not read as this one's. Nor does the build this swap replaces keep
+    // a window lane open: it is the new trial's predecessor now.
+    let _ = std::fs::remove_file(trial_launchers_path(staging));
+    let _ = std::fs::remove_file(trial_window_launch_path(staging));
+    // …nor any launch of an earlier trial still owed back.
+    let _ = remove_path_no_follow(&owed_give_backs_dir(staging));
+    clear_window_unproven(staging);
     Ok(sentinel)
 }
 
-/// Is the armed trial (if any) OWNED by the install at `app_root`? The sentinel and
-/// `trial.toml` are per user, but a build can be installed at several paths at once
-/// (`~/Applications/aterm.app` beside `/Applications/aterm.app`, a duplicate
-/// copy of a release). A same-build process launched from a bundle the trial did
-/// not swap must neither count launches against it (three sibling launches used to
-/// revert and poison a build that never crashed), nor confirm it, nor disarm it as
-/// dead authority. A marker without a recorded root (written before the field
-/// existed) is treated as owned, which is the historical behaviour.
+/// Whether the armed trial (if any) is owned by the install at `app_root`. The
+/// sentinel and `trial.toml` are per user, but a build can be installed at several
+/// paths (`~/Applications/aterm.app` beside `/Applications/aterm.app`). A
+/// same-build process launched from a bundle the trial did not swap must neither
+/// count launches against it, nor confirm it, nor disarm it as dead authority. A
+/// marker without a recorded root (an older format) is treated as owned.
 #[must_use]
 fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
     match crate::manifest::FailedMark::read(&staging.trial()).and_then(|trial| trial.install_root) {
         None => true,
         Some(recorded) => {
             let recorded = Path::new(&recorded);
-            // An install that is GONE (moved or deleted mid-trial) owns nothing: if
-            // only its ghost could count, confirm or budget the sentinel, every
-            // launch of this build from anywhere else would defer forever. Whoever
-            // runs this build now inherits the trial and its escapes. GONE means
-            // `NotFound` precisely — an unmounted volume or a TCC-protected folder
-            // answers another error and still owns its trial (fail-safe).
+            // An install that is gone (moved or deleted mid-trial) owns nothing, or
+            // every launch of this build from elsewhere would defer forever; whoever
+            // runs this build now inherits the trial and its escapes. Gone means
+            // `NotFound` exactly: a TCC-protected folder answers another error and
+            // still owns its trial. An ejected volume would read as gone, but no
+            // trial records one: `bundle::resolve_from` refuses every `/Volumes/`
+            // path, so nothing there is ever swapped or armed.
             match std::fs::symlink_metadata(recorded) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(_) => false,
@@ -1115,10 +1704,9 @@ fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
     }
 }
 
-/// Path equality for install roots, tolerant of a canonicalizable spelling. The one
-/// "is this the same copy of aterm.app?" test — the trial-ownership rule above and
-/// the S12 `which_copy` report both ask it, so a symlinked spelling of the running
-/// bundle can never read as a second copy on one surface and not the other.
+/// Path equality for install roots, tolerant of a canonicalizable spelling: the one
+/// "is this the same copy of aterm.app?" test, shared by the trial-ownership rule
+/// and `which_copy`, so a symlinked spelling reads the same on both.
 #[must_use]
 pub(crate) fn same_install_root(a: &Path, b: &Path) -> bool {
     if a == b {
@@ -1135,15 +1723,14 @@ fn abandoned_preswap_trial(process_build: u64, installed_build: u64, armed_build
     installed_build == process_build && armed_build > process_build
 }
 
-/// DEAD AUTHORITY: the sentinel names a build strictly OLDER than the bundle we
-/// are canonically installed as and running. Only an out-of-band install (a
-/// `tools/install.sh` run, a DMG drag) landing inside an armed trial window can
-/// produce it — and `MAX_BOOT_ATTEMPTS` is 3, so a trial legitimately survives two
-/// launches that crash before the health checkpoint, which is exactly when a user
-/// hand-installs a different build.
+/// Dead authority: the sentinel names a build strictly older than the bundle we are
+/// canonically installed as and running. Only an out-of-band install (a
+/// `tools/install.sh` run, a DMG drag) during an armed trial produces it; a trial
+/// legitimately survives two crashing launches (`MAX_BOOT_ATTEMPTS` is 3), which is
+/// when a user might hand-install a different build.
 ///
-/// Disjoint from [`abandoned_preswap_trial`] by construction: the armed build sits
-/// above the installed one there and below it here.
+/// Disjoint from [`abandoned_preswap_trial`]: there the armed build is above the
+/// installed one, here below it.
 #[must_use]
 fn dead_authority_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
     installed_build == process_build && armed_build < installed_build
@@ -1162,17 +1749,14 @@ fn identity_matches_running(
 /// The terminal transition for a [`dead_authority_trial`]: disarm, and drop the
 /// artifacts that trial owned.
 ///
-/// Leaving it armed is not the conservative choice, it is the permanent one. The
-/// trial can no longer be confirmed (its build is not installed) and must not be
-/// reverted (that would install a build older than the one already running), while
-/// `check_boot_health` / `confirm_boot_health` / `confirm_trial_health_after_proof`
-/// all early-out unless the armed build equals the running one — so nothing else
-/// in the tree can ever clear it, and every future apply is refused forever. Same
-/// reasoning as the wedged-trial escape hatch in `check_boot_health`.
+/// Leaving it armed would be permanent: it can no longer be confirmed (its build is
+/// not installed) and must not be reverted (that would install an older build),
+/// and `check_boot_health` / `confirm_boot_health` /
+/// `confirm_trial_health_after_proof` all return early unless the armed build is the
+/// running one, so every future apply would be refused.
 ///
 /// The caller must have proved the shape first; `check_boot_health` already
-/// returned for the `armed == process_build` case, so this cannot race a live
-/// trial of ours.
+/// returned for `armed == process_build`, so this cannot race a live trial of ours.
 fn disarm_dead_authority_trial(
     staging: &Staging,
     installed: &Path,
@@ -1184,7 +1768,7 @@ fn disarm_dead_authority_trial(
     if boot_sentinel(staging).confirm().is_err() {
         return false;
     }
-    crate::manifest::FailedMark::clear(&staging.trial());
+    clear_trial_identity(staging);
     // Its retained rollback source is older than the running build and has no
     // sentinel behind it; drop it so a later `recover_orphaned_prepared_candidate`
     // cannot mistake it for this transaction.
@@ -1210,10 +1794,9 @@ fn disarm_dead_authority_trial(
     true
 }
 
-/// Whether THIS install may recover an abandoned pre-swap trial: the shape
-/// matches, the trial is this install's (`trial_owned_by` — the same law as the
-/// dead-authority branch; the staging root is shared by every copy on the
-/// machine), and the running build is the installed one.
+/// Whether this install may recover an abandoned pre-swap trial: the shape matches,
+/// the trial is this install's (`trial_owned_by`; the staging root is shared by
+/// every copy on the machine), and the running build is the installed one.
 fn may_recover_abandoned_preswap(
     staging: &Staging,
     installed: &Path,
@@ -1225,14 +1808,14 @@ fn may_recover_abandoned_preswap(
         && identity_matches
 }
 
-/// Recover the sole safe mismatched-sentinel crash cut under apply_lock: this
-/// process's OLD build is still canonically installed while the armed build is
-/// newer. Because apply_lock is held, a live concurrent swap must finish before
-/// this observation; canonical OLD proves NEW is not installed. This covers both a
-/// pre-swap crash and a crash immediately after inverse rollback.
+/// Recovers the one safe mismatched-sentinel crash cut under the apply lock: this
+/// process's old build is still canonically installed while the armed build is
+/// newer. With the lock held, a concurrent swap has finished, so canonical OLD
+/// proves NEW is not installed. Covers a pre-swap crash and a crash right after an
+/// inverse rollback.
 ///
-/// Also the one place a [`dead_authority_trial`] — a sentinel armed for a build
-/// OLDER than the running one, which no other transition can reach — is retired.
+/// Also the one place a [`dead_authority_trial`] (a sentinel armed for a build
+/// older than the running one) is retired.
 fn recover_abandoned_preswap_trial_if_exact(
     staging: &Staging,
     installed: &Path,
@@ -1246,11 +1829,10 @@ fn recover_abandoned_preswap_trial_if_exact(
     let Ok((installed_build, installed_commit)) = verified_bundle_identity(installed) else {
         return false;
     };
-    // Placed AFTER the identity resolution on purpose: an installed bundle we
-    // cannot verify still fails closed, disarming nothing. And ONLY the install the
-    // trial swapped may retire it: a newer sibling bundle at another path sees
-    // "armed for an older build than me" too, and disarming from there stripped
-    // the live install's crash-loop protection and cleared its receipt.
+    // After identity resolution on purpose: an installed bundle we cannot verify
+    // fails closed and disarms nothing. Only the install the trial swapped may
+    // retire it: a newer sibling bundle at another path also sees "armed for an
+    // older build", and must not strip the live install's crash-loop protection.
     if dead_authority_trial(process_build, installed_build, armed_build)
         && trial_owned_by(staging, installed)
         && identity_matches_running(
@@ -1260,9 +1842,9 @@ fn recover_abandoned_preswap_trial_if_exact(
             process_commit,
         )
     {
-        // Do NOT `retire_published()` here (unlike the check_boot_health escape
-        // hatch): returning true lets the caller go on to apply a legitimately
-        // staged newer build in this same launch, and retiring would throw it away.
+        // No `retire_published()` here (unlike the check_boot_health escape hatch):
+        // returning true lets the caller apply a legitimately staged newer build in
+        // this same launch.
         return disarm_dead_authority_trial(
             staging,
             installed,
@@ -1301,22 +1883,19 @@ fn recover_abandoned_preswap_trial_if_exact(
         return false;
     }
 
-    // A crash after the O(1) staged_app→fixed rename (or after arming but before
-    // swap) leaves exact NEW at fixed and exact ready authority. Restore it to the
-    // published staging path so the update remains retryable. An inverse-swap cut
-    // after ready retirement instead has no publisher, so fixed is failed NEW and
-    // may be reclaimed only after the successful disarm above.
+    // A crash after the O(1) staged_app→fixed rename (or after arming, before the
+    // swap) leaves exact NEW at fixed and exact ready authority: restore it to the
+    // published staging path so the update stays retryable. An inverse-swap cut
+    // after ready retirement has no publisher, so fixed is failed NEW and may be
+    // reclaimed only after the successful disarm above.
     let ready = Ready::read(&staging.ready);
     if ready.as_ref().is_some_and(|ready| {
         ready_matches_verified_identity(ready, candidate_build, &candidate_commit)
     }) {
-        // Cross-volume staging COPIES staged_app -> fixed and leaves the staged
-        // copy intact, so when the staged bundle already carries the exact
-        // candidate identity the fixed twin is the redundant copy — reclaim it
-        // and keep the publication. Deleting the staged copy first just to fail
-        // the rename back (EXDEV whenever the install volume differs from HOME,
-        // i.e. every external-volume install) destroyed the one copy the
-        // published authority still pointed at.
+        // Cross-volume staging copies staged_app -> fixed and keeps the staged copy,
+        // so when the staged bundle already carries the exact candidate identity the
+        // fixed twin is redundant: reclaim it and keep the publication (renaming
+        // back would fail EXDEV on every external-volume install).
         if verified_bundle_identity(&staging.staged_app)
             .is_ok_and(|(build, commit)| build == candidate_build && commit == candidate_commit)
         {
@@ -1325,11 +1904,9 @@ fn recover_abandoned_preswap_trial_if_exact(
             let _ = remove_path_no_follow(&staging.staged_app);
             if rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()).is_err() {
                 // EXDEV (or any restore failure): the bytes cannot reach the
-                // staging path from here. Retire the publication and reclaim the
-                // fixed candidate so THIS launch settles at NoUpdate and the next
-                // check re-stages cleanly — instead of returning an unrecovered
-                // trial that defers every launch behind a marker naming bytes
-                // nothing can restore. Pre-swap the fixed path is NEW, never a
+                // staging path. Retire the publication and reclaim the fixed
+                // candidate so this launch settles at NoUpdate and the next check
+                // re-stages cleanly. Pre-swap the fixed path is NEW, never a
                 // rollback source, so reclaiming it is safe.
                 crate::warn(&format!(
                     "cannot restore the fixed candidate (build {candidate_build}) to the \
@@ -1343,7 +1920,7 @@ fn recover_abandoned_preswap_trial_if_exact(
     } else {
         let _ = remove_path_no_follow(&fixed);
     }
-    crate::manifest::FailedMark::clear(&staging.trial());
+    clear_trial_identity(staging);
     let receipt_matches = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
         .is_some_and(|receipt| receipt.matches_sealed(installed_build, &installed_commit));
     if !receipt_matches {
@@ -1352,60 +1929,48 @@ fn recover_abandoned_preswap_trial_if_exact(
     true
 }
 
-/// Budgeted escape for a boot sentinel armed for a build that is NOT the running
+/// Budgeted escape for a boot sentinel armed for a build that is not the running
 /// one and that [`recover_abandoned_preswap_trial_if_exact`] could not resolve.
 ///
-/// Such a sentinel is otherwise permanent. Every lane that clears one — the
-/// launch counting and revert in `check_boot_health`, `confirm_boot_health`,
-/// `confirm_trial_health_after_proof` — early-outs unless the armed build equals
-/// the running build, and [`prepare_trial`], the only writer, is gated behind the
-/// very check that is failing, so the stuck sentinel blocks its own replacement.
-/// The observable result is the "staged and ready but never applies" signature:
-/// every launch returns `Deferred` while the background stager keeps downloading
-/// and publishing, with no client-side repair short of deleting the file by hand.
-/// The shapes that reach here are the ones the exact recovery deliberately
-/// refuses (a rollback sibling that is not the armed build, an unverifiable
-/// install, an armed build below a running build we are not canonically installed
-/// as), so refusing forever is not evidence of anything except that this launch
-/// cannot prove the trial's story.
+/// Such a sentinel is otherwise permanent: every lane that clears one
+/// (`check_boot_health`, `confirm_boot_health`, `confirm_trial_health_after_proof`)
+/// returns early unless the armed build is the running one, and [`prepare_trial`],
+/// the only writer, is gated behind the failing check. Every launch would return
+/// `Deferred` while the stager keeps downloading. The shapes that reach here are
+/// those the exact recovery refuses (a rollback sibling that is not the armed
+/// build, an unverifiable install, an armed build below a running build we are not
+/// canonically installed as).
 ///
-/// So budget it exactly the way the same-build lane is budgeted: after
-/// [`MAX_BOOT_ATTEMPTS`] launches that observed the SAME unrecoverable armed
-/// build, disarm. The count lives in [`foreign_trial_counter`], never in the boot
-/// sentinel itself.
+/// So it is budgeted like the same-build lane: after [`MAX_BOOT_ATTEMPTS`] launches
+/// that observed the same unrecoverable armed build, disarm. The count lives in
+/// [`foreign_trial_counter`], never in the boot sentinel.
 ///
 /// Returns whether the sentinel was disarmed. The caller still defers on the
-/// disarming launch: recovery state was just mutated, and the next launch takes
-/// the normal path (`recover_orphaned_prepared_candidate` requires an absent
-/// sentinel), so nothing is applied on the same pass that repaired it. That
-/// deferral is itself recorded by [`apply_staged_if_ready`], whose refusal line
-/// supersedes the status line written here for this launch — the durable record
-/// of the repair is the health ledger entry and the log warning below.
+/// disarming launch (recovery state was just mutated; the next launch takes the
+/// normal path, since `recover_orphaned_prepared_candidate` requires an absent
+/// sentinel). [`apply_staged_if_ready`]'s refusal line supersedes this launch's
+/// status line; the durable record of the repair is the health ledger entry and
+/// the log warning below.
 fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_build: u64) -> bool {
     let counter = foreign_trial_counter(staging);
-    // A LIVE TRIAL IS NOT A WEDGED ONE, and the staging root is shared by every copy
-    // this user runs (`~/Library/Application Support/aterm/Updates` — per USER, not per
-    // install). So a second installation — a locally built .app beside the released one
-    // is the ordinary case — can be mid-trial on a build this process does not run, and
-    // three launches of THIS copy would otherwise disarm it. That would take the
-    // crash-loop protection away from the very build that is crash-looping: its own
-    // `check_boot_health` would find no sentinel and never revert.
+    // A live trial is not a wedged one. The staging root is per user, not per
+    // install, so another installation can be mid-trial on a build this process does
+    // not run; disarming it would remove the crash-loop protection from the build
+    // that is crash-looping.
     //
-    // The trial's owner is the only party that advances the sentinel (`observe_launch`
-    // counts only when the armed build is the RUNNING one), and it rewrites the file to
-    // do so. So "did anyone touch this trial while we were counting" is answerable
-    // without a clock, a pid, or new state: compare the sentinel's mtime against our own
-    // counter's. Advanced ⇒ the owner is alive ⇒ restart the budget and defer. Frozen
-    // across our whole budget ⇒ nobody is left to confirm or revert it, which is the
-    // wedge this escape exists for.
+    // Only the trial's owner advances the sentinel (`observe_launch` counts only when
+    // the armed build is the running one), rewriting the file. So compare the
+    // sentinel's mtime with our counter's: advanced ⇒ the owner is alive ⇒ restart the
+    // budget and defer; frozen across our whole budget ⇒ nobody is left to confirm or
+    // revert it.
     let sentinel = boot_sentinel(staging);
     let counter_state = counter.read_state();
     let advanced = mtime(&staging.root.join("boot.sentinel"))
         .zip(mtime(&foreign_trial_path(staging)))
         .is_some_and(|(trial, ours)| trial > ours);
     if advanced {
-        // The owner moved since we last counted. Restart the budget, and do NOT count
-        // this launch: a trial that is being actively observed is not abandoned.
+        // The owner moved since we last counted: restart the budget and do not count
+        // this launch; an actively observed trial is not abandoned.
         let _ = counter.arm(armed_build);
         return false;
     }
@@ -1418,18 +1983,17 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
     if observed < MAX_BOOT_ATTEMPTS {
         return false;
     }
-    // A trial OWNED BY ANOTHER INSTALL THAT STILL EXISTS keeps its protection unless
-    // that owner has been idle for a long time: three launches of a sibling copy in
-    // one afternoon must not strip the crash-loop revert from the install that is
-    // actually mid-trial (2026-08-19 round-3 audit). Idle = the sentinel untouched
-    // for `FOREIGN_TRIAL_OWNER_IDLE` — the owner's every launch rewrites it.
+    // A trial owned by another install that still exists keeps its protection
+    // unless that owner has been idle for `FOREIGN_TRIAL_OWNER_IDLE` (the owner's
+    // every launch rewrites the sentinel), so a sibling copy's launches cannot strip
+    // the crash-loop revert from the install that is mid-trial.
     let owned_elsewhere = crate::manifest::FailedMark::read(&staging.trial())
         .and_then(|trial| trial.install_root)
         .is_some_and(|root| {
             let root = Path::new(&root);
-            // Present unless the path is demonstrably GONE (`NotFound`): an
-            // unmounted volume or a TCC-protected folder still owns its trial,
-            // exactly as `trial_owned_by` judges it.
+            // Present unless the path is demonstrably gone (`NotFound`): a
+            // TCC-protected folder still owns its trial, as `trial_owned_by` judges
+            // it (which also says why an ejected volume never gets here).
             let present = !matches!(
                 std::fs::symlink_metadata(root),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound
@@ -1448,7 +2012,7 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
     if sentinel.confirm().is_err() {
         return false;
     }
-    crate::manifest::FailedMark::clear(&staging.trial());
+    clear_trial_identity(staging);
     let _ = counter.confirm();
     crate::health::Health::record_apply_failure(
         &staging.health(),
@@ -1473,18 +2037,17 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
     true
 }
 
-/// The STABLE path where the swapped-out OLD bundle is retained as the rollback
-/// source: a fixed-named sibling of the install (same volume as `installed`, so the
-/// revert swap-back is atomic), findable by the re-exec'd new process and by
-/// [`confirm_boot_health`] with no per-process pid in the name.
+/// The stable path where the swapped-out OLD bundle is retained as the rollback
+/// source: a fixed-named sibling of the install (same volume, so the revert
+/// swap-back is atomic), findable by the re-exec'd new process and by
+/// [`confirm_boot_health`] without a pid in the name.
 fn rollback_path(installed: &Path) -> PathBuf {
     installed.with_file_name("aterm.app.rollback")
 }
 
 fn canonical_digest(digest: &str) -> Option<String> {
     let digest = digest.trim();
-    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| digest.to_ascii_lowercase())
+    aterm_codec::hex::is_hex(digest, 64).then(|| digest.to_ascii_lowercase())
 }
 
 fn ready_matches_verified_identity(ready: &Ready, build: u64, sealed_commit: &str) -> bool {
@@ -1516,14 +2079,11 @@ fn trial_authorizes_candidate(staging: &Staging, build: u64, sealed_commit: &str
     })
 }
 
-/// Recover the crash cut after same-volume staged_app→fixed but before the
-/// sentinel commit marker. Exact ready+verified-bundle identity is sufficient to
-/// put the bytes back; a mismatched/corrupt fixed path is preserved and never
-/// adopted, so an unproven candidate is still refused.
-///
-/// When there is nothing to adopt, though, the marker itself is DANGLING and this
-/// function retires it — see the comment on that branch for why deferring instead
-/// wedged every future launch.
+/// Recovers the crash cut after the same-volume staged_app→fixed move but before
+/// the sentinel commit marker. Exact ready plus verified-bundle identity is enough
+/// to put the bytes back; a mismatched or corrupt fixed path is preserved and never
+/// adopted. When there is nothing to adopt, the dangling marker is retired (see
+/// that branch).
 fn recover_orphaned_prepared_candidate(
     staging: &Staging,
     installed: &Path,
@@ -1533,7 +2093,7 @@ fn recover_orphaned_prepared_candidate(
     if holds_a_stage(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
         return Ok(());
     }
-    // Past this point `ready.toml` advertises bytes that are NOT at `staged_app`, and
+    // Past this point `ready.toml` advertises bytes that are not at `staged_app`, and
     // the fixed path is the only place they could still be.
     let fixed = rollback_path(installed);
     let recoverable = verified_bundle_identity(&fixed).is_ok_and(|(build, commit)| {
@@ -1542,20 +2102,13 @@ fn recover_orphaned_prepared_candidate(
             && ready_matches_verified_identity(ready, build, &commit)
     });
     if !recoverable {
-        // The marker names bytes that exist NOWHERE — the ordinary shape being a fixed
-        // path that is just the previous build's retained rollback, or no fixed path at
-        // all. Returning Err here made every launch a `Deferred` whose message was about
-        // an "orphaned fixed candidate", i.e. a rollback path with nothing to do with the
-        // operator's actual problem; and because this runs BEFORE the `is_publishable`
-        // gate further down, the retirement that would have cleared the dangling marker
-        // was unreachable. Nothing on disk could ever satisfy it, so the deferral was
-        // permanent with no client-side repair short of deleting the file by hand.
-        //
-        // Retire it and report success instead: retirement touches only `ready` and the
-        // already-absent `staged_app`, the caller re-reads and sees `Absent` → `NoUpdate`,
-        // and the next check re-stages. The fixed path is deliberately LEFT ALONE — it may
-        // be the genuine rollback source crash recovery depends on, and declining to adopt
-        // an unproven candidate is exactly the fail-closed behavior kept from before.
+        // The marker names bytes that exist nowhere (typically the fixed path is just
+        // the previous build's retained rollback, or absent). Deferring would be
+        // permanent, since this runs before the `is_publishable` gate that could
+        // retire the marker. So retire it and report success: retirement touches only
+        // `ready` and the already-absent `staged_app`, the caller re-reads `Absent` →
+        // `NoUpdate`, and the next check re-stages. The fixed path is left alone: it
+        // may be the rollback source crash recovery depends on.
         crate::warn(&format!(
             "ready.toml advertises build {} but its staged bundle is gone and {} holds no \
              matching candidate; retiring the dangling marker so the next check re-stages",
@@ -1565,20 +2118,17 @@ fn recover_orphaned_prepared_candidate(
         staging.retire_published();
         return Ok(());
     }
-    // An EMPTY PLACEHOLDER can be sitting at the staging path — that is precisely the
-    // crash cut the guard above now falls through on. Clear it first: `rename_untagged`
-    // declines to exchange onto a destination that exists, so leaving it would degrade
-    // this restore to a tracked plain rename and put the provenance tag straight back
-    // onto the bundle the exchange lane exists to keep clean. Site 4 already does this.
+    // An empty placeholder can sit at the staging path (the crash cut the guard above
+    // falls through on). Clear it first: `rename_untagged` will not exchange onto an
+    // existing destination, and a plain tracked rename would put the provenance tag
+    // back onto the bundle.
     let _ = remove_path_no_follow(&staging.staged_app);
     if let Err(error) = rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()) {
-        // EXDEV on an external-volume install (fixed sits beside the bundle on
-        // the install volume; staging lives under HOME), or any other restore
-        // failure: an Err here made every launch defer behind a marker whose
-        // bytes can never reach the staging path. Same remedy as the
-        // nothing-to-adopt branch above — retire the marker, report success, and
-        // let the next check re-stage; the fixed path is deliberately LEFT ALONE
-        // (it may double as the rollback-shaped source a later recovery reads).
+        // EXDEV on an external-volume install (fixed sits on the install volume,
+        // staging under HOME) or any other restore failure: as in the
+        // nothing-to-adopt branch, retire the marker, report success and let the
+        // next check re-stage. The fixed path is left alone (it may be the rollback
+        // source a later recovery reads).
         crate::warn(&format!(
             "cannot restore the orphaned fixed candidate to the staging path ({error}); \
              retiring the dangling marker so the next check re-stages"
@@ -1588,10 +2138,9 @@ fn recover_orphaned_prepared_candidate(
     Ok(())
 }
 
-/// Materialize and verify NEW at the fixed destination-volume rollback name before
-/// the point of no return. The subsequent single RENAME_SWAP therefore places OLD
-/// directly at the only path crash-loop recovery knows; there is no post-swap
-/// retention rename or process-crash window.
+/// Materializes and verifies NEW at the fixed destination-volume rollback name
+/// before the point of no return, so the single RENAME_SWAP places OLD directly at
+/// the only path crash-loop recovery knows; no post-swap rename or crash window.
 #[derive(Debug)]
 struct PreparedSwapCandidate {
     fixed: PathBuf,
@@ -1617,19 +2166,16 @@ fn is_non_symlink_dir(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
-/// A STAGE, not merely a directory wearing the stage's name.
+/// A stage, not merely a directory wearing the stage's name.
 ///
-/// [`rename_untagged`] leaves an EMPTY directory at one end of its exchange for the two
-/// syscalls around it, so shape alone stopped separating "a staged bundle is present"
-/// from "a crash cut the move in half". Every other reader of this path verifies what
-/// it finds ([`Ready::is_publishable`], [`verified_bundle_identity`]) and so was never
-/// fooled; [`recover_orphaned_prepared_candidate`]'s opening guard is the one that asks
-/// only whether something is THERE, and an empty placeholder answering yes would turn
-/// the recovery off in exactly the case it exists to recover.
+/// [`rename_untagged`] leaves an empty directory at one end of its exchange for two
+/// syscalls, so shape alone cannot separate "a staged bundle is present" from "a
+/// crash cut the move in half". [`recover_orphaned_prepared_candidate`]'s opening
+/// guard is the one reader that asks only whether something is there.
 ///
-/// Non-empty, not "has an `Info.plist`", deliberately: this must catch the new state
-/// and change nothing else. What it lets through is still only a candidate — the code
-/// past the guard verifies it.
+/// Non-empty, not "has an `Info.plist`": it catches the new state and changes
+/// nothing else. What it lets through is still only a candidate; the code past the
+/// guard verifies it.
 fn holds_a_stage(path: &Path) -> bool {
     is_non_symlink_dir(path)
         && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
@@ -1666,20 +2212,17 @@ fn prepare_fixed_swap_candidate(
     remove_path_no_follow(&fixed)
         .map_err(|error| format!("remove stale fixed rollback: {error}"))?;
 
-    // The normal macOS layout places ~/Library and /Applications on the same
-    // APFS volume. Moving the already-verified bundle is O(1) metadata work and
-    // avoids a seconds-long `ditto` copy on the launch/quit path. External-volume
-    // installs retain the conservative copy path.
+    // The usual macOS layout puts ~/Library and /Applications on one APFS volume, so
+    // moving the already-verified bundle is O(1) metadata work, avoiding a `ditto`
+    // copy on the launch path. External-volume installs keep the copy path.
     let moved_from_stage = same_volume(staged, installed);
     if moved_from_stage {
         rename_untagged(staged, &fixed, &staging.staged_dir())
             .map_err(|error| format!("move verified stage to fixed swap path: {error}"))?;
     } else {
-        // The one genuinely slow step on this path: a several-hundred-megabyte
-        // copy between volumes, run while the apply lock is held and before the
-        // window exists. It was the ONLY child on the apply path with no ceiling
-        // at all — an unplugged or wedged external volume meant a launch that
-        // never finished and a lock every other launch queued behind.
+        // The one slow step here: a large copy between volumes, while the apply lock is
+        // held and before the window exists. Bounded so an unplugged or wedged external
+        // volume cannot hang the launch and every launch queued on the lock.
         let copy_started = std::time::Instant::now();
         let (status, stderr) = ditto_bounded_clean(
             &[staged.into(), fixed.as_os_str().to_os_string()],
@@ -1714,7 +2257,7 @@ fn prepare_fixed_swap_candidate(
     // identity the CALLER just read, because the move carried the very inode it read it
     // from — true whether the move was taken as `rename(2)` or as [`rename_untagged`]'s
     // `RENAME_SWAP` exchange, which exchanges the two directory entries and leaves both
-    // inodes untouched (measured; `tests/provenance_rename_probe.rs`). Same bytes, same
+    // inodes untouched (measured). Same bytes, same
     // signature, same plist. Re-running the five
     // codesign/spctl/PlistBuddy helpers over it would re-answer a question
     // nothing could have changed the answer to — the apply lock is held, the
@@ -1722,8 +2265,7 @@ fn prepare_fixed_swap_candidate(
     // the no-follow shape again at the point of no return. That redundant pass
     // was five of the sixteen helper spawns on the launch path.
     //
-    // The cross-volume path DOES re-verify: `ditto` produced new bytes at a new
-    // path, so its identity is genuinely unestablished.
+    // The cross-volume path does re-verify: `ditto` produced new bytes at a new path.
     let (fixed_build, sealed_commit) = if moved_from_stage {
         (staged_identity.0, staged_identity.1.to_string())
     } else {
@@ -1753,10 +2295,10 @@ fn swap_fixed_candidate(
     prepared: &PreparedSwapCandidate,
     installed: &Path,
 ) -> Result<PathBuf, String> {
-    // Revalidate the no-follow shape at the immediate point of no return. Full
-    // signature/build/commit verification occurred after materialization; the
-    // private parent + apply lock exclude compliant replacement, while this guard
-    // ensures a symlink can never be exchanged into the canonical install.
+    // Revalidate the no-follow shape at the point of no return. Full
+    // signature/build/commit verification ran after materialization; the private
+    // parent and apply lock exclude compliant replacement, and this guard ensures a
+    // symlink can never be exchanged into the canonical install.
     checked_bundle_exchange(&prepared.fixed, installed, "atomic fixed-path swap")?;
     Ok(prepared.fixed.clone())
 }
@@ -1775,14 +2317,13 @@ fn checked_bundle_exchange(a: &Path, b: &Path, operation: &str) -> Result<(), St
     Ok(())
 }
 
-/// Make a completed swap durable the way `manifest::write_durable` makes a
-/// ledger record durable: the exchange is a directory-entry change, so sync
-/// the directory holding each name (once when they share one). Best effort —
-/// the swap already happened, and a filesystem that cannot sync a directory
-/// degrades to the old non-durable behaviour rather than failing it.
+/// Makes a completed swap durable the way `manifest::write_durable` does a ledger
+/// record: the exchange is a directory-entry change, so sync the directory holding
+/// each name (once when shared). Best effort: the swap already happened, and a
+/// filesystem that cannot sync a directory stays non-durable rather than failing.
 fn sync_swap_parents(a: &Path, b: &Path) {
     let sync = |dir: &Path| {
-        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        let _ = crate::durable::sync_dir(dir);
     };
     let parent_a = a.parent();
     let parent_b = b.parent();
@@ -1796,12 +2337,11 @@ fn sync_swap_parents(a: &Path, b: &Path) {
     }
 }
 
-/// Read a bundle's SEALED identity (build + commit), refusing anything that is
-/// not a plain directory carrying an intact, policy-satisfying signature.
-/// Crate-visible door onto [`verified_bundle_identity`] for the installed-bundle
-/// activation pre-verify (`crate::preverify_installed_for_handoff`): the same policy
-/// gate + sealed identity read the staged-candidate path uses, aimed at the bundle
-/// under the running executable.
+/// Reads a bundle's sealed identity (build + commit), refusing anything that is not
+/// a plain directory with an intact, policy-satisfying signature. The crate-visible
+/// door onto [`verified_bundle_identity`] for the installed-bundle activation
+/// pre-verify (`crate::preverify_installed_for_handoff`): the same gate the staged
+/// candidate uses, aimed at the bundle under the running executable.
 pub(crate) fn verified_bundle_identity_at(app: &Path) -> Result<(u64, String), String> {
     verified_bundle_identity(app)
 }
@@ -1847,11 +2387,10 @@ fn validate_fixed_rollback(
 #[derive(Debug)]
 struct VerifiedRollback {
     path: PathBuf,
-    /// The sealed build the validation proved (2026-09-14): the revert names it,
-    /// and compares it with the operator floor — a crash loop is strictly worse
-    /// than a yank, so the revert still happens, but a restored build below the
-    /// floor is said out loud instead of the machine silently running a yanked
-    /// build the activation lane would have refused.
+    /// The sealed build the validation proved. The revert names it and compares it
+    /// with the operator floor: a crash loop is worse than a yank, so the revert
+    /// still happens, but a restored build below the floor is logged rather than
+    /// silently running a yanked build.
     build: u64,
 }
 
@@ -1868,27 +2407,47 @@ fn ensure_fixed_rollback(installed: &Path, current_build: u64) -> Result<Verifie
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect fixed rollback: {error}")),
     }
-    // No fixed rollback, and nowhere else to look. The pre-fixed-path v0.53
-    // updater could leave OLD at `staged_app` or at an `aterm.app.new-*` install
-    // sibling, and this used to scan both and migrate the nearest verified
-    // predecessor onto the fixed name. The modern swap is one atomic
-    // `renamex_np(RENAME_SWAP)` that always leaves OLD at the fixed path, so
-    // neither shape can occur, and the builds that produced them are in the
-    // retired lineage and cannot reach this one.
+    // No fixed rollback, and nowhere else to look: the atomic
+    // `renamex_np(RENAME_SWAP)` swap always leaves OLD at the fixed path.
     Err("fixed rollback missing".to_string())
 }
 
-fn recover_prepared_stage(rollback: &Path, staging: &Staging) {
-    if rollback != staging.staged_app {
-        let _ = std::fs::remove_dir_all(&staging.staged_app);
-        if let Err(error) = rename_untagged(rollback, &staging.staged_app, &staging.staged_dir()) {
-            let _ = std::fs::remove_dir_all(rollback);
-            staging.retire_published();
-            crate::warn(&format!(
-                "could not restore verified stage after pre-exec rollback: {error}"
-            ));
-        }
+/// The swap landed but its installed receipt could not be written: put the previous
+/// build back, disarm the trial, and leave the verified stage as it stood before the
+/// swap so the next launch retries the same bytes.
+///
+/// After [`restore_rollback`] the fixed path (`retained`, i.e. `prepared.fixed`)
+/// holds the candidate again (the pre-swap shape), so the stage is recovered as
+/// every pre-swap failure recovers it, by [`recover_prepared_candidate`]: a
+/// candidate moved out of the stage is moved back, and a copied one (cross-volume
+/// staging, where `staged_app` still holds the published bytes) is reclaimed.
+fn roll_back_unreceipted_swap(
+    prepared: &PreparedSwapCandidate,
+    retained: &Path,
+    installed: &Path,
+    sentinel: &Sentinel,
+    staging: &Staging,
+    error: &str,
+) -> ApplyOutcome {
+    debug_assert_eq!(retained, prepared.fixed.as_path());
+    crate::warn(&format!(
+        "could not commit installed artifact receipt after swap: {error}; rolling back"
+    ));
+    if let Err(rollback_error) = restore_rollback(retained, installed) {
+        // NEW remains installed. Preserve sentinel+trial+receipt state so the
+        // physical rollback can be retried; never erase recovery authority.
+        return ApplyOutcome::Deferred(format!(
+            "installed receipt: {error}; pre-exec rollback also failed: {rollback_error}"
+        ));
     }
+    if let Err(disarm_error) = sentinel.confirm() {
+        return ApplyOutcome::Deferred(format!(
+            "installed receipt: {error}; rollback succeeded but trial disarm failed: {disarm_error}"
+        ));
+    }
+    clear_trial_identity(staging);
+    recover_prepared_candidate(prepared, staging);
+    ApplyOutcome::Deferred(format!("installed receipt: {error}"))
 }
 
 fn restore_installed_receipt(
@@ -1906,10 +2465,9 @@ fn restore_installed_receipt(
         }
     };
     if let Err(error) = restored {
-        // OLD is already canonical again. A receipt for failed NEW must never
-        // remain usable as OLD's install proof merely because the kind-preserving
-        // rewrite failed. Best-effort removal makes the common failure fail-closed;
-        // even if removal itself fails, every reader still binds the receipt to
+        // OLD is canonical again. A receipt for failed NEW must never stay usable as
+        // OLD's install proof because the rewrite failed. Removal makes the common
+        // failure fail closed; even if it fails, every reader binds the receipt to
         // OLD's sealed identity before granting authority.
         let clear = match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -1970,9 +2528,9 @@ fn ensure_current_trial_receipt(
         return Ok(verified_rollback);
     }
 
-    // Process-crash cut after fixed RENAME_SWAP but before receipt commit: ready
-    // still carries the exact full commit+digest. Bind it to the sealed installed
-    // identity and finish the receipt before health can GC rollback.
+    // Process-crash cut after the fixed RENAME_SWAP but before the receipt commit:
+    // ready still carries the exact full commit and digest. Bind it to the sealed
+    // installed identity and finish the receipt before health can GC the rollback.
     if let Some(ready) = Ready::read(&staging.ready) {
         let commit = canonical_release_commit(ready.commit.as_deref())
             .filter(|_| ready.build_number == sealed_build)
@@ -1995,16 +2553,13 @@ fn ensure_current_trial_receipt(
     Err("installed trial has no exact receipt or authorized recovery record".to_string())
 }
 
-/// A mounted DMG that detaches itself on drop (best-effort). Mounted at a PRIVATE
+/// A mounted DMG that detaches itself on drop (best-effort). Mounted at a private
 /// mountpoint inside our `0700` staging dir (never `/Volumes`), so an abnormal exit
-/// can't leak a browsable `/Volumes/aterm*` mount and repeated same-named volumes
-/// can't collide (F19).
+/// cannot leak a browsable `/Volumes/aterm*` mount and same-named volumes cannot
+/// collide.
 ///
-/// EVERY `hdiutil` IS BOUNDED (plan P2-1, round three). These run on the update
-/// checker's thread, inside a check, while it holds the process's check lane and
-/// the machine-wide `checker.lock` — so an `hdiutil` that never returned (a
-/// detach waiting on a wedged disk-arbitration daemon, an attach on a hung image)
-/// parked the checker for good, and no replacement could ever take the lane. A
+/// Every `hdiutil` is bounded: these run on the checker thread while it holds the
+/// check lane and `checker.lock`, so a hung attach or detach must not park it. A
 /// timeout is a failed attach (retried, then the stage fails for this check) or a
 /// detach given up on (the `mnt-*` sweep reclaims it next time).
 struct Mounted {
@@ -2016,26 +2571,17 @@ impl Mounted {
     /// at the caller-chosen private `mp` (created fresh) so we never touch `/Volumes`
     /// and never have to parse a mount table. `mp` must be under our own `0700` dir.
     fn attach(dmg: &Path, mountpoint: &Path) -> Result<Self, String> {
-        // RETRY, THEN FALL BACK. A stage that dies here strands the whole fleet on
-        // the previous build with a verified DMG already on disk, so this step
-        // must not fail on the first refusal. Both mitigations below are cheap and
-        // no-ops on the happy path, and they are right for a genuinely transient
-        // refusal (memory pressure, a device attaching slowly).
+        // Retry, then fall back: a stage that dies here leaves the machine on the
+        // previous build with a verified DMG on disk. Both mitigations are no-ops on
+        // the happy path and right for a transient refusal (memory pressure, a slow
+        // device).
         //
-        // WHAT THEY DO NOT FIX. 2026-07-31 (v0.10.0): every machine reported
-        //   hdiutil attach failed: hdiutil: attach failed - Device not configured
-        // (ENXIO) from inside the app, while the IDENTICAL command — same DMG,
-        // same `-mountpoint` under the same 0700 dir, same environment copied
-        // from the running process — succeeded every time from a shell. The cause
-        // is the attaching process's BOOTSTRAP CONTEXT, not the image and not a
-        // race: after a seamless overlap update the surviving aterm is a
-        // fork-child whose parent (the launchd job's process) has exited, so it
-        // is an orphan holding a bootstrap context for a dead job. DiskImages
-        // registers with the `com.apple.hdiejectd` XPC service through that
-        // context, and a lookup in a dead domain can never succeed — so no number
-        // of retries and no choice of mount point helps. The only fix is to not
-        // use hdiutil at all, which is what `stage_from_zip` does; this path
-        // survives for releases whose manifest carries no zip.
+        // They do not fix an `ENXIO` ("Device not configured") from an orphaned
+        // process: after a seamless overlap update the surviving aterm can be a
+        // fork-child whose launchd job has exited, and DiskImages registers with
+        // `com.apple.hdiejectd` through that dead bootstrap context, which can never
+        // succeed. The fix is to avoid hdiutil (`stage_from_zip`); this path serves
+        // releases whose manifest carries no zip.
         let mut attempts: Vec<String> = Vec::new();
         for attempt in 0..3u32 {
             if attempt > 0 {
@@ -2047,10 +2593,9 @@ impl Mounted {
                 Err(error) => attempts.push(error),
             }
         }
-        // LAST RESORT: let hdiutil pick the mount point itself. `-mountpoint` is
-        // what keeps us out of `/Volumes` (and out of the user's Finder), so it
-        // is preferred and tried first — but a mounted image we can read beats a
-        // fleet that cannot update, and the `Drop` below detaches either shape.
+        // Last resort: let hdiutil pick the mount point. `-mountpoint` keeps us out
+        // of `/Volumes` (and Finder), so it is tried first, but a readable image
+        // beats one that cannot update; `Drop` detaches either shape.
         match Self::attach_at(dmg, None) {
             Ok(mounted) => Ok(mounted),
             Err(error) => {
@@ -2060,10 +2605,10 @@ impl Mounted {
                     |_| "unreadable".to_string(),
                     |meta| format!("{} bytes", meta.len()),
                 );
-                // PASSING ONLY IF EVERY ATTEMPT WAS (round six, finding 11): one
-                // attach past its limit beside an ENXIO is still the ENXIO's
-                // verdict, so each attempt's own key is taken off and the whole
-                // is marked once, when nothing but moments refused it.
+                // Passing only if every attempt was: one attach past its limit beside
+                // an ENXIO is still the ENXIO's verdict, so each attempt's own key is
+                // removed and the whole is marked once, only when nothing but moments
+                // refused it.
                 let passing = attempts
                     .iter()
                     .all(|error| crate::is_passing_refusal(error));
@@ -2091,7 +2636,7 @@ impl Mounted {
     /// 0700 path); `None` lets hdiutil choose, and the chosen path is read back
     /// from its output so `Drop` can detach exactly what was attached.
     fn attach_at(dmg: &Path, mountpoint: Option<&Path>) -> Result<Self, String> {
-        let mut cmd = Command::new("/usr/bin/hdiutil");
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
         cmd.args(["attach", "-nobrowse", "-readonly", "-noautoopen"]);
         if let Some(mountpoint) = mountpoint {
             let _ = std::fs::remove_dir_all(mountpoint);
@@ -2120,9 +2665,9 @@ impl Mounted {
             Some(mountpoint) => Ok(Self {
                 mountpoint: mountpoint.to_path_buf(),
             }),
-            // hdiutil's plain output is TAB-separated `dev \t type \t mountpoint`;
-            // splitting on tabs (not whitespace) keeps a mount path with spaces —
-            // which the release DMG's `aterm X.Y.Z` volume name always has — intact.
+            // hdiutil's plain output is tab-separated `dev \t type \t mountpoint`;
+            // splitting on tabs keeps a mount path with spaces (the release DMG's
+            // `aterm X.Y.Z` volume name) intact.
             None => {
                 let parsed = String::from_utf8_lossy(&out.stdout)
                     .lines()
@@ -2132,12 +2677,10 @@ impl Mounted {
                     .map(PathBuf::from);
                 match parsed {
                     Some(found) => Ok(Self { mountpoint: found }),
-                    // The image DID attach; only naming it failed. Returning a
-                    // bare Err here would drop the `Mounted` guard that has not
-                    // been built yet and leave the device attached for the life
-                    // of the process, so detach by DEVICE NODE — column 0 of the
-                    // same table, which is present even when the mount column is
-                    // not — before reporting the failure.
+                    // The image attached; only naming it failed. There is no
+                    // `Mounted` guard yet, so detach by device node (column 0,
+                    // present even when the mount column is not) before reporting
+                    // the failure.
                     None => {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         for dev in stdout
@@ -2147,7 +2690,7 @@ impl Mounted {
                             .filter(|dev| dev.starts_with("/dev/"))
                         {
                             let _ = crate::verify::output_within(
-                                Command::new("/usr/bin/hdiutil")
+                                aterm_uds::spawnfd::command("/usr/bin/hdiutil")
                                     .args(["detach", "-force"])
                                     .arg(dev),
                                 "hdiutil detach",
@@ -2168,7 +2711,7 @@ impl Mounted {
 impl Drop for Mounted {
     fn drop(&mut self) {
         let _ = crate::verify::output_within(
-            Command::new("/usr/bin/hdiutil")
+            aterm_uds::spawnfd::command("/usr/bin/hdiutil")
                 .args(["detach", "-force"])
                 .arg(&self.mountpoint),
             "hdiutil detach",
@@ -2187,9 +2730,8 @@ const HDIUTIL_ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// image is attached and when it is not.
 const HDIUTIL_DETACH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Best-effort reconciliation of leftover private mountpoints (`mnt-*`) from a prior
-/// run that was killed mid-stage (its `Mounted::drop` never ran), so stale mounts
-/// don't accumulate. Force-detach then remove each. (F19)
+/// Best-effort reconciliation of leftover private mountpoints (`mnt-*`) from a run
+/// killed mid-stage (its `Mounted::drop` never ran): force-detach, then remove each.
 fn sweep_stale_mounts(staging: &Staging) {
     let Ok(entries) = std::fs::read_dir(&staging.root) else {
         return;
@@ -2198,7 +2740,7 @@ fn sweep_stale_mounts(staging: &Staging) {
         if e.file_name().to_string_lossy().starts_with("mnt-") {
             let p = e.path();
             let _ = crate::verify::output_within(
-                Command::new("/usr/bin/hdiutil")
+                aterm_uds::spawnfd::command("/usr/bin/hdiutil")
                     .args(["detach", "-force"])
                     .arg(&p),
                 "hdiutil detach",
@@ -2209,11 +2751,9 @@ fn sweep_stale_mounts(staging: &Staging) {
     }
 }
 
-/// The zip path's counterpart to [`sweep_stale_mounts`]: reclaim leftover
-/// `zx-*` extract dirs from a run that was killed mid-stage. Nothing needs
-/// detaching (that is the entire point of the zip container) — an abandoned
-/// extract is just a directory, but it can be a whole app bundle's worth of
-/// bytes inside the user's Application Support, so it must not accumulate.
+/// The zip path's counterpart to [`sweep_stale_mounts`]: reclaims leftover `zx-*`
+/// extract dirs from a run killed mid-stage. Nothing needs detaching, but an
+/// abandoned extract can be a whole app bundle in Application Support.
 fn sweep_stale_extracts(staging: &Staging) {
     let Ok(entries) = std::fs::read_dir(staging.staged_dir()) else {
         return;
@@ -2225,13 +2765,9 @@ fn sweep_stale_extracts(staging: &Staging) {
     }
 }
 
-/// BOTH LANES SWEEP BOTH KINDS OF SCRATCH (2026-09-14): every current release
-/// ships a zip, so a `mnt-<pid>` a DMG-era stage left behind (a process
-/// killed mid-stage; on the owner's machine `Updates/mnt-21441` from
-/// 2026-08-31 survived every stage and an apply) was never reclaimed by the
-/// lane that now runs, and an image still attached behind it stayed attached
-/// until reboot. Each lane runs this before it unpacks, so a container
-/// `ditto` cannot even open still reclaims the other lane's leftover.
+/// Both lanes sweep both kinds of scratch, before they unpack: a `mnt-<pid>` a DMG
+/// stage left behind (with its image possibly still attached) is reclaimed even
+/// when the zip lane runs, and even when `ditto` cannot open the container.
 fn sweep_stale_scratch(staging: &Staging) {
     sweep_stale_mounts(staging);
     sweep_stale_extracts(staging);
@@ -2239,8 +2775,7 @@ fn sweep_stale_scratch(staging: &Staging) {
 
 fn canonical_release_commit(commit: Option<&str>) -> Option<String> {
     let commit = commit?.trim();
-    (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| commit.to_ascii_lowercase())
+    aterm_codec::hex::is_hex(commit, 40).then(|| commit.to_ascii_lowercase())
 }
 
 fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
@@ -2248,40 +2783,26 @@ fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
         .is_some_and(|expected| crate::commit_matches(&expected, sealed))
 }
 
-/// PRE-PARK handoff verification (seamless-update overlap seam). Run the full
-/// staged-bundle authenticity gate — the tiered codesign policy check plus the
-/// sealed CFBundleVersion/commit rebinding that the swap path re-runs at apply
-/// time — while every parent PTY reader is still live and consuming.
+/// Pre-park handoff verification (the seamless-update overlap seam): runs the full
+/// staged-bundle authenticity gate (the tiered codesign policy check plus the sealed
+/// CFBundleVersion/commit rebinding the swap re-runs at apply time) while every
+/// parent PTY reader is still live, so a candidate that would fail codesign is
+/// refused before a single reader stops rather than inside the parked window.
 ///
-/// WHY THIS EXISTS: without it, the first authenticity verdict on the staged
-/// candidate happens inside the handoff child's boot (`apply_staged_if_ready`),
-/// i.e. INSIDE the activity-sensitive parked window. A candidate that was going
-/// to fail codesign therefore parked the terminal for nothing. Hoisting the
-/// verdict here means a bad candidate is refused before a single reader stops.
-///
-/// This is strictly ADDITIVE authority: the child still re-verifies everything
-/// at swap time under `apply_lock` (the TOCTOU defence is unchanged; the disk
-/// can mutate between this call and the child's own gate). A `Ok(())` here is
-/// a latency optimization plus a warm codesign page cache, never a grant.
+/// Strictly additive: the child still re-verifies everything at swap time under
+/// `apply_lock` (the disk can change between this call and the child's gate). `Ok`
+/// here is a latency optimization, never a grant.
 ///
 /// `expected_build`/`expected_commit` bind the check to the exact artifact the
-/// updater reducer authorized, mirroring `ready_matches_expected`: a stage that
-/// changed identity since authorization fails now instead of after parking.
+/// reducer authorized (like `ready_matches_expected`): a stage that changed identity
+/// since authorization fails now. `current_commit` is the running image's
+/// provenance, for the swap's second precondition: the outgoing bundle must be able
+/// to become the rollback source ([`preverify_installed_rollback_source`]).
 ///
-/// `current_commit` is the RUNNING image's provenance, and it is here for the
-/// second half of the gate — see [`preverify_installed_rollback_source`]. A
-/// staged apply is a SWAP, and a swap has two preconditions, not one: the
-/// incoming bundle must be authentic, AND the outgoing bundle must be able to
-/// become the rollback source the swap installs at the fixed path. Only the
-/// first was hoisted here originally, and the second is the one that fails on a
-/// hand-installed bundle — silently, inside the successor, five seconds after
-/// the terminal parked.
-///
-/// ON A PASS, AND ONLY THEN, it also reads the candidate's handoff policy
-/// (`aterm_update_core::handoff_policy`, plan P0-5) — after every check above has
-/// authenticated the bundle, still under the apply lock, so the file read is the
-/// one the verified signature seals and no publication can swap the stage between
-/// the check and the read.
+/// Only on a pass does it read the candidate's handoff policy
+/// (`aterm_update_core::handoff_policy`): after every check has authenticated the
+/// bundle and still under the apply lock, so the file read is the one the verified
+/// signature seals.
 pub fn preverify_staged_handoff_candidate(
     current_build: u64,
     current_commit: Option<&str>,
@@ -2303,43 +2824,14 @@ pub fn preverify_staged_handoff_candidate(
     .and_then(std::convert::identity)
 }
 
-/// THE OTHER HALF OF A SWAP'S PRECONDITION: can the bundle we are running from
-/// become the rollback source the swap is about to install at the fixed path?
-///
-/// `apply_staged_if_ready` asks exactly this at step 7, immediately before it
-/// arms the crash-loop sentinel — "a corrupt/replaced install must never become
-/// crash-recovery authority" — and refuses with `Deferred` when the answer is
-/// no. That refusal is CORRECT and stays. What was wrong is WHERE the question
-/// was first asked: inside the SUCCESSOR's boot, after the outgoing process had
-/// already parked every reader, duplicated every PTY master, written a manifest
-/// and asked LaunchServices for a whole new application job.
-///
-/// A successor that cannot swap stays the OLD build, so it fails
-/// `seamless::take_target_identity` ("the outgoing process authorized build X,
-/// but this binary is build Y"), drops the readiness pipe it was handed, and
-/// exits. The parked parent reads EOF and books the one outcome that means the
-/// new bytes crashed — `ChildDied` — against a build that was never even
-/// executed. Observed in the field: five consecutive identical failures,
-/// `failing_applies=5 persistent=true`, five frozen terminals, and not one line
-/// anywhere naming the cause.
-///
-/// So the question moves here, where it is asked while every reader is still
-/// live and the answer costs the user nothing but a log line. This is strictly
-/// ADDITIVE, exactly like the staged half above: it can only ever refuse an
-/// attempt the swap was going to refuse anyway, and the swap re-runs it under
-/// `apply_lock` regardless.
-/// **THE REMEDY, said where the refusal is minted** (2026-09-14, the owner's
-/// desk): an installed bundle that fails the team-pinned policy can never be
-/// updated by ANY lane — the seamless apply refuses it as the rollback source
-/// here, the cold-launch apply refuses it at step 7 for the same reason — and
-/// until now neither refusal said what to do. A local build that was swapped
-/// into `/Applications` by hand (ad-hoc signed, no `ATermDevBuild` mark) is a
-/// state the owner's own workflow produces routinely; it sat on v0.85.0 for
-/// eight hours with six refusals and a red bar, and the only fix was never
-/// written anywhere. Both lanes now append this sentence; the trouble
-/// classifier keys on its first clause (`ROLLBACK_SOURCE_REFUSAL_KEY`) to
-/// render the cause and the remedy on the Software Update page and to stop
-/// scheduling retries that cannot succeed.
+/// The key marking the refusal of an installed bundle that cannot become the
+/// rollback source a swap installs at the fixed path (apply step 7: a corrupt or
+/// replaced install must never become crash-recovery authority). The seamless
+/// apply asks this before parking ([`preverify_installed_rollback_source`]), the
+/// cold-launch apply at step 7; neither lane can update such an install (e.g. a
+/// local ad-hoc build swapped into `/Applications` without the `ATermDevBuild`
+/// mark). Both append [`ROLLBACK_SOURCE_REMEDY`]; the trouble classifier keys on
+/// this clause to show the cause and remedy and to stop scheduling retries.
 pub const ROLLBACK_SOURCE_REFUSAL_KEY: &str = "cannot be the rollback source";
 
 /// The one sentence that names the way out of an unverifiable install.
@@ -2360,19 +2852,58 @@ pub fn is_rollback_source_refusal(reason: &str) -> bool {
     reason.contains(ROLLBACK_SOURCE_REFUSAL_KEY)
 }
 
-/// The refusal for an installed bundle whose verification returned `error`, on
-/// every lane that asks (the pre-park check below and the cold launch's steps
-/// 7-pre and 7).
+/// The one sentence that names the way out of a non-writable install location
+/// ([`crate::INSTALL_LOCATION_REFUSAL_KEY`]).
+pub(crate) const INSTALL_LOCATION_REMEDY: &str = "this install cannot update itself: move aterm.app to \
+     a folder you can write to (such as ~/Applications), or have an administrator install \
+     the update";
+
+/// The refusal for an install whose parent folder this user cannot write (an
+/// admin-installed `/Applications` run by a standard user, or an MDM-managed one).
+/// The swap renames inside that folder, so no lane can install anything until a
+/// person moves the app or grants the write; the refusal gives the remedy.
+pub(crate) fn install_location_refusal(app_root: &Path) -> String {
+    format!(
+        "{}: {}; {INSTALL_LOCATION_REMEDY}",
+        crate::INSTALL_LOCATION_REFUSAL_KEY,
+        app_root.display()
+    )
+}
+
+/// The swap's write, checked on every lane that needs it (the pre-park check, the
+/// boot apply's step 5, the activation supersede): `Ok` when the parent folder took
+/// a probe entry.
 ///
-/// ONLY A VERDICT BECOMES THE INSTALLED-SOURCE REFUSAL (round four, plan item
-/// 2). [`rollback_source_refusal`] says "a person must reinstall", and its key
-/// suspends automatic apply with no retry scheduled. A verification that did
-/// not FINISH — `codesign` past the 8 s apply budget on a loaded desk, a helper
-/// the kernel would not start, the apply lock held by a sibling — says nothing
-/// about the bundle, and wrapping it was how one slow `codesign` stopped a
-/// healthy machine's updates until someone reinstalled an app that was fine. A
+/// A write this user may not make is [`install_location_refusal`], the person's
+/// (move the app, or an administrator installs); a write that failed for a moment
+/// (full disk, quota, I/O error) is marked [`crate::PASSING_REFUSAL_KEY`] and
+/// retried.
+pub(crate) fn install_location_check(app_root: &Path) -> Result<(), String> {
+    install_location_verdict(app_root, bundle::probe_parent_write(app_root))
+}
+
+/// [`install_location_check`]'s mapping of one probe answer, apart from the probe.
+fn install_location_verdict(app_root: &Path, probe: bundle::ParentWrite) -> Result<(), String> {
+    match probe {
+        bundle::ParentWrite::Writable => Ok(()),
+        bundle::ParentWrite::NotWritable(_) => Err(install_location_refusal(app_root)),
+        bundle::ParentWrite::Passing(error) => Err(crate::verify::mark_passing(format!(
+            "the install location {} could not be written just then: {error}",
+            app_root.display()
+        ))),
+    }
+}
+
+/// The refusal for an installed bundle whose verification returned `error`, on
+/// every lane that asks (the pre-park check below and the cold launch's steps 7-pre
+/// and 7).
+///
+/// Only a verdict becomes the installed-source refusal ([`rollback_source_refusal`],
+/// which suspends automatic apply until a person reinstalls). A verification that
+/// did not finish (`codesign` past the apply budget, a helper the kernel would not
+/// start, the apply lock held by a sibling) says nothing about the bundle, so a
 /// passing error is returned with its location and its own
-/// [`crate::PASSING_REFUSAL_KEY`], so every reader retries it.
+/// [`crate::PASSING_REFUSAL_KEY`], and every reader retries it.
 fn installed_source_refusal(installed: &Path, error: &str) -> String {
     if crate::is_passing_refusal(error) {
         format!(
@@ -2384,14 +2915,19 @@ fn installed_source_refusal(installed: &Path, error: &str) -> String {
     }
 }
 
-/// Whether a failed check of the STAGED bundle is a verdict on its bytes — the
-/// only kind that may discard the stage or record a failure memo against the
-/// artifact. A check that did not finish ([`crate::is_passing_refusal`]) is not:
-/// the same bytes are checked again at the next attempt.
+/// Whether a failed check of the staged bundle is a verdict on its bytes, the only
+/// kind that may discard the stage or record a failure memo against the artifact. A
+/// check that did not finish ([`crate::is_passing_refusal`]) is not: the same bytes
+/// are checked again next time.
 fn stage_failure_is_a_verdict(error: &str) -> bool {
     !crate::is_passing_refusal(error)
 }
 
+/// The swap's second precondition, checked before the park: can the running bundle
+/// become the rollback source the swap installs at the fixed path? The boot apply
+/// asks the same at step 7 and still does; asking here, while every reader is live,
+/// keeps a doomed successor (which would stay the old build and refuse its target)
+/// from ever parking the terminal. Strictly additive.
 fn preverify_installed_rollback_source(
     installed: Option<&Path>,
     current_build: u64,
@@ -2410,10 +2946,9 @@ fn preverify_installed_rollback_source(
 type IdentityReader = dyn Fn(&Path) -> Result<(u64, String), String>;
 
 /// Injectable core of [`preverify_installed_rollback_source`]: `verify` is the
-/// sealed-identity reader, injected the way
-/// [`preverify_staged_handoff_candidate_at`] injects its policy reader, so the
-/// refusal a timed-out verification mints is provable without a signed fixture
-/// bundle.
+/// sealed-identity reader, injected like [`preverify_staged_handoff_candidate_at`]'s
+/// policy reader, so a timed-out verification's refusal is testable without a signed
+/// fixture bundle.
 fn preverify_installed_rollback_source_with(
     installed: Option<&Path>,
     current_build: u64,
@@ -2421,17 +2956,22 @@ fn preverify_installed_rollback_source_with(
     verify: &IdentityReader,
 ) -> Result<(), String> {
     let Some(installed) = installed else {
-        // `bundle::resolve` is what the apply itself calls, and `None` there is
-        // `ApplyOutcome::NotApplicable` — the updater is inert for this process
-        // (no `.app` layout, a translocated or DMG launch, or a bundle carrying
-        // the `ATermDevBuild` mark). A handoff whose successor's swap will be a
-        // no-op can only ever end as a wrong-build refusal, so say so now.
+        // `bundle::resolve` is what the apply calls, and `None` there is
+        // `ApplyOutcome::NotApplicable`: the updater is inert for this process (no
+        // `.app` layout, a translocated or DMG launch, or the `ATermDevBuild` mark).
+        // A handoff whose successor's swap is a no-op can only end as a wrong-build
+        // refusal, so say so now.
         return Err(
             "this process does not run from an installed bundle the updater may replace, so a \
              staged build cannot become its successor"
                 .to_string(),
         );
     };
+    // The swap's write, checked before the park: step 5 of the boot apply refuses a
+    // non-writable install location, but only inside the successor after every
+    // reader parked, where it reads as a structural failure. Cheap (one
+    // mkdir+rmdir), so it goes first.
+    install_location_check(installed)?;
     match verify(installed) {
         Ok((build, commit)) => {
             if identity_matches_running(build, &commit, current_build, current_commit) {
@@ -2450,31 +2990,78 @@ fn preverify_installed_rollback_source_with(
     }
 }
 
-/// THE OPERATOR APPLY FLOOR, as a handoff to `build` must respect it (round six
-/// of the update audit, item 26): `Some(refusal)` when `build` is below the
+/// What a fresh cached pass cannot vouch for when the candidate is the INSTALLED
+/// ACTIVATION `build`: the operator floor ([`handoff_apply_floor_refusal_at`]), and
+/// that the install path still holds it. Another window's retire
+/// (`supersede_installed_activation`) may have put the running build back there
+/// since the pass was cached; launching it would take a stage this attempt never
+/// authorized. `installed_build` reads the build the
+/// install path holds (its `Info.plist`, unauthenticated, which only ever refuses);
+/// a read that fails refuses too. Either answer is a moment: the next attempt reads
+/// the disk again, and the lane's reconcile retires an activation that is gone.
+pub(crate) fn handoff_activation_cached_pass_refusal_at(
+    staging: &Staging,
+    build: u64,
+    installed_build: impl FnOnce() -> Option<Result<u64, String>>,
+) -> Option<String> {
+    if let Some(refusal) = handoff_apply_floor_refusal_at(staging, build) {
+        return Some(refusal);
+    }
+    match installed_build()? {
+        Ok(installed) if installed == build => None,
+        Ok(installed) => Some(crate::verify::mark_passing(format!(
+            "the install path now holds build {installed}, not the activation {build}; not \
+             handing off to it"
+        ))),
+        Err(error) => Some(crate::verify::mark_passing(format!(
+            "could not read which build the install path holds ({error}); not handing off to \
+             the activation {build}"
+        ))),
+    }
+}
+
+/// THE OPERATOR APPLY FLOOR, as a handoff to `build` must respect it:
+/// `Some(refusal)` when `build` is below the
 /// floor `staging` records — a yank the swap's gate 4b would answer by retiring
 /// the stage and leaving the successor the old build. Read-only and cheap (one
-/// small TOML read, no lock, no `codesign`), so it is asked both inside the full
-/// pre-verification and, on its own, by a worker a fresh cached pass let skip
-/// that verification: the floor can rise after the pass was cached (a check
-/// observes a manifest with a higher `min_build`), and the cache knows nothing
-/// of it.
+/// small TOML read, no lock, no `codesign`), so it is asked on its own by an
+/// ACTIVATION worker a fresh cached pass let skip its verification: the floor can
+/// rise after the pass was cached (a check observes a manifest with a higher
+/// `min_build`), and the cache knows nothing of it. A STAGED worker asks
+/// [`handoff_cached_pass_refusal_at`], which reads the stage as well.
 ///
-/// AND THE REVOCATION SET (round seven, H1): a staged marker for `build` signed by a
-/// machine a roster has since revoked is refused the same way — the check lane
-/// retires such a stage when it observes the revocation, and a pass cached before
-/// that knows nothing of it, so without this the successor's own gate found no stage
-/// (or refused it) after every reader had parked.
+/// AND THE REVOCATION SET: a staged marker for `build` signed by a machine a roster
+/// has since revoked is refused the same way. It is read off the marker, so it
+/// finds a revoked stage only while the stage is still on disk — the check lane
+/// retires one the moment it observes the revocation, which is why a staged
+/// handoff asks whether its stage is still there.
 pub(crate) fn handoff_apply_floor_refusal_at(staging: &Staging, build: u64) -> Option<String> {
-    let floor = crate::manifest::Floor::read(&staging.floor());
-    if let Some(ready) = Ready::read(&staging.ready)
-        && ready.build_number == build
-        && floor.revokes(ready.machine_id.as_deref())
-    {
+    let marker = Ready::read(&staging.ready).filter(|ready| ready.build_number == build);
+    handoff_floor_refusal(
+        staging,
+        build,
+        marker
+            .as_ref()
+            .and_then(|ready| ready.machine_id.as_deref()),
+    )
+}
+
+/// [`handoff_apply_floor_refusal_at`] for `build` signed by `machine` (the stage's
+/// marker, when the caller has it in hand).
+///
+/// A floor that is there but could not be read refuses too, as a passing moment
+/// ([`crate::manifest::Floor::read_for_gate`]): it withdraws nothing
+/// it holds. Nothing parks past it, and the next attempt reads the floor again.
+fn handoff_floor_refusal(staging: &Staging, build: u64, machine: Option<&str>) -> Option<String> {
+    let floor = match crate::manifest::Floor::read_for_gate(&staging.floor()) {
+        Ok(floor) => floor,
+        Err(refusal) => return Some(format!("{refusal}; not handing off to build {build}")),
+    };
+    if floor.revokes(machine) {
         return Some(format!(
             "staged build {build} was signed by machine {}, which the machine roster has \
              revoked; not handing off to it",
-            ready.machine_id.as_deref().unwrap_or("?")
+            machine.unwrap_or("?")
         ));
     }
     let floor = floor.min_build;
@@ -2486,6 +3073,81 @@ pub(crate) fn handoff_apply_floor_refusal_at(staging: &Staging, build: u64) -> O
     })
 }
 
+/// WHAT A CACHED PASS CANNOT VOUCH FOR, asked by a worker that skips the staged
+/// candidate's full pre-verification on it: `Some(refusal)`
+/// unless the stage the pass was cached for — `build` at `commit` — is still the
+/// published one, not quarantined, and admitted by the floor
+/// ([`handoff_apply_floor_refusal_at`]).
+///
+/// The floor alone is not enough: its revocation arm reads the ready marker, which
+/// a revocation's retirement removes first, and a stage can also be quarantined by
+/// a sibling's revert or replaced by a newer one — each would launch a successor
+/// whose own gate finds no stage after every reader parked. Read-only and cheap
+/// like the floor (two small TOML reads, no lock, no
+/// `codesign`); the refusals are the full check's own (`read_ready`'s ladder,
+/// [`crate::manifest::artifact_quarantined`]), so either lane files them alike.
+pub(crate) fn handoff_cached_pass_refusal_at(
+    staging: &Staging,
+    build: u64,
+    commit: &str,
+) -> Option<String> {
+    // The STAGE'S STATE — gone, unreadable, another build — is a moment, as the full
+    // check files it: a sibling that consumed or replaced the
+    // shared stage, or a check that retired it, says nothing about this build. Still
+    // a refusal: nothing is handed off to a stage that is not there.
+    let stage_moment = crate::verify::mark_passing;
+    let Some(ready) = Ready::read(&staging.ready) else {
+        return Some(stage_moment(if staging.ready.exists() {
+            "staged ready marker is unreadable".to_string()
+        } else {
+            format!("staged build {build} is no longer staged; not handing off to it")
+        }));
+    };
+    if ready.build_number != build {
+        return Some(stage_moment(format!(
+            "staged build {} is not the authorized build {build}",
+            ready.build_number
+        )));
+    }
+    if !ready
+        .commit
+        .as_deref()
+        .is_some_and(|staged| crate::commit_matches(commit, staged))
+    {
+        return Some(format!(
+            "staged build {build} is not the authorized commit {commit}; not handing off to it"
+        ));
+    }
+    if crate::manifest::artifact_quarantined(staging, build, &ready.dmg_sha256) {
+        return Some(format!(
+            "staged build {build} is quarantined: it crash-looped on this machine and was reverted"
+        ));
+    }
+    if let Some(refusal) = handoff_apply_floor_refusal_at(staging, build) {
+        return Some(refusal);
+    }
+    // A stage whose roster authorization no check has confirmed for a day: the
+    // successor's gate 4d would refuse it after every reader parked. Passing; the
+    // check that confirms it ends the wait.
+    if let Some(refusal) = ready.roster_authorization_stale(
+        unix_now_secs(),
+        aterm_update_core::pins::roster_tier_armed(),
+    ) {
+        return Some(refusal);
+    }
+    // The marker names it but its bundle is not the published one — a retirement
+    // that removed the bundle first, or a sibling's publish that replaced it, or an
+    // identity read that failed just then: the shared stage again, a moment, and
+    // still no stage to hand off to. A bundle that really changed meets
+    // the full check once the pass expires.
+    (!ready.is_published_bundle(staging)).then(|| {
+        stage_moment(format!(
+            "the staged bundle of build {build} is no longer the published stage; not handing \
+             off to it"
+        ))
+    })
+}
+
 /// What a handoff pre-verification holds while it runs: the apply lock (when
 /// there is a staging root to take it in) and, under it, the verification
 /// budget. Declared budget first so the budget closes before the lock is let go.
@@ -2494,19 +3156,12 @@ pub(crate) struct PreverifyGuard {
     _lock: Option<FileLock>,
 }
 
-/// Enter a handoff pre-verification: take `apply_lock` within
-/// [`APPLY_LOCK_WAIT`], then open [`verify::APPLY_BUDGET`] for everything the
-/// check runs (round seven, item 36). The one door both pre-verifications — the
-/// staged candidate's and the activation's — go through, so the bound
-/// [`crate::HANDOFF_PREVERIFY_BOUND`] names (the lock wait plus the budget) is
-/// the bound they run under, and a caller that waits for one — the fork lane,
-/// for the candidate's handoff policy — waits on a number that holds.
-///
-/// Without the budget each helper was bounded only by its own 30 s, and one
-/// check runs two sealed-identity reads of five helpers each: minutes, on the
-/// loaded desk whose slow `spctl` is why that 30 s exists. A helper that outruns
-/// the budget is a PASSING refusal (`verify::timed_out`), retried like the lock
-/// wait's, never a verdict on the bundle.
+/// Enters a handoff pre-verification: takes `apply_lock` within
+/// [`APPLY_LOCK_WAIT`], then opens [`verify::APPLY_BUDGET`] for everything the check
+/// runs. The one door both pre-verifications (the staged candidate's and the
+/// activation's) go through, so [`crate::HANDOFF_PREVERIFY_BOUND`] (lock wait plus
+/// budget) is the bound they run under. A helper that outruns the budget is a
+/// passing refusal (`verify::timed_out`), retried, never a verdict on the bundle.
 pub(crate) fn enter_preverify(apply_lock: Option<&Path>) -> Result<PreverifyGuard, String> {
     let lock = apply_lock
         .map(|path| FileLock::acquire_within(path, APPLY_LOCK_WAIT))
@@ -2518,13 +3173,12 @@ pub(crate) fn enter_preverify(apply_lock: Option<&Path>) -> Result<PreverifyGuar
     })
 }
 
-/// Injectable core of [`preverify_staged_handoff_candidate`]; the split exists
-/// so the refusal ladder is provable against a temp staging root without a
-/// signed fixture bundle (a missing/unsigned candidate must refuse BEFORE any
-/// caller could park a reader on its behalf). `installed` is the resolved
-/// bundle root the swap would replace, injected for the same reason, and
-/// `read_policy` the handoff-policy reader, so a test can prove it is never
-/// called on a bundle that failed any check.
+/// Injectable core of [`preverify_staged_handoff_candidate`], so the refusal ladder
+/// is testable against a temp staging root without a signed fixture (a missing or
+/// unsigned candidate must refuse before any caller could park a reader).
+/// `installed` is the bundle root the swap would replace, and `read_policy` the
+/// handoff-policy reader, so a test can prove it is never called on a bundle that
+/// failed any check.
 fn preverify_staged_handoff_candidate_at<R>(
     staging: &Staging,
     installed: Option<&Path>,
@@ -2534,62 +3188,80 @@ fn preverify_staged_handoff_candidate_at<R>(
     expected_commit: Option<&str>,
     read_policy: &dyn Fn(&Path) -> R,
 ) -> Result<R, String> {
-    // Serialize against a concurrent publication/apply exactly like the swap
-    // path: verifying a half-published candidate proves nothing.
+    // Serialize against a concurrent publication/apply like the swap path:
+    // verifying a half-published candidate proves nothing.
     //
-    // BOUNDED, like the launch path's taker at `apply_staged_if_ready` and for
-    // a harsher reason: the seamless worker calls this with EVERY PTY reader
-    // already parked — the whole terminal frozen. An unbounded `acquire`
-    // against a wedged holder (SIGSTOPped, debugger, dead volume) froze the
-    // screen indefinitely, deferred Cmd+Q behind the stuck attempt, and made
-    // every later apply answer "an update handoff is already in flight"
-    // (2026-09-01 audit). A timeout is an ordinary refusal: overlap rolls
-    // back, readers resume, the stage stays armed for the next attempt.
+    // Bounded, like the launch path's taker, because the seamless worker may call
+    // this with the terminal's readers parked: a wedged holder (SIGSTOPped, a
+    // debugger, a dead volume) must not freeze the screen. A timeout is an ordinary
+    // refusal: overlap rolls back, readers resume, the stage stays armed.
     //
-    // And TIMED as a whole once the lock is held (round seven, item 36): the
-    // guard opens the apply's verification budget, so every `codesign`, `spctl`
-    // and `PlistBuddy` below answers inside `verify::APPLY_BUDGET` rather than
-    // each on its own 30 s — the bound `crate::HANDOFF_PREVERIFY_BOUND` states.
+    // Once the lock is held the guard opens the apply's verification budget, so
+    // every `codesign`, `spctl` and `PlistBuddy` below answers inside
+    // `verify::APPLY_BUDGET` (the bound `crate::HANDOFF_PREVERIFY_BOUND` states).
     let _preverify = enter_preverify(Some(&staging.apply_lock))?;
+    // THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT. The stage is per-user
+    // and shared: a sibling aterm that
+    // landed this update first retired its marker, one that published a newer
+    // stage replaced it, and a read the kernel refused just then (`EMFILE` in a
+    // Dock-launched window) reads as an unreadable marker. None of those says
+    // anything about the authorized build, so each is marked passing — and the
+    // install is still refused. EXACTLY these four, named here; every refusal
+    // below (quarantine, the operator floor, the sealed identity, the installed
+    // rollback source) keeps its verdict.
+    let stage_moment = crate::verify::mark_passing;
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => ready,
         ReadyState::NotNewer => {
-            return Err("staged build is not strictly newer than the running build".to_string());
+            return Err(stage_moment(
+                "staged build is not strictly newer than the running build".to_string(),
+            ));
         }
-        ReadyState::Corrupt => return Err("staged ready marker is unreadable".to_string()),
-        ReadyState::Absent => return Err("no verified update is staged".to_string()),
+        ReadyState::Corrupt => {
+            return Err(stage_moment(
+                "staged ready marker is unreadable".to_string(),
+            ));
+        }
+        ReadyState::Absent => return Err(stage_moment("no verified update is staged".to_string())),
     };
     if let Some(expected) = expected_build
         && ready.build_number != expected
     {
-        return Err(format!(
+        return Err(stage_moment(format!(
             "staged build {} is not the authorized build {expected}",
             ready.build_number
-        ));
+        )));
     }
-    // A stage an older stager published after this artifact was quarantined
-    // (round six, finding 15) is not a candidate, however well it verifies.
+    // A stage an older stager published after this artifact was quarantined is not a
+    // candidate, however well it verifies.
     if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
         return Err(format!(
             "staged build {} is quarantined: it crash-looped on this machine and was reverted",
             ready.build_number
         ));
     }
-    // THE OPERATOR APPLY FLOOR (a yank), as the swap's gate 4b reads it (round
-    // six of the update audit, item 26). The floor ratchets when a manifest is
-    // OBSERVED, before any download, and only an apply retires a stage below
-    // it — so a stage armed before the yank is still announced here, and
-    // without this check it parked every reader for a successor whose own swap
-    // then refused it (`NoUpdate`) and exited the old build. Read-only: the
-    // stage is retired by the apply that reaches gate 4b, not by a check. Before
-    // the sealed-identity read, which is `codesign`: a yanked stage costs none.
+    // The operator apply floor (a yank), as the swap's gate 4b reads it. The floor
+    // ratchets when a manifest is observed, before any download, and only an apply
+    // retires a stage below it, so a stage armed before the yank still reaches here.
+    // Read-only: the apply that reaches gate 4b retires the stage. Checked before
+    // the sealed-identity read (`codesign`), so a yanked stage costs none.
     if let Some(refusal) = handoff_apply_floor_refusal_at(staging, ready.build_number) {
         return Err(refusal);
     }
+    // The swap's gate 4d, asked before anything parks: a stage
+    // no check has confirmed against a current roster for a day waits for one, so
+    // the in-session lane cannot swap what the launch just declined. Passing, and
+    // before `codesign`, so the wait costs none.
+    if let Some(refusal) = ready.roster_authorization_stale(
+        unix_now_secs(),
+        aterm_update_core::pins::roster_tier_armed(),
+    ) {
+        return Err(refusal);
+    }
     let (staged_build, sealed_commit) = verified_bundle_identity(&staging.staged_app)?;
-    // The same sealed-identity rebinds the apply path enforces (F10): the number
-    // and provenance SEALED into the bundle must equal the unauthenticated
-    // marker and still exceed the running build.
+    // The sealed-identity rebinds the apply path enforces: the number and provenance
+    // sealed into the bundle must equal the unauthenticated marker and still exceed
+    // the running build.
     if staged_build != ready.build_number || staged_build <= current_build {
         return Err(format!(
             "sealed build {staged_build} does not rebind marker build {} over running {current_build}",
@@ -2604,44 +3276,33 @@ fn preverify_staged_handoff_candidate_at<R>(
     {
         return Err("staged bundle commit does not match the authorized artifact".to_string());
     }
-    // LAST, deliberately. Every check above is about the INCOMING bytes and is
-    // the more common refusal, so it keeps naming itself first; this one is
-    // about the machine's install and, when it fires, it fires forever.
+    // Last: every check above is about the incoming bytes and is the more common
+    // refusal; this one is about the machine's install and, when it fires, it fires
+    // until a person changes the install.
     preverify_installed_rollback_source(installed, current_build, current_commit)?;
-    // THE POLICY IS READ HERE AND NOWHERE EARLIER (plan P0-5): every refusal
-    // above returned before this line, so a bundle that failed its codesign
-    // policy, its sealed identity or its authorization never has a byte of its
-    // policy read — and `_lock` is still held, so the stage read is the one just
-    // verified.
+    // The policy is read here and nowhere earlier: every refusal above returned
+    // before this line, so a bundle that failed its codesign policy, sealed identity
+    // or authorization never has its policy read; `_lock` is still held, so the
+    // stage read is the one just verified.
     Ok(read_policy(&staging.staged_app))
 }
 
 /// Upper bound on the changelog text a `ready.toml` may carry.
 ///
-/// The marker is a SMALL ledger: every reader reaches it through
-/// `read_ledger_text`, which returns `None` for a file above `MAX_LEDGER_BYTES`. So
-/// an oversized changelog does not make the marker BIG, it makes it INVISIBLE — and
-/// nothing upstream bounded it: the publisher's changelog extraction runs to EOF when
-/// a heading is malformed, and CHANGELOG.md is ~382 KiB. The result was the worst
-/// shape this crate can produce: the stage reported success and the status file said
-/// "verified and ready to apply", while `publishable_stage_covers` read the marker as
-/// absent and re-downloaded the whole container every cadence tick forever, and every
-/// launch read the marker as `Corrupt` so the build never applied.
-///
-/// A few thousand characters is far more release note than any surface shows, and the
-/// authoritative changelog lives in the release itself.
+/// Every reader reaches the marker through `read_ledger_text`, which returns `None`
+/// above `MAX_LEDGER_BYTES`, so an oversized changelog would make the marker
+/// invisible: the stage would report success while the stage-cover check
+/// re-downloaded every tick and every launch read the marker as `Corrupt`. The
+/// authoritative changelog lives in the release.
 const MAX_READY_CHANGELOG_CHARS: usize = 4096;
 
 /// Appended in place of the discarded tail so a clamped changelog reads as truncated
 /// rather than as a release note that stops mid-sentence.
 const READY_CHANGELOG_TRUNCATED: &str = "\n… (changelog truncated)";
 
-/// Clamp the manifest's changelog to what a marker may carry.
-///
-/// The cut is by CHARACTERS, never bytes: release notes routinely contain em dashes
-/// and emoji, and slicing a `str` at a byte offset inside a multi-byte UTF-8 sequence
-/// panics. `char_indices().nth(N)` yields an offset that is a char boundary by
-/// construction, so the slice below cannot split a sequence.
+/// Clamps the manifest's changelog to what a marker may carry. The cut is by
+/// characters, never bytes: slicing a `str` inside a multi-byte UTF-8 sequence
+/// panics, and `char_indices().nth(N)` yields a char boundary by construction.
 fn clamp_ready_changelog(changelog: Option<&str>) -> Option<String> {
     let text = changelog?;
     match text.char_indices().nth(MAX_READY_CHANGELOG_CHARS) {
@@ -2650,23 +3311,30 @@ fn clamp_ready_changelog(changelog: Option<&str>) -> Option<String> {
     }
 }
 
-/// Publish one already-verified incoming bundle as a short transaction shared
-/// with the apply path. The long download/extract/verification work remains under
-/// `stage_lock` only; compliant callers therefore acquire locks in the sole nested
-/// order `stage_lock -> apply_lock`. Apply never acquires `stage_lock`, so startup
-/// cannot wait on a download and the two lanes cannot deadlock.
+/// Publishes one already-verified incoming bundle as a short transaction shared
+/// with the apply path. The long download/extract/verification work stays under
+/// `stage_lock` only, so locks nest only as `stage_lock -> apply_lock`. Apply never
+/// takes `stage_lock`, so startup cannot wait on a download and the lanes cannot
+/// deadlock.
 fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> Result<(), String> {
+    publish_verified_stage_within(staging, incoming, ready, BACKGROUND_LOCK_WAIT)
+}
+
+/// [`publish_verified_stage`] with the apply-lock wait named, so a test can run a
+/// sibling's hold out in milliseconds rather than two minutes.
+fn publish_verified_stage_within(
+    staging: &Staging,
+    incoming: &Path,
+    ready: &Ready,
+    lock_wait: std::time::Duration,
+) -> Result<(), String> {
     let marker = ready.to_toml()?;
-    // A marker above the shared ledger cap is not a big marker, it is an ABSENT one:
-    // `read_ledger_text` refuses it, so the status surface, the stage-coverage check
-    // and the apply gate all see "nothing staged" while a fully verified bundle sits on
-    // disk — the container then re-downloads forever and the build never applies.
-    // `clamp_ready_changelog` bounds today's only unbounded field; THIS guard is what
-    // stops a future field from silently reintroducing an unreadable marker.
-    //
-    // It runs before the lock and before the old generation is invalidated, so a
-    // rejected publish leaves the previously staged (readable) generation exactly as it
-    // was rather than trading a working stage for an invisible one.
+    // A marker above the shared ledger cap is absent to every reader
+    // (`read_ledger_text` refuses it): status, stage coverage and the apply gate would
+    // all see "nothing staged" beside a verified bundle. `clamp_ready_changelog`
+    // bounds the one unbounded field; this guard stops a future field from doing the
+    // same. It runs before the lock and before the old generation is invalidated, so
+    // a rejected publish leaves the previous readable stage as it was.
     if u64::try_from(marker.len()).unwrap_or(u64::MAX) > crate::MAX_LEDGER_BYTES {
         return Err(format!(
             "refusing to commit a {}-byte ready marker: the ledger cap every reader \
@@ -2675,10 +3343,13 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
             crate::MAX_LEDGER_BYTES
         ));
     }
-    // Bounded (plan P2-1): this runs on the checker thread, under the stage lock.
-    let _publish_lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
-        .map_err(|error| format!("publish lock: {error}"))?;
-    // UNDER THE LOCK THE CRASH-LOOP REVERT HOLDS (round six, finding 15). This
+    // Bounded: this runs on the checker thread, under the stage lock.
+    // A wait run out is a sibling's hold, a moment: it is
+    // marked passing like every other apply-lock wait, so `book_stage_failure`
+    // does not back a healthy, verified build off.
+    let _publish_lock = FileLock::acquire_within(&staging.apply_lock, lock_wait)
+        .map_err(|error| verify::lock_wait_refusal("publish lock", &error))?;
+    // UNDER THE LOCK THE CRASH-LOOP REVERT HOLDS. This
     // stage was decided before the download — minutes ago — and a revert may have
     // quarantined this very artifact since: then it is not published. The other
     // order is safe too: a revert after this publish retires the stage.
@@ -2689,14 +3360,17 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
             ready.build_number, ready.dmg_sha256
         ));
     }
-    // …AND UNDER THE LOCK THE FLOOR'S READERS AND THE CHECK LANE'S RETIREMENT HOLD
-    // (round seven, H1 finding 33). The roster generation was judged before the
+    // …AND UNDER THE LOCK THE FLOOR'S READERS AND THE CHECK LANE'S RETIREMENT HOLD.
+    // The roster generation was judged before the
     // download, minutes ago; a sibling's check may since have admitted a roster that
     // REVOKES this build's signer (or seen a yank), recorded it in the floor, and
     // found no published stage to retire. Publishing now would arm this process's
     // apply lane for a withdrawn machine's build. Either order is safe: a withdrawal
     // recorded after this publish finds the stage and retires it.
-    if let Some(why) = crate::manifest::Floor::read(&staging.floor())
+    // A floor that could not be read is no floor's word that the build is still
+    // admitted: refused as a moment, and the next check publishes it.
+    if let Some(why) = crate::manifest::Floor::read_for_gate(&staging.floor())
+        .map_err(|refusal| format!("stage refused: {refusal}"))?
         .withdraws(ready.build_number, ready.machine_id.as_deref())
     {
         return Err(format!(
@@ -2711,28 +3385,29 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
     rename_untagged(incoming, &staging.staged_app, &staging.staged_dir())
         .map_err(|error| format!("publish staged bundle: {error}"))?;
 
-    // The marker remains the commit point and is written last — DURABLY: it is the
-    // fallback link of the same recovery-proof chain as the trial identity and the
-    // installed receipt (`ensure_current_trial_receipt` falls back to it when the
-    // receipt is absent), so a zero-length one after a kernel panic would strand the
-    // very repair those two were made durable for (2026-08-19 round-4 skeptics).
+    // The marker is the commit point and is written last, durably: it is the
+    // fallback link of the recovery-proof chain with the trial identity and the
+    // installed receipt (`ensure_current_trial_receipt` falls back to it), so a
+    // zero-length one after a kernel panic would strand that repair.
     crate::manifest::write_durable(&staging.ready, &marker, "ready marker")
 }
 
-/// Stage a verified copy of the bundle from a downloaded (sha256-checked) DMG:
-/// mount, `ditto`-extract the `.app`, verify it (codesign/Team-ID/spctl), then
-/// publish `staged/aterm.app` + write `ready.toml` LAST. The ready marker's
-/// presence is the sole "ready" signal, so writing it last (atomic rename) means
-/// a reader never sees a half-staged bundle.
+/// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) DMG:
+/// mount, `ditto` the `.app` out, verify it (codesign/Team ID/spctl), publish
+/// `staged/aterm.app`, and write `ready.toml` last. The marker's presence is the
+/// sole "ready" signal, so writing it last (atomic rename) means a reader never sees
+/// a half-staged bundle.
 ///
-/// [`stage_from_zip`] is the preferred path when the release carries a zip; both
-/// share [`verify_and_publish_incoming`], so the two differ ONLY in how the
-/// bundle is unpacked.
+/// [`stage_from_zip`] is preferred when the release carries a zip; both share
+/// [`verify_and_publish_incoming`] and differ only in how the bundle is unpacked.
+/// `roster_read_at` is when the check that authorized `manifest` began reading the
+/// machine roster: the marker's roster confirmation ([`staged_ready_marker`]).
 pub fn stage_from_dmg(
     staging: &Staging,
     dmg: &Path,
     manifest: &Manifest,
     expected_team: &str,
+    roster_read_at: &str,
 ) -> Result<(), String> {
     let manifest_commit = staging_manifest_commit(manifest)?;
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
@@ -2742,9 +3417,9 @@ pub fn stage_from_dmg(
     let mountpoint = staging.root.join(format!("mnt-{}", std::process::id()));
     let mounted = Mounted::attach(dmg, &mountpoint)?;
     let src = mounted.mountpoint.join("aterm.app");
-    // `symlink_metadata` for the same reason the zip path uses it: the container
-    // controls this entry, and a symlink here would be copied into `staged/` as
-    // a link that can never be applied but IS published as ready.
+    // `symlink_metadata`, as on the zip path: the container controls this entry,
+    // and a symlink would be copied into `staged/` as a link that can never be
+    // applied but is published as ready.
     match std::fs::symlink_metadata(&src) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
@@ -2759,7 +3434,7 @@ pub fn stage_from_dmg(
     let incoming = staging.staged_dir().join("aterm.app.incoming");
     let _ = std::fs::remove_dir_all(&incoming);
     // The mounted bundle's size is what the copy will write; refuse a volume that
-    // cannot hold it before a byte lands (2026-09-14, see `refuse_without_room`).
+    // cannot hold it before a byte lands (`refuse_without_room`).
     refuse_without_room(&staging.staged_dir(), tree_bytes(&src), "the update bundle")?;
     // `ditto` (not `cp -R`) preserves extended attributes + the _CodeSignature
     // layout, so the copied bundle's signature stays valid.
@@ -2777,7 +3452,12 @@ pub fn stage_from_dmg(
     })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(ditto_failure("ditto extract failed", status, &stderr));
+        return Err(unpack_failure(
+            &staging.staged_dir(),
+            "ditto extract failed",
+            status,
+            &stderr,
+        ));
     }
     // detach the DMG now; everything we need is in `incoming`.
     drop(mounted);
@@ -2788,61 +3468,39 @@ pub fn stage_from_dmg(
         manifest,
         &manifest_commit,
         expected_team,
+        roster_read_at,
     )
 }
 
 // ---------------------------------------------------------------------------
-// Bounding the zip extract — what unpacking this archive would cost, read out
-// of the archive's own central directory BEFORE `ditto` is allowed to run.
+// Bounding the zip extract: what unpacking this archive would cost, read from the
+// archive's own central directory before `ditto` may run.
 // ---------------------------------------------------------------------------
 
-// Trait/type imports scoped to the zip reader below; the rest of this file
-// spells its occasional `std::io` use out in full, but four repetitions of
-// `std::io::SeekFrom::Start` earn the import.
+// Imports scoped to the zip reader below.
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-/// Hard ceiling on the UNCOMPRESSED bytes an update archive may DECLARE before
-/// [`stage_from_zip`] will hand it to `ditto`.
+/// Hard ceiling on the uncompressed bytes an update archive may declare before
+/// [`stage_from_zip`] hands it to `ditto`.
 ///
-/// WHY A CEILING EXISTS AT ALL. The download is capped (`github.rs` passes
-/// [`aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND`] to `download_to`) and the
-/// archive's sha256 is checked against the release manifest before extraction,
-/// so nothing reaches this point that the publisher did not sign for. But
-/// deflate EXPANDS, `ditto` has no size limit of its own, and one bad release is
-/// unpacked by every machine on the channel at once. A volume with no free space
-/// cannot stage the fix that would undo it, so the failure has no in-band
-/// recovery — it is a fleet-wide availability event, not a per-machine
-/// annoyance. Refusing on the archive's own declared size turns "every disk is
-/// full" into "the fleet stayed on the previous build and said why", which the
-/// caller's stage-failure path already knows how to sit on.
+/// The download is capped ([`aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND`]) and
+/// its SHA-256 checked against the signed manifest before extraction, but deflate
+/// expands, `ditto` has no limit of its own, and one bad release is unpacked by
+/// every machine on the channel at once. A full volume cannot stage the fix, so
+/// refusing on the archive's declared size keeps the fleet on the previous build
+/// with a stated reason.
 ///
-/// WHY THIS NUMBER, AND WHY IT IS NOT ITS OWN. It is the download bound itself,
-/// and it must never sit BELOW it. The cutter validates every published asset
-/// against that one constant (`UPDATER_MAX_DMG_BYTES` in `aterm-release`) and has
-/// no extraction gate of its own, so a stricter cap here is a hole the publisher
-/// cannot see: a container the cutter happily ships stages nowhere, on every
-/// machine on the channel, deterministically, and the stage-failure backoff just
-/// re-downloads it once a day forever.
-///
-/// The retired 1 GiB was picked when "the signed bundle is well under 100 MB
-/// uncompressed" was true of every cut. It is not: a batteries-included cut seals
-/// `Contents/Resources/toolchain-seed` into the SAME signed `.app` this archive
-/// carries, and one has already been observed at ~775 MB — three quarters of that
-/// cap, with a payload of already-compressed `.tar.zst` artifacts whose declared
-/// uncompressed size is roughly their packed size. Tying the two together removes
-/// the drift rather than re-guessing the headroom. The cap still does its job at
-/// the bound: it refuses any archive DECLARING more than the largest asset the
-/// publisher could ever have shipped, so an honestly-enormous zip is still
-/// refused before one byte is written.
+/// It equals the download bound and must never sit below it: the release cutter
+/// validates every asset against that constant (`UPDATER_MAX_DMG_BYTES` in
+/// `aterm-release`) and has no extraction gate, so a stricter cap here would make a
+/// shipped container unstageable everywhere. A cut can seal a large
+/// `Contents/Resources/toolchain-seed` of already-compressed artifacts into the
+/// bundle, so the cap is tied to the bound rather than guessed.
 const MAX_EXTRACT_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
 
-/// Companion ceiling on the archive's entry COUNT, because bytes alone do not
-/// bound the damage: a million empty files declare zero uncompressed bytes and
-/// still cost a filesystem block and an inode apiece. MEASURED, not estimated:
-/// the shipped `aterm-0.12.0-mac.zip` declares 48 entries / 51,203,501
-/// uncompressed bytes, and a fresh `ditto -c -k --sequesterRsrc --keepParent`
-/// of the installed bundle gives 48 / 51,154,253 — so
-/// this leaves three orders of magnitude of headroom while holding the
+/// Companion ceiling on the archive's entry count, since bytes alone do not bound
+/// the damage: a million empty files declare zero bytes and still cost a block and
+/// an inode apiece. A real bundle has about 48 entries; this holds the
 /// block-overhead worst case near 200 MiB (50k entries × one 4 KiB block).
 const MAX_EXTRACT_ENTRIES: u64 = 50_000;
 
@@ -2898,9 +3556,8 @@ fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
 }
 
-/// Read exactly `len` bytes at an absolute offset. A short read is an error, not
-/// a short buffer: every caller here is reading a FIXED-layout record, so "the
-/// file ended early" means the record is not there.
+/// Reads exactly `len` bytes at an absolute offset. A short read is an error: every
+/// caller reads a fixed-layout record, so an early end means the record is absent.
 fn read_exact_at(file: &mut std::fs::File, offset: u64, len: u64) -> Result<Vec<u8>, String> {
     let len = usize::try_from(len)
         .map_err(|_| format!("update zip record of {len} bytes does not fit in memory"))?;
@@ -2912,9 +3569,9 @@ fn read_exact_at(file: &mut std::fs::File, offset: u64, len: u64) -> Result<Vec<
     Ok(buffer)
 }
 
-/// Locate the End Of Central Directory record and read its classic 32-bit view
-/// of the directory. Returns the record's absolute offset alongside it, because
-/// everything the directory describes must lie strictly before it.
+/// Locates the End Of Central Directory record and reads its classic 32-bit view of
+/// the directory. Returns the record's absolute offset too, because everything the
+/// directory describes must lie strictly before it.
 fn find_end_of_central_directory(
     file: &mut std::fs::File,
     file_len: u64,
@@ -2928,10 +3585,9 @@ fn find_end_of_central_directory(
     let Some(highest) = tail.len().checked_sub(fixed) else {
         return Err("update zip is smaller than an end-of-central-directory record".to_string());
     };
-    // A four-byte signature also occurs inside compressed data and inside the
-    // archive comment, so the signature alone identifies nothing. What makes a
-    // candidate real is that its declared comment length runs EXACTLY to end of
-    // file.
+    // The four-byte signature also occurs inside compressed data and the archive
+    // comment, so a candidate is real only if its declared comment length runs
+    // exactly to end of file.
     let mut found: Option<(u64, DirectoryExtent)> = None;
     for index in (0..=highest).rev() {
         let Some(record) = tail.get(index..) else {
@@ -2951,12 +3607,10 @@ fn find_end_of_central_directory(
         if usize::from(comment_len) != record.len().saturating_sub(fixed) {
             continue;
         }
-        // TWO valid candidates means the archive has a decoy trailer, and
-        // nothing here can know which one `ditto` will follow — so the bound
-        // would be measured off a record that is not the one being extracted.
-        // Refuse. An honest archive cannot hit this by accident: it needs the
-        // four signature bytes AND a comment length that lands exactly on EOF,
-        // which is ~2^-48 per position over a ~64 KiB scan.
+        // Two valid candidates means a decoy trailer, and nothing here can know which
+        // one `ditto` will follow, so refuse. An honest archive cannot hit this by
+        // accident: it needs the signature and a comment length landing exactly on
+        // EOF, ~2^-48 per position over a ~64 KiB scan.
         if found.is_some() {
             return Err(
                 "update zip has more than one end-of-central-directory record; refusing \
@@ -2978,10 +3632,10 @@ fn find_end_of_central_directory(
     found.ok_or_else(|| "update zip has no end-of-central-directory record".to_string())
 }
 
-/// The ZIP64 view of the directory, when the archive carries one. `Ok(None)`
-/// means there is no ZIP64 locator at all (an ordinary small archive); once a
-/// locator IS present every further problem is a refusal, because the archive
-/// has declared that the 32-bit record cannot describe it.
+/// The ZIP64 view of the directory, when the archive carries one. `Ok(None)` means
+/// no ZIP64 locator (an ordinary small archive); once a locator is present every
+/// further problem is a refusal, since the archive declared the 32-bit record
+/// cannot describe it.
 fn zip64_directory_extent(
     file: &mut std::fs::File,
     eocd_offset: u64,
@@ -3019,10 +3673,10 @@ fn zip64_directory_extent(
     }))
 }
 
-/// The uncompressed size out of a central directory entry's ZIP64 extended
-/// information field. That field carries ONLY the values that overflowed 32
-/// bits, in a fixed order with the uncompressed ("original") size first — so an
-/// entry that reaches here (its 32-bit size saturated) has it at data offset 0.
+/// The uncompressed size from a central directory entry's ZIP64 extended
+/// information field, which carries only the values that overflowed 32 bits, the
+/// uncompressed size first, so for an entry whose 32-bit size saturated it is at
+/// data offset 0.
 fn zip64_uncompressed_size(extra: &[u8]) -> Option<u64> {
     let mut at = 0usize;
     while at < extra.len() {
@@ -3040,10 +3694,9 @@ fn zip64_uncompressed_size(extra: &[u8]) -> Option<u64> {
     None
 }
 
-/// Walk the central directory, summing uncompressed sizes and counting entries.
-///
-/// The caps are enforced INSIDE the walk, not after it: a directory claiming a
-/// billion entries has to cost a bounded read, not a billion iterations.
+/// Walks the central directory, summing uncompressed sizes and counting entries.
+/// The caps are enforced inside the walk, so a directory claiming a billion entries
+/// costs a bounded read.
 fn central_directory_claim(
     file: &mut std::fs::File,
     extent: DirectoryExtent,
@@ -3051,10 +3704,9 @@ fn central_directory_claim(
     file.seek(SeekFrom::Start(extent.offset))
         .map_err(|error| format!("seek update zip central directory: {error}"))?;
     let mut reader = BufReader::new(file);
-    // The caller proved the extent lies inside a file the download cap held
-    // under 512 MiB, so this cannot fail on any host aterm runs on; written as a
-    // conversion rather than a cast so a narrower target refuses instead of
-    // wrapping.
+    // The caller proved the extent lies inside a file the download cap bounded, so
+    // this cannot fail on any host aterm runs on; a conversion rather than a cast so
+    // a narrower target refuses instead of wrapping.
     let mut remaining = usize::try_from(extent.size)
         .map_err(|_| "update zip central directory does not fit in memory".to_string())?;
     let mut claim = ZipExtractClaim {
@@ -3092,9 +3744,9 @@ fn central_directory_claim(
             .read_exact(&mut variable_bytes)
             .map_err(|error| format!("read update zip central directory entry: {error}"))?;
         let uncompressed = if uncompressed == u32::MAX {
-            // 0xFFFFFFFF is the ZIP64 escape. It is also a legal literal size,
-            // but a ~4 GiB member already blows MAX_EXTRACT_BYTES on its own, so
-            // reading it as the escape can only make this stricter, never laxer.
+            // 0xFFFFFFFF is the ZIP64 escape. It is also a legal literal size, but a
+            // ~4 GiB member alone exceeds MAX_EXTRACT_BYTES, so reading it as the
+            // escape can only be stricter.
             let extra = variable_bytes
                 .get(usize::from(name_len)..)
                 .and_then(|rest| rest.get(..usize::from(extra_len)))
@@ -3133,30 +3785,23 @@ fn central_directory_claim(
     Ok(claim)
 }
 
-/// Read the archive's CENTRAL DIRECTORY and refuse anything claiming to unpack
+/// Reads the archive's central directory and refuses anything claiming to unpack
 /// to more than [`MAX_EXTRACT_BYTES`] or [`MAX_EXTRACT_ENTRIES`].
 ///
-/// HAND-ROLLED ON PURPOSE. This reads four fixed-layout records and never
-/// inflates a byte. The update path is the one place in aterm where a new
-/// dependency is also a new way to lose the whole fleet, so a page of
-/// little-endian field reads beats pulling a zip crate in behind it.
+/// Hand-rolled: it reads four fixed-layout records and never inflates a byte, so
+/// the update path takes no zip dependency.
 ///
-/// FAIL CLOSED. Every malformed, truncated, ambiguous or unreadable directory is
-/// a refusal, never an "assume fine" — a bound the archive can opt out of by
-/// being broken is not a bound. In particular the entry count the walk observes
-/// must equal the count the end record declares, so a directory that describes a
-/// different archive than its own trailer cannot slip past on either reading.
+/// Fails closed: every malformed, truncated, ambiguous or unreadable directory is a
+/// refusal. The entry count the walk observes must equal the count the end record
+/// declares, so a directory describing a different archive than its trailer cannot
+/// slip past.
 ///
-/// WHAT THIS DOES AND DOES NOT PROVE. It bounds what the archive DECLARES, read
-/// out of the record any extractor must consult to know what the archive holds.
-/// It is not a proof about `ditto`: an extractor that streamed local file headers
-/// and ignored the directory could still be fed members the directory never
-/// mentions, and that residue is bounded only by the download cap times deflate's
-/// expansion. Closing it needs a watchdog that kills `ditto` when the extract
-/// directory crosses the cap, which is a separate change. What this DOES close is
-/// every archive that honestly says it is enormous plus every malformed shape in
-/// between — the realistic failure being a release built wrong, not a signer gone
-/// hostile (a hostile signer already ships the binary).
+/// It bounds what the archive declares, in the record any extractor must consult.
+/// It is not a proof about `ditto`: an extractor streaming local headers could be
+/// fed members the directory never mentions, bounded only by the download cap times
+/// deflate's expansion (closing that needs a watchdog on the extract directory). It
+/// catches the realistic failure, a release built wrong; a hostile signer already
+/// ships the binary.
 fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
     let mut file = std::fs::File::open(zip).map_err(|error| format!("open update zip: {error}"))?;
     let file_len = file
@@ -3166,10 +3811,9 @@ fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
     let (eocd_offset, classic) = find_end_of_central_directory(&mut file, file_len)?;
     let extent = match zip64_directory_extent(&mut file, eocd_offset)? {
         Some(zip64) => {
-            // Where the 32-bit record is NOT saturated it must agree with the
-            // 64-bit one. A disagreement means the two records describe
-            // different archives, and nothing here can know which one `ditto`
-            // will follow — so neither is trusted.
+            // Where the 32-bit record is not saturated it must agree with the 64-bit
+            // one; a disagreement means two archives are described, and neither is
+            // trusted.
             let disagrees = (classic.entries != u64::from(u16::MAX)
                 && classic.entries != zip64.entries)
                 || (classic.size != u64::from(u32::MAX) && classic.size != zip64.size)
@@ -3183,10 +3827,9 @@ fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
             zip64
         }
         None => {
-            // A sentinel with no ZIP64 record behind it is an archive shape this
-            // reader cannot describe. Unhandled is a REFUSAL, never "assume
-            // fine": the saturated field is exactly the one the cap is measured
-            // against.
+            // A sentinel with no ZIP64 record behind it is a shape this reader cannot
+            // describe: a refusal, since the saturated field is the one the cap is
+            // measured against.
             if classic.entries == u64::from(u16::MAX)
                 || classic.size == u64::from(u32::MAX)
                 || classic.offset == u64::from(u32::MAX)
@@ -3209,37 +3852,31 @@ fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
     central_directory_claim(&mut file, extent)
 }
 
-/// Stage a verified copy of the bundle from a downloaded (sha256-checked) ZIP:
-/// `ditto -x -k` extract, then the IDENTICAL verification + publication
-/// [`stage_from_dmg`] performs ([`verify_and_publish_incoming`]).
+/// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) ZIP:
+/// `ditto -x -k` extract, then the same verification and publication as
+/// [`stage_from_dmg`] ([`verify_and_publish_incoming`]).
 ///
-/// WHY THIS EXISTS — and why it is preferred over the DMG path: `hdiutil attach`
-/// fails with ENXIO ("Device not configured") in the one process that most needs
-/// to stage. After a seamless overlap update the surviving aterm is a fork-child
-/// whose parent (the launchd job's process) has exited, so it is an orphan
-/// holding a bootstrap context for a dead job. DiskImages registers with the
-/// `com.apple.hdiejectd` XPC service through that context, and the lookup in a
-/// dead domain cannot succeed — which is why the identical command runs fine from
-/// a shell and never from the app. `ditto` needs no XPC service, so unpacking a
-/// zip works from ANY process context.
+/// Preferred over the DMG path because `hdiutil attach` fails with ENXIO in an
+/// orphaned process (after a seamless overlap update the surviving aterm's launchd
+/// job may be gone, and DiskImages' `com.apple.hdiejectd` lookup in that dead
+/// bootstrap domain cannot succeed). `ditto` needs no XPC service.
 ///
-/// Nothing about the trust model changes: the zip's bytes are checked against the
-/// manifest digest before this is called, and the extracted bundle then goes
-/// through the same codesign/Team-ID/sealed-identity gate. What the digest does
-/// NOT bound is how far those bytes EXPAND, so the unpack is gated on
-/// [`checked_zip_extraction_claim`] first — see [`MAX_EXTRACT_BYTES`] for why an
-/// authentic-but-malformed archive is still a fleet-wide availability problem.
+/// The trust model is unchanged: the zip's bytes are checked against the manifest
+/// digest first, and the extracted bundle goes through the same
+/// codesign/Team-ID/sealed-identity gate. The digest does not bound expansion, so
+/// the unpack is gated on [`checked_zip_extraction_claim`] first (see
+/// [`MAX_EXTRACT_BYTES`]). `roster_read_at` is as for [`stage_from_dmg`].
 pub fn stage_from_zip(
     staging: &Staging,
     zip: &Path,
     manifest: &Manifest,
     expected_team: &str,
+    roster_read_at: &str,
 ) -> Result<(), String> {
     let manifest_commit = staging_manifest_commit(manifest)?;
-    // Bound the unpack BEFORE any filesystem work: `ditto` has no size limit of
-    // its own, so the archive's own central directory is the only place to learn
-    // what extracting it would cost — and refusing here costs nothing, because
-    // not one byte has been written yet.
+    // Bound the unpack before any filesystem work: `ditto` has no size limit, so the
+    // archive's central directory is the only place to learn the cost, and refusing
+    // here writes nothing.
     let claim = checked_zip_extraction_claim(zip)?;
     crate::log(&format!(
         "update zip declares {} entries / {} uncompressed bytes \
@@ -3247,20 +3884,18 @@ pub fn stage_from_zip(
         claim.entries, claim.uncompressed_bytes
     ));
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
-    // Reclaim any extract dir a previously-killed run leaked (same intent as
-    // `sweep_stale_mounts`: nothing under our 0700 dir may accumulate — and the
-    // DMG lane's own leftovers too (`sweep_stale_scratch`, 2026-09-14).
+    // Reclaim any extract dir (and the DMG lane's mounts) a killed run leaked
+    // (`sweep_stale_scratch`).
     sweep_stale_scratch(staging);
-    // Extract into a fresh scratch dir rather than straight into `staged/`: the
-    // archive's root entry is `aterm.app` (`--keepParent`), and unpacking that
-    // name next to the PUBLISHED `staged/aterm.app` would collide with it.
+    // Extract into a fresh scratch dir, not `staged/`: the archive's root entry is
+    // `aterm.app` (`--keepParent`), which would collide with the published
+    // `staged/aterm.app`.
     let extract = staging
         .staged_dir()
         .join(format!("zx-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&extract);
-    // The archive's own declared size, against the volume's free space: a full disk
-    // used to surface as the bare "ditto zip extract failed (exit status: 1)" and a
-    // re-download per backoff step (2026-09-14, see `refuse_without_room`).
+    // The archive's declared size against the volume's free space
+    // (`refuse_without_room`).
     refuse_without_room(
         &staging.staged_dir(),
         claim.uncompressed_bytes,
@@ -3285,17 +3920,19 @@ pub fn stage_from_zip(
     })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&extract);
-        return Err(ditto_failure("ditto zip extract failed", status, &stderr));
+        return Err(unpack_failure(
+            &staging.staged_dir(),
+            "ditto zip extract failed",
+            status,
+            &stderr,
+        ));
     }
     let src = extract.join("aterm.app");
     // `symlink_metadata`, not `is_dir`: the archive controls this entry, and a
-    // SYMLINK named `aterm.app` pointing at some other bundle would follow
-    // through `is_dir` and then be renamed into `staged/` as a link. The apply
-    // path and the status reader both refuse a symlinked staged bundle
-    // (`install::…symlink_metadata`, `manifest.rs`), so it could never be
-    // installed — but it would be published as "ready", which is a staging
-    // success the DMG path would not have produced and a retry loop nobody can
-    // clear. Refuse it here, where the container's own claim is still local.
+    // symlink named `aterm.app` would follow through `is_dir` and be renamed into
+    // `staged/` as a link. The apply path and status reader refuse a symlinked
+    // staged bundle, so it could never install, but it would be published as
+    // "ready", a retry loop nobody can clear. Refuse it here.
     match std::fs::symlink_metadata(&src) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
@@ -3329,33 +3966,38 @@ pub fn stage_from_zip(
         manifest,
         &manifest_commit,
         expected_team,
+        roster_read_at,
     )
 }
 
-/// The manifest's git commit in canonical form — the one identity every stage
-/// binds the signed bundle back to. Shared so neither container path can drift
-/// into accepting a manifest the other would refuse.
+/// The manifest's git commit in canonical form: the one identity every stage binds
+/// the signed bundle back to, shared so neither container path can accept a
+/// manifest the other would refuse.
 fn staging_manifest_commit(manifest: &Manifest) -> Result<String, String> {
     canonical_release_commit(manifest.commit.as_deref()).ok_or_else(|| {
         "release manifest lacks a clean, valid git commit; refusing to stage".to_string()
     })
 }
 
-/// Verify an already-extracted incoming bundle and publish it as the staged
-/// update. This is the WHOLE security gate of staging — codesign policy, the
-/// manifest↔sealed-CFBundleVersion rebind, the sealed-commit rebind, then the
-/// ready marker written LAST — and it is deliberately the single copy shared by
-/// [`stage_from_dmg`] and [`stage_from_zip`]: which container the bytes arrived
-/// in must never be able to change what is proved about them.
+/// Verifies an already-extracted incoming bundle and publishes it as the staged
+/// update. This is the whole security gate of staging: codesign policy, the
+/// manifest↔sealed CFBundleVersion rebind, the sealed-commit rebind, then the ready
+/// marker written last. The single copy shared by [`stage_from_dmg`] and
+/// [`stage_from_zip`], so the container can never change what is proved.
 ///
 /// Every failure path removes `incoming`, so a refused candidate leaves no
-/// half-staged bundle behind.
+/// half-staged bundle.
+///
+/// `roster_read_at` (RFC3339; empty for a clock that could not be read) is when the
+/// check that authorized `manifest` began reading the machine roster it judged by:
+/// the marker's roster confirmation ([`staged_ready_marker`]).
 fn verify_and_publish_incoming(
     staging: &Staging,
     incoming: &Path,
     manifest: &Manifest,
     manifest_commit: &str,
     expected_team: &str,
+    roster_read_at: &str,
 ) -> Result<(), String> {
     // Verify the extracted bundle before publishing it (tiered: full Developer-ID
     // check when a Team ID is pinned, else structural-only — see the crate trust model).
@@ -3363,10 +4005,10 @@ fn verify_and_publish_incoming(
         let _ = std::fs::remove_dir_all(incoming);
         return Err(format!("staged bundle failed verification: {e}"));
     }
-    // Bind the (unauthenticated) manifest build_number to the number actually inside
-    // the signed bundle — otherwise a manifest could claim a high build_number while
-    // pointing at an OLD genuine signed bundle (a downgrade/replay via repo-write). The
-    // CFBundleVersion is codesign-sealed, so reading it AFTER verify_bundle is sound.
+    // Bind the (unauthenticated) manifest build_number to the number inside the
+    // signed bundle, or a manifest could claim a high build_number while pointing at
+    // an old genuine signed bundle (downgrade/replay via repo write). CFBundleVersion
+    // is codesign-sealed, so reading it after verify_bundle is sound.
     let bundle_build = match verify::bundle_build_number(incoming) {
         Ok(n) => n,
         Err(e) => {
@@ -3397,40 +4039,62 @@ fn verify_and_publish_incoming(
     }
     let team = verify::team_id(incoming).unwrap_or_else(|_| expected_team.to_string());
 
-    let ready = Ready {
+    let ready = staged_ready_marker(
+        manifest,
+        manifest_commit,
+        team,
+        &now_rfc3339(),
+        roster_read_at,
+    );
+    publish_verified_stage(staging, incoming, &ready)
+}
+
+/// The ready marker a verified stage of `manifest` is published under, written at
+/// `staged_at` by a check that began reading the machine roster at
+/// `roster_read_at` (both RFC3339; empty when the clock could not be read).
+///
+/// THE ROSTER CONFIRMATION IS THE ROSTER'S READ, NOT THE PUBLISH: the download,
+/// extract and `codesign` after the read may take hours, and stamping at the
+/// publish would add all of it to the window a revocation can hide in
+/// (`publish_verified_stage` re-reads only revocations already on the floor). An
+/// empty `roster_read_at` stamps nothing, which the swap reads as unconfirmed.
+fn staged_ready_marker(
+    manifest: &Manifest,
+    manifest_commit: &str,
+    team_id: String,
+    staged_at: &str,
+    roster_read_at: &str,
+) -> Ready {
+    Ready {
         build_number: manifest.build_number,
         version: manifest.version.clone(),
         // Store canonical lowercase hex (like `dmg_sha256`) so `commit_matches` and any
         // display get a clean value; `None` stays `None`.
         commit: Some(manifest_commit.to_string()),
-        // The manifest's `sha256` — the DMG digest — stays the staged artifact's
-        // identity even when the bytes arrived as a zip: it is what the release
-        // manifest, the ready marker, the failed-candidate memo and the apply-time
-        // expected-artifact handoff all key on. Recording the container-specific
-        // digest here would silently break that one identity.
+        // The manifest's `sha256` (the DMG digest) stays the staged artifact's
+        // identity even when the bytes arrived as a zip: the release manifest, the
+        // ready marker, the failed-candidate memo and the apply-time expected-artifact
+        // handoff all key on it.
         dmg_sha256: manifest.sha256.to_ascii_lowercase(),
-        team_id: team,
-        staged_at: now_rfc3339(),
-        // Clamped, never copied verbatim. The manifest's changelog is publisher-side
-        // text with no length bound anywhere in the pipeline, and an oversized one
-        // pushes the whole marker past `MAX_LEDGER_BYTES` — which does not make the
-        // marker large, it makes it unreadable to every consumer. See
-        // `clamp_ready_changelog` for the failure this prevents.
+        team_id,
+        roster_confirmed_at: (!roster_read_at.is_empty()).then(|| roster_read_at.to_string()),
+        staged_at: staged_at.to_string(),
+        // Clamped, never copied verbatim: the changelog is publisher text with no
+        // length bound, and an oversized one would push the marker past
+        // `MAX_LEDGER_BYTES`, making it unreadable (`clamp_ready_changelog`).
         changelog: clamp_ready_changelog(manifest.changelog.as_deref()),
-        // The pair the apply gate re-checks against the ratcheted floor. Both sit
-        // inside the manifest's SIGNED bytes, so recording them here carries the
-        // stage-time authorization forward without trusting anything new.
+        // The pair the apply gate re-checks against the ratcheted floor. Both are in
+        // the manifest's signed bytes, so this carries the stage-time authorization
+        // forward without trusting anything new.
         machine_id: manifest.machine_id.clone(),
         roster_seq: manifest.roster_seq,
-    };
-    publish_verified_stage(staging, incoming, &ready)
+    }
 }
 
-/// Publish the post-swap truth after `ready.toml` has been retired but before
-/// exec. The NEW build number is intentional: an overlapping OLD reader sees a
-/// ledger mismatch and reconciles neutrally, while the re-exec'd NEW process
-/// sees an exact installed/activating outcome instead of the historical stale
-/// "staged … applies on next launch" claim.
+/// Publishes the post-swap truth after `ready.toml` is retired but before exec. The
+/// new build number is intentional: an overlapping OLD reader sees a ledger
+/// mismatch and reconciles neutrally, while the re-exec'd NEW process sees an exact
+/// installed/activating outcome.
 fn record_activating_status(staging: &Staging, ready: &Ready) {
     crate::status::record(
         staging,
@@ -3442,14 +4106,24 @@ fn record_activating_status(staging: &Staging, ready: &Ready) {
     );
 }
 
+/// The boot swap's refusal while ANOTHER update trial holds the install — a
+/// sibling install's, or an older build's that never confirmed — MARKED PASSING:
+/// the trial confirms, reverts, or is escaped (`escape_wedged_foreign_trial`) by
+/// itself, and none of that is a verdict on the staged build's bytes. Unmarked, a
+/// candidate's parent would file it STRUCTURAL against a healthy release.
+fn unconfirmed_trial_refusal(armed_build: u64) -> String {
+    crate::verify::mark_passing(format!(
+        "update trial for build {armed_build} is still unconfirmed"
+    ))
+}
+
 /// The one outcome shape that means "a newer build is staged and this launch
 /// REFUSED to apply it" — the entire answer to an operator's "the build is
 /// staged, so why is it not running?".
 ///
-/// `NotApplicable`/`NoUpdate` are the every-launch common case, so recording them
-/// would rewrite `status.toml` on every single launch and neither is a refusal.
-/// `ReExecFailed` is excluded too: it is a genuine FAILURE that already recorded
-/// its own status line, and the refusal slot is the wrong ledger for it —
+/// `NotApplicable`/`NoUpdate` are the common every-launch case and not refusals, so
+/// recording them would rewrite `status.toml` on every launch. `ReExecFailed` is a
+/// failure that already recorded its own status line;
 /// [`crate::health::Health::record_apply_failure`] clears refusals by design, so
 /// routing a failure through the refusal slot would invert that ordering.
 fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
@@ -3461,29 +4135,24 @@ fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
     }
 }
 
-/// Apply a staged update if it is ready and strictly newer. On success this
-/// re-execs and never returns. See module + crate docs for the full contract.
+/// Applies a staged update if it is ready and strictly newer. On success this
+/// re-execs and never returns. See the module and crate docs for the contract.
 ///
-/// The body is `apply_staged_if_ready_inner`; this wrapper exists so that every
-/// refusal the boot lane can return is recorded in ONE place. Most of the inner
-/// deferrals used to be silent — no `status.toml` line, no health entry, nothing
-/// in the app log — so the lane that runs on every cold launch could refuse the
-/// same staged build forever while `status.toml` kept the stager's "verified and
-/// ready to apply" line and `aterm ctl update status` reported a healthy updater.
-/// The Deferred reason only ever reached stderr, which a Finder/launchd launch
-/// throws away. A refusal nobody can observe reads exactly like an updater that is
-/// not running — the same reasoning that put [`crate::record_apply_refusal`] on
-/// the in-session lane, which this one never called.
+/// The body is `apply_staged_if_ready_inner`; this wrapper records every refusal
+/// the boot lane can return in one place (`status.toml`, the health ledger, the app
+/// log), so a lane refusing on every cold launch is observable, like
+/// [`crate::record_apply_refusal`] on the in-session lane.
 ///
-/// Recording happens OUT here, after the inner call returned: the apply lock (and
-/// `check_boot_health`'s) are both released by then, so the health ledger lock is
-/// never taken underneath them. Do not "simplify" this by writing at each return.
+/// Recording happens here, after the inner call returned: the apply lock (and
+/// `check_boot_health`'s) are released by then, so the health ledger lock is never
+/// taken underneath them. Do not move the writes to each return.
 pub fn apply_staged_if_ready(
     current_build: u64,
     current_commit: Option<&str>,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
+    witness: crate::TrialWitness,
 ) -> ApplyOutcome {
     let outcome = apply_staged_if_ready_inner(
         current_build,
@@ -3491,19 +4160,40 @@ pub fn apply_staged_if_ready(
         handoff_fds,
         handoff_env,
         handoff_target_is_this_build,
+        witness,
     );
     if let Some(reason) = boot_apply_refusal_reason(&outcome) {
         crate::warn(&format!("boot apply refused: {reason}"));
         if let Some(staging) = Staging::resolve() {
-            crate::health::Health::record_apply_refusal(&staging.health(), current_build, reason);
-            crate::status::record(
-                &staging,
-                current_build,
-                &format!("boot apply refused: {reason}"),
-            );
+            record_boot_apply_refusal(&staging, current_build, reason);
         }
     }
     outcome
+}
+
+/// Book one boot-lane refusal: the health ledger's standing refusal and
+/// `status.toml`, after every lock the lane took is let go.
+///
+/// A WAIT FOR A ROSTER CONFIRMATION (gate 4d) also restarts the
+/// stage's pending clock ([`crate::health::Health::restart_pending_update`]). That
+/// clock counts from the stage's first sighting, so across the days the app was
+/// closed, and the overdue notice ("a newer build has waited an hour") would fire at
+/// the first checker cycle of every such launch, before or beside the check that
+/// confirms the stage within seconds. Restarted here, the notice says so only if the
+/// wait outlasts its hour (law L5); the check that confirms restarts it again
+/// ([`confirm_roster_authorization`]), for the lane that then installs it.
+fn record_boot_apply_refusal(staging: &Staging, current_build: u64, reason: &str) {
+    crate::health::Health::record_apply_refusal(&staging.health(), current_build, reason);
+    crate::status::record(
+        staging,
+        current_build,
+        &format!("boot apply refused: {reason}"),
+    );
+    if reason.contains(crate::manifest::ROSTER_UNCONFIRMED_KEY)
+        && let Some(waiting) = Ready::read(&staging.ready)
+    {
+        crate::health::Health::restart_pending_update(&staging.health(), waiting.build_number);
+    }
 }
 
 fn apply_staged_if_ready_inner(
@@ -3512,33 +4202,31 @@ fn apply_staged_if_ready_inner(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target_is_this_build: bool,
+    witness: crate::TrialWitness,
 ) -> ApplyOutcome {
-    // THE SWAP'S OWN COST, for the image that actually pays it. On a download
-    // lane the parent launches the CURRENT binary, so this image is the one that
-    // dittos the bundle and `execve`s — and `exec_preserving_handoff_fds` never
-    // returns, so a timer in the GUI's `main_entry` below the call can never see
-    // it. If a handoff is in flight, every millisecond spent here is spent with
-    // the OUTGOING process's readers parked.
+    // The swap's own cost, for the image that pays it: on a download lane the parent
+    // launches the current binary, so this image dittos the bundle and `execve`s, and
+    // `exec_preserving_handoff_fds` never returns to a timer in the GUI's
+    // `main_entry`. During a handoff every millisecond here is spent with the
+    // outgoing process's readers parked.
     let apply_started = std::time::Instant::now();
     let reexec_nonce = take_reexec_nonce();
     // Consume/clear child authority while startup is single-threaded, but do not
     // let malformed environment suppress crash-loop health observation/revert.
     // Its verdict is applied only after the mandatory boot-health lane below.
     let expected_artifact = take_expected_artifact();
-    // Resolve the private staging root ONCE per launch: boot-health, the re-exec
-    // guard, and the swap path below all share it. Each resolve chmods the 0700
-    // dir synchronously (and this runs before the first frame), so a single
-    // resolve keeps that off the launch critical path.
+    // Resolve the private staging root once per launch: boot-health, the re-exec
+    // guard and the swap path share it. Each resolve chmods the 0700 dir
+    // synchronously before the first frame, so one resolve keeps that off the launch.
     let staging = Staging::resolve();
     let reexec_authority = classify_reexec_authority(staging.as_ref(), reexec_nonce);
 
-    // 1. Boot-health check FIRST, on EVERY launch (re-exec OR a manual relaunch):
-    //    if a sentinel is armed for THIS build, count the launch and, if the build
-    //    is crash-looping (never reached the health checkpoint across
-    //    MAX_BOOT_ATTEMPTS launches), revert to the retained OLD bundle and re-exec
-    //    it. This must run regardless of the re-exec env, because a user manually
-    //    relaunching a crashing build still has to accrue attempts toward the revert
-    //    (the re-exec env is only set on the FIRST post-swap launch).
+    // 1. Boot-health check first, on every launch (re-exec or manual relaunch): if a
+    //    sentinel is armed for this build, count the launch and, if the build is
+    //    crash-looping (no health checkpoint across MAX_BOOT_ATTEMPTS launches),
+    //    revert to the retained OLD bundle and re-exec it. It runs regardless of the
+    //    re-exec env (set only on the first post-swap launch), so manual relaunches of
+    //    a crashing build still accrue attempts.
     if let Some(s) = &staging
         && let Some(outcome) = check_boot_health(
             s,
@@ -3547,6 +4235,7 @@ fn apply_staged_if_ready_inner(
             handoff_fds,
             handoff_env,
             handoff_target_is_this_build,
+            witness,
         )
     {
         return outcome;
@@ -3582,16 +4271,14 @@ fn apply_staged_if_ready_inner(
     if !crate::enabled() {
         return ApplyOutcome::NotApplicable;
     }
-    // WE ARE THE AUTHORIZED CANDIDATE of a seamless handoff (the outgoing process's
-    // target names THIS build): an activation successor, or a download successor
-    // already swapped and re-exec'd into its target. Everything above still ran —
-    // the re-exec nonce and stamp are consumed, the boot-trial launch is counted,
-    // startup authority is settled — but nothing below may SWAP: a newer stage on
-    // disk re-exec'd from here would be a build the parent did not authorize; it
-    // would refuse the target, drop the adopted PTYs and be booked as a structural
-    // failure against a healthy candidate (2026-08-19 audit). The newer stage keeps
-    // for the successor's own apply lane (or the next launch). `NoUpdate` is not a
-    // refusal, so the ledger stays quiet.
+    // We are the authorized candidate of a seamless handoff (the outgoing process's
+    // target names this build): an activation successor, or a download successor
+    // already swapped and re-exec'd. Everything above still ran (the re-exec nonce
+    // and stamp consumed, the boot-trial launch counted, startup authority settled),
+    // but nothing below may swap: re-exec'ing a newer stage would be a build the
+    // parent did not authorize, and it would refuse the target and drop the adopted
+    // PTYs. The newer stage keeps for the successor's own apply lane (or the next
+    // launch). `NoUpdate` is not a refusal, so the ledger stays quiet.
     if handoff_target_is_this_build {
         crate::log(&format!(
             "boot apply: build {current_build} is the handoff's authorized target; any newer \
@@ -3609,27 +4296,23 @@ fn apply_staged_if_ready_inner(
     };
 
     // 3–4. The pre-lock peek, the lock, the work that must hold it, and the decision
-    //    made UNDER it — one function ([`apply_lock_then_ready`]) that the Tier-1
-    //    (`two_processes_arming_one_build_swap_it_once`) drives with a sibling's whole
-    //    apply injected while this launch waits for the lock.
+    //    made under it: one function ([`apply_lock_then_ready`]) that the Tier-1
+    //    test `two_processes_arming_one_build_swap_it_once` drives with a sibling's
+    //    whole apply injected while this launch waits for the lock.
     //
-    //    Serializing the swap across concurrent launches:
-    //
-    // BOUNDED, unlike every other taker of this lock: we are before the window,
-    // so waiting here is a terminal that has not appeared. Every legitimate
-    // holder returns in millis (publish is remove+rename+write) or is itself
-    // bounded (verification by the apply budget, a cross-volume copy by its own
-    // ceiling). A holder that outlasts this one is wedged — SIGSTOPped, paused
-    // under a debugger, stuck on a dead volume — and the right answer then is to
-    // start on the build we already have, not to hang with nothing on screen.
+    // Bounded, unlike every other taker of this lock: we are before the window, so
+    // waiting here is a terminal that has not appeared. Every legitimate holder
+    // returns in milliseconds (publish is remove+rename+write) or is itself bounded
+    // (verification by the apply budget, a cross-volume copy by its ceiling). A
+    // holder that outlasts this is wedged, and we start on the build we have.
     let (_lock, _budget, ready) = match apply_lock_then_ready(
         &staging,
         current_build,
         || {
-            // A sibling's hold past the wait is a MOMENT, marked so (round
-            // four, plan item 2): a seamless successor that returns this stays
-            // the old build and refuses its target, and the parent must read
-            // that as "try again later", not as the new bytes' verdict.
+            // A sibling's hold past the wait is a moment, marked so: a seamless
+            // successor that returns this stays the old build and refuses its
+            // target, and the parent must read that as "try again later", not as
+            // the new bytes' verdict.
             FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
                 .map_err(|e| ApplyOutcome::Deferred(crate::verify::lock_wait_refusal("lock", &e)))
         },
@@ -3637,64 +4320,7 @@ fn apply_staged_if_ready_inner(
             // Everything from here to the swap is verification work on the launch path.
             // One ceiling over all of it (the guard restores any outer budget on drop).
             let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
-            if !recover_abandoned_preswap_trial_if_exact(
-                &staging,
-                &b.app_root,
-                current_build,
-                current_commit,
-            ) {
-                let armed_build = boot_sentinel(&staging)
-                    .read_state()
-                    .map_or(0, |(build, _)| build);
-                // THE JUST-SWAPPED SHAPE (2026-09-14, audit BA-7): a sibling cold launch
-                // that lost the apply-lock race is still the OLD image, and the bundle
-                // under it now holds the NEW build mid-trial — installed == armed, both
-                // newer than this process. That is a healthy apply in progress, not a
-                // wedged trial: it must neither spend the foreign-trial budget (three such
-                // launches would disarm a live trial) nor be booked as a refusal. This
-                // image keeps running; the check lane's installed-bundle announcement
-                // activates it later. The plist read is bounded and the trial owner's
-                // sentinel keeps its authority either way.
-                if armed_build != 0
-                    && armed_build > current_build
-                    && crate::verify::bundle_build_number(&b.app_root).ok() == Some(armed_build)
-                {
-                    crate::log(&format!(
-                        "boot apply: build {armed_build} is already installed and mid-trial; this \
-                     launch is the previous build {current_build} and leaves the trial to its owner"
-                    ));
-                    return Err(ApplyOutcome::NoUpdate);
-                }
-                // A sentinel armed for a build that is not the running one can never be
-                // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
-                // future apply forever. Budget it — with its own counter, never the
-                // trial's. The SAME-build case that another install owns is the same
-                // wedge for THIS process (`check_boot_health` rightly does not count us,
-                // and the owner may never run again), so it takes the same budget.
-                if armed_build != 0
-                    && (armed_build != current_build || !trial_owned_by(&staging, &b.app_root))
-                {
-                    escape_wedged_foreign_trial(&staging, current_build, armed_build);
-                }
-                return Err(ApplyOutcome::Deferred(format!(
-                    "update trial for build {armed_build} is still unconfirmed"
-                )));
-            }
-            // The mismatched-sentinel lane is behind us for this launch, so no budget is
-            // outstanding; never let one accumulate across unrelated trials.
-            let _ = foreign_trial_counter(&staging).confirm();
-            // Under the lock no other swap is in flight, so it is safe to clear orphaned
-            // transient swap copies from a previously interrupted/completed swap.
-            if let ReadyState::Newer(orphaned_ready) = read_ready(&staging, current_build)
-                && let Err(error) = recover_orphaned_prepared_candidate(
-                    &staging,
-                    &b.app_root,
-                    current_build,
-                    &orphaned_ready,
-                )
-            {
-                return Err(ApplyOutcome::Deferred(error));
-            }
+            settle_trials_under_apply_lock(&staging, &b.app_root, current_build, current_commit)?;
             Ok(budget)
         },
     ) {
@@ -3710,29 +4336,26 @@ fn apply_staged_if_ready_inner(
         ));
     }
 
-    // 4b/4c. The floor's withdrawals: a yank, and a revoked signer.
-    if let Some(outcome) = floor_withdrawal_gate(&staging, current_build, &ready) {
+    // 4b/4c/4d. The floor's withdrawals (a yank, a revoked signer), the published
+    // stage, and the age of its roster confirmation.
+    if let Some(outcome) = stage_admission_gates(&staging, current_build, &ready, unix_now_secs()) {
         return outcome;
     }
-    if !ready.is_publishable(&staging) {
-        staging.retire_published();
-        return ApplyOutcome::NoUpdate;
-    }
 
-    // 5. Can we even write the install location? Checked BEFORE the (more
-    //    expensive) re-verification so a persistently non-writable install (e.g.
-    //    an admin-owned /Applications) doesn't re-verify the staged bundle on every
-    //    single launch — there's nothing we could do with it anyway.
-    if !bundle::parent_writable(&b.app_root) {
+    // 5. Can we write the install location? Checked before the more expensive
+    //    re-verification, so a persistently non-writable install (e.g. an
+    //    admin-owned /Applications) does not re-verify the stage on every launch.
+    if let Err(refusal) = install_location_check(&b.app_root) {
         crate::status::record(
             &staging,
             current_build,
-            "deferred: install location not writable",
+            if crate::is_passing_refusal(&refusal) {
+                "deferred: install location could not be written just then"
+            } else {
+                "deferred: install location not writable"
+            },
         );
-        return ApplyOutcome::Deferred(format!(
-            "install location not writable: {}",
-            b.app_root.display()
-        ));
+        return ApplyOutcome::Deferred(refusal);
     }
 
     // 6. Apply-time re-verification (TOCTOU defence), tiered like stage time.
@@ -3740,12 +4363,10 @@ fn apply_staged_if_ready_inner(
     // commit can never authenticate a target while we later rename the symlink.
     let (staged_build, sealed_commit) = match verified_bundle_identity(&staging.staged_app) {
         Ok(identity) => identity,
-        // A VERIFICATION THAT DID NOT FINISH KEEPS THE STAGE (round four, plan
-        // item 2). Discarding is the answer to a verdict on the bytes; a
-        // `codesign` that ran out of the apply budget on a loaded machine is not
-        // one, and discarding for it cost a whole re-download on the checker's
-        // cadence — hours of a healthy build held off the machine. The swap
-        // re-verifies at the next attempt anyway, so keeping it trusts nothing.
+        // A verification that did not finish keeps the stage: discarding answers a
+        // verdict on the bytes, and a `codesign` out of the apply budget is not one
+        // (discarding would cost a re-download). The swap re-verifies at the next
+        // attempt anyway, so keeping it trusts nothing.
         Err(error) if !stage_failure_is_a_verdict(&error) => {
             crate::warn(&format!(
                 "staged bundle re-verification did not finish: {error}; keeping the stage \
@@ -3771,11 +4392,11 @@ fn apply_staged_if_ready_inner(
             return ApplyOutcome::Deferred(format!("re-verify: {error}"));
         }
     };
-    // 6b. Re-bind the codesign-sealed CFBundleVersion at APPLY time too, not just at
-    //     stage time: the strictly-newer gate above trusts ready.toml's build_number,
-    //     which is unauthenticated local state. Require the number SEALED into the
-    //     staged bundle to equal it and to still exceed the running build, so a
-    //     swapped-in older-but-genuine bundle (with a rewritten marker) is caught (F10).
+    // 6b. Re-bind the codesign-sealed CFBundleVersion at apply time too: the
+    //     strictly-newer gate above trusts ready.toml's build_number, which is
+    //     unauthenticated local state. The number sealed into the staged bundle must
+    //     equal it and still exceed the running build, so a swapped-in
+    //     older-but-genuine bundle with a rewritten marker is caught.
     if staged_build != ready.build_number || staged_build <= current_build {
         crate::warn(&format!(
             "staged bundle CFBundleVersion {staged_build} != marker build {} or not newer than \
@@ -3807,17 +4428,13 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::Deferred("commit rebind mismatch".to_string());
     }
 
-    // 7-pre. ON A CROSS-VOLUME INSTALL ONLY, ask the cheap-to-answer question
-    // first (2026-09-14, audit SV-5): can the installed bundle be the rollback
-    // source at all? The authoritative answer is re-asked below, AFTER the
-    // candidate is prepared (TOCTOU hygiene — the swap must trust nothing older
-    // than the exchange). But preparing a candidate across volumes is a ≤120 s
-    // `ditto` plus a five-helper re-verify, and an install that cannot verify
-    // (a hand-installed or ad-hoc bundle) did all of that on EVERY cold launch
-    // only to undo it. On the common same-volume path the preparation is two
-    // renames and the early pass would put five helper spawns back on every
-    // successful launch (the law recorded at `prepare_fixed_swap_candidate`), so
-    // it is gated on the volume.
+    // 7-pre. On a cross-volume install only, ask early whether the installed bundle
+    // can be the rollback source at all. The authoritative answer is re-asked after
+    // the candidate is prepared (the swap trusts nothing older than the exchange),
+    // but cross-volume preparation is a ≤120 s `ditto` plus a five-helper re-verify,
+    // wasted on every launch of an install that cannot verify. On the same-volume
+    // path preparation is two renames, and an early pass would add five helper
+    // spawns to every launch (see `prepare_fixed_swap_candidate`).
     if !same_volume(&staging.staged_app, &b.app_root)
         && let Err(error) = verified_bundle_identity(&b.app_root)
     {
@@ -3826,9 +4443,9 @@ fn apply_staged_if_ready_inner(
             installed_source_refusal(&b.app_root, &error)
         ));
     }
-    // 7. Prepare/verify NEW at the fixed destination-volume recovery path BEFORE
-    // the point of no return. One atomic exchange then puts NEW at installed and
-    // OLD directly at that fixed path; every process-crash cut is discoverable.
+    // 7. Prepare and verify NEW at the fixed destination-volume recovery path before
+    // the point of no return. One atomic exchange then puts NEW at installed and OLD
+    // at that fixed path; every process-crash cut is discoverable.
     let prepared = match prepare_fixed_swap_candidate(
         &staging,
         &b.app_root,
@@ -3841,9 +4458,9 @@ fn apply_staged_if_ready_inner(
     };
 
     // The atomic exchange makes the current canonical bundle the sole rollback
-    // source. Prove OLD itself is the signed/sealed running build immediately
-    // before arming and swapping, after any slow cross-volume candidate copy. A
-    // corrupt/replaced install must never become crash-recovery authority.
+    // source. Prove OLD is the signed, sealed running build immediately before
+    // arming and swapping (after any slow cross-volume copy): a corrupt or replaced
+    // install must never become crash-recovery authority.
     let (old_build, old_commit) = match verified_bundle_identity(&b.app_root) {
         Ok((build, commit))
             if identity_matches_running(build, &commit, current_build, current_commit) =>
@@ -3859,35 +4476,28 @@ fn apply_staged_if_ready_inner(
         }
         Err(error) => {
             recover_prepared_candidate(&prepared, &staging);
-            // The same refusal the seamless lane mints, remedy included: the
-            // cold launch is the "fallback" the stager promises, and on this
-            // bundle it refuses for the same reason — and, the same way, only
-            // a verdict carries the remedy (a check that did not finish is
-            // retried).
+            // The same refusal the seamless lane mints, remedy included; only a
+            // verdict carries the remedy (a check that did not finish is retried).
             return ApplyOutcome::Deferred(format!(
                 "current installed rollback source is not verified: {}",
                 installed_source_refusal(&b.app_root, &error)
             ));
         }
     };
-    // Preserve only a receipt that is authority for the exact sealed OLD bundle
-    // just rechecked above. A well-formed but stale receipt is unsigned local
-    // state and must not be resurrected after an inverse swap.
+    // Preserve only a receipt that is authority for the exact sealed OLD bundle just
+    // rechecked. A well-formed but stale receipt is unsigned local state and must not
+    // be resurrected after an inverse swap.
     let previous_receipt = previous_receipt_for_sealed_old(&staging, old_build, &old_commit);
 
-    // 7b. THE CANDIDATE MUST BE ABLE TO START. Every check so far is cryptographic;
-    // none of them proves the binary LOADS. The crash-loop sentinel cannot cover that
-    // case — it runs inside the new build's own `main` — so a bundle that dyld or
-    // Gatekeeper rejects before `main` would be swapped in and never reverted, leaving
-    // a bricked app beside the verified predecessor it should have rolled back to.
-    // Start it once, here, while OLD is still installed and backing out is free.
+    // 7b. The candidate must be able to start. Every check so far is cryptographic,
+    // and the crash-loop sentinel runs inside the new build's own `main`, so a bundle
+    // dyld or Gatekeeper rejects before `main` would be swapped in and never
+    // reverted. Start it once here, while OLD is installed and backing out is free.
     if let Err(error) = crate::verify::probe_bundle_starts(&prepared.fixed, ready.build_number) {
         recover_prepared_candidate(&prepared, &staging);
-        // A probe that could not RUN to an answer (it timed out on a loaded
-        // machine, or the kernel would not start it just then) is not a
-        // candidate that cannot start: no failure memo for the artifact, whose
-        // backoff would suppress re-staging healthy bytes (round four, plan
-        // item 2).
+        // A probe that could not run to an answer (timed out, or the kernel would
+        // not start it) is not a candidate that cannot start: no failure memo, whose
+        // backoff would suppress re-staging healthy bytes.
         if stage_failure_is_a_verdict(&error) {
             crate::manifest::FailedMark::record_stage_failure(
                 &staging.failed(),
@@ -3900,7 +4510,7 @@ fn apply_staged_if_ready_inner(
     }
 
     // 8. Arm exact crash-loop authority only after fixed NEW is fully verified and
-    // immediately before the atomic swap. A crash after this boundary has one
+    // immediately before the atomic swap. A crash after this point has one
     // deterministic pre-swap shape: installed=OLD, fixed=NEW, ready+trial exact.
     let sentinel = match prepare_trial(&staging, &ready, &b.app_root) {
         Ok(sentinel) => sentinel,
@@ -3917,15 +4527,15 @@ fn apply_staged_if_ready_inner(
                     "{error}; trial disarm failed: {disarm_error}"
                 ));
             }
-            crate::manifest::FailedMark::clear(&staging.trial());
+            clear_trial_identity(&staging);
             recover_prepared_candidate(&prepared, &staging);
             return ApplyOutcome::Deferred(error);
         }
     };
 
-    // Persist exact install provenance only AFTER the fixed-path swap. The atomic
-    // receipt replacement retires the previous installed artifact's proof at
-    // precisely the next complete transaction.
+    // Persist exact install provenance only after the fixed-path swap. The atomic
+    // receipt replacement retires the previous artifact's proof at exactly the next
+    // complete transaction.
     let ready_commit = ready
         .commit
         .as_deref()
@@ -3936,35 +4546,24 @@ fn apply_staged_if_ready_inner(
         ready_commit,
         &ready.dmg_sha256,
     ) {
-        crate::warn(&format!(
-            "could not commit installed artifact receipt after swap: {error}; rolling back"
-        ));
-        if let Err(rollback_error) = restore_rollback(&retained, &b.app_root) {
-            // NEW remains installed. Preserve sentinel+trial+receipt state so the
-            // physical rollback can be retried; never erase recovery authority.
-            return ApplyOutcome::Deferred(format!(
-                "installed receipt: {error}; pre-exec rollback also failed: {rollback_error}"
-            ));
-        }
-        if let Err(disarm_error) = sentinel.confirm() {
-            return ApplyOutcome::Deferred(format!(
-                "installed receipt: {error}; rollback succeeded but trial disarm failed: {disarm_error}"
-            ));
-        }
-        crate::manifest::FailedMark::clear(&staging.trial());
-        recover_prepared_stage(&retained, &staging);
-        return ApplyOutcome::Deferred(format!("installed receipt: {error}"));
+        return roll_back_unreceipted_swap(
+            &prepared,
+            &retained,
+            &b.app_root,
+            &sentinel,
+            &staging,
+            &error,
+        );
     }
     // Don't let it re-apply on the next launch. This retirement cannot touch the
     // fixed rollback sibling; it removes only ready + the duplicate staged NEW.
     staging.retire_published();
     record_activating_status(&staging, &ready);
 
-    // 9. Write the single-use re-exec nonce stamp (0600, in our 0700 dir) BEFORE exec
-    //    so the post-swap guard can prove this launch is genuinely our re-exec (F9). If
-    //    a nonce can't be made, pass the legacy marker "1": the guard then finds no
-    //    matching stamp and takes the safe normal path (a no-op, since `ready` is
-    //    already removed) instead of the cleanup shortcut.
+    // 9. Write the single-use re-exec nonce stamp (0600, in our 0700 dir) before exec
+    //    so the post-swap guard can prove this launch is our re-exec. If no nonce can
+    //    be made, pass the marker "1": the guard finds no matching stamp and takes the
+    //    safe normal path (a no-op, since `ready` is already removed).
     let nonce = random_nonce().unwrap_or_default();
     let reexec_value = if nonce.is_empty() {
         "1".to_string()
@@ -3992,9 +4591,9 @@ fn apply_staged_if_ready_inner(
     let new_exe = &b.exe;
     let mut reexec = boot_reexec_command(new_exe, &reexec_value, current_build, handoff_env);
     let err = exec_preserving_handoff_fds(&mut reexec, handoff_fds); // never returns on success
-    // exec ITSELF failed (not a later crash): the nonce stamp we wrote is now stale —
-    // remove it (F9); then restore the OLD bundle from the retained rollback source,
-    // drop the failed new build, and disarm the sentinel (below).
+    // exec itself failed (not a later crash): the nonce stamp is now stale, so remove
+    // it; then restore the OLD bundle from the retained rollback source, drop the
+    // failed new build, and disarm the sentinel (below).
     let _ = std::fs::remove_file(staging.reexec_stamp());
     crate::warn(&format!(
         "re-exec of {} failed: {err}; rolling back to the previous build",
@@ -4016,28 +4615,23 @@ fn apply_staged_if_ready_inner(
     let _ = std::fs::remove_dir_all(&retained);
     let receipt_restore_error =
         restore_installed_receipt(&staging, previous_receipt.as_ref()).err();
-    // Suppress the build whose exec failed so the next check doesn't re-download +
-    // re-apply it every interval (C1). We still hold `ready` here.
+    // Suppress the build whose exec failed so the next check does not re-download
+    // and re-apply it every interval. We still hold `ready` here.
     //
-    // BUDGETED, not permanent: this is ONE failed `execve` after a successful
-    // rollback — the machine is sitting on its previous, working build. An exec
-    // can fail for reasons that are nothing to do with the artifact (ENOMEM, a
-    // transient text-file-busy, an unlucky moment during a Gatekeeper scan), and
-    // permanently refusing the only newer build on the channel would strand this
-    // machine with no user-visible cause. The crash-loop revert below is the case
-    // that stays permanent, because there the build PROVED itself bad.
+    // Budgeted, not permanent: this is one failed `execve` after a successful
+    // rollback, and an exec can fail for reasons unrelated to the artifact (ENOMEM,
+    // text-file-busy, a Gatekeeper scan). The crash-loop revert below stays
+    // permanent, because there the build proved itself bad.
     crate::manifest::FailedMark::record_stage_failure(
         &staging.failed(),
         ready.build_number,
         &ready.dmg_sha256,
         unix_now_secs(),
     );
-    crate::manifest::FailedMark::clear(&staging.trial());
-    // Booked in the failure ledger too (2026-09-14): a swap that was rolled
-    // back because the new binary would not exec is an apply that failed, and
-    // the wrapper deliberately leaves `ReExecFailed` out of the refusal slot
-    // ("a re-exec FAILURE belongs in the failure ledger") — which nothing
-    // wrote until now.
+    clear_trial_identity(&staging);
+    // Booked in the failure ledger: a swap rolled back because the new binary
+    // would not exec is an apply that failed, and the wrapper leaves
+    // `ReExecFailed` out of the refusal slot.
     crate::health::Health::record_apply_failure(
         &staging.health(),
         current_build,
@@ -4058,11 +4652,6 @@ fn apply_staged_if_ready_inner(
     })
 }
 
-/// On every launch: if the boot sentinel is armed for `current_build`, count this
-/// launch and, if the build has failed to confirm across [`MAX_BOOT_ATTEMPTS`]
-/// launches (a crash loop), revert to the retained OLD bundle and re-exec it.
-/// Returns `Some` only in the revert path (which normally re-exec's away and does
-/// not return); `None` to continue booting the current build.
 /// Which boot-health lane a counted launch takes ([`boot_health_lane`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BootHealthLane {
@@ -4073,18 +4662,14 @@ enum BootHealthLane {
     CountOnly,
 }
 
-/// THE FIRST COUNTED LAUNCH OF A HANDOFF TARGET IS COUNT-ONLY (2026-09-19). The
-/// image that swapped the bundle proved both identities and recorded the receipt
-/// before it stamped the re-exec, moments ago; re-proving them here cost the
-/// 0.87.0→0.88.0 apply 430 ms of codesign inside the parked window ("update apply
-/// (boot): NotApplicable in 430 ms — this ran with the outgoing process's readers
-/// still parked"). So a launch that is the live parent's authorized handoff target
-/// (`handoff_target_is_this_build`) and the trial's first counted launch skips the
-/// proof: the launch is still counted (a crash before the checkpoint still climbs
-/// toward the revert), and the SAME proof runs at `confirm_boot_health` — after
-/// Commit, off the park — which is where a healthy trial is disarmed anyway. A
-/// second counted launch (a relaunch after a crash, a sibling cold launch inside
-/// the window) proves in full as before: degraded, never unsafe.
+/// The first counted launch of a handoff target is count-only. The image that
+/// swapped the bundle proved both identities and recorded the receipt just before
+/// stamping the re-exec, and re-proving them here would run codesign inside the
+/// parked window. So the live parent's authorized target
+/// (`handoff_target_is_this_build`) on the trial's first counted launch skips the
+/// proof: the launch is still counted (a crash still climbs toward the revert), and
+/// the same proof runs at `confirm_boot_health`, after Commit, where a healthy
+/// trial is disarmed anyway. Any later counted launch proves in full.
 fn boot_health_lane(handoff_target: bool, attempts_after_launch: u32) -> BootHealthLane {
     if handoff_target && attempts_after_launch <= 1 {
         BootHealthLane::CountOnly
@@ -4109,6 +4694,11 @@ mod boot_health_lane_tests {
     }
 }
 
+/// On every launch: if the boot sentinel is armed for `current_build`, counts this
+/// launch and, if the build has failed to confirm across [`MAX_BOOT_ATTEMPTS`]
+/// launches (a crash loop), reverts to the retained OLD bundle and re-execs it.
+/// Returns `Some` only in the revert path (which normally execs away); `None` to
+/// continue booting the current build.
 fn check_boot_health(
     staging: &Staging,
     current_build: u64,
@@ -4116,6 +4706,7 @@ fn check_boot_health(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target: bool,
+    witness: crate::TrialWitness,
 ) -> Option<ApplyOutcome> {
     check_boot_health_with_lock_wait(
         staging,
@@ -4124,10 +4715,14 @@ fn check_boot_health(
         handoff_fds,
         handoff_env,
         handoff_target,
+        witness,
         APPLY_LOCK_WAIT,
+        bundle::resolve_layout,
     )
 }
 
+/// [`check_boot_health`] with the apply-lock wait and the install resolver named
+/// (`resolve_installed`: `bundle::resolve_layout` in production).
 #[allow(clippy::too_many_arguments)]
 fn check_boot_health_with_lock_wait(
     staging: &Staging,
@@ -4136,16 +4731,37 @@ fn check_boot_health_with_lock_wait(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
     handoff_target: bool,
+    witness: crate::TrialWitness,
     lock_wait: std::time::Duration,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
 ) -> Option<ApplyOutcome> {
     let sentinel = boot_sentinel(staging);
+    let armed_for_this_build =
+        |sentinel: &Sentinel| matches!(sentinel.read_state(), Some((b, _)) if b == current_build);
+    // A WINDOW LAUNCH OF A BUILD A HEADLESS LAUNCH SETTLED may put it back on
+    // trial: see `window_unproven_path`. Peeked here,
+    // decided under the lock.
+    let retrial = witness == crate::TrialWitness::Window
+        && !armed_for_this_build(&sentinel)
+        && window_unproven_names(staging, current_build);
     // Cheap non-mutating early-out: nothing armed for us. A sentinel for another
     // build belongs to that build and is never "stale" authority for this process.
-    if !matches!(sentinel.read_state(), Some((b, _)) if b == current_build) {
+    if !armed_for_this_build(&sentinel) && !retrial {
         return None;
     }
     let apply_lock = match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
         Ok(lock) => lock,
+        // A re-trial that cannot take the lock is not attempted: nothing is armed,
+        // and this launch goes on exactly as it would have without the record.
+        Err(error) if retrial => {
+            crate::warn(&format!(
+                "build {current_build} was settled by a headless launch, and this window \
+                 launch could not take the apply lock to put it back on trial ({}); it is \
+                 not counted against it",
+                crate::verify::lock_wait_refusal("health lock", &error)
+            ));
+            return None;
+        }
         Err(error) => {
             return Some(ApplyOutcome::Deferred(crate::verify::lock_wait_refusal(
                 "health lock",
@@ -4155,12 +4771,23 @@ fn check_boot_health_with_lock_wait(
     };
     // Revalidate after acquiring the transaction lock. Another process may have
     // armed a newer build between the cheap peek and this point.
-    if !matches!(sentinel.read_state(), Some((b, _)) if b == current_build) {
+    if !armed_for_this_build(&sentinel) && !retrial {
         return None;
     }
     // Finalizing a swap a previous run already made — installs nothing — so the dev
     // mark must not strand an armed trial. See `bundle::resolve_layout`.
-    let b = bundle::resolve_layout()?;
+    let b = resolve_installed()?;
+    if !armed_for_this_build(&sentinel)
+        && !rearm_window_unproven_trial(
+            staging,
+            &sentinel,
+            current_build,
+            &b.app_root,
+            unix_now_secs(),
+        )
+    {
+        return None;
+    }
     // NOT OUR TRIAL: a same-build process launched from a bundle the trial did not
     // swap must not count, revert or disarm it — see `trial_owned_by`.
     if !trial_owned_by(staging, &b.app_root) {
@@ -4171,31 +4798,30 @@ fn check_boot_health_with_lock_wait(
         ));
         return None;
     }
-    // COUNT THE LAUNCH FIRST. This used to run after the recovery proof below, so a
-    // trial whose proof failed every boot never advanced its attempt counter, never
-    // reached MAX_BOOT_ATTEMPTS, and therefore never reverted OR confirmed: the
-    // sentinel stayed armed forever and this function returned `Deferred` on every
-    // subsequent launch, which makes `apply_staged_if_ready` return early forever.
-    // The machine kept running (and kept downloading and staging updates) but could
-    // never apply another one, with nothing in the UI to say why. The attempt count
-    // must measure LAUNCHES OBSERVED, which is a fact about this boot, not a
-    // conclusion that depends on a proof that may itself be what is broken.
+    // Count the launch first. The attempt count measures launches observed, a fact
+    // about this boot; if it waited on the recovery proof below, a trial whose proof
+    // fails every boot would never reach MAX_BOOT_ATTEMPTS, never revert or confirm,
+    // and block every future apply.
     //
-    // A BURST IS ONE LAUNCH (2026-09-14): a second process of the trial build
-    // starting within `BOOT_LAUNCH_BURST_WINDOW` of the last counted one is the
-    // same launch event, not a relaunch after a crash — see `launch_is_burst`.
-    let attempts_now = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
-    let sentinel_age = mtime(&staging.root.join("boot.sentinel")).and_then(|t| t.elapsed().ok());
-    if launch_is_burst(attempts_now, sentinel_age) {
-        crate::log(&format!(
-            "boot sentinel for build {current_build}: a launch {} ms after the last counted \
-             one is the same burst and is not counted (attempt {attempts_now} stands)",
-            sentinel_age.map_or(0, |age| age.as_millis())
-        ));
-    } else if let Err(error) = sentinel.observe_launch(current_build) {
-        return Some(ApplyOutcome::Deferred(format!(
-            "trial launch observation: {error}"
-        )));
+    // A burst is one launch: another process of the trial build starting within
+    // `BOOT_LAUNCH_BURST_WINDOW` of the last counted one (`launch_is_burst`).
+    //
+    // AN OVERLAPPING HANDOFF TARGET IS NOT A RELAUNCH: the
+    // authorized handoff target of this build, launched while an earlier launch of
+    // this trial is still running — see `count_trial_launch`. Any other launch
+    // counts, however many earlier launchers live, or this escape is lost.
+    //
+    // A HEADLESS LAUNCH OF A TRIAL A WINDOW HAS LAUNCHED IS NO EVIDENCE either way
+    // — see `count_trial_launch`.
+    if let Err(error) = count_trial_launch(
+        staging,
+        &sentinel,
+        current_build,
+        TrialLauncher::this_process(),
+        handoff_target,
+        witness,
+    ) {
+        return Some(ApplyOutcome::Deferred(error));
     }
     let attempts_after = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
     if boot_health_lane(handoff_target, attempts_after) == BootHealthLane::CountOnly
@@ -4219,17 +4845,12 @@ fn check_boot_health_with_lock_wait(
                         "trial recovery proof: {error}"
                     )));
                 }
-                // BUDGET EXHAUSTED. Reverting is the right answer whenever it is
-                // AVAILABLE — a verified predecessor sitting at the fixed rollback
-                // path — because this trial can no longer be confirmed and the build
-                // is, by the sentinel's own count, failing to reach its checkpoint.
-                // The proof that just failed is a CONJUNCTION (rollback ∧ sealed
-                // identity ∧ trial marker ∧ receipt), and only its first term speaks
-                // to whether a revert can be performed; treating any failure of the
-                // later terms as "the rollback is unprovable" left a crash-looping
-                // build installed beside a perfectly good predecessor, which is the
-                // outcome the whole sentinel exists to prevent (2026-08-19 round-4
-                // skeptics). Re-derive that first term alone and revert on it.
+                // Budget exhausted. Revert whenever a verified predecessor sits at
+                // the fixed rollback path: this trial can no longer be confirmed and
+                // the build is failing to reach its checkpoint. The proof that failed
+                // is a conjunction (rollback ∧ sealed identity ∧ trial marker ∧
+                // receipt), and only its first term decides whether a revert can be
+                // performed, so re-derive that term alone and revert on it.
                 if let Ok(rollback) = ensure_fixed_rollback(&b.app_root, current_build) {
                     crate::warn(&format!(
                         "trial recovery proof failed {MAX_BOOT_ATTEMPTS} launches in a row \
@@ -4250,12 +4871,10 @@ fn check_boot_health_with_lock_wait(
                         apply_lock,
                     ));
                 }
-                // No verified predecessor: reverting is genuinely unavailable.
-                // Staying armed is the strictly worse option: this build demonstrably
-                // BOOTS — we are executing its code, this many times in a row — and
-                // remaining armed only guarantees that no future update can ever
-                // apply. Disarm, keep running, and make the reason loud and durable
-                // instead of silently bricking the updater.
+                // No verified predecessor: reverting is unavailable. Staying armed
+                // would only guarantee no future update can apply, while this build
+                // demonstrably boots. Disarm, keep running, and make the reason loud
+                // and durable.
                 let disarm = sentinel.confirm();
                 crate::health::Health::record_apply_failure(
                     &staging.health(),
@@ -4308,6 +4927,31 @@ fn check_boot_health_with_lock_wait(
     ))
 }
 
+/// The crash-loop revert's re-exec of the restored build: the launch's own
+/// argv `args`, pinned to its mode exactly as the boot swap's re-exec is
+/// ([`window_successor_args`]), and the handoff authority variables the GUI's
+/// prearm consumed.
+///
+/// THE PIN. The revert runs before the launch is served, so a window started as
+/// `aterm --window` from a shell still has that terminal on stdin: handed the
+/// stripped argv alone, the one-binary router would read it as a SESSION and
+/// bring the restored build up nested in that terminal. Every build a revert can
+/// restore postdates the router (d2a29b6c7, an ancestor of v0.21.0) and strips
+/// the pin: a rollback slot holds the build that applied the update, and installs
+/// older than the router cannot update.
+fn rollback_reexec_command(
+    restored_exe: &Path,
+    args: impl Iterator<Item = std::ffi::OsString>,
+    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Command {
+    let mut reexec = Command::new(restored_exe);
+    for (key, value) in handoff_env {
+        reexec.env(key, value);
+    }
+    reexec.args(window_successor_args(args));
+    reexec
+}
+
 /// Captured descriptors and the authority environment restored together when
 /// rollback re-execs the predecessor during an inherited handoff.
 struct RollbackHandoff<'a> {
@@ -4315,10 +4959,10 @@ struct RollbackHandoff<'a> {
     env: &'a [(std::ffi::OsString, std::ffi::OsString)],
 }
 
-/// The trialed build is crash-looping: swap the retained OLD bundle back over the
-/// install, discard the failed new build + sentinel + staged bundle, and re-exec
-/// the restored OLD binary. A missing/temporarily failing inverse swap preserves
-/// all recovery authority and returns Deferred; NEW may still be installed.
+/// The trialed build is crash-looping: swaps the retained OLD bundle back over the
+/// install, discards the failed new build, sentinel and staged bundle, and re-execs
+/// the restored OLD binary. A missing or temporarily failing inverse swap keeps all
+/// recovery authority and returns Deferred; NEW may still be installed.
 fn revert_to_rollback(
     b: &bundle::Bundle,
     staging: &Staging,
@@ -4359,50 +5003,37 @@ fn revert_to_rollback(
             "rollback succeeded but trial disarm failed: {error}"
         ));
     }
-    // Poison the crash-looping build so the next background check doesn't re-download +
-    // re-apply it into another crash/revert loop (C1). Its DMG sha was recorded beside
-    // the sentinel at arm time (we no longer hold `ready`); guard on the build match.
+    // Poison the crash-looping build so the next check does not re-download and
+    // re-apply it into another crash/revert loop. Its DMG sha was recorded beside the
+    // sentinel at arm time (we no longer hold `ready`); guard on the build match.
     //
-    // PERMANENT on purpose (unlike the re-exec-failure path above): reaching here
-    // means the build was swapped in and then failed to confirm boot health
-    // MAX_BOOT_ATTEMPTS times in a row. That is the build proving itself bad on
-    // this machine, and re-applying it on a timer would just re-enter the
-    // crash/revert loop. The escape is a newer build or a re-publish under a
-    // different digest — both of which clear the memo by key.
+    // Permanent, unlike the re-exec failure path: the build failed to confirm boot
+    // health MAX_BOOT_ATTEMPTS times in a row on this machine. The escape is a newer
+    // build or a re-publish under a different digest, which clear the memo by key.
     if let Some(t) = crate::manifest::FailedMark::read(&staging.trial())
         && t.build_number == current_build
     {
-        // QUARANTINE, not `record`. The old call wrote the memo with `retry_after = 0`
-        // meaning "forever" — but `FailedMark::suppresses`, the only reader, treats a
-        // zero deadline as "already elapsed". The poison was written and then ignored,
-        // so the next background check (75 s later) re-downloaded and re-applied the
-        // build that had just crash-looped, and the machine went straight back around
-        // the crash/revert loop this code exists to break.
-        //
-        // INTO ITS OWN LEDGER TOO (round six, finding 32): `failed.toml` holds one
-        // artifact, and the next stage event of any other build overwrote this.
+        // Quarantine, not `record`: `FailedMark::suppresses` treats a zero
+        // `retry_after` as already elapsed, so a "forever" memo would be ignored.
+        // It also goes to its own ledger, since `failed.toml` holds one artifact
+        // and the next stage event of another build overwrites it.
         crate::manifest::quarantine_artifact(staging, t.build_number, &t.sha256);
     }
     // OLD is restored at the install; failed NEW sits at rb. Disarm succeeded, so
     // transaction cleanup cannot leave an armed trial without recovery metadata.
     let _ = std::fs::remove_dir_all(&rb);
     crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
-    crate::manifest::FailedMark::clear(&staging.trial());
+    clear_trial_identity(staging);
     staging.retire_published(); // the staged build is bad — never re-apply it
-    // BOOKED IN THE FAILURE LEDGER (2026-09-14): the one outcome that means the
-    // update landed and was taken back used to leave `health.toml` at
-    // `apply_failures = 0`, so `update status` said failing=0, the pull-down
-    // never showed the failing row, the persistent notice could not fire, and
-    // the only trace — one status line — was overwritten by the next check.
-    // The user experienced an app that silently went back a version.
-    // THE FLOOR, SAID OUT LOUD (2026-09-14, audit BA-4). The activation lane
-    // refuses an installed bundle below the operator floor ("a yanked build found
-    // under our own path is still a yanked build"); the revert restores whatever
-    // verified predecessor the fixed path holds, and a crash loop is strictly
-    // worse than a yank, so it must. But the two lanes must not disagree in
-    // silence: the ledger, the status line and the notice name the breach and the
-    // remedy, so the machine does not sit on a known-bad build with a status
-    // line that reads like a repair.
+    // Booked in the failure ledger: an update that landed and was taken back is a
+    // failed apply, so `update status`, the pull-down and the persistent notice see
+    // it.
+    //
+    // The floor, stated: the activation lane refuses an installed bundle below the
+    // operator floor, while the revert restores whatever verified predecessor the
+    // fixed path holds (a crash loop is worse than a yank). The ledger, the status
+    // line and the notice name the breach and the remedy rather than disagree
+    // silently.
     let floor = crate::manifest::Floor::read(&staging.floor()).min_build;
     let breach = (restored_build < floor).then(|| {
         format!(
@@ -4429,23 +5060,14 @@ fn revert_to_rollback(
     crate::warn(&format!(
         "reverted a crash-looping update to the previous build {restored_build}{breach}"
     ));
-    // Re-exec the restored OLD binary as a FRESH boot: no re-exec env, no sentinel
-    // (already cleared), and nothing staged, so it comes up clean on the old build.
+    // Re-exec the restored OLD binary as a fresh boot: no re-exec env, no sentinel
+    // (already cleared), nothing staged.
     //
-    // THE HANDOFF AUTHORITY RIDES ALONG (2026-09-14, audit BA-6). The handoff
-    // descriptors were already kept open across this exec, but the authority
-    // variables the GUI's prearm consumed were not restored, so a reverted
-    // overlap candidate came up with the fds in its environment and no parent
-    // identity — `rejected malformed inherited handoff`, a stderr-only line — and
-    // the parked parent read EOF with nothing in the log joining the two facts.
-    // With the pairs restored the OLD image re-validates the inherited handoff
-    // and refuses it on target identity through its loud, logged path; the
-    // parent's verdict is the same (the candidate did not commit) and the record
-    // says why.
-    let mut reexec = Command::new(&b.exe);
-    for (key, value) in handoff_env {
-        reexec.env(key, value);
-    }
+    // The handoff authority rides along: the handoff descriptors are kept open
+    // across this exec, and the authority variables the GUI's prearm consumed are
+    // restored, so a reverted overlap candidate re-validates the inherited handoff
+    // and refuses it on target identity through its logged path.
+    let mut reexec = rollback_reexec_command(&b.exe, std::env::args_os().skip(1), handoff_env);
     if !handoff_fds.is_empty() {
         crate::warn(&format!(
             "the crash-loop revert of build {current_build} happened inside a seamless \
@@ -4453,84 +5075,64 @@ fn revert_to_rollback(
              parked outgoing process keeps its sessions"
         ));
     }
-    reexec
-        .args(reexec_forwarded_args(std::env::args_os().skip(1)))
-        // NO --window here: the restored ROLLBACK build may predate the
-        // one-binary router entirely (its gui parser exits 2 on the unknown
-        // flag — a dead relaunch is worse than a mode-imperfect one). A
-        // pre-collapse rollback IS the window binary and needs no flag; a
-        // one-binary rollback launched flag-less from a TTY degrades to a
-        // session but stays alive. That is also why the LEADING `--window`
-        // pins are stripped from the forwarded args: this process's argv
-        // carries one per swap it has ridden, and forwarding any of them to a
-        // pre-collapse rollback is the exit-2 dead relaunch this comment
-        // exists to prevent.
-        ;
     let err = exec_preserving_handoff_fds(&mut reexec, handoff_fds);
     crate::warn(&format!("re-exec of restored build failed: {err}"));
     ApplyOutcome::ReExecFailed(err.to_string())
 }
 
-/// THE RUNNING BUILD TAKES THE INSTALL PATH BACK FROM AN ACTIVATION A NEWER STAGE
-/// SUPERSEDES — the transaction behind [`crate::supersede_installed_activation`].
+/// The running build takes the install path back from an activation a newer stage
+/// supersedes: the transaction behind [`crate::supersede_installed_activation`].
 ///
-/// THE STRAND IT ENDS. A launched-lane candidate boot-applies its stage before it
-/// dials, so when build N's handoff fails, N is left INSTALLED — with its boot trial
-/// armed and unconfirmed, and this process's own build M retained at the fixed
-/// rollback path. Two such failures the bytes answer for converge the GUI's
-/// automatic lane on that activation. A newer verified stage N' then had no way
-/// in: M cannot swap it (the installed bundle is not M, so a swap has no rollback
-/// source — step 7 of the boot apply refuses), a launch of the install path is a
-/// launch of N (which walks N's trial toward the revert, and as the handoff's
-/// authorized target refuses to boot-apply past itself), and N's unconfirmed trial
-/// owns the only rollback slot. So every later release waited for a person.
+/// When build N's handoff fails, a launched-lane candidate has already boot-applied
+/// it, so N is installed with its boot trial armed and unconfirmed and this
+/// process's build M at the fixed rollback path. A newer verified stage N' then has
+/// no way in: M cannot swap it (the installed bundle is not M, so there is no
+/// rollback source), a launch of the install path is a launch of N (which refuses
+/// to boot-apply past itself as the authorized target), and N's trial owns the only
+/// rollback slot.
 ///
-/// THE TRANSACTION, under the apply lock:
+/// The transaction, under the apply lock:
 ///
-/// 1. the REPLACEMENT is real: `ready.toml` names exactly `newer_build`, which is
-///    strictly newer than the activation, at or above the operator floor, and the
-///    staged bundle's SEALED identity (the full codesign policy in production) is
-///    the marker's — "verified like any stage", before anything moves;
-/// 2. the installed bundle is EXACTLY the activation the GUI latched, sealed, and
+/// 1. the replacement is real: `ready.toml` names exactly `newer_build`, strictly
+///    newer than the activation and at or above the operator floor, and the staged
+///    bundle's sealed identity (the full codesign policy in production) is the
+///    marker's, before anything moves;
+/// 2. the installed bundle is exactly the activation the GUI latched, sealed, and
 ///    newer than the running build;
 /// 3. the boot sentinel is armed for it, the trial is this install's
 ///    ([`trial_owned_by`]) and its marker authorizes exactly those bytes
-///    ([`trial_authorizes_candidate`]);
-/// 4. the fixed rollback path holds THIS process's own build, sealed build and
-///    commit ([`identity_matches_running`]) — the predecessor the trial would
-///    revert to, and the one image on the machine known to run;
-/// 5. the inverse exchange ([`restore_rollback`], the crash-loop revert's own):
-///    M back at the install path, N at the fixed path;
-/// 6. the sentinel is DISARMED (`confirm`), never observed: no launch of N is
-///    counted, and N is never executed;
-/// 7. cleanup in `revert_to_rollback`'s order — the retired N at the fixed path,
-///    a receipt that no longer names the installed bundle, the trial marker.
+///    ([`trial_authorizes_candidate`]), and no other window's launch of it is still
+///    running (another window's candidate of N could still Commit onto the bundle
+///    this would delete);
+/// 4. the fixed rollback path holds this process's own build, sealed build and
+///    commit ([`identity_matches_running`]): the one image known to run;
+/// 5. the inverse exchange ([`restore_rollback`], the crash-loop revert's own): M
+///    back at the install path, N at the fixed path;
+/// 6. the sentinel is disarmed (`confirm`), never observed: no launch of N is
+///    counted, and this process never executes N (nor does any window's launch of
+///    it still run: step 3);
+/// 7. cleanup in `revert_to_rollback`'s order: the retired N at the fixed path, a
+///    receipt that no longer names the installed bundle, the trial marker.
 ///
 /// Anything short of all of 1–4 refuses and moves nothing, as a
-/// [`crate::SupersedeRefusal`] that says whether the refusal was about the
-/// MOMENT (the lock, a verification, a stage being replaced — the GUI tries
-/// again after a backoff and puts nothing on glass) or about the DISK's shape
-/// (the GUI still tries again, but says the Version menu moves it). A disarm
-/// that fails AFTER the exchange (step 6) is not a refusal at all: the retire
-/// happened, and [`crate::SupersededActivation::trial_disarm_deferred`] says the
-/// crash cut is left for the next boot apply to finish.
+/// [`crate::SupersedeRefusal`] saying whether the refusal was about the moment or
+/// the disk's shape. A disarm that fails after the exchange is not a refusal: the
+/// retire happened, and [`crate::SupersededActivation::trial_disarm_deferred`] says
+/// the crash cut is left for the next boot apply.
 ///
-/// WHY THIS KEEPS THE SENTINEL / TRIAL / ROLLBACK INVARIANTS:
+/// Invariants kept:
 ///
-/// * the only rename is the atomic exchange the disk transaction model already
-///   covers as the inverse swap, and a crash cut after it and before the disarm
-///   (installed = OLD, fixed = NEW, trial armed for NEW, receipt still NEW's) is
-///   exactly the "crash immediately after inverse rollback" shape
-///   [`recover_abandoned_preswap_trial_if_exact`] finishes on the next boot apply
-///   — which the very next candidate (M's own binary, launched for N') runs before
-///   it swaps anything;
-/// * the rollback copy of M is never destroyed: it becomes the installed bundle,
-///   and it is the running image;
-/// * no trial is re-armed here; N' gets a fresh one from [`prepare_trial`] when
-///   the ordinary lane swaps it, with M — the running build — as its rollback;
-/// * N is not QUARANTINED. Its failures were handoffs between two images, not a
-///   boot it could not survive, and it is older than the stage replacing it;
-///   poisoning it is the crash-loop revert's verdict and not this one's.
+/// * the only rename is the atomic inverse exchange; a crash after it and before
+///   the disarm (installed = OLD, fixed = NEW, trial armed for NEW, receipt NEW's)
+///   is the "crash right after inverse rollback" shape
+///   [`recover_abandoned_preswap_trial_if_exact`] finishes on the next boot apply,
+///   which the next candidate runs before it swaps anything;
+/// * the rollback copy of M is never destroyed: it becomes the installed, running
+///   image;
+/// * no trial is re-armed here; N' gets a fresh one from [`prepare_trial`] when the
+///   ordinary lane swaps it, with M as its rollback;
+/// * N is not quarantined: its failures were handoffs, not a boot it could not
+///   survive, and it is older than the stage replacing it.
 pub(crate) fn supersede_installed_activation(
     current_build: u64,
     current_commit: &str,
@@ -4546,20 +5148,20 @@ pub(crate) fn supersede_installed_activation(
     })?;
     let staging = Staging::resolve()
         .ok_or_else(|| Settled("no private staging root is available".to_string()))?;
-    if !bundle::parent_writable(&installed.app_root) {
-        return Err(Settled(format!(
-            "install location not writable: {}",
-            installed.app_root.display()
-        )));
-    }
-    // A background caller, so the background lane's lock wait: a cold launch that
-    // holds the lock for its own boot apply is bounded well inside it. A lock
-    // held past that is a moment, not a verdict on the disk.
+    install_location_check(&installed.app_root).map_err(|refusal| {
+        if crate::is_passing_refusal(&refusal) {
+            ForNow(refusal)
+        } else {
+            Settled(refusal)
+        }
+    })?;
+    // A background caller, so the background lane's lock wait: a cold launch holding
+    // the lock for its boot apply is bounded well inside it. A lock held past that is
+    // a moment, not a verdict on the disk.
     let _lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
         .map_err(|error| ForNow(format!("apply lock: {error}")))?;
-    // ONE CEILING OVER THE THREE VERIFICATIONS, and under a launch's own lock wait
-    // (`APPLY_LOCK_WAIT`): a cold launch queued behind this transaction still gets
-    // the lock and opens on time instead of deferring its own apply.
+    // One ceiling over the three verifications, inside a launch's own lock wait
+    // (`APPLY_LOCK_WAIT`), so a cold launch queued behind this still opens on time.
     let _budget = verify::ApplyBudget::start(verify::APPLY_BUDGET);
     supersede_activation_locked(
         &staging,
@@ -4574,10 +5176,9 @@ pub(crate) fn supersede_installed_activation(
 /// A bundle's SEALED identity reader — [`verified_bundle_identity`] in production.
 type SealedIdentityReader = dyn Fn(&Path) -> Result<(u64, String), String>;
 
-/// The body of [`supersede_installed_activation`], run under the apply lock, with the
-/// sealed-identity reader injected: the one seam a real-disk test needs, since a
-/// fixture bundle carries no signature. Every exchange, sentinel transition, marker
-/// and receipt write below is the shipping code.
+/// The body of [`supersede_installed_activation`], run under the apply lock with the
+/// sealed-identity reader injected (a fixture bundle carries no signature). Every
+/// exchange, sentinel transition, marker and receipt write is the shipping code.
 fn supersede_activation_locked(
     staging: &Staging,
     installed: &Path,
@@ -4586,10 +5187,9 @@ fn supersede_activation_locked(
     newer_build: u64,
     identity: &SealedIdentityReader,
 ) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
-    // Every refusal names the build that stays, and says which kind it is: a
-    // MOMENT (`for_now`) — a verification that failed or ran out of its budget,
-    // a stage being replaced, a rename the kernel refused — or the DISK's shape
-    // (`settled`). See `crate::SupersedeRefusal` for why the kind matters.
+    // Every refusal names the build that stays and says which kind it is: a moment
+    // (`for_now`: a verification that failed or ran out of budget, a stage being
+    // replaced, a rename the kernel refused) or the disk's shape (`settled`).
     let stays =
         |why: String| format!("the installed build {activation_build} stays in place: {why}");
     let for_now = |why: String| -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
@@ -4598,23 +5198,25 @@ fn supersede_activation_locked(
     let settled = |why: String| -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
         Err(crate::SupersedeRefusal::Settled(stays(why)))
     };
-    // 1. THE REPLACEMENT, verified like any stage before anything moves.
+    // 1. The replacement, verified like any stage before anything moves.
     if newer_build <= activation_build {
         return settled(format!("build {newer_build} is not newer than it"));
     }
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) if ready.build_number == newer_build => ready,
-        // A marker that names another build, or none, is a stage being
-        // replaced or retired under the lock's wait — a moment. A release that
-        // has really left the disk is not offered again: the GUI offers only
-        // what its last observation found there.
+        // A marker naming another build, or none, is a stage being replaced or
+        // retired during the lock wait: a moment. A release that has left the disk is
+        // not offered again; the GUI offers only what it last observed there.
         _ => {
             return for_now(format!(
                 "no verified stage of build {newer_build} is on disk"
             ));
         }
     };
-    let floor = crate::manifest::Floor::read(&staging.floor()).min_build;
+    let floor = match crate::manifest::Floor::read_for_gate(&staging.floor()) {
+        Ok(floor) => floor.min_build,
+        Err(refusal) => return for_now(refusal),
+    };
     if newer_build < floor {
         return settled(format!(
             "the staged build {newer_build} is below the operator floor {floor} (yanked)"
@@ -4634,11 +5236,11 @@ fn supersede_activation_locked(
             ));
         }
         // A verification error is a moment: the full codesign policy includes a
-        // Gatekeeper assessment that rides the network, and the budget over the
-        // three reads is 8 s (`verify::APPLY_BUDGET`) at utility QoS.
+        // Gatekeeper assessment over the network, and the budget over the three reads
+        // is `verify::APPLY_BUDGET` at utility QoS.
         Err(error) => return for_now(format!("the staged bundle does not verify: {error}")),
     }
-    // 2. THE ACTIVATION, exactly the bytes the lane latched.
+    // 2. The activation, exactly the bytes the lane latched.
     let installed_commit = match identity(installed) {
         Ok((build, commit))
             if build == activation_build
@@ -4654,7 +5256,7 @@ fn supersede_activation_locked(
         }
         Err(error) => return for_now(format!("the installed bundle does not verify: {error}")),
     };
-    // 3. ITS TRIAL, armed, this install's, and exact.
+    // 3. Its trial: armed, this install's, and exact.
     let sentinel = boot_sentinel(staging);
     let trial_launches = match sentinel.read_state() {
         Some((armed, launches)) if armed == activation_build => launches,
@@ -4675,7 +5277,29 @@ fn supersede_activation_locked(
     if !trial_authorizes_candidate(staging, activation_build, &installed_commit) {
         return settled("its trial marker does not name these bytes".to_string());
     }
-    // 4. THE ROLLBACK IS THIS PROCESS.
+    // 3b. No other window's launch of it is still running. Several windows each run
+    // their own candidate of the one activation, and a live one can still prove and
+    // Commit: retired
+    // under it, it would land on a deleted bundle whose trial nobody watches, with an
+    // older build at the install path. The launcher record knows which launches of the
+    // trial live; a headless one hands nothing off. A moment: the next look offers the
+    // retire again.
+    let this = std::process::id();
+    if let Some(live) = read_trial_launchers(staging, activation_build)
+        .into_iter()
+        .find(|recorded| {
+            recorded.witness == crate::TrialWitness::Window
+                && recorded.launcher.pid != this
+                && recorded.launcher.is_alive()
+        })
+    {
+        return for_now(format!(
+            "a window's launch of it (pid {}) is still running, and its switch may still \
+             land on it",
+            live.launcher.pid
+        ));
+    }
+    // 4. The rollback is this process.
     let fixed = rollback_path(installed);
     if !same_volume(&fixed, installed) {
         return settled("no retained predecessor sits beside it".to_string());
@@ -4696,15 +5320,15 @@ fn supersede_activation_locked(
             return for_now(format!("the retained predecessor does not verify: {error}"));
         }
     };
-    // 5. THE INVERSE EXCHANGE: the running build back at the install path. It is
-    // one atomic swap, so a refused one moved nothing.
+    // 5. The inverse exchange: the running build back at the install path. One
+    // atomic swap, so a refused one moved nothing.
     if let Err(error) = restore_rollback(&fixed, installed) {
         return for_now(error);
     }
-    // 6. DISARMED, NEVER OBSERVED. A failure here leaves the crash cut
-    // `recover_abandoned_preswap_trial_if_exact` finishes on the next boot apply
-    // (see this function's doc), so the stage is still what applies next — the
-    // retire HAPPENED, and is reported as one, with the disarm deferred.
+    // 6. Disarmed, never observed. A failure here leaves the crash cut
+    // `recover_abandoned_preswap_trial_if_exact` finishes on the next boot apply, so
+    // the stage still applies next: the retire happened and is reported as one, with
+    // the disarm deferred.
     if let Err(error) = sentinel.confirm() {
         let deferred = format!(
             "build {activation_build}'s boot trial could not be disarmed ({error}); the next \
@@ -4739,7 +5363,7 @@ fn supersede_activation_locked(
     {
         crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
     }
-    crate::manifest::FailedMark::clear(&staging.trial());
+    clear_trial_identity(staging);
     crate::status::record(
         staging,
         current_build,
@@ -4768,8 +5392,8 @@ fn confirm_trial_health_after_proof(
     prove: impl FnOnce() -> Result<(), String>,
 ) -> bool {
     let sentinel = boot_sentinel(staging);
-    // Only disarm a sentinel that is for THIS build — never clobber one a
-    // concurrent apply just armed for a different (newer) build.
+    // Only disarm a sentinel for this build; never clobber one a concurrent apply
+    // just armed for a different (newer) build.
     if !matches!(sentinel.read_state(), Some((b, _)) if b == current_build) {
         return false;
     }
@@ -4786,18 +5410,11 @@ fn confirm_trial_health_after_proof(
     }
     // Booted healthy → no crash-loop poison pending. The installed receipt is
     // intentionally independent and survives for overlapping old processes.
-    crate::manifest::FailedMark::clear(&staging.trial());
-    // THIS is where an apply is known to have SUCCEEDED, and therefore the only
-    // honest place to clear the apply-failure streak.
-    //
-    // The GUI used to call `record_apply_success` the moment it SUBMITTED an apply
-    // (`UpdateOutcome::Accepted`), which cleared the streak before the swap had even
-    // been attempted — so `apply_failures` could never reach `PERSISTENT_AFTER` and
-    // the self-healing ledger was blind to a lane that failed every single time. That
-    // call is gone; without this one the streak would instead be uncleanable, which is
-    // the opposite error. A new build swapped in, re-execed, and confirmed its own boot
-    // health is the whole apply lane working end to end, which is exactly the claim
-    // `record_apply_success` makes.
+    clear_trial_identity(staging);
+    // THIS is where an apply is known to have SUCCEEDED — swapped in, re-execed,
+    // and confirmed its own boot health — and therefore the only honest place to
+    // clear the apply-failure streak. Clearing it at submit would keep
+    // `apply_failures` from ever reaching `PERSISTENT_AFTER`.
     crate::health::Health::record_apply_success(&staging.health());
     true
 }
@@ -4816,15 +5433,78 @@ fn confirm_health_under_apply_lock_with_proof(
     }
     // Successful disarm is the cleanup boundary. Before it, every branch above
     // preserves fixed rollback, trial, receipt, and staged orphan intact.
+    let _ = std::fs::remove_file(trial_window_launch_path(staging));
+    clear_window_unproven(staging);
     let _ = remove_path_no_follow(&rollback_path(app_root));
-    // A ready marker means a newer publisher now owns staged_app. Only reclaim the
-    // swapped-out orphan when no published generation exists.
-    if !staging.ready.exists() {
-        let _ = std::fs::remove_dir_all(&staging.staged_app);
-    }
+    reclaim_swapped_out_orphan(staging);
     true
 }
 
+/// A ready marker means a newer publisher now owns staged_app. Only reclaim the
+/// swapped-out orphan when no published generation exists.
+fn reclaim_swapped_out_orphan(staging: &Staging) {
+    if !staging.ready.exists() {
+        let _ = std::fs::remove_dir_all(&staging.staged_app);
+    }
+}
+
+/// A HEADLESS confirmation of a trial no window is waiting on (see
+/// [`window_unproven_path`]): the trial is settled for the headless path — the
+/// sentinel disarms and the success is booked, exactly as a window's confirmation
+/// does, so later updates are not held — but the retained predecessor stays, and
+/// the record says which window launch puts the build back on trial. A record that
+/// cannot be written (or a trial with no identity to key it by) settles the whole
+/// trial, as before the record existed. Runs under the apply lock.
+fn confirm_headless_keeping_predecessor(
+    staging: &Staging,
+    current_build: u64,
+    app_root: &Path,
+    prove: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    // The trial's identity, read before the settle clears it.
+    let digest = crate::manifest::FailedMark::read(&staging.trial())
+        .filter(|trial| trial.build_number == current_build)
+        .and_then(|trial| canonical_digest(&trial.sha256));
+    if !confirm_trial_health_after_proof(staging, current_build, prove) {
+        return false;
+    }
+    let _ = std::fs::remove_file(trial_window_launch_path(staging));
+    let record = digest.map(|digest| WindowUnproven {
+        build: current_build,
+        digest,
+        at: unix_now_secs(),
+        install_root: app_root.to_path_buf(),
+    });
+    match record.as_ref().map(|record| record.record(staging)) {
+        Some(Ok(())) => crate::log(&format!(
+            "build {current_build}'s trial was settled by a headless launch, which proves \
+             nothing about its windows: the previous build stays at {} until a window of \
+             build {current_build} confirms it, and a window launch within {} h puts it \
+             back on trial",
+            rollback_path(app_root).display(),
+            WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600
+        )),
+        failed => {
+            crate::warn(&format!(
+                "build {current_build}'s trial was settled by a headless launch, and its \
+                 window lane could not be kept open ({}); the retained predecessor is \
+                 removed as before",
+                match failed {
+                    Some(Err(error)) => format!("record: {error}"),
+                    _ => "the trial had no identity to key it by".to_string(),
+                }
+            ));
+            clear_window_unproven(staging);
+            let _ = remove_path_no_follow(&rollback_path(app_root));
+        }
+    }
+    reclaim_swapped_out_orphan(staging);
+    true
+}
+
+/// A window's settle over the real proof, as [`confirm_boot_health_at`]'s window arm
+/// runs it, for the tests that hold the apply lock themselves.
+#[cfg(test)]
 fn confirm_health_under_apply_lock(
     staging: &Staging,
     current_build: u64,
@@ -4835,110 +5515,714 @@ fn confirm_health_under_apply_lock(
         return false;
     };
     confirm_health_under_apply_lock_with_proof(staging, current_build, app_root, || {
-        // This is the hard health-commit gate. Plist fields become sealed evidence
-        // only after policy verification; the fixed OLD must itself be verified
-        // and strictly older; receipt build+commit+DIGEST must equal active trial.
+        // The hard health-commit gate: plist fields become sealed evidence only after
+        // policy verification; the fixed OLD must itself be verified and strictly
+        // older; the receipt's build+commit+digest must equal the active trial.
         ensure_current_trial_receipt(staging, app_root, current_build, current_commit).map(|_| ())
     })
 }
 
-/// See [`crate::forgive_trial_launch`]. Under the apply lock so it cannot interleave
-/// with a `check_boot_health` observation or a `confirm_boot_health` disarm.
 /// How many launches the boot sentinel has counted for `build` (0 when it is armed
-/// for another build, or not armed at all). The parent snapshots this before it
-/// launches a candidate so it can tell whether that candidate actually observed a
-/// launch before it was killed — see [`crate::forgive_trial_launch_if_advanced`].
-///
-/// A LOCK-FREE READ, unlike the forgiveness it feeds: it is a hint compared against
-/// a later read, and both a stale and a fresh answer are handled by the "moved and
-/// non-zero" rule.
+/// for another build, or not armed at all).
 #[must_use]
 pub(crate) fn trial_launch_count(build: u64) -> u32 {
-    Staging::resolve()
-        .and_then(|staging| boot_sentinel(&staging).read_state())
+    Staging::resolve().map_or(0, |staging| trial_launch_count_at(&staging, build))
+}
+
+/// [`trial_launch_count`] against an explicit staging root.
+fn trial_launch_count_at(staging: &Staging, build: u64) -> u32 {
+    boot_sentinel(staging)
+        .read_state()
         .filter(|(armed, _)| *armed == build)
         .map_or(0, |(_, attempts)| attempts)
 }
 
-pub(crate) fn forgive_trial_launch(target_build: u64) {
+/// The longest a trial-launch stamp can be: `<pid> <seconds> <micros>\n` is at
+/// most 10 + 1 + 20 + 1 + 20 + 1 bytes.
+const TRIAL_LAUNCH_STAMP_MAX_BYTES: u64 = 64;
+
+/// See [`crate::stamp_trial_launch`].
+pub(crate) fn stamp_trial_launch(stamp: &Path) -> std::io::Result<()> {
+    let this = TrialLauncher::this_process()
+        .ok_or_else(|| std::io::Error::other("the kernel will not name this process"))?;
+    write_trial_launch_stamp(stamp, this)
+}
+
+/// Write the name `launch` is counted under ([`TrialLauncher::name`]) to
+/// `stamp`, once: created, never followed and never replaced. A stamp already
+/// there is this launch's own, written before its boot apply re-exec'd it:
+/// `execve` keeps the pid and the kernel's birth stamp.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "Launch",
+        reason = "The parent's launch touches no ledger; its candidate stamps, here, the name its boot may count under, before its boot apply can count, and the parent's SettledUnnamed reads it back."
+    )
+)]
+fn write_trial_launch_stamp(stamp: &Path, launch: TrialLauncher) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(stamp);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let name = launch.name();
+    file.write_all(format!("{} {} {}\n", name.pid, name.started.0, name.started.1).as_bytes())
+}
+
+/// The launch `stamp` names ([`write_trial_launch_stamp`]), or `None` when there
+/// is none, it is not a regular file, or it is not exactly one name: nothing is
+/// given back by it, and a launch it counted stays counted.
+fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // Never followed, and never waited on: a FIFO at the name cannot park the
+    // handoff worker.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(stamp)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(TRIAL_LAUNCH_STAMP_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    let mut fields = text.strip_suffix('\n')?.split(' ');
+    let name = LaunchName {
+        pid: fields.next()?.parse().ok()?,
+        started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+    };
+    fields.next().is_none().then_some(name)
+}
+
+/// See [`crate::forgive_stamped_trial_launch`].
+pub(crate) fn forgive_stamped_trial_launch(target_build: u64, stamp: &Path) -> bool {
     let Some(staging) = Staging::resolve() else {
-        return;
+        return false;
     };
-    let sentinel = boot_sentinel(&staging);
-    if !matches!(sentinel.read_state(), Some((b, _)) if b == target_build) {
-        return;
-    }
-    // Only a launch this install COUNTED may be given back: `check_boot_health`
-    // does not count launches against a trial another install owns, so forgiving
-    // from here would decrement the owner's count for a launch it never saw.
-    if let Some(b) = bundle::resolve_layout()
-        && !trial_owned_by(&staging, &b.app_root)
-    {
-        return;
-    }
-    let Ok(_apply_lock) = FileLock::acquire(&staging.apply_lock) else {
-        crate::warn(&format!(
-            "could not take the apply lock to forgive a killed trial launch of build \
-             {target_build}; the launch stays counted"
+    let installed = bundle::resolve_layout();
+    forgive_stamped_trial_launch_at(
+        &staging,
+        target_build,
+        stamp,
+        installed.as_ref().map(|b| b.app_root.as_path()),
+        APPLY_LOCK_WAIT,
+    )
+}
+
+/// [`forgive_stamped_trial_launch`] against an explicit staging root and
+/// install: the launch the stamp names, given back by that name exactly as a
+/// candidate a pid names is ([`forgive_trial_launch_of_at`]).
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SettledUnnamed",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+fn forgive_stamped_trial_launch_at(
+    staging: &Staging,
+    target_build: u64,
+    stamp: &Path,
+    installed: Option<&Path>,
+    lock_wait: std::time::Duration,
+) -> bool {
+    let Some(name) = read_trial_launch_stamp(stamp) else {
+        crate::log(&format!(
+            "the launched successor of build {target_build} left no whole launch stamp; a trial \
+             launch it counted stays counted"
         ));
-        return;
+        return false;
     };
-    match sentinel.forgive_launch(target_build) {
-        Ok(remaining) => crate::log(&format!(
-            "trial launch of build {target_build} forgiven — the outgoing process ended \
-             that candidate itself ({remaining} unconfirmed launch(es) still counted)"
-        )),
-        Err(error) => crate::warn(&format!(
-            "could not forgive a killed trial launch of build {target_build}: {error}"
-        )),
+    forgive_trial_launch_of_at(
+        staging,
+        target_build,
+        name.pid,
+        Some(name.started),
+        installed,
+        lock_wait,
+    )
+}
+
+/// See [`crate::forgive_trial_launch_of`].
+pub(crate) fn forgive_trial_launch_of(
+    target_build: u64,
+    pid: u32,
+    started: Option<(i64, i64)>,
+) -> bool {
+    let Some(staging) = Staging::resolve() else {
+        return false;
+    };
+    let installed = bundle::resolve_layout();
+    forgive_trial_launch_of_at(
+        &staging,
+        target_build,
+        pid,
+        started,
+        installed.as_ref().map(|b| b.app_root.as_path()),
+        APPLY_LOCK_WAIT,
+    )
+}
+
+/// See [`crate::forgive_own_trial_launch`].
+pub(crate) fn forgive_own_trial_launch(build: u64) -> bool {
+    TrialLauncher::this_process()
+        .is_some_and(|this| forgive_trial_launch_of(build, this.pid, Some(this.started)))
+}
+
+/// Gives back the one launch of `target_build` that process `pid` (born at
+/// `started`, when known) counted, if it is still on the count
+/// ([`Sentinel::forgive_launch_of`]), against an explicit staging root and install.
+/// Both ends of a handoff may ask (the successor on its way out, the parent
+/// settling the same death) and the launch is given back once; no ask can take an
+/// earlier kept launch or a sibling window's launch for its own. `true` when a
+/// launch was given back, or owed back to the next holder of the apply lock
+/// ([`owe_trial_launch`]).
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "ExitsByRule",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "Settled",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingGivesBack",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingSettled",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "Killed",
+        reason = "A death the candidate did not choose (its parent's post-grant kill, the machine's) runs no ledger code; its parent's settle that follows is Settled."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingDies",
+        reason = "A sibling's death it did not choose runs no ledger code; its parent's settle by name that may follow is SiblingSettled."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SiblingCrashes",
+        reason = "A crash the trial keeps runs no ledger code, and nothing gives it back."
+    )
+)]
+fn forgive_trial_launch_of_at(
+    staging: &Staging,
+    target_build: u64,
+    pid: u32,
+    started: Option<(i64, i64)>,
+    installed: Option<&Path>,
+    lock_wait: std::time::Duration,
+) -> bool {
+    let sentinel = boot_sentinel(staging);
+    match trial_give_back_lock(staging, &sentinel, target_build, installed, lock_wait) {
+        GiveBackLock::Held(_apply_lock) => {
+            pay_owed_trial_launches(staging, &sentinel);
+            give_back_launch_of(&sentinel, target_build, pid, started)
+        }
+        GiveBackLock::NotOurs => false,
+        // ANOTHER ATERM HOLDS THE LOCK past this wait: the
+        // give-back is OWED, never dropped — a launch nobody gives back moves a
+        // healthy build toward its revert, and the next holder of the lock pays it
+        // before it reads the count.
+        GiveBackLock::Busy => owe_trial_launch(staging, &sentinel, target_build, pid, started),
     }
 }
 
-/// Confirm the running build reached a healthy checkpoint (window up / first
-/// frame): clear the boot sentinel and GC the retained rollback bundle + orphaned
-/// post-swap copy. Idempotent and best-effort — call once from the GUI after deep init so
-/// that a crash BEFORE this point is caught by [`check_boot_health`], while a
-/// crash after it is a normal (non-update) fault the sentinel must not react to.
+/// Where a give-back that met a held apply lock is OWED: one file per owed launch,
+/// `<build> <pid> <seconds> <micros>`,
+/// published by a rename so a reader never sees half of one. Written WITHOUT the
+/// lock — that is the point — so each debt is its own file and no two writers
+/// share one. A separate place on purpose: the sentinel's line is what every build
+/// reads and writes, and an older build that never pays a debt leaves the launch
+/// counted.
+fn owed_give_backs_dir(staging: &Staging) -> PathBuf {
+    staging.root.join("boot.sentinel.owed")
+}
+
+/// The most owed give-backs one pass reads: far above the launches the sentinel
+/// names (`MAX_NAMED_LAUNCHES`), so it only bounds a directory something else
+/// filled.
+const MAX_OWED_GIVE_BACKS: usize = 64;
+
+/// How long a half-written debt (its writer died between the write and the rename)
+/// is left before a pass removes it.
+const OWED_TEMP_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Owe the one launch of `build` that `pid` (born at `started`, when known) has on
+/// the count, for the next holder of the apply lock to give back
+/// ([`pay_owed_trial_launches`]). Run by a give-back whose lock wait ran out
+/// ([`forgive_trial_launch_of_at`]). The name is read off the sentinel's line now —
+/// no lock is needed for a read, since every write is a rename — so a debt always
+/// names exactly one launch that IS counted, and one that was never counted (a
+/// burst, an overlapping handoff target) or was given back already owes nothing.
+/// `true` when the debt is on disk.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "SettledOwed",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+fn owe_trial_launch(
+    staging: &Staging,
+    sentinel: &Sentinel,
+    build: u64,
+    pid: u32,
+    started: Option<(i64, i64)>,
+) -> bool {
+    let Some(name) = sentinel
+        .named_launches(build)
+        .into_iter()
+        .find(|name| name.pid == pid && started.is_none_or(|started| started == name.started))
+    else {
+        crate::log(&format!(
+            "pid {pid}'s trial launch of build {build} is not on the count; nothing to give \
+             back once the apply lock frees"
+        ));
+        return false;
+    };
+    let dir = owed_give_backs_dir(staging);
+    let made = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && is_non_symlink_dir(&dir) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let LaunchName {
+        pid,
+        started: (seconds, micros),
+    } = name;
+    let file = format!("{build}-{pid}-{seconds}-{micros}");
+    let tmp = dir.join(format!(".{file}.tmp-{}", std::process::id()));
+    let written = made
+        .and_then(|()| {
+            write_private_file(
+                &tmp,
+                format!("{build} {pid} {seconds} {micros}\n").as_bytes(),
+            )
+        })
+        .and_then(|()| std::fs::rename(&tmp, dir.join(&file)));
+    match written {
+        Ok(()) => {
+            crate::log(&format!(
+                "pid {pid}'s trial launch of build {build} is owed back: the next aterm to \
+                 take the apply lock gives it back before it reads the count"
+            ));
+            true
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            crate::warn(&format!(
+                "could not record that pid {pid}'s trial launch of build {build} is owed back \
+                 ({error}); the launch stays counted"
+            ));
+            false
+        }
+    }
+}
+
+/// The owed give-back `text` records ([`owe_trial_launch`]): its build and launch,
+/// or `None` when it is not exactly one.
+fn parse_owed_give_back(text: &str) -> Option<(u64, LaunchName)> {
+    let mut fields = text.strip_suffix('\n')?.split(' ');
+    let build = fields.next()?.parse().ok()?;
+    let name = LaunchName {
+        pid: fields.next()?.parse().ok()?,
+        started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+    };
+    fields.next().is_none().then_some((build, name))
+}
+
+/// PAY WHAT IS OWED: every give-back that
+/// met a held apply lock ([`owe_trial_launch`]) whose launch is still on the armed
+/// trial's count is given back, by its name, and every debt is then removed — paid,
+/// or owed to a trial that is no longer armed, or to a launch no longer on the
+/// count. Run by every holder of the apply lock that reads the count: a counted
+/// launch ([`count_trial_launch`], before it counts — so the revert a boot decides
+/// never stands on a launch someone gave back) and every give-back that took the
+/// lock. The caller holds the apply lock.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateTrialGiveBack",
+        action = "PaysOwed",
+        project = "aterm_update::install::boot_tests::trial_give_back_projection"
+    )
+)]
+fn pay_owed_trial_launches(staging: &Staging, sentinel: &Sentinel) {
+    let Ok(entries) = std::fs::read_dir(owed_give_backs_dir(staging)) else {
+        return;
+    };
+    let armed = sentinel.read_state().map(|(build, _)| build);
+    for entry in entries.flatten().take(MAX_OWED_GIVE_BACKS) {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            // A debt still being written, unless its writer died long ago.
+            let stale = std::fs::symlink_metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age >= OWED_TEMP_STALE);
+            if stale {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        if let Some((build, name)) = crate::read_ledger_text(&path)
+            .as_deref()
+            .and_then(parse_owed_give_back)
+            && armed == Some(build)
+            && give_back_launch_of(sentinel, build, name.pid, Some(name.started))
+        {
+            crate::log(&format!(
+                "the trial launch of build {build} by pid {} was owed back since its \
+                 give-back met a held apply lock; paid",
+                name.pid
+            ));
+        }
+        let _ = remove_path_no_follow(&path);
+    }
+}
+
+/// [`Sentinel::forgive_launch_of`], said in the log, for a caller that holds the
+/// give-back lock ([`trial_give_back_lock`]).
+fn give_back_launch_of(
+    sentinel: &Sentinel,
+    target_build: u64,
+    pid: u32,
+    started: Option<(i64, i64)>,
+) -> bool {
+    match sentinel.forgive_launch_of(target_build, pid, started) {
+        Ok(Some(remaining)) => {
+            crate::log(&format!(
+                "trial launch of build {target_build} by pid {pid} given back — it did not fail \
+                 the build ({remaining} unconfirmed launch(es) still counted)"
+            ));
+            true
+        }
+        // Not counted (a burst, an overlapping handoff target), or given back
+        // already: nothing of this process's is on the count.
+        Ok(None) => false,
+        Err(error) => {
+            crate::warn(&format!(
+                "could not give back pid {pid}'s trial launch of build {target_build}: {error}"
+            ));
+            false
+        }
+    }
+}
+
+/// What [`trial_give_back_lock`] answers.
+enum GiveBackLock {
+    /// The apply lock, held for the give-back.
+    Held(FileLock),
+    /// No trial of the build is armed, or another install owns it: this process
+    /// may give nothing back.
+    NotOurs,
+    /// The lock could not be taken (a sibling held it past the wait, or taking it
+    /// failed): the give-back is owed ([`owe_trial_launch`]).
+    Busy,
+}
+
+/// The apply lock, held to give back a counted launch of `target_build`, or why
+/// not. Under the apply lock so a give-back cannot interleave with a
+/// `check_boot_health` observation or a `confirm_boot_health` disarm. Bounded, so a
+/// stopped sibling holding the lock cannot park the parent's handoff worker or a
+/// refusing successor; a timed-out wait is `Busy`, and the give-back is OWED to the
+/// next holder of the lock — never dropped: the sentinel
+/// exists to revert, and a counted launch nobody gives back moves a healthy build
+/// toward its revert.
+fn trial_give_back_lock(
+    staging: &Staging,
+    sentinel: &Sentinel,
+    target_build: u64,
+    installed: Option<&Path>,
+    lock_wait: std::time::Duration,
+) -> GiveBackLock {
+    if !matches!(sentinel.read_state(), Some((b, _)) if b == target_build) {
+        return GiveBackLock::NotOurs;
+    }
+    // Only a launch this install counted may be given back: `check_boot_health` does
+    // not count launches against a trial another install owns, so forgiving here
+    // would decrement the owner's count for a launch it never saw.
+    if let Some(app_root) = installed
+        && !trial_owned_by(staging, app_root)
+    {
+        return GiveBackLock::NotOurs;
+    }
+    match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
+        Ok(lock) => GiveBackLock::Held(lock),
+        Err(error) => {
+            // The error says why (a sibling past the wait, or a lock that cannot be
+            // taken at all); `owe_trial_launch` says what became of the give-back.
+            crate::warn(&format!(
+                "could not take the apply lock to give back a trial launch of build \
+                 {target_build}: {error}"
+            ));
+            GiveBackLock::Busy
+        }
+    }
+}
+
+/// Confirms the running build reached a healthy checkpoint (window up / first
+/// frame): clears the boot sentinel and GCs the retained rollback bundle and
+/// orphaned post-swap copy. Idempotent and best-effort; call once from the GUI after
+/// deep init, so a crash before this point is caught by [`check_boot_health`] and a
+/// crash after it is an ordinary fault the sentinel ignores.
 #[must_use]
-pub fn confirm_boot_health(current_build: u64, current_commit: Option<&str>) -> bool {
+pub fn confirm_boot_health(
+    current_build: u64,
+    current_commit: Option<&str>,
+    witness: crate::TrialWitness,
+) -> bool {
     let Some(staging) = Staging::resolve() else {
         return true;
     };
+    confirm_boot_health_at(
+        &staging,
+        current_build,
+        current_commit,
+        witness,
+        bundle::resolve_layout,
+        APPLY_LOCK_WAIT,
+    )
+}
+
+/// [`confirm_boot_health`] against an explicit staging root, with the install
+/// resolver and the apply-lock wait named.
+///
+/// The wait is BOUNDED: this runs on the GUI's one updater facts worker, which a
+/// stopped sibling holding the apply lock must not park. A timeout answers `false`
+/// (retry later: the caller re-arms its backoff) and leaves the trial armed.
+///
+/// A HEADLESS confirmation settles only
+/// what a headless launch proves:
+/// * of a trial a WINDOW has launched (inside [`WINDOW_TRIAL_HEADLESS_WAIT`]),
+///   nothing: it answers `true` — nothing for the caller to retry — and leaves the
+///   trial armed and the retained predecessor in place for the window path to prove
+///   or revert. `update status` says so, from the trial's own records
+///   ([`window_trial_wait_at`]);
+/// * of any other trial, the headless path: the trial settles, but the predecessor
+///   stays for the next window launch to put the build back on trial
+///   ([`confirm_headless_keeping_predecessor`]).
+fn confirm_boot_health_at(
+    staging: &Staging,
+    current_build: u64,
+    current_commit: Option<&str>,
+    witness: crate::TrialWitness,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    lock_wait: std::time::Duration,
+) -> bool {
+    confirm_boot_health_at_with_proof(
+        staging,
+        current_build,
+        witness,
+        resolve_installed,
+        lock_wait,
+        |app_root| {
+            // This is the hard health-commit gate. Plist fields become sealed
+            // evidence only after policy verification; the fixed OLD must itself be
+            // verified and strictly older; receipt build+commit+DIGEST must equal
+            // the active trial.
+            ensure_current_trial_receipt(staging, app_root, current_build, current_commit)
+                .map(|_| ())
+        },
+    )
+}
+
+/// [`confirm_boot_health_at`] with the trial's recovery proof named (`prove`, over
+/// the install's `app_root`), so the settle can be driven over unsealed fixtures.
+fn confirm_boot_health_at_with_proof(
+    staging: &Staging,
+    current_build: u64,
+    witness: crate::TrialWitness,
+    resolve_installed: impl FnOnce() -> Option<bundle::Bundle>,
+    lock_wait: std::time::Duration,
+    prove: impl FnOnce(&Path) -> Result<(), String>,
+) -> bool {
     // No trial for this build is already complete. A different build's marker is
     // not ours to retry or mutate.
     if !matches!(
-        boot_sentinel(&staging).read_state(),
+        boot_sentinel(staging).read_state(),
         Some((build, _)) if build == current_build
     ) {
         return true;
     }
     // Publication/apply lock only: never stage_lock, so a long download cannot
     // delay this off-UI cleanup and no inverse lock ordering exists.
-    let Ok(_apply_lock) = FileLock::acquire(&staging.apply_lock) else {
+    let Ok(_apply_lock) = FileLock::acquire_within(&staging.apply_lock, lock_wait) else {
+        crate::warn(&format!(
+            "could not take the apply lock within {}s to confirm build {current_build}'s \
+             boot health (another aterm holds it); the confirmation is retried later",
+            lock_wait.as_secs()
+        ));
         return false;
     };
     // Health confirmation of an already-applied swap — dev-mark-independent, same
     // reasoning as the trial path above.
-    let Some(installed) = bundle::resolve_layout() else {
+    let Some(installed) = resolve_installed() else {
         return false;
     };
-    // A trial another install of this build owns is not ours to confirm (nor could
-    // we: its rollback lives beside THAT bundle). Answer "nothing to do" instead of
-    // failing the proof forever from a sibling process — see `trial_owned_by`.
-    if !trial_owned_by(&staging, &installed.app_root) {
+    // A trial another install of this build owns is not ours to confirm (its
+    // rollback lives beside that bundle): answer "nothing to do" rather than failing
+    // the proof forever from a sibling (`trial_owned_by`).
+    if !trial_owned_by(staging, &installed.app_root) {
         return true;
     }
-    confirm_health_under_apply_lock(
-        &staging,
-        current_build,
-        current_commit,
-        Some(installed.app_root.as_path()),
-    )
+    let app_root = installed.app_root.as_path();
+    match witness {
+        crate::TrialWitness::Window => {
+            confirm_health_under_apply_lock_with_proof(staging, current_build, app_root, || {
+                prove(app_root)
+            })
+        }
+        crate::TrialWitness::Headless => {
+            match trial_window_launch(staging, current_build, unix_now_secs()) {
+                WindowLaunch::Waiting { until } => {
+                    // Logged, and said by `update status` from the records
+                    // themselves ([`window_trial_wait_at`]): nothing is written
+                    // into a slot another running build keeps its own reason in.
+                    crate::log(&format!(
+                        "build {current_build}'s trial was launched by a window, and a \
+                         headless launch proves nothing about the window path: the trial \
+                         and its predecessor are left for a window to confirm or revert, \
+                         until {}",
+                        aterm_types::rfc3339::format_rfc3339(until)
+                    ));
+                    true
+                }
+                WindowLaunch::None | WindowLaunch::Lapsed => {
+                    confirm_headless_keeping_predecessor(staging, current_build, app_root, || {
+                        prove(app_root)
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// The boot swap's work that must hold `apply_lock` before it reads the stage
+/// (step 3 of [`apply_lock_then_ready`]): an abandoned trial recovered, the
+/// just-swapped shape left to its owner, a foreign trial's wedge budgeted, and
+/// orphaned swap copies cleared. `Err` is the lane's answer; `app_root` is the
+/// installed bundle.
+fn settle_trials_under_apply_lock(
+    staging: &Staging,
+    app_root: &Path,
+    current_build: u64,
+    current_commit: Option<&str>,
+) -> Result<(), ApplyOutcome> {
+    if !recover_abandoned_preswap_trial_if_exact(staging, app_root, current_build, current_commit) {
+        let armed_build = boot_sentinel(staging)
+            .read_state()
+            .map_or(0, |(build, _)| build);
+        // THE JUST-SWAPPED SHAPE: a sibling cold launch
+        // that lost the apply-lock race is still the OLD image, and the bundle
+        // under it now holds the NEW build mid-trial — installed == armed, both
+        // newer than this process. That is a healthy apply in progress, not a
+        // wedged trial: it must neither spend the foreign-trial budget (three such
+        // launches would disarm a live trial) nor be booked as a refusal. This
+        // image keeps running; the check lane's installed-bundle announcement
+        // activates it later. The plist read is bounded and the trial owner's
+        // sentinel keeps its authority either way.
+        if armed_build != 0
+            && armed_build > current_build
+            && crate::verify::bundle_build_number(app_root).ok() == Some(armed_build)
+        {
+            crate::log(&format!(
+                "boot apply: build {armed_build} is already installed and mid-trial; this \
+                 launch is the previous build {current_build} and leaves the trial to its owner"
+            ));
+            return Err(ApplyOutcome::NoUpdate);
+        }
+        // A sentinel armed for a build that is not the running one can never be
+        // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
+        // future apply forever. Budget it — with its own counter, never the
+        // trial's. The SAME-build case that another install owns is the same
+        // wedge for THIS process (`check_boot_health` rightly does not count us,
+        // and the owner may never run again), so it takes the same budget.
+        if armed_build != 0 && (armed_build != current_build || !trial_owned_by(staging, app_root))
+        {
+            escape_wedged_foreign_trial(staging, current_build, armed_build);
+        }
+        return Err(ApplyOutcome::Deferred(unconfirmed_trial_refusal(
+            armed_build,
+        )));
+    }
+    // The mismatched-sentinel lane is behind us for this launch, so no budget is
+    // outstanding; never let one accumulate across unrelated trials.
+    let _ = foreign_trial_counter(staging).confirm();
+    // Under the lock no other swap is in flight, so it is safe to clear orphaned
+    // transient swap copies from a previously interrupted/completed swap.
+    if let ReadyState::Newer(orphaned_ready) = read_ready(staging, current_build)
+        && let Err(error) =
+            recover_orphaned_prepared_candidate(staging, app_root, current_build, &orphaned_ready)
+    {
+        return Err(ApplyOutcome::Deferred(error));
+    }
+    Ok(())
 }
 
 /// Tri-state read of the staging marker, distinguishing a missing marker from a
-/// present-but-unparseable one (the latter is discarded rather than wedging
-/// updates forever) and folding in the strict downgrade gate.
+/// present but unparseable one (discarded rather than wedging updates) and folding
+/// in the strict downgrade gate.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Newer` IS the marker (past the lint's 200-byte line since \
+              `roster_confirmed_at`); a ReadyState is the \
+              transient answer of one read, matched at once and never stored, so boxing \
+              it would add an allocation per read to save nothing"
+)]
 enum ReadyState {
     Newer(Ready),
     NotNewer,
@@ -4946,18 +6230,19 @@ enum ReadyState {
     Absent,
 }
 
-/// Steps 3–4 of the boot apply lane, as ONE function the lane and its Tier-1 both run.
+/// Steps 3–4 of the boot apply lane, as one function the lane and its Tier-1 test
+/// both run.
 ///
-/// 1. The pre-lock PEEK: nothing staged and no boot sentinel is the common case, and it
-///    skips the lock entirely (`NoUpdate`). The peek decides nothing else — newer,
-///    not-newer and corrupt are all decided UNDER the lock, so retirement never races
-///    the stager's final publication transaction (F15), and a sibling that swapped and
-///    retired the marker while this launch waited is seen (`NativeUpdateTwoProcessApply`).
-/// 2. `lock` takes `apply_lock` (the lane: bounded by `APPLY_LOCK_WAIT`).
-/// 3. `under_lock` is the work that must hold the lock before the decision — the
-///    lane's apply budget, trial and orphan recovery — and its value (the budget guard)
-///    is returned alongside the lock so both live until the swap.
-/// 4. The decision: [`ready_under_apply_lock`], the marker as it reads NOW.
+/// 1. The pre-lock peek: nothing staged and no boot sentinel is the common case and
+///    skips the lock (`NoUpdate`). It decides nothing else: newer, not-newer and
+///    corrupt are decided under the lock, so retirement never races the stager's
+///    final publication, and a sibling that swapped and retired the marker while
+///    this launch waited is seen (`NativeUpdateTwoProcessApply`).
+/// 2. `lock` takes `apply_lock` (in the lane, bounded by `APPLY_LOCK_WAIT`).
+/// 3. `under_lock` is the work that must hold the lock before the decision (the
+///    apply budget, trial and orphan recovery); its value (the budget guard) is
+///    returned with the lock so both live until the swap.
+/// 4. The decision: [`ready_under_apply_lock`], the marker as it reads now.
 fn apply_lock_then_ready<L, U>(
     staging: &Staging,
     current_build: u64,
@@ -4978,14 +6263,13 @@ fn apply_lock_then_ready<L, U>(
     Ok((held, work, ready))
 }
 
-/// THE UNDER-LOCK RE-READ — what the apply lane acts on once `apply_lock` is held: the
-/// marker as it reads NOW, never as a pre-lock peek saw it. Two aterm processes arming
-/// the same build is the ordinary case (every window and session runs the lane), and
-/// one of them may finish its whole pre-lock preflight on that build while the other's
-/// successor holds the lock, swaps the bundle and retires the marker. The loser finds
-/// nothing left to apply and swaps nothing (`NativeUpdateTwoProcessApply`; Tier-1:
-/// `two_processes_arming_one_build_swap_it_once`). A marker that is not newer, or not
-/// readable, is retired here too.
+/// The under-lock re-read the apply lane acts on once `apply_lock` is held: the
+/// marker as it reads now, never as a pre-lock peek saw it. Two processes arming the
+/// same build is ordinary (every window and session runs the lane); if the other's
+/// successor swapped the bundle and retired the marker meanwhile, the loser finds
+/// nothing to apply and swaps nothing (`NativeUpdateTwoProcessApply`; Tier-1:
+/// `two_processes_arming_one_build_swap_it_once`). A marker that is not newer, or
+/// not readable, is retired here too.
 fn ready_under_apply_lock(staging: &Staging, current_build: u64) -> Result<Ready, ApplyOutcome> {
     match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => Ok(ready),
@@ -5002,10 +6286,10 @@ fn ready_under_apply_lock(staging: &Staging, current_build: u64) -> Result<Ready
     }
 }
 
-/// Gates 4b and 4c of the swap: the operator floor's WITHDRAWALS of a staged build —
-/// a yank (`min_build`) and a signer the machine roster revoked (the floor's durable
-/// revocation set). `Some(NoUpdate)` once the stage is retired; `None` to go on. The
-/// caller holds the apply lock and has read `ready` under it.
+/// Gates 4b and 4c of the swap: the operator floor's withdrawals of a staged build,
+/// a yank (`min_build`) and a signer the machine roster revoked (the floor's
+/// durable revocation set). `Some(NoUpdate)` once the stage is retired; `None` to go
+/// on. The caller holds the apply lock and read `ready` under it.
 fn floor_withdrawal_gate(
     staging: &Staging,
     current_build: u64,
@@ -5013,8 +6297,24 @@ fn floor_withdrawal_gate(
 ) -> Option<ApplyOutcome> {
     // 4b. Honor an operator apply floor (yank): never apply a staged build below the
     //     persisted, monotonic min_build — even though it's genuine and strictly newer
-    //     than us — so the owner can retire a bad-but-genuine release after the fact (F5).
-    let floor = crate::manifest::Floor::read(&staging.floor());
+    //     than us — so the owner can retire a bad-but-genuine release after the fact.
+    //     A floor that is there but could not be read DEFERS the swap and retires
+    //     nothing: the stage waits for a read that can judge it.
+    let floor = match crate::manifest::Floor::read_for_gate(&staging.floor()) {
+        Ok(floor) => floor,
+        Err(refusal) => {
+            crate::warn(&format!(
+                "staged build {} not applied: {refusal}",
+                ready.build_number
+            ));
+            crate::status::record(
+                staging,
+                current_build,
+                "deferred: aterm could not read its update records just then",
+            );
+            return Some(ApplyOutcome::Deferred(refusal));
+        }
+    };
     if ready.build_number < floor.min_build {
         crate::warn(&format!(
             "staged build {} is below the operator floor {}; discarding (yanked)",
@@ -5031,37 +6331,31 @@ fn floor_withdrawal_gate(
         );
         return Some(ApplyOutcome::NoUpdate);
     }
-    // 4c. THE DURABLE REVOCATION SET — and NO roster-GENERATION gate, and the reason
-    //     is worth recording.
+    // 4c. The durable revocation set, and deliberately no roster-generation gate.
     //
-    //     A stage is an authorization made at stage time, and a revocation lands
-    //     afterwards. The check lane that admits the revoking roster records the
-    //     revoked machine ids in the floor and retires the stage under this same lock
-    //     — but a check that could not take the lock in time leaves it for the next
-    //     check, and a quit app launches here first. So this gate reads the same set
-    //     (round seven, H1): a stage signed by a machine this client has seen revoked
-    //     is retired, never swapped in. It is EXACT — the machine id is inside the
-    //     manifest's signed bytes and the set holds only what an admitted,
-    //     master-verified roster revoked.
+    //     A stage is authorized at stage time; a revocation lands afterwards. The
+    //     check lane that admits the revoking roster records the revoked machine ids
+    //     in the floor and retires the stage under this lock, but a check that could
+    //     not take the lock leaves it for later, and a quit app launches here first.
+    //     So this gate reads the same set: a stage signed by a machine this client
+    //     has seen revoked is retired, never swapped in. It is exact: the machine id
+    //     is in the manifest's signed bytes, and the set holds only what an
+    //     admitted, master-verified roster revoked.
     //
-    //     What it cannot see is a revocation no check on this Mac has observed yet (a
-    //     stage made, the app quit, the machine revoked, the app launched offline or
-    //     before its first check): the apply lane holds no roster, and fetching one
-    //     before the boot swap is a network wait at every launch. That residual is
-    //     `min_build`'s to yank (docs/RELEASE-KEYS.md: revocation stops future
-    //     acceptance).
+    //     It cannot see a revocation no check on this Mac has observed yet (the apply
+    //     lane holds no roster, and fetching one before the boot swap would put a
+    //     network wait on every launch). Gate 4d bounds that: a stage whose roster
+    //     authorization no check has confirmed for a day is not swapped until one
+    //     has ([`roster_freshness_gate`]), so only a revocation published inside
+    //     that day is missed — and that residual is `min_build`'s to yank
+    //     (docs/RELEASE-KEYS.md: revocation stops future acceptance).
     //
-    //     Comparing the marker's recorded GENERATION against `Floor::roster_seq`
-    //     LOOKS like the missing check and is not. `Floor::roster_seq` ratchets to the
-    //     generation of the roster ASSET the client observed, while the marker
-    //     records the generation the MANIFEST was attributed under — and those two
-    //     legitimately differ. A machine joining the roster attaches the new pair to
-    //     releases that already shipped, so `manifest_seq < floor` is the ordinary
-    //     POST-JOIN STEADY STATE, which `authorize_by_roster` deliberately admits
-    //     ("a newer roster paired with an older release"). Gating on it would retire
-    //     a perfectly good stage on every launch after any join: the update never
-    //     applies and the container is downloaded again forever — the exact
-    //     never-updates shape this file already carries two other scars from.
+    //     Comparing the marker's generation with `Floor::roster_seq` is not the
+    //     missing check: the floor ratchets to the roster asset's generation, the
+    //     marker records the generation the manifest was attributed under, and a
+    //     machine joining the roster attaches its pair to releases already shipped,
+    //     so `manifest_seq < floor` is the ordinary post-join state
+    //     `authorize_by_roster` admits. Gating on it would retire good stages forever.
     if floor.revokes(ready.machine_id.as_deref()) {
         let machine = ready.machine_id.as_deref().unwrap_or("?");
         crate::warn(&format!(
@@ -5084,6 +6378,180 @@ fn floor_withdrawal_gate(
     None
 }
 
+/// The swap's gates on the stage it read under the apply lock, in order: the floor's
+/// withdrawals (4b, 4c: [`floor_withdrawal_gate`], which retire), a marker that no
+/// longer names the published stage (retired), and the age of its roster
+/// confirmation (4d: [`roster_freshness_gate`], which waits). `Some` is the lane's
+/// answer; `None` goes on to the install location and the re-verification.
+///
+/// The `Swap` guard of `NativeUpdateRosterFreshness`: a stage on
+/// disk whose roster confirmation is younger than the window. Tier-1:
+/// `github::tests::roster_freshness_conformance`.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NativeUpdateRosterFreshness",
+        action = "Swap",
+        project = "aterm_update::roster_freshness_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateRosterFreshness",
+        action = "Tick",
+        reason = "Time passing is the environment; the Tier-1 bind maps each tick to half the window of the real clock it hands these gates."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateRosterFreshness",
+        action = "Revoke",
+        reason = "The owner's revocation is published elsewhere and reaches this Mac only as a roster a check admits, which is Check."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateRosterFreshness",
+        action = "SwapOnTheFloorAlone",
+        reason = "Buggy=1 negative control only: a lane that admits a stage on the floor's withdrawals alone; gate 4d reads the confirmation's age."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateRosterFreshness",
+        action = "ConfirmWithoutTheRoster",
+        reason = "Buggy=1 negative control only: a confirmation stamped without reading the roster's revocations; the check stamps only after the floor it just wrote withdraws nothing."
+    )
+)]
+pub(crate) fn stage_admission_gates(
+    staging: &Staging,
+    current_build: u64,
+    ready: &Ready,
+    now: u64,
+) -> Option<ApplyOutcome> {
+    if let Some(outcome) = floor_withdrawal_gate(staging, current_build, ready) {
+        return Some(outcome);
+    }
+    if !ready.is_publishable(staging) {
+        staging.retire_published();
+        return Some(ApplyOutcome::NoUpdate);
+    }
+    roster_freshness_gate(ready, now)
+}
+
+/// Gate 4d of the swap: the stage's roster authorization must
+/// have been confirmed against a freshly fetched machine roster within
+/// [`crate::manifest::ROSTER_FRESHNESS_SECS`] of `now`
+/// ([`Ready::roster_authorization_stale`]). `Some(Deferred)` — a PASSING refusal,
+/// the stage kept, nothing memoized — otherwise; `None` to go on.
+///
+/// A revocation reaches this Mac only through a check, and a launch swaps before
+/// any check runs; with no bound, a stage signed by a machine revoked while the app
+/// was quit would be swapped in at the next launch. Waiting costs no
+/// network at launch: the check that runs right after it re-reads the roster
+/// (`Ready::needs_roster_reconfirmation`) and either confirms the stage
+/// ([`confirm_roster_authorization`]), after which the in-session lane or the next
+/// launch applies it, or retires it as revoked. The residual — a revocation
+/// published inside the window — is stated in docs/RELEASE-KEYS.md.
+///
+/// AND A CHANNEL NO CHECK CAN CONFIRM AGAINST HOLDS THE STAGE AS LONG AS IT LASTS.
+/// Only a check that admits the channel head's roster
+/// confirms anything, so the wait lasts while the head is not an app release (an
+/// index cut or a source-only release at the head: no roster is read) and, for
+/// good, once this build's anchor cannot verify the roster (a master rotation it
+/// predates: `STALE_ANCHOR`). In the second a stage carrying the new pin is
+/// stranded on disk and only a reinstall (tools/install.sh) moves the client; so a
+/// rotation's adoption window must
+/// cover staged-but-uninstalled clients (docs/RELEASE-KEYS.md, *Rotating the
+/// master*). Failing open there is not the answer: a roster no pin verifies is
+/// what a thief with the publish credential can serve too, and opening the gate on
+/// it would let the stage of a machine revoked in the real roster install. The
+/// check's status line says which state holds the stage
+/// (`github::unconfirmable_stage_note`).
+///
+/// The pre-park checks ask the same predicate ([`handoff_cached_pass_refusal_at`],
+/// [`preverify_staged_handoff_candidate_at`]), so the in-session lane neither swaps
+/// such a stage before the check confirms it nor parks a reader for a successor
+/// this gate would turn away. Its refusal carries [`crate::ROSTER_UNCONFIRMED_KEY`]
+/// so the window files it as a wait for the check
+/// ([`crate::is_roster_confirmation_wait`]) and not as a passing failure to retry
+/// on its transient budget: it lasts until a check reads the roster, which no
+/// apply attempt does.
+fn roster_freshness_gate(ready: &Ready, now: u64) -> Option<ApplyOutcome> {
+    ready
+        .roster_authorization_stale(now, aterm_update_core::pins::roster_tier_armed())
+        .map(ApplyOutcome::Deferred)
+}
+
+/// Record that a check CONFIRMED `staged` against a roster it admitted, which it
+/// began reading at `confirmed_at` (RFC3339): its marker's
+/// [`Ready::roster_confirmed_at`] moves to that instant, so the swap's gate 4d and
+/// the pre-park checks admit it for another
+/// [`crate::manifest::ROSTER_FRESHNESS_SECS`], and a standing
+/// apply refusal that waited for exactly this is withdrawn from the ledger.
+///
+/// NEVER BACKWARDS: a stamp already on the marker that is later than
+/// `confirmed_at` (a sibling's check that read a newer roster while this one ran)
+/// and not ahead of this Mac's clock is kept, since both are genuine reads and the
+/// later one bounds the window more tightly. A stamp ahead of the clock is
+/// replaced: its age cannot be known, and it reads as stale.
+///
+/// UNDER THE APPLY LOCK, like every other write of the published marker, and only
+/// for the stage the caller judged: a marker another process replaced or retired
+/// meanwhile is left alone (its own check confirms it). Bounded like the check
+/// lane's retirement; a lock not had in time confirms nothing, and the next check
+/// that reads a roster tries again. The ledger is written after the lock is let go:
+/// the health lock is never taken under the apply lock (see
+/// [`apply_staged_if_ready`]).
+///
+/// A stage that was WAITING for this (its confirmation stale, or never written)
+/// becomes installable only now, so its pending clock restarts here
+/// ([`crate::health::Health::restart_pending_update`]): the clock counts the days
+/// the app was closed, and the overdue notice would otherwise call an update stuck
+/// the moment the launch after them confirmed it.
+pub(crate) fn confirm_roster_authorization(
+    staging: &Staging,
+    staged: &Ready,
+    confirmed_at: &str,
+) -> Result<(), String> {
+    let confirmed = aterm_types::rfc3339::parse_utc(confirmed_at)
+        .and_then(|secs| u64::try_from(secs).ok())
+        .ok_or_else(|| format!("the clock could not be read ({confirmed_at:?})"))?;
+    let was_waiting = {
+        let _apply_lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+            .map_err(|error| verify::lock_wait_refusal("confirm lock", &error))?;
+        let Some(mut ready) = Ready::read_published_bundle(staging).filter(|still| {
+            still.build_number == staged.build_number
+                && still.dmg_sha256.eq_ignore_ascii_case(&staged.dmg_sha256)
+                && still.commit == staged.commit
+        }) else {
+            return Ok(());
+        };
+        let wall = unix_now_secs().max(confirmed);
+        let was_waiting = ready.roster_authorization_stale(wall, true).is_some();
+        let later_on_disk = ready
+            .roster_confirmation_age(wall)
+            .is_some_and(|age| age < wall - confirmed);
+        if !later_on_disk && ready.roster_confirmed_at.as_deref() != Some(confirmed_at) {
+            ready.roster_confirmed_at = Some(confirmed_at.to_string());
+            crate::manifest::write_durable(&staging.ready, &ready.to_toml()?, "ready marker")?;
+        }
+        was_waiting
+    };
+    crate::health::Health::withdraw_apply_refusal_containing(
+        &staging.health(),
+        crate::manifest::ROSTER_UNCONFIRMED_KEY,
+    );
+    if was_waiting {
+        crate::health::Health::restart_pending_update(&staging.health(), staged.build_number);
+    }
+    Ok(())
+}
+
 fn read_ready(staging: &Staging, current_build: u64) -> ReadyState {
     match Ready::read(&staging.ready) {
         Some(r) if !r.has_canonical_identity() => ReadyState::Corrupt,
@@ -5094,21 +6562,18 @@ fn read_ready(staging: &Staging, current_build: u64) -> ReadyState {
     }
 }
 
-/// Exec-failure rollback: put the OLD bundle (at `rollback`) back at `installed`,
-/// which currently holds the NEW (failed-to-exec) bundle. Both are on the same
-/// volume, so this is the inverse atomic exchange.
+/// Exec-failure rollback: puts the OLD bundle (at `rollback`) back at `installed`,
+/// which holds the NEW (failed-to-exec) bundle. Both are on one volume, so this is
+/// the inverse atomic exchange.
 fn restore_rollback(rollback: &Path, installed: &Path) -> Result<(), String> {
     checked_bundle_exchange(rollback, installed, "atomic rollback restore")
 }
 
-/// 16 CSPRNG bytes, hex-encoded (32 chars), for the single-use re-exec nonce (F9).
-/// Unguessable so an attacker can't preset a matching env var. Minted through
-/// `aterm_uds::rand` — the ONE audited entropy surface — not a hand-rolled
-/// `/dev/urandom` read: this runs at EVERY packaged-app launch that finds a
-/// staged build (`apply_staged_if_ready`), and the hand-rolled pattern is what
-/// caused the 2026-07-04/05 kernel panics elsewhere in the workspace. `None` if
-/// the OS CSPRNG is somehow unavailable; the caller then degrades safely to the
-/// legacy "1" marker (guard finds no stamp and takes the normal no-op path).
+/// 16 CSPRNG bytes, hex-encoded (32 chars), for the single-use re-exec nonce.
+/// Unguessable, so an attacker cannot preset a matching env var. Minted through
+/// `aterm_uds::rand`, the one audited entropy surface, not a hand-rolled
+/// `/dev/urandom` read. `None` if the OS CSPRNG is unavailable; the caller then
+/// uses the "1" marker (the guard finds no stamp and takes the normal no-op path).
 fn random_nonce() -> Option<String> {
     aterm_uds::rand::hex_token::<16>().ok()
 }
@@ -5126,25 +6591,19 @@ fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
-/// Best-effort RFC3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`), for the
-/// human-readable `staged_at`/status fields. Computed in-process (no `/bin/date`
-/// fork — this is called from status/health/stage/loop, dozens of times per
-/// session). Falls back to the empty string on a pre-epoch clock.
+/// Best-effort RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for the
+/// human-readable `staged_at`/status fields, computed in-process (no `/bin/date`
+/// fork). Empty on a pre-epoch clock.
 pub(crate) fn now_rfc3339() -> String {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format_rfc3339(d.as_secs()),
-        Err(_) => String::new(),
-    }
+    aterm_time::unix_secs().map_or_else(String::new, format_rfc3339)
 }
 
-/// Unix seconds now, or 0 on a pre-epoch clock. Used for the stage-failure retry
-/// budget's deadlines. Zero is the safe fallback: it makes every deadline appear
-/// already passed, so a broken clock retries rather than suppresses forever.
+/// Unix seconds now, or 0 on a pre-epoch clock, for the stage-failure retry
+/// budget's deadlines and the check lane's window and receipt. Zero makes every
+/// deadline appear passed, so a broken clock retries rather than suppresses forever.
 #[must_use]
 pub(crate) fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    aterm_time::unix_secs().unwrap_or(0)
 }
 
 /// Seconds between two of our own RFC3339 instants (`later - earlier`), or
@@ -5158,4513 +6617,19 @@ pub(crate) fn rfc3339_delta_secs(earlier: &str, later: &str) -> Option<u64> {
     epoch(later)?.checked_sub(epoch(earlier)?)
 }
 
-// The RFC3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339` — one
-// workspace home for the Howard-Hinnant civil-calendar math the publisher,
-// the updater client, the GUI and atpkg all stamp with.
+// The RFC 3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339`, shared by the
+// publisher, the updater client, the GUI and atpkg.
 use aterm_types::rfc3339::format_rfc3339;
 
-// Boot-apply audit tests (2026-09-14): red until their findings are fixed; see the
-// file header. A child module so they reach this file's private entry points.
+// Boot-apply tests, a child module so they reach this file's private entry points.
 #[cfg(test)]
 #[path = "install_boot_tests.rs"]
 mod boot_tests;
 
 #[cfg(test)]
-mod tests {
-
-    /// THE ChildDied FIELD FAILURE (2026-08-25), pinned at the seam that now
-    /// answers it. Five consecutive in-session updates on one desk ended
-    /// `handoff proof ended ChildDied` with `failing_applies=5 persistent=true`,
-    /// and nothing on the machine named a cause. The chain was:
-    /// `/Applications/aterm.app` had been replaced in place by a hand-built,
-    /// ad-hoc-signed bundle → the successor's boot apply refused to swap
-    /// ("current installed rollback source is not verified") → the successor
-    /// stayed the OLD build → it refused the authorized target identity and
-    /// dropped the readiness pipe → the parent read EOF and booked the crash
-    /// outcome. Five frozen terminals for a verdict that was decidable before
-    /// the first reader parked.
-    ///
-    /// `None` is `bundle::resolve()` finding nothing the updater may replace,
-    /// which is `ApplyOutcome::NotApplicable` at swap time: a successor whose
-    /// swap is a no-op can only ever refuse the target, so this must refuse now.
-    #[test]
-    fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
-        let error = super::preverify_installed_rollback_source(None, 100, Some("abcdef0"))
-            .expect_err("no replaceable bundle cannot host a swap");
-        assert!(
-            error.contains("does not run from an installed bundle"),
-            "the refusal names the missing bundle rather than blaming the candidate: {error}"
-        );
-    }
-
-    /// A bundle path that is not a verifiable bundle refuses, and the refusal
-    /// NAMES THE PATH — the one fact an operator needs to act on, and the one
-    /// the `ChildDied` verdict could never carry.
-    #[test]
-    fn an_unverifiable_installed_bundle_refuses_and_names_itself() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-rollback-source-{}-{}",
-            std::process::id(),
-            super::unix_now_secs()
-        ));
-        let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
-            .expect_err("a path that is not a bundle cannot be a rollback source");
-        assert!(
-            error.contains(&root.display().to_string()),
-            "the refusal names the bundle it examined: {error}"
-        );
-        assert!(
-            error.contains("rollback source"),
-            "the refusal names WHAT the bundle failed to be: {error}"
-        );
-    }
-
-    /// The identity half of the same gate, pinned pure. The owner's desk failed
-    /// this one too — the bundle on disk was sealed 1787634715 while the process
-    /// running out of it was 1787614521, because the `.app` had been replaced
-    /// underneath a live instance. A rollback source that is not the running
-    /// image is not a rollback source.
-    #[test]
-    fn only_the_running_image_can_be_the_rollback_source() {
-        assert!(
-            super::identity_matches_running(1787614521, "abcdef0123", 1787614521, Some("abcdef0")),
-            "the sealed identity of the image we are executing is the rollback source"
-        );
-        assert!(
-            !super::identity_matches_running(1787634715, "abcdef0123", 1787614521, Some("abcdef0")),
-            "a bundle swapped under a live instance is a different build, not our rollback source"
-        );
-        assert!(
-            !super::identity_matches_running(1787614521, "abcdef0123", 1787614521, Some("9999999")),
-            "same build number, different provenance, is still not our image"
-        );
-    }
-
-    /// THE ChildDied regression (2026-07-22): the post-swap re-exec image must
-    /// carry BOTH the single-use re-exec nonce and the caller's restored
-    /// handoff authority pairs — the successor's prearm cannot validate the
-    /// inherited overlap handoff without them and exits before writing the
-    /// readiness proof. Asserted on the constructed Command (program, `--window`
-    /// mode pin first, envs) so the contract is testable off-mac without exec.
-    #[test]
-    fn boot_reexec_command_pins_mode_and_restores_handoff_env() {
-        let handoff_env = vec![(
-            std::ffi::OsString::from("ATERM_HANDOFF_PARENT_PID"),
-            std::ffi::OsString::from("4242"),
-        )];
-        let command = super::boot_reexec_command(
-            std::path::Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
-            "0123456789abcdef",
-            1785910394,
-            &handoff_env,
-        );
-        assert_eq!(
-            command.get_program(),
-            std::ffi::OsStr::new("/Applications/aterm.app/Contents/MacOS/aterm")
-        );
-        assert_eq!(
-            command.get_args().next(),
-            Some(std::ffi::OsStr::new("--window")),
-            "the mode pin must precede the forwarded args"
-        );
-        let envs: Vec<_> = command.get_envs().collect();
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("ATERM_UPDATE_REEXEC"),
-                Some(std::ffi::OsStr::new("0123456789abcdef")),
-            )),
-            "re-exec nonce set"
-        );
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("ATERM_UPDATED_FROM"),
-                Some(std::ffi::OsStr::new("1785910394")),
-            )),
-            "the cold-launch apply names the build it came from, so the successor shows \
-             the post-update notice (2026-09-14)"
-        );
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("ATERM_HANDOFF_PARENT_PID"),
-                Some(std::ffi::OsStr::new("4242")),
-            )),
-            "handoff authority restored onto the exec image"
-        );
-    }
-
-    /// THE `--window` accumulation regression (2026-08-24): the re-exec
-    /// forwards this process's own argv, which already carries the mode pin
-    /// the PREVIOUS swap prepended — forwarded verbatim, a long-lived install
-    /// grows one `--window` per update it rides (observed at six). The strip
-    /// makes the forwarded argv a fixed point while never reaching past the
-    /// first non-pin token, so `-e`/`--command` payloads are untouchable.
-    #[test]
-    fn reexec_forwarded_args_is_a_fixed_point_and_never_reads_past_the_lead() {
-        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
-            list.iter().map(std::ffi::OsString::from).collect()
-        };
-        // The field case: six accumulated pins collapse to none forwarded
-        // (boot_reexec_command re-pins exactly one).
-        assert_eq!(
-            super::reexec_forwarded_args(args(&["--window"; 6]).into_iter()),
-            args(&[]),
-        );
-        // Fixed point: a once-stripped argv re-strips to itself.
-        let once = super::reexec_forwarded_args(
-            args(&["--window", "--font-px", "30", "--window"]).into_iter(),
-        );
-        assert_eq!(once, args(&["--font-px", "30", "--window"]));
-        assert_eq!(
-            super::reexec_forwarded_args(once.clone().into_iter()),
-            once,
-            "stripping must converge after one pass"
-        );
-        // A `--window` past the first other token is payload-adjacent and
-        // survives verbatim — including inside an -e command.
-        assert_eq!(
-            super::reexec_forwarded_args(args(&["-e", "sh", "-c", "--window"]).into_iter()),
-            args(&["-e", "sh", "-c", "--window"]),
-        );
-        // Empty argv (Finder/launchd launch) stays empty.
-        assert_eq!(
-            super::reexec_forwarded_args(args(&[]).into_iter()),
-            args(&[])
-        );
-    }
-
-    /// `rfc3339_delta_secs` inverts `format_rfc3339` across day/month/year and
-    /// leap boundaries, and fails closed on malformed input (the pre-epoch
-    /// empty-string fallback) — the duration gate on the persistent-failure
-    /// notice depends on both properties.
-    #[test]
-    fn rfc3339_delta_round_trips_and_fails_closed() {
-        for (a, b, want) in [
-            (0u64, 61, 61),
-            (86_399, 86_401, 2),                   // midnight crossing
-            (1_709_164_799, 1_709_164_800, 1),     // Feb 29 2024 (leap) boundary
-            (1_784_100_000, 1_784_101_800, 1_800), // a modern 30-min streak
-        ] {
-            let (ea, eb) = (super::format_rfc3339(a), super::format_rfc3339(b));
-            assert_eq!(
-                super::rfc3339_delta_secs(&ea, &eb),
-                Some(want),
-                "{ea}..{eb}"
-            );
-            assert_eq!(
-                super::rfc3339_delta_secs(&eb, &ea),
-                None,
-                "reversed underflows to None"
-            );
-        }
-        assert_eq!(super::rfc3339_delta_secs("", &super::now_rfc3339()), None);
-        assert_eq!(
-            super::rfc3339_delta_secs("garbage-not-a-date-Z", "2026-07-15T00:00:00Z"),
-            None
-        );
-    }
-    use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-
-    fn temp_staging() -> (Staging, std::path::PathBuf) {
-        let s = Staging::scratch("rr");
-        std::fs::create_dir_all(s.staged_dir()).unwrap();
-        let root = s.root.clone();
-        (s, root)
-    }
-
-    fn write_ready(s: &Staging, build: u64) {
-        let r = Ready {
-            build_number: build,
-            version: format!("0.0.{build}"),
-            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-            dmg_sha256: "ab".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: None,
-            roster_seq: None,
-        };
-        std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
-    }
-
-    /// TWO PROCESSES ARMING ONE BUILD SWAP IT IN ONCE (Tier-1 of
-    /// `NativeUpdateTwoProcessApply`, auto-apply audit #8). Both run build 10 with build
-    /// 11 staged, and both run the lane's own steps 3–4 ([`apply_lock_then_ready`]). B
-    /// peeks, sees the stage and goes for the lock; while it waits (injected at B's `lock`),
-    /// A runs the same function, wins the REAL `apply_lock`, reads the marker under it and
-    /// swaps (the swap's marker effect: `retire_published`), and B's attempt on the lock
-    /// is refused until A lets go. Then B takes the lock and finds nothing to apply. Each
-    /// real step is projected onto the model and checked as one of its transitions — and
-    /// the other order (B wins) swaps once too.
-    ///
-    /// NEGATIVE CONTROL, in real code: the same race run through a lane that acts on its
-    /// pre-lock peek (the model's `Buggy = 1`, and the shape a regression of the lane would
-    /// take) swaps build 11 a second time, which the model's invariant refutes — so the
-    /// race this test stages is one a peek-trusting lane cannot pass. `the_boot_lane_decides
-    /// _through_apply_lock_then_ready` pins that the lane runs the function this drives.
-    #[test]
-    fn two_processes_arming_one_build_swap_it_once() {
-        use aterm_spec::interp::State;
-        type Lane = fn(
-            &Staging,
-            &mut dyn FnMut() -> Result<FileLock, ApplyOutcome>,
-        ) -> Result<Ready, ApplyOutcome>;
-        let model = aterm_spec::derive::native_update_two_process_apply_model();
-        let project = |ready: bool, a_done: bool, b_peeked: bool, b_done: bool, swaps: i64| {
-            State::from([
-                ("ready", i64::from(ready)),
-                ("a_done", i64::from(a_done)),
-                ("b_peeked", i64::from(b_peeked)),
-                ("b_done", i64::from(b_done)),
-                ("swaps", swaps),
-            ])
-        };
-        let marker_present = |s: &Staging| matches!(read_ready(s, 10), ReadyState::Newer(_));
-        let acquire = |s: &Staging| {
-            FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_secs(5))
-                .map_err(|e| ApplyOutcome::Deferred(format!("lock: {e}")))
-        };
-        // THE LANE (steps 3–4, exactly as `apply_staged_if_ready_inner` runs them) and the
-        // peek-trusting one the negative control stages the same race through.
-        let shipped: Lane =
-            |s, lock| apply_lock_then_ready(s, 10, lock, || Ok(())).map(|(_lock, (), ready)| ready);
-        let peek_trusting: Lane = |s, lock| {
-            let peek = read_ready(s, 10);
-            let _lock = lock()?;
-            match peek {
-                ReadyState::Newer(ready) => Ok(ready),
-                _ => Err(ApplyOutcome::NoUpdate),
-            }
-        };
-        // A wins the lock while B waits; returns (B's swaps, the model states it walked).
-        let race = |b_lane: Lane| {
-            let (s, root) = temp_staging();
-            write_ready(&s, 11);
-            let init = project(true, false, false, false, 0);
-            let mut walked = vec![init.clone()];
-            let b_decision = b_lane(&s, &mut || {
-                // B got here only because its peek saw the stage.
-                let peeked = project(marker_present(&s), false, true, false, 0);
-                walked.push(peeked.clone());
-                // A's successor runs the SAME lane: it holds the real lock (B is refused
-                // it meanwhile), reads under it, swaps and retires.
-                let a_ready = shipped(&s, &mut || {
-                    let held = acquire(&s)?;
-                    assert!(
-                        FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).is_err(),
-                        "B waits behind A: the lock serializes the two processes"
-                    );
-                    Ok(held)
-                })
-                .expect("A finds the stage under the lock");
-                assert_eq!(a_ready.build_number, 11);
-                s.retire_published();
-                // A's lock went with `shipped`'s return: a `FileLock` drop is `LOCK_UN`
-                // (aterm-update-core `sys.rs`), a deterministic release, so B's one
-                // acquire below cannot meet a forked copy of A's descriptor.
-                walked.push(project(marker_present(&s), true, true, false, 1));
-                acquire(&s)
-            });
-            let b_swaps = i64::from(b_decision.is_ok());
-            walked.push(project(marker_present(&s), true, true, true, 1 + b_swaps));
-            let _ = std::fs::remove_dir_all(&root);
-            (b_swaps, walked)
-        };
-
-        let (b_swaps, walked) = race(shipped);
-        assert_eq!(
-            b_swaps, 0,
-            "B's under-lock re-read must find nothing left to apply"
-        );
-        let [init, peeked, swapped, done] = &walked[..] else {
-            panic!("the race walks four states: {walked:?}");
-        };
-        for (action, from, to) in [
-            ("BPeek", init, peeked),
-            ("ASwap", peeked, swapped),
-            ("BApply", swapped, done),
-        ] {
-            assert!(
-                model.successors(action, from).contains(to),
-                "{action}: the real step is not a model transition: {to:?}"
-            );
-        }
-        assert!(model.check_invariant("OneSwapPerBuild", done));
-
-        // NEGATIVE CONTROL: the peek-trusting lane, same race — a second swap.
-        let (b_swaps, walked) = race(peek_trusting);
-        assert_eq!(b_swaps, 1, "a lane acting on its peek swaps build 11 again");
-        let (swapped, second) = (&walked[2], &walked[3]);
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        assert!(
-            buggy.successors("BApply", swapped).contains(second),
-            "the peek-trusting lane is the model's Buggy = 1 step: {second:?}"
-        );
-        assert!(!model.check_invariant("OneSwapPerBuild", second));
-
-        // B wins the lock instead: B swaps, A finds nothing — still exactly one swap.
-        let (s, root) = temp_staging();
-        write_ready(&s, 11);
-        assert!(shipped(&s, &mut || acquire(&s)).is_ok());
-        s.retire_published();
-        assert!(matches!(
-            shipped(&s, &mut || acquire(&s)),
-            Err(ApplyOutcome::NoUpdate)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The boot lane decides through [`apply_lock_then_ready`] — the function the two-process
-    /// Tier-1 drives — and nothing else in this file's shipped code calls the under-lock
-    /// re-read: a lane that went back to its own peek, or re-read outside the lock, would
-    /// leave that Tier-1 green over code that no longer runs. Asserted as source because
-    /// the alternative is a packaged bundle and a second process.
-    #[test]
-    fn the_boot_lane_decides_through_apply_lock_then_ready() {
-        let src = include_str!("install.rs");
-        let shipped = &src[..src
-            .find(concat!("#[cfg(test)]\n", "mod tests {"))
-            .expect("the test module")];
-        let lane = &shipped[shipped
-            .find("fn apply_staged_if_ready_inner(")
-            .expect("the boot lane")..];
-        let lane = &lane[..lane.find("\n}\n").expect("end of the boot lane")];
-        // Split so these assertions do not match themselves.
-        assert_eq!(
-            lane.matches(concat!("apply_lock_then_ready", "(")).count(),
-            1,
-            "the boot lane decides through apply_lock_then_ready, once"
-        );
-        assert!(
-            lane.contains(concat!(
-                "let (_lock, _budget, ready) = match ",
-                "apply_lock_then_ready("
-            )),
-            "the `ready` the lane acts on is the one apply_lock_then_ready decided under the lock"
-        );
-        // Its one other marker read is the orphan recovery, inside `under_lock`; a second
-        // (a peek bound before the lock and acted on after) is the regression.
-        assert_eq!(lane.matches(concat!("read_ready", "(")).count(), 1);
-        assert!(!lane.contains(concat!("Ready::", "read(")));
-        assert_eq!(
-            shipped
-                .matches(concat!("ready_under_apply_lock", "("))
-                .count(),
-            2,
-            "ready_under_apply_lock: its definition and apply_lock_then_ready's one call"
-        );
-        let helper = &shipped[shipped
-            .find(concat!("fn apply_lock_then_ready", "<"))
-            .expect("the helper")..];
-        let (locked, decided) = (
-            helper.find("let held = lock()?;").expect("the lock"),
-            helper
-                .find(concat!("ready_under_apply_lock", "(staging"))
-                .expect("the decision"),
-        );
-        assert!(locked < decided, "the decision is made under the lock");
-    }
-
-    /// A `ready.toml` whose staged bundle is GONE must clear itself. This recovery runs
-    /// before the `is_publishable` retirement, so returning Err made that retirement
-    /// unreachable and turned every launch into a permanent `Deferred` naming a rollback
-    /// path the operator has no reason to care about.
-    #[test]
-    fn a_ready_marker_whose_staged_bundle_vanished_retires_instead_of_deferring_forever() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 7);
-        let installed = root.join("Applications").join("aterm.app");
-        std::fs::create_dir_all(&installed).unwrap();
-        let ready = Ready::read(&s.ready).unwrap();
-        assert!(
-            !s.staged_app.exists(),
-            "the staged bundle is the missing half"
-        );
-        assert!(
-            !rollback_path(&installed).exists(),
-            "and nothing at the fixed path could ever satisfy the marker"
-        );
-
-        assert!(
-            recover_orphaned_prepared_candidate(&s, &installed, 6, &ready).is_ok(),
-            "a dangling marker is a self-healing condition, not a permanent refusal"
-        );
-        assert!(!s.ready.exists(), "the dangling marker cleared itself");
-        assert!(matches!(read_ready(&s, 6), ReadyState::Absent));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// THE SAME MARKER, BUT THE STAGED BUNDLE IS AN EMPTY DIRECTORY rather than absent —
-    /// the state [`rename_untagged`] introduced and `rename(2)` never could.
-    ///
-    /// The exchange lane creates the destination, swaps, and drops the emptied source,
-    /// so a crash between any two of those leaves an EMPTY directory at one end. On the
-    /// main same-volume carrier that end is `staged_app` itself. This guard used to ask
-    /// only `is_non_symlink_dir`, which an empty directory satisfies, so the recovery
-    /// whose entire purpose is this crash cut would decline to run on it: the marker
-    /// stayed, `is_publishable` then failed on the empty bundle, and a complete verified
-    /// update sitting at the fixed path was thrown away and re-downloaded.
-    ///
-    /// The sibling test above covers ABSENCE. Nothing covered the placeholder.
-    #[test]
-    fn a_ready_marker_whose_staged_bundle_is_an_empty_placeholder_recovers_too() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 7);
-        let installed = root.join("Applications").join("aterm.app");
-        std::fs::create_dir_all(&installed).unwrap();
-        let ready = Ready::read(&s.ready).unwrap();
-
-        // The crash cut: the name is there, the bundle is not.
-        std::fs::create_dir_all(&s.staged_app).unwrap();
-        assert!(
-            is_non_symlink_dir(&s.staged_app),
-            "shape alone says a stage is present — which is exactly the trap"
-        );
-        assert!(
-            !holds_a_stage(&s.staged_app),
-            "and the guard the recovery actually uses must see through it"
-        );
-
-        assert!(
-            recover_orphaned_prepared_candidate(&s, &installed, 6, &ready).is_ok(),
-            "an interrupted move is a self-healing condition"
-        );
-        assert!(
-            !s.ready.exists(),
-            "the recovery RAN: with nothing at the fixed path to restore, it retired \
-             the dangling marker instead of early-returning on the placeholder"
-        );
-        assert!(matches!(read_ready(&s, 6), ReadyState::Absent));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The new attribution fields must be OPTIONAL on the wire: a `ready.toml` written
-    /// before they existed has to keep parsing, or an upgrade would strand every
-    /// already-staged build behind a `Corrupt` marker.
-    #[test]
-    fn a_ready_marker_without_attribution_still_parses() {
-        let legacy = r#"
-build_number = 42
-version = "0.42.0"
-dmg_sha256 = "abcd"
-team_id = "T"
-staged_at = "2026-08-17T00:00:00Z"
-"#;
-        let ready: Ready = aterm_toml::from_str(legacy).expect("pre-attribution marker parses");
-        assert_eq!(ready.build_number, 42);
-        assert_eq!(ready.machine_id, None);
-        assert_eq!(ready.roster_seq, None);
-    }
-
-    /// AN OVERSIZED CHANGELOG MAKES THE MARKER INVISIBLE, NOT LARGE: every reader goes
-    /// through `read_ledger_text`, which returns `None` above `MAX_LEDGER_BYTES`. The
-    /// clamp must count CHARACTERS — a byte-offset cut inside a multi-byte sequence
-    /// panics, and release notes are full of em dashes.
-    #[test]
-    fn an_oversized_manifest_changelog_is_clamped_by_characters_not_bytes() {
-        assert_eq!(clamp_ready_changelog(None), None);
-        assert_eq!(
-            clamp_ready_changelog(Some("a short release note")).as_deref(),
-            Some("a short release note")
-        );
-
-        // Three bytes per char, so any byte-indexed cut would land mid-sequence.
-        let wide = "—".repeat(MAX_READY_CHANGELOG_CHARS * 4);
-        let clamped = clamp_ready_changelog(Some(&wide)).unwrap();
-        assert!(clamped.starts_with('—'), "the head survives verbatim");
-        assert!(clamped.ends_with(READY_CHANGELOG_TRUNCATED));
-        assert_eq!(
-            clamped.chars().count(),
-            MAX_READY_CHANGELOG_CHARS + READY_CHANGELOG_TRUNCATED.chars().count()
-        );
-
-        // The defect's real scale: the whole ~382 KiB CHANGELOG.md in one manifest
-        // field. Clamped, the committed marker stays inside the cap every reader
-        // enforces, so the stage stays visible instead of reading as absent/corrupt.
-        let whole_changelog_md = "x".repeat(382 * 1024);
-        let ready = Ready {
-            build_number: 9,
-            version: "0.9.0".into(),
-            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-            dmg_sha256: "ab".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: clamp_ready_changelog(Some(&whole_changelog_md)),
-            machine_id: None,
-            roster_seq: None,
-        };
-        let marker = ready.to_toml().unwrap();
-        assert!(
-            u64::try_from(marker.len()).unwrap() <= crate::MAX_LEDGER_BYTES,
-            "clamped marker is {} bytes",
-            marker.len()
-        );
-        assert!(
-            crate::read_ledger_text(&{
-                let (s, _root) = temp_staging();
-                std::fs::write(&s.ready, &marker).unwrap();
-                s.ready
-            })
-            .is_some()
-        );
-    }
-
-    /// A STAGE DECIDED BEFORE A CRASH-LOOP REVERT CANNOT OUTLIVE IT (round six,
-    /// finding 15). A checker still on the old build starts downloading Q during
-    /// Q's boot trial; the third failed launch of Q reverts and quarantines it; the
-    /// in-flight check then publishes Q and cleared the memo — erasing the verdict —
-    /// and nothing downstream looked at the quarantine, so Q was applied and
-    /// crash-looped again. The publish shares the revert's apply lock, so a check
-    /// under it closes the race; the readers refuse what an older stager published.
-    #[test]
-    fn a_stage_decided_before_a_crash_loop_revert_cannot_republish_the_quarantined_build() {
-        let (s, root) = temp_staging();
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let sha = "ab".repeat(32);
-        let plist = format!(
-            "<plist><dict><key>CFBundleVersion</key><string>7</string>\
-             <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
-        );
-        let incoming = s.staged_dir().join("aterm.app.incoming");
-        make_app(&incoming, "Q");
-        std::fs::create_dir_all(incoming.join("Contents")).unwrap();
-        std::fs::write(incoming.join("Contents/Info.plist"), &plist).unwrap();
-        let ready = Ready {
-            build_number: 7,
-            version: "0.0.7".into(),
-            commit: Some(commit.into()),
-            dmg_sha256: sha.clone(),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: None,
-            roster_seq: None,
-        };
-
-        // The revert lands while the stager is still downloading.
-        crate::manifest::quarantine_artifact(&s, 7, &sha);
-        let refused = publish_verified_stage(&s, &incoming, &ready);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|error| error.contains("quarantined")),
-            "{refused:?}"
-        );
-        assert!(Ready::read_publishable(&s).is_none());
-        // The stager's success tail must not erase the verdict.
-        crate::manifest::FailedMark::clear_backoff(&s.failed());
-        assert!(crate::manifest::artifact_quarantined(&s, 7, &sha));
-
-        // A stager of an older build publishes without asking: every reader
-        // still refuses the quarantined stage.
-        std::fs::rename(&incoming, &s.staged_app).unwrap();
-        std::fs::write(&s.ready, ready.to_toml().unwrap()).unwrap();
-        assert!(
-            Ready::read_publishable(&s).is_none(),
-            "a quarantined stage is not publishable"
-        );
-        let preverify =
-            preverify_staged_handoff_candidate_at(&s, None, 6, None, Some(7), None, &|_| ());
-        assert!(
-            preverify
-                .as_ref()
-                .is_err_and(|error| error.contains("quarantined")),
-            "{preverify:?}"
-        );
-        // NEGATIVE CONTROL: the same stage of an artifact nobody quarantined
-        // reads as publishable.
-        let other = Ready {
-            dmg_sha256: "cd".repeat(32),
-            ..ready
-        };
-        std::fs::write(&s.ready, other.to_toml().unwrap()).unwrap();
-        assert!(Ready::read_publishable(&s).is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A STAGE WHOSE SIGNER A SIBLING SAW REVOKED MID-DOWNLOAD IS NEVER PUBLISHED
-    /// (round seven, H1 finding 33). Check A authorized build 7 by m11 under roster
-    /// generation 9 and began its download; the pre-download supersession guard had
-    /// passed. Meanwhile check B admitted generation 10, which revokes m11, recorded
-    /// that in the floor, and found no published stage to retire. A then published —
-    /// the only guard ran before the download — and armed its own apply lane for a
-    /// withdrawn machine's build. The publish now re-reads the floor under the lock
-    /// the check's retirement holds.
-    #[test]
-    fn a_stage_whose_signer_was_revoked_during_its_download_is_not_published() {
-        let (s, root) = temp_staging();
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let incoming = s.staged_dir().join("aterm.app.incoming");
-        make_app(&incoming, "R");
-        std::fs::create_dir_all(incoming.join("Contents")).unwrap();
-        std::fs::write(
-            incoming.join("Contents/Info.plist"),
-            format!(
-                "<plist><dict><key>CFBundleVersion</key><string>7</string>\
-                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
-            ),
-        )
-        .unwrap();
-        let ready = Ready {
-            build_number: 7,
-            version: "0.0.7".into(),
-            commit: Some(commit.into()),
-            dmg_sha256: "ab".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: Some("m11".into()),
-            roster_seq: Some(9),
-        };
-        // The sibling's check, landing while this one downloaded.
-        let revoked = vec!["m11".to_string()];
-        crate::manifest::Floor::observe_and_write(
-            &s.floor(),
-            &crate::manifest::FloorObservation {
-                roster_seq: 10,
-                revoked: &revoked,
-                ..crate::manifest::FloorObservation::default()
-            },
-        );
-        let refused = publish_verified_stage(&s, &incoming, &ready);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|error| error.contains("m11") && error.contains("revoked")),
-            "{refused:?}"
-        );
-        assert!(
-            Ready::read_published_bundle(&s).is_none(),
-            "nothing published"
-        );
-
-        // NEGATIVE CONTROL: a generation that only ADDS a machine (a join) does not
-        // withdraw a stage signed by one that stays — the exactness a
-        // roster-generation comparison would lose.
-        let by_m3 = Ready {
-            machine_id: Some("m3".into()),
-            ..ready
-        };
-        crate::manifest::Floor::observe_and_write(
-            &s.floor(),
-            &crate::manifest::FloorObservation {
-                roster_seq: 11,
-                ..crate::manifest::FloorObservation::default()
-            },
-        );
-        publish_verified_stage(&s, &incoming, &by_m3).expect("m3 is still trusted");
-        assert!(Ready::read_publishable(&s).is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// THE SWAP REFUSES A STAGE SIGNED BY A MACHINE THIS CLIENT HAS SEEN REVOKED
-    /// (round seven, H1 finding 56's reachable half). The check that admits the
-    /// revoking roster retires the stage under the apply lock — unless it could not
-    /// take that lock in time, which leaves the stage for its next check; an app quit
-    /// in between launched straight into the swap, which read only `min_build`.
-    /// Gate 4c now reads the floor's durable revocation set.
-    #[test]
-    fn the_swap_retires_a_stage_whose_signer_the_floor_has_seen_revoked() {
-        let (s, root) = temp_staging();
-        let ready = |machine: &str| Ready {
-            build_number: 20,
-            version: "0.0.20".into(),
-            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-            dmg_sha256: "ab".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: Some(machine.into()),
-            roster_seq: Some(9),
-        };
-        std::fs::write(&s.ready, ready("m11").to_toml().unwrap()).unwrap();
-        // NEGATIVE CONTROL: nothing revoked, nothing yanked — the gate lets it on.
-        assert!(floor_withdrawal_gate(&s, 10, &ready("m11")).is_none());
-        assert_eq!(handoff_apply_floor_refusal_at(&s, 20), None);
-
-        let revoked = vec!["m11".to_string()];
-        crate::manifest::Floor::observe_and_write(
-            &s.floor(),
-            &crate::manifest::FloorObservation {
-                roster_seq: 10,
-                revoked: &revoked,
-                ..crate::manifest::FloorObservation::default()
-            },
-        );
-        // Another machine's stage is untouched by m11's revocation.
-        assert!(floor_withdrawal_gate(&s, 10, &ready("m3")).is_none());
-        // The pre-park check refuses it before any reader parks…
-        let refusal = handoff_apply_floor_refusal_at(&s, 20).expect("revoked signer");
-        assert!(
-            refusal.contains("m11") && refusal.contains("revoked"),
-            "{refusal}"
-        );
-        // …and the swap retires it.
-        let outcome = floor_withdrawal_gate(&s, 10, &ready("m11"));
-        assert!(
-            matches!(outcome, Some(ApplyOutcome::NoUpdate)),
-            "{outcome:?}"
-        );
-        assert!(!s.ready.exists(), "the stage is retired");
-        let status = std::fs::read_to_string(&s.status).unwrap_or_default();
-        assert!(status.contains("revoked"), "{status}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A marker that would read as ABSENT must never be committed — and refusing it
-    /// must not cost the readable generation that is already staged, which is why the
-    /// size guard runs before the lock and before the old marker/bundle are removed.
-    #[test]
-    fn publish_refuses_a_marker_that_would_exceed_the_ledger_cap() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 5);
-        make_app(&s.staged_app, "OLD-STAGE");
-        let incoming = s.staged_dir().join("aterm.app.incoming");
-        make_app(&incoming, "NEW-STAGE");
-
-        let mut ready = Ready::read(&s.ready).unwrap();
-        ready.build_number = 6;
-        ready.changelog = Some("y".repeat(usize::try_from(crate::MAX_LEDGER_BYTES).unwrap() + 1));
-        let error = publish_verified_stage(&s, &incoming, &ready).unwrap_err();
-        assert!(error.contains("ready marker"), "{error}");
-
-        assert!(
-            matches!(
-                read_ready(&s, 4),
-                ReadyState::Newer(Ready {
-                    build_number: 5,
-                    ..
-                })
-            ),
-            "a rejected publish leaves the previous readable generation staged"
-        );
-        assert_eq!(read_id(&s.staged_app), "OLD-STAGE");
-        assert_eq!(read_id(&incoming), "NEW-STAGE");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_ready_classifies_all_states() {
-        let (s, root) = temp_staging();
-
-        // Absent: no marker file.
-        assert!(matches!(read_ready(&s, 10), ReadyState::Absent));
-
-        // Corrupt: present but unparseable → must be discardable, not Absent.
-        std::fs::write(&s.ready, "this is not valid toml {{{").unwrap();
-        assert!(matches!(read_ready(&s, 10), ReadyState::Corrupt));
-
-        // Newer: staged build strictly greater than running.
-        write_ready(&s, 20);
-        assert!(matches!(read_ready(&s, 10), ReadyState::Newer(_)));
-
-        // NotNewer: equal or lower than running (downgrade gate).
-        assert!(matches!(read_ready(&s, 20), ReadyState::NotNewer));
-        assert!(matches!(read_ready(&s, 21), ReadyState::NotNewer));
-
-        // Parseable is not sufficient: a short commit cannot authorize apply and
-        // must not be surfaced by the status reader as a staged update either.
-        let mut corrupt = Ready::read(&s.ready).unwrap();
-        corrupt.commit = Some("0123456789ab".into());
-        std::fs::write(&s.ready, corrupt.to_toml().unwrap()).unwrap();
-        assert!(matches!(read_ready(&s, 10), ReadyState::Corrupt));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Overlap seam 1 (pre-park verification): every refusal on this ladder
-    /// happens with a plain `Err` return — the caller (the GUI handoff
-    /// starter) receives it BEFORE `park_all_readers`, so an absent, stale,
-    /// wrong-artifact, or unverifiable candidate can never cost a parked
-    /// reader, a frozen frame, or a doomed child spawn.
-    #[test]
-    fn preverify_refuses_unverifiable_candidates_before_any_reader_could_park() {
-        let (s, root) = temp_staging();
-
-        // Nothing staged: refuse immediately.
-        let absent =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, None, None, NEVER_READ);
-        assert!(
-            absent.clone().unwrap_err().contains("no verified update"),
-            "{absent:?}"
-        );
-
-        // Staged but not strictly newer than the running build.
-        write_ready(&s, 20);
-        let stale =
-            preverify_staged_handoff_candidate_at(&s, None, 20, None, None, None, NEVER_READ);
-        assert!(
-            stale.clone().unwrap_err().contains("strictly newer"),
-            "{stale:?}"
-        );
-
-        // Staged build is not the artifact the updater reducer authorized.
-        let wrong =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(21), None, NEVER_READ);
-        assert!(
-            wrong
-                .clone()
-                .unwrap_err()
-                .contains("not the authorized build"),
-            "{wrong:?}"
-        );
-
-        // Right identity on the marker, but no verifiable bundle exists at the
-        // staged path: the sealed-identity gate must fail closed.
-        let unverifiable =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
-        assert!(unverifiable.is_err(), "{unverifiable:?}");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A STAGE YANKED AFTER IT WAS ARMED NEVER PARKS A READER (round six of the
-    /// update audit, item 26). The floor rose on observation (`min_build = 21`)
-    /// while build 20 was still staged; the swap's gate 4b would retire it and
-    /// leave the successor the old build, so the pre-park check must refuse it
-    /// by the floor — before the sealed-identity read — and read no policy.
-    ///
-    /// RED before the fix: the check never read the floor, and its only
-    /// refusal here was the unverifiable fixture bundle's, which says nothing
-    /// of a yank (a signed stage would have passed and parked).
-    /// The floor check a worker runs ALONE when a fresh cached pass let it skip
-    /// the full pre-verification (round six, item 26, review round two): the
-    /// same refusal the full check gives, read off the same file, and silent at
-    /// or above the floor and when no floor was ever written.
-    #[test]
-    fn the_floor_check_alone_refuses_only_below_the_floor() {
-        let (s, root) = temp_staging();
-        assert_eq!(
-            handoff_apply_floor_refusal_at(&s, 20),
-            None,
-            "no floor written"
-        );
-        std::fs::write(s.floor(), "min_build = 21\n").unwrap();
-        let refusal = handoff_apply_floor_refusal_at(&s, 20).expect("20 is below 21");
-        assert!(
-            refusal.contains("below the operator apply floor 21") && refusal.contains("yanked"),
-            "{refusal}"
-        );
-        assert_eq!(handoff_apply_floor_refusal_at(&s, 21), None, "at the floor");
-        assert_eq!(
-            handoff_apply_floor_refusal_at(&s, 22),
-            None,
-            "above the floor"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn preverify_refuses_a_stage_below_the_operator_floor() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 20);
-        std::fs::write(s.floor(), "min_build = 21\n").unwrap();
-        let yanked =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
-        let error = yanked.unwrap_err();
-        assert!(
-            error.contains("below the operator apply floor 21") && error.contains("yanked"),
-            "{error}"
-        );
-        // Read-only: the stage is still there for the apply to retire.
-        assert!(matches!(read_ready(&s, 10), ReadyState::Newer(_)));
-        // At the floor, the floor is not the refusal.
-        std::fs::write(s.floor(), "min_build = 20\n").unwrap();
-        let at_floor =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
-                .unwrap_err();
-        assert!(!at_floor.contains("floor"), "{at_floor}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A CHECK OF THE INSTALLED BUNDLE THAT DID NOT FINISH IS NOT A PERSON'S TO
-    /// CLEAR (round four of the 2026-09 update robustness work, plan item 2).
-    ///
-    /// The installed bundle's sealed-identity reader answers what
-    /// `verified_bundle_identity` answers when its team-pinned `codesign` outruns
-    /// the apply budget on a loaded desk — the verifier's own `timed_out`, under
-    /// the same "bundle policy:" prefix (the real helper outrunning a real budget
-    /// is `verify`'s `a_helper_timeout_is_a_passing_refusal`; a reader here that
-    /// raced a real `codesign` against a spent budget would be a flaky test). That
-    /// refusal must carry the passing key and must NOT be the installed-source
-    /// refusal — whose key suspends automatic apply with no retry and tells the
-    /// owner to reinstall an app that is fine. Before this change the pre-park
-    /// check wrapped EVERY error in `rollback_source_refusal`, so
-    /// `is_rollback_source_refusal` answered true here (the assertion below that
-    /// fails on that code).
-    ///
-    /// CONTROL: the REAL reader, given all the time it needs, refuses the same
-    /// unsigned bundle as a VERDICT — and that one is still the person's.
-    #[test]
-    fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-update-installed-timeout-{}-{}",
-            std::process::id(),
-            unix_now_secs()
-        ));
-        let app = root.join("aterm.app");
-        let _ = unsigned_bundle_with_a_policy(&app, 10);
-        let commit = Some("0123456789abcdef0123456789abcdef01234567");
-
-        let slow_machine = |_installed: &Path| -> Result<(u64, String), String> {
-            Err(format!(
-                "bundle policy: {}",
-                crate::verify::timed_out("codesign --verify (team-pinned)", true)
-            ))
-        };
-        let refusal =
-            preverify_installed_rollback_source_with(Some(&app), 10, commit, &slow_machine)
-                .expect_err("a check that did not finish must refuse, never pass");
-        assert!(
-            crate::is_passing_refusal(&refusal),
-            "a verification that ran out of the apply budget is a passing refusal: {refusal}"
-        );
-        assert!(
-            !is_rollback_source_refusal(&refusal),
-            "a check that did not finish must not read as the installed-source refusal: {refusal}"
-        );
-        assert!(
-            !crate::refusal_needs_person(&refusal),
-            "nothing about the bundle is known, so nothing is asked of a person: {refusal}"
-        );
-        assert!(
-            refusal.contains(&app.display().to_string()),
-            "the refusal still names the bundle it was about: {refusal}"
-        );
-        // The shape the old wrapping minted — the installed-source key AROUND a
-        // passing error — is not a person's either, wherever it is still read.
-        let wrapped = rollback_source_refusal(&app, &refusal);
-        assert!(is_rollback_source_refusal(&wrapped));
-        assert!(!crate::refusal_needs_person(&wrapped), "{wrapped}");
-
-        // CONTROL: the verdict on the same unsigned bundle keeps its remedy.
-        let verdict = preverify_installed_rollback_source_with(
-            Some(&app),
-            10,
-            commit,
-            &verified_bundle_identity,
-        )
-        .expect_err("an unsigned installed bundle is refused");
-        assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
-        assert!(is_rollback_source_refusal(&verdict), "{verdict}");
-        assert!(crate::refusal_needs_person(&verdict), "{verdict}");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// ONLY A VERDICT DISCARDS A STAGE OR MEMOS THE ARTIFACT AS FAILED (round
-    /// four, plan item 2): the cold launch's step 6 and step 7b both used to act
-    /// on any error, so a re-verification or a start probe that merely ran out of
-    /// time discarded a healthy stage or backed its re-download off. Passing
-    /// shapes minted for real — the apply lock held past its wait by a live
-    /// holder, a copy that outran its limit, a helper past the apply budget — are
-    /// kept; a codesign rejection is not.
-    #[test]
-    fn a_stage_check_that_did_not_finish_is_not_a_verdict_on_the_bytes() {
-        let held = std::env::temp_dir().join(format!(
-            "aterm-update-held-apply-lock-{}-{}",
-            std::process::id(),
-            unix_now_secs()
-        ));
-        let holder = FileLock::acquire(&held).expect("take the lock as a sibling would");
-        let waited = FileLock::acquire_within(&held, std::time::Duration::from_millis(40))
-            .err()
-            .expect("a held lock refuses the bounded wait");
-        let lock = crate::verify::lock_wait_refusal("lock", &waited);
-        drop(holder);
-        let _ = std::fs::remove_file(&held);
-
-        let copy = crate::verify::status_bounded_with_stderr(
-            Command::new("/bin/sleep").arg("30"),
-            "ditto to fixed swap path",
-            std::time::Duration::from_millis(50),
-        )
-        .expect_err("a copy past its limit refuses");
-        let budget = crate::verify::timed_out("candidate --version probe", true);
-        for passing in [&lock, &copy, &budget] {
-            assert!(
-                crate::is_passing_refusal(passing),
-                "a moment must be marked passing: {passing}"
-            );
-            assert!(
-                !stage_failure_is_a_verdict(passing),
-                "a moment must not discard the stage: {passing}"
-            );
-        }
-        let verdict = "bundle policy: codesign --verify (structural) failed: code object is not \
-                       signed at all";
-        assert!(stage_failure_is_a_verdict(verdict));
-    }
-
-    /// The handoff-policy reader for a pre-verification that must refuse: a read
-    /// is the failure (plan P0-5 — no refused bundle's policy is ever read).
-    const NEVER_READ: &dyn Fn(&Path) -> aterm_update_core::handoff_policy::PolicyRead = &|path| {
-        panic!(
-            "a refused candidate's handoff policy was read: {}",
-            path.display()
-        )
-    };
-
-    /// A staged `.app` shaped like a release — an `Info.plist` naming `build` and
-    /// a handoff policy asking every producer for blank screens — that carries NO
-    /// signature. Returns the policy it holds, as a reader would parse it.
-    fn unsigned_bundle_with_a_policy(
-        app: &Path,
-        build: u64,
-    ) -> aterm_update_core::handoff_policy::PolicyRead {
-        let contents = app.join("Contents");
-        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
-        std::fs::create_dir_all(contents.join("Resources")).unwrap();
-        std::fs::write(
-            contents.join("Info.plist"),
-            format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n\
-                 <key>CFBundleExecutable</key><string>aterm</string>\n\
-                 <key>CFBundleVersion</key><string>{build}</string>\n\
-                 <key>ATermGitCommit</key>\
-                 <string>0123456789abcdef0123456789abcdef01234567</string>\n\
-                 </dict></plist>\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(contents.join("MacOS/aterm"), b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(
-            app.join(aterm_update_core::handoff_policy::BUNDLE_PATH),
-            "schema = 1\ncarry = \"repaint\"\npark_quiet_gate_at_land = \"relaxed\"\n",
-        )
-        .unwrap();
-        aterm_update_core::handoff_policy::read_from_bundle(app)
-    }
-
-    /// A HANDOFF POLICY IN AN UNVERIFIED BUNDLE IS NEVER READ (the 2026-09-22/23
-    /// update audit, plan P0-5). The policy's whole authority is the signature
-    /// that seals it with the successor's code, so the pre-verification reads it
-    /// only once every check has passed — here the codesign policy refuses an
-    /// unsigned stage whose marker, plist and policy all look right, and the
-    /// reader must never run. Both candidate shapes: a staged download, and an
-    /// installed bundle an activation would exec.
-    #[test]
-    fn a_handoff_policy_in_an_unverified_bundle_is_never_read() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 20);
-        let held = unsigned_bundle_with_a_policy(&s.staged_app, 20);
-        assert!(
-            matches!(held, aterm_update_core::handoff_policy::PolicyRead::Parsed(policy)
-                if policy.carry == Some(aterm_update_core::handoff_policy::CarryCeiling::Repaint)),
-            "PRECONDITION: the unsigned stage holds a policy a reader would follow: {held:?}"
-        );
-        let reads = std::cell::Cell::new(0_u32);
-        let counting = |path: &Path| {
-            reads.set(reads.get() + 1);
-            aterm_update_core::handoff_policy::read_from_bundle(path)
-        };
-        let refused =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, &counting);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|why| why.contains("bundle policy")),
-            "the unsigned stage fails its codesign policy: {refused:?}"
-        );
-        assert_eq!(reads.get(), 0, "the refused stage's policy was never read");
-
-        let installed = root.join("Applications").join("aterm.app");
-        let held = unsigned_bundle_with_a_policy(&installed, 20);
-        assert!(
-            matches!(
-                held,
-                aterm_update_core::handoff_policy::PolicyRead::Parsed(_)
-            ),
-            "{held:?}"
-        );
-        let refused =
-            crate::preverify_installed_at(&installed, 0, 10, 20, "0123456789ab", &counting);
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|why| why.contains("bundle policy")),
-            "the unsigned installed bundle fails its codesign policy: {refused:?}"
-        );
-        assert_eq!(
-            reads.get(),
-            0,
-            "the refused activation's policy was never read"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// AN ACTIVATION'S PRE-VERIFY RUNS UNDER THE APPLY LOCK, as the staged lane's
-    /// does. A sibling's swap renames a new bundle onto the installed path while it
-    /// holds that lock; the check and the policy read must both land on one side
-    /// of it, or the policy of the bundle swapped in after the check is read and
-    /// cached under the verified one's name. Here a sibling holds the lock for
-    /// 400 ms: the pre-verify must not verify, or read anything, until it lets go.
-    /// RED before the fix: nothing waited — the unsigned bundle was refused within
-    /// milliseconds, inside the sibling's swap.
-    #[test]
-    fn an_activation_pre_verify_waits_out_a_siblings_swap_before_it_verifies() {
-        let (s, root) = temp_staging();
-        let installed = root.join("Applications").join("aterm.app");
-        let _ = unsigned_bundle_with_a_policy(&installed, 20);
-        let sibling = FileLock::acquire(&s.apply_lock).expect("the sibling's swap holds it");
-        let hold = std::time::Duration::from_millis(400);
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(hold);
-            drop(sibling);
-        });
-        let started = std::time::Instant::now();
-        let refused = crate::preverify_installed_locked(
-            Some(&s),
-            &installed,
-            10,
-            20,
-            "0123456789ab",
-            NEVER_READ,
-        );
-        let waited = started.elapsed();
-        releaser.join().expect("the sibling let go");
-        assert!(
-            waited >= hold,
-            "the check ran inside the sibling's swap ({waited:?} < {hold:?})"
-        );
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|why| why.contains("bundle policy")),
-            "then it verified, and refused the unsigned bundle: {refused:?}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// THE PRE-VERIFICATION IS TIMED AS A WHOLE (round seven, item 36). The fork
-    /// lane waits for a running pre-verification up to a ceiling derived from
-    /// [`crate::HANDOFF_PREVERIFY_BOUND`] — the lock wait plus the verification
-    /// budget. That ceiling is a bound only if the check really runs under the
-    /// budget: without it each helper had its own 30 s and one check runs ten of
-    /// them, so a read outlived the ceiling on exactly the slow desk the wait is
-    /// for, the lane parked without the policy, and its worker then queued for
-    /// the lock that read still held with every reader frozen. Here: entering a
-    /// pre-verification holds the apply lock AND opens a budget no longer than
-    /// `APPLY_BUDGET`, both released on drop, and the bound is their sum.
-    #[test]
-    fn a_pre_verification_holds_the_lock_and_runs_under_the_verification_budget() {
-        assert_eq!(
-            crate::HANDOFF_PREVERIFY_BOUND,
-            APPLY_LOCK_WAIT + verify::APPLY_BUDGET,
-            "the bound a waiter derives its ceiling from is the lock wait plus the budget"
-        );
-        let (s, root) = temp_staging();
-        assert!(verify::current_budget_deadline().is_none());
-        {
-            let entered = std::time::Instant::now();
-            let _guard = enter_preverify(Some(&s.apply_lock)).expect("an idle lock is taken");
-            let deadline = verify::current_budget_deadline()
-                .expect("every helper under a pre-verification answers inside the budget");
-            assert!(
-                deadline <= std::time::Instant::now() + verify::APPLY_BUDGET
-                    && deadline >= entered + verify::APPLY_BUDGET,
-                "the budget is the apply budget, opened once the lock is held"
-            );
-            assert!(
-                FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_millis(50))
-                    .is_err(),
-                "the apply lock is held for the whole check"
-            );
-        }
-        assert!(
-            verify::current_budget_deadline().is_none(),
-            "the budget closes with the check"
-        );
-        let _free = FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_millis(50))
-            .expect("and the lock is let go");
-        // No staging root: nothing to lock, and the budget still opens.
-        {
-            let _guard = enter_preverify(None).expect("no lock to wait for");
-            assert!(verify::current_budget_deadline().is_some());
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Both pre-verifications — the staged candidate's and the activation's —
-    /// enter through [`enter_preverify`], once, and take the apply lock nowhere
-    /// else: a check that went back to its own `acquire_within` would drop the
-    /// budget, and the ceiling above would be a comment again. Asserted as source
-    /// because the helpers under the budget need a signed bundle to run long.
-    #[test]
-    fn both_pre_verifications_enter_through_the_budgeted_door() {
-        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
-            let from = &source[source.find(signature).expect(signature)..];
-            &from[..from.find("\n}\n").expect("end of fn")]
-        }
-        let install = include_str!("install.rs");
-        let install = install
-            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
-            .map_or(install, |(before, _)| before);
-        let lib = include_str!("lib.rs");
-        for (what, lane) in [
-            (
-                "the staged candidate's",
-                body(install, "fn preverify_staged_handoff_candidate_at<"),
-            ),
-            (
-                "the activation's",
-                body(lib, "fn preverify_installed_locked<"),
-            ),
-        ] {
-            // Split so these assertions do not match themselves.
-            assert_eq!(
-                lane.matches(concat!("enter_preverify", "(")).count(),
-                1,
-                "{what} pre-verification enters through enter_preverify, once"
-            );
-            assert!(
-                !lane.contains(concat!("acquire_within", "(")),
-                "{what} pre-verification takes the lock only through the budgeted door"
-            );
-        }
-    }
-
-    #[test]
-    fn successful_swap_status_is_new_build_and_has_no_staged_claim() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 54);
-        let ready = Ready::read(&s.ready).unwrap();
-        s.retire_published();
-        record_activating_status(&s, &ready);
-
-        let text = std::fs::read_to_string(&s.status).expect("activation status written");
-        let value: aterm_toml::Value =
-            aterm_toml::from_str(&text).expect("activation status parses");
-        assert_eq!(
-            value
-                .get("current_build")
-                .and_then(aterm_toml::Value::as_integer),
-            Some(54)
-        );
-        assert_eq!(
-            value.get("outcome").and_then(aterm_toml::Value::as_str),
-            Some("installed 0.0.54 (build 54); activating now")
-        );
-        assert!(
-            value.get("staged_build").is_none(),
-            "retired ready marker cannot leave a staged status field: {text}"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn release_and_ready_commits_bind_to_sealed_bundle_provenance() {
-        let full = "0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(canonical_release_commit(Some(full)), Some(full.to_string()));
-        assert!(sealed_commit_matches(Some(full), "0123456789ab"));
-
-        for invalid in [
-            None,
-            Some(""),
-            Some("unknown"),
-            Some("0123456"),
-            Some("0123456789ab"),
-            Some("0123456789abcdef0123456789abcdef0123456"),
-            Some("0123456789abcdef0123456789abcdef012345678"),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            Some("0123456789ab-dirty"),
-        ] {
-            assert!(canonical_release_commit(invalid).is_none());
-        }
-        assert!(
-            !sealed_commit_matches(Some(full), "fedcba9876543210fedcba9876543210fedcba98"),
-            "negative control: same build/digest marker cannot authorize wrong sealed commit"
-        );
-    }
-
-    #[test]
-    fn running_rollback_identity_requires_build_and_commit() {
-        let running = "0123456789ab";
-        let same = "0123456789abcdef0123456789abcdef01234567";
-        let other = "fedcba9876543210fedcba9876543210fedcba98";
-        assert!(identity_matches_running(53, same, 53, Some(running)));
-        assert!(!identity_matches_running(53, other, 53, Some(running)));
-        assert!(!identity_matches_running(54, same, 53, Some(running)));
-    }
-
-    #[test]
-    fn expected_handoff_authority_is_exact_build_commit_and_digest() {
-        let ready = Ready {
-            build_number: 54,
-            version: "0.54".into(),
-            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-            dmg_sha256: "ab".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: None,
-            roster_seq: None,
-        };
-        let exact = ExpectedArtifact {
-            build: 54,
-            commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            dmg_sha256: "ab".repeat(32),
-        };
-        assert!(ready_matches_expected(&ready, &exact));
-        let mut wrong_digest = exact.clone();
-        wrong_digest.dmg_sha256 = "cd".repeat(32);
-        assert!(!ready_matches_expected(&ready, &wrong_digest));
-        let mut wrong_commit = exact.clone();
-        wrong_commit.commit = "fedcba9876543210fedcba9876543210fedcba98".into();
-        assert!(!ready_matches_expected(&ready, &wrong_commit));
-        let mut wrong_build = exact;
-        wrong_build.build = 55;
-        assert!(!ready_matches_expected(&ready, &wrong_build));
-    }
-
-    #[test]
-    fn inverse_swap_receipt_restore_binds_old_identity_and_fails_closed() {
-        let model = aterm_spec::derive::native_update_disk_transaction_model();
-        let (staging, root) = temp_staging();
-        let old_commit = "c16c6fd7955b0011223344556677889900aabbcc";
-        let old_digest = "cd".repeat(32);
-        crate::manifest::InstalledReceipt::record(
-            &staging.installed_receipt(),
-            52,
-            old_commit,
-            &old_digest,
-        )
-        .unwrap();
-        let previous = previous_receipt_for_sealed_old(&staging, 52, old_commit)
-            .expect("exact sealed OLD receipt");
-        let mut stale_state = disk_model_ready(&model);
-        disk_model_step(&model, &mut stale_state, "CorruptPreviousReceipt");
-        assert!(
-            previous_receipt_for_sealed_old(&staging, 52, &"f".repeat(40)).is_none(),
-            "well-formed but stale local receipt is not rollback authority"
-        );
-        assert!(
-            previous_receipt_for_sealed_old(&staging, 51, old_commit).is_none(),
-            "receipt build must bind the sealed OLD build"
-        );
-        disk_model_step(&model, &mut stale_state, "PrepareFixedNew");
-        assert_eq!(stale_state["previous_receipt_saved"], 0);
-
-        crate::manifest::InstalledReceipt::record(
-            &staging.installed_receipt(),
-            53,
-            "0123456789abcdef0123456789abcdef01234567",
-            &"ef".repeat(32),
-        )
-        .unwrap();
-        let blocked_tmp = staging
-            .installed_receipt()
-            .with_extension(format!("toml.{}.tmp", std::process::id()));
-        std::fs::create_dir(&blocked_tmp).unwrap();
-        let error = restore_installed_receipt(&staging, Some(&previous))
-            .expect_err("blocked kind-preserving rewrite must surface failure");
-        let mut failure_state = disk_model_ready(&model);
-        for action in [
-            "PrepareFixedNew",
-            "ArmExactTrial",
-            "AtomicSwap",
-            "RecordExactReceipt",
-            "VerifyExactRollback",
-            "ExecFails",
-            "RestoreExactOld",
-            "DisarmRestoredTrialReceiptRestoreFailsClosed",
-        ] {
-            disk_model_step(&model, &mut failure_state, action);
-        }
-        assert!(error.contains("superseded receipt cleared"), "{error}");
-        assert!(
-            !staging.installed_receipt().exists(),
-            "failed NEW receipt is cleared instead of surviving as OLD authority"
-        );
-        assert_eq!(failure_state["receipt_restore_failed"], 1);
-        assert_eq!(failure_state["superseded_receipt_cleared"], 1);
-        std::fs::remove_dir(&blocked_tmp).unwrap();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn apply_retirement_never_removes_stage_owned_download_scratch() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 5);
-        std::fs::create_dir_all(&s.staged_app).unwrap();
-        std::fs::write(s.download.join("aterm-0.0.5.dmg.part"), b"partial").unwrap();
-        let _apply = FileLock::acquire(&s.apply_lock).unwrap();
-        s.retire_published();
-        assert!(!s.ready.exists());
-        assert!(!s.staged_app.exists());
-        assert_eq!(
-            std::fs::read(s.download.join("aterm-0.0.5.dmg.part")).unwrap(),
-            b"partial",
-            "apply owns only the published generation; stage scratch survives"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn apply_lock_spans_preexec_and_failure_rollback_window() {
-        let (s, root) = temp_staging();
-        let apply = FileLock::acquire(&s.apply_lock).unwrap();
-        let lock_path = s.apply_lock.clone();
-        let (attempting_tx, attempting_rx) = std::sync::mpsc::sync_channel(0);
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
-        let competitor = std::thread::spawn(move || {
-            attempting_tx.send(()).unwrap();
-            let _competing_apply = FileLock::acquire(&lock_path).unwrap();
-            acquired_tx.send(()).unwrap();
-        });
-        attempting_rx.recv().unwrap();
-        assert!(
-            acquired_rx
-                .recv_timeout(std::time::Duration::from_millis(25))
-                .is_err(),
-            "a competing swap cannot enter before exec/rollback resolves"
-        );
-
-        // This mutation stands in for the synchronous exec-error rollback path;
-        // the same guard remains live across it in apply_staged_if_ready.
-        std::fs::write(root.join("rollback-complete"), b"done").unwrap();
-        assert!(!root.join("competing-swap").exists());
-        drop(apply);
-        acquired_rx.recv().unwrap();
-        competitor.join().unwrap();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn concurrent_apply_retirement_cannot_erase_a_newer_stage_publisher() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 5);
-        make_app(&s.staged_app, "OLD-STAGE");
-
-        // Apply acquires only the short publication/swap lock. A stager may keep
-        // downloading under stage_lock while this guard is held, but must wait at
-        // the final publication boundary.
-        let apply = FileLock::acquire(&s.apply_lock).unwrap();
-        let stage = s.clone();
-        let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(0);
-        let publisher = std::thread::spawn(move || {
-            let _stage_lock = FileLock::acquire(&stage.stage_lock).unwrap();
-            let incoming = stage.staged_dir().join("aterm.app.incoming");
-            make_app(&incoming, "NEW-STAGE");
-            let scratch = stage.download.join("aterm-0.0.6.dmg");
-            std::fs::write(&scratch, b"new download").unwrap();
-            prepared_tx.send((incoming.clone(), scratch)).unwrap();
-            let ready = Ready {
-                build_number: 6,
-                version: "0.0.6".into(),
-                commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-                dmg_sha256: "cd".repeat(32),
-                team_id: "T".into(),
-                staged_at: String::new(),
-                changelog: None,
-                machine_id: None,
-                roster_seq: None,
-            };
-            publish_verified_stage(&stage, &incoming, &ready)
-        });
-
-        let (incoming, scratch) = prepared_rx.recv().unwrap();
-        s.retire_published();
-        assert!(incoming.is_dir(), "apply must not erase unpublished input");
-        assert_eq!(
-            std::fs::read(&scratch).unwrap(),
-            b"new download",
-            "apply must not erase stage-owned download scratch"
-        );
-        drop(apply);
-
-        publisher.join().unwrap().unwrap();
-        assert_eq!(read_id(&s.staged_app), "NEW-STAGE");
-        assert!(matches!(
-            read_ready(&s, 5),
-            ReadyState::Newer(Ready {
-                build_number: 6,
-                ..
-            })
-        ));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn trial_arm_failure_keeps_verified_stage_ready_and_unswapped() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 6);
-        make_app(&s.staged_app, "VERIFIED-NEW");
-        // Atomic rename cannot replace a directory at the sentinel path.
-        std::fs::create_dir_all(s.root.join("boot.sentinel")).unwrap();
-        let ready = Ready::read(&s.ready).unwrap();
-
-        assert!(prepare_trial(&s, &ready, Path::new("/Applications/aterm.app")).is_err());
-        assert!(s.ready.exists());
-        assert_eq!(read_id(&s.staged_app), "VERIFIED-NEW");
-        assert!(
-            crate::manifest::FailedMark::read(&s.trial()).is_none(),
-            "a failed sentinel arm cannot mint partial trial authority"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // --- swap / rollback machinery (real same-volume RENAME_SWAP on macOS) --------
-    //
-    // These prove the security-critical invariants the self-updater must never get
-    // wrong: the live install is NEVER left missing, the swapped-out OLD bundle is
-    // preserved as a rollback source, and a revert restores the previous build.
-
-    fn make_app(dir: &Path, id: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("id"), id).unwrap();
-    }
-    fn read_id(dir: &Path) -> String {
-        std::fs::read_to_string(dir.join("id")).unwrap()
-    }
-    fn copied_candidate(path: &Path) -> PreparedSwapCandidate {
-        PreparedSwapCandidate {
-            fixed: path.to_path_buf(),
-            moved_from_stage: false,
-        }
-    }
-
-    fn disk_model_step(
-        model: &aterm_spec::derive::Model,
-        state: &mut aterm_spec::interp::State,
-        action: &'static str,
-    ) {
-        let successors = model.successors(action, state);
-        assert_eq!(
-            successors.len(),
-            1,
-            "real transaction step must map to exactly one {action} successor: {state:?}"
-        );
-        *state = successors[0].clone();
-        for invariant in &model.invariants {
-            assert!(
-                model.check_invariant(invariant.name, state),
-                "real transaction step violates {}::{} after {action}: {state:?}",
-                model.name,
-                invariant.name,
-            );
-        }
-    }
-
-    fn disk_model_ready(model: &aterm_spec::derive::Model) -> aterm_spec::interp::State {
-        let mut state = model.init_state();
-        for action in [
-            "ConsumeStartupAuthority",
-            "ObserveBootHealth",
-            "EnterDiskLane",
-        ] {
-            disk_model_step(model, &mut state, action);
-        }
-        state
-    }
-
-    fn fixture_identity(path: &Path) -> i64 {
-        match std::fs::read_to_string(path.join("id")).as_deref() {
-            Ok("OLD") => 1,
-            Ok("NEW") => 2,
-            Ok(_) => 3,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => panic!("read fixture identity {}: {error}", path.display()),
-        }
-    }
-
-    /// Project the genuine fixed paths and exact ledgers independently back onto
-    /// the derived transaction variables. The fixture id stands in only for the
-    /// already-tested codesign-sealed OLD/NEW identity guard; every exchange,
-    /// sentinel transition, and receipt write below uses shipping code.
-    fn assert_real_disk_projection(
-        state: &aterm_spec::interp::State,
-        staging: &Staging,
-        installed: &Path,
-        current_build: u64,
-        current_commit: &str,
-        current_digest: &str,
-    ) {
-        let installed_identity = fixture_identity(installed);
-        let fixed = rollback_path(installed);
-        let fixed_identity = fixture_identity(&fixed);
-        assert_eq!(state["installed"], installed_identity);
-        assert_eq!(state["fixed"], fixed_identity);
-        assert_eq!(
-            state["fixed_exact"],
-            i64::from(matches!(fixed_identity, 1 | 2))
-        );
-
-        let trial_exact =
-            matches!(
-                boot_sentinel(staging).read_state(),
-                Some((build, _)) if build == current_build
-            ) && crate::manifest::FailedMark::read(&staging.trial()).is_some_and(|trial| {
-                trial.build_number == current_build
-                    && trial.sha256.eq_ignore_ascii_case(current_digest)
-            });
-        assert_eq!(state["trial"], i64::from(trial_exact));
-
-        let receipt_exact = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
-            .is_some_and(|receipt| {
-                receipt.matches_sealed(current_build, current_commit)
-                    && receipt.dmg_sha256.eq_ignore_ascii_case(current_digest)
-            });
-        assert_eq!(state["receipt"], i64::from(receipt_exact));
-        assert_eq!(state["receipt_exact"], i64::from(receipt_exact));
-    }
-    /// A same-volume temp root (both bundles must share a volume for RENAME_SWAP).
-    fn swap_root(label: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("aterm-swap-{label}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    /// EVERY PLACEMENT MOVE TAKES THE LANE — pinned on the source, because the cost of
-    /// missing one is invisible.
-    ///
-    /// A plain `std::fs::rename` of a bundle by a tracked process tags it, and nothing
-    /// downstream complains: the install succeeds, the bundle works, and the tag is only
-    /// discovered later as a toolchain that cannot cut a release. Eight moves were
-    /// converted to [`rename_untagged`]; a ninth added later would be silent.
-    ///
-    /// So: outside the test module, this file may contain exactly ONE `std::fs::rename`,
-    /// the fallback inside [`rename_untagged`] itself. A new one fails here and has to
-    /// say why — if it genuinely does not place a bundle, name it in this test.
-    #[test]
-    fn nothing_outside_the_lane_renames_a_bundle_into_place() {
-        let source = include_str!("install.rs");
-        let production = source
-            .split_once("\n#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
-        assert!(
-            production.contains("fn rename_untagged"),
-            "the split found the production half"
-        );
-
-        let calls = production.match_indices("std::fs::rename(").count();
-        assert_eq!(
-            calls, 1,
-            "expected exactly one plain rename in the production half of install.rs — \
-             the fallback inside rename_untagged — but found {calls}. A placement move \
-             that does not take the lane hands this process's com.apple.provenance to \
-             the bundle it moves, and nothing at runtime will tell you."
-        );
-
-        // And that one is the fallback: the line after the lane's `#[cfg]` arms.
-        let lane = production
-            .split_once("fn rename_untagged")
-            .expect("the lane is here")
-            .1;
-        let lane_body = lane.split_once("\n}\n").expect("the lane ends").0;
-        assert!(
-            lane_body.contains("std::fs::rename(from, to)"),
-            "the single remaining rename is the lane's own fallback, not a stray one \
-             that merely happens to be the first match"
-        );
-    }
-
-    /// THE EXCHANGE, driven directly.
-    ///
-    /// Every `the_untagged_lane_*` test below goes through [`rename_untagged`], whose
-    /// first question is whether THIS process is provenance-tracked. On a developer's
-    /// tagged machine that is true and the exchange runs; in CI it is false and all of
-    /// them quietly measure `std::fs::rename` instead. So the mechanism is pinned here,
-    /// through [`exchange_move`], where the answer does not depend on the host.
-    #[test]
-    fn the_exchange_moves_the_payload_and_keeps_its_inode() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let root = swap_root("exchange-move");
-        let from = root.join("payload");
-        std::fs::create_dir_all(from.join("Contents")).unwrap();
-        std::fs::write(from.join("Contents/body"), b"BODY").unwrap();
-        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let before = std::fs::metadata(&from).unwrap();
-        let (ino, mtime) = (before.ino(), before.mtime());
-
-        let to = root.join("dest");
-        exchange_move(&from, &to).expect("same-volume exchange");
-
-        assert!(!from.exists(), "the emptied source name is dropped");
-        assert_eq!(
-            std::fs::read(to.join("Contents/body")).unwrap(),
-            b"BODY",
-            "the payload arrives byte for byte"
-        );
-        let after = std::fs::metadata(&to).unwrap();
-        assert_eq!(
-            after.ino(),
-            ino,
-            "THE SAME INODE arrives at the destination — this is what lets the caller \
-             skip re-verifying a bundle it already verified, and what keeps the \
-             extended attribute it does NOT carry from being added"
-        );
-        assert_eq!(after.mtime(), mtime, "and its timestamps are its own");
-        assert_eq!(
-            after.permissions().mode() & 0o777,
-            0o750,
-            "as is its mode; the placeholder's is discarded with the placeholder"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The failure arm: when the exchange cannot be made, the placeholder the attempt
-    /// created must be gone again. `Err` from this function means NOTHING MOVED and
-    /// NOTHING WAS LEFT, which is the contract [`rename_untagged`] relies on to fall
-    /// back to a plain rename and report that rename's own error.
-    #[test]
-    fn a_failed_exchange_sweeps_the_placeholder_it_created() {
-        let root = swap_root("exchange-sweep");
-        let from = root.join("absent");
-        let to = root.join("dest");
-
-        let error = exchange_move(&from, &to).expect_err("no source to exchange with");
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert!(
-            !to.exists(),
-            "the placeholder is swept — left behind it is an EMPTY BUNDLE at a path a \
-             later launch reads as a stage"
-        );
-        assert!(
-            !holds_a_stage(&to),
-            "and it would not read as a stage even if something did leave one"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// An occupied destination is refused before anything is created, so the exchange
-    /// can never silently replace bytes a plain rename would have refused.
-    #[test]
-    fn the_exchange_refuses_a_destination_that_already_exists() {
-        let root = swap_root("exchange-occupied");
-        let from = root.join("payload");
-        std::fs::create_dir_all(&from).unwrap();
-        std::fs::write(from.join("mark"), b"1").unwrap();
-        let to = root.join("dest");
-        std::fs::create_dir(&to).unwrap();
-        std::fs::write(to.join("other"), b"2").unwrap();
-
-        let error = exchange_move(&from, &to).expect_err("the destination is taken");
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read(to.join("other")).unwrap(),
-            b"2",
-            "the destination's bytes are untouched"
-        );
-        assert!(from.join("mark").exists(), "and so are the source's");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The policy half, at the one edge that is decidable without a tracked process:
-    /// a path with no parent, and a destination that exists, are both refused. The
-    /// volume and tracking terms need a real second volume and a tagged process, which
-    /// the ignored probes cover.
-    #[test]
-    fn the_exchange_is_not_attempted_without_two_real_parents() {
-        let root = swap_root("exchange-policy");
-        let from = root.join("payload");
-        std::fs::create_dir_all(&from).unwrap();
-        let occupied = root.join("taken");
-        std::fs::create_dir(&occupied).unwrap();
-
-        assert!(
-            !exchange_is_needed(&from, &occupied, &root),
-            "a destination that exists is never exchanged onto"
-        );
-        assert!(
-            !exchange_is_needed(&from, Path::new("/"), &root),
-            "and neither is a destination with no parent"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The untagged lane must be a drop-in for `rename`: same result, same content,
-    /// same mode, same errors. Everything it changes is invisible to the caller except
-    /// the extended attribute it declines to add, which only a tracked process and a
-    /// real `launchctl` can observe — `tests/provenance_rename_probe.rs` measures that
-    /// half. These pin the half that must hold on EVERY host, including CI.
-    #[test]
-    fn the_untagged_lane_moves_a_directory_exactly_as_rename_does() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = swap_root("untagged-move");
-        let from = root.join("payload");
-        std::fs::create_dir_all(from.join("Contents/MacOS")).unwrap();
-        std::fs::write(from.join("Contents/MacOS/exe"), b"BODY").unwrap();
-        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let to = root.join("dest");
-        rename_untagged(&from, &to, &root).unwrap();
-
-        assert!(!from.exists(), "the source name is gone, as after a rename");
-        assert_eq!(
-            std::fs::read(to.join("Contents/MacOS/exe")).unwrap(),
-            b"BODY",
-            "the payload arrives byte for byte"
-        );
-        assert_eq!(
-            std::fs::metadata(&to).unwrap().permissions().mode() & 0o777,
-            0o700,
-            "the moved inode keeps its own mode — the placeholder's is discarded with it"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `stage_from_zip` creates its extract directory before the `ditto`, so a promote
-    /// onto an EXISTING destination is a real case. `rename` replaces an empty one;
-    /// the lane must not turn that into an exchange, and must not fail it either.
-    #[test]
-    fn the_untagged_lane_keeps_renames_semantics_when_the_destination_exists() {
-        let root = swap_root("untagged-exists");
-        let from = root.join("payload");
-        std::fs::create_dir_all(&from).unwrap();
-        std::fs::write(from.join("mark"), b"1").unwrap();
-
-        let empty = root.join("empty-dest");
-        std::fs::create_dir(&empty).unwrap();
-        rename_untagged(&from, &empty, &root).unwrap();
-        assert!(
-            empty.join("mark").exists(),
-            "an empty destination is replaced"
-        );
-
-        let occupied = root.join("occupied-dest");
-        std::fs::create_dir(&occupied).unwrap();
-        std::fs::write(occupied.join("other"), b"1").unwrap();
-        let refused = rename_untagged(&empty, &occupied, &root);
-        assert!(
-            refused.is_err(),
-            "a non-empty destination still refuses the move, as rename(2) does"
-        );
-        assert!(
-            empty.join("mark").exists(),
-            "and the source is left where it was"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A missing source must report ENOENT and leave NOTHING behind.
-    ///
-    /// This reaches the sweep for real. The volume test compares the two PARENTS, and
-    /// the source's parent exists even when the source does not, so the exchange is
-    /// attempted: the destination is created, `renamex_np` fails `ENOENT`, and the
-    /// placeholder has to be removed again. Left behind, it would be an empty bundle at
-    /// a path a later launch reads.
-    #[test]
-    fn the_untagged_lane_leaves_no_placeholder_when_the_move_cannot_happen() {
-        let root = swap_root("untagged-missing");
-        let from = root.join("absent");
-        let to = root.join("dest");
-        let error = rename_untagged(&from, &to, &root).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert!(
-            !to.exists(),
-            "no empty directory is left at the destination for a reader to mistake \
-             for a staged bundle"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// EXDEV is load-bearing: three restore paths read an instant cross-volume failure
-    /// as "the bytes cannot reach the staging path" and retire the publication so the
-    /// next check re-stages. `RENAME_SWAP` is in-volume only, so the lane must hand back
-    /// `rename`'s own error immediately rather than route around it — the repair was got
-    /// wrong once by substituting `/bin/mv`, whose cross-device form is a recursive copy
-    /// that deletes the destination first.
-    ///
-    /// Deterministic half, running on every host: `same_volume` fails CLOSED on a path
-    /// it cannot stat, so a destination whose parent is absent takes the plain lane. The
-    /// lane must then create nothing at all — a placeholder left at a staging or
-    /// rollback path is exactly the failure mode that makes an empty bundle readable.
-    #[test]
-    fn the_untagged_lane_hands_an_unexchangeable_move_straight_to_rename() {
-        let root = swap_root("untagged-gate");
-        let from = root.join("payload");
-        std::fs::create_dir_all(&from).unwrap();
-        let to = root.join("no-such-parent").join("dest");
-
-        let error = rename_untagged(&from, &to, &root).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::NotFound,
-            "the caller sees rename(2)'s own error, not a lane-specific one"
-        );
-        assert!(from.exists(), "the source is untouched");
-        assert!(
-            !to.parent().unwrap().exists(),
-            "the lane created no directory on a path it declined to exchange"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The other half, on a host that actually has a second writable volume: the failure
-    /// is EXDEV and it is instant.
-    ///
-    /// IGNORED, like the two probes in `tests/provenance_rename_probe.rs`, and for the
-    /// same reason — it measures the HOST, not this crate. Finding a second volume means
-    /// statting and trying an exclusive `mkdir` at the root of every mount, which on a
-    /// machine with a stalled network share is a suite that hangs rather than a test that
-    /// fails. Run it deliberately where a second writable volume exists:
-    ///
-    /// ```text
-    /// targo --unverified test -p aterm-update --lib untagged_lane_still_fails -- --ignored
-    /// ```
-    #[test]
-    #[ignore = "probes every mounted volume for a second writable one; run with --ignored"]
-    fn the_untagged_lane_still_fails_fast_across_a_real_volume_boundary() {
-        let root = swap_root("untagged-exdev");
-        // `/Volumes` only: `/private/var/tmp` and `/System/Volumes/Data` share `st_dev`
-        // with `$TMPDIR` on every stock macOS host, so they could never be selected.
-        let Some(other) = std::fs::read_dir("/Volumes")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|candidate| {
-                candidate.is_dir()
-                    && !same_volume(candidate, &root)
-                    && std::fs::DirBuilder::new()
-                        .create(candidate.join(format!(".aterm-vol-{}", std::process::id())))
-                        .inspect(|()| {
-                            let _ = std::fs::remove_dir(
-                                candidate.join(format!(".aterm-vol-{}", std::process::id())),
-                            );
-                        })
-                        .is_ok()
-            })
-        else {
-            eprintln!(
-                "SKIPPED: this host has no second WRITABLE volume, so the cross-volume \
-                 branch cannot be exercised here; the deterministic gate test covers the \
-                 decision, and the lane contains no copy of any kind"
-            );
-            let _ = std::fs::remove_dir_all(&root);
-            return;
-        };
-        let from = root.join("payload");
-        std::fs::create_dir_all(&from).unwrap();
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let to = other.join(format!("aterm-exdev-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&to);
-
-        let started = std::time::Instant::now();
-        let error = rename_untagged(&from, &to, &root).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "cross-volume must fail immediately, never degrade into a copy"
-        );
-        assert!(from.exists(), "and must not have consumed the source");
-        assert!(!to.exists(), "nor left a placeholder on the far volume");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fixed_swap_places_old_at_the_only_recovery_path_atomically() {
-        let root = swap_root("basic");
-        let installed = root.join("installed.app");
-        let fixed = rollback_path(&installed);
-        make_app(&fixed, "NEW");
-        make_app(&installed, "OLD");
-
-        let rollback =
-            swap_fixed_candidate(&copied_candidate(&fixed), &installed).expect("fixed swap");
-        assert_eq!(read_id(&installed), "NEW");
-        assert_eq!(read_id(&rollback), "OLD");
-        assert_eq!(rollback, rollback_path(&installed));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn restore_rollback_swaps_the_previous_build_back() {
-        let root = swap_root("restore");
-        let installed = root.join("installed.app");
-        let fixed = rollback_path(&installed);
-        make_app(&fixed, "NEW");
-        make_app(&installed, "OLD");
-
-        let rollback = swap_fixed_candidate(&copied_candidate(&fixed), &installed).unwrap();
-        assert_eq!(read_id(&installed), "NEW");
-        restore_rollback(&rollback, &installed).unwrap();
-        assert_eq!(read_id(&installed), "OLD");
-        assert_eq!(read_id(&fixed), "NEW");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fixed_swap_crash_cuts_are_always_discoverable() {
-        let root = swap_root("crash-cuts");
-        let installed = root.join("installed.app");
-        let fixed = rollback_path(&installed);
-        make_app(&installed, "OLD");
-        make_app(&fixed, "NEW");
-
-        // Pre-swap crash cut: OLD remains installed; prepared NEW is fixed and
-        // harmless. There is no transient/pid-only authority.
-        assert_eq!(read_id(&installed), "OLD");
-        assert_eq!(read_id(&fixed), "NEW");
-
-        swap_fixed_candidate(&copied_candidate(&fixed), &installed).unwrap();
-        // Post-swap crash cut: NEW is installed and OLD is already at the exact
-        // fixed path recovery probes. No later rename is required.
-        assert_eq!(read_id(&installed), "NEW");
-        assert_eq!(read_id(&fixed), "OLD");
-        restore_rollback(&fixed, &installed).unwrap();
-        assert_eq!(read_id(&installed), "OLD");
-        assert_eq!(read_id(&fixed), "NEW");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_fixed_exchange_leaves_old_install_untouched() {
-        let root = swap_root("failed-fixed");
-        let installed = root.join("installed.app");
-        make_app(&installed, "OLD");
-        let error = swap_fixed_candidate(&copied_candidate(&root.join("missing.app")), &installed)
-            .unwrap_err();
-        assert!(error.contains("changed into a symlink/non-directory"));
-        assert_eq!(read_id(&installed), "OLD");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fixed_candidate_symlink_is_never_swapped_into_canonical_install() {
-        use std::os::unix::fs::symlink;
-
-        let root = swap_root("fixed-symlink");
-        let installed = root.join("installed.app");
-        let target = root.join("signed-looking-target.app");
-        let fixed = rollback_path(&installed);
-        make_app(&installed, "OLD");
-        make_app(&target, "TARGET");
-        symlink(&target, &fixed).unwrap();
-
-        let error = swap_fixed_candidate(&copied_candidate(&fixed), &installed).unwrap_err();
-        assert!(error.contains("symlink/non-directory"));
-        assert_eq!(read_id(&installed), "OLD");
-        assert!(
-            std::fs::symlink_metadata(&fixed)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn inverse_swap_rejects_substituted_symlink_rollback() {
-        use std::os::unix::fs::symlink;
-
-        let root = swap_root("rollback-symlink");
-        let installed = root.join("installed.app");
-        let target = root.join("target.app");
-        let rollback = rollback_path(&installed);
-        make_app(&installed, "NEW");
-        make_app(&target, "OLD-TARGET");
-        symlink(&target, &rollback).unwrap();
-
-        let error = restore_rollback(&rollback, &installed).unwrap_err();
-        assert!(error.contains("symlink/non-directory"));
-        assert_eq!(read_id(&installed), "NEW");
-        assert_eq!(read_id(&target), "OLD-TARGET");
-        assert!(
-            std::fs::symlink_metadata(&rollback)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn same_volume_pre_swap_failure_restores_published_stage() {
-        let (s, root) = temp_staging();
-        write_ready(&s, 54);
-        make_app(&s.staged_app, "NEW");
-        let installed = root.join("Applications/aterm.app");
-        make_app(&installed, "OLD");
-        let fixed = rollback_path(&installed);
-        std::fs::rename(&s.staged_app, &fixed).unwrap();
-        let prepared = PreparedSwapCandidate {
-            fixed: fixed.clone(),
-            moved_from_stage: true,
-        };
-        recover_prepared_candidate(&prepared, &s);
-        assert_eq!(read_id(&s.staged_app), "NEW");
-        assert!(!fixed.exists());
-        assert!(s.ready.exists());
-        assert_eq!(read_id(&installed), "OLD");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn old_process_confirmation_cannot_gc_a_newer_trial_or_its_receipt() {
-        let (s, root) = temp_staging();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
-        crate::manifest::InstalledReceipt::record(
-            &s.installed_receipt(),
-            1000,
-            "0123456789abcdef0123456789abcdef01234567",
-            &"ab".repeat(32),
-        )
-        .unwrap();
-        make_app(&s.staged_app, "SWAPPED-OUT-OLD");
-        let installed = root.join("Applications").join("aterm.app");
-        make_app(&installed, "RUNNING-NEW");
-        let rollback = rollback_path(&installed);
-        make_app(&rollback, "ROLLBACK");
-
-        let _apply = FileLock::acquire(&s.apply_lock).unwrap();
-        assert!(
-            !confirm_health_under_apply_lock(&s, 999, None, Some(&installed)),
-            "an overlapping old process has no authority over the newer trial"
-        );
-        assert_eq!(
-            sentinel.read_state(),
-            Some((1000, 0)),
-            "non-matching confirm is a no-op"
-        );
-        assert!(s.trial().exists());
-        assert!(s.installed_receipt().exists());
-        assert!(s.staged_app.exists());
-        assert!(rollback.exists());
-
-        assert!(confirm_health_under_apply_lock_with_proof(
-            &s,
-            1000,
-            &installed,
-            || Ok(())
-        ));
-        assert_eq!(sentinel.read_state(), None, "matching confirm disarms");
-        assert!(
-            !s.trial().exists(),
-            "health-only crash-loop state is cleared"
-        );
-        assert!(!s.staged_app.exists(), "matching owner may GC swap orphan");
-        assert!(!rollback.exists(), "matching owner may GC rollback");
-        assert!(
-            s.installed_receipt().exists(),
-            "exact installed proof survives confirm-before-reconcile ordering"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unresolved_installed_bundle_cannot_disarm_or_gc_trial() {
-        let (s, root) = temp_staging();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
-        let _apply = FileLock::acquire(&s.apply_lock).unwrap();
-        assert!(!confirm_health_under_apply_lock(&s, 1000, None, None));
-        assert_eq!(sentinel.read_state(), Some((1000, 0)));
-        assert!(s.trial().exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The two mismatched-sentinel shapes are disjoint, and neither admits a
-    /// process that is not running the installed build: an overlapping process
-    /// from another build has no authority to disarm anything.
-    #[test]
-    fn dead_authority_and_abandoned_preswap_shapes_are_disjoint() {
-        // Out-of-band replacement: armed BELOW the build that is installed and
-        // running. Nothing in the tree could ever clear this one before.
-        assert!(dead_authority_trial(1001, 1001, 1000));
-        assert!(!abandoned_preswap_trial(1001, 1001, 1000));
-        // The pre-swap crash cut the exact recovery was written for: armed ABOVE.
-        assert!(abandoned_preswap_trial(1000, 1000, 1001));
-        assert!(!dead_authority_trial(1000, 1000, 1001));
-        // Neither fires for a process that is not the installed build.
-        assert!(!dead_authority_trial(999, 1001, 1000));
-        assert!(!abandoned_preswap_trial(999, 1000, 1001));
-    }
-
-    // --- a newer stage supersedes an unconfirmed activation (round three) --------
-    //
-    // A fixture bundle carries its SEALED identity in a `sealed` file ("<build>
-    // <commit>"): the one stand-in, for the codesign read `verified_bundle_identity`
-    // performs in production. Every exchange, sentinel transition, marker and
-    // receipt write is the shipping code.
-
-    const SUPERSEDE_RUNNING_COMMIT: &str = "1111111111111111111111111111111111111111";
-    const SUPERSEDE_ACTIVATION_COMMIT: &str = "2222222222222222222222222222222222222222";
-    const SUPERSEDE_NEWER_COMMIT: &str = "3333333333333333333333333333333333333333";
-    const SUPERSEDE_ACTIVATION_DIGEST: &str =
-        "abababababababababababababababababababababababababababababababab";
-
-    fn sealed_fixture(app: &Path, build: u64, commit: &str) {
-        std::fs::create_dir_all(app).unwrap();
-        std::fs::write(app.join("sealed"), format!("{build} {commit}")).unwrap();
-    }
-
-    fn sealed_fixture_identity(app: &Path) -> Result<(u64, String), String> {
-        let text = std::fs::read_to_string(app.join("sealed"))
-            .map_err(|error| format!("{}: {error}", app.display()))?;
-        let (build, commit) = text
-            .split_once(' ')
-            .ok_or_else(|| "malformed fixture".to_string())?;
-        Ok((
-            build.parse().map_err(|error| format!("{error}"))?,
-            commit.to_string(),
-        ))
-    }
-
-    fn write_ready_for(s: &Staging, build: u64, commit: &str) {
-        let r = Ready {
-            build_number: build,
-            version: format!("0.{build}.0"),
-            commit: Some(commit.into()),
-            dmg_sha256: "cd".repeat(32),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: None,
-            roster_seq: None,
-        };
-        std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
-    }
-
-    /// THE DISK A FAILED LAUNCHED-LANE HANDOFF LEAVES BEHIND, with a newer release
-    /// staged: build 11 INSTALLED and mid-trial (two counted launches — a structural
-    /// `ChildDied` keeps its launch), the running build 10 retained at the fixed
-    /// rollback path, 11's receipt and trial marker, and build 12 staged and ready.
-    fn superseded_activation_desk() -> (Staging, PathBuf, PathBuf) {
-        let (s, root) = temp_staging();
-        let installed = root.join("Applications").join("aterm.app");
-        sealed_fixture(&installed, 11, SUPERSEDE_ACTIVATION_COMMIT);
-        sealed_fixture(&rollback_path(&installed), 10, SUPERSEDE_RUNNING_COMMIT);
-        write_ready_for(&s, 12, SUPERSEDE_NEWER_COMMIT);
-        sealed_fixture(&s.staged_app, 12, SUPERSEDE_NEWER_COMMIT);
-        crate::manifest::FailedMark::record_required(
-            &s.trial(),
-            11,
-            SUPERSEDE_ACTIVATION_DIGEST,
-            Some(&installed),
-        )
-        .unwrap();
-        crate::manifest::InstalledReceipt::record(
-            &s.installed_receipt(),
-            11,
-            SUPERSEDE_ACTIVATION_COMMIT,
-            SUPERSEDE_ACTIVATION_DIGEST,
-        )
-        .unwrap();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(11).unwrap();
-        sentinel.observe_launch(11).unwrap();
-        sentinel.observe_launch(11).unwrap();
-        (s, root, installed)
-    }
-
-    fn supersede_desk(
-        s: &Staging,
-        installed: &Path,
-        running: (u64, &str),
-        newer: u64,
-    ) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
-        supersede_activation_locked(
-            s,
-            installed,
-            running,
-            (11, SUPERSEDE_ACTIVATION_COMMIT),
-            newer,
-            &sealed_fixture_identity,
-        )
-    }
-
-    /// A NEWER STAGE RETIRES THE UNCONFIRMED ACTIVATION WITHOUT COUNTING A LAUNCH OF
-    /// IT. The running build is back at the install path, the activation's trial is
-    /// DISARMED at the two launches it had counted (never observed a third time —
-    /// the third is the one `check_boot_health` reverts and poisons on), nothing is
-    /// quarantined, and the stage is untouched — and the ordinary boot apply's own
-    /// preconditions now hold for the NEXT candidate, the running build's binary:
-    /// the installed bundle is the running build (a verified rollback source), no
-    /// trial owns the fixed path, and `ready.toml` names the newer build.
-    ///
-    /// Fails on the code before this change: the transaction did not exist, and the
-    /// GUI's only move was to launch build 11 again.
-    #[test]
-    fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch() {
-        let (s, root, installed) = superseded_activation_desk();
-        assert_eq!(boot_sentinel(&s).read_state(), Some((11, 2)));
-
-        let superseded = supersede_desk(&s, &installed, (10, SUPERSEDE_RUNNING_COMMIT), 12)
-            .expect("a newer verified stage supersedes the activation");
-        assert_eq!(
-            superseded,
-            crate::SupersededActivation {
-                activation_build: 11,
-                restored_build: 10,
-                newer_build: 12,
-                trial_launches: 2,
-                trial_disarm_deferred: None,
-            }
-        );
-        assert_eq!(
-            sealed_fixture_identity(&installed),
-            Ok((10, SUPERSEDE_RUNNING_COMMIT.to_string())),
-            "the running build is back at the install path"
-        );
-        assert!(
-            !rollback_path(&installed).exists(),
-            "the retired activation is reclaimed"
-        );
-        assert_eq!(
-            boot_sentinel(&s).read_state(),
-            None,
-            "the trial is disarmed, never walked"
-        );
-        assert!(!s.trial().exists());
-        assert!(
-            crate::manifest::InstalledReceipt::read(&s.installed_receipt()).is_none(),
-            "a receipt naming the retired activation is not proof for what is installed"
-        );
-        assert!(
-            crate::manifest::FailedMark::read(&s.failed()).is_none(),
-            "nothing is quarantined: the activation never failed to BOOT"
-        );
-        assert_eq!(
-            sealed_fixture_identity(&s.staged_app),
-            Ok((12, SUPERSEDE_NEWER_COMMIT.to_string())),
-            "the stage is untouched"
-        );
-
-        // …and it is now an ordinary stage over the running build.
-        assert!(identity_matches_running(
-            10,
-            SUPERSEDE_RUNNING_COMMIT,
-            10,
-            Some(SUPERSEDE_RUNNING_COMMIT)
-        ));
-        let ReadyState::Newer(ready) = read_ready(&s, 10) else {
-            panic!("the newer stage is still ready over the running build");
-        };
-        assert_eq!(ready.build_number, 12);
-        assert!(
-            recover_abandoned_preswap_trial_if_exact(
-                &s,
-                &installed,
-                10,
-                Some(SUPERSEDE_RUNNING_COMMIT)
-            ),
-            "no trial is left for the next boot apply to refuse on"
-        );
-        assert_eq!(
-            recover_orphaned_prepared_candidate(&s, &installed, 10, &ready),
-            Ok(())
-        );
-        assert!(s.ready.exists(), "the stage survives the orphan check");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// THE CRASH CUT: the exchange happened and the disarm did not (here the staging
-    /// root refuses the sentinel's removal). The disk is then EXACTLY the "crash
-    /// immediately after inverse rollback" shape `recover_abandoned_preswap_trial_if
-    /// _exact` finishes — installed = the running build, fixed = the activation, the
-    /// trial still armed for it, owned by this install and authorized by its receipt
-    /// — and the sentinel still reads the two launches: a failed supersede walks
-    /// nothing either.
-    ///
-    /// And it is REPORTED AS THE RETIRE IT WAS (round three review): the running
-    /// build is at the install path, and the newer stage applies next exactly as
-    /// after a clean retire. It used to come back as an `Err`, which the GUI said
-    /// as a refusal naming the Version menu while its lane installed the release
-    /// seconds later. Fails on the code before that change: `expect` on an `Err`.
-    #[test]
-    fn a_supersede_that_cannot_disarm_leaves_the_cut_the_next_boot_apply_finishes() {
-        use std::os::unix::fs::PermissionsExt;
-        let (s, root, installed) = superseded_activation_desk();
-        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let result = supersede_desk(&s, &installed, (10, SUPERSEDE_RUNNING_COMMIT), 12);
-        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let retired = result.expect("the exchange happened: a retire, with its disarm deferred");
-        assert_eq!(
-            (
-                retired.activation_build,
-                retired.restored_build,
-                retired.newer_build
-            ),
-            (11, 10, 12)
-        );
-        assert!(
-            retired
-                .trial_disarm_deferred
-                .as_deref()
-                .is_some_and(|why| why.contains("could not be disarmed")
-                    && why.contains("the next boot apply finishes it")),
-            "{retired:?}"
-        );
-
-        assert_eq!(
-            sealed_fixture_identity(&installed),
-            Ok((10, SUPERSEDE_RUNNING_COMMIT.to_string()))
-        );
-        let fixed = rollback_path(&installed);
-        assert_eq!(
-            sealed_fixture_identity(&fixed),
-            Ok((11, SUPERSEDE_ACTIVATION_COMMIT.to_string()))
-        );
-        assert_eq!(
-            boot_sentinel(&s).read_state(),
-            Some((11, 2)),
-            "not one launch counted"
-        );
-        // Every conjunct `recover_abandoned_preswap_trial_if_exact` checks past the
-        // sealed-identity reads.
-        assert!(abandoned_preswap_trial(10, 10, 11));
-        assert!(trial_owned_by(&s, &installed));
-        assert!(same_volume(&fixed, &installed));
-        assert!(trial_authorizes_candidate(
-            &s,
-            11,
-            SUPERSEDE_ACTIVATION_COMMIT
-        ));
-        assert!(
-            s.ready.exists() && s.staged_app.exists(),
-            "the stage the recovery then applies is untouched"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// NOTHING MOVES UNLESS EVERY PRECONDITION HOLDS: each of the ways the disk can
-    /// differ from the one shape the transaction knows how to undo refuses, and
-    /// leaves the activation installed, its trial armed at the same count, the
-    /// predecessor retained, and the stage in place.
-    #[test]
-    fn a_supersede_moves_nothing_unless_every_precondition_holds() {
-        type Mutation = fn(&Staging, &Path, &Path);
-        type Case = (
-            &'static str,
-            Mutation,
-            (u64, &'static str),
-            u64,
-            &'static str,
-            bool,
-        );
-        let other_install = |s: &Staging, _installed: &Path, root: &Path| {
-            let other = root.join("Other").join("aterm.app");
-            sealed_fixture(&other, 11, SUPERSEDE_ACTIVATION_COMMIT);
-            crate::manifest::FailedMark::record_required(
-                &s.trial(),
-                11,
-                SUPERSEDE_ACTIVATION_DIGEST,
-                Some(&other),
-            )
-            .unwrap();
-        };
-        // (why, the disk's difference, the running identity, the newer build, the
-        // words of the refusal that must answer it — each at its own step — and
-        // whether that refusal is about the MOMENT rather than the disk's shape).
-        // A bundle whose sealed identity cannot be read: the stand-in for a
-        // verification that failed or ran out of its budget.
-        fn unverifiable(app: &Path) {
-            std::fs::remove_file(app.join("sealed")).unwrap();
-        }
-        let cases: [Case; 14] = [
-            (
-                "not newer",
-                |_, _, _| {},
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                11,
-                "is not newer than it",
-                false,
-            ),
-            (
-                "the marker names another build",
-                |s, _, _| write_ready_for(s, 13, SUPERSEDE_NEWER_COMMIT),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "no verified stage of build 12",
-                true,
-            ),
-            (
-                "the staged bundle is not the marker's",
-                |s, _, _| sealed_fixture(&s.staged_app, 13, SUPERSEDE_NEWER_COMMIT),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "not the marker's build 12",
-                true,
-            ),
-            (
-                "the staged bundle does not verify",
-                |s, _, _| unverifiable(&s.staged_app),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "the staged bundle does not verify",
-                true,
-            ),
-            (
-                "the stage is yanked",
-                |s, _, _| std::fs::write(s.floor(), "min_build = 13\n").unwrap(),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "below the operator floor 13",
-                false,
-            ),
-            (
-                "the installed bundle is not the activation",
-                |_, installed, _| sealed_fixture(installed, 13, SUPERSEDE_NEWER_COMMIT),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "sealed 13, not the activation",
-                false,
-            ),
-            (
-                "the installed bundle does not verify",
-                |_, installed, _| unverifiable(installed),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "the installed bundle does not verify",
-                true,
-            ),
-            (
-                "the trial is armed for another build",
-                |s, _, _| boot_sentinel(s).arm(12).unwrap(),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "armed for build 12, not for it",
-                false,
-            ),
-            (
-                "no trial is armed",
-                |s, _, _| boot_sentinel(s).confirm().unwrap(),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "no boot trial is armed",
-                false,
-            ),
-            (
-                "the trial belongs to another install",
-                other_install,
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "belongs to another install",
-                false,
-            ),
-            (
-                "the trial marker names other bytes",
-                |s, _, _| {
-                    crate::manifest::InstalledReceipt::clear(&s.installed_receipt());
-                },
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "does not name these bytes",
-                false,
-            ),
-            (
-                "the retained predecessor is not the running build",
-                |_, installed, _| {
-                    sealed_fixture(&rollback_path(installed), 9, SUPERSEDE_RUNNING_COMMIT);
-                },
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "is 9/1111111111111111111111111111111111111111, not the running 10/",
-                false,
-            ),
-            (
-                "the retained predecessor does not verify",
-                |_, installed, _| unverifiable(&rollback_path(installed)),
-                (10, SUPERSEDE_RUNNING_COMMIT),
-                12,
-                "the retained predecessor does not verify",
-                true,
-            ),
-            (
-                "the running build is another commit",
-                |_, _, _| {},
-                (10, "4444444444444444444444444444444444444444"),
-                12,
-                "not the running 10/4444444444444444444444444444444444444444",
-                false,
-            ),
-        ];
-        for (why, mutate, running, newer, words, for_now) in cases {
-            let (s, root, installed) = superseded_activation_desk();
-            mutate(&s, &installed, &root);
-            let installed_before = sealed_fixture_identity(&installed);
-            let fixed_before = sealed_fixture_identity(&rollback_path(&installed));
-            let sentinel_before = boot_sentinel(&s).read_state();
-            let refusal = supersede_desk(&s, &installed, running, newer)
-                .expect_err(&format!("{why}: must refuse"));
-            let error = refusal.reason();
-            assert!(
-                error.contains("stays in place") && error.contains(words),
-                "{why}: {error}"
-            );
-            assert_eq!(
-                refusal.is_for_now(),
-                for_now,
-                "{why}: the refusal's kind ({refusal:?})"
-            );
-            assert_eq!(
-                sealed_fixture_identity(&installed),
-                installed_before,
-                "{why}"
-            );
-            assert_eq!(
-                sealed_fixture_identity(&rollback_path(&installed)),
-                fixed_before,
-                "{why}"
-            );
-            assert_eq!(boot_sentinel(&s).read_state(), sentinel_before, "{why}");
-            assert!(s.ready.exists() && s.staged_app.exists(), "{why}");
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-
-    /// An out-of-band install (install.sh, a DMG drag) landing inside an armed
-    /// trial window leaves a sentinel for a build that is no longer installed.
-    /// It can never be confirmed and must never be reverted, so the terminal
-    /// transition is to disarm it — otherwise every future apply is refused
-    /// forever while the stager keeps publishing "ready to apply".
-    #[test]
-    fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
-        let (s, root) = temp_staging();
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
-        // A receipt for the DEAD trial's build — not proof for what is installed.
-        crate::manifest::InstalledReceipt::record(
-            &s.installed_receipt(),
-            1000,
-            commit,
-            &"ab".repeat(32),
-        )
-        .unwrap();
-        let installed = root.join("Applications").join("aterm.app");
-        make_app(&installed, "HAND-INSTALLED-1001");
-        let rollback = rollback_path(&installed);
-        make_app(&rollback, "OLDER-THAN-RUNNING");
-
-        assert!(disarm_dead_authority_trial(
-            &s, &installed, 1000, 1001, commit, 1001
-        ));
-        assert_eq!(sentinel.read_state(), None, "the wedge is cleared");
-        assert!(!s.trial().exists(), "the dead trial's identity goes too");
-        assert!(
-            !rollback.exists(),
-            "its rollback source is older than the running build and has no sentinel behind it"
-        );
-        assert!(
-            !s.installed_receipt().exists(),
-            "a receipt for the dead build is not proof for the installed one"
-        );
-        assert!(
-            std::fs::read_to_string(&s.status)
-                .unwrap()
-                .contains("updates re-enabled"),
-            "the repair is durable and explains itself"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A trial belongs to the install it swapped. A same-build process launched
-    /// from ANOTHER bundle (`~/Applications/aterm.app` beside
-    /// `/Applications/aterm.app`, a duplicate copy) is not its owner: it must not
-    /// count launches against it, confirm it, or disarm it as dead authority.
-    /// Legacy markers without a recorded root stay owned by whoever asks.
-    #[test]
-    fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
-        let (s, root) = temp_staging();
-        let owner = root.join("Applications").join("aterm.app");
-        let sibling = root.join("dist").join("aterm.app");
-        make_app(&owner, "OWNER");
-        make_app(&sibling, "SIBLING");
-        write_ready(&s, 6);
-        let ready = Ready::read(&s.ready).unwrap();
-        let sentinel = prepare_trial(&s, &ready, &owner).unwrap();
-        assert!(trial_owned_by(&s, &owner));
-        assert!(!trial_owned_by(&s, &sibling));
-        // A sibling launch of the trialed build does not count against it…
-        // (`check_boot_health` early-outs before `observe_launch` for a non-owner —
-        // exercised through the pure predicate here, and through
-        // `recover_abandoned_preswap_trial_if_exact` below).
-        assert_eq!(sentinel.read_state(), Some((6, 0)));
-        // …and a sibling that is NEWER than the armed build may not retire it as
-        // dead authority either: the pure gate is the ownership test.
-        assert!(dead_authority_trial(7, 7, 6) && !trial_owned_by(&s, &sibling));
-        // The abandoned-pre-swap gate: the owner may recover, a same-build
-        // sibling may not. Drop the ownership term and the second assert fails.
-        assert!(may_recover_abandoned_preswap(&s, &owner, (6, 6, 7), true));
-        assert!(!may_recover_abandoned_preswap(
-            &s,
-            &sibling,
-            (6, 6, 7),
-            true
-        ));
-        // The owner install GONE (moved/deleted mid-trial): whoever runs the build
-        // now inherits the trial, so it can still be counted, confirmed or escaped.
-        std::fs::remove_dir_all(&owner).unwrap();
-        assert!(trial_owned_by(&s, &sibling), "a ghost owns nothing");
-        // A legacy marker (no recorded root) is owned by whoever asks.
-        crate::manifest::FailedMark::record(&s.trial(), 6, &"ab".repeat(32));
-        assert!(trial_owned_by(&s, &sibling) && trial_owned_by(&s, &owner));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The unrecoverable mismatched-sentinel shapes get a budgeted escape of
-    /// their own. The budget must be counted in a SEPARATE file: incrementing the
-    /// boot sentinel would advance the trialed build's attempt count from
-    /// launches of a different build and could revert a build that never crashed.
-    #[test]
-    fn an_unrecoverable_foreign_trial_is_disarmed_on_a_budget_not_on_sight() {
-        let (s, root) = temp_staging();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
-
-        for launch in 1..MAX_BOOT_ATTEMPTS {
-            assert!(
-                !escape_wedged_foreign_trial(&s, 1001, 1000),
-                "launch {launch} is inside the budget"
-            );
-            assert_eq!(
-                sentinel.read_state(),
-                Some((1000, 0)),
-                "the trialed build's OWN attempt count is never touched"
-            );
-        }
-
-        assert!(
-            escape_wedged_foreign_trial(&s, 1001, 1000),
-            "the budget is exhausted"
-        );
-        assert_eq!(sentinel.read_state(), None, "the wedge is cleared");
-        assert!(!s.trial().exists());
-        assert!(
-            !s.root.join("foreign-trial").exists(),
-            "the counter is retired with the sentinel it was counting"
-        );
-        assert!(
-            std::fs::read_to_string(&s.status)
-                .unwrap()
-                .contains("updates re-enabled")
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A trial OWNED BY ANOTHER INSTALL THAT STILL EXISTS is not disarmed by a
-    /// sibling's exhausted budget unless that owner has been idle for a day; an owner
-    /// that is GONE cedes at the budget as before.
-    #[test]
-    fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idle() {
-        let (s, root) = temp_staging();
-        let owner = root.join("Applications").join("aterm.app");
-        make_app(&owner, "OWNER");
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        crate::manifest::FailedMark::record_required(
-            &s.trial(),
-            1000,
-            &"ab".repeat(32),
-            Some(&owner),
-        )
-        .unwrap();
-        for _ in 0..MAX_BOOT_ATTEMPTS + 2 {
-            assert!(
-                !escape_wedged_foreign_trial(&s, 1001, 1000),
-                "a present, recently-touched owner keeps its trial past the budget"
-            );
-        }
-        assert_eq!(
-            sentinel.read_state(),
-            Some((1000, 0)),
-            "still armed, still untouched"
-        );
-        // The owner install GONE: the next exhausted budget disarms (ghost cedes).
-        std::fs::remove_dir_all(&owner).unwrap();
-        let mut disarmed = false;
-        for _ in 0..MAX_BOOT_ATTEMPTS + 1 {
-            disarmed |= escape_wedged_foreign_trial(&s, 1001, 1000);
-        }
-        assert!(disarmed, "a ghost owner cedes at the budget");
-        assert_eq!(sentinel.read_state(), None);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A LIVE TRIAL BELONGING TO ANOTHER INSTALLATION IS NEVER DISARMED.
-    ///
-    /// The staging root is per USER, not per install, so a locally built .app beside
-    /// the released one shares this sentinel. If launches of THIS copy could exhaust
-    /// the budget while the other copy is still trialing, the escape would strip the
-    /// crash-loop protection off the very build that is crash-looping: that build's
-    /// own `check_boot_health` would then find no sentinel and never revert.
-    ///
-    /// The owner advancing its own attempt count is what proves it alive, so a budget
-    /// that spans such an advance must restart rather than complete.
-    #[test]
-    fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
-        let (s, root) = temp_staging();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-
-        // Run the budget to one launch short of the escape, over and over, with the
-        // trial's OWNER observing a launch each time — exactly what a crash-looping
-        // second installation does. The escape must never fire.
-        for round in 0..4 {
-            for _ in 1..MAX_BOOT_ATTEMPTS {
-                assert!(
-                    !escape_wedged_foreign_trial(&s, 1001, 1000),
-                    "round {round}: inside the budget"
-                );
-            }
-            // The other copy launches: `observe_launch` counts because IT is build 1000.
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let attempts = sentinel.observe_launch(1000).unwrap();
-            assert!(attempts >= 1, "the owner really did advance its own trial");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            assert!(
-                !escape_wedged_foreign_trial(&s, 1001, 1000),
-                "round {round}: an advance restarts the budget instead of completing it"
-            );
-            assert!(
-                sentinel.read_state().is_some(),
-                "round {round}: the live trial survives"
-            );
-        }
-
-        // NEGATIVE CONTROL: the same number of launches with the owner GONE (nothing
-        // advances the sentinel) does reach the escape — so the guard above is what is
-        // holding, not a budget that never completes.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let mut fired = false;
-        for _ in 0..MAX_BOOT_ATTEMPTS + 1 {
-            fired |= escape_wedged_foreign_trial(&s, 1001, 1000);
-        }
-        assert!(fired, "an abandoned trial is still escaped");
-        assert_eq!(sentinel.read_state(), None);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A new armed build restarts the budget: launches counted against a trial
-    /// that has since been replaced must not carry over and disarm the new one
-    /// early.
-    #[test]
-    fn the_foreign_trial_budget_does_not_accumulate_across_trials() {
-        let (s, root) = temp_staging();
-        let sentinel = boot_sentinel(&s);
-        sentinel.arm(1000).unwrap();
-        for _ in 1..MAX_BOOT_ATTEMPTS {
-            assert!(!escape_wedged_foreign_trial(&s, 1001, 1000));
-        }
-        // A different build is armed now (the previous one was resolved).
-        sentinel.arm(1002).unwrap();
-        assert!(
-            !escape_wedged_foreign_trial(&s, 1001, 1002),
-            "the new trial gets the full budget, not the tail of the old one"
-        );
-        assert_eq!(sentinel.read_state(), Some((1002, 0)));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Only a refusal is recorded as one. The every-launch outcomes would rewrite
-    /// `status.toml` on every boot, and a re-exec FAILURE belongs in the failure
-    /// ledger — `record_apply_failure` clears refusals, never the reverse.
-    #[test]
-    fn only_a_deferred_boot_apply_is_recorded_as_a_refusal() {
-        let deferred = ApplyOutcome::Deferred("trial 1000 unconfirmed".to_string());
-        assert_eq!(
-            boot_apply_refusal_reason(&deferred),
-            Some("trial 1000 unconfirmed")
-        );
-        for quiet in [
-            ApplyOutcome::NotApplicable,
-            ApplyOutcome::NoUpdate,
-            ApplyOutcome::ReExecFailed("exec: ENOMEM".to_string()),
-        ] {
-            assert_eq!(
-                boot_apply_refusal_reason(&quiet),
-                None,
-                "{quiet:?} is not an apply refusal"
-            );
-        }
-    }
-
-    #[test]
-    fn active_trial_digest_rejects_same_build_commit_receipt_with_other_artifact() {
-        let (s, root) = temp_staging();
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
-        crate::manifest::InstalledReceipt::record(
-            &s.installed_receipt(),
-            1000,
-            commit,
-            &"cd".repeat(32),
-        )
-        .unwrap();
-        assert!(
-            !trial_authorizes_candidate(&s, 1000, commit),
-            "same build+commit with a different DMG must not authorize health or recovery"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Tier-1 conformance for the native update disk machine. This test drives
-    /// the real fixed-path exchange, inverse rollback, sentinel, exact receipt,
-    /// startup authority reducer, and health cleanup; each physical observation
-    /// is projected onto the same model that Tier-0 proves and bug-mutates.
-    #[test]
-    fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_health_guards() {
-        let model = aterm_spec::derive::native_update_disk_transaction_model();
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let other_commit = "fedcba9876543210fedcba9876543210fedcba98";
-        let digest = "ab".repeat(32);
-        let build = 1000;
-
-        // Startup authority must not return before the real boot-health lane has
-        // run. A malformed expected-artifact tuple and a matching re-exec both
-        // produce the observe verdict pre-observation; this is the regression's
-        // production negative control.
-        assert_eq!(
-            startup_authority_decision(false, ReexecAuthority::Absent, false),
-            StartupAuthorityDecision::ObserveBootHealth
-        );
-        assert_eq!(
-            startup_authority_decision(false, ReexecAuthority::Matched, true),
-            StartupAuthorityDecision::ObserveBootHealth
-        );
-        assert_eq!(
-            startup_authority_decision(true, ReexecAuthority::Absent, false),
-            StartupAuthorityDecision::ReturnMalformedExpected
-        );
-        assert_eq!(
-            startup_authority_decision(true, ReexecAuthority::Matched, true),
-            StartupAuthorityDecision::ReturnMatchedReexec
-        );
-        let mut malformed = model.init_state();
-        for action in [
-            "InheritMalformedAuthority",
-            "ConsumeStartupAuthority",
-            "ObserveBootHealth",
-            "ReturnAfterObservedAuthority",
-        ] {
-            disk_model_step(&model, &mut malformed, action);
-        }
-
-        // The post-swap startup lane, without the retired v0.52 synthesis.
-        //
-        // That branch recovered a receipt for a machine whose updater deleted
-        // `ready.toml` before minting one; it and its model action are gone with
-        // the rest of the two-component lineage. What survives is the MODERN
-        // recovery — `ready.toml` is still present, so the receipt is rebuilt
-        // from evidence the current updater actually writes — and this binds it
-        // to the model, then proves each corrupted disk fact disables it.
-        let mut modern_state = model.init_state();
-        for action in [
-            "EnterLegacyPostSwapExact",
-            "SupplyModernReadyRecovery",
-            "ConsumeStartupAuthority",
-            "RecoverModernReceiptFromReady",
-        ] {
-            disk_model_step(&model, &mut modern_state, action);
-        }
-        assert_eq!(modern_state["receipt_exact"], 1);
-        assert_eq!(modern_state["modern_receipt_recovered"], 1);
-
-        // Each corrupted disk fact must leave its REFUSAL enabled and preserve
-        // recovery authority — trial armed, rollback fixed, no receipt minted —
-        // so a later launch can still act on unchanged evidence. A corruption
-        // that silently disabled both the recovery and its refusal would strand
-        // the machine with no path forward, which is what this excludes.
-        //
-        // `legacy_variant` is the model's mutex: supplying modern ready evidence
-        // and corrupting a fact are mutually exclusive scenarios, so these runs
-        // deliberately do NOT also supply ready — with `ready_present == 0`,
-        // `RecoverModernReceiptFromReady` is disabled by its own guard.
-        for (corrupt, refuse) in [
-            ("CorruptLegacySentinel", "RefuseLegacySentinelMismatch"),
-            (
-                "CorruptLegacyCurrentBuild",
-                "RefuseLegacyCurrentBuildMismatch",
-            ),
-            (
-                "CorruptLegacyCurrentCommit",
-                "RefuseLegacyCurrentCommitMismatch",
-            ),
-            ("CorruptLegacyTrialBuild", "RefuseLegacyTrialBuildMismatch"),
-            (
-                "CorruptLegacyTrialDigest",
-                "RefuseLegacyTrialDigestMismatch",
-            ),
-            ("CorruptLegacyRollback", "RefuseLegacyRollbackMismatch"),
-        ] {
-            let mut rejected_state = model.init_state();
-            for action in [
-                "EnterLegacyPostSwapExact",
-                corrupt,
-                "ConsumeStartupAuthority",
-            ] {
-                disk_model_step(&model, &mut rejected_state, action);
-            }
-            assert!(
-                model
-                    .successors("RecoverModernReceiptFromReady", &rejected_state)
-                    .is_empty(),
-                "{corrupt} left receipt recovery model-enabled"
-            );
-            disk_model_step(&model, &mut rejected_state, refuse);
-            assert_eq!(rejected_state["trial"], 1);
-            assert_eq!(rejected_state["fixed"], 1);
-            assert_eq!(rejected_state["receipt"], 0);
-        }
-
-        // OLD authority is build+commit, not build-only. Likewise NEW handoff
-        // authority is the exact marker build+commit+digest tuple.
-        assert!(identity_matches_running(
-            build,
-            commit,
-            build,
-            Some("0123456789ab")
-        ));
-        assert!(
-            !identity_matches_running(build, other_commit, build, Some("0123456789ab")),
-            "negative control: build-only comparison would authorize the wrong OLD"
-        );
-        let mut wrong_old = disk_model_ready(&model);
-        disk_model_step(&model, &mut wrong_old, "CorruptOldCommit");
-        assert!(
-            model.successors("PrepareFixedNew", &wrong_old).is_empty(),
-            "healthy model must reject the same build with the wrong commit"
-        );
-        let ready = Ready {
-            build_number: build,
-            version: "1.0.1000".into(),
-            commit: Some(commit.into()),
-            dmg_sha256: digest.clone(),
-            team_id: "T".into(),
-            staged_at: String::new(),
-            changelog: None,
-            machine_id: None,
-            roster_seq: None,
-        };
-        let exact = ExpectedArtifact {
-            build,
-            commit: commit.into(),
-            dmg_sha256: digest.clone(),
-        };
-        assert!(ready_matches_expected(&ready, &exact));
-        let mut wrong_new = exact.clone();
-        wrong_new.commit = other_commit.into();
-        assert!(!ready_matches_expected(&ready, &wrong_new));
-
-        // A genuine failed fixed exchange plus shipping disarm/recovery leaves
-        // canonical OLD intact and no partial trial authority.
-        let (failed_staging, failed_root) = temp_staging();
-        write_ready(&failed_staging, build);
-        let failed_installed = failed_root.join("Applications/aterm.app");
-        make_app(&failed_installed, "OLD");
-        let failed_ready = Ready::read(&failed_staging.ready).unwrap();
-        let failed_sentinel =
-            prepare_trial(&failed_staging, &failed_ready, &failed_installed).unwrap();
-        let mut failed_state = disk_model_ready(&model);
-        disk_model_step(&model, &mut failed_state, "RemovePreviousReceipt");
-        disk_model_step(&model, &mut failed_state, "PrepareFixedNew");
-        disk_model_step(&model, &mut failed_state, "ArmExactTrial");
-        let missing = rollback_path(&failed_installed);
-        assert!(swap_fixed_candidate(&copied_candidate(&missing), &failed_installed).is_err());
-        // Negative control: a two-rename "swap" failing between its renames would
-        // leave NEW installed and OLD off the fixed path with the trial armed. The
-        // real exchange just failed as one step; the projection below shows
-        // canonical OLD intact.
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        let torn = buggy.successors("BuggyTwoRenameSwapFailsMidway", &failed_state)[0].clone();
-        assert!(!buggy.check_invariant("FailedSwapNeverReplacesOld", &torn));
-        failed_sentinel.confirm().unwrap();
-        crate::manifest::FailedMark::clear(&failed_staging.trial());
-        disk_model_step(&model, &mut failed_state, "SwapFailsAndDisarms");
-        assert_real_disk_projection(
-            &failed_state,
-            &failed_staging,
-            &failed_installed,
-            build,
-            commit,
-            &digest,
-        );
-        let _ = std::fs::remove_dir_all(failed_root);
-
-        // Successful fixed-path transaction and exact receipt.
-        let (staging, root) = temp_staging();
-        write_ready(&staging, build);
-        make_app(&staging.staged_app, "OLD");
-        let installed = root.join("Applications/aterm.app");
-        let fixed = rollback_path(&installed);
-        make_app(&installed, "OLD");
-        make_app(&fixed, "NEW");
-        let mut state = disk_model_ready(&model);
-        disk_model_step(&model, &mut state, "RemovePreviousReceipt");
-        disk_model_step(&model, &mut state, "PrepareFixedNew");
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-
-        let ready = Ready::read(&staging.ready).unwrap();
-        let _sentinel = prepare_trial(&staging, &ready, &installed).unwrap();
-        disk_model_step(&model, &mut state, "ArmExactTrial");
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-        // Negative control: the receipt is recorded only after the exchange below.
-        // Written here, it would name NEW over an installed OLD.
-        let early_receipt = buggy.successors("BuggyWriteReceiptBeforeSwap", &state)[0].clone();
-        assert!(!buggy.check_invariant("ReceiptBindsExactNewIdentity", &early_receipt));
-
-        swap_fixed_candidate(&copied_candidate(&fixed), &installed).unwrap();
-        disk_model_step(&model, &mut state, "AtomicSwap");
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-
-        crate::manifest::InstalledReceipt::record(
-            &staging.installed_receipt(),
-            build,
-            commit,
-            &digest,
-        )
-        .unwrap();
-        std::fs::remove_file(&staging.ready).unwrap();
-        disk_model_step(&model, &mut state, "RecordExactReceipt");
-        disk_model_step(&model, &mut state, "VerifyExactRollback");
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-
-        // The GUI first-present edge precedes the worker proof. A failed proof is
-        // a strict no-op on every recovery artifact, then a retry may prove,
-        // disarm, and garbage-collect in that order.
-        disk_model_step(&model, &mut state, "PresentInstalledUi");
-        let _apply = FileLock::acquire(&staging.apply_lock).unwrap();
-        assert!(!confirm_health_under_apply_lock_with_proof(
-            &staging,
-            build,
-            &installed,
-            || Err("injected health-proof failure".to_string()),
-        ));
-        disk_model_step(&model, &mut state, "HealthProofFails");
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-        assert!(staging.staged_app.exists() && fixed.exists());
-
-        disk_model_step(&model, &mut state, "RetryHealthProof");
-        assert!(confirm_health_under_apply_lock_with_proof(
-            &staging,
-            build,
-            &installed,
-            || Ok(()),
-        ));
-        for action in [
-            "ProveInstalledHealth",
-            "DisarmTrial",
-            "GarbageCollectRollback",
-        ] {
-            disk_model_step(&model, &mut state, action);
-        }
-        assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
-        assert!(!staging.staged_app.exists() && !fixed.exists());
-        drop(_apply);
-        let _ = std::fs::remove_dir_all(root);
-
-        // Exec-failure inverse rollback: a rejected/missing rollback input leaves
-        // NEW+exact OLD untouched; the genuine fixed path then restores OLD and
-        // successful disarm permits cleanup.
-        let (rollback_staging, rollback_root) = temp_staging();
-        write_ready(&rollback_staging, build);
-        let rollback_installed = rollback_root.join("Applications/aterm.app");
-        let rollback_fixed = rollback_path(&rollback_installed);
-        make_app(&rollback_installed, "OLD");
-        make_app(&rollback_fixed, "NEW");
-        let rollback_ready = Ready::read(&rollback_staging.ready).unwrap();
-        let rollback_sentinel =
-            prepare_trial(&rollback_staging, &rollback_ready, &rollback_installed).unwrap();
-        let mut rollback_state = disk_model_ready(&model);
-        disk_model_step(&model, &mut rollback_state, "RemovePreviousReceipt");
-        for action in ["PrepareFixedNew", "ArmExactTrial"] {
-            disk_model_step(&model, &mut rollback_state, action);
-        }
-        swap_fixed_candidate(&copied_candidate(&rollback_fixed), &rollback_installed).unwrap();
-        disk_model_step(&model, &mut rollback_state, "AtomicSwap");
-        crate::manifest::InstalledReceipt::record(
-            &rollback_staging.installed_receipt(),
-            build,
-            commit,
-            &digest,
-        )
-        .unwrap();
-        for action in ["RecordExactReceipt", "VerifyExactRollback", "ExecFails"] {
-            disk_model_step(&model, &mut rollback_state, action);
-        }
-        assert!(
-            restore_rollback(
-                &rollback_root.join("missing-rollback.app"),
-                &rollback_installed,
-            )
-            .is_err()
-        );
-        disk_model_step(&model, &mut rollback_state, "RestoreExactOldFails");
-        assert_real_disk_projection(
-            &rollback_state,
-            &rollback_staging,
-            &rollback_installed,
-            build,
-            commit,
-            &digest,
-        );
-        restore_rollback(&rollback_fixed, &rollback_installed).unwrap();
-        disk_model_step(&model, &mut rollback_state, "RestoreExactOld");
-        rollback_sentinel.confirm().unwrap();
-        crate::manifest::FailedMark::clear(&rollback_staging.trial());
-        std::fs::remove_dir_all(&rollback_fixed).unwrap();
-        restore_installed_receipt(&rollback_staging, None).unwrap();
-        disk_model_step(
-            &model,
-            &mut rollback_state,
-            "DisarmRestoredTrialAndClearUnboundReceipt",
-        );
-        assert_real_disk_projection(
-            &rollback_state,
-            &rollback_staging,
-            &rollback_installed,
-            build,
-            commit,
-            &digest,
-        );
-        let _ = std::fs::remove_dir_all(rollback_root);
-    }
-
-    // -----------------------------------------------------------------------
-    // The zip extraction bound. These build central directories BY HAND rather
-    // than shelling out to `ditto -c -k`, because the shapes that matter are
-    // exactly the ones a real archiver will not produce: a saturated ZIP64
-    // sentinel with nothing behind it, a directory cut mid-header, a size field
-    // no filesystem could satisfy.
-    // -----------------------------------------------------------------------
-
-    /// One central directory file header for `name`, declaring `uncompressed`
-    /// bytes and carrying `extra` as its extra field.
-    fn central_header(name: &str, uncompressed: u32, extra: &[u8]) -> Vec<u8> {
-        let mut header = Vec::new();
-        header.extend_from_slice(&CENTRAL_HEADER_SIGNATURE.to_le_bytes());
-        header.extend_from_slice(&[0u8; 4]); // version made by + version needed
-        header.extend_from_slice(&[0u8; 2]); // general purpose flags
-        header.extend_from_slice(&[0u8; 2]); // method (stored)
-        header.extend_from_slice(&[0u8; 4]); // mod time + mod date
-        header.extend_from_slice(&[0u8; 4]); // crc32
-        header.extend_from_slice(&0u32.to_le_bytes()); // compressed size
-        header.extend_from_slice(&uncompressed.to_le_bytes());
-        header.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-        header.extend_from_slice(&u16::try_from(extra.len()).unwrap().to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes()); // file comment length
-        header.extend_from_slice(&[0u8; 2]); // disk number start
-        header.extend_from_slice(&[0u8; 2]); // internal attributes
-        header.extend_from_slice(&[0u8; 4]); // external attributes
-        header.extend_from_slice(&0u32.to_le_bytes()); // local header offset
-        assert_eq!(
-            header.len(),
-            CENTRAL_HEADER_FIXED_LEN,
-            "fixed header layout"
-        );
-        header.extend_from_slice(name.as_bytes());
-        header.extend_from_slice(extra);
-        header
-    }
-
-    /// An End Of Central Directory record with the given (already-encoded)
-    /// fields, so a test can declare a sentinel or a deliberate mismatch.
-    fn eocd(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
-        let mut record = Vec::new();
-        record.extend_from_slice(&EOCD_SIGNATURE.to_le_bytes());
-        record.extend_from_slice(&0u16.to_le_bytes()); // this disk
-        record.extend_from_slice(&0u16.to_le_bytes()); // disk with the directory
-        record.extend_from_slice(&entries.to_le_bytes()); // entries on this disk
-        record.extend_from_slice(&entries.to_le_bytes()); // total entries
-        record.extend_from_slice(&size.to_le_bytes());
-        record.extend_from_slice(&offset.to_le_bytes());
-        record.extend_from_slice(&u16::try_from(comment.len()).unwrap().to_le_bytes());
-        record.extend_from_slice(comment);
-        record
-    }
-
-    /// A stand-in for the local-file-header area, so the directory offset under
-    /// test is never the degenerate zero.
-    const ZIP_PREFIX: &[u8] = b"PK\x03\x04stub!!";
-
-    /// Write `bytes` to a fresh temp path and hand back a guard that removes it.
-    struct TempZip(std::path::PathBuf);
-
-    impl TempZip {
-        fn new(label: &str, bytes: &[u8]) -> Self {
-            let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aterm-zipbound-{label}-{}-{n}.zip",
-                std::process::id()
-            ));
-            std::fs::write(&path, bytes).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempZip {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    /// Assemble prefix + headers + an EOCD whose extent and count match them —
-    /// the shape every refusal test then perturbs in exactly one place.
-    fn well_formed_zip(entries: &[(&str, u32)]) -> Vec<u8> {
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        for &(name, uncompressed) in entries {
-            bytes.extend_from_slice(&central_header(name, uncompressed, &[]));
-        }
-        let size = u32::try_from(bytes.len()).unwrap() - offset;
-        let count = u16::try_from(entries.len()).unwrap();
-        bytes.extend_from_slice(&eocd(count, size, offset, b""));
-        bytes
-    }
-
-    /// The happy path: a directory `ditto -c -k` could plausibly have written is
-    /// read exactly — entry count and summed uncompressed bytes both.
-    #[test]
-    fn zip_claim_reads_a_well_formed_central_directory() {
-        let zip = TempZip::new(
-            "ok",
-            &well_formed_zip(&[
-                ("aterm.app/", 0),
-                ("aterm.app/Contents/Info.plist", 1_024),
-                ("aterm.app/Contents/MacOS/aterm", 40_000_000),
-            ]),
-        );
-        let claim = checked_zip_extraction_claim(&zip.0).expect("well-formed directory is read");
-        assert_eq!(
-            claim,
-            ZipExtractClaim {
-                entries: 3,
-                uncompressed_bytes: 40_001_024,
-            }
-        );
-    }
-
-    /// An archive comment does not hide the end record: the scan must mind the
-    /// variable-length tail rather than assume the record sits at EOF - 22.
-    #[test]
-    fn zip_claim_finds_the_end_record_behind_an_archive_comment() {
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        bytes.extend_from_slice(&central_header("only", 7, &[]));
-        let size = u32::try_from(bytes.len()).unwrap() - offset;
-        // A 4 KiB comment of bytes that are NOT a signature, so the only valid
-        // candidate is the real record.
-        let comment = [b'c'; 4096];
-        bytes.extend_from_slice(&eocd(1, size, offset, &comment));
-        let zip = TempZip::new("comment", &bytes);
-        assert_eq!(
-            checked_zip_extraction_claim(&zip.0).expect("comment does not hide the end record"),
-            ZipExtractClaim {
-                entries: 1,
-                uncompressed_bytes: 7,
-            }
-        );
-    }
-
-    /// A batteries-included container — the toolchain seed sealed into the same
-    /// signed `.app` — declares far more than the retired 1 GiB cap while staying
-    /// inside the ONE bound the cutter validates every published asset against.
-    /// The client must be able to unpack anything the publisher was allowed to
-    /// publish, or a legitimate release strands the whole channel at unpack time
-    /// with nothing on the publishing side able to see it coming.
-    #[test]
-    fn zip_claim_admits_a_batteries_sized_container_the_cutter_would_publish() {
-        assert_eq!(
-            MAX_EXTRACT_BYTES,
-            aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
-            "the extract cap must never sit below the bound the cutter enforces"
-        );
-        let declared: u32 = 1_610_612_736; // 1.5 GiB
-        let zip = TempZip::new(
-            "batteries",
-            &well_formed_zip(&[(
-                "aterm.app/Contents/Resources/toolchain-seed/trust.tar.zst",
-                declared,
-            )]),
-        );
-        assert_eq!(
-            checked_zip_extraction_claim(&zip.0).expect("a publishable container is accepted"),
-            ZipExtractClaim {
-                entries: 1,
-                uncompressed_bytes: u64::from(declared),
-            }
-        );
-    }
-
-    /// An absurd declared size is refused. `u32::MAX - 1` is the largest size a
-    /// classic entry can state without tripping the ZIP64 escape, and it is
-    /// already twice the cap, so this is refused on BYTES — no
-    /// filesystem, no `ditto`, nothing written.
-    #[test]
-    fn zip_claim_refuses_an_absurd_declared_size() {
-        let zip = TempZip::new(
-            "huge",
-            &well_formed_zip(&[("aterm.app/huge", u32::MAX - 1)]),
-        );
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("absurd size is refused");
-        assert!(
-            error.contains("uncompressed bytes") && error.contains("extraction cap"),
-            "refusal names the byte cap: {error}"
-        );
-    }
-
-    /// THIS MACHINE's free space is asked before `ditto` is spawned (2026-09-14,
-    /// audit SV-3). `checked_zip_extraction_claim` bounds the fleet-wide cost; a
-    /// declared size the volume cannot hold used to be learned by extracting into
-    /// it and reading "ditto zip extract failed (exit status: 1)" — then re-downloading
-    /// the container on every backoff step. The refusal names free, needed and the
-    /// volume; a size the volume holds passes; a volume that will not report passes
-    /// too (ditto decides, with its stderr kept).
-    #[test]
-    fn the_stage_refuses_an_unpack_the_volume_cannot_hold_and_names_the_numbers() {
-        let (_s, root) = temp_staging();
-        let free = free_bytes_at(&root).expect("the scratch volume reports its free space");
-        // More than the volume has, by a margin no headroom explains.
-        let error = refuse_without_room(&root, free.saturating_add(1 << 40), "the update zip")
-            .expect_err("a declared size past the volume is refused before any byte lands");
-        assert!(
-            error.contains("not enough free space")
-                && error.contains("MiB free")
-                && error.contains("MiB needed")
-                && error.contains(&root.display().to_string()),
-            "the refusal names the numbers and the volume: {error}"
-        );
-        // A modest size the volume holds is let through.
-        refuse_without_room(&root, 1024, "the update zip").expect("a small unpack fits");
-        // A path no volume answers for is let through, not refused: ditto decides.
-        refuse_without_room(
-            Path::new("/nonexistent/volume/for/this/test"),
-            u64::MAX / 2,
-            "the update zip",
-        )
-        .expect("an unanswerable volume defers to ditto");
-        assert!(free_bytes_at(Path::new("/nonexistent/volume/for/this/test")).is_none());
-    }
-
-    /// `tree_bytes` is what the DMG lane's copy will write: regular files summed,
-    /// directories and symlinks counted as nothing and not followed.
-    #[test]
-    fn tree_bytes_sums_regular_files_and_never_follows_links() {
-        let (_s, root) = temp_staging();
-        let tree = root.join("tree.app");
-        std::fs::create_dir_all(tree.join("Contents/MacOS")).unwrap();
-        std::fs::write(tree.join("Contents/MacOS/aterm"), vec![7u8; 1000]).unwrap();
-        std::fs::write(tree.join("Contents/Info.plist"), vec![1u8; 24]).unwrap();
-        // A link to a big file outside the tree must not be counted through.
-        let big = root.join("big.bin");
-        std::fs::write(&big, vec![0u8; 100_000]).unwrap();
-        std::os::unix::fs::symlink(&big, tree.join("Contents/MacOS/link")).unwrap();
-        assert_eq!(tree_bytes(&tree), 1024);
-        assert_eq!(tree_bytes(&root.join("absent")), 0);
-    }
-
-    /// Many small entries are refused on COUNT even though their declared bytes
-    /// are zero — the inode/block cost bytes alone cannot see.
-    #[test]
-    fn zip_claim_refuses_an_absurd_entry_count() {
-        let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        for _ in 0..over {
-            bytes.extend_from_slice(&central_header("e", 0, &[]));
-        }
-        let size = u32::try_from(bytes.len()).unwrap() - offset;
-        bytes.extend_from_slice(&eocd(u16::try_from(over).unwrap(), size, offset, b""));
-        let zip = TempZip::new("many", &bytes);
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("absurd count is refused");
-        assert!(
-            error.contains("entries"),
-            "refusal names the entry cap: {error}"
-        );
-    }
-
-    /// A directory cut mid-header is refused. The end record still declares the
-    /// full extent, so the walk runs out of header before it runs out of extent
-    /// — the shape a truncated upload produces.
-    #[test]
-    fn zip_claim_refuses_a_truncated_central_directory() {
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        bytes.extend_from_slice(&central_header("first", 10, &[]));
-        let full = central_header("second", 20, &[]);
-        let present = u32::try_from(bytes.len()).unwrap() - offset;
-        // Half of the second header survives; the extent still claims both.
-        let size = present + u32::try_from(full.len()).unwrap();
-        bytes.extend_from_slice(&full[..full.len() / 2]);
-        bytes.extend_from_slice(&eocd(2, size, offset, b""));
-        let zip = TempZip::new("cut", &bytes);
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("truncation is refused");
-        assert!(
-            error.contains("does not lie before its end record")
-                || error.contains("ends inside a file header"),
-            "refusal names the truncation: {error}"
-        );
-    }
-
-    /// A directory whose walked entry count disagrees with the trailer is
-    /// refused: the two records must describe the SAME archive, or the bound was
-    /// measured off something other than what is about to be unpacked.
-    #[test]
-    fn zip_claim_refuses_a_directory_that_contradicts_its_trailer() {
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        bytes.extend_from_slice(&central_header("one", 1, &[]));
-        bytes.extend_from_slice(&central_header("two", 2, &[]));
-        let size = u32::try_from(bytes.len()).unwrap() - offset;
-        // Two headers present, seven declared.
-        bytes.extend_from_slice(&eocd(7, size, offset, b""));
-        let zip = TempZip::new("miscount", &bytes);
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("miscount is refused");
-        assert!(
-            error.contains("end record declares"),
-            "refusal names the disagreement: {error}"
-        );
-    }
-
-    /// A ZIP64 sentinel with no locator behind it is a shape this reader cannot
-    /// describe, and the saturated field is exactly the one the cap is measured
-    /// against — so it is a REFUSAL, never "assume fine".
-    #[test]
-    fn zip_claim_refuses_a_zip64_sentinel_without_a_locator() {
-        for (label, entries, size, offset) in [
-            ("count", u16::MAX, 46u32, 12u32),
-            ("size", 1u16, u32::MAX, 12u32),
-            ("offset", 1u16, 46u32, u32::MAX),
-        ] {
-            let mut bytes = ZIP_PREFIX.to_vec();
-            bytes.extend_from_slice(&central_header("one", 1, &[]));
-            bytes.extend_from_slice(&eocd(entries, size, offset, b""));
-            let zip = TempZip::new(label, &bytes);
-            let error = checked_zip_extraction_claim(&zip.0)
-                .expect_err("a sentinel with no ZIP64 record is refused");
-            assert!(
-                error.contains("carries no ZIP64 one"),
-                "{label}: refusal names the missing ZIP64 record: {error}"
-            );
-        }
-    }
-
-    /// An entry escaping to a ZIP64 size with no ZIP64 extra field to hold it is
-    /// refused rather than read as a literal ~4 GiB (which would also fail, but
-    /// for the wrong reason — the point is that the escape is UNRESOLVED).
-    #[test]
-    fn zip_claim_refuses_a_zip64_escape_with_no_extra_field() {
-        let zip = TempZip::new("escape", &well_formed_zip(&[("aterm.app/x", u32::MAX)]));
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("bare escape is refused");
-        assert!(
-            error.contains("carries no ZIP64 extra field"),
-            "refusal names the missing extra field: {error}"
-        );
-    }
-
-    /// Two trailers that both run exactly to EOF are ambiguous: the bound would
-    /// be measured off a record that may not be the one `ditto` follows.
-    #[test]
-    fn zip_claim_refuses_an_ambiguous_pair_of_end_records() {
-        let mut bytes = ZIP_PREFIX.to_vec();
-        let offset = u32::try_from(bytes.len()).unwrap();
-        bytes.extend_from_slice(&central_header("one", 1, &[]));
-        let size = u32::try_from(bytes.len()).unwrap() - offset;
-        // The decoy's comment swallows the real record, so BOTH end exactly at
-        // EOF and both parse.
-        let real = eocd(1, size, offset, b"");
-        let filler = vec![0u8; real.len()];
-        bytes.extend_from_slice(&eocd(1, size, offset, &filler));
-        let decoy_comment_start = bytes.len() - real.len();
-        bytes[decoy_comment_start..].copy_from_slice(&real);
-        let zip = TempZip::new("ambiguous", &bytes);
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("ambiguity is refused");
-        assert!(
-            error.contains("more than one end-of-central-directory record"),
-            "refusal names the ambiguity: {error}"
-        );
-    }
-
-    /// A file too short to hold an end record at all is refused, not read as an
-    /// empty archive.
-    #[test]
-    fn zip_claim_refuses_a_file_with_no_end_record() {
-        let zip = TempZip::new("stub", b"PK\x03\x04not-a-zip");
-        let error = checked_zip_extraction_claim(&zip.0).expect_err("a non-archive is refused");
-        assert!(
-            error.contains("end-of-central-directory"),
-            "refusal names the missing end record: {error}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // 2026-09-14 stage-verify audit.
-    // -----------------------------------------------------------------------
-
-    /// THE OWNER'S DESK, 2026-09-14 (aterm.log 1789364570 … 1789390973): six automatic
-    /// applies of v0.85.0 refused with exactly this error, escalating stand-downs up
-    /// to ~6 h — and the cold-launch fallback refuses for the SAME reason at step 7 of
-    /// `apply_staged_if_ready_inner` ("current installed rollback source is not
-    /// verified"), so a hand-installed, ad-hoc-signed bundle in `/Applications` can
-    /// never be updated by ANY lane. The refusal names the cause and the path; it must
-    /// also name the way out, because nothing else on the machine does: put the signed
-    /// release back (`tools/install.sh`, or drag it from the release DMG), or mark a
-    /// local build `ATermDevBuild` so the updater leaves it alone instead of failing
-    /// every half hour.
-    #[test]
-    fn a_rollback_source_refusal_names_the_remedy() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-rollback-remedy-{}-{}",
-            std::process::id(),
-            super::unix_now_secs()
-        ));
-        let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
-            .expect_err("a path that is not a bundle cannot be a rollback source");
-        assert!(
-            error.contains("tools/install.sh"),
-            "the refusal must say how to put a signed release back: {error}"
-        );
-        assert!(
-            error.contains("ATermDevBuild"),
-            "…and how to take a local build out of the channel on purpose: {error}"
-        );
-    }
-
-    /// `sweep_stale_mounts` runs only on the DMG lane and `sweep_stale_extracts` only
-    /// on the zip lane. Every current release carries a zip, so a `mnt-<pid>` that a
-    /// DMG-era stage left behind (a process killed mid-stage; on this machine
-    /// `Updates/mnt-21441`, 2026-08-31, still present on 2026-09-14) is never
-    /// reclaimed — and if the image behind it was still attached, it stays attached
-    /// until reboot. Both lanes must sweep both kinds of scratch. The sweep runs
-    /// BEFORE the unpack, so a zip `ditto` cannot even open still reclaims the
-    /// leftover.
-    #[test]
-    fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
-        let (s, root) = temp_staging();
-        let stale_mount = s.root.join("mnt-424242");
-        std::fs::create_dir_all(&stale_mount).unwrap();
-        let stale_extract = s.staged_dir().join("zx-424242");
-        std::fs::create_dir_all(&stale_extract).unwrap();
-        let zip = TempZip::new("sweep", &well_formed_zip(&[("aterm.app/", 0)]));
-        let manifest = Manifest {
-            schema: 1,
-            version: "0.0.9".into(),
-            build_number: 9,
-            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
-            sha256: "ab".repeat(32),
-            dmg: "aterm-0.0.9.dmg".into(),
-            url: None,
-            zip: Some("aterm-0.0.9-mac.zip".into()),
-            zip_sha256: Some("cd".repeat(32)),
-            min_build: None,
-            machine_id: None,
-            roster_seq: None,
-            changelog: None,
-        };
-        let outcome = stage_from_zip(&s, &zip.0, &manifest, "");
-        assert!(
-            outcome.is_err(),
-            "a synthetic central directory has nothing ditto can unpack: {outcome:?}"
-        );
-        assert!(
-            !stale_extract.exists(),
-            "the zip lane reclaims its own leftover extract dir"
-        );
-        assert!(
-            !stale_mount.exists(),
-            "the DMG lane's leftover mountpoint must be reclaimed by the zip lane too"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
+#[path = "install_tests.rs"]
+mod tests;
 
 #[cfg(all(test, target_os = "macos"))]
-mod launchd_copy_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
-
-    /// HOW LONG A FIXTURE THAT MUST FINISH MAY TAKE (2026-09-27): a hang
-    /// detector, never a latency budget. The one-shot wrapper replay and the
-    /// completed and malformed copies below each end as soon as their fixture
-    /// does, so a passing test pays none of it; the 5 s these waits carried
-    /// went red when the merge contract ran the module beside other builds at
-    /// load 50-100 (the push-gate audit, 2026-09-24). A wedged fixture still
-    /// fails, after a minute. The deadline the module is ABOUT —
-    /// `launchd_submit_and_remove_share_the_real_callers_deadline` — keeps its
-    /// own seconds: there the clock is the property under test.
-    const FIXTURE_FINISHES: Duration = Duration::from_secs(60);
-
-    fn budget_model() -> aterm_spec::derive::Model {
-        aterm_spec::ty_model! {
-            LaunchdCopyDeadline {
-                const Buggy = 0;
-                var now = 0;
-                var deadline = 3;
-                var cleanup = 0;
-                action Tick when (now <= 3) { now = now + 1; }
-                action Cleanup when (cleanup == 0) {
-                    cleanup = 1;
-                    deadline = if Buggy == 1 { now + 4 } else { 4 };
-                }
-                invariant NoRenewedDeadline: deadline <= 4;
-            }
-        }
-    }
-
-    #[test]
-    fn launchd_copy_deadline_proves_and_catches_renewed_cleanup_budget() {
-        let model = budget_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, "launchd copy deadline");
-        let started = Instant::now();
-        let limit = Duration::from_secs(4);
-        let budget = LaunchdCopyBudget::new(started, limit);
-        for seconds in 0..=4 {
-            let now = started + Duration::from_secs(seconds);
-            for cleanup in [false, true] {
-                let mut state = model.init_state();
-                state.insert("now", i64::try_from(seconds).unwrap());
-                state.insert("cleanup", i64::from(cleanup));
-                let until = budget.deadline(cleanup);
-                state.insert(
-                    "deadline",
-                    i64::try_from(until.duration_since(started).as_secs()).unwrap(),
-                );
-                assert!(model.check_invariant("NoRenewedDeadline", &state));
-                assert!(
-                    until.saturating_duration_since(now)
-                        <= limit.saturating_sub(now.duration_since(started))
-                );
-                if cleanup && seconds > 0 {
-                    // Historical per-operation timeout: a fresh deadline after
-                    // submit has already consumed part of the caller's budget.
-                    state.insert(
-                        "deadline",
-                        i64::try_from((now + limit).duration_since(started).as_secs()).unwrap(),
-                    );
-                    assert!(!model.check_invariant("NoRenewedDeadline", &state));
-                }
-            }
-        }
-    }
-
-    fn publication_model() -> aterm_spec::derive::Model {
-        aterm_spec::ty_model! {
-            IsolatedCopyPublication {
-                const Buggy = 0;
-                var phase = 0;
-                var current_target = 1;
-                var old_target = 1;
-                var opened_target = 0;
-                var published_target = 0;
-                var corrupted = 0;
-                action Timeout when (phase == 0) { phase = 1; }
-                action Retry when (phase == 1) {
-                    phase = 2;
-                    current_target = if Buggy == 1 { old_target } else { 2 };
-                }
-                action OpenOld when (phase == 2) {
-                    phase = 3;
-                    opened_target = old_target;
-                }
-                action Publish when (phase == 3) {
-                    phase = 4;
-                    published_target = current_target;
-                }
-                action LateWrite when (phase == 4) {
-                    phase = 5;
-                    corrupted = if opened_target == published_target { 1 } else { 0 };
-                }
-                invariant NoLateMutation: corrupted == 0;
-            }
-        }
-    }
-
-    fn wrapper_model() -> aterm_spec::derive::Model {
-        aterm_spec::ty_model! {
-            LaunchdCopyOnce {
-                const Buggy = 0;
-                var claimed = 0;
-                var complete = 0;
-                var copies = 0;
-                var replayed = 0;
-                var removed = 0;
-                action Start when (claimed == 0 && removed == 0) {
-                    claimed = 1;
-                    copies = 1;
-                }
-                action Complete when (claimed == 1 && complete == 0) { complete = 1; }
-                action Replay when (complete == 1 && replayed == 0) {
-                    replayed = 1;
-                    copies = if Buggy == 1 { 2 } else { copies };
-                }
-                action Remove when (complete == 1 && removed == 0) { removed = 1; }
-                invariant OneCopy: copies <= 1;
-            }
-        }
-    }
-
-    fn copy_model_step(
-        model: &aterm_spec::derive::Model,
-        state: &mut aterm_spec::interp::State,
-        action: &str,
-    ) {
-        let next = model.successors(action, state);
-        assert_eq!(next.len(), 1, "{action}: {state:?}");
-        *state = next[0].clone();
-    }
-
-    #[test]
-    fn isolated_copy_and_one_shot_wrapper_prove_and_catch() {
-        for model in [publication_model(), wrapper_model()] {
-            aterm_spec::verify::prove_and_catch_scalar(&model, "isolated update copy");
-        }
-    }
-
-    // The negative control replays the old shipping policy: ditto receives the
-    // caller's reusable path directly, and returning success needs no promotion.
-    fn copy_with_policy(
-        isolated: bool,
-        args: &[std::ffi::OsString],
-        run: impl FnOnce(
-            &[std::ffi::OsString],
-            &Path,
-        )
-            -> Result<(std::process::ExitStatus, String), crate::verify::HelperFailure>,
-    ) -> Result<(std::process::ExitStatus, String), String> {
-        if isolated {
-            copy_into_isolated_destination(args, "copy fixture", run)
-        } else {
-            run(args, Path::new(args.last().unwrap()).parent().unwrap())
-                .map_err(|failure| failure.message)
-        }
-    }
-
-    #[test]
-    fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
-        use std::io::Write;
-        use std::os::unix::process::ExitStatusExt;
-        use std::sync::mpsc;
-        for shape in ["dmg", "zip", "cross-volume"] {
-            for isolated in [true, false] {
-                let staging = Staging::scratch(&format!("copy-late-{shape}-{isolated}"));
-                std::fs::create_dir_all(staging.staged_dir()).unwrap();
-                let installed = staging.root.join("aterm.app");
-                let destination = match shape {
-                    "dmg" => staging.staged_dir().join("aterm.app.incoming"),
-                    "zip" => staging.staged_dir().join("zx-fixture"),
-                    _ => rollback_path(&installed),
-                };
-                let bundle_in = |payload: &Path| {
-                    if shape == "zip" {
-                        payload.join("aterm.app")
-                    } else {
-                        payload.to_path_buf()
-                    }
-                };
-                let args = ["source".into(), destination.as_os_str().to_os_string()];
-                let (open_tx, open_rx) = mpsc::sync_channel(1);
-                let (opened_tx, opened_rx) = mpsc::sync_channel(1);
-                let (write_tx, write_rx) = mpsc::sync_channel(1);
-                let mut old_payload = None;
-                let mut writer = None;
-                let error = copy_with_policy(isolated, &args, |actual, _| {
-                    let payload = PathBuf::from(actual.last().unwrap());
-                    let bundle = bundle_in(&payload);
-                    std::fs::create_dir_all(&bundle).unwrap();
-                    std::fs::write(bundle.join("id"), "OLD-COPY").unwrap();
-                    old_payload = Some(payload);
-                    // Open the old job's absolute destination only AFTER the
-                    // retry has materialized, then keep that actual file open
-                    // across the retry's publication/atomic exchange.
-                    writer = Some(std::thread::spawn(move || {
-                        open_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-                        let mut file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(bundle.join("id"))
-                            .unwrap();
-                        opened_tx.send(()).unwrap();
-                        write_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-                        file.set_len(0).unwrap();
-                        file.write_all(b"LATE-WRITE").unwrap();
-                        file.sync_all().unwrap();
-                    }));
-                    Err(crate::verify::HelperFailure {
-                        message: "copy deadline elapsed; cleanup not confirmed".to_string(),
-                        writer_stopped: false,
-                    })
-                })
-                .unwrap_err();
-                assert!(error.contains("cleanup not confirmed"), "{error}");
-                let old_payload = old_payload.unwrap();
-                let mut model = publication_model();
-                model
-                    .consts
-                    .iter_mut()
-                    .find(|(name, _)| *name == "Buggy")
-                    .unwrap()
-                    .1 = i64::from(!isolated);
-                let mut state = model.init_state();
-                copy_model_step(&model, &mut state, "Timeout");
-                // The real callers reclaim their requested destination after
-                // failure. The isolated attempt must remain outside that cleanup.
-                remove_path_no_follow(&destination).unwrap();
-                if shape == "zip" {
-                    std::fs::create_dir(&destination).unwrap();
-                }
-                copy_with_policy(isolated, &args, |actual, _| {
-                    let payload = PathBuf::from(actual.last().unwrap());
-                    let bundle = bundle_in(&payload);
-                    std::fs::create_dir_all(&bundle).unwrap();
-                    std::fs::write(bundle.join("id"), "NEW").unwrap();
-                    copy_model_step(&model, &mut state, "Retry");
-                    assert_eq!(
-                        state["current_target"],
-                        if payload == old_payload { 1 } else { 2 },
-                        "the model must bind actual destination identity"
-                    );
-                    if isolated {
-                        assert_eq!(payload.parent().unwrap().parent(), destination.parent());
-                        assert!(
-                            old_payload.exists(),
-                            "caller cleanup cannot reclaim a live attempt"
-                        );
-                    }
-                    open_tx.send(()).unwrap();
-                    opened_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-                    copy_model_step(&model, &mut state, "OpenOld");
-                    Ok((std::process::ExitStatus::from_raw(0), String::new()))
-                })
-                .unwrap();
-
-                let published = if shape == "cross-volume" {
-                    std::fs::create_dir(&installed).unwrap();
-                    std::fs::write(installed.join("id"), "ROLLBACK").unwrap();
-                    checked_bundle_exchange(&destination, &installed, "copy fixture swap").unwrap();
-                    installed
-                } else {
-                    let ready = Ready {
-                        build_number: 42,
-                        version: "0.42.0".to_string(),
-                        commit: Some("ab".repeat(20)),
-                        dmg_sha256: "cd".repeat(32),
-                        team_id: String::new(),
-                        staged_at: String::new(),
-                        changelog: None,
-                        machine_id: None,
-                        roster_seq: None,
-                    };
-                    // The fixture models already-verified bytes; publication and
-                    // the apply lock below are the genuine shipping transaction.
-                    publish_verified_stage(&staging, &bundle_in(&destination), &ready).unwrap();
-                    staging.staged_app.clone()
-                };
-                copy_model_step(&model, &mut state, "Publish");
-                write_tx.send(()).unwrap();
-                writer.unwrap().join().unwrap();
-                copy_model_step(&model, &mut state, "LateWrite");
-                let actual = std::fs::read_to_string(published.join("id")).unwrap();
-                assert_eq!(state["corrupted"], i64::from(actual != "NEW"));
-                assert_eq!(model.check_invariant("NoLateMutation", &state), isolated);
-                assert_eq!(actual, if isolated { "NEW" } else { "LATE-WRITE" });
-                if shape == "cross-volume" {
-                    assert_eq!(
-                        std::fs::read_to_string(destination.join("id")).unwrap(),
-                        "ROLLBACK"
-                    );
-                }
-                let _ = std::fs::remove_dir_all(staging.root);
-            }
-        }
-    }
-
-    #[test]
-    fn the_real_launchd_wrapper_cannot_copy_again_after_publishing_status() {
-        use std::os::unix::process::ExitStatusExt;
-        for guarded in [true, false] {
-            let staging = Staging::scratch(&format!("copy-wrapper-replay-{guarded}"));
-            let cleanup = staging.root.join("cleanup-fixture");
-            std::fs::write(&cleanup, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&cleanup, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let destination = staging.root.join("result");
-            let calls = staging.root.join("copies");
-            let script = if guarded {
-                LAUNCHD_COPY_WRAPPER.to_string()
-            } else {
-                LAUNCHD_COPY_WRAPPER.replace("/bin/mkdir \"$st.once\" 2>/dev/null || exit 0; ", "")
-            };
-            assert_eq!(script == LAUNCHD_COPY_WRAPPER, guarded);
-            let run_wrapper = |root: &Path, payload: &Path| {
-                let (exit, stderr) = crate::verify::status_bounded_with_stderr(
-                    Command::new("/bin/sh")
-                        .arg("-c")
-                        .arg(&script)
-                        .arg("fixture-wrapper")
-                        .arg(root.join("status"))
-                        .arg("fixture-label")
-                        .arg(&cleanup)
-                        .arg("/bin/sh")
-                        .arg("-c")
-                        .arg(r#"/bin/mkdir -p "$1"; printf NEW > "$1/id"; printf 'copy\n' >> "$2""#)
-                        .arg("fixture-copy")
-                        .arg(payload)
-                        .arg(&calls),
-                    "one-shot wrapper fixture",
-                    FIXTURE_FINISHES,
-                )
-                .unwrap();
-                assert!(exit.success(), "{stderr}");
-            };
-            let mut model = wrapper_model();
-            model
-                .consts
-                .iter_mut()
-                .find(|(name, _)| *name == "Buggy")
-                .unwrap()
-                .1 = i64::from(!guarded);
-            let mut state = model.init_state();
-            let mut old_paths = None;
-            copy_into_isolated_destination(
-                &[destination.clone().into_os_string()],
-                "wrapper copy",
-                |args, root| {
-                    let payload = Path::new(args.last().unwrap());
-                    run_wrapper(root, payload);
-                    copy_model_step(&model, &mut state, "Start");
-                    assert_eq!(std::fs::read_to_string(root.join("status")).unwrap(), "0\n");
-                    copy_model_step(&model, &mut state, "Complete");
-                    // Replay the exact shipping shell after its terminal status is
-                    // visible, before the parent gets to rename the completed tree.
-                    run_wrapper(root, payload);
-                    copy_model_step(&model, &mut state, "Replay");
-                    assert_eq!(
-                        state["copies"],
-                        i64::try_from(std::fs::read_to_string(&calls).unwrap().lines().count())
-                            .unwrap()
-                    );
-                    assert_eq!(model.check_invariant("OneCopy", &state), guarded);
-                    old_paths = Some((root.to_path_buf(), payload.to_path_buf()));
-                    Ok((std::process::ExitStatus::from_raw(0), String::new()))
-                },
-            )
-            .unwrap();
-            copy_model_step(&model, &mut state, "Remove");
-            if guarded {
-                let (root, payload) = old_paths.unwrap();
-                assert!(!root.exists());
-                run_wrapper(&root, &payload);
-                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "copy\n");
-                assert!(!root.exists(), "a replay cannot recreate a retired attempt");
-            }
-            assert_eq!(
-                std::fs::read_to_string(destination.join("id")).unwrap(),
-                "NEW"
-            );
-            let _ = std::fs::remove_dir_all(staging.root);
-        }
-    }
-
-    /// The reaper's contract. SETTLED reclaims an attempt its caller abandoned once
-    /// the fenced writer published a terminal status; LAPSED (round six, finding 50)
-    /// reclaims one past every writer's ceiling whose caller gave it up or is gone.
-    /// Neither ever takes a live caller's attempt it has not given up, and neither
-    /// takes one a writer could still be filling.
-    fn reaper_model() -> aterm_spec::derive::Model {
-        aterm_spec::ty_model! {
-            AbandonedCopyReclamation {
-                const Buggy = 0;
-                var abandoned = 0;
-                var complete = 0;
-                var fenced = 1;
-                var owner_gone = 0;
-                var lapsed = 0;
-                var reaped = 0;
-                action Abandon when (abandoned == 0 && owner_gone == 0 && reaped == 0) { abandoned = 1; }
-                action Complete when (complete == 0 && reaped == 0) { complete = 1; }
-                action LoseFence when (fenced == 1 && reaped == 0) { fenced = 0; }
-                action OwnerDies when (owner_gone == 0 && reaped == 0) { owner_gone = 1; }
-                action Lapse when (lapsed == 0 && reaped == 0) { lapsed = 1; }
-                action Reap when (reaped == 0 && ((abandoned == 1 && complete == 1 && fenced == 1) || (lapsed == 1 && (abandoned == 1 || owner_gone == 1)) || Buggy == 1)) {
-                    reaped = 1;
-                }
-                invariant ReclaimOnlyDisowned: reaped == 0 || abandoned == 1 || owner_gone == 1;
-                invariant ReclaimOnlySettledOrLapsed: reaped == 0 || (complete == 1 && fenced == 1) || lapsed == 1;
-            }
-        }
-    }
-
-    #[test]
-    fn abandoned_copy_reaping_requires_terminal_status_and_the_one_shot_fence() {
-        let model = reaper_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, "abandoned copy reclamation");
-        let dead = {
-            let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-            let pid = child.id();
-            child.wait().unwrap();
-            pid
-        };
-        let old = std::time::SystemTime::now()
-            - STALE_COPY_ATTEMPT_AFTER
-            - std::time::Duration::from_secs(60);
-        for abandoned in [false, true] {
-            for completed in ["absent", "malformed", "complete"] {
-                for fenced in [false, true] {
-                    for owner_gone in [false, true] {
-                        for lapsed in [false, true] {
-                            reaper_case(
-                                &model, dead, old, abandoned, completed, fenced, owner_gone, lapsed,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn reaper_case(
-        model: &aterm_spec::derive::Model,
-        dead: u32,
-        old: std::time::SystemTime,
-        abandoned: bool,
-        completed: &str,
-        fenced: bool,
-        owner_gone: bool,
-        lapsed: bool,
-    ) {
-        let staging = Staging::scratch("copy-reaper");
-        let attempt = IsolatedCopy::create(&staging.root.join("destination")).unwrap();
-        let label = format!("systems.alab.aterm-update.unpack-{}", "ab".repeat(16));
-        std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
-        if abandoned {
-            std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
-        }
-        if fenced {
-            std::fs::create_dir(attempt.root.join(format!(".{label}.status.once"))).unwrap();
-        }
-        match completed {
-            "complete" => {
-                std::fs::write(attempt.root.join(format!(".{label}.status")), "0\n").unwrap()
-            }
-            "malformed" => {
-                std::fs::write(attempt.root.join(format!(".{label}.status")), "unfinished").unwrap()
-            }
-            _ => {}
-        }
-        if owner_gone {
-            std::fs::write(attempt.root.join(COPY_OWNER), format!("{dead}\n")).unwrap();
-        }
-        if lapsed {
-            std::fs::File::options()
-                .write(true)
-                .open(attempt.root.join("copy-layout"))
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
-        let mut state = model.init_state();
-        state.insert("abandoned", i64::from(abandoned));
-        state.insert("complete", i64::from(completed == "complete"));
-        state.insert("fenced", i64::from(fenced));
-        state.insert("owner_gone", i64::from(owner_gone));
-        state.insert("lapsed", i64::from(lapsed));
-        let admitted = model.action_enabled("Reap", &state);
-        // Creating an apply/copy attempt must not recursively sweep
-        // predecessors, even when their cleanup is already authorized.
-        // The historical allocation-time sweep fails this assertion.
-        let next = IsolatedCopy::create(&staging.root.join("next-destination")).unwrap();
-        assert!(
-            attempt.root.exists(),
-            "allocation must leave bulk cleanup to the checker"
-        );
-        reap_abandoned_copy_attempts(&staging.root);
-        assert!(
-            next.root.exists(),
-            "maintenance cannot reclaim the live new attempt"
-        );
-        let case = format!(
-            "abandoned={abandoned} completed={completed} fenced={fenced} \
-             owner_gone={owner_gone} lapsed={lapsed}"
-        );
-        assert_eq!(!attempt.root.exists(), admitted, "{case}");
-        if admitted {
-            copy_model_step(model, &mut state, "Reap");
-            assert!(
-                model.check_invariant("ReclaimOnlyDisowned", &state),
-                "{case}"
-            );
-            assert!(
-                model.check_invariant("ReclaimOnlySettledOrLapsed", &state),
-                "{case}"
-            );
-            assert!(
-                !staging.root.join("destination").exists(),
-                "late completion cannot promote abandoned bytes"
-            );
-        }
-        if !abandoned && !owner_gone && completed == "complete" && fenced {
-            // Negative control: completion alone — however old — is not authority
-            // to delete the live caller's not-yet-promoted output.
-            std::fs::remove_dir_all(&attempt.root).unwrap();
-            state.insert("reaped", 1);
-            assert!(
-                !model.check_invariant("ReclaimOnlyDisowned", &state),
-                "{case}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(staging.root);
-    }
-
-    /// A COPY ATTEMPT NOBODY CAN FINISH IS RECLAIMED IN THE END (round six, finding
-    /// 50). The reaper admitted only an attempt its caller had marked abandoned AND
-    /// whose fenced writer had published a status. Two ordinary cuts satisfy neither
-    /// and leaked an app-sized hidden directory each, for good: a caller killed
-    /// mid-copy (a force-quit launch, a reboot) never marks its attempt, and a
-    /// launchd copy stopped by the timeout's `launchctl remove` never writes its
-    /// status. An attempt whose caller is gone or gave it up, and that has outlived
-    /// every copy's ceiling by a wide margin, has no writer left to protect.
-    #[test]
-    fn an_attempt_whose_caller_or_writer_died_is_eventually_reclaimed() {
-        let staging = Staging::scratch("copy-lapsed");
-        let dead = {
-            let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-            let pid = child.id();
-            child.wait().unwrap();
-            pid
-        };
-        let old = std::time::SystemTime::now()
-            - STALE_COPY_ATTEMPT_AFTER
-            - std::time::Duration::from_secs(60);
-        let label = format!("systems.alab.aterm-update.unpack-{}", "cd".repeat(16));
-        let attempt = |name: &str, owner: u32, aged: bool, launchd_cut: bool| {
-            let attempt = IsolatedCopy::create(&staging.root.join(name)).unwrap();
-            std::fs::create_dir_all(&attempt.payload).unwrap();
-            std::fs::write(attempt.payload.join("partial"), "bytes").unwrap();
-            std::fs::write(attempt.root.join(COPY_OWNER), format!("{owner}\n")).unwrap();
-            if launchd_cut {
-                std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
-                std::fs::create_dir(attempt.root.join(format!(".{label}.status.once"))).unwrap();
-                std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
-            }
-            if aged {
-                std::fs::File::options()
-                    .write(true)
-                    .open(attempt.root.join("copy-layout"))
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
-            }
-            attempt.root
-        };
-        let live = std::process::id();
-        let caller_killed = attempt("killed", dead, true, false);
-        let launchd_cut = attempt("launchd-cut", live, true, true);
-        // NEGATIVE CONTROLS: a live caller that has not given its attempt up (it
-        // may be stopped, and will still promote it), and either cut while it is
-        // young enough that a writer could still be finishing.
-        let live_caller = attempt("live-caller", live, true, false);
-        let young_killed = attempt("young-killed", dead, false, false);
-        let young_cut = attempt("young-cut", live, false, true);
-
-        reap_abandoned_copy_attempts(&staging.root);
-        assert!(
-            !caller_killed.exists(),
-            "a dead caller's attempt is reclaimed"
-        );
-        assert!(!launchd_cut.exists(), "a cut launchd copy is reclaimed");
-        assert!(
-            live_caller.exists(),
-            "a live caller's attempt is never reclaimed"
-        );
-        assert!(
-            young_killed.exists(),
-            "a young attempt may still have a writer"
-        );
-        assert!(
-            young_cut.exists(),
-            "a young attempt may still have a writer"
-        );
-        let _ = std::fs::remove_dir_all(staging.root);
-    }
-
-    #[test]
-    fn an_observed_stopped_writer_reclaims_its_failed_attempt_immediately() {
-        let staging = Staging::scratch("copy-confirmed-failure");
-        let destination = staging.root.join("destination");
-        let mut root = None;
-        let error = copy_into_isolated_destination(
-            &[destination.clone().into_os_string()],
-            "failed copy",
-            |_, attempt| {
-                root = Some(attempt.to_path_buf());
-                Err(crate::verify::HelperFailure {
-                    message: "the owned child was reaped".to_string(),
-                    writer_stopped: true,
-                })
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error, "the owned child was reaped");
-        assert!(!root.unwrap().exists());
-        assert!(!destination.exists());
-        let _ = std::fs::remove_dir_all(staging.root);
-    }
-
-    fn fake_launchctl(staging: &Staging, mode: &str) -> std::path::PathBuf {
-        let script = staging.root.join("launchctl-fixture");
-        // No launchd mutation and no inherited background child: a hung helper
-        // replaces itself with sleep, so the real bounded runner can kill/reap it.
-        std::fs::write(
-            &script,
-            r##"#!/bin/sh
-dir="${0%/*}"
-printf '%s\n' "$1" >> "$dir/calls"
-IFS= read -r mode < "$dir/mode"
-if [ "$1" = remove ]; then
-    if [ "$mode" = remove-hangs ] || [ "$mode" = both-hang ]; then exec /bin/sleep 30; fi
-    exit 0
-fi
-if [ "$mode" = submit-hangs ] || [ "$mode" = both-hang ]; then exec /bin/sleep 30; fi
-# submit -l LABEL -e STDERR -- /bin/sh -c WRAPPER argv0 STATUS LABEL launchctl ditto ...
-shift 3
-err="$2"
-shift 3
-st="$5"
-case "$mode" in
-    complete)
-        /usr/bin/head -c 65536 /dev/zero > "$err"
-        printf '\ncopy failed: fixture disk full\n' >> "$err"
-        printf '1\n' > "$st"
-        ;;
-    malformed) printf 'not-an-exit-status\n' > "$st" ;;
-esac
-exit 0
-"##,
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // THE FIRST EXEC IS NOT THE ONE UNDER TEST (2026-09-25). This provenance-
-        // tracked process just wrote the script, so its first exec waits on
-        // syspolicyd's assessment (bc2918c70: 0.4 s idle, ~13 s with the assessor
-        // busy, past 60 s under heavy load, at 0% CPU) and a later exec costs
-        // nothing. Unassessed, that wait landed on the bounded `submit` — 1.25 s at
-        // a 2 s limit — and killed it before its receipt line. So the fixture is run
-        // once here, as a non-hanging `remove` that no bound measures, and its
-        // receipt is cleared: the calls a test reads are the runner's alone.
-        std::fs::write(staging.root.join("mode"), "assess").unwrap();
-        let assessed = std::process::Command::new(&script)
-            .arg("remove")
-            .stdin(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(
-            assessed.success(),
-            "the fixture's unbounded first exec: {assessed}"
-        );
-        std::fs::remove_file(staging.root.join("calls")).unwrap();
-        std::fs::write(staging.root.join("mode"), mode).unwrap();
-        script
-    }
-
-    /// THE CALLER'S BUDGET IS THE PROPERTY; THE FIXTURE'S START IS NOT (2026-09-25).
-    /// The fixture arrives already assessed (see `fake_launchctl`), so what is
-    /// left is plain CPU starvation of a spawn. At a 2 s limit in `remove-hangs`,
-    /// `remove` gets what is left after the work deadline — ~0.5 s, of which its own
-    /// kill reserve leaves ~375 ms from BEFORE its spawn to the fixture's first line
-    /// (~0.56 s after a timed-out submit) — and a thread woken late from the poll
-    /// loop spends part of that before the spawn. A call the runner demonstrably
-    /// made and ended at its budget ("… did not finish", "deadline exhausted") whose
-    /// fixture never wrote its receipt line is a starved spawn, not a finding: that
-    /// attempt is repeated at twice the budget. The runner's deadline is itself a
-    /// wall clock and the property under test, so no fixture event can gate it; the
-    /// missing receipt is the evidence. A runner that never makes the call names
-    /// none of that and fails at once, and the last attempt's assertions stand
-    /// whatever it says.
-    #[test]
-    fn launchd_submit_and_remove_share_the_real_callers_deadline() {
-        for mode in ["submit-hangs", "remove-hangs", "both-hang"] {
-            let mut limit = Duration::from_secs(2);
-            loop {
-                let staging = Staging::scratch(&format!("launchd-bound-{mode}"));
-                let launchctl = fake_launchctl(&staging, mode);
-                let started = Instant::now();
-                let error = ditto_via_launchd_using(
-                    &[],
-                    "fixture unpack",
-                    limit,
-                    &staging.root,
-                    &launchctl,
-                )
-                .unwrap_err();
-                let elapsed = started.elapsed();
-                let calls = std::fs::read_to_string(staging.root.join("calls")).unwrap_or_default();
-                let _ = std::fs::remove_dir_all(&staging.root);
-                let starved = ["submit", "remove"].iter().any(|op| {
-                    let call = format!("launchctl {op} for fixture unpack");
-                    !calls.lines().any(|line| line == *op)
-                        && (error.contains(&format!("{call} did not finish"))
-                            || error.contains(&format!("{call}: unpack deadline exhausted")))
-                });
-                if starved && limit < Duration::from_secs(8) {
-                    limit *= 2;
-                    continue;
-                }
-                // The fake helper's 30 s hang exceeds every budget here by far.
-                assert!(
-                    elapsed < limit + Duration::from_secs(3),
-                    "{mode} bypassed the {limit:?} deadline ({elapsed:?}): {error}"
-                );
-                assert!(error.contains("did not finish"), "{mode}: {error}");
-                assert_eq!(
-                    calls, "submit\nremove\n",
-                    "{mode}: the helper's receipt; runner: {error}"
-                );
-                if mode != "submit-hangs" {
-                    assert!(
-                        error.contains("cleanup not confirmed"),
-                        "a timed-out removal must be explicit: {error}"
-                    );
-                }
-                break;
-            }
-        }
-    }
-
-    #[test]
-    fn launchd_completion_keeps_only_the_error_tail_and_rejects_malformed_status() {
-        let staging = Staging::scratch("launchd-result-tail");
-        let launchctl = fake_launchctl(&staging, "complete");
-        let (status, stderr) = ditto_via_launchd_using(
-            &[],
-            "fixture unpack",
-            FIXTURE_FINISHES,
-            &staging.root,
-            &launchctl,
-        )
-        .unwrap();
-        assert!(!status.success());
-        assert!(stderr.len() <= 512);
-        assert_eq!(
-            crate::verify::last_stderr_line(&stderr),
-            Some("copy failed: fixture disk full")
-        );
-        assert!(std::fs::read_dir(&staging.root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".systems.alab.")
-        }));
-        std::fs::write(staging.root.join("mode"), "malformed").unwrap();
-        let error = ditto_via_launchd_using(
-            &[],
-            "fixture unpack",
-            FIXTURE_FINISHES,
-            &staging.root,
-            &launchctl,
-        )
-        .unwrap_err();
-        assert!(error.contains("malformed exit status"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(staging.root.join("calls")).unwrap(),
-            "submit\nsubmit\nremove\n"
-        );
-        let _ = std::fs::remove_dir_all(staging.root);
-    }
-}
+#[path = "install_launchd_copy_tests.rs"]
+mod launchd_copy_tests;

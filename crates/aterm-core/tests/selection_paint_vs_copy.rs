@@ -5,7 +5,7 @@
 //!
 //! A double-width glyph (CJK, emoji, a ZWJ sequence) owns a lead cell and a
 //! blank continuation cell, and the two ends of a selection are independent
-//! half-cell anchors, so a drag can stop INSIDE one. The renderer decides per
+//! half-cell anchors, so a drag can stop inside one. The renderer decides per
 //! cell (`RenderInput::selection_contains_cell` -> `TextSelection::contains_cell`)
 //! and the clipboard decides per column range (`Terminal::selection_to_string`).
 //! Two authorities over one boundary is how the highlight comes to cover half a
@@ -13,7 +13,7 @@
 //! not-what-you-see-is-what-you-get. [`glyph_cell_span`] is the one rule both
 //! consult, and these tests are what holds them to it.
 //!
-//! These tests reconstruct the painted run through the renderer's OWN frame and
+//! These tests reconstruct the painted run through the renderer's own frame and
 //! predicate and compare it to the copy, so the two cannot drift apart without
 //! one of them failing here.
 //!
@@ -22,7 +22,7 @@
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
-/// The columns the RENDERER would fill on `row`, read through the exact input
+/// The columns the renderer would fill on `row`, read through the exact input
 /// and predicate it paints with: a real frame's per-cell `wide` bit fed to
 /// `selection_contains_cell`, the one seam both the CPU and GPU backends use.
 fn painted_cols(term: &mut Terminal, rows: usize, cols: usize, row: usize) -> Vec<usize> {
@@ -31,7 +31,7 @@ fn painted_cols(term: &mut Terminal, rows: usize, cols: usize, row: usize) -> Ve
     (0..cols)
         .filter(|&c| {
             // Exactly the renderer's spelling of the two width bits: a cell is a
-            // wide LEAD when the cell after it is a continuation.
+            // wide lead when the cell after it is a continuation.
             let is_wide_lead = row_cells.get(c + 1).is_some_and(|n| n.wide);
             let is_continuation = row_cells.get(c).is_some_and(|n| n.wide);
             frame.selection_contains_cell(row, c, is_wide_lead, is_continuation)
@@ -42,7 +42,7 @@ fn painted_cols(term: &mut Terminal, rows: usize, cols: usize, row: usize) -> Ve
 /// The text under the painted run on `row` — each highlighted cell's grapheme,
 /// in reading order, trailing blanks trimmed the way the copy trims them.
 ///
-/// `display_cell_grapheme` because `row` is a DISPLAY row, like the frame's:
+/// `display_cell_grapheme` because `row` is a display row, like the frame's:
 /// identical to the live read while unscrolled, and the only correct one once a
 /// selection edge sits on a history line.
 fn painted_text(term: &mut Terminal, rows: usize, cols: usize, row: usize) -> String {
@@ -113,7 +113,7 @@ fn a_selection_starting_on_a_wide_glyphs_right_half_copies_what_it_paints() {
     }
     assert_paint_and_copy_agree(&mut term, 3, 20, 0, "start on a wide continuation");
     // Which way they agree is itself the contract: the glyph the edge landed
-    // inside joins the SELECTION whole, rather than being dropped from the copy.
+    // inside joins the selection whole, rather than being dropped from the copy.
     assert_eq!(term.selection_to_string().as_deref(), Some("漢字C"));
     assert_eq!(painted_cols(&mut term, 3, 20, 0), vec![2, 3, 4, 5, 6]);
 }
@@ -135,7 +135,7 @@ fn a_selection_ending_on_a_wide_glyphs_left_half_copies_what_it_paints() {
 
 #[test]
 fn a_drag_that_halts_between_the_halves_of_a_glyph_agrees_on_both_sides() {
-    // The two half-cell anchors that land BETWEEN 漢's cells: an end on the left
+    // The two half-cell anchors that land between 漢's cells: an end on the left
     // side of the continuation, and a start on the right side of the lead. Both
     // are what a real pointer produces when it stops over the glyph's middle.
     let mut term = cjk_row();
@@ -176,7 +176,7 @@ fn a_backwards_drag_over_a_wide_glyph_agrees_exactly_as_a_forwards_one_does() {
         sel.complete_selection();
     }
     assert_paint_and_copy_agree(&mut term, 3, 20, 0, "backwards ending at a wide lead");
-    // The same span the forward drag produced: anchor ORDER is normalized away
+    // The same span the forward drag produced: anchor order is normalized away
     // before the edges widen, so the direction of the pointer never shows up in
     // either answer.
     assert_eq!(term.selection_to_string().as_deref(), Some("AB漢"));
@@ -185,7 +185,7 @@ fn a_backwards_drag_over_a_wide_glyph_agrees_exactly_as_a_forwards_one_does() {
 
 #[test]
 fn a_zwj_emoji_is_selected_whole_from_either_of_its_halves() {
-    // A ZWJ sequence is ONE cluster two cells wide, so it splits exactly the way
+    // A ZWJ sequence is one cluster two cells wide, so it splits exactly the way
     // a CJK ideograph does — and, unlike a CJK char, it is many code points, so
     // half a highlight over it could never be described by half its text.
     let mut term = Terminal::new(3, 20);
@@ -212,10 +212,10 @@ fn a_zwj_emoji_is_selected_whole_from_either_of_its_halves() {
 
 #[test]
 fn a_combining_cluster_occupies_one_cell_and_no_edge_can_divide_it() {
-    // The width-1 control: an NFD accent is several code points in ONE cell, so
+    // The width-1 control: an NFD accent is several code points in one cell, so
     // there is no boundary inside it for an anchor to land on. Pinned alongside
     // the wide cases so the snapping rule is not mistaken for a cluster rule —
-    // it is a CELL-PAIR rule, and this row must be unaffected by it.
+    // it is a CELL-pair rule, and this row must be unaffected by it.
     let mut term = Terminal::new(3, 20);
     term.process("Ae\u{301}Z".as_bytes()); // A=0, e+U+0301=1, Z=2
 

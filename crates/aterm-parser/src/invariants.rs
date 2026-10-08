@@ -211,6 +211,19 @@ impl Parser {
                 self.state
             );
 
+            // A string payload's UTF-8 head is held only in the three strings
+            // whose 8-bit ST it decides (dispatch.rs drops it as one ends).
+            assert!(
+                self.string_utf8 == crate::utf8::Utf8Prefix::NONE
+                    || matches!(
+                        self.state,
+                        State::DcsPassthrough | State::DcsIgnore | State::SosPmApcString
+                    ),
+                "StringUtf8StateConsistent violated: {:?} held in state={:?}",
+                self.string_utf8,
+                self.state
+            );
+
             // NOTE: the param-parsing fields (`param_started`, `last_was_colon`,
             // `subparam_mask`) do NOT admit a clean state coupling — `clear()`
             // resets them on sequence START but `push_current_param` does not

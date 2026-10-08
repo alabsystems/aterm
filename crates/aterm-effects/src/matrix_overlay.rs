@@ -773,6 +773,7 @@ fn to_render_cell(cell: ExternalRainCell, default_bg: [u8; 3]) -> RenderCell {
         overline: cell.flags & EXTERNAL_CELL_OVERLINE != 0,
         underline_color: None,
         overline_color: None,
+        script: aterm_core::terminal::Script::Normal,
     }
 }
 
@@ -790,10 +791,9 @@ fn valid_cursor(cursor: Option<(u16, u16)>, rows: u16, cols: u16) -> Option<(u16
 
 fn sampling_key(live: ExternalRainLiveState<'_>, rows: u16, cols: u16) -> SamplingKey {
     // Stable FNV-1a over a tiny (normally <=5 row) host slice; no allocation.
-    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    let mut hash = aterm_hash::FNV64_OFFSET;
     for &row in live.hidden_cursor_rows {
-        hash ^= u64::from(row);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        hash = aterm_hash::fnv_mix_u64(hash, u64::from(row));
     }
     SamplingKey {
         cursor_row: valid_cursor(live.cursor, rows, cols).map(|(row, _)| row),

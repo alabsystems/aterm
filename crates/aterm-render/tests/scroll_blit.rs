@@ -17,18 +17,20 @@
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu};
 
-fn renderer() -> Option<Renderer> {
+fn renderer() -> Renderer {
     renderer_px(16.0)
 }
 
 /// A warm/fresh renderer at an EXPLICIT font px — the E7 overshoot bugs only
 /// manifest at specific cell_h/baseline geometries (the seam byte-diverges at
 /// px 13/14 but not at 16), so the differential gate MUST sweep px, not pin one.
-fn renderer_px(px: f32) -> Option<Renderer> {
-    Renderer::from_system(px, Theme::default()).map(|mut r| {
-        r.debug_block_on_lazy_fallbacks();
-        r
-    })
+fn renderer_px(px: f32) -> Renderer {
+    Renderer::from_system(px, Theme::default())
+        .map(|mut r| {
+            r.debug_block_on_lazy_fallbacks();
+            r
+        })
+        .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
 /// Render through the warm damage cache and assert byte-identity against a fresh
@@ -48,7 +50,7 @@ fn render_both(
         (view.pixels().to_vec(), view.width(), view.height())
     };
     let outcome = wc.last_damage();
-    let mut fresh = renderer().expect("font (checked by caller)");
+    let mut fresh = renderer();
     let full = fresh.render_input(&input);
     assert_eq!((w, h), (full.width, full.height), "dims @ {label}");
     assert_eq!(pixels, full.pixels, "scroll-blit != full repaint @ {label}");
@@ -61,10 +63,7 @@ fn render_both(
 /// cursor is live-visible on the bottom row throughout.
 #[test]
 fn deep_history_scroll_blits_and_matches_full_repaint() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -101,10 +100,7 @@ fn deep_history_scroll_blits_and_matches_full_repaint() {
 /// delta and exposes the BOTTOM strip; still byte-identical to a full repaint.
 #[test]
 fn scroll_toward_bottom_blits_the_other_direction() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -142,10 +138,7 @@ fn scroll_toward_bottom_blits_the_other_direction() {
 /// in full rather than shifting stale cursor pixels into/out of the viewport.
 #[test]
 fn single_row_scroll_is_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (5usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -233,10 +226,7 @@ fn single_row_scroll_is_byte_exact() {
 /// BOTH the shade-phase seam and the overshoot apron) — every frame byte-exact.
 #[test]
 fn shade_and_overshoot_single_notch_is_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (8usize, 28usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -277,10 +267,7 @@ fn shade_and_overshoot_single_notch_is_byte_exact() {
 /// byte-identical to a full repaint.
 #[test]
 fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (10usize, 30usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -324,10 +311,7 @@ fn shade_and_overshoot_multi_row_both_directions_byte_exact() {
 /// composed frame must still equal a full repaint every notch.
 #[test]
 fn shade_scroll_with_live_cursor_is_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (7usize, 26usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -357,10 +341,7 @@ fn shade_scroll_with_live_cursor_is_byte_exact() {
 /// row above). Byte-exact confirms the upper+lower apron pair.
 #[test]
 fn shade_row_over_tall_glyph_row_is_byte_exact() {
-    let Some(mut warm) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
+    let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (8usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -497,11 +478,8 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
     let mut blits = 0usize; // notches that took the blit fast path
 
     for &px in &px_sweep {
-        let Some(mut warm) = renderer_px(px) else {
-            eprintln!("SKIP px={px}: no system monospace font");
-            continue;
-        };
-        let mut fresh = renderer_px(px).expect("font (warm built at same px)");
+        let mut warm = renderer_px(px);
+        let mut fresh = renderer_px(px);
 
         for class in classes {
             for &delta in &deltas {
@@ -580,10 +558,6 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
         }
     }
 
-    if combos == 0 {
-        eprintln!("SKIP: no system monospace font at any swept px");
-        return;
-    }
     // Non-hollow: the blit fast path must carry the clear majority of notches —
     // a silent fall-through to full repaint would satisfy byte-identity vacuously
     // and forfeit the entire E7 win.

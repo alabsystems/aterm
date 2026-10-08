@@ -1,42 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A report's rows as Claude Code draws them: BLOCKS, each opened by a head
+//! A report's rows as Claude Code draws them: blocks, each opened by a head
 //! row, so `report --final` and `report --messages` can print what the worker
-//! SAID without what its tools did.
-//!
-//! Measured on 2026-09-14: a manager read whole `report` outputs of 689 and
-//! 249 rows to find a final message of about 70, grepping for the last `⏺`
-//! block by hand. The rows are the same; this only says which of them are the
-//! worker's words.
+//! said without what its tools did.
 //!
 //! A head row, found by what it starts with:
-//! * `❯` in column 0, then whitespace — the user's turn ([`BlockKind::User`]);
-//! * `⏺` (or `●`, where the platform draws that; never the session survey) in
-//!   column 0 — the worker's message ([`BlockKind::Message`]) or a TOOL row
-//!   ([`BlockKind::Tool`]): a call (`⏺ Bash(…`, `⏺ Workflow(…` — one to three
-//!   capitalised words run straight into `(`, or an `(MCP)` tool), one of
-//!   Claude Code's notices (`NOTICE_HEADS`: `⏺ Background command "…"
-//!   completed`, `⏺ Dynamic workflow "…"`, `⏺ Task Output …`, `⏺ Stop Task`,
-//!   `⏺ Update Todos`, `⏺ Agent "…"`, `⏺ Shell "…"`, `⏺ Monitor "…"`), or a
-//!   head with its `⎿` output on the very next row that does not end like a
-//!   sentence (a tool shown by its description, `⏺ Running 3 shell commands ·
-//!   2m 14s…`);
-//! * a spinner glyph in column 0 — the done row that ends a turn (`✻ Cooked
-//!   for 4s · done 2:41 PM`, [`BlockKind::Done`]) or a status row still in
-//!   flight (`✻ Waiting for 1 dynamic workflow to finish`, `· Hullaballooing…`,
-//!   [`BlockKind::Status`]);
-//! * two spaces, then only the collapsed tool groups Claude Code prints, whose
-//!   FIRST clause is capitalised — `Ran 3 shell commands`, `Read 1 file, ran 2
-//!   shell commands`, `Searched for 1 pattern`, `Searched memories`
-//!   ([`BlockKind::Summary`]).
+//! * `❯` in column 0, then whitespace: the user's turn ([`BlockKind::User`]);
+//! * `⏺` (or `●`; never the session survey) in column 0: the worker's message
+//!   ([`BlockKind::Message`]) or a tool row ([`BlockKind::Tool`]): a call
+//!   (`⏺ Bash(…`, one to three capitalised words run into `(`, or an `(MCP)`
+//!   tool), one of Claude Code's notices (`NOTICE_HEADS`), or a head whose
+//!   `⎿` output is on the next row and which does not end like a sentence;
+//! * a spinner glyph in column 0: a done row ending a turn
+//!   ([`BlockKind::Done`]) or a status row still in flight
+//!   ([`BlockKind::Status`]);
+//! * two spaces, then a collapsed tool group (`Ran 3 shell commands`, `Read 1
+//!   file, ran 2 shell commands`; [`BlockKind::Summary`]).
 //!
-//! Every other row belongs to the block above it — a message's wrapped rows,
-//! its blank rows between paragraphs, its tables, bullets and code; a tool's
-//! `⎿` output and the rows under it. Rows above the first head (a message
-//! whose head scrolled off before the read, `--since`) are a block of their
-//! own: the worker's words when they open indented two columns like a
-//! message's, a tool's output otherwise.
+//! Every other row belongs to the block above it. Rows above the first head
+//! are a block of their own: the worker's words when indented two columns
+//! like a message's, a tool's output otherwise.
 
 use super::phase::{is_done_row, is_glyph_row, is_survey};
 
@@ -389,9 +373,9 @@ mod tests {
         blocks(&r).iter().map(|b| (b.kind, b.start)).collect()
     }
 
-    /// The heads, as the live worker's archive draws them (2026-09-14): a
-    /// message, a call, a notice, a tool shown by its description, a
-    /// collapsed group right under a message row, a done row and a status row.
+    /// The heads as a live worker's archive draws them: a message, a call, a
+    /// notice, a tool shown by its description, a collapsed group right under
+    /// a message row, a done row and a status row.
     #[test]
     fn each_head_opens_its_kind_of_block() {
         use BlockKind::*;

@@ -34,15 +34,18 @@
 //! push per burst (`crate::app_input::note_person`), so a person at work is
 //! one row however long they stay. A controller's input
 //! ([`crate::input::Source::Controller`] — every control verb, the session
-//! owner's included, and the keys the Claude Code lights send on their own
-//! after a person's click) is never stamped: that is the whole point.
+//! owner's included, and the shift+tabs the Claude Code lights press on their
+//! own after a person's click) is never stamped: that is the whole point.
 //!
-//! **What it never does**: gate a byte. The seam records `src` for audit and
-//! never branches its egress on it (`bytes_human_eq_controller`); this stamp
-//! is such a record, read by the `status` and `text --json` verbs — and by
-//! the Claude Code lights (`crate::claude_lights`), which type nothing more
-//! into a composer a person has touched since aterm's own last write
-//! ([`HumanInputStamp::last`]).
+//! **What it never does**: gate a PERSON's byte. The seam records `src` for
+//! audit and never branches its egress on it (`bytes_human_eq_controller`);
+//! this stamp is such a record, read by the `status` and `text --json` verbs
+//! and by a CONTROLLER's own fence: `key|send
+//! if-human=<n>` (`crate::control_input::InputFence`) asks, under the terminal
+//! lock its write is made under, that ITS OWN write be refused (`OK skipped
+//! reason=person`) when the count moved since the read that returned `n`
+//! ([`HumanInputStamp::seq`]). The only byte the stamp ever holds back is the
+//! controller's that asked for it.
 //!
 //! **The count** ([`HumanInputStamp::seq`], `status human_seq=`, `text
 //! --json`'s `"human_seq"`): how many person gestures have reached the
@@ -53,8 +56,20 @@
 //! its key that the age alone cannot close (R3b of the question answer's
 //! critique, 2026-09-25; built 2026-09-27).
 //!
+//! **What that fence is not** (the residual, said plainly): atomic with the
+//! person's own write. A person's gesture is counted here, on the main thread,
+//! BEFORE its bytes are written, but that write does not take the terminal
+//! lock (the key encoder reads the lock-free `ModeMirror`; a paste or an
+//! ordered write goes through the FIFO writer). So a person's gesture counted
+//! after the fence's check and written before the controller's write — inside
+//! that one lock hold, microseconds wide — still lands ahead of it. What the
+//! fence does close is the round trip it replaces: a controller that read the
+//! count on one request and wrote on the next.
+//!
 //! Lock-free: one monotonic clock read ([`crate::metrics::now_us`]), one
-//! relaxed atomic store and one relaxed add per person gesture, one load per
+//! relaxed atomic store and one release add per person gesture — the stamp
+//! before the count, so a read of the count (an acquire) and then the age
+//! never pairs a counted gesture with an age from before it — one load per
 //! read. The stamp lives in this process: a session adopted across a
 //! seamless update reads "never" until a person keys it again.
 
@@ -77,24 +92,36 @@ impl HumanInputStamp {
     /// opens a burst: the first ever, or the first after
     /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one.
     pub(crate) fn note(&self, now_us: u64) -> bool {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        // THE STAMP BEFORE THE COUNT, the count's add a Release and
+        // [`Self::seq`]'s load an Acquire: a reader that sees this gesture
+        // counted sees its stamp too. Counted first (as it was until
+        // 2026-09-29), a read landing between the two stores paired the new
+        // count with the OLD age — "quiet" — and a key fenced on that count
+        // passed the fence the gesture should have moved.
         let before = self.at.swap(now_us.saturating_add(1), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
         before.checked_sub(1).is_none_or(|at| {
             now_us.saturating_sub(at) / 1000 >= crate::session_timeline::HUMAN_BURST_GAP_MS
         })
     }
 
     /// The raw stamp: equal to an earlier reading exactly when no person's
-    /// gesture has reached the session since that reading.
+    /// gesture has reached the session since that reading — what the tests
+    /// pair with [`Self::seq`].
+    #[cfg(test)]
     pub(crate) fn last(&self) -> u64 {
         self.at.load(Ordering::Relaxed)
     }
 
     /// How many person gestures have reached the session in this process
     /// (`human_seq=`): equal to an earlier reading exactly when none has
-    /// since — what a write fenced `if-human=<n>` is checked against.
+    /// since — what a write fenced `if-human=<n>` is checked against. Read
+    /// it BEFORE the age ([`Self::ms_since`], [`Self::wire`]) whenever the two
+    /// go out together: the Acquire here makes every stamp up to the count
+    /// read visible to that later load, so the pair never says "quiet" about
+    /// a gesture the count already holds ([`Self::note`]).
     pub(crate) fn seq(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
+        self.count.load(Ordering::Acquire)
     }
 
     /// Milliseconds from the last person's gesture to `now_us`; `None` when
@@ -165,6 +192,52 @@ mod tests {
         // A stamp at the clock's origin is still a stamp, not "never".
         s.note(0);
         assert_eq!(s.ms_since(2_000), Some(2));
+    }
+
+    /// A COUNT NEVER OUTRUNS ITS STAMP: a reader that loads the count and
+    /// then the stamp — the order `status` and `text --json` read them in —
+    /// while a person's gestures land never sees gesture `n` counted beside
+    /// the stamp of an earlier one. A torn pair is a `human_seq` that holds
+    /// the gesture beside a `human_ms` that says the person is quiet: the
+    /// supervisor keys on it, fenced `if-human=` on that very count, and the
+    /// fence passes. Gesture `k` lands at `k` ms, so gesture `n`'s stamp is
+    /// `n * 1000 + 1`, and a later one only larger. (Counted before it was
+    /// stamped, as until 2026-09-29, the pair tore on a plain interleaving,
+    /// whatever the memory model: this reader, spinning beside the writer,
+    /// is how it shows.)
+    #[test]
+    fn a_read_that_sees_a_gesture_counted_sees_its_stamp() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        const GESTURES: u64 = 200_000;
+        let stamp = Arc::new(HumanInputStamp::default());
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stamp = Arc::clone(&stamp);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for k in 1..=GESTURES {
+                    stamp.note(k * 1000);
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let (mut reads, mut torn) = (0_u64, 0_u64);
+        while !done.load(Ordering::Acquire) {
+            let n = stamp.seq();
+            let at = stamp.last();
+            if n > 0 && at < n * 1000 + 1 {
+                torn += 1;
+            }
+            reads += 1;
+        }
+        writer.join().expect("the writer");
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads paired a counted gesture with an older stamp"
+        );
+        assert_eq!(stamp.seq(), GESTURES);
+        assert_eq!(stamp.last(), GESTURES * 1000 + 1);
     }
 
     /// The first gesture and the first after

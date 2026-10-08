@@ -8,9 +8,6 @@
 //! `TerminalSize`) and cross-crate type definitions for domain, input,
 //! keyboard, mouse, selection, GPU views, text shaping, terminal hosting,
 //! perception, and verification.
-//!
-//! C ABI boundary helpers (panic catching, bounded pointer+len conversion)
-//! live in `aterm-ffi-types` (#3353).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -31,8 +28,6 @@ pub mod dev_seam;
 
 pub mod verification;
 
-pub mod ordered_map;
-
 pub mod identity;
 pub mod version;
 
@@ -41,9 +36,8 @@ pub mod version;
 // ============================================================================
 mod cursor;
 
-// Grid indexing types (Line, Column, Point, etc.) — extracted from aterm-alacritty-bridge (#3828).
+// Grid indexing types (Line, Column, Point, etc.).
 pub mod index;
-// Re-export commonly used index types at crate root for ergonomic imports.
 
 #[macro_use]
 mod bitflags;
@@ -59,8 +53,7 @@ pub mod rfc3339;
 
 // Rust on this machine means the Trust toolchain: the stock names, their Trust
 // spellings, and the reader that finds a stock tool at command position — one
-// vocabulary for atpkg's reroute, `aterm pkg lane` (the reader a guard the owner
-// wires calls) and `aterm help rust` (owner ruling, 2026-09-23).
+// vocabulary for atpkg's reroute, `aterm pkg lane` and `aterm help rust`.
 pub mod rust_lane;
 
 pub mod app_inspection;
@@ -74,11 +67,11 @@ pub mod fs_restricted;
 mod inline_image;
 pub mod scheme;
 mod x11_colors;
-pub use inline_image::{ImageData, ImageFormat, ImageScaling, SourceRect};
-// Re-export cursor style at crate root (was inline, extracted for file size).
-pub use cursor::CursorStyle;
-// Re-export color palette at crate root (extracted for file size, Part of #5332).
 pub use color_palette::ColorPalette;
+pub use cursor::CursorStyle;
+pub use inline_image::{
+    ImageData, ImageFormat, ImageScaling, KittyPlacementTag, SourceRect, layer_order,
+};
 // Named color schemes ("theme palettes"): the single source for terminal colors.
 pub use scheme::{Appearance, ColorScheme, ThemeParts};
 
@@ -93,7 +86,6 @@ mod kitty_keyboard;
 pub mod mouse;
 pub mod pipeline_timestamps;
 pub use pipeline_timestamps::PipelineTimestamps;
-pub mod callback_events;
 mod callback_types;
 pub mod charset;
 pub mod paragraph_direction;
@@ -107,58 +99,39 @@ pub mod text_shaping;
 pub mod vt_level;
 mod window;
 mod xterm_keyboard;
-// Re-export callback event types at crate root (Part of #5663 Phase 1).
-// Re-export ParagraphDirection at crate root (Part of #5663).
-pub use paragraph_direction::ParagraphDirection;
-// Re-export VtLevel at crate root (Part of #5663 Phase 1).
-pub use vt_level::VtLevel;
-// Re-export charset types at crate root (Part of #5663 Phase 1).
 pub use charset::{
     CharacterSet, CharacterSet96, CharacterSetState, GlMapping, GrMapping, SingleShift,
 };
-// Re-export window types at crate root (Part of #5663 Phase 1).
-pub use window::{WindowOperation, WindowResponse};
-// Re-export shell block types at crate root (Part of #5663 Phase 3).
-pub use shell_blocks::{BlockState, OutputBlock, RowSpan};
-// Re-export shell types at crate root (Part of #5663 Phase 3).
-pub use shell_types::{Annotation, CommandMark, TerminalMark, current_time_ms};
-// Re-export core terminal types at crate root (Part of #5663).
-pub use terminal_core::TerminalCapabilities;
-// Re-export terminal mode flags at crate root (Part of #5663).
-pub use terminal_modes::TerminalModes;
-// Re-export kitty keyboard types at crate root (Part of #5663).
+pub use clipboard::{ClipboardOperation, ClipboardSelection};
 pub use kitty_keyboard::{
     KittyKeyboardFlags, KittyKeyboardState, KittyKeyboardStateSnapshot, ScreenBuffer,
 };
-// Re-export xterm keyboard type at crate root (Part of #5663).
+pub use paragraph_direction::ParagraphDirection;
+pub use shell_blocks::{BlockState, OutputBlock};
+pub use shell_types::{Annotation, CommandMark, TerminalMark, current_time_ms};
+pub use terminal_core::TerminalCapabilities;
+pub use terminal_modes::TerminalModes;
+pub use vt_level::VtLevel;
+pub use window::{WindowOperation, WindowResponse};
 pub use xterm_keyboard::XtermKeyboardState;
-// Re-export clipboard types at crate root (Part of #5663).
-pub use clipboard::{ClipboardOperation, ClipboardSelection};
 pub mod osc;
 mod search_content;
-// Re-export SearchContent trait at crate root (#5759: decouple aterm-scrollback from aterm-search).
-pub use search_content::SearchContent;
-// Re-export OSC protocol types at crate root (Part of #5663).
-pub use osc::{
-    Iterm2ShellIntegrationVersion, Notification, NotificationUrgency, RemoteHost, TaskbarProgress,
-};
-// Re-export callback type aliases at crate root (Part of #5663, Phase 2).
+pub use buffer_access::BufferAccess;
+pub use buffer_command::BufferCommand;
 pub use callback_types::{
     AdvancedNotificationCallback, ClipboardCallback, ColorChangeCallback, ColorChangeOp,
     NotificationCallback, WindowCallback,
 };
-// Re-export unified buffer types at crate root for ergonomic imports.
-pub use buffer_access::BufferAccess;
-pub use buffer_command::BufferCommand;
+pub use osc::{
+    Iterm2ShellIntegrationVersion, Notification, NotificationUrgency, RemoteHost, TaskbarProgress,
+};
+pub use search_content::SearchContent;
 
 // ============================================================================
 // Terminal Size
 // ============================================================================
 
 /// Terminal dimensions (rows and columns).
-///
-/// Extracted to `aterm-types` so both `aterm-core` and integration crates
-/// can share the same size type without circular dependencies (#2440, #2341).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TerminalSize {
@@ -267,9 +240,14 @@ impl Rgb {
 
     /// Calculate relative luminance per WCAG 2.0.
     fn luminance(self) -> f64 {
-        // Skip: f64 arithmetic with `powf`. Needs the Trust verifier's native
-        // float theory ($HOME/trust, docs/TRUST_100PCT_PLAN.md T5); delete this skip
-        // when a promoted seal discharges it.
+        // Skip, standing: `powf` is an inexact float intrinsic, which Trust
+        // refuses to admit by design (std documents its precision as
+        // non-deterministic; trust d1a7b27696 and c065186961). No seal will
+        // discharge this body as written. No `[f64; 256]` table replaces it:
+        // `aterm_messages::ink::contrast` transcribes this body token for token
+        // and is pinned to it bit for bit (ruling 324) with no aterm-types
+        // dependency, so a table here needs a second copy there or leaves the
+        // pin resting on the host's `pow` matching the table's.
         #[cfg_attr(trust_verify, trust::skip)]
         fn linearize(c: u8) -> f64 {
             let c = f64::from(c) / 255.0;
@@ -299,9 +277,10 @@ impl Rgb {
 impl std::ops::Mul<f32> for Rgb {
     type Output = Self;
 
-    // Skip: f32 arithmetic. Needs the Trust verifier's native float theory
-    // ($HOME/trust, docs/TRUST_100PCT_PLAN.md T5); delete this skip when a promoted
-    // seal discharges it.
+    // Skip: f32 multiply, clamp and saturating cast, no transcendental — the
+    // float-interval lane (docs/TRUST_100PCT_PLAN.md, wave 3b: "float-clamp
+    // intervals", blocked on native float theory in $HOME/trust). Delete it when a
+    // promoted seal proves this body.
     #[cfg_attr(trust_verify, trust::skip)]
     fn mul(self, rhs: f32) -> Self::Output {
         Self {

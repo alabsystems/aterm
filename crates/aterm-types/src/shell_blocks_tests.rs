@@ -59,44 +59,25 @@ fn block_failed_requires_nonzero_exit_code() {
     assert!(block.failed());
 }
 
-#[test]
-fn row_span_helpers_preserve_count_and_tuple_shape() {
-    let rows = RowSpan::new(4, 9);
-    assert_eq!(rows.row_count(), 5);
-    assert_eq!(rows.as_tuple(), (4, 9));
-}
-
 // ========================================================================
 // Regression: u64::MAX overflow (#5715)
 //
 // Before the fix, `start + 1` wrapped to 0 when start == u64::MAX,
-// creating an inverted RowSpan where start > end.
+// creating an inverted row range where start > end.
 // ========================================================================
 
 #[test]
-fn command_row_span_saturates_at_u64_max() {
+fn command_rows_saturate_at_u64_max() {
     let mut block = make_block(0, 0);
     block.command_start_row = Some(u64::MAX);
-    let span = block.command_row_span().expect("should have command span");
-    assert!(
-        span.start_row <= span.end_row_exclusive,
-        "command_row_span must not wrap: start={}, end={}",
-        span.start_row,
-        span.end_row_exclusive
-    );
-    assert_eq!(span.row_count(), 0);
+    let rows = block.command_rows().expect("should have command rows");
+    assert_eq!(rows, (u64::MAX, u64::MAX), "command_rows must not wrap");
 }
 
 #[test]
-fn output_row_span_saturates_at_u64_max() {
+fn output_rows_saturate_at_u64_max() {
     let mut block = make_block(0, 0);
     block.output_start_row = Some(u64::MAX);
-    let span = block.output_row_span().expect("should have output span");
-    assert!(
-        span.start_row <= span.end_row_exclusive,
-        "output_row_span must not wrap: start={}, end={}",
-        span.start_row,
-        span.end_row_exclusive
-    );
-    assert_eq!(span.row_count(), 0);
+    let rows = block.output_rows().expect("should have output rows");
+    assert_eq!(rows, (u64::MAX, u64::MAX), "output_rows must not wrap");
 }

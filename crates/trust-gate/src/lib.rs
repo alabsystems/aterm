@@ -14,7 +14,7 @@ mod gate;
 
 #[cfg(test)]
 mod tests {
-    use super::gate::{INSTALL_URL, is_trust_compiler, refusal, tree_pins_trust};
+    use super::gate::{INSTALL_URL, TRUST_HOST, is_trust_compiler, refusal};
 
     /// Measured 2026-08-29 on the store build (acb08e761): the ONE line that
     /// separates a Trust `rustc -vV` from an upstream one.
@@ -24,10 +24,6 @@ mod tests {
     /// An upstream NIGHTLY says `-dev` too — the release string is not a marker.
     const NIGHTLY_VV: &str = "rustc 1.99.0-nightly (0123456789 2026-08-20)\nbinary: rustc\ncommit-hash: 0123456789abcdef\ncommit-date: 2026-08-20\nhost: aarch64-apple-darwin\nrelease: 1.99.0-dev\nLLVM version: 22.1.2\n";
     const HOST: &str = "aarch64-apple-darwin";
-    /// The dev workspace's pin (rust-toolchain.toml) — the gate enforces here.
-    const TRUST_PIN: &str = "[toolchain]\nchannel = \"trust\"\n";
-    /// What publish/transforms.sh swaps in for the public snapshot.
-    const STOCK_PIN: &str = "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"minimal\"\n";
 
     #[test]
     fn marker_is_the_trust_key_line_only() {
@@ -44,14 +40,8 @@ mod tests {
 
     #[test]
     fn trust_compiler_passes_silently() {
-        assert_eq!(
-            refusal(HOST, HOST, "rustc", TRUST_VV, true, Some(TRUST_PIN)),
-            None
-        );
-        assert_eq!(
-            refusal(HOST, HOST, "rustc", TRUST_VV, false, Some(TRUST_PIN)),
-            None
-        );
+        assert_eq!(refusal(HOST, HOST, "rustc", TRUST_VV, true, None), None);
+        assert_eq!(refusal(HOST, HOST, "rustc", TRUST_VV, false, None), None);
     }
 
     #[test]
@@ -59,14 +49,7 @@ mod tests {
         // The release's x86_64-apple-darwin compat slice: upstream stable, cross
         // from the aarch64 host. TARGET != HOST ⇒ no refusal, whatever -vV says.
         assert_eq!(
-            refusal(
-                HOST,
-                "x86_64-apple-darwin",
-                "rustc",
-                STABLE_VV,
-                true,
-                Some(TRUST_PIN)
-            ),
+            refusal(HOST, "x86_64-apple-darwin", "rustc", STABLE_VV, true, None,),
             None
         );
         assert_eq!(
@@ -76,27 +59,24 @@ mod tests {
                 "rustc",
                 STABLE_VV,
                 false,
-                Some(TRUST_PIN)
+                None,
             ),
             None
         );
     }
 
     #[test]
-    fn native_upstream_build_is_refused_with_doctor_when_aterm_is_on_path() {
-        let msg = refusal(
-            HOST,
-            HOST,
-            "/opt/homebrew/bin/rustc",
-            STABLE_VV,
-            true,
-            Some(TRUST_PIN),
-        )
-        .expect("stable on the native triple must be refused");
-        assert!(msg.contains("aterm pkg doctor"), "{msg}");
+    fn native_upstream_build_is_refused_with_targo_when_aterm_is_on_path() {
+        let msg = refusal(HOST, HOST, "/opt/homebrew/bin/rustc", STABLE_VV, true, None)
+            .expect("stable on the native triple must be refused");
+        assert!(msg.contains("fix:  targo --unverified build"), "{msg}");
+        assert!(
+            msg.contains("cause     this cargo is not rustup's and ignores the pin"),
+            "{msg}"
+        );
         assert!(
             !msg.contains(INSTALL_URL),
-            "doctor, not the installer: {msg}"
+            "targo, not the installer: {msg}"
         );
         assert!(
             msg.contains("/opt/homebrew/bin/rustc"),
@@ -106,18 +86,64 @@ mod tests {
             msg.contains("rustc 1.96.0 (ac68faa20 2026-05-25)"),
             "quotes what it reported: {msg}"
         );
-        assert!(msg.contains("trust:"), "names the missing marker: {msg}");
     }
 
     #[test]
     fn native_upstream_build_is_refused_with_installer_when_aterm_is_absent() {
-        let msg = refusal(HOST, HOST, "rustc", NIGHTLY_VV, false, Some(TRUST_PIN))
+        let msg = refusal(HOST, HOST, "rustc", NIGHTLY_VV, false, None)
             .expect("nightly on the native triple must be refused");
         assert!(msg.contains(INSTALL_URL), "{msg}");
         assert!(
-            !msg.contains("aterm pkg doctor"),
-            "installer, not doctor: {msg}"
+            !msg.contains("targo --unverified build"),
+            "installer, not targo: {msg}"
         );
+    }
+
+    #[test]
+    fn without_aterm_a_host_trust_is_not_packaged_for_is_told_so() {
+        for host in ["x86_64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            let msg = refusal(host, host, "rustc", STABLE_VV, false, None)
+                .expect("stable on the native triple must be refused");
+            assert!(msg.contains(TRUST_HOST), "{msg}");
+            assert!(msg.contains(host), "{msg}");
+            assert!(!msg.contains(INSTALL_URL), "{msg}");
+            assert!(!msg.contains("targo"), "{msg}");
+            // With aterm there, a linked local seal can serve: the usual remedy stands.
+            let msg = refusal(host, host, "rustc", STABLE_VV, true, None)
+                .expect("stable on the native triple must be refused");
+            assert!(msg.contains("targo --unverified build"), "{msg}");
+        }
+    }
+
+    /// The cause comes from `RUSTUP_TOOLCHAIN`, which rustup's proxy sets for
+    /// cargo and its build scripts while `RUSTC` stays a bare `rustc`: another
+    /// name is an override, `trust` itself is a link that is not a Trust
+    /// compiler, and unset is a cargo that is not rustup's.
+    #[test]
+    fn the_cause_and_its_fix_come_from_rustup_toolchain() {
+        let refuse = |toolchain: Option<&str>| {
+            refusal(HOST, HOST, "rustc", STABLE_VV, true, toolchain).expect("refused")
+        };
+        let stable = refuse(Some("stable-aarch64-apple-darwin"));
+        assert!(
+            stable.contains("`cargo +stable-aarch64-apple-darwin`"),
+            "{stable}"
+        );
+        assert!(stable.contains("override"), "{stable}");
+        assert!(
+            stable.contains("fix:  targo --unverified build"),
+            "{stable}"
+        );
+        let link = refuse(Some("trust"));
+        assert!(link.contains("rustup's `trust` toolchain"), "{link}");
+        assert!(!link.contains("override"), "{link}");
+        assert!(link.contains("fix:  aterm pkg repair"), "{link}");
+        assert!(!link.contains("doctor"), "{link}");
+        for unset in [None, Some("")] {
+            let plain = refuse(unset);
+            assert!(plain.contains("not rustup's"), "{plain}");
+            assert!(!plain.contains("override"), "{plain}");
+        }
     }
 
     #[test]
@@ -129,42 +155,9 @@ mod tests {
             "rustc",
             "(could not run it: No such file)",
             true,
-            Some(TRUST_PIN),
+            None,
         )
         .expect("an unrunnable rustc is refused");
         assert!(msg.contains("could not run it"), "{msg}");
-    }
-
-    /// THE PUBLIC SNAPSHOT'S LANE. publish/transforms.sh swaps the tree's pin
-    /// to stock 1.97.1 and publish/DECISIONS.md's public stock-Rust gate then
-    /// builds it with upstream rustc under anonymous git — the gate must stand
-    /// down THERE and only there, on the committed pin, never on an env var.
-    #[test]
-    fn a_tree_pinned_to_stock_rust_is_the_public_snapshot_and_is_not_gated() {
-        assert!(tree_pins_trust(Some(TRUST_PIN)));
-        assert!(!tree_pins_trust(Some(STOCK_PIN)));
-        assert_eq!(
-            refusal(HOST, HOST, "rustc", STABLE_VV, true, Some(STOCK_PIN)),
-            None
-        );
-        // the dev tree still refuses exactly as before
-        assert!(refusal(HOST, HOST, "rustc", STABLE_VV, true, Some(TRUST_PIN)).is_some());
-    }
-
-    /// FAIL-CLOSED: no pin file, an unreadable one, or one with no channel
-    /// line enforces — only an explicit non-trust channel stands the gate
-    /// down. Comments and quoting do not confuse the read.
-    #[test]
-    fn a_missing_or_channelless_pin_enforces_and_comments_do_not_confuse_it() {
-        assert!(tree_pins_trust(None));
-        assert!(tree_pins_trust(Some("")));
-        assert!(tree_pins_trust(Some(
-            "[toolchain]\nprofile = \"minimal\"\n"
-        )));
-        assert!(tree_pins_trust(Some(
-            "# channel = \"1.97.1\"\nchannel = \"trust\"\n"
-        )));
-        assert!(!tree_pins_trust(Some("channel = \"1.97.1\" # was trust\n")));
-        assert!(refusal(HOST, HOST, "rustc", STABLE_VV, false, None).is_some());
     }
 }

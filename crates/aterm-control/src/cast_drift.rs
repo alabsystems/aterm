@@ -1,75 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cast drift`: a COUNTERFACTUAL REPLAY AUDIT of a session's asciicast against
+//! `cast drift`: a counterfactual replay audit of a session's asciicast against
 //! the screen it produced.
 //!
-//! THE FAILURE IT NAMES. A net-zero resize run (64 -> 63 -> 64 rows within a
-//! millisecond) that lands on the ALTERNATE screen shifts every row up one: the
-//! shrink demotes the top row and the alt grid keeps no history, so the grow
-//! appends a blank row instead of revealing it. (The engine now undoes a flap
-//! with NO output between its halves: its resize undo hands the demoted row
-//! back. Any output between them, even a mode set that draws nothing, drops
-//! the undo. An engine that predates it shifted on every such flap, so the
-//! replays can drop the undo before each resize, as that engine did
-//! ([`Undo`], `undo=off` on the wire): a client-side report against an aterm
-//! older than this verb always does, and a saved recording is replayed so only
-//! when that alone reproduces the given screen.) An app that repaints only when
-//! its SIGWINCH handler reads a CHANGED size (Claude Code, like Node's
-//! `tty.WriteStream`) never sees a pair that completed before the handler ran,
-//! so its later diff frames land on shifted content for good. Measured on a live
-//! window on 2026-09-28: one flap in 41 did exactly that, and nothing in aterm
-//! could say so without an investigator bisecting replays by hand.
+//! The failure it names: a net-zero resize run (64 -> 63 -> 64 rows within a
+//! millisecond) landing on the alternate screen shifts every row up one, since
+//! the shrink demotes the top row and the alt grid keeps no history, so the grow
+//! appends a blank row. The engine's resize undo hands the row back when nothing
+//! is output between the halves; any output, even a mode set, drops the undo
+//! (replays can drop it before each resize: [`Undo`], `undo=off` on the wire).
+//! An app that repaints only when its SIGWINCH handler reads a changed size
+//! (Claude Code, Node's `tty.WriteStream`) never sees a completed pair, so its
+//! later diff frames land on shifted content.
 //!
-//! THE METHOD. Fold the recording through fresh headless engines, varying only
-//! how the resize runs are applied:
+//! The method: fold the recording through fresh headless engines, varying only
+//! how resize runs are applied.
 //!
-//! - FAITHFUL applies every resize as recorded. It must reproduce the live screen
-//!   (the FIDELITY gate); if it does not, the recording cannot explain the grid
-//!   and nothing is attributed (`verdict=unfaithful`). That gate is this audit's
-//!   negative control: a dropped burst or an evicted head can never accuse a
+//! - Faithful applies every resize as recorded and must reproduce the live
+//!   screen (the fidelity gate); otherwise nothing is attributed
+//!   (`verdict=unfaithful`), so a dropped burst or evicted head never accuses a
 //!   resize.
-//! - STABLE skips EVERY net-zero candidate run and collapses every other
-//!   candidate run to its final geometry — the only geometry an app whose handler
-//!   ran after the run can have seen. It is the screen the app BELIEVES it drew.
-//!   Every candidate, however many: a cap here would let the culprit fall
-//!   outside it and cancel out of both replays.
-//! - The CULPRIT is named from the faithful replay's own engine journal: the
-//!   candidate runs holding an alt-screen resize that demoted or pushed rows no
-//!   later grow handed back (the rows nothing can bring back). Only when the journal names none (a primary-
-//!   screen rotation, a ConPTY seam) is it attributed by ONLY(r) — run `r`
-//!   collapsed alone — over the newest `max_runs` candidates.
+//! - Stable skips every net-zero candidate run and collapses every other to its
+//!   final geometry: the screen the app believes it drew. Every candidate is
+//!   included, so the culprit cannot fall outside a cap.
+//! - The culprit is named from the faithful replay's engine journal: the
+//!   candidates holding an alt-screen resize whose demoted or pushed rows no
+//!   later grow handed back. When the journal names none (a primary-screen
+//!   rotation, a ConPTY seam), attribution is by ONLY(r), run `r` collapsed
+//!   alone, over the newest `max_runs` candidates.
 //!
-//! A candidate is a run of two or more resizes after the ANCHOR: the last output
-//! that replaced the whole screen (`ESC[2J`, or an alt-screen entry that clears)
-//! with no alt-screen toggle after it. A run before the last full clear cannot
-//! explain present drift for an app that clears. A RUN groups resizes by time
-//! alone ([`RUN_GAP_SECS`]): output between two halves of a flap does not split
-//! it, because a frame the app drew there (a spinner tick) is no sign its
-//! SIGWINCH handler ran, and the recording's `o`/`r` order is only approximately
-//! the engine's (a burst is stamped when the writer records it).
+//! A candidate is a run of two or more resizes after the anchor: the last output
+//! that replaced the whole screen (`ESC[2J`, or a clearing alt-screen entry)
+//! with no alt toggle after it. Runs group resizes by time alone
+//! ([`RUN_GAP_SECS`]), since output between a flap's halves is no sign the
+//! handler ran and the recording's `o`/`r` order only approximates the engine's.
 //!
-//! A RETURN is a candidate too: an alternate-screen resize after the anchor and
-//! the last alt toggle whose moved rows no grow handed back (the faithful
-//! replay's journal), that no run candidate holds, through the first later
-//! resize that brings the geometry back to where it stood before it — however
-//! far apart, output between included. It is the flap TIME split: an app whose
-//! handler ran only after the size came back (a busy event loop) read no change
-//! and drew its diffs onto the moved rows, exactly as for a flap one run holds,
-//! so the stable replay skips the whole span. An app that did read the smaller
-//! size and repainted every row at it, then again at the size that came back,
-//! lands on the same screen either way and reads `clean`. A resize whose
-//! geometry never came back is the app's to repaint (its handler reads a
-//! change whenever it runs), so it is replayed as recorded, as ever.
+//! A return is a candidate too: an alt-screen resize after the anchor and last
+//! toggle whose moved rows no grow handed back, held by no run, through the
+//! first later resize restoring the prior geometry (however far apart). An app
+//! whose handler ran only after the size came back drew onto the moved rows, so
+//! the stable replay skips the span; an app that repainted at both sizes lands
+//! on the same screen and reads `clean`. A resize whose geometry never came back
+//! is the app's to repaint and is replayed as recorded.
 //!
-//! PURITY. No I/O, no clock, no GUI type: the server (`aterm-gui`, over its
-//! recorder snapshot and the live engine) and the one binary's client path (over
-//! a fetched `cast` and `text`, for a server that predates the verb, or saved
-//! files offline) run THIS code, so the two faces cannot disagree. It lives here
-//! rather than in `aterm-core` because it is a control-protocol report — an
-//! asciicast reader and a wire renderer — built on the engine, and this crate is
-//! the headless half of the protocol that already owns [`visible_row`] and
-//! [`pct_encode`], the row text and the token encoding the report is made of.
+//! Pure: no I/O, clock or GUI type. The server (`aterm-gui`, over its recorder
+//! and live engine) and the client path (over a fetched `cast` and `text`, or
+//! saved files) run this same code. It lives in this crate, the headless half
+//! of the control protocol, beside [`visible_row`] and [`pct_encode`].
 
 /// The resize seam policy the replays apply, re-exported so a caller that
 /// links only this crate (the one binary's client path) can name it.
@@ -84,19 +62,18 @@ pub const USAGE: &str = "ERR usage: cast drift [max_runs=<k>] [rows=<n>] [seed=a
 /// Candidate runs varied by default (newest first).
 pub const DEFAULT_MAX_RUNS: usize = 8;
 
-/// The most candidate runs one request may vary: each costs one more fold of
-/// the whole recording, so this bounds the work at `2 + MAX_RUNS` folds (one
-/// more when a saved screen, which names no buffer, has to pick the seed).
+/// The most candidate runs one request may vary: each costs a fold of the whole
+/// recording, bounding work at `2 + MAX_RUNS` folds (one more when a saved
+/// screen must pick the seed).
 pub const MAX_RUNS: usize = 16;
 
 /// Two resizes closer than this are one run, whatever output lies between: the
-/// app's SIGWINCH handler may have read only the second size. A heuristic, and
-/// named as one — the measured flaps were 0.5-0.9 ms apart.
+/// app's SIGWINCH handler may have read only the second size. A heuristic
+/// (flaps are typically under a millisecond apart).
 pub const RUN_GAP_SECS: f64 = 0.250;
 
-/// One recorded event. `D` is the output burst's storage: the server hands its
-/// recorder's shared `Arc<[u8]>`s straight through, the asciicast reader owns
-/// `Vec<u8>`s.
+/// One recorded event. `D` is the output burst's storage: the server passes its
+/// recorder's shared `Arc<[u8]>`s; the asciicast reader owns `Vec<u8>`s.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CastEvent<D> {
     /// `[t, "o", data]`: program output. `t` is seconds on the cast's own
@@ -151,6 +128,13 @@ pub struct CastHeader {
     /// `Some` when the recorder counts drops (0 included); `None` for a
     /// recording whose producer does not say — a file from an older aterm.
     pub dropped: Option<CastDrops>,
+    /// `Some(true)` when the recording says its engine kept the resize undo
+    /// (`aterm_resize_undo`: every aterm since the undo writes it); `None` for a
+    /// recording that does not say, a file from an aterm before it. A recording
+    /// that carries the key is replayed under the undo law only ([`Undo::Match`]
+    /// never second-guesses it), so an undo regression in the recording engine
+    /// still reads `unfaithful`.
+    pub resize_undo: Option<bool>,
 }
 
 /// A parsed asciicast v2 recording.
@@ -163,9 +147,8 @@ pub struct Asciicast {
 }
 
 impl Asciicast {
-    /// The recording as it stood at `until` seconds: every event after it
-    /// dropped. What a saved cast is cut to when it is held against a screen
-    /// captured at that instant.
+    /// The recording cut at `until` seconds (later events dropped), to hold a
+    /// saved cast against a screen captured at that instant.
     #[must_use]
     pub fn until(mut self, until: f64) -> Self {
         self.events.retain(|e| e.t() <= until);
@@ -187,13 +170,12 @@ pub struct LiveScreen {
 /// Which buffer the replay engines start on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Seed {
-    /// The alternate screen when the recording's first alt toggle is an EXIT, or
-    /// when it has none and the live screen is on the alternate buffer (an
-    /// ADOPTED session, whose cast starts at adoption mid-app); primary when it
-    /// has none and the screen is on the primary buffer. With no toggle and no
-    /// word on the buffer (a saved screen dump), the one of the two that
-    /// reproduces the screen; with no screen either, primary — where a resize
-    /// flap is lossless, so a guess never manufactures an accusation.
+    /// The alternate screen when the first alt toggle is an exit, or when there
+    /// is none and the live screen is on the alternate buffer (an adopted
+    /// session, whose cast starts mid-app); primary when there is none and the
+    /// screen is primary. With no toggle and no buffer information (a saved
+    /// screen dump), whichever reproduces the screen; with no screen, primary,
+    /// where a flap is lossless and a guess cannot accuse.
     #[default]
     Auto,
     /// Start on the alternate screen.
@@ -231,22 +213,22 @@ impl SeedBasis {
     }
 }
 
-/// Whether the replays keep the engine's RESIZE UNDO (the grid hands the rows
-/// an alt-screen shrink took off back to a grow with nothing output between).
-/// An aterm before 2026-09-28 had none: every such flap shifted its screen,
-/// and its recording replayed with the undo reproduces a screen it never had.
+/// Whether the replays keep the engine's resize undo (a grow gets back the rows
+/// an alt-screen shrink took when nothing was output between). A recording from
+/// an engine without the undo, replayed with it, reproduces a screen it never
+/// had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Undo {
     /// This engine's: what the server answers with, over its own recording.
     #[default]
     Keep,
-    /// Dropped before every resize, as the older engine applied them (`undo=off`
-    /// on the wire): a client-side report against an aterm older than this
-    /// verb, which is older than the undo too.
+    /// Dropped before every resize (`undo=off` on the wire): a client-side
+    /// report against an aterm older than this verb (and the undo).
     Drop,
     /// Kept, unless only the replay without it reproduces the screen (then
     /// `undo=off`): a saved recording, whose aterm is not known. With no screen
-    /// it is kept.
+    /// it is kept, and so it is for a recording whose header says its engine
+    /// kept the undo ([`CastHeader::resize_undo`]).
     Match,
 }
 
@@ -254,10 +236,9 @@ pub enum Undo {
 /// binary's client path sets it for the aterm it computes against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriftArgs {
-    /// Candidate runs attributed one at a time (ONLY folds) and listed, newest
-    /// first, when the engine journal names no culprit (`max_runs=`, at most
-    /// [`MAX_RUNS`]; 0 = no such attribution). The verdict always weighs every
-    /// candidate.
+    /// Candidate runs attributed one at a time (only folds) and listed, newest
+    /// first, when the journal names no culprit (`max_runs=`, at most
+    /// [`MAX_RUNS`]; 0 = none). The verdict always weighs every candidate.
     pub max_runs: usize,
     /// At most this many `row` lines (`rows=`); `None` lists every drift row.
     pub list_rows: Option<usize>,
@@ -312,9 +293,9 @@ impl DriftArgs {
 pub enum Verdict {
     /// The recording holds no event.
     Empty,
-    /// The screen is what the app believes it drew (STABLE matches).
+    /// The screen is what the app believes it drew (stable matches).
     Clean,
-    /// The recording reproduces the screen, and the screen is NOT what the app
+    /// The recording reproduces the screen, and the screen is not what the app
     /// believes it drew: a resize run it never repainted after moved content.
     Desync,
     /// The recording does not reproduce the screen; nothing is attributed.
@@ -429,9 +410,9 @@ pub struct DriftReport {
     /// Every resize run in the recording.
     pub runs_total: usize,
     /// Every candidate (after the anchor: a run of two or more resizes, or a
-    /// RETURN): all of them are collapsed in the stable replay.
+    /// return): all of them are collapsed in the stable replay.
     pub eligible: usize,
-    /// The candidate runs LISTED (a `run` line each), oldest first: every
+    /// The candidate runs listed (a `run` line each), oldest first: every
     /// culprit and the newest `max_runs`.
     pub candidates: Vec<Run>,
     /// Candidate runs not listed (`eligible - candidates.len()`); they are in
@@ -468,13 +449,11 @@ pub struct DriftReport {
 }
 
 impl DriftReport {
-    /// Record how the screen and the recording were cut. A racy cut of a report
-    /// held against the SCREEN turns a `desync` or `unfaithful` finding into
-    /// `unknown`: the difference may be a burst the recording had not taken
-    /// yet. `clean` stays clean — a racy read that still matches accuses
-    /// nothing. A report of the replays against each other ([`analyze_replay`],
-    /// what a caller answers after a racy cut) reads no screen and keeps its
-    /// verdict.
+    /// Record how the screen and recording were cut. A racy cut of a report
+    /// held against the screen turns `desync` or `unfaithful` into `unknown`
+    /// (the difference may be a burst not yet recorded); `clean` stays clean. A
+    /// replay-against-replay report ([`analyze_replay`]) reads no screen and
+    /// keeps its verdict.
     pub fn settle_cut(&mut self, cut: Cut) {
         self.cut = Some(cut);
         if cut == Cut::Racy
@@ -501,12 +480,12 @@ impl DriftReport {
         }
     }
 
-    /// The wire form: `OK <n> <header k=v…>` then `n` lines — the candidate
+    /// The wire form: `OK <n> <header k=v…>` then `n` lines: the candidate
     /// `run` lines (oldest first), the `row` lines (ascending, at most `rows=`)
     /// and one `cursor` line when there is a finding. `ms` is the caller's
-    /// measure of the analysis (this module owns no clock); ` undo=off` follows
-    /// it when the replays dropped the resize undo, and `computed` names where
-    /// it ran when that is not the server (`computed=client`).
+    /// timing (this module has no clock); ` undo=off` follows when the replays
+    /// dropped the undo, and `computed` names where it ran when not the server
+    /// (`computed=client`).
     #[must_use]
     pub fn render(&self, ms: u64, computed: Option<&str>) -> String {
         let mut body = String::new();
@@ -626,9 +605,7 @@ fn geom_chain(geoms: &[(u16, u16)]) -> String {
     parts.join(">")
 }
 
-// ---------------------------------------------------------------------------
-// The analysis
-// ---------------------------------------------------------------------------
+// The analysis.
 
 /// A position in the recording: (event index, byte offset in its burst).
 type Pos = (usize, usize);
@@ -637,7 +614,7 @@ type Pos = (usize, usize);
 /// clears the anchor and the seed are decided from.
 #[derive(Default)]
 struct Marks {
-    /// Whether the FIRST alt-screen toggle is an exit (`Some(true)`), an entry
+    /// Whether the first alt-screen toggle is an exit (`Some(true)`), an entry
     /// (`Some(false)`), or there is none.
     first_toggle_exit: Option<bool>,
     /// The last alt-screen toggle of any kind.
@@ -763,11 +740,10 @@ fn follow_up<D>(events: &[CastEvent<D>], clears: &[bool], runs: &mut [Run]) {
     }
 }
 
-/// The RETURNS (see the module note): from each `lossy` resize (event indices,
-/// ascending, already cut to those after the anchor and the last alt toggle)
-/// that no candidate in `held` and no earlier return covers, through the first
-/// later resize that brings the geometry back to where it stood before it. A
-/// lossy resize whose geometry never came back yields none.
+/// The returns (see the module note): from each `lossy` resize (event indices,
+/// ascending, after the anchor and last alt toggle) not covered by a `held`
+/// candidate or an earlier return, through the first later resize restoring
+/// the prior geometry. A resize whose geometry never came back yields none.
 fn return_chains<D>(
     header: &CastHeader,
     events: &[CastEvent<D>],
@@ -822,9 +798,9 @@ struct Replay {
     rows: Vec<String>,
     cursor: (u16, u16),
     geom: (u16, u16),
-    /// Event indices of the applied resizes the engine journalled as LOSSY on
-    /// the alternate screen (rows demoted or pushed off that no later grow's
-    /// resize undo handed back), when the fold was asked to watch its journal.
+    /// Event indices of applied resizes the engine journalled as lossy on the
+    /// alternate screen (rows no later grow's undo handed back), when the fold
+    /// watched its journal.
     lossy: Vec<usize>,
 }
 
@@ -856,11 +832,10 @@ struct Engine {
 /// Fold the recording through one fresh engine; `journal` also collects the
 /// lossy alt-screen resizes ([`Replay::lossy`]).
 ///
-/// The engine's ALT-SCREEN ARCHIVE is off: it keeps text of committed
-/// alternate-screen frames for scrolling back (measured: most of a fold's time
-/// on a Claude recording) and never touches the grid a replay is read from.
-/// Without the undo (`engine.keep_undo` false) the active grid's is dropped
-/// before every resize, so a grow appends as an engine before it did.
+/// The engine's alt-screen archive is off: it only keeps scrollback text of
+/// committed alt frames (most of a fold's time on a Claude recording) and never
+/// touches the grid being read. Without the undo (`engine.keep_undo` false)
+/// the active grid's undo is dropped before every resize.
 fn fold<D: AsRef<[u8]>>(
     header: &CastHeader,
     events: &[CastEvent<D>],
@@ -874,9 +849,9 @@ fn fold<D: AsRef<[u8]>>(
     if seed_alt {
         term.process(b"\x1b[?1049h");
     }
-    // Each alt-screen resize that took rows off the screen, with how many are
-    // still gone: a grow the engine's resize undo served hands the newest ones
-    // back (LIFO, as the undo does), so a quiet flap leaves nothing here.
+    // Each alt-screen resize that took rows off, with how many are still gone;
+    // a grow served by the undo hands the newest back (LIFO), so a quiet flap
+    // leaves nothing here.
     let mut moved: Vec<(usize, u32)> = Vec::new();
     for (i, ev) in events.iter().enumerate() {
         match ev {
@@ -941,10 +916,9 @@ fn same_on(a: &[String], b: &[String], rows: &[usize]) -> bool {
 }
 
 /// Run the audit. `live` is the screen to hold the recording against (`None`
-/// offline without one: FAITHFUL then stands in for it and fidelity reads `-`).
-/// `policy` is the session's resize seam policy (`ConPty` behind a Windows
-/// pseudoconsole, else `Native`). The cut is recorded afterwards with
-/// [`DriftReport::settle_cut`].
+/// offline: faithful stands in and fidelity reads `-`). `policy` is the
+/// session's resize seam policy (`ConPty` behind a Windows pseudoconsole, else
+/// `Native`). Record the cut afterwards with [`DriftReport::settle_cut`].
 #[must_use]
 pub fn analyze<D: AsRef<[u8]>>(
     header: &CastHeader,
@@ -956,11 +930,11 @@ pub fn analyze<D: AsRef<[u8]>>(
     analyze_inner(header, events, live, live.and_then(|l| l.alt), args, policy)
 }
 
-/// The audit of the replays against EACH OTHER (FAITHFUL against STABLE,
+/// The audit of the replays against each other (faithful vs stable,
 /// `against=replay fidelity=-`), seeded from the live buffer when `alt` says
-/// it. What a live caller answers when the screen would not hold still
-/// (`cut=racy`): no screen is compared, so a racing app cannot make the
-/// answer `unknown` forever, at the cost of the fidelity gate.
+/// so. For a live screen that will not hold still (`cut=racy`): no screen is
+/// compared, so a racing app cannot keep the answer `unknown`, at the cost of
+/// the fidelity gate.
 #[must_use]
 pub fn analyze_replay<D: AsRef<[u8]>>(
     header: &CastHeader,
@@ -988,13 +962,15 @@ fn analyze_inner<D: AsRef<[u8]>>(
     match args.undo {
         Undo::Keep => seeded(true),
         Undo::Drop => seeded(false),
-        // A saved recording of an aterm that predates the undo, held against
-        // its screen: this engine's replay says `unfaithful` wherever a quiet
-        // flap shifted that screen. The replay without the undo is taken only
-        // when it alone reproduces the screen, as the seed pick is.
+        // A saved recording from an aterm without the undo reads `unfaithful`
+        // wherever a quiet flap shifted its screen; the undo-less replay is
+        // taken only when it alone reproduces the screen.
         Undo::Match => {
             let mut kept = seeded(true);
-            if live.is_none() || kept.fidelity != Some(false) {
+            // A recording that says its engine kept the undo is replayed under
+            // it only: a fidelity failure there is an undo regression, not an
+            // older aterm, and must stay `unfaithful`.
+            if live.is_none() || kept.fidelity != Some(false) || header.resize_undo == Some(true) {
                 return kept;
             }
             let mut dropped = seeded(false);
@@ -1032,12 +1008,11 @@ fn analyze_seeded<D: AsRef<[u8]>>(
     let mut report = audit(
         header, events, marks, live, seed_alt, seed_basis, args, engine,
     );
-    // No screen and nothing that says which buffer the recording began on (a
-    // saved recording of an adopted session, with no toggle): the verdict on
-    // one guessed seed is no finding. Fold the other; when the two disagree
-    // the answer is `unknown`, `seed=ambiguous` — pass `seed=alt|primary`.
-    // Any resize at all: a RETURN is a candidate only on the seed whose
-    // journal saw it lose rows, so none here says nothing about the other.
+    // No screen and no indication of the starting buffer (a saved recording
+    // of an adopted session with no toggle): one guessed seed is no finding.
+    // Fold the other; if they disagree the answer is `unknown`,
+    // `seed=ambiguous` (pass `seed=alt|primary`). Any resize counts, since a
+    // return is a candidate only on the seed whose journal saw rows lost.
     if live.is_none() && seed_basis == SeedBasis::Default && report.runs_total > 0 {
         let other = audit(
             header, events, marks, None, !seed_alt, seed_basis, args, engine,
@@ -1097,7 +1072,7 @@ fn audit<D: AsRef<[u8]>>(
         return report;
     }
 
-    // THE ANCHOR: the last full clear, provided no alt toggle follows it (an
+    // The anchor: the last full clear, provided no alt toggle follows it (an
     // exit brings back a screen the clear never touched).
     let anchor = match (marks.last_clear, marks.last_toggle) {
         (Some(clear), Some(toggle)) if clear < toggle => None,
@@ -1110,9 +1085,8 @@ fn audit<D: AsRef<[u8]>>(
 
     let mut faithful = fold(header, events, seed_alt, None, engine, true);
     report.folds = 1;
-    // A screen with no word on its buffer, a recording with no toggle: let the
-    // fidelity gate pick the seed. The alt screen is taken only when it alone
-    // reproduces the screen.
+    // No buffer information and no toggle: the fidelity gate picks the seed;
+    // alt only when it alone reproduces the screen.
     if seed_basis == SeedBasis::Default
         && let Some(live) = live
         && !diff_rows(&live.rows, &faithful.rows).is_empty()
@@ -1138,10 +1112,8 @@ fn audit<D: AsRef<[u8]>>(
         .copied()
         .filter(|&i| since_toggle.is_none_or(|t| i > t))
         .collect();
-    // THE CANDIDATES, oldest first: every run of two or more resizes after the
-    // anchor, and every RETURN (a lossy resize no such run holds, through the
-    // resize that brought its geometry back); a run a return spans is folded
-    // into it.
+    // The candidates, oldest first: every run of two or more resizes after
+    // the anchor, and every return; a run a return spans is folded into it.
     let mut owned: Vec<Run> = runs
         .iter()
         .filter(|r| r.len() >= 2 && anchor.is_none_or(|a| r.first > a))
@@ -1165,7 +1137,7 @@ fn audit<D: AsRef<[u8]>>(
     let eligible: Vec<&Run> = owned.iter().collect();
     report.eligible = eligible.len();
 
-    // STABLE collapses EVERY candidate: the verdict never depends on a cap.
+    // Stable collapses every candidate: the verdict never depends on a cap.
     let stable = if eligible.is_empty() {
         None
     } else {
@@ -1231,10 +1203,9 @@ fn audit<D: AsRef<[u8]>>(
         })
         .collect();
 
-    // ATTRIBUTION. One candidate is the culprit by construction (its ONLY fold
-    // IS the stable one). Otherwise the faithful replay's own journal names
-    // them: every candidate holding a lossy alt-screen resize on the screen
-    // still showing (after the last toggle).
+    // Attribution. A single candidate is the culprit by construction (its
+    // only fold is the stable one). Otherwise the faithful journal names every
+    // candidate holding a lossy alt-screen resize on the screen still showing.
     let blame: Vec<bool> = if eligible.len() == 1 {
         vec![true]
     } else {
@@ -1331,11 +1302,15 @@ fn parse_header(line: &str) -> Result<CastHeader, String> {
         bursts: d.get("bursts").and_then(Json::as_u64).unwrap_or(0),
         bytes: d.get("bytes").and_then(Json::as_u64).unwrap_or(0),
     });
+    let resize_undo = get("aterm_resize_undo")
+        .and_then(Json::as_u64)
+        .map(|v| v != 0);
     Ok(CastHeader {
         width: dim("width")?,
         height: dim("height")?,
         evicted,
         dropped,
+        resize_undo,
     })
 }
 
@@ -1538,9 +1513,9 @@ impl JsonReader<'_> {
         Ok(v)
     }
 
-    /// A JSON string at the cursor (which must be on its `"`). Escapes decode,
-    /// `\uXXXX` included; a surrogate pair joins into one scalar, and a LONE
-    /// surrogate becomes U+FFFD (it names no character).
+    /// A JSON string at the cursor (on its `"`). Escapes decode, `\uXXXX`
+    /// included; a surrogate pair joins into one scalar and a lone surrogate
+    /// becomes U+FFFD.
     fn string(&mut self) -> Result<String, String> {
         if self.s.get(self.i) != Some(&b'"') {
             return Err("expected a JSON string".to_string());
@@ -1618,8 +1593,8 @@ impl JsonReader<'_> {
 mod tests {
     use super::*;
 
-    /// A recording under construction, with the LIVE engine driven by the
-    /// identical operations beside it — the screen the audit is held against.
+    /// A recording under construction, with the live engine driven by the same
+    /// operations beside it: the screen the audit is held against.
     struct Rec {
         header: CastHeader,
         events: Vec<CastEvent<Vec<u8>>>,
@@ -1632,7 +1607,7 @@ mod tests {
 
     impl Rec {
         /// A `cols`x`rows` recording; `adopted` puts the live engine on the alt
-        /// screen BEFORE the recording starts, as an adopted session is.
+        /// screen before the recording starts, as an adopted session is.
         fn new(cols: u16, rows: u16, adopted: bool) -> Self {
             let mut live = Terminal::new(rows, cols);
             if adopted {
@@ -1644,6 +1619,7 @@ mod tests {
                     height: rows,
                     evicted: 0,
                     dropped: Some(CastDrops::default()),
+                    resize_undo: None,
                 },
                 events: Vec::new(),
                 live,
@@ -1676,12 +1652,10 @@ mod tests {
             self.t
         }
 
-        /// A 64 -> 63 -> 64-shaped flap (here rows -> rows-1 -> rows), 0.7 ms
-        /// apart, split by output that draws nothing (a mode set, the first
-        /// bytes of a SIGWINCH handler): the app never saw a changed size to
-        /// repaint for, and the output dropped the engine's resize undo, so the
-        /// grow appends and the screen stays shifted. Returns its first
-        /// resize's time.
+        /// A 64 -> 63 -> 64-shaped flap (rows -> rows-1 -> rows), 0.7 ms
+        /// apart, split by output that draws nothing (a mode set): the app sees
+        /// no size change, the output drops the resize undo, and the screen
+        /// stays shifted. Returns the first resize's time.
         fn flap(&mut self, dt: f64) -> f64 {
             let (cols, rows) = (self.live.cols(), self.live.rows());
             let t = self.resize(dt, cols, rows - 1);
@@ -1747,11 +1721,11 @@ mod tests {
         report.drift.iter().map(|d| d.row).collect()
     }
 
-    /// THE INCIDENT, in eight rows: an alt-screen app draws a frame with its
-    /// cursor above a non-blank footer, the window flaps 8 -> 7 -> 8 with only
-    /// a mode set between (nothing drawn), and the app — which never saw a
-    /// size change — sends a diff. Every row but the diffed one is shifted up by one, and the audit
-    /// names the flap and exactly those rows, with what the app believes they say.
+    /// An alt-screen app draws a frame with its cursor above a non-blank
+    /// footer, the window flaps 8 -> 7 -> 8 with only a mode set between, and
+    /// the app sends a diff. Every row but the diffed one is shifted up one;
+    /// the audit names the flap and exactly those rows, with what the app
+    /// believes they say.
     #[test]
     fn drift_finds_a_net_zero_flap_on_the_alt_screen() {
         let mut rec = Rec::new(20, 8, false);
@@ -1809,10 +1783,9 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "cursor live=5,2 expected=5,2");
     }
 
-    /// The incident's flap with NOTHING between its halves, on this engine: the
-    /// resize undo hands the demoted row back, so the live screen is exactly
-    /// what the app believes it drew, and the audit, holding the flap as a
-    /// candidate, finds nothing to attribute to it.
+    /// The same flap with nothing between its halves: the resize undo hands
+    /// the row back, the live screen is what the app believes it drew, and the
+    /// audit finds nothing to attribute.
     #[test]
     fn a_quiet_flap_is_undone_and_drift_is_clean() {
         let mut rec = Rec::new(20, 8, false);
@@ -1839,13 +1812,11 @@ mod tests {
         assert_eq!(report.culprit_word(), fmt_t(split));
     }
 
-    /// THE FLAP TIME SPLIT (review of 2026-09-28, reproduced live): the halves
-    /// of the incident's flap land 1.6 s apart, output that draws nothing (a
-    /// mode set) between them, and the app — whose handler ran only once the
-    /// size had come back — sends a diff. No run holds both halves, so before
-    /// RETURNS the audit had no candidate and called the shifted screen
-    /// `clean`. The shrink is lossy in the faithful journal and the grow brings
-    /// its geometry back: that span is a candidate, and the audit names it.
+    /// A flap split in time: the halves land 1.6 s apart with a mode set
+    /// between, and the app (whose handler ran after the size came back) sends
+    /// a diff. No run holds both halves; the shrink is lossy in the faithful
+    /// journal and the grow restores the geometry, so the span is a return
+    /// candidate and the audit names it.
     #[test]
     fn a_flap_time_split_is_a_return_and_is_named() {
         for gap in [1.6, 0.4] {
@@ -1878,14 +1849,11 @@ mod tests {
         }
     }
 
-    /// The controls for RETURNS. (1) An app that DID read the smaller size and
-    /// repainted every row at it, then every row again once it came back, all
-    /// without clearing: the span is a candidate, and collapsing it lands on
-    /// the same screen — `clean`. (2) Nothing output between the halves: the
-    /// undo handed the row back, the journal holds nothing lossy, no
-    /// candidate. (3) A shrink that stays: the app's to repaint (its handler
-    /// reads a change whenever it runs), replayed as recorded — `clean`, no
-    /// candidate.
+    /// Controls for returns: (1) an app that repainted every row at the
+    /// smaller size and again at the restored size, without clearing: a
+    /// candidate that collapses to the same screen, `clean`; (2) nothing output
+    /// between the halves: the undo restored the row, no candidate; (3) a
+    /// shrink that stays: replayed as recorded, `clean`, no candidate.
     #[test]
     fn a_return_the_app_repainted_through_is_clean_and_a_kept_size_is_no_candidate() {
         let repaint = |rows: usize| {
@@ -1929,13 +1897,11 @@ mod tests {
         assert_eq!((report.runs_total, report.eligible), (1, 0));
     }
 
-    /// A recording made by an aterm BEFORE the resize undo, held against that
-    /// aterm's screen: its quiet flap shifted the screen, which this engine's
-    /// replay cannot reproduce (`unfaithful`). Replayed without the undo
-    /// (`Undo::Drop`, what the client path uses against an aterm older than
-    /// this verb) it is faithful and the flap is named, `undo=off`; `Undo::Match`
-    /// (a saved recording) takes that replay only because it alone reproduces
-    /// the screen, and keeps the undo for a screen this engine made.
+    /// A recording from an aterm without the resize undo, held against its
+    /// screen: this engine's replay is `unfaithful`. Replayed with
+    /// `Undo::Drop` it is faithful and the flap is named (`undo=off`);
+    /// `Undo::Match` takes that replay only because it alone reproduces the
+    /// screen, and keeps the undo for a screen this engine made.
     #[test]
     fn a_recording_from_before_the_undo_replays_without_it() {
         let mut old = Rec::new(20, 8, false);
@@ -1972,8 +1938,10 @@ mod tests {
             assert_eq!(report.folds, folds, "{undo:?}");
         }
 
-        // This engine's screen of the same session: the undo is kept.
+        // This engine's screen of the same session: the undo is kept. Its
+        // recording carries the key, and says nothing of a law on the wire.
         let mut new = Rec::new(20, 8, false);
+        new.header.resize_undo = Some(true);
         new.out(0.1, b"\x1b[?1049h");
         new.out(0.1, &frame("A", 8));
         new.quiet_flap(1.0);
@@ -1985,6 +1953,7 @@ mod tests {
         assert_eq!(report.verdict, Verdict::Clean, "{report:?}");
         assert!(!report.undo_dropped);
         assert_eq!(report.folds, 2, "one engine: its fidelity passed");
+        assert!(!report.render(3, None).contains("undo="));
         // With no screen there is nothing to match: the undo is kept.
         let blind = analyze(
             &old.header,
@@ -1998,6 +1967,63 @@ mod tests {
         );
         assert!(!blind.undo_dropped);
         assert_eq!(blind.verdict, Verdict::Clean, "{blind:?}");
+    }
+
+    /// A recording that SAYS its engine kept the undo (`aterm_resize_undo`) is
+    /// never replayed without it. An engine whose undo failed to hand a row back
+    /// makes exactly the recording the historical law would reproduce, so
+    /// matching it would hide the regression: it stays `unfaithful`, with no
+    /// culprit and no `undo=off`.
+    #[test]
+    fn a_keyed_recording_is_never_replayed_without_the_undo() {
+        let mut broken = Rec::new(20, 8, false);
+        broken.header.resize_undo = Some(true);
+        broken.pre_undo = true;
+        broken.out(0.1, b"\x1b[?1049h");
+        broken.out(0.1, &frame("A", 8));
+        broken.quiet_flap(1.0);
+        broken.out(0.005, &diff(2, "B2"));
+        for undo in [Undo::Keep, Undo::Match] {
+            let report = broken.audit(&DriftArgs {
+                undo,
+                ..DriftArgs::default()
+            });
+            assert_eq!(report.verdict, Verdict::Unfaithful, "{undo:?}: {report:?}");
+            assert!(!report.undo_dropped, "{undo:?}");
+            assert_eq!(report.folds, 2, "{undo:?}: no second law was tried");
+            let wire = report.render(3, Some("client"));
+            assert!(!wire.contains("undo=off"), "{wire}");
+            assert!(!report.candidates.iter().any(|c| c.culprit), "{report:?}");
+        }
+        // The same recording without the key: an older aterm, matched to its
+        // screen.
+        broken.header.resize_undo = None;
+        let report = broken.audit(&DriftArgs {
+            undo: Undo::Match,
+            ..DriftArgs::default()
+        });
+        assert_eq!(report.verdict, Verdict::Desync, "{report:?}");
+        assert!(report.undo_dropped);
+    }
+
+    /// The header key: `1` reads `Some(true)`, `0` `Some(false)`, absent `None`
+    /// (a file from an aterm before the undo), and the rest of the header is read
+    /// as ever.
+    #[test]
+    fn the_resize_law_key_is_read_from_the_header() {
+        let read = |header: &str| {
+            parse_asciicast(&format!("{header}\n[0.1, \"o\", \"hi\"]\n"))
+                .expect("parses")
+                .header
+        };
+        let keyed =
+            read("{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 1}");
+        assert_eq!(keyed.resize_undo, Some(true));
+        assert_eq!((keyed.width, keyed.height), (80, 24));
+        let off = read("{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": 0}");
+        assert_eq!(off.resize_undo, Some(false));
+        let plain = read("{\"version\": 2, \"width\": 80, \"height\": 24}");
+        assert_eq!(plain.resize_undo, None);
     }
 
     /// Claude's healthy case (82 of 83 measured flaps): the app DID see the
@@ -2020,9 +2046,9 @@ mod tests {
         assert!(report.render(0, None).starts_with("OK 0 verdict=clean"));
     }
 
-    /// NEGATIVE CONTROL: with blank rows below the cursor the shrink only trims
-    /// them (nothing moves) and the grow appends one back. The flap IS a
-    /// candidate, and it is correctly found harmless.
+    /// Negative control: with blank rows below the cursor the shrink only trims
+    /// them and the grow appends one back; the flap is a candidate, found
+    /// harmless.
     #[test]
     fn drift_is_clean_when_the_tail_is_blank() {
         let mut rec = Rec::new(20, 8, false);
@@ -2037,9 +2063,9 @@ mod tests {
         assert_eq!(report.culprit_word(), "-");
     }
 
-    /// THE FIDELITY GATE: a recording that lost a burst cannot reproduce the
-    /// screen, and says so (`unfaithful`, rows as live/replayed) — it never
-    /// turns the gap into an accusation against the flap beside it.
+    /// The fidelity gate: a recording that lost a burst cannot reproduce the
+    /// screen and says so (`unfaithful`, rows as live/replayed), never accusing
+    /// the flap beside the gap.
     #[test]
     fn drift_reports_unfaithful_not_desync_when_a_burst_is_missing() {
         let mut rec = Rec::new(20, 8, false);
@@ -2062,9 +2088,8 @@ mod tests {
         assert_eq!(racy.verdict, Verdict::Unknown);
     }
 
-    /// 83 flaps, the first 82 healed by the app's repaint and only the last one
-    /// missed: the anchor (the last clear) bounds the search to that one run,
-    /// so it is the one culprit and the work is two folds, not 84.
+    /// 83 flaps, the first 82 healed by a repaint: the anchor (the last clear)
+    /// bounds the search to the last run, the one culprit, in two folds.
     #[test]
     fn drift_attributes_the_one_culprit_among_many_healed_flaps() {
         let mut rec = Rec::new(20, 8, false);
@@ -2093,10 +2118,10 @@ mod tests {
         assert_eq!(capped.culprit_word(), fmt_t(last));
     }
 
-    /// An ADOPTED session's recording starts mid-app: no `?1049h` in it, while
-    /// the live engine is on the alt screen. The seed follows the live screen,
-    /// so the replay is faithful; forced onto the primary screen (where a flap
-    /// is lossless) the same recording fails the fidelity gate instead.
+    /// An adopted session's recording starts mid-app (no `?1049h`) while the
+    /// live engine is on the alt screen. The seed follows the live screen, so
+    /// the replay is faithful; forced to primary (where a flap is lossless) it
+    /// fails the fidelity gate.
     #[test]
     fn drift_seeds_alt_for_an_adopted_cast() {
         let mut rec = Rec::new(20, 8, true);
@@ -2132,10 +2157,8 @@ mod tests {
         assert!(chosen.seed_alt);
         assert_eq!(chosen.verdict, Verdict::Desync);
         assert_eq!(chosen.folds, 3, "primary FAITHFUL, alt FAITHFUL, STABLE");
-        // No screen at all: nothing says which buffer the recording began on.
-        // The primary replay (where the flap moves nothing) calls it clean, the
-        // alt one a desync: a guessed seed is no finding, so the answer is
-        // `unknown`, `seed=ambiguous`, and `seed=alt` settles it.
+        // No screen: the primary replay calls it clean, the alt one a desync,
+        // so the answer is `unknown`, `seed=ambiguous`; `seed=alt` settles it.
         let blind = analyze(
             &rec.header,
             &rec.events,
@@ -2172,9 +2195,8 @@ mod tests {
         assert_eq!(told.culprit_word(), fmt_t(flap));
     }
 
-    /// Two candidate runs, one harmless (blank tail at the time) and one
-    /// destructive: the faithful replay's journal names the destructive one
-    /// alone, with no attribution fold.
+    /// Two candidates, one harmless (blank tail) and one destructive: the
+    /// journal names the destructive one alone, with no attribution fold.
     #[test]
     fn drift_attributes_between_two_candidates() {
         let mut rec = Rec::new(20, 8, false);
@@ -2192,10 +2214,9 @@ mod tests {
         assert_eq!(report.folds, 2, "FAITHFUL + STABLE: the journal attributes");
     }
 
-    /// A busy app draws BETWEEN the flap's halves (a spinner tick on its
-    /// footer; or the recorder stamped a burst the engine took before the
-    /// flap between its halves): the output does not split the run, which
-    /// stays one net-zero candidate, and the desync is named.
+    /// Output between the flap's halves (a spinner tick, or a burst stamped
+    /// late by the recorder) does not split the run; it stays one net-zero
+    /// candidate and the desync is named.
     #[test]
     fn a_draw_between_the_halves_does_not_hide_the_flap() {
         let mut rec = Rec::new(20, 8, false);
@@ -2216,10 +2237,9 @@ mod tests {
     }
 
     /// Nine flaps with no clear between: the first demotes the top row, the
-    /// eight after it only trim the blank row it left. The verdict weighs every
-    /// candidate (the culprit is the OLDEST, past the default `max_runs` of
-    /// eight), and the journal names that one run alone; a culprit is always
-    /// listed, whatever `max_runs` lists besides.
+    /// rest only trim the blank row it left. Every candidate is weighed (the
+    /// culprit is the oldest, past the default `max_runs` of eight), the
+    /// journal names it alone, and a culprit is always listed.
     #[test]
     fn every_candidate_is_weighed_and_the_journal_names_the_culprit() {
         let mut rec = Rec::new(20, 8, false);
@@ -2254,10 +2274,10 @@ mod tests {
         );
     }
 
-    /// With no lossy alt-screen resize to point at — the PRIMARY screen's
-    /// corner, where a shrink with the cursor on row 0 pushes the bottom row
-    /// into history and the grow reveals it on top, rotating the screen — the
-    /// culprit falls back to the ONLY(r) folds over the newest `max_runs`.
+    /// With no lossy alt-screen resize (the primary screen, where a shrink
+    /// with the cursor on row 0 pushes the bottom row into history and the grow
+    /// reveals it on top), attribution falls back to ONLY(r) folds over the
+    /// newest `max_runs`.
     #[test]
     fn a_primary_rotation_is_attributed_by_the_only_folds() {
         let mut rec = Rec::new(20, 8, false);
@@ -2292,9 +2312,9 @@ mod tests {
         );
     }
 
-    /// A screen that will not hold still (`cut=racy`) is answered with the
-    /// replays against each other: `against=replay fidelity=-`, seeded from the
-    /// live buffer, and the racy cut does not turn that verdict `unknown`.
+    /// A racy screen (`cut=racy`) is answered with the replays against each
+    /// other (`against=replay fidelity=-`, seeded from the live buffer), and
+    /// the racy cut does not make that verdict `unknown`.
     #[test]
     fn a_racy_cut_is_answered_by_the_replays() {
         let mut rec = Rec::new(20, 8, true);
@@ -2323,8 +2343,8 @@ mod tests {
         assert!(head.lines().next().unwrap().contains(" cut=racy "));
     }
 
-    /// Offline with no screen: FAITHFUL stands in for the screen, fidelity
-    /// reads `-`, and the verdict is FAITHFUL against STABLE.
+    /// Offline with no screen: faithful stands in for the screen, fidelity
+    /// reads `-`, and the verdict is faithful against stable.
     #[test]
     fn drift_without_a_screen_compares_the_replays() {
         let mut rec = Rec::new(20, 8, false);
@@ -2370,6 +2390,7 @@ mod tests {
             height: 24,
             evicted: 0,
             dropped: None,
+            resize_undo: None,
         };
         let events: Vec<CastEvent<Vec<u8>>> = Vec::new();
         let report = analyze(
@@ -2389,7 +2410,7 @@ mod tests {
         assert!(report.render(0, None).contains(" dropped=- "));
     }
 
-    /// An alt-screen EXIT after the last clear brings back a screen the clear
+    /// An alt-screen exit after the last clear brings back a screen the clear
     /// never touched, so there is no anchor; the first toggle being an exit
     /// seeds the alt screen.
     #[test]
@@ -2448,6 +2469,7 @@ mod tests {
                 height: 63,
                 evicted: 0,
                 dropped: None,
+                resize_undo: None,
             }
         );
         assert_eq!(cast.events.len(), 5, "the `i` event is skipped");

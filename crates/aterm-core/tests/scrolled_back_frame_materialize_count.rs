@@ -2,78 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! SCR-1 AS A COUNT: a stationary scrolled-back repaint materializes NOTHING.
+//! A stationary scrolled-back repaint materializes no history rows.
 //!
-//! # Why this file exists at all
+//! A scrolled-back viewport keeps its rows in a memo keyed by
+//! `HistoryEpoch`, so repeated frames (pill fade, cursor blink, effects,
+//! selection-drag mouse moves) cost nothing and a wheel notch pays only for
+//! the rows that scrolled in. Counts are exact and machine-independent, so
+//! they guard the structure (a memo that stops memoizing, an O(N) walk, a key
+//! that stops matching); they cannot see a constant-factor slowdown.
 //!
-//! The perf campaign that produced SCR-1 landed ~20 measured wins. What
-//! protects them is `xtask perf`, which is a TIMING gate: it needs a
-//! release build of several harnesses and it is not in the merge contract,
-//! because a per-push timing gate on this box cannot resolve anything smaller
-//! than a couple of milliseconds (the paired-round noise floor) and a hook slow
-//! enough to be bypassed teaches the bypass. So the largest wins of the campaign
-//! shipped with no automatic defender.
+//! Every zero is two-sided: the first scrolled-back frame must materialize the
+//! whole viewport (else the fixture is not reading history), and a notch must
+//! materialize exactly the rows that moved in.
 //!
-//! A COUNT has none of those problems. It is machine-independent, it is exact,
-//! it cannot flake under load, and it rides `cargo test` — and therefore
-//! `tools/verify.sh`, the merge contract — at zero marginal cost. This
-//! crate already had the shape (`aterm_grid::test_counters`); it had simply
-//! never been pointed at the campaign's own numbers.
-//!
-//! That sentence read "`tools/verify.sh --fast` and the pre-push hook" until
-//! 2026-08-31. The second half was false: `.githooks/pre-push` was demoted to
-//! ADVISORY on 2026-08-24 — one printf and `exit 0` — on the very rule quoted
-//! above ("a hook slow enough to be bypassed teaches the bypass"), so
-//! `verify.sh` is the only automatic home this file has.
-//!
-//! WHAT A COUNT CANNOT CATCH, said plainly so nobody reads more into a green run
-//! than it means: a CONSTANT-FACTOR slowdown with the counts unchanged. If
-//! materializing one row gets 3x more expensive, this file stays green — the
-//! frame still materializes zero rows when parked and three on a wheel notch.
-//! Counts catch STRUCTURE (a memo that stopped memoizing, an O(N) walk that came
-//! back, a cache key that stopped matching); the timing lanes catch cost. This
-//! is a floor under the structural half, not a replacement for measurement.
-//!
-//! # The claim, in the numbers the commit reported
-//!
-//! Before SCR-1, a stationary scrolled-back viewport rebuilt all 24 visible rows
-//! from the 3-tier store ON EVERY PRESENTED FRAME — the pill fade, the cursor
-//! blink, an effects frame and every mouse-move of a selection drag each paid a
-//! full viewport of materializations for zero new information. The live-bottom
-//! control paid zero. SCR-1 made the scrolled-back frame pay zero too, and a
-//! wheel notch pay only for the rows that actually scrolled in (24 -> 3).
-//!
-//! # Both sides, always
-//!
-//! A one-sided "it is zero" test passes just as well when the workload never
-//! reached the path — which is how a fence ends up measuring nothing. So the
-//! first scrolled-back frame is asserted to materialize the FULL viewport (the
-//! memo starts cold: if that is not `ROWS`, this fixture is not actually reading
-//! history and every zero below is vacuous), and a wheel notch is asserted to
-//! materialize EXACTLY the rows that moved in.
-//!
-//! # PER-SITE COVERAGE, CHECKED BY MUTATION
-//!
-//! "Delete the memo and watch this go red" is only honest one site at a time.
-//! SCR-1 is a memo hit, a memo store, and a FOUR-FIELD epoch key, and each was
-//! mutated alone:
-//!
-//! | site | mutated alone | caught by |
-//! |------|---------------|-----------|
-//! | the memo HIT (`lookup` early-return) | 24/frame returns | all fixtures |
-//! | the memo STORE | 24/frame returns | all fixtures |
-//! | epoch `content_gen` | stale hits after output | `output_arriving_…` |
-//! | epoch `renumber` | stale hits after a Kitty unscroll | `a_kitty_unscroll_…` (added for exactly this — it was UNCOVERED) |
-//! | epoch `visible_rows` | permanent misses | all fixtures, but MECHANICALLY: `capacity_for(0)` clamps the slot table to 8 for a 24-row viewport, so one viewport's keys collide. It is not a staleness gate. |
-//! | epoch `cols` | NOTHING | nothing — see below |
-//!
-//! `cols` is not a coverage hole, it is an EQUIVALENT MUTANT: a width change
-//! reflows history and `reflow.rs` bumps `content_gen` by hand, so the key is
-//! already invalidated without it. `viewport_row_cache`'s own docs say `cols`
-//! and `visible_rows` are in the key "so the cache cannot be wrong even if some
-//! future resize path forgets to" — defence against a path that does not exist
-//! yet, which no test today can distinguish from its absence. Recorded here so
-//! the next reader does not mistake it for an untested field and delete it.
+//! Key fields covered: the memo hit and store (all fixtures), `content_gen`
+//! (`output_arriving_…`), `renumber` (`a_kitty_unscroll_…`) and `visible_rows`
+//! (all fixtures, through slot-table collisions). `cols` is an equivalent
+//! mutant: a width change reflows history and bumps `content_gen` anyway; it
+//! stays in the key as defence for a future resize path.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -106,7 +52,7 @@ fn filled_terminal() -> Terminal {
     term
 }
 
-/// [`filled_terminal`]'s twin over a TIERED scrollback store, for the one
+/// [`filled_terminal`]'s twin over a tiered scrollback store, for the one
 /// fixture that needs a Kitty unscroll: that path budgets against the tiered
 /// line count and no-ops on a ring-only grid.
 fn filled_tiered_terminal() -> Terminal {
@@ -131,10 +77,8 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
     let mut term = filled_terminal();
     let mut scratch = RenderInput::empty();
 
-    // THE CONTROL. At the live bottom no row is history, so the count is zero
-    // for a reason that has nothing to do with the memo. If this ever moves,
-    // the counter is counting the wrong thing and every assertion below is
-    // measuring something else.
+    // Control: at the live bottom no row is history, so the count is zero
+    // regardless of the memo.
     frame(&mut term, &mut scratch);
     let _ = take_viewport_row_materialize();
     for _ in 0..4 {
@@ -146,14 +90,11 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
         "live-bottom control: a frame at the bottom reads no history at all"
     );
 
-    // REACH. The first scrolled-back frame finds a cold memo and must pay for
-    // the whole viewport PLUS ONE: the M1b incoming-row apron (the row just
-    // below the viewport, `Terminal::apron_row_into`) is read once per offset
-    // change so a sub-row glide can show it in the strip it exposes — and that
-    // read lands in the memo, which is why the wheel notch below still pays
-    // only for the rows that scrolled in. A number below ROWS + 1 here means
-    // the fixture is not reading history — and would make the zeros below
-    // prove nothing.
+    // Reach. The first scrolled-back frame finds a cold memo and pays for the
+    // whole viewport plus one: the incoming-row apron (the row just below the
+    // viewport, `Terminal::apron_row_into`) is read once per offset change and
+    // lands in the memo too. Fewer than ROWS + 1 means the fixture is not
+    // reading history.
     term.scroll_display(DEPTH);
     frame(&mut term, &mut scratch);
     assert_eq!(
@@ -164,7 +105,7 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
          reached the SCR-1 path"
     );
 
-    // THE CLAIM. Every repaint after that, with the viewport motionless, is
+    // The claim. Every repaint after that, with the viewport motionless, is
     // free. This is 24-per-frame -> 0, and it is what the pill fade, the cursor
     // blink, an effects frame and a selection drag all stopped paying.
     for _ in 0..16 {
@@ -187,11 +128,9 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
     frame(&mut term, &mut scratch);
     let _ = take_viewport_row_materialize();
 
-    // A NOTCH brings exactly NOTCH new absolute rows into the viewport; the
-    // other ROWS - NOTCH keys are still in the memo and must hit. This is the
-    // "24 -> 3" half of SCR-1 and it is the assertion that would catch a memo
-    // keyed on viewport POSITION instead of row IDENTITY — such a memo passes
-    // the stationary test above and fails this one with ROWS.
+    // A notch brings exactly NOTCH new absolute rows into the viewport; the
+    // other ROWS - NOTCH keys must hit. A memo keyed on viewport position
+    // instead of row identity passes the stationary test and fails here.
     term.scroll_display(NOTCH);
     frame(&mut term, &mut scratch);
     let moved = take_viewport_row_materialize();
@@ -211,11 +150,8 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
     );
 }
 
-/// The memo must not survive a CONTENT change, and the count is how that is
-/// visible: output arriving while scrolled back moves the history under the
-/// viewport, so the next frame has to pay again. A memo that stayed "free" here
-/// would be serving stale glyphs — the failure mode SCR-1's epoch key exists to
-/// make impossible, pinned from the cost side.
+/// Output arriving while scrolled back moves the history under the viewport,
+/// so the next frame pays again: the memo must not serve stale glyphs.
 #[test]
 fn output_arriving_while_scrolled_back_reopens_the_bill() {
     let mut term = filled_terminal();
@@ -235,29 +171,18 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
     );
 }
 
-/// SITE COVERAGE — the `history_renumber_epoch` half of the memo key, which
-/// `content_gen` cannot stand in for.
+/// The `history_renumber_epoch` half of the memo key, which `content_gen`
+/// cannot stand in for.
 ///
-/// A Kitty CSI `+T` unscroll removes the NEWEST scrollback lines. Every older
-/// row keeps its content, but its ABSOLUTE key shifts wholesale, and
-/// `scroll_unscroll.rs` says in so many words that "no content_gen / damage /
-/// absolute-row-revision signal distinguishes this wholesale renumbering from an
-/// ordinary append batch". `history_renumber_epoch` is therefore the ONLY thing
-/// between the memo and a viewport of rows served under someone else's number.
-///
-/// It was uncovered. Dropping `renumber` from `HistoryEpoch` — measured, one
-/// field at a time — left every other assertion in this file green: the
-/// stationary test never renumbers, the notch test only moves the viewport, and
-/// `content_gen` is what `output_arriving_…` moves. A key field nothing
-/// exercises is a key field a refactor deletes.
+/// A Kitty CSI `+T` unscroll removes the newest scrollback lines: older rows
+/// keep their content but their absolute keys shift wholesale, and no
+/// content_gen, damage or row-revision signal distinguishes that from an
+/// append. Without `renumber` in `HistoryEpoch` every other test here stays
+/// green.
 #[test]
 fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
-    // A TIERED store with a tiny ring, unlike the other fixtures. Since
-    // 2026-09-12 `unscroll_from_scrollback` pulls history's newest lines from
-    // the ring above the viewport and then the store, so a ring-only grid
-    // unscrolls too; this fixture dates from when only the store was read
-    // (a ring-only grid then blank-scrolled and removed nothing), and it keeps
-    // most of the corpus in the tiers.
+    // A tiered store with a tiny ring, so most of the corpus sits in the tiers
+    // (`unscroll_from_scrollback` reads the ring, then the store).
     let mut term = filled_tiered_terminal();
     let mut scratch = RenderInput::empty();
     term.scroll_display(DEPTH);
@@ -266,7 +191,7 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
     frame(&mut term, &mut scratch);
     assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
 
-    // REACH, four ways — this fixture only proves anything while ALL of these
+    // Reach, four ways — this fixture only proves anything while all of these
     // hold, and three of them are the exact conditions that make the renumber
     // epoch the sole authority.
     let lines_before = term.grid().scrollback_lines();
@@ -300,7 +225,7 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
         "the absolute counter moved, so every memo key shifted on its own and \
          the misses below would prove nothing about the epoch"
     );
-    // The viewport keeps its depth across the unscroll, so the SAME 24 absolute
+    // The viewport keeps its depth across the unscroll, so the same 24 absolute
     // keys are asked for again — while the line each one names has shifted by
     // the three the unscroll pulled back onto the screen. Same keys, different
     // rows: the collision `history_renumber_epoch` exists to prevent.
@@ -311,7 +236,7 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
          different key set and would miss for reasons of its own"
     );
 
-    // Attribute the count to the FRAME: whatever the unscroll itself read is
+    // Attribute the count to the frame: whatever the unscroll itself read is
     // not what this fixture is claiming anything about.
     let _ = take_viewport_row_materialize();
     frame(&mut term, &mut scratch);

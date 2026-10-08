@@ -3,12 +3,10 @@
 
 //! `ArrayVec<T, N>`: fixed-capacity inline-only storage.
 //!
-//! The implementation names only `core` items, and the crate root is
-//! `#![no_std]`, so the compiler enforces that. It matters because
-//! `crates/aterm-arrayvec` republishes this type under the package name
-//! `arrayvec`, and three of the six third-party consumers of that package
-//! (`naga`, `tiny-skia`, `vte`) are `no_std`-capable and take it with
-//! `default-features = false`.
+//! The implementation names only `core` items and the crate root is
+//! `#![no_std]`: `crates/aterm-arrayvec` republishes this type as `arrayvec`,
+//! and some of its third-party consumers (`naga`, `tiny-skia`) take it
+//! with `default-features = false`.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -18,7 +16,7 @@ use core::ops::{Bound, Deref, DerefMut, RangeBounds};
 /// A fixed-capacity vector stored entirely on the stack.
 ///
 /// Never allocates on the heap. Panics if you try to push beyond capacity `N`.
-/// Used in the parser for CSI params (N=16) and intermediates (N=4).
+/// Used in the parser for CSI params (N = `MAX_PARAMS` = 24) and intermediates (N = 4).
 pub struct ArrayVec<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     len: usize,
@@ -29,11 +27,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            // An array of `MaybeUninit` needs no initialization. Build it with an
-            // inline-const element (stable) rather than `MaybeUninit::uninit()
-            // .assume_init()` — there is then no `unsafe`/`assume_init` obligation
-            // for the Trust verifier to refute (it cannot see that the outer array's
-            // elements are themselves `MaybeUninit`).
+            // An inline-const array of `MaybeUninit` needs no `assume_init`, so
+            // there is no `unsafe` obligation for the Trust verifier.
             buf: [const { MaybeUninit::uninit() }; N],
             len: 0,
         }
@@ -82,38 +77,31 @@ impl<T, const N: usize> ArrayVec<T, N> {
     /// # Panics
     ///
     /// Panics if `len == N`.
-    // AUDITED CONTRACT PANIC (T9): `push` beyond capacity panics BY DOCUMENTED
-    // CONTRACT (the ArrayVec API promise); callers that cannot uphold `len < N`
-    // use `try_push`. The declaration reclassifies the refuted panic-freedom
-    // obligation into the visible `contract-panic` gate column.
+    // Audited contract panic: `push` beyond capacity panics by the documented
+    // ArrayVec contract; callers that cannot uphold `len < N` use `try_push`.
+    // The declaration files the obligation under the `contract-panic` column.
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "ArrayVec overflow")
     )]
-    // `#[track_caller]` so a capacity panic names the CALLER's line, not this
-    // file's. Upstream `arrayvec` marks `push`/`insert`/`extend`/`from_iter`
-    // the same way, and the shim inherits the attribute through the re-export:
-    // without it every overflow in the patched graph would report
-    // `crates/aterm-alloc/src/array_vec.rs:<line>` and read as an aterm bug
-    // rather than the wgpu/naga limit violation it is.
+    // `#[track_caller]` so a capacity panic names the caller's line (as
+    // upstream `arrayvec` does); the shim inherits it through the re-export,
+    // so an overflow in the patched graph points at the real caller.
     #[track_caller]
     pub fn push(&mut self, value: T) {
-        // Guard on a LOCAL copy of `len`: the verifier is a modular open-model
-        // checker that reloads `self.len` at every field read, so only a local
-        // carries the `len < N` fact to the index and the increment. Behavior
-        // is identical — same store, same increment, same panic when full.
+        // Guard on a local copy of `len`: the open-model verifier reloads
+        // `self.len` at every field read, so only a local carries `len < N` to
+        // the index and the increment.
         let len = self.len;
         if len < N {
             self.buf[len] = MaybeUninit::new(value);
-            // `len < N <= usize::MAX` means the increment cannot wrap; the
-            // wrapping form only removes the overflow obligation the verifier
-            // cannot discharge across the const-generic bound.
+            // `len < N <= usize::MAX`, so the increment cannot wrap; the
+            // wrapping form removes an overflow obligation the verifier cannot
+            // discharge across the const-generic bound.
             self.len = len.wrapping_add(1);
         } else {
-            // Const message (not `{N}`-formatted): the contract_panic matcher
-            // chases `Arguments::from_str` one level and can only bind a const
-            // string. Same contract violation, same panic — only the panic
-            // text loses the capacity value.
+            // A const message (not `{N}`-formatted) so the contract_panic
+            // matcher can bind it.
             panic!("ArrayVec overflow: capacity exceeded");
         }
     }
@@ -122,23 +110,14 @@ impl<T, const N: usize> ArrayVec<T, N> {
     ///
     /// # Errors
     ///
-    /// Returns the element back inside a [`CapacityError`] when `len == N`.
-    ///
-    /// The error type is `CapacityError<T>` rather than a bare `T` so that the
-    /// signature is upstream `arrayvec`'s to the letter — see the module docs
-    /// of `crates/aterm-arrayvec`. No caller in this workspace or in the
-    /// patched graph used the old `Result<(), T>` form, so the change is
-    /// source-compatible with everything that exists.
+    /// Returns the element back inside a [`CapacityError`] when `len == N`
+    /// (upstream `arrayvec`'s signature).
     pub fn try_push(&mut self, value: T) -> Result<(), CapacityError<T>> {
-        // Same local-copy idiom as `push` (above): the open-model verifier
-        // reloads `self.len` at every field read, so only a local carries the
-        // `len < N` fact to the index and the increment. Behavior-identical.
+        // Same local-copy idiom as `push`.
         let len = self.len;
         if len < N {
             self.buf[len] = MaybeUninit::new(value);
-            // `len < N <= usize::MAX`: the increment cannot wrap; the
-            // wrapping form only removes the overflow obligation the
-            // verifier cannot discharge across the const-generic bound.
+            // `len < N <= usize::MAX`: the increment cannot wrap.
             self.len = len.wrapping_add(1);
             Ok(())
         } else {
@@ -147,35 +126,23 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Pop the last element.
-    // Skip (this crate's one memory-model row): proving the popped slot is
-    // INITIALIZED before `assume_init_read` needs per-slot init tracking the
-    // toolchain does not yet have (the proof-unit memory-model producer
-    // lane). The invariant is crate-local and audited: `len` counts exactly
-    // the initialized prefix — the only writers are `push`/`try_push`
-    // (verified in-bounds writes that increment `len` only AFTER
-    // initializing `buf[len]`) and `pop` (decrements before reading below
-    // the old `len`); round-trip unit tests cover the boundary. Verify-only;
-    // behavior unchanged. Re-measured 2026-09-27 on seal 321aaeda7 with this
-    // skip removed: VIOLATIONS (2 of 4 obligations refuted — the false
-    // refutation per-slot tracking would close). Needed from $HOME/trust, in a
-    // promoted seal: per-slot `MaybeUninit` init tracking; then drop this and
-    // the same family's skips below (`targo trust check -p aterm-alloc --lib
-    // --allow-l0-gaps`).
+    // Skip: proving the popped slot is initialized before `assume_init_read`
+    // needs per-slot `MaybeUninit` init tracking the verifier lacks. Invariant:
+    // `len` counts exactly the initialized prefix; `push`/`try_push` increment
+    // `len` only after initializing `buf[len]`, and `pop` decrements before
+    // reading.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn pop(&mut self) -> Option<T> {
-        // Same local-copy idiom as `push`/`try_push` (above); wrapping_sub is
-        // exact under the `len != 0` guard and removes the underflow
-        // obligation the verifier cannot chain through the field re-read.
+        // Same local-copy idiom as `push`; `wrapping_sub` is exact under the
+        // `len != 0` guard.
         let len = self.len;
         if len == 0 {
             None
         } else {
             let idx = len.wrapping_sub(1);
-            // `get` (not `buf[idx]`): the struct invariant `len <= N` cannot
-            // cross the open-model havoc of `self.len`, so a direct index
-            // carries an undischargeable bounds obligation; `get` is total
-            // and its `None` arm is unreachable in every real state — same
-            // value, same one bounds check at runtime.
+            // `get`, not `buf[idx]`: `len <= N` cannot cross the verifier's
+            // havoc of `self.len`, and `get`'s `None` arm is unreachable in
+            // every real state (same single bounds check at runtime).
             match self.buf.get(idx) {
                 Some(slot) => {
                     self.len = idx;
@@ -190,13 +157,10 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Replace all contents with a single element.
     ///
-    /// Equivalent to `clear(); push(value);` — panics for `N == 0` exactly
-    /// as `push` on a full vec does (the same documented capacity contract).
-    // AUDITED CONTRACT PANIC (T9): same "ArrayVec overflow" contract as
-    // `push`; reachable only for an `N == 0` instantiation (none exist in
-    // this workspace). The `try_push` spelling carries the verified bounds
-    // proof; the direct `buf[0]` store it replaces was refuted by the
-    // verifier at symbolic `N = 0` — the same panic, now annotation-bound.
+    /// Equivalent to `clear(); push(value);`; panics for `N == 0` by the same
+    /// capacity contract as `push`.
+    // Audited contract panic: the same "ArrayVec overflow" contract as `push`,
+    // reachable only for an `N == 0` instantiation (none exist here).
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "ArrayVec overflow")
@@ -211,27 +175,18 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Clear all elements.
-    // Skip: the same crate-local init-tracking class as `pop` above —
-    // proving each dropped slot is INITIALIZED needs the per-slot
-    // memory-model producer; the audited invariant (`len` counts exactly
-    // the initialized prefix; the clamp keeps the subslice in-bounds) is
-    // documented on the SAFETY comment below. Droppable with `pop`'s.
+    // Skip: the same init-tracking class as `pop`; the audited invariant is on
+    // the SAFETY comment below.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
-        // `len <= N` by invariant, but the verifier cannot see that across calls,
-        // so clamp to a provably in-bounds count (identical when the invariant
-        // holds), then iterate the clamped subslice: the single slice operation
-        // carries the `n <= N` proof and the loop has no per-index obligation.
+        // Clamp to a provably in-bounds count (identical when `len <= N`
+        // holds) so the subslice carries the bound and the loop has no
+        // per-index obligation.
         let n = if self.len < N { self.len } else { N };
-        // LENGTH FIRST, AND THAT ORDER IS A SAFETY REQUIREMENT, not a style.
-        // If an element's `Drop` PANICS partway through the loop below, unwinding
-        // runs `Drop for ArrayVec`, which calls this same `clear`. With `len`
-        // still describing the old contents, that second pass re-drops every
-        // slot the first pass already dropped — a double free. Zeroing `len`
-        // before any destructor runs makes the re-entrant call a no-op.
-        // The cost is that the not-yet-dropped tail LEAKS when a destructor
-        // panics; leaking is safe and double-dropping is not, which is the
-        // trade upstream `arrayvec` makes for the same reason.
+        // Zero `len` before any destructor runs: if an element's `Drop` panics,
+        // unwinding runs `Drop for ArrayVec`, which calls this `clear` again;
+        // with the old `len` it would double-drop. The not-yet-dropped tail
+        // leaks instead, which is safe (upstream `arrayvec` does the same).
         self.len = 0;
         for slot in &mut self.buf[..n] {
             // SAFETY: elements `0..n` were initialized when pushed and
@@ -245,23 +200,15 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Truncate to the given length.
-    // Skip: same crate-local init-tracking class as `pop`/`clear` above —
-    // the drop-initialized-suffix loop needs the per-slot memory-model
-    // producer. Same audited len-invariant; droppable with theirs.
+    // Skip: same init-tracking class as `pop`/`clear`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn truncate(&mut self, new_len: usize) {
         if new_len < self.len {
-            // `len <= N` by invariant, but the verifier cannot see that across
-            // calls, so clamp both slice bounds to provably in-bounds values
-            // (identical when the invariant holds: `new_len < len <= N`), then
-            // iterate the clamped subslice — the slice operation carries the
-            // `start <= end <= N` proof and the loop has no per-index obligation.
+            // Clamp both bounds to provably in-bounds values (identical when
+            // `new_len < len <= N`) so the subslice carries the bound.
             let end = if self.len < N { self.len } else { N };
             let start = if new_len < end { new_len } else { end };
-            // LENGTH FIRST — same panic-safety requirement as `clear` above: a
-            // destructor that panics inside the loop unwinds into
-            // `Drop for ArrayVec` -> `clear`, which would re-drop this range if
-            // `len` still covered it.
+            // Length first, for the same panic-safety reason as `clear`.
             self.len = new_len;
             for slot in &mut self.buf[start..end] {
                 // SAFETY: elements `start..end` were initialized when pushed
@@ -278,16 +225,12 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// View as a slice.
     #[must_use]
-    // Skip: the raw-parts reconstruction is the same crate-local init/
-    // provenance class as `pop`/`clear`/`truncate` (the null/bounds facts of
-    // `init.as_ptr()` don't cross the unsafe cast in the sep model). Same
-    // audited len-invariant; droppable with theirs.
+    // Skip: the raw-parts reconstruction is in the same init/provenance class
+    // as `pop`/`clear`/`truncate`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_slice(&self) -> &[T] {
-        // `len <= N` by invariant; clamp to a provably in-bounds length (a no-op
-        // when the invariant holds) and take the initialized subslice first —
-        // the safe slice operation carries the `n <= N` proof, and the raw-parts
-        // reconstruction below reuses that subslice's own pointer and length.
+        // Clamp to a provably in-bounds length and take the initialized
+        // subslice; the raw-parts reconstruction reuses its pointer and length.
         let n = if self.len < N { self.len } else { N };
         let init: &[MaybeUninit<T>] = &self.buf[..n];
         // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the pointer and
@@ -300,10 +243,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // Skip: same class as `as_slice` above.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        // `len <= N` by invariant; clamp to a provably in-bounds length (a no-op
-        // when the invariant holds) and take the initialized subslice first —
-        // the safe slice operation carries the `n <= N` proof, and the raw-parts
-        // reconstruction below reuses that subslice's own pointer and length.
+        // Clamp to a provably in-bounds length and take the initialized
+        // subslice; the raw-parts reconstruction reuses its pointer and length.
         let n = if self.len < N { self.len } else { N };
         let init: &mut [MaybeUninit<T>] = &mut self.buf[..n];
         // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the pointer and
@@ -327,10 +268,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
     /// # Panics
     ///
     /// Panics if `index > len` or if the array is full.
-    // Skip: the raw `ptr::copy` element shift + `ptr::write` carry the same
-    // crate-local init/provenance class as `pop`/`clear`/`as_slice` (the
-    // sep model cannot see the shifted region's bounds across the raw ops).
-    // Same audited len-invariant; droppable with theirs.
+    // Skip: the raw `ptr::copy` shift and `ptr::write` are in the same
+    // init/provenance class as `pop`/`clear`/`as_slice`.
     #[cfg_attr(trust_verify, trust::skip)]
     #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
@@ -339,9 +278,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
             "index out of bounds: {index} > {}",
             self.len
         );
-        // Const message (not `{N}`-formatted) so the contract_panic matcher
-        // can bind it; same contract violation, same panic — only the panic
-        // text loses the capacity value.
+        // Const message so the contract_panic matcher can bind it.
         assert!(self.len < N, "ArrayVec overflow: capacity exceeded");
 
         // SAFETY: we checked bounds and capacity above
@@ -358,10 +295,7 @@ impl<T, const N: usize> ArrayVec<T, N> {
     /// # Panics
     ///
     /// Panics if `index >= len`.
-    // Skip: the raw element shift joins `insert`'s init/provenance
-    // classification (pop/clear/as_slice family — the sep model cannot see
-    // the shifted region's bounds across the raw ops). Same audited
-    // len-invariant; droppable with theirs.
+    // Skip: the raw element shift is in `insert`'s init/provenance class.
     #[cfg_attr(trust_verify, trust::skip)]
     #[track_caller]
     pub fn remove(&mut self, index: usize) -> T {
@@ -383,16 +317,11 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Retain only elements where the predicate returns true.
     ///
-    /// Panic-safe: if the predicate panics, all elements that have already
-    /// been processed are in a valid state and will be dropped correctly.
-    ///
-    /// The predicate takes `&mut T`, matching upstream `arrayvec`'s
-    /// `retain<F>(&mut self, f: F) where F: FnMut(&mut T) -> bool`. A closure
-    /// that only reads still infers the right argument type, so every
-    /// `retain(|x| …)` spelling keeps compiling.
-    // Skip: the compaction's raw element shift joins insert/remove's
-    // init/provenance classification; `F: FnMut` is caller-chosen code
-    // besides (the user-T dispatch class). Same audited len-invariant.
+    /// Panic-safe: if the predicate panics, processed elements are in a valid
+    /// state and are dropped correctly. The predicate takes `&mut T`, as
+    /// upstream `arrayvec`'s does.
+    // Skip: the compaction's raw shift is in insert/remove's class, and
+    // `F: FnMut` is caller-chosen code.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn retain<F: FnMut(&mut T) -> bool>(&mut self, mut f: F) {
         let original_len = self.len;
@@ -409,14 +338,10 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
         impl<T, const N: usize> Drop for RetainGuard<'_, T, N> {
             fn drop(&mut self) {
-                // Elements 0..write are the retained (initialized) elements.
-                // Elements write..read have already been processed (moved or
-                // dropped). Elements read..original_len have NOT been processed
-                // — drop them now. `read <= original_len <= N` by invariant;
-                // clamp both slice bounds so they are provably in bounds
-                // (identical when the invariant holds), then iterate the
-                // clamped subslice — the slice operation carries the
-                // `start <= end <= N` proof, no per-index obligation remains.
+                // 0..write are retained, write..read already processed,
+                // read..original_len not processed: drop them now. Both bounds
+                // are clamped (identical when the invariant holds) so the
+                // subslice carries the proof.
                 let end = if self.original_len < N {
                     self.original_len
                 } else {
@@ -472,21 +397,16 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Append every element of `other`, cloning each.
     ///
-    /// A deliberate SUPERSET: upstream `arrayvec` keeps its `extend_from_slice`
-    /// `pub(crate)` (arrayvec-0.7.6/src/arrayvec.rs:1116) and exposes only
-    /// [`try_extend_from_slice`](Self::try_extend_from_slice). This one is
-    /// public because `clone_from` and the shim's tests want the panicking
-    /// form by name; behaviourally it is upstream's `extend` over a slice, and
-    /// `crates/aterm-alloc/tests/arrayvec_differential.rs` asserts exactly that.
+    /// Public, unlike upstream's `pub(crate)` version, for `clone_from` and the
+    /// shim's tests; behaves as upstream's `extend` over a slice
+    /// (`crates/aterm-alloc/tests/arrayvec_differential.rs`).
     ///
     /// # Panics
     ///
-    /// Panics if the slice does not fit in the remaining capacity — the same
-    /// contract as [`push`](Self::push), and the same contract as upstream
-    /// `arrayvec::ArrayVec::extend_from_slice`.
-    // AUDITED CONTRACT PANIC (T9): delegates to `push`, whose overflow panic is
-    // the documented ArrayVec capacity contract; `try_extend_from_slice` is the
-    // non-panicking form.
+    /// Panics if the slice does not fit in the remaining capacity, the same
+    /// contract as [`push`](Self::push).
+    // Audited contract panic: delegates to `push`; `try_extend_from_slice` is
+    // the non-panicking form.
     #[cfg_attr(
         trust_verify,
         trust::contract_panic(message_contains = "ArrayVec overflow")
@@ -506,9 +426,8 @@ impl<T, const N: usize> ArrayVec<T, N> {
     ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] and appends NOTHING when
-    /// `other.len() > remaining_capacity()` — the all-or-nothing behaviour of
-    /// upstream `arrayvec::ArrayVec::try_extend_from_slice`.
+    /// Returns [`CapacityError`] and appends nothing when
+    /// `other.len() > remaining_capacity()` (upstream's all-or-nothing rule).
     pub fn try_extend_from_slice(&mut self, other: &[T]) -> Result<(), CapacityError>
     where
         T: Clone,
@@ -520,15 +439,12 @@ impl<T, const N: usize> ArrayVec<T, N> {
         Ok(())
     }
 
-    /// Return the inner fixed-size array, but only if the vec is FULL.
+    /// Return the inner fixed-size array, but only if the vec is full.
     ///
     /// # Errors
     ///
-    /// Returns `Err(self)` when `len < N`. The polarity is upstream's and it
-    /// is load-bearing: `naga`'s constant evaluator spells this
-    /// `.into_inner().unwrap()` and relies on the panic to reject a
-    /// short vector component list. Returning an `Ok` with a default-filled
-    /// tail would compile everywhere and emit shaders built from garbage.
+    /// Returns `Err(self)` when `len < N`. `naga`'s constant evaluator relies
+    /// on `.into_inner().unwrap()` panicking to reject a short component list.
     // Skip: `into_inner_unchecked` below carries the memory-model obligation;
     // this arm is a pure `len` comparison.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -547,15 +463,13 @@ impl<T, const N: usize> ArrayVec<T, N> {
     /// # Safety
     ///
     /// Sound if and only if `len == N`.
-    // Skip (the pop/clear/as_slice init-tracking family): proving every slot
-    // is INITIALIZED before the whole-array `ptr::read` needs the per-slot
-    // memory-model producer. Same audited invariant — `len` counts exactly the
-    // initialized prefix — plus the caller's `len == N` obligation.
+    // Skip (the init-tracking family): the whole-array `ptr::read` relies on
+    // the len invariant plus the caller's `len == N` obligation.
     #[cfg_attr(trust_verify, trust::skip)]
     pub unsafe fn into_inner_unchecked(self) -> [T; N] {
         debug_assert_eq!(self.len, N, "into_inner_unchecked on a non-full ArrayVec");
         // `ManuallyDrop` first: the array is moved out wholesale, so `Drop for
-        // ArrayVec` must NOT also run over the same slots.
+        // ArrayVec` must not also run over the same slots.
         let me = ManuallyDrop::new(self);
         // SAFETY: `[MaybeUninit<T>; N]` has the same layout as `[T; N]`, the
         // caller guarantees all `N` slots are initialized, and `me` will not be
@@ -565,10 +479,9 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Remove `range` from the vec and yield the removed elements.
     ///
-    /// The tail is closed up as the iterator runs, so the vec is in a valid,
-    /// correctly-shortened state at every point — including if the [`Drain`]
-    /// is dropped early, and including if it is `mem::forget`ten (see the
-    /// divergence note on [`Drain`]).
+    /// The tail closes up as the iterator runs, so the vec is valid and
+    /// correctly shortened at every point, including when the [`Drain`] is
+    /// dropped early or forgotten.
     ///
     /// # Panics
     ///
@@ -627,11 +540,9 @@ impl<T: Clone, const N: usize> Clone for ArrayVec<T, N> {
         new
     }
 
-    /// Overridden (the trait default would `drop` every existing element and
-    /// rebuild) so that the common prefix is `clone_from`-ed in place, exactly
-    /// as upstream `arrayvec` does. The observable result is identical; what
-    /// changes is the per-call cost, and `wgpu-hal`'s GLES backend calls this
-    /// on every pipeline bind (`gles/command.rs:238`).
+    /// Clones the common prefix in place rather than dropping and rebuilding,
+    /// as upstream does; `wgpu-hal`'s GLES backend calls this on every pipeline
+    /// bind.
     fn clone_from(&mut self, source: &Self) {
         let prefix = if self.len < source.len {
             self.len
@@ -672,9 +583,8 @@ impl<T, const N: usize> Drop for ArrayVec<T, N> {
 }
 
 impl<T, const N: usize> FromIterator<T> for ArrayVec<T, N> {
-    // Skip: `I: IntoIterator` is CALLER-CHOSEN code — `next` is an open-trait
-    // dispatch on a type parameter (user-T class); `push`'s capacity contract
-    // is the documented panic.
+    // Skip: `I: IntoIterator` is caller-chosen code; `push`'s capacity
+    // contract is the documented panic.
     #[cfg_attr(trust_verify, trust::skip)]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut av = Self::new();
@@ -689,11 +599,9 @@ impl<T, const N: usize> FromIterator<T> for ArrayVec<T, N> {
 
 /// The element did not fit.
 ///
-/// Upstream `arrayvec`'s error type, reproduced so that
-/// [`ArrayVec::try_push`] and [`ArrayVec::try_extend_from_slice`] have
-/// upstream's exact signatures. `Debug` and `Display` are hand-written and do
-/// NOT require `T: Debug`, matching upstream: the payload is deliberately not
-/// printed, because it is frequently a value whose `Debug` is enormous.
+/// Upstream `arrayvec`'s error type, so [`ArrayVec::try_push`] and
+/// [`ArrayVec::try_extend_from_slice`] have upstream's signatures. `Debug` and
+/// `Display` do not require `T: Debug` and never print the payload.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CapacityError<T = ()> {
     element: T,
@@ -734,24 +642,16 @@ impl<T> fmt::Debug for CapacityError<T> {
     }
 }
 
-// DIVERGENCE, deliberate and a strict superset: upstream gates this impl on its
-// `std` feature, because `Error` lived only in `std` when 0.7.6 was written.
-// `core::error::Error` is stable now, so the impl is unconditional here. Every
-// program that compiled against upstream's still compiles; programs that would
-// have failed under `default-features = false` now succeed. The `T: Any` bound
-// is upstream's, kept so the two impls select identically.
+// Unconditional, unlike upstream's `std`-gated impl: `core::error::Error` is
+// stable, so this is a strict superset. The `T: Any` bound is upstream's.
 
 impl<T: core::any::Any> core::error::Error for CapacityError<T> {}
 
 // ── Hash ────────────────────────────────────────────────────────────────────
 
-// DELEGATES TO THE SLICE, and that is the whole point. `&**self` is exactly
-// `len` elements; hashing the backing `[MaybeUninit<T>; N]` would read
-// uninitialized memory while still satisfying the Hash/Eq contract within a
-// single process — i.e. it would pass every test and be UB. `wgpu-hal`'s
-// `ProgramCacheKey`, `RenderPassKey` and `FramebufferKey` and `wgpu-core`'s
-// `AttachmentData` are all `HashMap` keys that reach here through
-// `#[derive(Hash)]`.
+// Hashes the `len` initialized elements through the slice; hashing the backing
+// `[MaybeUninit<T>; N]` would read uninitialized memory. `wgpu-hal` and
+// `wgpu-core` use ArrayVec-holding types as `HashMap` keys.
 impl<T: Hash, const N: usize> Hash for ArrayVec<T, N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Hash::hash(&**self, state);
@@ -760,19 +660,12 @@ impl<T: Hash, const N: usize> Hash for ArrayVec<T, N> {
 
 // ── Extend ──────────────────────────────────────────────────────────────────
 
-/// PANICS on overflow; it does not truncate.
-///
-/// This is the single most consequential line in the file. A fixed-capacity
-/// `extend` that quietly stopped at capacity would compile everywhere and never
-/// fire: `wgpu-hal`'s DXC path (`dx12/shader_compilation.rs:388`) would drop
-/// compiler arguments and silently change how every HLSL shader is built, and
-/// `wgpu-core`'s texture-to-texture copy (`command/transfer.rs:1462`) would
-/// drop the destination barrier and race the GPU. Upstream panics; so does
-/// this, via `push`.
+/// Panics on overflow; it does not truncate. A silently truncating `extend`
+/// would drop `wgpu-hal`'s DXC compiler arguments or `wgpu-core`'s copy
+/// barriers. Upstream panics too, via `push`.
 impl<T, const N: usize> Extend<T> for ArrayVec<T, N> {
-    // AUDITED CONTRACT PANIC (T9): the overflow panic is `push`'s documented
-    // capacity contract, reached through caller-chosen `I: IntoIterator` code
-    // (the user-T dispatch class, as in `FromIterator` above).
+    // Audited contract panic: `push`'s capacity contract, reached through
+    // caller-chosen `I: IntoIterator` code.
     #[cfg_attr(trust_verify, trust::skip)]
     #[track_caller]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
@@ -784,11 +677,9 @@ impl<T, const N: usize> Extend<T> for ArrayVec<T, N> {
 
 // ── Iteration ───────────────────────────────────────────────────────────────
 
-// `for x in &av` and `for x in &mut av` need these EXPLICITLY: trait selection
-// happens before autoderef, so `Deref<Target = [T]>` does not satisfy either
-// loop. Both bound the walk by `len` (through `as_slice`/`as_mut_slice`), never
-// by `N` — `tiny-skia`'s `pipeline/mod.rs:407` writes through every element it
-// visits, so a `0..N` walk would write into uninitialized slots.
+// `for x in &av` and `for x in &mut av` need these explicitly: trait selection
+// happens before autoderef. Both walk `len` elements, never `N` (`tiny-skia`
+// writes through every element it visits).
 impl<'a, T, const N: usize> IntoIterator for &'a ArrayVec<T, N> {
     type Item = &'a T;
     type IntoIter = core::slice::Iter<'a, T>;
@@ -818,26 +709,11 @@ impl<T, const N: usize> IntoIterator for ArrayVec<T, N> {
 
 /// By-value iterator for [`ArrayVec`], produced by `IntoIterator`.
 ///
-/// # Why this owns an `ArrayVec` and moves elements out with `remove(0)`
-///
-/// The dangerous way to write this type is an index cursor plus a hand-rolled
-/// `Drop` that drops the un-yielded remainder. Get that `Drop` wrong in one
-/// direction and every early `return` out of a `for ra in self.render_attachments`
-/// (`wgpu-core/src/command/render.rs:1532`) leaks an `Arc<Texture>` — no panic,
-/// no failing test, just VRAM that never comes back. Get it wrong in the other
-/// direction and it double-frees.
-///
-/// Holding the `ArrayVec` itself removes the failure mode instead of testing
-/// for it: the un-yielded elements are exactly the elements still in the vec,
-/// so `ArrayVec`'s own already-audited `Drop` drops each of them exactly once
-/// and there is no second drop path to get wrong. There is no `impl Drop` on
-/// this type at all, and no `unsafe` in it.
-///
-/// The cost is that forward iteration is O(n²) in element moves rather than
-/// O(n), because each `next` shifts the tail down by one. The largest capacity
-/// anywhere in the patched graph is 32 and these sites are pipeline/attachment
-/// setup, not per-frame work, so the shifts are bounded by a few hundred
-/// register-sized moves per call. That trade is deliberate.
+/// It owns the `ArrayVec` and moves elements out with `remove(0)`, so the
+/// un-yielded elements are exactly those still in the vec and `ArrayVec`'s own
+/// `Drop` drops each once: no `impl Drop`, no `unsafe`, no leak or double free
+/// on early exit. Forward iteration costs O(n²) moves; capacities in the
+/// patched graph are at most 32 and the sites are setup code, not per-frame.
 pub struct IntoIter<T, const N: usize> {
     vec: ArrayVec<T, N>,
 }
@@ -891,24 +767,13 @@ impl<T: fmt::Debug, const N: usize> fmt::Debug for IntoIter<T, N> {
 
 /// A draining iterator for [`ArrayVec`], produced by [`ArrayVec::drain`].
 ///
-/// # Why the tail closes up as it goes
+/// Each element is removed from the vec as it is yielded (`ArrayVec::remove`
+/// shifts the tail down), and `Drop` drains the rest, so the removal happens
+/// whether or not the caller finishes (`wgpu-hal`'s GLES backend relies on
+/// `drain(..)` emptying `resolve_attachments`). No `unsafe`.
 ///
-/// `wgpu-hal`'s GLES backend empties `resolve_attachments` exactly once per
-/// pass, with `drain(..)` at `gles/command.rs:698`. A `drain` that yielded the
-/// elements but left `len` alone would make every later pass re-emit the
-/// previous pass's MSAA resolves against stale `TextureView`s — wrong pixels,
-/// never a panic. So the removal has to be real, and it has to happen whether
-/// or not the caller runs the iterator to the end.
-///
-/// This type therefore removes each element from the vec as it yields it
-/// (`ArrayVec::remove`, which shifts the tail down), and its `Drop` simply
-/// drains whatever is left. Like [`IntoIter`], it contains no `unsafe`.
-///
-/// DIVERGENCE from upstream, in the safe direction: upstream shortens the vec
-/// up front and restores the tail in `Drop`, so `mem::forget`ting an upstream
-/// `Drain` loses the un-drained tail. Forgetting this one leaves those elements
-/// in the vec instead. Nothing in the patched graph forgets a `Drain`, and
-/// "keeps the elements" is the safer of the two answers.
+/// Unlike upstream, forgetting a `Drain` leaves the un-drained elements in the
+/// vec instead of losing them.
 pub struct Drain<'a, T, const N: usize> {
     vec: &'a mut ArrayVec<T, N>,
     /// Index in `vec` of the next element to yield from the FRONT.
@@ -951,9 +816,8 @@ impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {}
 
 impl<T, const N: usize> Drop for Drain<'_, T, N> {
     fn drop(&mut self) {
-        // Removing each remaining element both drops it and closes the tail up,
-        // so an early-dropped `Drain` leaves exactly the same vec an exhausted
-        // one would.
+        // Removing each remaining element drops it and closes the tail, so an
+        // early-dropped `Drain` leaves the same vec an exhausted one would.
         while self.next().is_some() {}
     }
 }
@@ -1107,12 +971,7 @@ mod tests {
 mod kani_proofs {
     use super::*;
 
-    /// Verify that pushing into a full ArrayVec panics (not UB).
-    ///
-    /// The `push` method uses an `assert!` guard before writing into the
-    /// MaybeUninit buffer. This proof drives all capacity-4 slots full, then
-    /// confirms the N+1 push triggers the panic path rather than writing
-    /// out-of-bounds into uninitialized memory.
+    /// Pushing into a full ArrayVec panics rather than writing out of bounds.
     #[kani::proof]
     #[kani::unwind(6)]
     fn arrayvec_push_at_capacity_panics() {
@@ -1126,11 +985,7 @@ mod kani_proofs {
         kani::assert(av.len() == 4, "len must equal capacity after filling");
         kani::assert(av.is_full(), "is_full must be true at capacity");
 
-        // try_push must fail and return the value back. `try_push` yields
-        // `Result<(), CapacityError<T>>`, not `Result<(), T>` — comparing against
-        // `Err(99)` did not type-check, so this harness never compiled and the
-        // whole crate's `list` step died with it, taking harness discovery for the
-        // entire workspace down (the lane then exits 2, having proved nothing).
+        // try_push must fail and return the value inside `CapacityError`.
         let result = av.try_push(99);
         kani::assert(
             result == Err(CapacityError::new(99)),
@@ -1141,12 +996,8 @@ mod kani_proofs {
         kani::assert(av.len() == 4, "len must remain 4 after failed try_push");
     }
 
-    /// Verify the retain drop guard: after retain, len equals the number of
-    /// elements that passed the predicate, and those elements are exactly
-    /// the ones the predicate accepted.
-    ///
-    /// Uses symbolic threshold to partition elements into keep/drop sets,
-    /// then verifies the surviving slice matches expectations.
+    /// After retain, len equals the number of elements the predicate accepted
+    /// and the survivors are exactly those, for a symbolic threshold.
     #[kani::proof]
     #[kani::unwind(6)]
     fn arrayvec_retain_len_consistent() {
@@ -1182,10 +1033,7 @@ mod kani_proofs {
         }
     }
 
-    /// Verify that pop returns elements in LIFO order.
-    ///
-    /// Pushes symbolic values a, b, c and verifies pop returns c, b, a
-    /// in that order, then returns None on empty.
+    /// Pop returns symbolic values a, b, c in LIFO order, then None.
     #[kani::proof]
     fn arrayvec_pop_lifo_order() {
         let a: u32 = kani::any();
@@ -1215,11 +1063,8 @@ mod kani_proofs {
         kani::assert(p4.is_none(), "pop on empty must return None");
     }
 
-    /// Verify that as_slice returns a slice whose length equals the
-    /// ArrayVec's len, and whose elements match what was pushed.
-    ///
-    /// Pushes a symbolic number of elements (0..=4) and verifies the
-    /// slice length and content at each step.
+    /// as_slice's length equals len and its elements match what was pushed,
+    /// for a symbolic count 0..=4.
     #[kani::proof]
     #[kani::unwind(6)]
     fn arrayvec_as_slice_len_and_content() {

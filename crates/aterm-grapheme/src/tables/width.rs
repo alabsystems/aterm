@@ -620,16 +620,14 @@ pub const fn char_width(c: char) -> usize {
     let cp = c as u32;
     if cp >= 0x30000 {
         // CJK Unified Ideographs Extension G (U+30000-U+3134A) and
-        // Extension H (U+31350-U+323AF) are East Asian Width "W" (#7775).
+        // Extension H (U+31350-U+323AF) are East Asian Width "W".
         if cp <= 0x323AF {
             return 2;
         }
-        // Plane 14 — Tags (U+E0000-U+E007F, the letters of a subdivision
-        // flag), the Variation Selectors Supplement (U+E0100-U+E01EF) and the
-        // reserved gaps between — is Default_Ignorable_Code_Point end to end:
-        // zero width, attaches to the preceding cell, draws nothing.
-        // unicode-width 0.2 says 0 for the whole block. Reported narrow by
-        // the catch-all below, a flag's six tags took six cells of tofu.
+        // Plane 14 (Tags U+E0000-U+E007F, the Variation Selectors Supplement
+        // U+E0100-U+E01EF, and the reserved gaps) is Default_Ignorable_Code_Point
+        // throughout: zero width, attaching to the preceding cell. Without this
+        // a subdivision flag's tags would each take a cell.
         if matches!(cp, 0xE0000..=0xE0FFF) {
             return 0;
         }
@@ -654,7 +652,7 @@ pub const fn char_width(c: char) -> usize {
 pub const fn char_width_cjk(c: char) -> usize {
     let cp = c as u32;
     if cp >= 0x30000 {
-        // CJK Unified Ideographs Extension G/H are wide (#7775).
+        // CJK Unified Ideographs Extension G/H are wide.
         if cp <= 0x323AF {
             return 2;
         }

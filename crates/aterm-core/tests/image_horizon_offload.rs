@@ -1,50 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! THE IMAGE RETENTION HORIZON, end to end through the real `Terminal`.
+//! The inline-image retention horizon, end to end through the real `Terminal`.
 //!
-//! `image_survives_scrollback.rs` pins that a picture follows its text over the
-//! scrollback boundary. This pins how FAR — the limit on the other side of that
-//! promise, which is a decision and not an oversight:
-//!
-//! an inline image is retained for exactly as long as its line is held
-//! UNCOMPRESSED — through the grid's scrolled-row ring, the deferred-line
-//! staging buffer behind it, and then the tiered store's hot tier. The wire
-//! format the warm/cold/disk tiers keep lines in has no image section, because
-//! a payload shared by every row of a footprint would be written once per
-//! COVERED ROW there — see `Line::serialize`.
-//!
-//! So the outcome a person gets is decided rather than accidental, and stated
-//! in three parts, one test each:
+//! An inline image is retained only while its line is held uncompressed: the
+//! grid's scrolled-row ring, the deferred-line staging buffer, then the tiered
+//! store's hot tier. The warm/cold/disk wire format has no image section (see
+//! `Line::serialize`). One test each:
 //!   * inside the horizon the picture is whole;
-//!   * past it the row is the EMPTY row it always was under the picture, with
-//!     the surrounding text untouched — nothing half-drawn, nothing invented;
-//!   * the crossing is REPORTED (`Terminal::scrollback_image_rows_dropped`),
-//!     never silent.
+//!   * past it the row is empty and the surrounding text is untouched;
+//!   * the crossing is reported (`Terminal::scrollback_image_rows_dropped`).
 
 use aterm_core::render::RenderInput;
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
 
-/// A payload the OSC 1337 handler classifies as PNG. The engine never decodes
-/// pixels, so the bytes after the magic are inert.
-const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+use crate::osc1337::{PNG_MAGIC, osc_1337_file};
 
 const ROWS: u16 = 10;
 const COLS: u16 = 20;
 /// Footprint height of the card every test places.
 const CARD_ROWS: usize = 3;
-
-fn osc_1337_file(args: &str, payload: &[u8]) -> Vec<u8> {
-    let b64 = aterm_codec::base64::encode(payload).expect("encode");
-    let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b]1337;File=");
-    out.extend_from_slice(args.as_bytes());
-    out.push(b':');
-    out.extend_from_slice(b64.as_bytes());
-    out.extend_from_slice(b"\x1b\\");
-    out
-}
 
 fn place_card(term: &mut Terminal) {
     let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
@@ -62,12 +38,10 @@ fn frame_image_cells(frame: &RenderInput) -> Vec<(usize, usize)> {
     v
 }
 
-/// A terminal whose horizon is as SHORT as this layer allows: a 4-line
-/// scrolled-row ring in front of a store that holds 4 uncompressed lines and
-/// compresses in blocks of 4. The staging buffer between them drains on its own
-/// fixed threshold, which is why [`PAST_HORIZON`] is a four-figure number and
-/// not a handful of lines. The production numbers (a 10k ring, the same staging
-/// buffer, a 1000-line hot tier) are the same shape, just further away.
+/// A terminal with the shortest horizon this layer allows: a 4-line ring in
+/// front of a store holding 4 uncompressed lines, compressing in blocks of 4.
+/// The staging buffer drains on its own fixed threshold, hence the size of
+/// [`PAST_HORIZON`].
 fn terminal_with_short_horizon() -> Terminal {
     Terminal::with_scrollback(
         ROWS,
@@ -77,9 +51,8 @@ fn terminal_with_short_horizon() -> Terminal {
     )
 }
 
-/// Enough scrolled-off text to carry a line ALL the way across: past the ring,
-/// past the deferred-line staging buffer's drain threshold, and out of the
-/// store's uncompressed hot tier.
+/// Enough scrolled-off text to carry a line past the ring, the staging
+/// buffer's drain threshold, and the store's hot tier.
 const PAST_HORIZON: usize = 1_100;
 
 /// Scroll off `n` lines of ordinary text.
@@ -114,10 +87,8 @@ fn inside_the_horizon_a_scrolled_off_picture_is_whole() {
 
 #[test]
 fn past_the_horizon_the_row_is_the_empty_row_it_always_was_under_the_picture() {
-    // The user-visible outcome, and the whole reason the limit is stated: the
-    // picture goes, the text it sat between does NOT, and nothing is drawn in
-    // its place. A blank row here is the row a picture-less terminal would have
-    // shown — not a hole punched in history.
+    // The picture goes, the text around it stays, and nothing is drawn in its
+    // place: the row is what a picture-less terminal would show.
     let mut term = terminal_with_short_horizon();
     term.process(b"ABOVE\r\n");
     place_card(&mut term);
@@ -131,7 +102,7 @@ fn past_the_horizon_the_row_is_the_empty_row_it_always_was_under_the_picture() {
         "past the horizon no tile of the card may be painted"
     );
 
-    // The text around it is intact — this is retention loss of a PICTURE, not
+    // The text around it is intact — this is retention loss of a picture, not
     // of history.
     let text: Vec<String> = frame
         .cells
@@ -148,7 +119,7 @@ fn past_the_horizon_the_row_is_the_empty_row_it_always_was_under_the_picture() {
         "the line below the picture is still history: {trimmed:?}"
     );
 
-    // And the footprint's own rows are BLANK — not spaces the screen never
+    // And the footprint's own rows are blank — not spaces the screen never
     // showed, not a fragment of the card.
     let above = trimmed
         .iter()
@@ -165,9 +136,8 @@ fn past_the_horizon_the_row_is_the_empty_row_it_always_was_under_the_picture() {
 
 #[test]
 fn crossing_the_horizon_is_reported_and_never_silent() {
-    // A named limit a host can surface. One count per FOOTPRINT ROW, so the
-    // 4x3 card reports three — the same unit the sibling retention signal
-    // (`scrollback_truncated_lines`) uses.
+    // One count per footprint row (the 4x3 card reports three), the same unit
+    // as `scrollback_truncated_lines`.
     let mut term = terminal_with_short_horizon();
     place_card(&mut term);
     feed(&mut term, PAST_HORIZON);

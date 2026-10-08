@@ -1,45 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **CLAUDE CODE'S COMPOSER WRAP, WITH THE REAL BYTES** (2026-09-21) — the
-//! owner, on v0.90.0 with Claude Code in the window: *"incorrect blending
-//! after a new line — a hard vertical colour edge between blue and purple a
-//! few cells into the row the composer wrapped onto"*, and *"when typing
-//! wraps to a new line the previous row's rainbow vanishes suddenly while
-//! the new row populates — I want a beautiful animation where the previous
-//! row's rainbow flows in the direction of typing while the rainbow
-//! continues on the next line"*.
+//! Claude Code's composer wrap, with the real bytes: when typing wraps to a new
+//! line, the previous row's rainbow must follow its text and flow toward the
+//! fold rather than vanish, and the new row must continue the walk without a
+//! hard colour edge (owner, 2026-09-21).
 //!
-//! What Claude Code's composer writes at the wrap was CAPTURED
-//! (`docs/measured/claude-code-composer-wrap-bytes-2026-09-21.md`: Claude
-//! Code v2.1.278 under a Python pty, 90×30, one key per 60 ms) and no
-//! fixture in the repo modelled it: per ordinary key ONE glyph addressed
-//! from home; a Space a caret move only; and at the wrap key ONE chunk that
-//! repaints the bottom-anchored box ONE ROW HIGHER WITHOUT A SCROLL — the
-//! rule row up a row, the text row rewritten a row up minus the word the
-//! wrap moved, the continuation row holding that word beside a glyph Ink's
-//! diff reused, and the caret making a same-row backward move.
+//! What the composer writes at the wrap (captured from Claude Code under a
+//! Python pty, 90×30, one key per 60 ms): per ordinary key one glyph addressed
+//! from home; a Space a caret move only; and at the wrap key one chunk that
+//! repaints the bottom-anchored box one row higher without a scroll: the rule
+//! up a row, the text row rewritten a row up minus the word the wrap moved, the
+//! continuation row holding that word beside a glyph Ink's diff reused, and the
+//! caret making a same-row backward move.
 //!
-//! Every law below runs at the HOST seam — a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled
-//! exactly as `app_render.rs`'s frame hold samples them, fed through
-//! `CursorGlow::observe_row` / `observe_ribbon_row` / `ribbon_rows` and
-//! ticked through `CursorGlow::tick` at 16.7 ms, keys at 60 ms — and reads
-//! the rows' COVERAGE CENSUS frame by frame, the helpers copied from
-//! `tests/new_line_fade.rs` (`row_quads`, `coverage`, `dark_at`,
-//! `worst_step`, `max_rise`). Each law says whether it was RED on the
-//! unmodified tree; the new symbols the laws read (`FLOW_TOTAL_S`,
-//! `Cohort::flow`, `Status::followed`) do not exist there, so the redness
-//! is by the mechanism the doc above names, restated at each law.
+//! Every law runs at the host seam: a real `aterm_core::terminal::Terminal`
+//! driven byte for byte, rows sampled as `app_render.rs`'s frame hold samples
+//! them, fed through `CursorGlow::observe_row` / `observe_ribbon_row` /
+//! `ribbon_rows` and ticked through `CursorGlow::tick` at 16.7 ms, keys at
+//! 60 ms, reading each row's coverage census frame by frame (helpers from
+//! `tests/new_line_fade.rs`: `row_quads`, `coverage`, `dark_at`, `worst_step`,
+//! `max_rise`).
 
+use crate::common::{
+    caret_sample, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
+};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::ribbon::{
     FLOW_TAIL_S, FLOW_TOTAL_S, HOT_EDGE_CELLS_MAX, RETIRE_MELT_S, WALK_FAST_CELLS, WALK_LAY_RATE,
 };
-use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
 /// The owner's window: 90 columns, 30 rows, the retina cell 15×28 device px.
@@ -60,64 +52,31 @@ const TEXT_ROW: usize = 28;
 const OLD_ROW: u16 = (TEXT_ROW - 1) as u16;
 const NEW_ROW: u16 = OLD_ROW - 1;
 
-/// **THE SYNCHRONIZED-OUTPUT BRACKET.** Ink wraps every repaint in DEC
-/// 2026 (`tests/ink_wrap_line_fill_repro.rs` records it on glass:
-/// sync-begin, hide, the rewrite, show, sync-end), and aterm's seam reads
-/// the hide INSIDE that bracket as the "repaint blink" that admits an
-/// alt-screen re-anchor (`Terminal::repaint_blink_epoch`,
-/// `CursorGlow::blink_fresh`). The pty capture carries NO bracket: nothing
-/// answered Claude Code's DECRQM 2026 query there, while aterm does. The
-/// bytes below are the capture's with the bracket the window sees put
-/// back; without it the seam classes the wrap as a keyless park and never
-/// lays the wrap key's own glyph — a premise the doc records.
+/// The synchronized-output bracket. Ink wraps every repaint in DEC 2026
+/// (sync-begin, hide, rewrite, show, sync-end; see
+/// `tests/ink_wrap_line_fill_repro.rs`), and the seam reads the hide inside it
+/// as the repaint blink that admits an alt-screen re-anchor
+/// (`Terminal::repaint_blink_epoch`, `CursorGlow::blink_fresh`). The pty
+/// capture has no bracket (nothing answered DECRQM 2026 there; aterm does), so
+/// it is put back here; without it the seam classes the wrap as a keyless park.
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 
 /// The first text row up to the wrap: keys 0..=82 land on 1-based columns
-/// 3..=85 (the engine's 2..=84); the Space at 86, `W` at 87, `H` at 88,
-/// and the `Y` wraps.
+/// 3..=85 (the engine's 2..=84); Space at 86, `W` at 87, `H` at 88, and `Y`
+/// wraps.
 const LINE1: &str =
     "HEY!!! [Image #1] in the other tab in aterm, I got this confirmation message. AUDIT";
 /// The keys after the wrap, typed on the continuation row.
 const AFTER: &str = " ATERM claude code h";
 
-fn geom() -> Geom {
-    Geom {
-        cw: CW,
-        ch: CH,
-        rows: ROWS,
-        cols: COLS,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: (COLS * CW) as u16,
-        win_h: (ROWS * CH) as u16,
-        head: 0,
-    }
-}
-
 /// The owner's setup: rainbow kitty at intensity 0.70 on the default dark
 /// theme (fg `0xD0D0D0`, bg `0x111318`).
 fn cfg() -> GlowConfig {
     GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
         theme_fg: 0x00D0_D0D0,
         theme_bg: 0x0011_1318,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-        pack: None,
+        ..rainbow_cfg()
     }
 }
 
@@ -127,9 +86,9 @@ fn rule() -> String {
     s
 }
 
-/// One ordinary key's echo, as captured: the glyph `ch` on 1-based column
-/// `c` of 1-based `row` (the text row), addressed from home, the status row
-/// touched, the caret put after it — inside a hide/show bracket.
+/// One ordinary key's echo as captured: glyph `ch` at 1-based column `c` of
+/// 1-based `row`, addressed from home, the status row touched, the caret after
+/// it, inside a hide/show bracket.
 fn glyph_bytes(row: usize, ch: char, c: usize) -> Vec<u8> {
     format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}C\x1b[{}B{ch}\x1b[30;1H\x1b[{row};{}H\x1b[?25h{SYNC_END}",
@@ -149,11 +108,10 @@ fn space_bytes(row: usize, c: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-/// **THE WRAP CHUNK**, in the captured shape: the rule repainted one row up
-/// (row 26), the first text row (`line1`) rewritten on row 27 without the
-/// moved word plus `EL`, the continuation row holding `  WH` with the
-/// reused `Y` left standing on column 5 and `EL` from column 6, the caret
-/// to (28, 6).
+/// The wrap chunk in the captured shape: the rule one row up (row 26), `line1`
+/// rewritten on row 27 without the moved word plus `EL`, the continuation row
+/// holding `  WH` with the reused `Y` on column 5 and `EL` from column 6, the
+/// caret to (28, 6).
 fn wrap_bytes(line1: &str) -> Vec<u8> {
     format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}B{}\r\x1b[1B\u{276f}\u{a0}{line1}\x1b[K\r\x1b[1B  WH\x1b[6G\x1b[K\x1b[30;1H\x1b[{TEXT_ROW};6H\x1b[?25h{SYNC_END}",
@@ -183,9 +141,9 @@ struct Host {
 }
 
 impl Host {
-    /// Claude Code's screen as painted before the first key: the alt
-    /// screen, the rule on row 27, the prompt marker on row 28, the status
-    /// on row 29, the caret on (28, 3); one frame presented.
+    /// Claude Code's screen before the first key: alt screen, rule on row 27,
+    /// prompt marker on row 28, status on row 29, caret at (28, 3); one frame
+    /// presented.
     fn new() -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         term.process(b"\x1b[?1049h\x1b[2J\x1b[H");
@@ -201,7 +159,7 @@ impl Host {
             term,
             glow: CursorGlow::default(),
             cfg: cfg(),
-            g: geom(),
+            g: crate::common::geom(ROWS, COLS, CW, CH),
             now,
             next_frame: now,
             last_key: now,
@@ -215,29 +173,15 @@ impl Host {
         h
     }
 
-    /// EXACTLY the frame hold, then the tick: sample the cursor, the repaint blink,
-    /// the caret row's probe, and the rows the resident ribbon wants — all
-    /// from the terminal AFTER the last `process` — then advance the engine
-    /// one frame. (`tests/new_line_fade.rs` `Host::frame`, verbatim.)
+    /// The frame hold then the tick: sample the cursor, repaint blink, caret
+    /// row probe and the ribbon's rows from the terminal after the last
+    /// `process`, then advance one frame (as `tests/new_line_fade.rs`).
     fn frame(&mut self) {
-        let c = self.term.cursor();
-        let cur = self.term.cursor_visible().then_some((c.row, c.col));
-        let epoch = self.term.repaint_blink_epoch();
-        if epoch != self.blink_seen {
-            self.blink_seen = epoch;
-            self.glow.note_repaint_blink(self.now);
-        }
+        let (c, cur) = caret_sample(&self.term);
+        note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
         self.glow.note_context(self.term.is_alternate_screen());
-        self.term
-            .row_cols_into(usize::from(c.row), &mut self.row_buf);
-        self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
-        self.glow.observe_ribbon_row(c.row, &self.row_buf);
-        let mut rows = [0u16; WITNESS_ROWS];
-        let n = self.glow.ribbon_rows(&mut rows);
-        for &r in &rows[..n] {
-            self.term.row_cols_into(usize::from(r), &mut self.row_buf);
-            self.glow.observe_ribbon_row(r, &self.row_buf);
-        }
+        observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
+        observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
         self.next_frame = self.now + Duration::from_micros(FRAME_US);
@@ -259,10 +203,9 @@ impl Host {
         self.advance_to(t);
     }
 
-    /// One key, `KEY_MS` after the last: the frames until then run, the
-    /// app_input seam arms the typed hint at the key, the PTY answers
-    /// `bytes`, and the next frame of the train samples the echo — as the
-    /// window does.
+    /// One key `KEY_MS` after the last: frames until then run, the typed hint
+    /// is armed at the key, the PTY answers `bytes`, and the next frame samples
+    /// the echo.
     fn press(&mut self, ch: char, bytes: &[u8]) {
         let t = self.last_key + Duration::from_millis(KEY_MS);
         self.advance_to(t);
@@ -295,9 +238,9 @@ impl Host {
         }
     }
 
-    /// The wrap key: the `Y` of `WHY`, answered by the chunk that repaints
-    /// the box one row up with `line1` on the first text row; the next
-    /// glyph lands on column 6 of the continuation row.
+    /// The wrap key: the `Y` of `WHY`, answered by the chunk that repaints the
+    /// box one row up with `line1` on the first text row; the next glyph lands
+    /// on column 6 of the continuation row.
     fn wrap(&mut self, line1: &str) {
         self.press('Y', &wrap_bytes(line1));
         self.col = 6;
@@ -349,9 +292,8 @@ impl Host {
         self.row_quads(row).next().is_some()
     }
 
-    /// THE ROW'S COVERAGE CENSUS: the share of `row`'s pixel width the
-    /// bed's quads cover this frame, each weighted by its source-over
-    /// opacity (`tests/new_line_fade.rs` `coverage`).
+    /// The row's coverage census: the share of `row`'s pixel width the bed's
+    /// quads cover this frame, weighted by source-over opacity.
     fn coverage(&self, row: u16) -> f32 {
         let sum: f32 = self
             .row_quads(row)
@@ -387,11 +329,10 @@ impl Host {
         (den > 0.0).then(|| num / den)
     }
 
-    /// **THE HOT EDGE'S FAR TAIL** on `row` this frame, from column
-    /// `from_col` on: the light (width times summed channels) of the
-    /// additive quads riding the row's top MORE than `HOT_EDGE_CELLS_MAX`
-    /// behind the caret, where even the longest head's own falloff is dark
-    /// and only the new line's seam (`Ribbon::seam`) draws.
+    /// The hot edge's far tail on `row` from column `from_col` on: the light
+    /// (width times summed channels) of additive quads on the row's top more
+    /// than `HOT_EDGE_CELLS_MAX` behind the caret, where only the new line's
+    /// seam (`Ribbon::seam`) draws.
     fn far_tail(&self, row: u16, from_col: u16) -> f32 {
         let cw = CW as f32;
         let from_x = f32::from(self.g.origin_x) + f32::from(from_col) * cw;
@@ -492,16 +433,14 @@ fn max_rise(curve: &[Sample]) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// The census's quantisation noise: a one-pixel boundary rounding at full
-/// alpha over the 1350 px row is 7.4e-4 (`tests/new_line_fade.rs`
-/// `RISE_TOL`).
+/// Census quantisation noise: a one-pixel boundary rounding at full alpha over
+/// the 1350 px row is 7.4e-4.
 const RISE_TOL: f32 = 2e-3;
 
-/// The largest step the band's FAR EDGE took AWAY from the fold (left)
-/// between two frames that each still hold at least `floor` of the light,
-/// px — `0` when it only ever moved toward it. Below that share the last
-/// slabs' alpha bytes round in and out of zero (measured: a 7 px step back
-/// at 2 % of the light), which is not the band moving.
+/// The largest step the band's far edge took away from the fold (left) between
+/// two frames that each hold at least `floor` of the light, in px; `0` when it
+/// only moved toward it. Below that share the last slabs' alpha bytes round in
+/// and out of zero.
 fn worst_far_edge_step(curve: &[Sample], floor: f32) -> u16 {
     curve
         .windows(2)
@@ -552,9 +491,8 @@ fn typed_to_the_wrap() -> (Host, f32, usize, f32) {
         pre_cov > 0.5,
         "the row is well lit before the wrap: {pre_cov}"
     );
-    // The cells the text carries: the first row's glyphs, columns 2..=84
-    // (`LINE1`); the Space the wrap ate at 85 and the moved word at 86..=87
-    // stay behind for the re-anchor.
+    // Cells the text carries: the first row's glyphs, columns 2..=84; the
+    // eaten Space at 85 and the moved word at 86..=87 stay for the re-anchor.
     let line_end = 2 + LINE1.len() as u16 - 1;
     let n_pre = live.iter().filter(|&&c| c <= line_end).count();
     let t_w = h
@@ -567,18 +505,11 @@ fn typed_to_the_wrap() -> (Host, f32, usize, f32) {
     (h, pre_cov, n_pre, t_w)
 }
 
-/// **(1) THE BAND FOLLOWS ITS TEXT, AND (4) THE COUNTS SAY SO.** One frame
-/// after the wrap the band stands on the row the text moved to — the row
-/// above — under its own glyphs, at no less than 60 % of the row's
-/// pre-wrap coverage, and it is NOT melted at +0.15 s. `ribbon_followed=`
-/// counts every cell the text carried; `ribbon_retired=` counts none of
-/// them (at most the moved word's two old cells, which the witness finds
-/// re-laid on the continuation row).
-///
-/// RED on the unmodified tree by the mechanism: the witness sampled only
-/// the rows holding ribbon cells, saw the old row's glyphs replaced, and
-/// melted the run in `RETIRE_MELT_S` — row 27 (0-based 26) was never lit
-/// and `ribbon_retired=` counted the whole band.
+/// (1) The band follows its text, and the counts say so: one frame after the
+/// wrap the band stands on the row above under its glyphs at ≥ 60% of the
+/// pre-wrap coverage and is not melted at +0.15 s. `ribbon_followed=` counts
+/// every carried cell; `ribbon_retired=` at most the moved word's two old
+/// cells.
 #[test]
 fn one_frame_after_the_wrap_the_band_stands_under_its_text_a_row_up_and_is_not_melted() {
     let (mut h, pre_cov, n_pre, _) = typed_to_the_wrap();
@@ -631,15 +562,10 @@ fn one_frame_after_the_wrap_the_band_stands_under_its_text_a_row_up_and_is_not_m
     );
 }
 
-/// **(2) THE FOLDED ROW FLOWS INTO THE FOLD.** From the wrap frame the
-/// followed row's light moves in the direction of typing: its lit-column
-/// centroid never steps left, its coverage never rises, it is still lit at
-/// +0.5 s, its far (left) end goes first, and it is dark by
-/// `FLOW_TOTAL_S` plus a frame — never the 120 ms cut.
-///
-/// RED on the unmodified tree by the mechanism: the row was melted where
-/// it stood (the 0.12 s cut, `worst_step` a fifth of the coverage a frame)
-/// and nothing was lit at +0.5 s.
+/// (2) The folded row flows into the fold: from the wrap frame its light moves
+/// in the typing direction, coverage never rises, it is still lit at +0.5 s,
+/// its far (left) end goes first, and it is dark by `FLOW_TOTAL_S` plus a
+/// frame.
 #[test]
 fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
     let (mut h, pre_cov, _, _) = typed_to_the_wrap();
@@ -659,14 +585,10 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
         at(0.5).cov > 0.0 && at(0.5).resident > 0,
         "the followed row is still lit at +0.5 s: {shown}"
     );
-    // THE BAND FLOWS TOWARD THE FOLD (the drift, 2026-09-23): its far
-    // edge only ever moves toward the fold point. The light-weighted
-    // centroid is not the law any more: late in the far-first fade every
-    // stop sits near its OWN colour floor, and those floors differ by hue,
-    // so the weighted centre can drift back a few cells (measured 834 ->
-    // 793 px between +0.6 and +0.9 s here) while the band itself only ever
-    // slides toward the fold — the rigid slide's pitch is pinned in
-    // `ribbon.rs`'s drift test.
+    // The band flows toward the fold: its far edge only moves toward the fold
+    // point. The light-weighted centroid can drift back late in the fade
+    // (colour floors differ by hue), so it is not the measure; the rigid
+    // slide's pitch is pinned in `ribbon.rs`'s drift test.
     let far: Vec<(f32, Option<u16>)> = curve.iter().map(|s| (s.t, s.left)).collect();
     assert!(
         worst_far_edge_step(&curve, 0.05 * curve[0].cov) <= 1,
@@ -715,20 +637,10 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
     );
 }
 
-/// **(3) THE NEW ROW'S WALK HAS NO STEP.** After the wrap and a few more
-/// keys, the continuation row's cells — the relaid `WH`, the reused `Y`,
-/// and the keys typed since — carry a `t` that is monotone at the walk's
-/// pace (no backward step; every adjacent step the [`WALK_LAY_RATE`] the
-/// old row had reached — tightened 2026-09-23 from "at most a sixteenth",
-/// the allowance the owner's smoosh passed through; (3b) pins the pace on
-/// a row long enough to cross the fast leg's whole sixteen), and the
-/// relaid word's first cell has exactly the `t` its column had on the old
-/// row.
-///
-/// RED on the unmodified tree by the mechanism: the wrap key's glyph
-/// minted a cohort at its own column and the relaid word walked UP from
-/// that cohort's `t0` — a backward step of `w/16` at column `inset + w`,
-/// the owner's hard edge.
+/// (3) The new row's walk has no step: after the wrap and a few more keys, the
+/// continuation row's cells (relaid `WH`, reused `Y`, later keys) carry a `t`
+/// that is monotone at the old row's pace (each step [`WALK_LAY_RATE`]), and
+/// the relaid word's first cell keeps the `t` its column had on the old row.
 #[test]
 fn the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_had() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
@@ -771,35 +683,17 @@ fn the_new_rows_cells_carry_a_monotone_walk_and_the_relaid_word_keeps_the_t_it_h
     );
 }
 
-/// The keys after the wrap for the PACE law: long enough that the
-/// continuation row is laid well past [`WALK_FAST_CELLS`] from its first
-/// cell (columns 2..=45, 44 cells), so a walk that restarted its fast phase
-/// at the fold is caught over the whole of it AND past its end.
+/// Keys after the wrap for the pace law: the continuation row reaches well past
+/// [`WALK_FAST_CELLS`] from its first cell (columns 2..=45), so a walk that
+/// restarted its fast phase at the fold is caught.
 const AFTER_LONG: &str = " ATERM claude code how is the rainbow now";
 
-/// **(3b) THE NEW ROW KEEPS THE PACE THE OLD ROW HAD** (2026-09-23 — the
-/// owner, on v0.91.0 with Claude Code v2.1.280's composer wrapped onto a
-/// third row: *"fix this rainbow cursor issue where the spectrum is
-/// smooshed on the next line. I want smooth continuous rainbow"*; his row
-/// `of using the accoutn to ▮`, ~22 cells, carried the WHOLE arc from
-/// violet back round to red). The sibling of (3), which bounds each step
-/// at a sixteenth — the very allowance that lets the smoosh through.
-///
-/// The old row was typed 86 cells from its first, so its walk had long
-/// left the `d/16` fast phase and was laying at [`WALK_LAY_RATE`] a cell
-/// (asserted here as the premise, off the old row's own `W`/`H` cells).
-/// After the wrap and 41 more keys the continuation row's cells must
-/// CONTINUE that walk — the colour AND the pace: every laid column `c`
-/// from the relaid `W` at 2 carries `t_w + (c − 2) · WALK_LAY_RATE`, so the
-/// relaid `H` has exactly the `t` it had on the old row (column 87), and
-/// every adjacent step is the old row's step, to 1e-4.
-///
-/// RED on the unmodified tree by the mechanism: the relay minted its cohort
-/// at the word's first column with `t0 = t_w` and `anchor_col = 2`, and
-/// `Cohort::t_at` reads `t0 + walk_t(col − anchor_col)` — the walk's
-/// distance restarted at zero, so the first sixteen cells of the new row
-/// ran at `1/16` a cell, 2.25× the `1/36` the old row had reached: a full
-/// sweep of the arc in sixteen cells.
+/// (3b) The new row keeps the old row's pace (owner, 2026-09-23). The old row
+/// was typed 86 cells from its first, so it lays at [`WALK_LAY_RATE`] a cell
+/// (asserted from its `W`/`H` cells). After the wrap and 41 more keys every
+/// laid column `c` from the relaid `W` at 2 carries `t_w + (c − 2) ·
+/// WALK_LAY_RATE`, so the relaid `H` keeps its old-row `t` and every step is
+/// the old row's, to 1e-4, rather than restarting the `1/16` fast leg.
 #[test]
 fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
@@ -873,12 +767,10 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     }
 }
 
-/// **(5) THE NEGATIVE CONTROL: A TRUE RE-LAYOUT STILL MELTS.** The same
-/// bytes, but the text row is rewritten one row up with DIFFERENT text: the
-/// old run's glyphs are found nowhere, nothing follows, and the old cells
-/// retire on the melt exactly as before — `ribbon_retired=` counts the
-/// band, `ribbon_followed=` stays 0, and the row the text went to is dark.
-/// GREEN on the unmodified tree and green here: the stray fix is intact.
+/// (5) Negative control: a true re-layout still melts. The same bytes but with
+/// different text a row up: nothing follows, the old cells retire on the melt
+/// (`ribbon_retired=` counts the band, `ribbon_followed=` stays 0), and the row
+/// the text went to is dark.
 #[test]
 fn a_true_re_layout_with_different_text_a_row_up_still_melts_the_old_band() {
     let (mut h, _, n_pre, _) = typed_to_the_wrap();
@@ -922,11 +814,10 @@ fn a_true_re_layout_with_different_text_a_row_up_still_melts_the_old_band() {
     assert!(!h.lit(NEW_ROW));
 }
 
-/// **THE UNWRAP CHUNK**, modelled on the wrap's own shape (not captured):
-/// the Backspace that erases the continuation row's last glyph lets the
-/// line fit one row again, and the box is repainted one row LOWER — the
-/// row the rule stood on cleared, the rule back on row 27, the text row 28
-/// holding the whole line, the caret after it.
+/// The unwrap chunk, modelled on the wrap's shape: the Backspace that erases the
+/// continuation row's last glyph lets the line fit one row, and the box is
+/// repainted one row lower (rule row cleared, rule back on row 27, text row 28
+/// holding the whole line, caret after it).
 fn unwrap_bytes(line: &str) -> Vec<u8> {
     format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[{};1H\x1b[K\x1b[{RULE_ROW};1H{}\x1b[{TEXT_ROW};1H\u{276f}\u{a0}{line}\x1b[K\x1b[30;1H\x1b[{TEXT_ROW};{}H\x1b[?25h{SYNC_END}",
@@ -937,22 +828,13 @@ fn unwrap_bytes(line: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// **(6) A BACKSPACE BACK THROUGH THE FOLD RE-WETS THE ROW THE HAND CAME
-/// BACK TO.** After the wrap, a Backspace erases the continuation row and
-/// the box is repainted one row lower with the whole line on the text row
-/// again: the follow pass carries the flowing band back DOWN onto the
-/// caret's row, and the hand keeps backspacing there. That row is the
-/// hand's again — it must hold its light while the hand works on it, as
-/// the same Backspace run does on a line that never wrapped (the control),
-/// and must not drain away as the flowing orphan it was a row up. Run with
-/// the unwrap's echo on the Backspace's own frame and one frame late.
-///
-/// RED on the integration tree before 2026-09-22: on the same frame the
-/// follow pass placed the band on the caret's row BEFORE the Backspace was
-/// replayed at the continuation row's column 5, whose suffix retract then
-/// stamped 83 of the 86 cells (the row's left 40 columns fell 0.43 → 0.034
-/// against the control's 0.395 floor); one frame late the band arrived
-/// still FLOWING under the hand and slid away into a fold that was gone.
+/// (6) A Backspace back through the fold re-wets the row the hand came back to.
+/// After the wrap, a Backspace unwraps and the follow pass carries the flowing
+/// band back down onto the caret's row, where the hand keeps backspacing. The
+/// row must hold its light like the same Backspace run on a never-wrapped line
+/// (the control), not drain as a flowing orphan; the Backspace's replay must
+/// not retract the carried band. Run with the unwrap echo on the Backspace's
+/// frame and one frame late.
 #[test]
 fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     fn backspace_run(h: &mut Host, from_col: usize, n: usize) -> Vec<(u64, f32)> {
@@ -1022,26 +904,15 @@ fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     }
 }
 
-/// **(6b) AN UNWRAP TAKES THE SEAM OFF THE LINE THE HAND CAME BACK TO**
-/// (2026-09-25, the review of the drift). The wrap armed the new-line seam
-/// on the caret's row (the follow pass carried line 1 up off it); the
-/// Backspace that unwraps repaints the box a row lower and the follow pass
-/// carries line 1 back DOWN onto the caret's row — which no longer holds a
-/// continued line at all. The caret's row never changed, so nothing that
-/// clears the seam ran, and as the Backspace run reached line 1's own band
-/// the seam's floor lit its whole tail from column 2 (measured 42,427
-/// lum·px in one frame, against ~10 with the seam cleared). The far tail
-/// under the Backspace run after the round trip stays at the level of the
-/// same run on a line that never wrapped (the control). RED before the
-/// carried-back run cleared the seam.
+/// (6b) An unwrap takes the seam off the line the hand came back to. The wrap
+/// armed the new-line seam on the caret's row; the unwrap carries line 1 back
+/// down onto that row, which no longer holds a continued line, so the seam must
+/// clear or its floor lights the whole tail under the Backspace run. The far
+/// tail after the round trip stays at the control's level.
 ///
-/// Read from column 12 on: for the first two Backspaces the hand's hot edge
-/// is still the continuation word's (`WHY` at 2..4, whose `Y` stands over
-/// line 1's `Y` and is the newest cell on the row), and its own falloff
-/// reaches back to column 2 (1,888 lum·px) — the head's, not the seam's,
-/// and the same with the seam cleared. The seam, left armed, lit the whole
-/// tail from column 2 to the head's falloff, so what it drew past column 12
-/// is still almost all of it.
+/// Read from column 12 on: for the first two Backspaces the hand's hot edge is
+/// still `WHY`'s (at 2..4), whose own falloff reaches back to column 2, so the
+/// comparison starts past it.
 #[test]
 fn an_unwrap_takes_the_seam_off_the_line_the_hand_came_back_to() {
     const TAIL_FROM: u16 = 12;
@@ -1111,24 +982,12 @@ fn cohorts_on(h: &Host, row: u16) -> Vec<(u16, f32, f32, u16, u16, bool)> {
         .collect()
 }
 
-/// **(7) A WRAP WHOSE OLD ROW MELTS STILL CONTINUES THE WALK ON THE NEXT
-/// ROW** (2026-09-23, the audit of the walk odometer — the owner: *"fix
-/// this rainbow cursor issue where the spectrum is smooshed on the next
-/// line. I want smooth continuous rainbow"*). (5)'s shape — the box grows
-/// with OTHER text a row up, so nothing follows and the old band melts in
-/// `RETIRE_MELT_S` — and the hand typing on at 60 ms, so its first keys
-/// land while the melting cells are still resident and their run's bounds
-/// still span the row. A run with no standing cell is not a band a key can
-/// join (`Ribbon::join_cohort`): the continuation row must CONTINUE the
-/// walk the old row had, colour and pace — every column `c` from the
-/// relaid `W` at 2 carries `t_w + (c − 2) · WALK_LAY_RATE`, exactly (3b)'s
-/// law for a wrap that followed — and never restart at red on the `1/16`
-/// fast leg.
-///
-/// RED before 2026-09-23 (the audit measured it at 60, 90 and 130 ms
-/// keys): the keys joined the melting run and read its walk column by
-/// column from its own anchor — the row above's colours again, from red,
-/// sixteen cells to the whole arc: the smoosh, with the odometer in place.
+/// (7) A wrap whose old row melts still continues the walk on the next row.
+/// (5)'s shape (other text a row up, the old band melting in `RETIRE_MELT_S`)
+/// with the hand typing on at 60 ms, so its first keys land while melting cells
+/// are resident. A run with no standing cell is not joinable
+/// (`Ribbon::join_cohort`): every column `c` from the relaid `W` at 2 carries
+/// `t_w + (c − 2) · WALK_LAY_RATE`, as in (3b), never a restart at red.
 #[test]
 fn after_a_wrap_whose_old_row_melts_the_next_row_continues_the_walk_at_its_pace() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
@@ -1178,12 +1037,10 @@ fn after_a_wrap_whose_old_row_melts_the_next_row_continues_the_walk_at_its_pace(
 /// row's first column (1-based 3), a cold walk past its knee.
 const LINE_A: &str = "abcdefghijklmnopqrstuvwxyzabcd";
 
-/// **SHIFT+ENTER IN THE BOTTOM-ANCHORED BOX** (modelled on the captured wrap
-/// chunk, not captured itself: Ink lays the box out the same way whether
-/// its second text row comes from a soft wrap or a hard newline): the rule
-/// repainted one row up (row 26), `line` rewritten on row 27, the text row
-/// 28 cleared, and the caret homed to the box's inset `(28, 3)` — the SAME
-/// row it was on.
+/// Shift+Enter in the bottom-anchored box (modelled on the wrap chunk; Ink lays
+/// out soft wraps and hard newlines alike): rule one row up (row 26), `line` on
+/// row 27, text row 28 cleared, caret homed to the inset `(28, 3)` on the same
+/// row.
 fn newline_up_bytes(line: &str) -> Vec<u8> {
     format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}B{}\r\x1b[1B\u{276f}\u{a0}{line}\x1b[K\r\x1b[1B\x1b[K\x1b[30;1H\x1b[{TEXT_ROW};3H\x1b[?25h{SYNC_END}",
@@ -1193,9 +1050,9 @@ fn newline_up_bytes(line: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// **…AND IN A TOP-ANCHORED BOX** (the control): the box grows DOWN — the
-/// text row keeps `line`, the new line opens on row 29, the status moves
-/// to row 30 — and the caret changes row, `(28, 33) → (29, 3)`.
+/// In a top-anchored box (the control): the box grows down (text row keeps
+/// `line`, new line on row 29, status to row 30) and the caret changes row,
+/// `(28, 33) → (29, 3)`.
 fn newline_down_bytes() -> Vec<u8> {
     format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[29;1H  \x1b[K\x1b[30;1H  auto mode on\x1b[K\x1b[29;3H\x1b[?25h{SYNC_END}"
@@ -1203,24 +1060,14 @@ fn newline_down_bytes() -> Vec<u8> {
     .into_bytes()
 }
 
-/// **(8) CLAUDE CODE'S SHIFT+ENTER STARTS THE WALK AGAIN, WHICHEVER WAY THE
-/// BOX GROWS** (2026-09-23, the audit of `Ribbon::fresh_line`). Thirty keys
-/// from the text row's first column, Shift+Enter as the host hands it over
-/// (`app_input`: the composer-newline hint and the typed stamp; the hint
-/// sends a separate key-time `ComposerNewline` event, not `note_return`), the
-/// box's repaint, and twenty keys on the new line. The new line continues
-/// the colour one step past the old line's end and starts its walk: `d0 =
-/// 0`, `1/16` a cell for its first sixteen cells — in Claude Code's
-/// bottom-anchored box (its repaint here is `newline_up_bytes`, MODELLED
-/// on the captured wrap chunk: a Shift+Enter's own bytes were not
-/// captured), where the old line is carried a row UP and the caret stays
-/// on its row, exactly as in the top-anchored control, where the caret
-/// moves down a row.
-///
-/// RED before 2026-09-23 in the bottom-anchored box (the audit measured
-/// it): the newline's `Licence::Return` move was same-row, the gate's row
-/// clause refused it, and the new line carried the old walk's distance —
-/// `d0 = 30`, stepping `1/36` from its first cell. The control was green.
+/// (8) Claude Code's Shift+Enter starts the walk again, whichever way the box
+/// grows (`Ribbon::fresh_line`). Thirty keys, Shift+Enter as the host hands it
+/// over (the composer-newline hint and typed stamp; a key-time
+/// `ComposerNewline` event, not `note_return`), the repaint, and twenty keys on
+/// the new line. The new line continues the colour one step past the old
+/// line's end and starts its walk (`d0 = 0`, `1/16` a cell for its first
+/// sixteen cells), both in the bottom-anchored box (`newline_up_bytes`, caret
+/// stays on its row) and the top-anchored control (caret moves down).
 #[test]
 fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
     for bottom in [true, false] {
@@ -1311,23 +1158,13 @@ fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
     }
 }
 
-/// **(9) …HOWEVER SOON THE NEW LINE'S FIRST KEY FOLLOWS THE SHIFT+ENTER**
-/// (2026-09-24, the review of the landing). (8)'s gesture with the first
-/// key of the new line pressed BEFORE the frame that observes the box's
-/// repaint: in mode 1 the repaint lands at the chord and the key is pressed
-/// half-way to the next frame; in mode 2 Ink is slower than the hand — the
-/// key 20 or 45 ms after the chord, the repaint processed after the key.
-/// Either way the key's echo is swept on the key's own press clock, which
-/// is EARLIER than the instant the host observed the newline's move. The
-/// gate the move armed (`Ribbon::fresh_line`) was dated at that observation,
-/// and a same-row home records no row the hand left, so the gate refused
-/// the key: the new line minted on the old walk's distance.
-///
-/// RED before the fix in the bottom-anchored box, measured by the review:
-/// `d0 = 30` and every step `1/36` (`0.0278`) in both modes, both lags;
-/// the top-anchored control (a cross-row move) restarted. The gate is now
-/// dated at the chord's press, ignores that chord's own stamp, and waits
-/// for the observed home before its first real echo can spend it.
+/// (9) However soon the new line's first key follows the Shift+Enter: the first
+/// key is pressed before the frame that observes the repaint (mode 1: repaint
+/// at the chord, key half-way to the next frame; mode 2: key 20 or 45 ms after
+/// the chord, repaint processed after the key). The key's echo is swept on its
+/// press clock, earlier than the observed move, so the gate is dated at the
+/// chord's press, ignores the chord's own stamp, and waits for the observed
+/// home before its first echo can spend it.
 #[test]
 fn a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follows() {
     for bottom in [true, false] {

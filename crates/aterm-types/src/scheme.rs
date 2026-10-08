@@ -569,9 +569,7 @@ pub fn builtin_themes() -> Vec<(&'static str, &'static str)> {
 
 /// Error from parsing a disk theme definition ([`parse_scheme_str`]).
 /// Stringly-typed line context so a bad user theme file produces an actionable
-/// diagnostic rather than a silent fallback. (Its not-found and I/O variants
-/// belonged to the by-name file loader, which had no caller and was deleted on
-/// 2026-09-25; the GUI reads theme files through its own bounded catalog.)
+/// diagnostic rather than a silent fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeError {
     /// A line was syntactically malformed (no `=`, bad colour, unknown key), or a
@@ -665,10 +663,7 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
     let mut selection: Option<Rgb> = None;
     // Start from the engine defaults so an omitted `colorN` is render-identical to
     // an unthemed slot.
-    let mut ansi = [Rgb::new(0, 0, 0); 16];
-    for (i, slot) in ansi.iter_mut().enumerate() {
-        *slot = ColorPalette::default_color(i as u8);
-    }
+    let mut ansi = ColorScheme::default().ansi;
     // Track which ANSI slots were explicitly set so a duplicate `colorN` is caught.
     let mut ansi_seen = [false; 16];
 
@@ -688,22 +683,12 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
         // `format!` — runtime-argument `format_args!` cannot be lowered
         // natively. `debug_string` is byte-identical to `{…:?}`.
         let Some((key, value)) = line.split_once('=') else {
-            let mut reason = String::from("missing '=' in ");
-            reason.push_str(&crate::trust_fmt::debug_string(line));
-            return Err(ThemeError::Parse {
-                line: lineno,
-                reason,
-            });
+            return Err(parse_error(lineno, "missing '=' in ", line));
         };
         let key = key.trim().to_ascii_lowercase();
         let value = strip_inline_comment(value).trim().to_string();
         if value.is_empty() {
-            let mut reason = String::from("empty value for key ");
-            reason.push_str(&crate::trust_fmt::debug_string(&key));
-            return Err(ThemeError::Parse {
-                line: lineno,
-                reason,
-            });
+            return Err(parse_error(lineno, "empty value for key ", &key));
         }
 
         let bad_color = |reason_key: &str| {
@@ -724,12 +709,11 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
                     "dark" => Appearance::Dark,
                     "light" => Appearance::Light,
                     _ => {
-                        let mut reason = String::from("appearance must be dark|light, got ");
-                        reason.push_str(&crate::trust_fmt::debug_string(&value));
-                        return Err(ThemeError::Parse {
-                            line: lineno,
-                            reason,
-                        });
+                        return Err(parse_error(
+                            lineno,
+                            "appearance must be dark|light, got ",
+                            &value,
+                        ));
                     }
                 };
             }
@@ -763,14 +747,7 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
                         ansi[n] = parse_hex(&value).ok_or_else(|| bad_color(other))?;
                         ansi_seen[n] = true;
                     }
-                    _ => {
-                        let mut reason = String::from("unknown key ");
-                        reason.push_str(&crate::trust_fmt::debug_string(other));
-                        return Err(ThemeError::Parse {
-                            line: lineno,
-                            reason,
-                        });
-                    }
+                    _ => return Err(parse_error(lineno, "unknown key ", other)),
                 }
             }
         }
@@ -794,6 +771,14 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
         selection,
         ansi,
     })
+}
+
+/// A [`ThemeError::Parse`] at `line` whose reason is `prefix` then `detail`
+/// rendered as `{detail:?}` (via `debug_string`, see `parse_scheme_str`).
+fn parse_error(line: usize, prefix: &str, detail: &str) -> ThemeError {
+    let mut reason = String::from(prefix);
+    reason.push_str(&crate::trust_fmt::debug_string(detail));
+    ThemeError::Parse { line, reason }
 }
 
 /// Strip a trailing ` #…` / ` ;…` inline comment from a value, but never a leading

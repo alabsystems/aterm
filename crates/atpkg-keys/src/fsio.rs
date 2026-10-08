@@ -133,9 +133,10 @@ pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// The temporary is created in the TARGET'S OWN DIRECTORY, never in `/tmp`: `rename` across
 /// filesystems fails with EXDEV, and a fallback copy would reintroduce exactly the
-/// truncate-then-write window this function removes. It is created `create_new`, so a
-/// leftover from an interrupted run is reported rather than silently reused, and it is
-/// removed on every failure path so a refusal leaves no litter beside a trust anchor.
+/// truncate-then-write window this function removes. It is created `create_new` under a
+/// unique pid+sequence name, so a dead run's leftover is neither reused nor in the way
+/// (see [`stage_sibling_temp`]), and it is removed on every failure path so a refusal
+/// leaves no litter beside a trust anchor.
 ///
 /// Known Trust L0 artifact: `OpenOptions::open` and `fs::rename` are hardened raw-path
 /// boundaries (Trust's obligation kind `hardened_raw_path_api`, fail-closed
@@ -147,24 +148,18 @@ pub fn write_bytes_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     promote_staged(&tmp, path)
 }
 
-/// The STAGING half of [`write_bytes_atomic`], on its own because a whole fsynced sibling
-/// is a building block in its own right: per-file atomicity cannot make a PAIR of files
-/// consistent, and the roster's crash-safe pair publication is built out of staged
-/// members (see [`crate::provision`]'s redo transaction).
+/// The STAGING half of [`write_bytes_atomic`].
 ///
 /// Writes `bytes` to a UNIQUE sibling temporary (`create_new`), flushes it to the device,
 /// and returns the temporary's path. Every ordinary failure removes the temporary before
 /// returning: a stray `.tmp` beside a trust anchor is confusing at exactly the moment
 /// nobody can afford to be confused.
 ///
-/// The name carries this process's pid and a per-process counter rather than the single
-/// fixed `<path>.atpkg-keys.tmp` it used to. A fixed name made a process DEATH — the one
-/// failure no error path can clean up — wedge every later run on `create_new`, for a
-/// reason that has nothing to do with what that run was doing, and on the very file
-/// (`aterm-machines.toml`) whose recovery story is "copy it back from another machine".
-/// A unique name cannot be reused, cannot be mistaken for this run's bytes, and cannot
-/// block anybody; the residual is a litter file, which is what a crash leaves anyway.
-pub fn stage_sibling_temp(path: &str, bytes: &[u8]) -> std::io::Result<String> {
+/// The name carries this process's pid and a per-process counter. A fixed name would let
+/// a process DEATH — the one failure no error path can clean up — wedge every later run on
+/// `create_new`. A unique name cannot be reused or block anybody; the residual is a litter
+/// file, which is what a crash leaves anyway.
+fn stage_sibling_temp(path: &str, bytes: &[u8]) -> std::io::Result<String> {
     stage_sibling_temp_with_mode(path, bytes, 0o666)
 }
 
@@ -227,7 +222,7 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
 /// target, removing the temporary if the rename itself fails so no litter survives, then
 /// flushing the DIRECTORY ENTRY so the new name survives a power loss (see
 /// [`sync_parent`]).
-pub fn promote_staged(tmp: &str, path: &str) -> std::io::Result<()> {
+fn promote_staged(tmp: &str, path: &str) -> std::io::Result<()> {
     if let Err(e) = std::fs::rename(tmp, path) {
         let _ = std::fs::remove_file(tmp);
         return Err(e);
@@ -315,11 +310,8 @@ pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("atpkg-keys-fsio").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch(name: &str) -> crate::testdir::Dir {
+        crate::testdir::dir(&format!("atpkg-keys-fsio-{name}-"))
     }
 
     /// The ordinary case: the file is replaced, and no temporary is left beside it.
@@ -380,10 +372,7 @@ mod tests {
         assert_eq!(leftovers, vec!["pins.rs".to_string()], "no litter");
     }
 
-    /// A TEMPORARY LEFT BY A DEAD PROCESS NEVER WEDGES THE NEXT WRITE. The fixed
-    /// `<path>.atpkg-keys.tmp` name this staging used to take made the one failure no
-    /// error path can clean up — a process death — fail every later run on `create_new`,
-    /// on the file whose only recovery is a copy from another machine.
+    /// A TEMPORARY LEFT BY A DEAD PROCESS NEVER WEDGES THE NEXT WRITE.
     ///
     /// MUTATION: give `stage_sibling_temp_with_mode` back the fixed name and the write
     /// below fails with EEXIST instead of landing.

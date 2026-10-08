@@ -4,7 +4,7 @@
 //! The production GitHub-Releases [`Fetcher`](crate::flow::Fetcher) (§5/§9) — the network
 //! impl the install flow ([`crate::flow`]) runs against a real repo.
 //!
-//! ONE TRANSPORT (R3, 2026-09-23): every byte it reads — the index and its roster, each
+//! ONE TRANSPORT: every byte it reads — the index and its roster, each
 //! program's `pkg-*.toml`, every artifact — comes from the release DOWNLOAD host,
 //! `https://github.com/<owner>/<repo>/releases/download/<tag>/<name>`, with no credential,
 //! and it makes no `api.github.com` request at all. The download host is unmetered; the
@@ -22,11 +22,9 @@
 //! * which build of a program is fetched is named by the signed index's pin, and the
 //!   publishing tag convention (`atpkg-<program>-<build>`) names its manifest and artifact.
 //!
-//! Until 2026-09-23 a listing of `…/releases` on the API backed every one of these up — the
-//! index discovery, each manifest, each artifact — and the anonymous budget it spent is what
-//! the 0.91 cut and a first-launch pass died on (audit 2026-09-23, RC1). A repointed account
-//! (`[packages].account`, a development setting) or a `[packages.links]` fetch override must
-//! therefore be publicly readable, as the app's own channel must.
+//! Every fetch is anonymous, so a repointed account (`[packages].account`, a development
+//! setting) or a `[packages.links]` fetch override must be publicly readable, as the app's own
+//! channel must.
 //!
 //! The index lives on `<owner>/aterm` ([`crate::discovery::index_repo`]); each program's
 //! `pkg-*.toml` + artifacts live on that program's own repo (`repo`, §4.2), which the flow
@@ -54,20 +52,19 @@ fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
     aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
 }
 
-/// The ONE way this fetcher reads bytes from the release download host — and it has
-/// no credential parameter, so "no token is ever presented to `github.com`" is a fact
-/// of the type, not of each call site's discipline. Refuses an API URL outright, and the
-/// transport refuses the converse (`aterm_update_core` will not pair a token with a
-/// non-API host).
+/// The ONE way this fetcher reads bytes from the release download host — and neither
+/// it nor the transport has a credential parameter, so "no token is ever presented to
+/// `github.com`" is a fact of the type, not of each call site's discipline. Refuses an
+/// API URL outright.
 fn web_fetch_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     refuse_api_host(url)?;
-    aterm_update_core::download_bytes(url, None, cap)
+    aterm_update_core::download_bytes(url, cap)
 }
 
 /// [`web_fetch_bytes`] for the artifact lane: resumable, to `dest`, no credential.
 fn web_fetch_to(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
     refuse_api_host(url)?;
-    aterm_update_core::download_to_resumable(url, None, dest, cap)
+    aterm_update_core::download_to_resumable(url, dest, cap)
 }
 
 /// The web helpers' own gate: an API URL is not the download host.
@@ -207,8 +204,9 @@ const ROSTER_CAP: u64 = 65_536;
 /// generation, so the newest release wins essentially always; the others are the genuine
 /// fallbacks — a newest index that fails verification, or whose assets are still being
 /// uploaded. In the steady state the newest IS the floor, and one quad is fetched. Still
-/// below the §14 cache's own candidate cap (`cache::MAX_CACHE_CANDIDATES` = 24), so a full
-/// candidate set is never refused by the cache write.
+/// below the §14 cache's own candidate cap (`cache::MAX_CACHE_CANDIDATES` = 24) with room
+/// for one more, so a full candidate set, and one cached beside the cached index that
+/// serves, is never refused by the cache write.
 const INDEX_CANDIDATE_CAP: u64 = 4;
 
 /// The most HEADs one index discovery spends before it gives up. The walk needs two in the
@@ -241,22 +239,23 @@ fn index_tag(build: u64) -> String {
 /// run, and a miss above a published build bounds it:
 ///
 /// * the run's lower end is the store's verified `floor` — published when this store
-///   verified it — or, on a store that has verified nothing, the first power of two that
-///   answers (the public channel's first index is atpkg-index-6, so 8 does);
+///   verified it, unless a machine signed it above the run, which
+///   [`GithubFetcher::walk_candidates`] then walks again from none — or, on a store that
+///   has verified nothing, the first power of two that answers (the public channel's first
+///   index is atpkg-index-6, so 8 does);
 /// * from there the walk GALLOPS — HEAD `low+1`, `low+2`, `low+4`, … — to the first miss,
 ///   then bisects between it and the last hit, landing a published `hit` whose `hit+1` is
 ///   not;
 /// * and it HEADs `hit+2` before it believes that: published, the walk gallops on from
 ///   there. So ONE missing number anywhere — a first publish numbered by hand, a release
-///   deleted and never re-cut — is stepped over, where one directly above a store's floor
-///   used to hold that store at its floor for good (the probe HEADs only `floor+1`, and
-///   this walk stopped at the same miss). Two consecutive missing numbers can still end
-///   the run — always when they sit directly above the floor — and the builds above them
-///   are then reached only once the missing ones are published.
+///   deleted and never re-cut — is stepped over (the probe HEADs only `floor+1`, so a gap
+///   there would otherwise hold the store at its floor for good). Two consecutive missing
+///   numbers can still end the run — always when they sit directly above the floor — and the
+///   builds above them are then reached only once the missing ones are published.
 ///
 /// Two HEADs in the steady state (`floor+1` and `floor+2` absent), three when one index was
-/// published. Before 2026-09-23 a walk that could not prove it had found the newest listed
-/// the releases on the metered API instead; the guarantee is what lets it prove it.
+/// published. The contiguity guarantee is what lets the walk prove it found the newest
+/// without listing releases on the metered API.
 fn newest_index(
     floor: u64,
     probe: &mut dyn FnMut(u64) -> Result<bool, String>,
@@ -331,6 +330,30 @@ fn index_quad(slug: &str, tag: &str) -> Option<IndexQuad> {
         roster: web_asset_url(slug, tag, roster)?,
         roster_sig: web_asset_url(slug, tag, &roster_sig)?,
     })
+}
+
+/// The quads of `newest` and the builds below it, down to [`INDEX_CANDIDATE_CAP`] and never
+/// below `low`, newest first. A release whose four assets do not all arrive is left out,
+/// the first such failure kept in `first_error`.
+fn fetch_run(
+    slug: &str,
+    (newest, low): (u64, u64),
+    fetch: &mut WebFetch<'_>,
+    first_error: &mut Option<String>,
+) -> Result<Vec<Candidate>, String> {
+    let oldest = newest.saturating_sub(INDEX_CANDIDATE_CAP - 1).max(low);
+    let mut out = Vec::new();
+    for build in (oldest..=newest).rev() {
+        let tag = index_tag(build);
+        let quad = index_quad(slug, &tag).ok_or_else(|| underivable(slug, &tag))?;
+        match fetch_quad(&quad, fetch) {
+            Ok(candidate) => out.push(candidate),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The four assets of `quad`, whole, or the first that did not arrive.
@@ -464,7 +487,9 @@ impl GithubFetcher {
     /// is LEFT OUT — an index can be up before its signature or roster while the publisher
     /// is still uploading — so that release is simply not a candidate, as the listing that
     /// came before skipped an incomplete release; only when none arrives does the resolve
-    /// fail. A HEAD that reached no host marks the link down ([`Self::link_down`]).
+    /// fail. A floor that is no published tag at all — one a machine signed above the run —
+    /// is walked again from first contact. A HEAD that reached no host marks the link down
+    /// ([`Self::link_down`]).
     fn walk_candidates(
         &self,
         slug: &str,
@@ -515,19 +540,27 @@ impl GithubFetcher {
                 }
             }
         };
-        let (newest, low) = newest_index(self.index_floor, &mut probe)?;
-        let oldest = newest.saturating_sub(INDEX_CANDIDATE_CAP - 1).max(low);
-        let mut out = Vec::new();
+        let floor = self.index_floor;
+        let run = newest_index(floor, &mut probe)?;
         let mut first_error: Option<String> = None;
-        for build in (oldest..=newest).rev() {
-            let tag = index_tag(build);
-            let quad = index_quad(slug, &tag).ok_or_else(|| underivable(slug, &tag))?;
-            match fetch_quad(&quad, fetch) {
-                Ok(candidate) => out.push(candidate),
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
-            }
+        let mut out = fetch_run(slug, run, fetch, &mut first_error)?;
+        // THE FLOOR IS A SIGNED NUMBER, NOT A TAG. A rostered machine chose it, so one that
+        // signed a build far above the run lifted every store that took it out of the run,
+        // and no tag the owner publishes was asked for again: not even the revoking
+        // republish of the newer generation that re-bases the floor (`sig::BuildFloor`).
+        // Nothing above the floor, its release not arriving and its own tag absent, the walk
+        // finds the run as a store that has verified nothing does; selection still holds
+        // every candidate to the floor, and a run it refuses whole leaves the resolve on its
+        // cache (`flow::resolve_verified_index`). A run that ends directly below the floor
+        // is its tag deleted to be re-cut: no second walk, and the failure stands.
+        if out.is_empty()
+            && floor > 0
+            && run.0 == floor
+            && matches!(probe(floor), Ok(false))
+            && let Ok(found) = newest_index(0, &mut probe)
+            && found.0 < floor - 1
+        {
+            out = fetch_run(slug, found, fetch, &mut first_error)?;
         }
         if out.is_empty() {
             return Err(first_error.unwrap_or_else(|| underivable(slug, "the index")));
@@ -588,7 +621,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         // The release TAG is `atpkg-<program>-<build>` by publishing convention, and `build`
         // arrived here from the SIGNED index's channel `pin` table — so the exact URL is
         // already determined, and the answer to "which build" comes only from bytes the
-        // master-rooted chain covers. The bytes are still verified exactly as before
+        // master-rooted chain covers. The bytes are still verified
         // (`verify_pkg` → `parse_pkg`, which re-binds program and build), so the host remains
         // a transport, never an authenticity input (§8).
         let (toml_url, sig_url) = direct_manifest_urls(&slug, program, build)
@@ -640,7 +673,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         // consulted — nothing about this fetcher's account reaches the request, and no
         // credential either. `cap` is the signed `size`, exactly. Resumable like every big
         // transfer, and the https pin covers the first hop as well as every redirect.
-        aterm_update_core::download_to_resumable_https_only(url, None, dest, cap)
+        aterm_update_core::download_to_resumable_https_only(url, dest, cap)
     }
 
     fn vendor_get(
@@ -1066,11 +1099,10 @@ mod tests {
         );
     }
 
-    /// No credential on the web host, pinned STRUCTURALLY from both sides: the only
-    /// functions this fetcher reads `github.com` through (`web_fetch_bytes`,
-    /// `web_fetch_to`) have no token parameter and refuse an API URL before any
-    /// request; and the transport underneath refuses a token paired with a non-API
-    /// host. Neither refusal needs the network, so both are asserted here.
+    /// No credential on the web host, pinned STRUCTURALLY: the only functions this
+    /// fetcher reads `github.com` through (`web_fetch_bytes`, `web_fetch_to`) have no
+    /// token parameter — nor does the transport underneath — and refuse an API URL
+    /// before any request. The refusal needs no network, so it is asserted here.
     #[test]
     fn direct_fetches_present_no_credential_to_the_web_host() {
         let api = "https://api.github.com/repos/alabsystems/ty/releases/assets/1";
@@ -1088,21 +1120,13 @@ mod tests {
             "{refused}"
         );
         assert!(super::refuse_api_host(web).is_ok());
-        // The converse gate, in the transport every lane shares.
-        let refused = aterm_update_core::download_bytes(web, Some("ghp_x"), 1024).unwrap_err();
-        assert!(refused.contains("non-API host"), "{refused}");
-        let refused =
-            aterm_update_core::download_to_resumable(web, Some("ghp_x"), &dest, 1024).unwrap_err();
-        assert!(refused.contains("non-API host"), "{refused}");
         assert!(!dest.exists(), "nothing was spawned");
     }
 
     #[test]
     fn dir_fetcher_rejects_traversal_names() {
         use crate::flow::Fetcher as _;
-        let d = std::env::temp_dir().join(format!("atpkg-dirfetch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testdir::dir("atpkg-dirfetch-");
         let f = DirFetcher::new(d.clone());
         let dest = d.join("out");
         assert!(f.download("r", "../../etc/passwd", &dest).is_err());
@@ -1133,9 +1157,7 @@ mod tests {
     #[test]
     fn dir_source_id_is_canonical() {
         use crate::flow::Fetcher as _;
-        let d = std::env::temp_dir().join(format!("atpkg-dirsrc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testdir::dir("atpkg-dirsrc-");
         let canon = std::fs::canonicalize(&d).unwrap();
         let f = DirFetcher::new(d.clone());
         assert_eq!(f.source_id(), format!("dir:{}", canon.display()));
@@ -1146,9 +1168,7 @@ mod tests {
     fn dir_manifest_sparse_oversize_is_rejected_without_allocation() {
         use crate::flow::Fetcher as _;
 
-        let d = std::env::temp_dir().join(format!("atpkg-dirfetch-sparse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testdir::dir("atpkg-dirfetch-sparse-");
         let index = std::fs::File::create(d.join("index.toml")).unwrap();
         index.set_len(MANIFEST_CAP + 1).unwrap();
         std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
@@ -1162,7 +1182,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]
@@ -1171,9 +1191,7 @@ mod tests {
         use crate::flow::Fetcher as _;
         use std::os::unix::ffi::OsStrExt as _;
 
-        let d = std::env::temp_dir().join(format!("atpkg-dirfetch-special-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testdir::dir("atpkg-dirfetch-special-");
         let index = d.join("index.toml");
         let index_c = std::ffi::CString::new(index.as_os_str().as_bytes()).unwrap();
         // SAFETY: `index_c` is a live NUL-terminated path in our private fixture.
@@ -1196,7 +1214,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &pkg).unwrap();
         std::fs::write(d.join("pkg-ay-1.toml.sig"), b"sig").unwrap();
         assert!(fetcher.pkg_manifest("ignored", "ay", 1).is_err());
-        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// THE INODE-TRUNCATION REGRESSION. `DirFetcher` hardlinks a registry file into
@@ -1209,8 +1227,7 @@ mod tests {
     #[test]
     fn a_stale_staging_hardlink_never_truncates_the_registry_file() {
         use crate::flow::Fetcher as _;
-        let dir = std::env::temp_dir().join(format!("atpkg-hl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testdir::dir("atpkg-hl-");
         std::fs::create_dir_all(dir.join("reg")).unwrap();
         std::fs::create_dir_all(dir.join("staging")).unwrap();
         let payload = b"the registry bytes that must survive";
@@ -1347,7 +1364,7 @@ mod tests {
     }
 
     /// A name no download URL derives from is REFUSED before any request — there is no
-    /// listing behind the derived URL any more (R3, 2026-09-23), so the manifest, the unsized
+    /// listing behind the derived URL, so the manifest, the unsized
     /// asset and the sized artifact lanes each answer an underivable name with an error and
     /// write nothing. The control: the same fetcher derives the URL for a published name.
     #[test]
@@ -1471,7 +1488,7 @@ mod tests {
         Ok(builds.iter().map(|b| index_tag(*b)).collect())
     }
 
-    /// THE REQUIRED NET TEST (R3, 2026-09-23). From a verified floor of 44, `atpkg-index-45`
+    /// THE REQUIRED NET TEST. From a verified floor of 44, `atpkg-index-45`
     /// answering GitHub's own 302 and 46 onward a 404 resolves 45 — with 44 behind it — in
     /// exactly three HEADs and eight asset downloads, every one on the release download host:
     /// no api.github.com request is asked. The negative control is the predicate itself: it
@@ -1501,10 +1518,11 @@ mod tests {
     }
 
     /// The walk from every kind of floor. The steady state (the floor is the newest) is TWO
-    /// HEADs — the next number and the one past it — and one quad; a store five builds behind gallops and bisects to the newest and
-    /// fetches the four below it; and a store that has verified NOTHING finds the channel
-    /// from its first power of two (the public channel starts at atpkg-index-6, so 8) — none
-    /// of it with a listing, which is what each of these cases cost before.
+    /// HEADs — the next number and the one past it — and one quad; a store five builds behind
+    /// gallops and bisects to the newest and fetches the four below it; and a store that has
+    /// verified NOTHING finds the channel from its first power of two (the public channel starts at
+    /// atpkg-index-6, so 8) — none of it with a listing, which is what each of these cases cost
+    /// before.
     #[test]
     fn the_walk_finds_the_newest_from_any_floor_and_from_none() {
         let steady = walk(45, &channel(6, 45), &[]);
@@ -1575,15 +1593,13 @@ mod tests {
         }
     }
 
-    /// A MISSING NUMBER IS STEPPED OVER (review of the one-transport walk, 2026-09-23). The
-    /// publisher refuses a gap, but a first publish numbered by hand or a release deleted and
-    /// never re-cut can still leave one, and a gap directly above a store's verified floor
-    /// used to hold that store at its floor for good: the walk HEADed `floor+1`, met the
-    /// 404, and landed the floor on every pass. Exhaustively over small channels with every
-    /// pattern of single missing numbers, from every floor, the walk lands the newest and the
-    /// lower bound it reports is published. The control is the documented limit, so the step
-    /// is not a walk that ignores misses: two consecutive missing numbers directly above the
-    /// floor end the run at the floor.
+    /// A MISSING NUMBER IS STEPPED OVER. The publisher refuses a gap, but a first publish
+    /// numbered by hand or a release deleted and never re-cut can still leave one, and a gap
+    /// directly above a store's verified floor must not hold it there. Exhaustively over small
+    /// channels with every pattern of single missing numbers, from every floor, the walk lands the
+    /// newest and the lower bound it reports is published. The control is the documented limit, so
+    /// the step is not a walk that ignores misses: two consecutive missing numbers directly above
+    /// the floor end the run at the floor.
     #[test]
     fn the_search_steps_over_a_missing_number_and_stops_at_two() {
         for first in 1..=3u64 {
@@ -1798,6 +1814,257 @@ mod tests {
         assert!(err.contains("atpkg-index-45/index.toml"), "{err}");
     }
 
+    /// A FLOOR ABOVE THE PUBLISHED RUN: the floor is the SIGNED `index_build` of the last
+    /// index this store took, which a rostered machine chooses, so one that signed the TOML
+    /// integer ceiling into a release lifted every store that took it above every tag. With
+    /// nothing above the floor and its own tag answering 404, the walk finds the run again
+    /// as a store that has verified nothing does, and the owner's revoking republish (the
+    /// newest tag) is a candidate again. The control is the re-cut window: a floor whose
+    /// tag was deleted to be re-cut sits directly above the run, and its walk still fails,
+    /// so the resolve keeps serving the cached floor index rather than candidates below it.
+    #[test]
+    fn a_floor_above_the_published_run_is_found_again_from_first_contact() {
+        let poisoned = i64::MAX.unsigned_abs();
+        let unpublished = format!("atpkg-index-{poisoned}/index.toml");
+        let w = walk(poisoned, &channel(6, 46), &[unpublished.as_str()]);
+        assert_eq!(w.labels, labels(&[46, 45, 44, 43]));
+        let w = walk(45, &channel(6, 44), &["atpkg-index-45/index.toml"]);
+        let err = w.labels.unwrap_err();
+        assert!(err.contains("atpkg-index-45/index.toml"), "{err}");
+    }
+
+    /// What [`SignedChannel`] publishes for one pass.
+    #[derive(Clone)]
+    struct Publication {
+        /// The builds whose releases are up; `None` is the link down.
+        run: Option<std::ops::RangeInclusive<u64>>,
+        /// The first build published beside the NEXT roster generation.
+        newer_roster_from: u64,
+        /// The first build whose index declares that generation.
+        newer_index_from: u64,
+        /// The first build whose index a key on no roster signed.
+        outsider_from: u64,
+    }
+
+    /// The channel as discovery meets it: the real walk from a floor of 47 over HEADs and
+    /// downloads of genuinely signed quads (the test roster's machine and paper master).
+    struct SignedChannel {
+        fetcher: GithubFetcher,
+        publication: std::cell::RefCell<Publication>,
+        /// The builds up to which an index's freshness window has already lapsed.
+        lapsed_through: std::cell::Cell<u64>,
+    }
+
+    impl crate::flow::Fetcher for SignedChannel {
+        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            use crate::sig::testkit;
+            let p = self.publication.borrow().clone();
+            let lapsed_through = self.lapsed_through.get();
+            let up = |build: u64| p.run.as_ref().is_some_and(|run| run.contains(&build));
+            let generation =
+                |newer_from: u64, build: u64| testkit::SEQ + u64::from(build >= newer_from);
+            self.fetcher.walk_candidates(
+                &self.fetcher.index_slug(),
+                &mut |url: &str| {
+                    if p.run.is_none() {
+                        return Err(aterm_update_core::HttpError::Transport(
+                            "curl: (6) Could not resolve host".into(),
+                        ));
+                    }
+                    if up(walked_build(url)) {
+                        published()
+                    } else {
+                        absent()
+                    }
+                },
+                &mut |url: &str, _cap: u64| {
+                    let (build, asset) = url
+                        .split_once("/atpkg-index-")
+                        .and_then(|(_, rest)| rest.split_once('/'))
+                        .and_then(|(n, asset)| Some((n.parse::<u64>().ok()?, asset)))
+                        .unwrap_or_else(|| panic!("not an index asset: {url}"));
+                    if !up(build) {
+                        return Err(format!("HTTP 404 for {url}"));
+                    }
+                    let roster = aterm_update_core::roster::Roster {
+                        roster_seq: generation(p.newer_roster_from, build),
+                        ..testkit::roster()
+                    }
+                    .to_toml()
+                    .expect("a valid roster emits")
+                    .into_bytes();
+                    let valid_until = if build <= lapsed_through {
+                        "2020-01-01T00:00:00Z"
+                    } else {
+                        "2099-01-01T00:00:00Z"
+                    };
+                    let index = format!(
+                        "schema = 2\nindex_build = {build}\nvalid_until = \"{valid_until}\"\n\
+                         machine_id = \"{}\"\nroster_seq = {}\n[programs.ay]\nrepo = \"ay\"\n",
+                        testkit::MACHINE_ID,
+                        generation(p.newer_index_from, build),
+                    )
+                    .into_bytes();
+                    Ok(match asset {
+                        "index.toml" => index,
+                        "index.toml.sig" if build >= p.outsider_from => {
+                            testkit::sign(&testkit::OUTSIDER_SEED, &index)
+                        }
+                        "index.toml.sig" => testkit::sign(&testkit::MACHINE_SEED, &index),
+                        "aterm-machines.toml" => roster,
+                        _ => testkit::sign(&testkit::MASTER_SEED, &roster),
+                    })
+                },
+            )
+        }
+        fn index_link_down(&self) -> bool {
+            self.fetcher.index_link_down()
+        }
+        fn pkg_manifest(&self, _: &str, _: &str, _: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
+            Err("not asked".into())
+        }
+        fn download(&self, _: &str, _: &str, _: &std::path::Path) -> Result<(), String> {
+            Err("not asked".into())
+        }
+        fn source_id(&self) -> String {
+            github_source_id("alabsystems")
+        }
+    }
+
+    /// A RUN FOUND BELOW THE FLOOR NEVER DISPLACES THE CACHED FLOOR INDEX. A store whose
+    /// floor is 47 meets the owner deleting 47 to re-cut it, then 46 too: the walk finds the
+    /// run again at 45, every candidate of which selection refuses (same generation, below
+    /// the floor). The resolve still serves the cached 47, says it ran on the cache, keeps
+    /// it cached beside what was served, and serves it offline after; a refused run above
+    /// the floor, longer than the walk fetches, is cached beside it the same way, for
+    /// `doctor` to name. The controls are the generations: a release
+    /// served beside the NEXT roster drops the cached 47 even though its own index is
+    /// refused — the source's refusal then stands, and its set replaces the cache — and the
+    /// owner's republish of 45 at that generation, the rescue the rediscovery exists for,
+    /// is selected live.
+    #[test]
+    fn a_run_found_below_the_floor_keeps_serving_the_cached_floor_index() {
+        use crate::sig::testkit;
+        let store = crate::testdir::absent_layout("atpkg-net-below-floor-");
+        let f = SignedChannel {
+            fetcher: GithubFetcher::new("alabsystems".into()).with_index_floor(47),
+            publication: std::cell::RefCell::new(Publication {
+                run: None,
+                newer_roster_from: u64::MAX,
+                newer_index_from: u64::MAX,
+                outsider_from: u64::MAX,
+            }),
+            lapsed_through: std::cell::Cell::new(0),
+        };
+        let pass = |run: Option<std::ops::RangeInclusive<u64>>,
+                    roster_from: u64,
+                    index_from: u64,
+                    outsider_from| {
+            *f.publication.borrow_mut() = Publication {
+                run,
+                newer_roster_from: roster_from,
+                newer_index_from: index_from,
+                outsider_from,
+            };
+            let floor = crate::sig::BuildFloor {
+                index_build: 47,
+                roster_seq: testkit::SEQ,
+            };
+            let index = crate::flow::resolve_verified_index(
+                &f,
+                &store,
+                &testkit::anchor(),
+                floor,
+                testkit::NOW,
+            );
+            let cached = crate::cache::IndexCache::for_layout(&store)
+                .labels(&github_source_id("alabsystems"))
+                .unwrap_or_default();
+            (
+                index.map(|i| i.index_build).map_err(|e| e.to_string()),
+                crate::flow::last_resolve().is_some_and(|r| r.reached),
+                cached,
+            )
+        };
+        let cached = |builds: &[u64]| labels(builds).unwrap();
+        let never = u64::MAX;
+        // 1. First contact, on a prefix nothing has created yet: 47 live, cached, and the
+        //    generation that admitted it recorded in the prefix.
+        assert_eq!(
+            pass(Some(6..=47), never, never, never),
+            (Ok(47), true, cached(&[47]))
+        );
+        assert_eq!(
+            crate::sig::Floor::new(store.roster_floor()).current(),
+            testkit::SEQ
+        );
+        // 2. 47 deleted to be re-cut, 3. then offline: the cache serves.
+        let from_cache = (Ok(47), false, cached(&[47]));
+        assert_eq!(pass(Some(6..=46), never, never, never), from_cache);
+        assert_eq!(pass(None, never, never, never), from_cache);
+        // 4. 46 deleted as well, 5. then offline: the run found again at 45 is refused
+        //    whole, and the cached floor index still serves, cached beside that run.
+        let beside_run = (Ok(47), false, cached(&[45, 44, 43, 42, 47]));
+        assert_eq!(pass(Some(6..=45), never, never, never), beside_run);
+        assert_eq!(pass(None, never, never, never), beside_run);
+        // 6. Restored.
+        assert_eq!(
+            pass(Some(6..=47), never, never, never),
+            (Ok(47), true, cached(&[47]))
+        );
+        // 6b. Four releases above the floor signed by a key on no roster: the walk fetches
+        //     nothing at or below the floor, the cached 47 serves, and the refused run is
+        //     cached beside it — `doctor`'s "index 51 was downloaded but not accepted", where
+        //     a cache of 47 alone said no complete newer release was there. Offline after,
+        //     47 still serves.
+        let beside_refused = (Ok(47), false, cached(&[51, 50, 49, 48, 47]));
+        assert_eq!(pass(Some(6..=51), never, never, 48), beside_refused);
+        assert_eq!(pass(None, never, never, 48), beside_refused);
+        // 6c. The same with the floor index's window lapsed: it is refused `Stale` live, and
+        //     beside the refused run it still wins and is refused the same way — the run is
+        //     cached beside it all the same, for `doctor` to name.
+        f.lapsed_through.set(47);
+        let stale = |builds: &[u64], reached| {
+            (
+                Err(crate::flow::FlowError::Stale.to_string()),
+                reached,
+                cached(builds),
+            )
+        };
+        assert_eq!(pass(Some(6..=47), never, never, never), stale(&[47], true));
+        assert_eq!(
+            pass(Some(6..=51), never, never, 48),
+            stale(&[51, 50, 49, 48, 47], false)
+        );
+        f.lapsed_through.set(0);
+        assert_eq!(
+            pass(Some(6..=47), never, never, never),
+            (Ok(47), true, cached(&[47]))
+        );
+        // 7. 48 published beside the next generation, signed by a key on no roster: nothing
+        //    selects, the cached 47 least of all, so the source's verdict stands and what it
+        //    served is the cache — `doctor`'s "index 48 was downloaded but not accepted".
+        let refused = |builds: &[u64]| {
+            (
+                Err(crate::flow::FlowError::NoIndex.to_string()),
+                true,
+                cached(builds),
+            )
+        };
+        assert_eq!(pass(Some(6..=48), 48, never, 48), refused(&[48, 47]));
+        // 8. The run found below the floor beside that generation, its indexes declaring the
+        //    old one: refused the same way.
+        assert_eq!(
+            pass(Some(6..=45), 0, never, never),
+            refused(&[45, 44, 43, 42])
+        );
+        // 9. The owner republishes 45 at the next generation: selected live.
+        assert_eq!(
+            pass(Some(6..=45), 45, 45, never),
+            (Ok(45), true, cached(&[45, 44, 43, 42]))
+        );
+    }
+
     /// A host whose every answer is "published" cannot hold the walk: it stops at its HEAD
     /// budget with a named failure, and fetches nothing.
     #[test]
@@ -1822,8 +2089,9 @@ mod tests {
         assert_eq!(q.roster_sig, format!("{base}aterm-machines.toml.sig"));
         assert!(index_quad("a/b/c", "atpkg-index-41").is_none());
         assert!(index_quad("alabsystems/aterm", "atpkg-index-4/1").is_none());
-        // Still below the §14 cache's candidate ceiling, or a full set could never be
-        // persisted for the offline fallback — a ceiling on the SOURCE.
-        const { assert!(INDEX_CANDIDATE_CAP <= 24) };
+        // Still below the §14 cache's candidate ceiling with room for the cached index that
+        // serves beside a refused set, or a full set could never be persisted for the
+        // offline fallback — a ceiling on the SOURCE.
+        const { assert!(INDEX_CANDIDATE_CAP < 24) };
     }
 }

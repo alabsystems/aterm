@@ -229,7 +229,7 @@ fn resize_wide_char_at_boundary_is_cleared() {
     // SAFETY: Test-local `pages` outlives `row` for the full scope.
     unsafe { row.resize(9, &mut pages) };
 
-    // Col 8 should be cleared since the continuation cell at col 9 is gone
+    // Col 8 is cleared: its continuation at col 9 is gone.
     assert_eq!(row.get(8).unwrap().char(), ' ');
     assert!(!row.get(8).unwrap().is_wide());
 }

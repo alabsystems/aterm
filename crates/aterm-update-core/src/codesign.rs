@@ -6,12 +6,14 @@
 //!
 //! ONE requirement text for every caller — the app updater's bundle check and atpkg's
 //! staged agent binaries — so the two cannot disagree about what "signed by team X"
-//! means. The spawn is bounded by a deadline and fails closed: a timeout, a spawn
-//! failure or a non-zero exit is never a pass.
+//! means. The spawn is bounded by a deadline (`aterm_uds::deadline::output_until`, the
+//! workspace's one bounded child runner) and fails closed: a timeout, a spawn failure or
+//! a non-zero exit is never a pass.
 
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use aterm_uds::deadline::{RunError, output_until};
 
 /// Absolute, so no `PATH` entry can stand in for Apple's tool.
 pub const CODESIGN: &str = "/usr/bin/codesign";
@@ -24,15 +26,10 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// for: 2 MiB/s. codesign `--verify --strict` hashes every page of the file, so its time
 /// is its READ time, and under atpkg's `taskpolicy -c utility` clamp (the window spawns
 /// every pass as `qos::Role::Background`, and codesign inherits the clamp) those reads are
-/// IO-throttled behind whatever else the disk is doing. Evidence (2026-09-26, the owner's
-/// Mac at a load average of ~90 from parallel `targo` builds): the installed codex
-/// 0.157.0 binary (238 MB) verified in 1.98 s unclamped and in 453 s under `taskpolicy -c
-/// utility` (`sample` mid-run: `scanFileData` → `FileDesc::read`, i.e. throttled
-/// reads, 2.3 s of CPU in all); its 65 MB helper in 0.66 s unclamped and 130–215 s
-/// clamped (116 s with `taskpolicy -d important` inside the clamp — the disk policy
-/// does not escape it). The
-/// fixed 30 s ceiling this replaces failed codex twice on 2026-09-25 (02:42:55Z,
-/// 02:48:29Z) and let it through 21 s later — a race against the disk, not a verdict.
+/// IO-throttled behind whatever else the disk is doing. Measured at a load average of
+/// ~90: a 238 MB binary verified in 1.98 s unclamped and in 453 s clamped (throttled
+/// reads, 2.3 s of CPU in all), and a fixed 30 s ceiling failed it, then passed it 21 s
+/// later — a race against the disk, not a verdict.
 /// So no deadline is long enough on a saturated machine: this rate covers a moderately
 /// busy one, and what a deadline still cannot cover is DEFERRED by the caller, never
 /// failed (atpkg's `StageError::VerifyDeferred`).
@@ -53,11 +50,6 @@ pub fn verify_timeout_for(len: u64) -> Duration {
         .min(VERIFY_TIMEOUT_MAX)
 }
 
-/// The first child-exit poll, doubled up to [`POLL_MAX`]: codesign on one binary takes
-/// tens of milliseconds, and a fixed tick would round every call up to it.
-const POLL_MIN: Duration = Duration::from_millis(1);
-const POLL_MAX: Duration = Duration::from_millis(25);
-
 /// How much of codesign's stderr a refusal keeps: the tail, and more than a pipe holds,
 /// so no diagnostic a finishing child could write is cut.
 const STDERR_KEEP: usize = 64 * 1024;
@@ -77,7 +69,7 @@ pub enum CodesignError {
     /// codesign did not finish by the deadline; it was killed and reaped. Never a pass,
     /// and never a verdict on the bytes ([`Self::is_verdict`]): what a caller does with it
     /// is its own policy — the app updater refuses the update, atpkg's Developer ID gate
-    /// defers the program to its next pass (`StageError::VerifyDeferred`, 2026-09-26).
+    /// defers the program to its next pass (`StageError::VerifyDeferred`).
     TimedOut,
     /// codesign ran and refused. `code` is its exit status (`None` when a signal ended
     /// it): 1 is a signature that does not verify, 3 a valid signature that fails the
@@ -111,14 +103,41 @@ impl std::error::Error for CodesignError {}
 
 /// codesign's words (Security.framework's `errSecCS…` strings) for a signature fault in
 /// the bytes it read. Exit 1 also reports a file it could not read or an internal
-/// failure, and those are facts about this machine, not verdicts on the bytes.
-const SIGNATURE_FAULTS: [&str; 6] = [
+/// failure, and those are facts about this machine, not verdicts on the bytes. The
+/// bundle-level two (a changed, added or removed sealed resource; a stray file in the
+/// bundle root) were measured on an ad hoc signed `.app` under `--deep --strict`: the
+/// app updater's stage is a bundle, and its tampering must stay a verdict where a
+/// non-verdict is a passing refusal. `bundle format
+/// unrecognized, invalid, or unsuitable` is the bundle's form of the object-file line
+/// (`errSecCSBadBundleFormat`, measured: an `.app` with no `Info.plist`, or
+/// an empty one): a bundle that is not a bundle stays that way until something
+/// replaces it.
+const SIGNATURE_FAULTS: [&str; 11] = [
     "code object is not signed at all",
     "invalid signature (code or signature have been modified)",
     "invalid or unsupported format for signature",
     "unsupported type or version of signature",
     "main executable failed strict validation",
     "object file format unrecognized, invalid, or unsuitable",
+    "a sealed resource is missing or invalid",
+    "unsealed contents present in the bundle root",
+    "invalid Info.plist (plist or signature have been modified)",
+    "invalid resource directory (directory or signature have been modified)",
+    "bundle format unrecognized, invalid, or unsuitable",
+];
+
+/// codesign's words for a failure to READ or to run, on a line of an exit-1 refusal:
+/// facts about this machine at this moment, never about the bytes
+/// ([`CodesignError::judged_nothing`]).
+const MACHINE_FAULTS: [&str; 8] = [
+    "Permission denied",
+    "No such file or directory",
+    "internal error in Code Signing subsystem",
+    "the code cannot be read by the verifier (file system permissions etc.)",
+    "Resource temporarily unavailable",
+    "Operation not permitted",
+    "Too many open files",
+    "Too many open files in system",
 ];
 
 impl CodesignError {
@@ -137,6 +156,33 @@ impl CodesignError {
                 let line = line.trim_end();
                 SIGNATURE_FAULTS.iter().any(|fault| line.ends_with(fault))
             }),
+            _ => false,
+        }
+    }
+
+    /// Whether codesign RAN and KNOWABLY judged nothing: a signal ended it, or exit 1
+    /// names only a failure to read or to run ([`MACHINE_FAULTS`]) and no signature
+    /// fault. Narrower than `!is_verdict()` on purpose: a refusal in words not listed
+    /// either way (codesign has many) stays a refusal of the bytes, so a caller that
+    /// discards or asks a person on a refusal keeps doing so for any tampering it has
+    /// not been taught (a modified Info.plist and a modified resource directory were
+    /// measured in words neither list then held).
+    #[must_use]
+    pub fn judged_nothing(&self) -> bool {
+        match self {
+            Self::Refused { code: None, .. } => true,
+            Self::Refused {
+                code: Some(1),
+                stderr,
+            } => {
+                let named = |faults: &[&str]| {
+                    stderr.lines().any(|line| {
+                        let line = line.trim_end();
+                        faults.iter().any(|fault| line.ends_with(fault))
+                    })
+                };
+                !self.is_verdict() && named(&MACHINE_FAULTS)
+            }
             _ => false,
         }
     }
@@ -184,97 +230,27 @@ pub fn verify_developer_id_until(
     if !cfg!(target_os = "macos") {
         return Err(CodesignError::Unsupported);
     }
-    let mut cmd = Command::new(CODESIGN);
+    let mut cmd = aterm_uds::spawnfd::command(CODESIGN);
     cmd.arg("--verify");
     if deep {
         cmd.arg("--deep");
     }
     cmd.args(["--strict", "--verbose=2", "-R", &requirement])
         .arg(path);
-    let (status, stderr) = run_bounded(&mut cmd, deadline)?;
-    if status.success() {
+    let out = output_until(&mut cmd, deadline).map_err(|e| match e {
+        RunError::Spawn(e) => CodesignError::Spawn(e),
+        RunError::Wait(e) => CodesignError::Wait(e),
+        RunError::TimedOut => CodesignError::TimedOut,
+    })?;
+    if out.status.success() {
         Ok(())
     } else {
+        let tail = out.stderr.len().saturating_sub(STDERR_KEEP);
         Err(CodesignError::Refused {
-            code: status.code(),
-            stderr,
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr[tail..]).into_owned(),
         })
     }
-}
-
-/// Run `cmd` to completion by `deadline`, keeping the tail of its stderr. The stream is
-/// drained on its own thread so a chatty child cannot wedge on a full pipe; a child still
-/// running at the deadline is killed and reaped before [`CodesignError::TimedOut`].
-fn run_bounded(
-    cmd: &mut Command,
-    deadline: Instant,
-) -> Result<(ExitStatus, String), CodesignError> {
-    use std::io::Read as _;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(CodesignError::Spawn)?;
-    let drain = match child.stderr.take() {
-        Some(mut stream) => {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let spawned = std::thread::Builder::new()
-                .name("codesign-stderr".to_string())
-                .spawn(move || {
-                    let mut tail: Vec<u8> = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    while let Ok(n) = stream.read(&mut chunk) {
-                        if n == 0 {
-                            break;
-                        }
-                        tail.extend_from_slice(&chunk[..n]);
-                        if tail.len() > STDERR_KEEP {
-                            let cut = tail.len() - STDERR_KEEP;
-                            tail.drain(..cut);
-                        }
-                    }
-                    let _ = tx.send(String::from_utf8_lossy(&tail).into_owned());
-                });
-            if let Err(e) = spawned {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CodesignError::Spawn(e));
-            }
-            Some(rx)
-        }
-        None => None,
-    };
-    let mut poll = POLL_MIN;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CodesignError::TimedOut);
-                }
-                std::thread::sleep(poll.min(remaining));
-                poll = (poll * 2).min(POLL_MAX);
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CodesignError::Wait(e));
-            }
-        }
-    };
-    // The child has exited, so its end of the pipe is closed and the drain finishes
-    // promptly; the short floor only covers a deadline the exit itself used up.
-    let grace = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(250));
-    let stderr = drain
-        .and_then(|rx| rx.recv_timeout(grace).ok())
-        .unwrap_or_default();
-    Ok((status, stderr))
 }
 
 #[cfg(test)]
@@ -351,8 +327,15 @@ mod tests {
              In architecture: arm64\n",
             "x: main executable failed strict validation",
             "x: object file format unrecognized, invalid, or unsuitable\n",
+            "aterm.app: a sealed resource is missing or invalid\n",
+            "aterm.app: unsealed contents present in the bundle root\n",
+            "A.app: invalid Info.plist (plist or signature have been modified)\n",
+            "A.app: invalid resource directory (directory or signature have been modified)\n\
+             In subcomponent: /A.app/Contents/Helpers/h\n",
+            "aterm.app: bundle format unrecognized, invalid, or unsuitable\n",
         ] {
             assert!(refused(Some(1), stderr).is_verdict(), "{stderr:?}");
+            assert!(!refused(Some(1), stderr).judged_nothing(), "{stderr:?}");
         }
         assert!(
             refused(
@@ -375,6 +358,47 @@ mod tests {
         assert!(!CodesignError::TimedOut.is_verdict());
         assert!(!CodesignError::Unsupported.is_verdict());
         assert!(!CodesignError::InvalidTeam(String::new()).is_verdict());
+    }
+
+    /// What a caller that DISCARDS or ASKS A PERSON on a refusal may set aside
+    /// ([`CodesignError::judged_nothing`]): a signal, and exit 1 naming only a failure to
+    /// read or run. NEGATIVE CONTROLS: a refusal in words neither list holds — the next
+    /// tampering codesign words differently — judged something (fail closed), as does a
+    /// line naming a machine fault beside a signature fault, and exit 2 or 3.
+    #[test]
+    fn only_a_known_machine_fault_or_a_signal_judged_nothing() {
+        let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
+            code,
+            stderr: stderr.to_string(),
+        };
+        assert!(refused(None, "").judged_nothing());
+        for stderr in [
+            "bin/claude: Permission denied\n",
+            "bin/claude: No such file or directory\n",
+            "bin/claude: internal error in Code Signing subsystem\n",
+            "bin/claude: the code cannot be read by the verifier (file system permissions etc.)",
+        ] {
+            assert!(refused(Some(1), stderr).judged_nothing(), "{stderr:?}");
+        }
+        for (code, stderr) in [
+            (Some(1), "A.app: nested code is modified or invalid\n"),
+            (Some(1), ""),
+            (
+                Some(1),
+                "A.app: Permission denied\nA.app: code object is not signed at all\n",
+            ),
+            (Some(2), "bin/claude: Permission denied\n"),
+            (
+                Some(3),
+                "code failed to satisfy specified code requirement(s)\n",
+            ),
+        ] {
+            assert!(
+                !refused(code, stderr).judged_nothing(),
+                "{code:?} {stderr:?}"
+            );
+        }
+        assert!(!CodesignError::TimedOut.judged_nothing());
     }
 
     /// Measured on the real tool: exit 1 for a file codesign cannot read is NOT a verdict
@@ -403,13 +427,14 @@ mod tests {
                 "{unreadable:?}"
             );
             assert!(!unreadable.is_verdict(), "{unreadable}");
+            assert!(unreadable.judged_nothing(), "{unreadable}");
         }
+        assert!(!unsigned.judged_nothing(), "{unsigned}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE DEADLINE SCALES WITH THE FILE (2026-09-26): a small file keeps the historical
-    /// 30 s, codex's 238 MB binary gets 143 s rather than the 30 s that failed it twice on
-    /// 2026-09-25, and nothing is given more than the ten-minute cap.
+    /// THE DEADLINE SCALES WITH THE FILE: a small file keeps 30 s, a 238 MB binary gets
+    /// 143 s, and nothing is given more than the ten-minute cap.
     #[test]
     fn the_verify_deadline_scales_with_the_file_and_is_capped() {
         assert_eq!(verify_timeout_for(0), VERIFY_TIMEOUT);
@@ -442,6 +467,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_validly_signed_binary_of_another_signer_is_refused() {
+        if aterm_uds::deadline::trust_service_silent() {
+            return;
+        }
         match verify_developer_id(Path::new("/bin/ls"), "Q6L2SF6YDW", false) {
             Err(CodesignError::Refused { code, .. }) => {
                 assert!(matches!(code, Some(1 | 3)), "{code:?}");

@@ -1,28 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// APPLICATION BLIT coverage — the present-path fullscreen-triangle blit
-// (`vs_blit` + `fs_blit`) that copies the offscreen frame into the swapchain
-// destination.
+// Present-path blit coverage: the fullscreen-triangle blit (`vs_blit` +
+// `fs_blit`, NEAREST) that copies the offscreen `Rgba8Unorm` frame into the
+// swapchain.
+//   * `BlitUniform.flag == 0`: destination bytes equal the offscreen frame.
+//   * `BlitUniform.flag != 0` (visual-bell flash): RGB inverted (`1.0 - rgb`),
+//     the GPU counterpart of the CPU `px ^ 0x00ffffff`.
 //
-// The real `GpuRenderer::present_input` does NOT re-render into the window; it
-// BLITS the single-source-of-truth offscreen `Rgba8Unorm` texture into the
-// swapchain with a fullscreen triangle, sampled NEAREST. Two contracts:
-//   * `BlitUniform.flag == 0` (the normal application blit): the destination
-//     bytes are BYTE-IDENTICAL to the offscreen frame at the app-owned encoder
-//     boundary.
-//   * `BlitUniform.flag != 0` (the visual-bell flash): RGB is inverted
-//     (`1.0 - rgb`), the GPU twin of the CPU softbuffer `px ^ 0x00ffffff`.
+// The swapchain is not readable headless, so the same pipeline, shader,
+// sampler and uniform are driven against a readable target via
+// `blit_to_offscreen_for_test`. `present()`, WSI and scanout are not
+// exercised.
 //
-// The existing GPU tests only ever read the OFFSCREEN back (`render_input` /
-// `present_input_readback`); NEITHER the blit's byte-exactness NOR the invert
-// path had any coverage. This test closes that hole. The swapchain surface isn't
-// readable headless, so it drives the EXACT same blit pipeline + `fs_blit` shader
-// + `blit_sampler` (NEAREST) + `BlitUniform` against a readable `Rgba8Unorm`
-// target via the test-only `blit_to_offscreen_for_test`, and reads that back.
-// This stand-in test does not execute `present()`, WSI, compositor, or scanout.
-//
-// Gated: no GPU or no system font => the test no-ops (returns).
+// No GPU or no system font: no-op.
 
 use std::sync::Arc;
 
@@ -31,36 +22,20 @@ use aterm_core::terminal::Terminal;
 use aterm_gpu::GpuRenderer;
 use aterm_render::{Frame, RenderInput, SceneAtlas, Theme};
 
-mod common;
-use common::{bb, gg, rr};
+use crate::common::{self, bb, gg, rr};
 
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
+/// This suite drives the wgpu oracle arm's blit seams (they read the wgpu
+/// offscreen).
 fn fresh_gpu() -> Option<GpuRenderer> {
-    match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => {
-            // THE FLIP: this suite drives the WGPU ORACLE arm's blit seams
-            // (they read the wgpu offscreen); post-flip the oracle must be
-            // asked for by name.
-            #[cfg(target_os = "macos")]
-            let g = {
-                let mut g = g;
-                g.disarm_metal_for_oracle();
-                g
-            };
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
+    common::wgpu_oracle_or_skip(18.0, Theme::default())
 }
 
-/// Render `input` to the renderer's offscreen, capture those pixels (the existing
-/// readback — the SINGLE SOURCE OF TRUTH), then run the REAL blit (`invert`) into
-/// a readable target and read it back. Returns `(offscreen_source, blit_output)`.
+/// Render `input` to the offscreen, read it back, then run the real blit
+/// (`invert`) into a readable target and read that back. Returns
+/// `(offscreen_source, blit_output)`.
 fn source_and_blit(
     gpu: &mut GpuRenderer,
     win: &mut aterm_gpu::WindowGpu,
@@ -90,10 +65,8 @@ fn representative_input() -> RenderInput {
     term.cell_frame(ROWS, COLS)
 }
 
-/// PASSTHROUGH (invert = false): the blit output must be BYTE-IDENTICAL to the
-/// offscreen source for EVERY pixel. This is the hard "blit is byte-exact"
-/// invariant — NEAREST sampling at 1:1, no interpolation smear, no colour-space
-/// drift. A single mismatch is an application blit-path bug, not a tolerance miss.
+/// Passthrough (invert = false): every blit output pixel equals the offscreen
+/// source (NEAREST at 1:1, no smear, no colour-space drift).
 #[test]
 fn blit_passthrough_is_byte_identical() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -129,10 +102,9 @@ fn blit_passthrough_is_byte_identical() {
     );
 }
 
-/// A pixel ramp for `w * h` pixels that visits EVERY 8-bit value in EVERY
-/// channel: `i` for red, and odd strides (coprime with 256) for green and blue,
-/// so each channel's residues cycle through all 256 values. Whole-domain
-/// coverage is not assumed — the caller MEASURES it on the readback.
+/// A ramp over `w * h` pixels that visits every 8-bit value in every channel:
+/// `i` for red and odd strides (coprime with 256) for green and blue. The
+/// caller checks coverage on the readback.
 fn full_domain_ramp(w: usize, h: usize) -> Vec<u32> {
     (0..w * h)
         .map(|i| {
@@ -144,18 +116,12 @@ fn full_domain_ramp(w: usize, h: usize) -> Vec<u32> {
         .collect()
 }
 
-/// Put EXACT `0x00RRGGBB` bytes into the renderer's resident offscreen and
-/// return the readback, having asserted the injection was byte-exact.
+/// Put exact `0x00RRGGBB` bytes into the renderer's offscreen and return the
+/// readback, asserting the injection was exact.
 ///
-/// The seam is the FREE-SPRITE layer: one opaque (`alpha == 255`, untinted)
-/// NEAREST 1:1 rect covering the whole frame, drawn `OverText` over a blank
-/// cursor-hidden grid. That is a plain replacement of every frame pixel, so the
-/// offscreen ends up carrying `pixels` verbatim — MEASURED here, per call, not
-/// assumed: if the sprite path ever stopped being a byte-exact 1:1 copy this
-/// panics on the spot instead of silently weakening the caller.
-///
-/// Bloom and shimmer are the caller's responsibility to disable; they add light
-/// to the offscreen and would break the injection.
+/// Uses one opaque, untinted NEAREST 1:1 free sprite covering the frame,
+/// drawn `OverText` over a blank cursor-hidden grid, which replaces every
+/// pixel. The caller must disable bloom and shimmer.
 fn inject_offscreen(
     gpu: &mut GpuRenderer,
     win: &mut aterm_gpu::WindowGpu,
@@ -208,26 +174,12 @@ fn inject_offscreen(
     got
 }
 
-/// The LITERAL double invert, over the WHOLE 8-BIT DOMAIN.
-///
-/// The two legs are real inverts of the REAL blit, and the second leg's INPUT
-/// IS THE FIRST LEG'S OUTPUT BYTES — `invert(invert(x)) == x` is performed, not
-/// composed from two separately-measured frames. What makes it expressible is
-/// that the offscreen is writable from a `RenderInput` after all: a single
-/// opaque NEAREST 1:1 `FreeSprite` covering the frame replaces every pixel with
-/// atlas bytes (`inject_offscreen`, which asserts that exactness on every call).
-/// (An earlier note in the retired `blit_invert_hits_range_anchors` said no
-/// such feedback path existed through this seam; it was wrong.)
-///
-/// Two properties, both stronger than any font- or SGR-built frame can reach
-/// (which is why this test replaced the two that checked `255 - x` on such
-/// frames):
-///   * DOMAIN-COMPLETE `255 - x`: the injected ramp carries all 256 values in
-///     all three channels (MEASURED on the readback, not assumed), so the
-///     invert is checked at every input value rather than at the handful the
-///     font, theme and SGR anchors happen to produce.
-///   * INVOLUTION: re-injecting the inverted frame and inverting again returns
-///     the original frame byte-for-byte.
+/// Literal double invert over the whole 8-bit domain: the second leg blits
+/// the first leg's output bytes (re-injected via `inject_offscreen`), so
+/// `invert(invert(x)) == x` is performed, not composed.
+///   * `255 - x` is checked at all 256 values in all three channels
+///     (coverage measured on the readback).
+///   * Re-inverting returns the original frame byte-for-byte.
 #[test]
 fn blit_double_invert_round_trips_the_real_output() {
     let Some(mut gpu) = fresh_gpu() else { return };
@@ -246,8 +198,8 @@ fn blit_double_invert_round_trips_the_real_output() {
     let src = inject_offscreen(&mut gpu, &mut win, &ramp, w, h);
     let inv1 = gpu.blit_to_offscreen_for_test(&mut win, true);
 
-    // NON-VACUITY, measured on the SOURCE READBACK: every 8-bit value really is
-    // present in every channel, so the per-pixel check below is domain-complete.
+    // Non-vacuity: every 8-bit value is present in every channel of the
+    // source readback.
     let mut seen = [[false; 256]; 3];
     for &p in &src.pixels {
         seen[0][rr(p) as usize] = true;
@@ -273,7 +225,7 @@ fn blit_double_invert_round_trips_the_real_output() {
         }
     }
 
-    // LEG 2: the FIRST BLIT'S OUTPUT is what gets blitted this time.
+    // Leg 2: blit the first blit's output.
     let inv1_px: Vec<u32> = inv1.pixels.iter().map(|p| p & 0x00ff_ffff).collect();
     let _ = inject_offscreen(&mut gpu, &mut win, &inv1_px, w, h);
     let inv2 = gpu.blit_to_offscreen_for_test(&mut win, true);

@@ -3,40 +3,22 @@
 
 //! Cryptographic digests for aterm: SHA-256 and HMAC-SHA256.
 //!
-//! This crate is a first-party, dependency-free replacement for the `sha2` and
-//! `hmac` crates. Measured with `cargo forge survey --cell mac-arm`, dropping
-//! them removed **8 packages / 49,474 lines** of third-party source from the
-//! shipped graph (`sha2`, `hmac`, `digest`, `typenum`, `generic-array`,
-//! `crypto-common`, `block-buffer`, `cpufeatures`) -- `digest` and its
-//! const-generic tower dominate at 45,734 lines, of which `typenum` alone is
-//! 40,601 -- to provide a surface aterm uses four methods of:
-//! [`Sha256::new`], [`Sha256::digest`], `update` and `finalize`, plus HMAC's
-//! `new_from_slice` / `update` / `finalize` / `verify_slice`.
-//!
-//! `subtle` is **not** removed by this crate and is not claimed above: `rustls`
-//! depends on it directly (and again through `ureq` ->
-//! `rustls-platform-verifier`), so it stays in the graph regardless. What
-//! [`ct_eq`] replaces is aterm's *use* of it, not the package.
-//!
-//! Trading 49k lines of const-generic type arithmetic for ~250 lines of
-//! transcribed FIPS 180-4 is the right side of the maintenance ledger: when
-//! this breaks we can read it, and every release-signature check in the tree
-//! runs through code we can audit in one sitting.
+//! A first-party, dependency-free replacement for the `sha2` and `hmac`
+//! crates, covering the surface aterm uses: [`Sha256::new`],
+//! [`Sha256::digest`], `update` and `finalize`, plus HMAC's `new_from_slice` /
+//! `update` / `finalize` / `verify_slice`. [`ct_eq`] replaces aterm's use of
+//! `subtle` (the package stays in the graph through `rustls`).
 //!
 //! # Exported types
 //!
 //! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot
 //! - [`HmacSha256`] -- RFC 2104 HMAC keyed with SHA-256
-//! - [`ct_eq`] -- constant-time byte-slice comparison (in-house, no `subtle`)
+//! - [`ct_eq`] -- constant-time byte-slice comparison
 //! - [`InvalidLength`], [`MacError`] -- API-compatible error types
 //!
-//! # What this crate is not
-//!
-//! There is no SIMD, no SHA-NI, no assembly and no `unsafe`. Correctness and
-//! auditability are the goals; aterm hashes release manifests and capability
-//! tokens, not bulk traffic. It is not gratuitously slow either -- input is
-//! consumed in 64-byte blocks straight out of the caller's slice, with a single
-//! partial-block buffer.
+//! No SIMD, SHA-NI, assembly or `unsafe`: aterm hashes release manifests and
+//! capability tokens, not bulk traffic. Input is consumed in 64-byte blocks
+//! straight from the caller's slice with one partial-block buffer.
 //!
 //! # Example
 //!
@@ -65,46 +47,22 @@
 
 #![forbid(unsafe_code)]
 
-// Named `hmac_sha256`, not `hmac`: the dev-dependency oracle is the `hmac`
-// crate, and a private module of the same name at the crate root makes a bare
-// `hmac::` path ambiguous in edition 2024.
 mod hmac_sha256;
 mod sha256;
 
 pub use hmac_sha256::{HmacSha256, InvalidLength, MacError};
 pub use sha256::Sha256;
 
-/// Compares two byte slices in constant time with respect to their *contents*.
+/// Compares two byte slices in constant time with respect to their contents.
 ///
 /// Returns `true` when the slices have the same length and the same bytes.
 ///
-/// # Why the obvious loop is wrong
-///
-/// The natural implementation --
-///
-/// ```text
-/// for (x, y) in a.iter().zip(b) {
-///     if x != y {
-///         return false;      // WRONG
-///     }
-///}
-/// ```
-///
-/// -- leaks the position of the first differing byte through how long it runs.
-/// An attacker who can submit candidate tags and time the answer recovers a
-/// 32-byte HMAC one byte at a time, in 256 * 32 guesses instead of 2^256. This
-/// is the property `subtle`'s `ConstantTimeEq` provided, and it is why
-/// [`HmacSha256::verify_slice`] must not be written with `==`.
-///
-/// So: fold every byte pair into one accumulator with `|=`, which has no
-/// branch and no early exit, and run the whole length every time. Length is
-/// *not* secret (it is visible in the wire format), so an unequal length may
-/// short-circuit; the bytes may not.
-///
-/// The final [`std::hint::black_box`] is load-bearing. Without it the optimiser
-/// is free to notice that `diff` can only grow and bail out of the loop as soon
-/// as it is non-zero, reintroducing exactly the branch this function exists to
-/// avoid.
+/// An early-exit loop would leak the position of the first differing byte
+/// through timing, letting an attacker recover an HMAC tag byte by byte. Every
+/// byte pair is folded into one accumulator with `|=`, with no branch and no
+/// early exit. Length is not secret (it is visible in the wire format), so an
+/// unequal length may short-circuit. The final [`std::hint::black_box`] keeps
+/// the optimiser from reintroducing an early exit once `diff` is non-zero.
 #[must_use]
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -191,11 +149,9 @@ mod tests {
 
     #[test]
     fn ct_eq_stays_branch_free() {
-        // Value tests cannot see this property: an early-return `ct_eq` passes
-        // every assertion above (mutation-checked -- inserting
-        // `if x != y { return false; }` into the fold leaves the whole suite
-        // green) while leaking the first differing byte through timing. The
-        // property lives in the SHAPE of the code, so pin the source.
+        // Value tests cannot see timing: an early-return `ct_eq` passes every
+        // assertion above. The property lives in the shape of the code, so pin
+        // the source.
         let src = include_str!("lib.rs");
         let body = src
             .split("pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {")

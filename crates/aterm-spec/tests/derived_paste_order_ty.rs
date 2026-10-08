@@ -31,9 +31,8 @@ fn a_spill_receipt_cannot_grant_queued_key_present_priority() {
             .iter()
             .any(|registered| registered.name == model.name)
     );
-    if let Err(verify::NotRun { model }) = verify::prove_and_catch_tiered(&model, model.name) {
-        eprintln!("TIER-0 SKIPPED: `{model}` requires an unavailable external checker");
-    }
+    // A NotRun has already printed its own NOT RUN line.
+    let _ = verify::prove_and_catch_tiered(&model, model.name);
 
     let healthy = interp::with_buggy(&model, 0);
     let mut state = healthy.init_state();
@@ -61,11 +60,8 @@ fn a_paste_in_a_cannot_order_a_key_in_b() {
             .any(|registered| registered.name == model.name),
         "the sink-isolation machine must stay enrolled in the spec-link registry"
     );
-    if let Err(verify::NotRun { model }) = verify::prove_and_catch_tiered(&model, model.name) {
-        eprintln!(
-            "TIER-0 SKIPPED (this test is NOT a pass for it): `{model}` requires an unavailable external checker"
-        );
-    }
+    // A NotRun has already printed its own NOT RUN line.
+    let _ = verify::prove_and_catch_tiered(&model, model.name);
 
     let healthy = interp::with_buggy(&model, 0);
     let mut state = healthy.init_state();

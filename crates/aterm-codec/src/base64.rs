@@ -35,17 +35,14 @@ pub enum DecodeError {
     /// Strict decode only: the padding is not canonical — the input length is
     /// not an exact multiple of four. Value is the input length.
     InvalidPadding(usize),
-    /// Strict decode only: the final data symbol carries bits the decode would
-    /// discard, so the input is a NON-CANONICAL spelling of its own output
-    /// (`"Zh=="` and `"Zg=="` both mean `b"f"`). Position + the offending byte.
+    /// Strict decode only: the final data symbol has nonzero discarded bits,
+    /// a non-canonical spelling (`"Zh=="` vs `"Zg=="`). Position + byte.
     InvalidLastSymbol(usize, u8),
 }
 
 impl fmt::Display for DecodeError {
-    // Formatted via `write_str` + the crate's digit writers instead of
-    // `write!`: the `format_args!` expansion calls the unsafe
-    // `fmt::Arguments` constructor, which Trust fails closed on. The output
-    // is byte-identical to the previous `write!` format strings.
+    // `write_str` + the crate's digit writers instead of `write!`, whose
+    // `format_args!` Trust fails closed on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidByte(pos, byte) => {
@@ -129,24 +126,18 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     decode_with_table(input.as_bytes(), &STANDARD_DECODE)
 }
 
-/// Decode standard Base64 under STRICT RFC 4648 canonicalisation.
+/// Decode standard Base64 under strict RFC 4648 canonicalisation.
 ///
-/// This is the acceptance set every trust-critical decode in the tree needs,
-/// and it is deliberately NARROWER than [`decode`]:
+/// Narrower than [`decode`]:
 ///
-/// * the input length must be an exact multiple of four — canonical padding is
-///   REQUIRED, where [`decode`] happily accepts an unpadded tail;
+/// * the length must be a multiple of four (padding required);
 /// * `=` may appear only as the last one or two bytes of the final quad;
-/// * the low bits of the final data symbol that the decode discards must be
-///   zero, so exactly ONE Base64 spelling maps to any given byte string.
+/// * the discarded low bits of the final data symbol must be zero, so exactly
+///   one spelling maps to any byte string.
 ///
-/// That last rule is the reason this entry point exists. Under [`decode`] both
-/// `"Zg=="` and `"Zh=="` yield `b"f"`, so a pinned Ed25519 key would have
-/// textual aliases that compare unequal as strings yet verify identically —
-/// and the release pipeline compares those keys AS TEXT
-/// (`aterm_release::publish::canonical_update_pubkey`). Signature, roster and
-/// pinned-key paths therefore call `decode_strict`; [`decode`] stays lenient
-/// for terminal payloads (OSC 52, OSC 1337) where real emitters omit padding.
+/// Signature, roster and pinned-key paths use this, since keys are compared as
+/// text (`aterm_release::publish::canonical_update_pubkey`); [`decode`] stays
+/// lenient for terminal payloads whose emitters omit padding.
 ///
 /// # Errors
 ///
@@ -161,11 +152,8 @@ pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 fn encode_padded(input: &[u8]) -> String {
     let alphabet = STANDARD_ALPHABET;
-    // Dominating DoS guard: bound `input.len()` so the `encoded_len` allocation
-    // below is provably below the verifier's per-allocation ceiling. The public
-    // caller (`encode`) already rejects input over `crate::MAX_INPUT_LEN`, so this
-    // guard is unreachable for any real call — it only makes the bound LOCALLY visible to verification and fails
-    // safe (empty output) for any future caller that forgets the cap.
+    // Makes the `encoded_len` allocation bound locally provable; `encode`
+    // already rejects larger input, so this only fails safe for other callers.
     if input.len() > crate::MAX_INPUT_LEN {
         return String::new();
     }
@@ -173,19 +161,12 @@ fn encode_padded(input: &[u8]) -> String {
         return String::new();
     }
 
-    // Capacity is a SINGLE, branch-free over-estimate computed directly from the
-    // guarded `input.len()` so the verifier can bound the allocation: every Base64
-    // encoding of `n` bytes is at most `(n / 3 + 1) * 4` chars (4 output chars per
-    // 3 input bytes, plus one partial-chunk quad). With `input.len() <=
-    // MAX_INPUT_LEN` (the dominating guard above) this is `< 2 * MAX_INPUT_LEN <
-    // 2^28`, and the exact length still drives the pushes below, so the returned
-    // string is byte-identical — only the reservation may be a few bytes larger.
+    // Branch-free over-estimate `(n / 3 + 1) * 4 < 2^28` the verifier can
+    // bound; the pushes below produce the exact length.
     let cap = input.len() / 3 * 4 + 4;
     let mut out = Vec::with_capacity(cap);
 
-    // Process full 3-byte chunks — `as_chunks` yields `&[u8; 3]` arrays, so
-    // every chunk index below is compile-time bounded (no runtime obligations),
-    // and the remainder falls out of the same call.
+    // `as_chunks` yields `&[u8; 3]`, so chunk indices are compile-time bounded.
     let (chunks, rem) = input.as_chunks::<3>();
     for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
@@ -228,16 +209,9 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
         return Ok(Vec::new());
     }
 
-    // Reservation upper bound computed DIRECTLY from the original, guarded
-    // `input.len()` (before any re-slice below): a Base64 decode yields at most 3
-    // bytes per 4 input chars, so the decoded length never exceeds the original
-    // input length. With the dominating `input.len() > MAX_INPUT_LEN` guard above
-    // this is `< MAX_INPUT_LEN < 2^28`. Taken here, off the un-shadowed `input`,
-    // so the bound is visible to verification (the post-pad-strip re-slice length
-    // is a fresh slice var the verifier cannot relate back to the guarded length).
-    // `.min(MAX_INPUT_LEN)` restates the dominating guard as a local fact for
-    // the verifier's allocation budget; identical value on every path that
-    // reaches here (the guard already returned for larger inputs).
+    // Decoded length never exceeds the input length. Taken from the guarded,
+    // un-reshadowed `input` so the verifier can relate it to the guard; `.min`
+    // restates the guard locally.
     let cap = input.len().min(crate::MAX_INPUT_LEN);
 
     // Count and validate padding (0, 1, or 2 trailing '=' allowed).
@@ -245,10 +219,8 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
     if pad_count > 2 {
         return Err(DecodeError::InvalidLength(input.len()));
     }
-    // `take_while` counts at most `input.len()` bytes, so this never actually
-    // saturates; `saturating_sub` just makes the bound locally visible, and the
-    // total `get(..).unwrap_or(input)` fallback (never taken: end <= len by the
-    // saturation) removes the slice obligation outright.
+    // Never saturates, and the `get(..).unwrap_or(input)` fallback is never
+    // taken; both remove obligations.
     let input = input
         .get(..input.len().saturating_sub(pad_count))
         .unwrap_or(input);
@@ -266,14 +238,9 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
 
     let mut i: usize = 0;
 
-    // Process full 4-byte chunks. `as_chunks::<4>()` yields `&[u8; 4]` arrays,
-    // handing the verifier the chunk length at compile time — no index or
-    // add-overflow obligations remain, and the array pattern is irrefutable;
-    // `i` only tracks the absolute position for error reporting. It advances
-    // by 4 per consumed chunk and never exceeds `input.len()`, so the
-    // saturating adds never actually saturate. Iteration count, decode order,
-    // and error positions are identical to the previous `while i + 4 <= len`
-    // loop.
+    // `as_chunks::<4>()` gives fixed-size arrays, so no index or overflow
+    // obligations remain; `i` tracks the absolute position for errors and
+    // never saturates.
     let (chunks, rem) = input.as_chunks::<4>();
     for chunk in chunks {
         let &[c0, c1, c2, c3] = chunk;
@@ -289,10 +256,7 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
         i = i.saturating_add(4);
     }
 
-    // Process the remainder (0, 2, or 3 trailing chars; 1 was rejected above).
-    // Same bytes and positions as the previous `input.get(i..)` re-slice —
-    // `i == input.len() - rem.len()` here — destructured by slice pattern for
-    // the same zero-obligation reason as the main loop.
+    // Remainder: 0, 2 or 3 chars (1 was rejected above); `i` is its offset.
     match *rem {
         [r0, r1] => {
             let a = decode_byte(table, r0, i)?;
@@ -315,9 +279,7 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
 }
 
 fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {
-    // Dominating DoS guard, identical in placement and effect to
-    // `decode_with_table`: bound the input before any work, so the
-    // `with_capacity` below is provably under the verifier's allocation ceiling.
+    // Allocation guard, as in `decode_with_table`.
     if input.len() > crate::MAX_INPUT_LEN {
         return Err(DecodeError::InputTooLarge(input.len()));
     }
@@ -325,10 +287,8 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
         return Ok(Vec::new());
     }
 
-    // Canonical padding: the encoded form of `n` bytes is always a whole number
-    // of quads. A remainder of 1 can never be a truncated quad (six bits is less
-    // than a byte) and is reported as a length error; any other remainder is an
-    // input that dropped its `=` padding.
+    // Canonical encodings are whole quads. A remainder of 1 is a length error
+    // (six bits is less than a byte); any other means missing padding.
     let remainder = input.len() % 4;
     if remainder != 0 {
         return Err(if remainder == 1 {
@@ -338,25 +298,20 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
         });
     }
 
-    // At most 3 output bytes per 4 input bytes, so the decoded length never
-    // exceeds the (already guarded) input length. `.min` restates the dominating
-    // guard as a local fact for the verifier; identical value on every path.
+    // Decoded length never exceeds the guarded input length; `.min` restates
+    // the guard for the verifier.
     let cap = input.len().min(crate::MAX_INPUT_LEN);
     let mut out = Vec::with_capacity(cap);
 
-    // `input.len() % 4 == 0` and `input` is non-empty, so `as_chunks::<4>()`
-    // yields at least one `&[u8; 4]` and an EMPTY remainder — every byte of the
-    // input is covered by the loop below, and each index is bounded at compile
-    // time by the array pattern.
+    // Length is a nonzero multiple of 4, so the remainder is empty and the
+    // loop covers every byte.
     let (chunks, _rem) = input.as_chunks::<4>();
     let last = chunks.len().saturating_sub(1);
     let mut i: usize = 0;
     for (idx, chunk) in chunks.iter().enumerate() {
         let &[c0, c1, c2, c3] = chunk;
-        // Padding is legal ONLY in the final quad. In every other quad `=` is
-        // just a byte outside the alphabet and `decode_byte` rejects it, which
-        // is what makes `"Zg==Zg=="` an error rather than two concatenated
-        // decodes.
+        // Padding is legal only in the final quad; elsewhere `decode_byte`
+        // rejects `=`, so `"Zg==Zg=="` is an error.
         if idx == last && c3 == b'=' {
             if c2 == b'=' {
                 // `XX==` — 12 bits carried, 8 consumed; the low 4 bits of the
@@ -418,9 +373,8 @@ mod tests {
 
     #[test]
     fn fuzz_base64_roundtrip_and_decode_never_panics() {
-        // base64 carries untrusted payloads (e.g. OSC 52 clipboard data from any
-        // program), so `decode` must NEVER panic on arbitrary input — only
-        // Ok/Err — and `encode` ∘ `decode` must round-trip every byte string.
+        // `decode` must never panic on arbitrary input, and `encode` then
+        // `decode` must round-trip every byte string.
         let mut state: u64 = 0xC2B2_AE3D_27D4_EB4F;
         let mut next = move || {
             state = state

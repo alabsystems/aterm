@@ -3,15 +3,11 @@
 
 //! Zero-allocation grapheme cluster iterator (UAX #29).
 //!
-//! Implements Unicode Technical Annex #29 extended grapheme cluster
-//! segmentation using a generated Grapheme_Cluster_Break (GCB) property
-//! table (see [`crate::tables::gcb`]) and a 15x15 break decision matrix.
+//! Implements UAX #29 extended grapheme cluster segmentation using a
+//! generated Grapheme_Cluster_Break (GCB) property table (see
+//! [`crate::tables::gcb`]) and a 15x15 break decision matrix. Every rule is
+//! implemented:
 //!
-//! Replaces the `unicode-segmentation` crate dependency (#7698, #7737).
-//!
-//! # UAX #29 Rule Coverage
-//!
-//! **Fully implemented:**
 //! - GB1/GB2  — break at start/end of text
 //! - GB3      — CR × LF
 //! - GB4/GB5  — break after/before Control, CR, or LF
@@ -21,34 +17,23 @@
 //! - GB9      — × (Extend | ZWJ)
 //! - GB9a     — × SpacingMark
 //! - GB9b     — Prepend ×
-//! - GB11     — Extended_Pictographic Extend\* ZWJ × Extended_Pictographic
-//!   (stateful lookahead via `in_ext_pict_zwj`)
-//! - GB12/GB13 — Regional_Indicator × Regional_Indicator at odd indices
-//!   (parity tracked via `ri_count`)
-//! - GB999    — break everywhere else
-//!
 //! - GB9c     — InCB=Consonant [InCB={Extend,Linker}]* InCB=Linker
-//!   [InCB={Extend,Linker}]* × InCB=Consonant
-//!   (Indic conjunct cluster — tracked via `incb_*` state bits)
-//!
-//! **Not implemented:** none of the UAX #29 extended grapheme rules are missing.
+//!   [InCB={Extend,Linker}]* × InCB=Consonant (`incb_*` state bits)
+//! - GB11     — Extended_Pictographic Extend\* ZWJ × Extended_Pictographic
+//!   (`in_ext_pict_zwj`)
+//! - GB12/GB13 — Regional_Indicator × Regional_Indicator at odd indices
+//!   (`ri_count`)
+//! - GB999    — break everywhere else
 //!
 //! # Algorithm
 //!
-//! The state machine operates on pairs of GCB classes: the previous character's
-//! GCB class and the next character's GCB class. For each pair, the generated
-//! `GRAPHEME_BREAK[prev][next]` matrix answers "break between prev and next?"
-//! This handles GB3–GB9b and GB999 directly.
+//! The generated `GRAPHEME_BREAK[prev][next]` matrix over GCB class pairs
+//! answers GB3–GB9b and GB999 directly. The contextual rules add state:
 //!
-//! Two pieces of state are maintained on top of the matrix for the contextual
-//! rules:
-//!
-//! - `ri_count`: number of consecutive Regional_Indicator codepoints seen
-//!   since the last non-RI. GB12/13 says RI×RI holds only when the number of
-//!   preceding RIs (including the one to the left of the boundary) is odd.
-//! - `in_ext_pict_zwj`: `true` when we are inside an
-//!   Extended_Pictographic Extend\* ZWJ prefix, meaning a following
-//!   Extended_Pictographic should join via GB11.
+//! - `ri_count`: consecutive Regional_Indicators since the last non-RI;
+//!   RI×RI holds only when the count before the boundary is odd.
+//! - `in_ext_pict_zwj`: inside an Extended_Pictographic Extend\* ZWJ prefix,
+//!   so a following Extended_Pictographic joins via GB11.
 
 use crate::tables::gcb::{GCB, GRAPHEME_BREAK, InCB, gcb_class, incb_class};
 
@@ -59,9 +44,10 @@ use crate::tables::gcb::{GCB, GRAPHEME_BREAK, InCB, gcb_class, incb_class};
 /// Segmentation state carried between codepoints.
 ///
 /// The GB11 emoji-ZWJ chain is tracked in the iterator (via
-/// `last_base_was_ext_pict`) because it requires looking back past `Extend`
-/// codepoints to the most recent non-Extend, non-ZWJ base. Only the "are we
-/// in a complete ExtPict Extend\* ZWJ prefix?" bit flows through `BreakState`.
+/// `ext_pict_then_extends`, "the text so far ends with ExtPict Extend\*")
+/// because it requires looking back past `Extend` codepoints to the
+/// pictograph. Only the "are we in a complete ExtPict Extend\* ZWJ prefix?"
+/// bit flows through `BreakState`.
 #[derive(Debug, Clone, Copy, Default)]
 struct BreakState {
     /// Number of consecutive Regional_Indicator codepoints since the last
@@ -217,9 +203,10 @@ fn find_first_cluster_end(
     let (mut prev_gcb, first_incb) =
         first_classes.unwrap_or_else(|| (gcb_class(first), incb_class(first)));
 
-    // Track whether the last non-Extend non-ZWJ base was Extended_Pictographic.
-    // A following Extend* ZWJ establishes the GB11 prefix.
-    let mut last_base_was_ext_pict = prev_gcb == GCB::Extended_Pictographic;
+    // Whether the text so far ends with `ExtPict Extend*`: the only thing a
+    // ZWJ may follow for GB11 to join the next pictograph. A ZWJ ends it (a
+    // second ZWJ, or an Extend after the ZWJ, is no longer that prefix).
+    let mut ext_pict_then_extends = prev_gcb == GCB::Extended_Pictographic;
     let mut state = BreakState {
         ri_count: if prev_gcb == GCB::Regional_Indicator {
             1
@@ -235,33 +222,29 @@ fn find_first_cluster_end(
         let next_gcb = gcb_class(c);
         let next_incb = incb_class(c);
 
-        // Rebuild the GB11 chain flag immediately before the decision, so
-        // that a ZWJ following ExtPict Extend* transitions into the chain.
-        if prev_gcb == GCB::ZWJ && last_base_was_ext_pict {
-            state.in_ext_pict_zwj = true;
-        }
-
         if is_break(prev_gcb, next_gcb, next_incb, &state) {
             // The boundary char `c` (at `idx`) becomes the base of the next
             // cluster; hand its already-computed classes to the next call.
             return (idx, Some((next_gcb, next_incb)));
         }
 
-        // Advance state for the next iteration.
+        // Advance the GB11 state: `in_ext_pict_zwj` holds exactly when the
+        // text so far ends with `ExtPict Extend* ZWJ`.
         match next_gcb {
             GCB::Extended_Pictographic => {
-                last_base_was_ext_pict = true;
+                ext_pict_then_extends = true;
                 state.in_ext_pict_zwj = false;
             }
             GCB::Extend => {
-                // No change to last_base tracker — Extend extends the base.
+                // Extend continues `ExtPict Extend*` but ends `... ZWJ`.
+                state.in_ext_pict_zwj = false;
             }
             GCB::ZWJ => {
-                // Defer flipping `in_ext_pict_zwj` until the next iteration,
-                // where we can consult `last_base_was_ext_pict`.
+                state.in_ext_pict_zwj = ext_pict_then_extends;
+                ext_pict_then_extends = false;
             }
             _ => {
-                last_base_was_ext_pict = false;
+                ext_pict_then_extends = false;
                 state.in_ext_pict_zwj = false;
             }
         }
@@ -362,10 +345,8 @@ impl<'a> Iterator for GraphemeIndices<'a> {
 // Extension trait
 // ---------------------------------------------------------------------------
 
-/// Extension trait providing grapheme cluster iteration on `&str`.
-///
-/// This replaces the `UnicodeSegmentation` trait from the `unicode-segmentation`
-/// crate. The API is intentionally similar for drop-in replacement.
+/// Extension trait providing grapheme cluster iteration on `&str`, with an
+/// API close to `unicode-segmentation`'s `UnicodeSegmentation`.
 ///
 /// # Example
 ///
@@ -425,13 +406,38 @@ mod tests {
     }
 
     #[test]
+    fn test_gb11_needs_extend_only_between_pictograph_and_zwj() {
+        // GB11 is `\p{ExtPict} Extend* ZWJ × \p{ExtPict}`: only Extend may sit
+        // between the pictograph and the ZWJ. A second ZWJ, or an Extend after
+        // a ZWJ, ends the prefix, so the next pictograph starts a new cluster
+        // (GB999). The official test file has no such line; ICU agrees.
+        let (p, zwj, ext) = ("\u{1F44D}", "\u{200D}", "\u{0308}");
+        for (head, why) in [
+            (format!("{p}{zwj}{zwj}"), "ZWJ ZWJ"),
+            (format!("{p}{zwj}{ext}{zwj}"), "ZWJ Extend ZWJ"),
+            (format!("{p}{ext}{zwj}{ext}{zwj}"), "Extend ZWJ Extend ZWJ"),
+        ] {
+            let s = format!("{head}{p}");
+            let g: Vec<&str> = s.graphemes().collect();
+            assert_eq!(g, [head.as_str(), p], "{why}");
+        }
+        // The prefix GB11 does match still joins.
+        for joined in [
+            format!("{p}{ext}{zwj}{p}"),
+            format!("{p}{ext}{ext}{zwj}{p}{zwj}{p}"),
+        ] {
+            let g: Vec<&str> = joined.graphemes().collect();
+            assert_eq!(g, [joined.as_str()]);
+        }
+    }
+
+    #[test]
     fn test_boundary_class_reuse_across_clusters() {
-        // Regression for the next_base threading: the boundary codepoint that
-        // ends one cluster becomes the base of the next, and its precomputed
-        // (GCB, InCB) classes are reused. Exercise boundaries whose classes
-        // drive state init (Consonant for GB9c, Regional_Indicator for GB12/13,
-        // Extended_Pictographic for GB11) to confirm the reused classes
-        // reconstruct the same state as a fresh classification would.
+        // next_base threading: the boundary codepoint ending one cluster is the
+        // base of the next, with its (GCB, InCB) classes reused. Boundaries
+        // whose classes drive state init (Consonant for GB9c, RI for GB12/13,
+        // ExtPict for GB11) must reconstruct the same state as a fresh
+        // classification.
 
         // Two adjacent Devanagari conjuncts: each conjunct ends and the next
         // begins on an InCB=Consonant whose incb_after_consonant init matters.
@@ -451,7 +457,7 @@ mod tests {
         assert_eq!(g, &["\u{1F1FA}\u{1F1F8}", "\u{1F1EC}", "a"]);
 
         // ExtPict boundary then standalone ZWJ+ExtPict: the second emoji is a
-        // boundary base; last_base_was_ext_pict must derive from its class.
+        // boundary base; ext_pict_then_extends must derive from its class.
         let emoji = "\u{1F600}\u{1F601}";
         let g: Vec<&str> = emoji.graphemes().collect();
         assert_eq!(g, &["\u{1F600}", "\u{1F601}"]);
@@ -464,9 +470,8 @@ mod tests {
 
     #[test]
     fn test_plane14_tag_classification() {
-        // Regression: Plane 14 tag characters were previously out of the GCB
-        // table range and defaulted to Other, breaking subdivision-flag
-        // sequences. Verify they classify as Extend.
+        // Plane 14 tag characters are in the GCB table and classify as Extend,
+        // so subdivision-flag sequences stay one cluster.
         use crate::tables::gcb::{GCB, gcb_class};
         assert_eq!(gcb_class('\u{E0020}'), GCB::Extend);
         assert_eq!(gcb_class('\u{E0067}'), GCB::Extend);

@@ -3,39 +3,39 @@
 
 //! Serialized, versioned preference transaction core for native Settings.
 //!
-//! The reducer is pure and deterministic. A host worker reads/writes the file and feeds
-//! whole snapshots here; this service performs OCC, per-key stale rebase, conditional
-//! undo, and one `aterm-toml` document transform per accepted patch. The UI never writes config
-//! bytes directly.
+//! The reducer is pure and deterministic. A host worker reads/writes the file and
+//! feeds whole snapshots here; the service does OCC, per-key stale rebase, conditional
+//! undo and one `aterm-toml` document transform per accepted patch. The UI never
+//! writes config bytes directly.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
 const UNDO_LIMIT: usize = 64;
-/// One admission budget shared by startup, watcher reloads, and Manual's
-/// semantic analysis. Keeping these equal prevents startup from accepting a
-/// generation the watcher can never fingerprint or the editor can never
-/// validate.
+/// Admission budget shared by startup, watcher reloads and Manual's semantic
+/// analysis, so startup never accepts a generation the watcher cannot fingerprint or
+/// the editor cannot validate.
 pub(crate) const MAX_CONFIG_FILE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct ConfigSnapshot {
     pub(crate) revision: u64,
-    /// Generation of the external environment against which Manual diagnostics
-    /// were last requested. A stable file observation advances this even when
-    /// `aterm.toml` bytes are identical, because referenced assets and installed
-    /// fonts may have changed independently of the document text.
+    /// Environment generation Manual diagnostics were last requested against. A stable
+    /// file observation advances it even when `aterm.toml` is byte-identical, since
+    /// referenced assets and installed fonts can change independently.
     pub(crate) analysis_generation: u64,
     pub(crate) text: Arc<str>,
-    /// Parsed semantic projection produced before admission. Native Settings
-    /// and process-wide policy edges clone this Arc instead of reparsing the
-    /// bounded TOML document on the event loop.
+    /// Parsed semantic projection produced before admission; Settings and process-wide
+    /// policy clone this Arc instead of reparsing on the event loop.
     pub(crate) config: Arc<crate::app_config::Config>,
     pub(crate) semantic_values: Arc<BTreeMap<String, String>>,
-    /// Exact immutable non-text assets admitted with `text` at `revision`.
-    /// Cloning a snapshot clones this one outer Arc; Trail manifests and the
-    /// custom kitty sprite are never independently re-resolved by consumers.
+    /// The values of `text` the harness's `[disk]` reader does not read as written
+    /// ([`parse_disk_faults`]), parsed with `semantic_values`: Settings ▸ Modified asks
+    /// them before it calls an authored key one with no effect.
+    pub(crate) disk_faults: DiskFaults,
+    /// Immutable non-text assets admitted with `text` at `revision`, shared as one outer
+    /// Arc; consumers never re-resolve Trail manifests or the custom kitty sprite.
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
 }
 
@@ -47,16 +47,27 @@ impl std::fmt::Debug for ConfigSnapshot {
             .field("analysis_generation", &self.analysis_generation)
             .field("text_len", &self.text.len())
             .field("semantic_value_count", &self.semantic_values.len())
+            .field("disk_fault_count", &self.disk_faults.len())
             .field("assets", &self.assets)
             .finish_non_exhaustive()
     }
 }
 
+/// What the harness's `[disk]` reader does not read as written in one text
+/// (`aterm_agent::harness::cli::disk_faults`).
+pub(crate) type DiskFaults = Arc<[aterm_agent::harness::cli::DiskFault]>;
+
+/// [`DiskFaults`] of `text`, computed with the text's semantic values
+/// ([`parse_values`]) wherever they are: at load, on the host worker for a disk
+/// observation, and on the reducer for a patch.
+fn parse_disk_faults(text: &str) -> DiskFaults {
+    aterm_agent::harness::cli::disk_faults(text).into()
+}
+
 impl ConfigSnapshot {
-    /// Semantic top-level values exactly as the transaction service compares
-    /// them for optimistic concurrency.  Settings uses this projection for
-    /// "Modified" and edit expectations: an effective default is presentation,
-    /// not evidence that the key exists in `aterm.toml`.
+    /// Semantic top-level values as the service compares them for optimistic
+    /// concurrency. Settings uses them for "Modified" and edit expectations; an
+    /// effective default is presentation, not evidence the key exists in `aterm.toml`.
     pub(crate) fn values(&self) -> Result<BTreeMap<String, String>, String> {
         Ok((*self.semantic_values).clone())
     }
@@ -82,11 +93,10 @@ pub(crate) struct ConfigPatchRequest {
     pub(crate) edits: Vec<ConfigKeyEdit>,
 }
 
-/// Immutable handoff from the optimistic reducer to the sole durable config
-/// worker. `expected_text` and `baseline` are the last synchronized disk
-/// generation, while `snapshot` is the candidate to publish. Keeping all three
-/// together prevents a later service mutation from changing a queued commit's
-/// compare-and-swap authority.
+/// Immutable handoff from the optimistic reducer to the sole durable config worker:
+/// `expected_text` and `baseline` are the last synchronized disk generation, and
+/// `snapshot` is the candidate to publish. Bundled so later service mutations cannot
+/// change a queued commit's compare-and-swap authority.
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigPersistencePlan {
     pub(crate) snapshot: ConfigSnapshot,
@@ -95,25 +105,24 @@ pub(crate) struct ConfigPersistencePlan {
     pub(crate) baseline: Option<crate::native_document_host::AtomicFileBaseline>,
 }
 
-/// One stable UTF-8 disk read plus the exact logical-target/file generation
-/// that supplied it. The reload host carries this same value through Manual
-/// refresh, strict parse, and config-service admission; no consumer performs an
-/// independent second content read.
+/// One stable UTF-8 disk read plus the logical-target/file generation it came from,
+/// carried through Manual refresh, strict parse and config-service admission so no
+/// consumer reads the content a second time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigDiskObservation {
     pub(crate) text: String,
     pub(crate) baseline: crate::native_document_host::AtomicFileBaseline,
 }
 
-/// Exact disk bytes plus every filesystem-backed asset and effect-feed runtime
-/// needed to admit those bytes on the event loop. Construction belongs to a
-/// host worker; admission and the downstream font worker perform only bounded
-/// computation over this immutable generation.
+/// Disk bytes plus every filesystem-backed asset and effect-feed runtime needed to
+/// admit them on the event loop. Built on a host worker; admission and the font
+/// worker only compute over this immutable generation.
 #[derive(Clone)]
 pub(crate) struct PreparedConfigObservation {
     pub(crate) observation: ConfigDiskObservation,
     pub(crate) config: crate::app_config::Config,
     pub(crate) values: BTreeMap<String, String>,
+    pub(crate) disk_faults: DiskFaults,
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
     pub(crate) path_feeds: crate::app_config::PreparedPathFeedGeneration,
 }
@@ -124,6 +133,7 @@ impl std::fmt::Debug for PreparedConfigObservation {
             .debug_struct("PreparedConfigObservation")
             .field("observation", &self.observation)
             .field("semantic_value_count", &self.values.len())
+            .field("disk_fault_count", &self.disk_faults.len())
             .field("assets", &self.assets)
             .finish_non_exhaustive()
     }
@@ -173,9 +183,11 @@ struct UndoRecord {
 pub(crate) struct VersionedConfigService {
     text: String,
     values: BTreeMap<String, String>,
+    disk_faults: DiskFaults,
     config: Arc<crate::app_config::Config>,
     durable_text: String,
     durable_values: BTreeMap<String, String>,
+    durable_disk_faults: DiskFaults,
     durable_config: Arc<crate::app_config::Config>,
     durable_assets: Arc<crate::app_config::ConfigAssetCatalog>,
     disk_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
@@ -190,22 +202,19 @@ pub(crate) struct VersionedConfigService {
 }
 
 impl VersionedConfigService {
-    // bench-support: `headless_for_test` (which the frame-latency bench builds
-    // through) constructs its config service with this deterministic ctor.
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     pub(crate) fn new(text: String) -> Result<Self, String> {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
 
-    /// Runtime constructor used only before presentation. Theme/rainbow kitty discovery
-    /// is bounded and parsed once here; Trail/Sparkle feeds remain explicitly
-    /// pending for the parallel startup worker. Tests use the deterministic
-    /// test constructor and its complete synchronous catalog.
+    /// Runtime constructor used before presentation. Theme/rainbow kitty discovery is
+    /// bounded and parsed once here; Trail/Sparkle feeds stay pending for the startup
+    /// worker. Tests use the deterministic test constructor instead.
     pub(crate) fn new_runtime(text: String) -> Result<Self, String> {
         Self::new_with_themes_mode(text, crate::app_config::ThemeCatalog::discover(), true)
     }
 
-    #[cfg(any(test, feature = "bench-support"))]
+    #[cfg(test)]
     fn new_with_themes(
         text: String,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -219,6 +228,7 @@ impl VersionedConfigService {
         path_feeds_pending: bool,
     ) -> Result<Self, String> {
         let values = parse_values(&text)?;
+        let disk_faults = parse_disk_faults(&text);
         let config = parse_config(&text)?;
         let assets = if path_feeds_pending {
             config.resolve_preliminary_asset_catalog_with_themes(themes)
@@ -229,10 +239,12 @@ impl VersionedConfigService {
         Ok(Self {
             durable_text: text.clone(),
             durable_values: values.clone(),
+            durable_disk_faults: Arc::clone(&disk_faults),
             durable_config: Arc::clone(&config),
             durable_assets: Arc::clone(&assets),
             text,
             values,
+            disk_faults,
             config,
             disk_baseline: None,
             disk_text_admitted: false,
@@ -246,10 +258,9 @@ impl VersionedConfigService {
         })
     }
 
-    /// Seed the process service from the same user config path watched by the
-    /// rest of the app. Missing config is the valid empty document; unreadable
-    /// or malformed input is reported so startup can degrade without clobbering
-    /// the user's file.
+    /// Seed the process service from the watched user config path. A missing file is
+    /// the valid empty document; unreadable or malformed input is reported so startup
+    /// degrades without clobbering the file.
     pub(crate) fn load_current() -> Result<Self, String> {
         let Some(path) = crate::app_config::config_path() else {
             return Self::new_runtime(String::new());
@@ -277,14 +288,14 @@ impl VersionedConfigService {
         })
     }
 
-    /// Resolve one worker-observed generation completely before it crosses the
-    /// event-loop boundary. The caller must run this on a host worker because
-    /// Trail manifests and a custom kitty sprite may require bounded file I/O.
+    /// Resolve one worker-observed generation before it crosses to the event loop. Runs
+    /// on a host worker, since Trail manifests and a custom kitty sprite need file I/O.
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
     ) -> Result<PreparedConfigObservation, String> {
         let values = parse_values(&observation.text)?;
+        let disk_faults = parse_disk_faults(&observation.text);
         let config = parse_config(&observation.text)?;
         let path_feeds = config.prepare_path_feed_generation();
         let preliminary = config.resolve_preliminary_asset_catalog_with_themes(themes);
@@ -299,6 +310,7 @@ impl VersionedConfigService {
             observation,
             config,
             values,
+            disk_faults,
             assets,
             path_feeds,
         })
@@ -311,14 +323,14 @@ impl VersionedConfigService {
             text: Arc::from(self.text.clone()),
             config: Arc::clone(&self.config),
             semantic_values: Arc::new(self.values.clone()),
+            disk_faults: Arc::clone(&self.disk_faults),
             assets: Arc::clone(&self.assets),
         }
     }
 
-    /// Install the exact path-backed effect generation prepared for startup
-    /// before any view can observe the service. This does not advance the
-    /// revision: it completes revision 1's preliminary asset catalog rather
-    /// than admitting a new text generation.
+    /// Install the path-backed effect generation prepared for startup before any view
+    /// observes the service. Completes revision 1's preliminary asset catalog without
+    /// advancing the revision.
     pub(crate) fn complete_startup_path_generation(
         &mut self,
         consumers: aterm_effects::spec::SpecConsumerCapabilities,
@@ -361,18 +373,16 @@ impl VersionedConfigService {
             .map(|baseline| baseline.target.logical_path())
     }
 
-    /// Exact disk generation from which the current startup/runtime service was
-    /// initialized. The watcher uses this only to close the load→watch handoff:
-    /// a first observation that differs is a real edge, even before polling.
+    /// Disk generation the service was initialized from. The watcher uses it to close
+    /// the load→watch handoff: a differing first observation is a real edge.
     pub(crate) fn observed_disk_baseline(
         &self,
     ) -> Option<&crate::native_document_host::AtomicFileBaseline> {
         self.disk_baseline.as_ref()
     }
 
-    /// A writer reported an unknown or externally-won disk generation. Until a
-    /// stable observation is admitted, persistence plans must not reuse the old
-    /// baseline as if it still proved write authority.
+    /// A writer reported an unknown or externally won disk generation; until a stable
+    /// observation is admitted, persistence plans must not reuse the old baseline.
     pub(crate) fn mark_reconciliation_required(&mut self) {
         self.disk_text_admitted = false;
         self.write_reconciliation_required = true;
@@ -382,10 +392,9 @@ impl VersionedConfigService {
         self.write_reconciliation_required
     }
 
-    /// Retain path/generation authority when startup could read UTF-8 bytes but
-    /// could not admit malformed TOML into live Config. Opening Manual supplies
-    /// the already-minted config grant here; the current service text remains
-    /// unchanged until a later valid durable Manual observation is admitted.
+    /// Keep path/generation authority when startup read UTF-8 bytes but could not admit
+    /// malformed TOML. Opening Manual supplies its config grant here; the service text
+    /// stays unchanged until a valid durable Manual observation is admitted.
     pub(crate) fn bind_unparsed_disk_baseline(
         &mut self,
         baseline: crate::native_document_host::AtomicFileBaseline,
@@ -402,9 +411,8 @@ impl VersionedConfigService {
         Ok(())
     }
 
-    /// Immediately import the live durable file while retaining monotonic
-    /// revision/key stamps. Manual editor completion calls this directly; it
-    /// never waits for the polling watcher.
+    /// Import the live durable file immediately, keeping revision/key stamps monotonic.
+    /// Manual editor completion calls this directly instead of waiting for the watcher.
     #[cfg(test)]
     pub(crate) fn synchronize_from_disk(&mut self) -> Result<ConfigSnapshot, String> {
         let path = self
@@ -438,6 +446,7 @@ impl VersionedConfigService {
         observation: ConfigDiskObservation,
         config: crate::app_config::Config,
         values: BTreeMap<String, String>,
+        disk_faults: DiskFaults,
         assets: Arc<crate::app_config::ConfigAssetCatalog>,
     ) -> Result<ConfigSnapshot, String> {
         let ConfigDiskObservation { text, baseline } = observation;
@@ -457,12 +466,14 @@ impl VersionedConfigService {
             }
             self.text = text;
             self.values = values;
+            self.disk_faults = disk_faults;
             self.config = Arc::new(config);
         } else if assets != self.assets {
             self.revision = self.revision.saturating_add(1);
         }
         self.durable_text.clone_from(&self.text);
         self.durable_values.clone_from(&self.values);
+        self.durable_disk_faults = Arc::clone(&self.disk_faults);
         self.durable_config = Arc::clone(&self.config);
         self.durable_assets = Arc::clone(&assets);
         self.assets = assets;
@@ -480,16 +491,16 @@ impl VersionedConfigService {
             observation,
             config,
             values,
+            disk_faults,
             assets,
             path_feeds: _,
         } = prepared;
-        self.synchronize_observation_prepared(observation, config, values, assets)
+        self.synchronize_observation_prepared(observation, config, values, disk_faults, assets)
     }
 
-    /// Roll an optimistic in-memory candidate back to the last bytes proven
-    /// durable when its worker commit fails and the current disk generation is
-    /// not admissible (for example malformed external TOML). Revision/key stamps
-    /// remain monotonic through the same external-replacement reducer.
+    /// Roll an optimistic candidate back to the last durable bytes when its worker
+    /// commit fails and the current disk generation is not admissible (e.g. malformed
+    /// external TOML). Stamps stay monotonic through the external-replacement reducer.
     pub(crate) fn restore_durable_snapshot(&mut self) -> Result<ConfigSnapshot, String> {
         let changed = self.text != self.durable_text
             || self.values != self.durable_values
@@ -511,6 +522,7 @@ impl VersionedConfigService {
             }
             self.text.clone_from(&self.durable_text);
             self.values.clone_from(&self.durable_values);
+            self.disk_faults = Arc::clone(&self.durable_disk_faults);
             self.config = Arc::clone(&self.durable_config);
             self.assets = Arc::clone(&self.durable_assets);
         }
@@ -522,9 +534,8 @@ impl VersionedConfigService {
         Ok(self.values.get(key).cloned())
     }
 
-    /// Apply one all-or-nothing patch. A stale patch is accepted only when every
-    /// touched key is unchanged since its base revision and every supplied expectation
-    /// still matches the current semantic TOML value.
+    /// Apply one all-or-nothing patch. A stale patch is accepted only when every touched
+    /// key is unchanged since its base revision and every expectation still matches.
     pub(crate) fn patch(&mut self, request: ConfigPatchRequest) -> ConfigPatchResult {
         if request.base_revision == 0 || request.base_revision > self.revision {
             return self.rejected("invalid base revision");
@@ -595,26 +606,21 @@ impl VersionedConfigService {
             };
         }
 
-        // Validate the complete typed config before advancing any service
-        // state. Host-backed source keys were rejected above and are edited in
-        // Manual, whose worker admits text plus decoded assets atomically.
-        // Ordinary structured toggles/theme/font changes therefore reuse the
-        // admitted Trail/rainbow kitty/theme assets with no event-thread file I/O. A
-        // sparkle-table change below rewraps those assets with a typed pending
-        // consumer projection until its worker generation is ready.
+        // Validate the full typed config before advancing any state. Host-backed
+        // source keys were rejected above (Manual's worker admits text and decoded
+        // assets together), so structured toggle/theme/font changes reuse the admitted
+        // Trail/rainbow kitty/theme assets with no event-thread I/O. A sparkle-table
+        // change below rewraps them with a pending consumer projection.
         let next_config = match parse_config(&next) {
             Ok(config) => config,
             Err(message) => return self.rejected(message),
         };
 
-        // The admitted consumer projection belongs to the exact parsed
-        // `[sparkle_words]` generation that produced it. A structured Settings
-        // patch is intentionally filesystem-free, so it cannot synchronously
-        // rebuild lexicon/Toy Pack capabilities on the event thread. Publish a
-        // typed preliminary state for a changed sparkle table instead of
-        // carrying the previous generation's authoritative `Some(...)` verdict
-        // across the revision. The config/font worker replaces `None` with the
-        // exact empty-or-nonempty projection from the durable generation.
+        // The consumer projection belongs to the `[sparkle_words]` generation that
+        // produced it, and a structured patch cannot rebuild lexicon/Toy Pack
+        // capabilities on the event thread. A changed sparkle table therefore
+        // publishes `None` (preliminary); the config/font worker fills in the
+        // projection from the durable generation.
         if self.config.sparkle_words != next_config.sparkle_words
             && self.assets.sparkle_spec_consumers.is_some()
         {
@@ -626,11 +632,9 @@ impl VersionedConfigService {
                 sparkle_spec_consumers: None,
             });
         }
-        // WALLPAPER: unlike the manual-only asset-source keys (which a worker
-        // must co-admit with the text), the wallpaper key IS structured-writable
-        // — the Settings file picker writes it — so this patch lane re-resolves
-        // the image inline; without this the catalog would keep serving the
-        // previous picture (or none) under the new path.
+        // Wallpaper is structured-writable (the Settings file picker writes it),
+        // unlike the manual-only asset-source keys, so this lane re-resolves the image
+        // inline; otherwise the catalog would serve the previous picture.
         if self.config.wallpaper != next_config.wallpaper {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_packs: Arc::clone(&self.assets.trail_packs),
@@ -654,6 +658,7 @@ impl VersionedConfigService {
             Err(message) => return self.rejected(message),
         };
         self.values.clone_from(&after_values);
+        self.disk_faults = parse_disk_faults(&self.text);
         let after = request
             .edits
             .iter()
@@ -734,13 +739,11 @@ impl VersionedConfigService {
         let after = parse_values(&text)?;
         let before_config = Arc::clone(&self.config);
         let after_config = Arc::new(parse_config(&text)?);
-        // A watcher/durable observation is also an environment observation.
-        // A byte-equal explicit observation remains the documented refresh
-        // signal for a touched manifest/sprite. When config text itself changed,
-        // however, an unrelated external edit reuses the exact immutable asset
-        // Arc and performs no Trail/rainbow kitty I/O on the event thread; only an actual
-        // source projection change resolves a new catalog. Manual diagnostics
-        // use the independent generation to recheck fonts and other host state.
+        // A watcher/durable observation is also an environment observation, and a
+        // byte-equal one is the refresh signal for a touched manifest/sprite. When the
+        // text changed, an unrelated edit reuses the asset Arc with no event-thread
+        // I/O; only a source projection change resolves a new catalog. Manual
+        // diagnostics recheck fonts and host state via the separate generation.
         let refresh_assets =
             text == self.text || asset_sources_changed(&before_config, &after_config);
         let assets = if refresh_assets {
@@ -752,6 +755,7 @@ impl VersionedConfigService {
         if text == self.text {
             self.durable_text = text;
             self.durable_values.clone_from(&self.values);
+            self.durable_disk_faults = Arc::clone(&self.disk_faults);
             self.durable_config = Arc::clone(&self.config);
             if assets != self.assets {
                 self.revision = self.revision.saturating_add(1);
@@ -773,18 +777,20 @@ impl VersionedConfigService {
         }
         self.text = text;
         self.values = after;
+        self.disk_faults = parse_disk_faults(&self.text);
         self.config = after_config;
         self.durable_text.clone_from(&self.text);
         self.durable_values.clone_from(&self.values);
+        self.durable_disk_faults = Arc::clone(&self.disk_faults);
         self.durable_config = Arc::clone(&self.config);
         self.assets = assets;
         self.durable_assets = Arc::clone(&self.assets);
         Ok(self.snapshot())
     }
 
-    /// Admit a catalog parsed by the background theme-directory watcher. Text,
-    /// Trail Packs, and rainbow kitty retain their current values; publishing a changed
-    /// theme catalog advances the single outer snapshot revision atomically.
+    /// Admit a catalog parsed by the background theme-directory watcher. Text, Trail
+    /// Packs and rainbow kitty keep their values; a changed catalog advances the one
+    /// outer snapshot revision.
     pub(crate) fn replace_theme_catalog(
         &mut self,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -839,10 +845,8 @@ fn read_config_file(
         .map_err(|error| config_read_error(path, error))
 }
 
-/// Why `aterm.toml` at `path` could not be read, naming the file once: the
-/// host's own sentence without its internal stage tag (most already name the
-/// file, "could not open <path>: Permission denied"). Every reader of the
-/// config file (the service's observation, a Settings save) says it this way.
+/// Why `aterm.toml` at `path` could not be read, naming the file once: the host's
+/// sentence without its internal stage tag. Every config-file reader reports this way.
 pub(crate) fn config_read_error(
     path: &Path,
     error: crate::native_document_host::DocumentHostError,
@@ -870,31 +874,24 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
         .map_err(|error| format!("existing aterm.toml is not valid TOML: {error}"))?;
     let mut values = BTreeMap::new();
     for (key, item) in document.iter() {
-        // FULL-DEPTH dotted-key projection, mirroring the nested writer
-        // (`prefs::apply_prefs_edits` walks a dotted path of ANY depth): every
-        // item inside a table tree is ALSO exposed under its full dotted path,
-        // so dotted editable keys at any depth (`matrix_rain.enabled`,
-        // `sparkle_words.profanity.enabled`) get exact per-key semantics —
-        // `is_explicit`, the Modified page, and OCC expected-value comparison
-        // all address the leaf, never a table's opaque serialization. Each
-        // intermediate table keeps its opaque whole-table entry too (its
-        // consumers predate the dotted model, and an external edit anywhere in
-        // the table must still stamp its revision).
+        // Full-depth dotted-key projection, mirroring `prefs::apply_prefs_edits`:
+        // every item in a table tree is also exposed under its full dotted path, so
+        // `is_explicit`, the Modified page and OCC expectations address the leaf
+        // (`matrix_rain.enabled`, `sparkle_words.profanity.enabled`). Each
+        // intermediate table keeps its opaque whole-table entry too, so an external
+        // edit anywhere in it still stamps its revision.
         project_item(&mut values, &join_config_key_path("", key), item);
     }
     Ok(values)
 }
 
-/// Append one semantic TOML key segment to the stable identity used by
+/// Append one semantic TOML key segment to the identity used by
 /// `ConfigSnapshot::values`.
 ///
-/// TOML's `packages.include` is a two-segment path, while
-/// `"packages.include"` is one literal segment. Flattening both to the same
-/// bytes lets an authored forward-compatible value impersonate a registered
-/// setting. `aterm_toml::edit::Key` supplies the canonical, escaped TOML spelling for
-/// a segment: bare-safe names stay compact and names containing `.` remain
-/// quoted. The result is therefore both human-readable and injective over
-/// segment sequences.
+/// `packages.include` (two segments) and `"packages.include"` (one) must not collide,
+/// or an unknown value could impersonate a registered setting.
+/// `aterm_toml::edit::Key` supplies the escaped spelling (bare-safe names stay
+/// compact, names with `.` stay quoted), so the result is readable and injective.
 pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
     let segment = aterm_toml::edit::Key::new(segment).to_string();
     if parent.is_empty() {
@@ -904,10 +901,9 @@ pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
     }
 }
 
-/// Insert `item`'s semantic value at `path` and, when the item is table-like
-/// (both `[a.b]` header tables and `b = { … }` inline tables), recurse into
-/// every child under `path.child`. Arrays of tables stay one opaque entry,
-/// matching the nested writer, which never addresses into them.
+/// Insert `item`'s value at `path` and, for header or inline tables, recurse into
+/// each child under `path.child`. Arrays of tables stay one opaque entry, as in the
+/// nested writer.
 fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
     if let Some(table) = item.as_table_like() {
         for (child, child_item) in table.iter() {
@@ -968,10 +964,8 @@ mod tests {
         }
     }
 
-    /// A patch whose base the service never published — zero, or the revision
-    /// the write would produce — is refused before anything moves. No design
-    /// path builds one (a controller copies its base from the snapshot it
-    /// holds), so this is a plain refusal test, not a model law.
+    /// A patch whose base was never published (zero, or the revision the write would
+    /// produce) is refused before anything moves.
     #[test]
     fn a_base_revision_the_service_never_published_is_refused_without_a_write() {
         let mut service =
@@ -1332,9 +1326,7 @@ mod tests {
             panic!("valid patch must apply before persistence");
         };
         let plan = service.persistence_plan(snapshot);
-        // Mint from a regular path, then replace that spelling with a symlink.
-        // Symlinks are rejected at mint time now; this sequence retains the
-        // more important regression coverage that an already-issued plan also
+        // Mint from a regular path, then replace it with a symlink: an issued plan
         // cannot be redirected after its baseline was captured.
         std::fs::rename(&logical, &first).unwrap();
         symlink(&second, &logical).unwrap();
@@ -1533,9 +1525,8 @@ mod tests {
         ));
         let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
-        // Make a re-read observable: the already-admitted source is now
-        // invalid. A patch that cannot change either asset source must not
-        // touch it and must retain the exact immutable catalog allocation.
+        // Make a re-read observable by invalidating the admitted source: a patch that
+        // changes no asset source must keep the exact catalog allocation.
         std::fs::write(&path, b"not a PNG").unwrap();
 
         let ConfigPatchResult::Applied {
@@ -1565,9 +1556,9 @@ mod tests {
         assert!(Arc::ptr_eq(&patched.assets, &undone.assets));
         assert_eq!(service.value("theme").unwrap().as_deref(), Some("Nord"));
 
-        // A structured source-key patch is rejected before mutation: resolving
-        // filesystem assets here would put I/O on the event loop, while reusing
-        // the old Arc would publish a split generation.
+        // A structured source-key patch is rejected before mutation: resolving assets
+        // here would put I/O on the event loop, and reusing the old Arc would publish
+        // a split generation.
         let second_rgba = [0xee, 0x22, 0x66, 0xff, 0x22, 0xee, 0x66, 0xff];
         let second_png = crate::app_introspect::encode_rgba8_png(&second_rgba, 2, 1).unwrap();
         std::fs::write(&second_path, second_png).unwrap();
@@ -1641,12 +1632,9 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
     }
 
-    /// FULL-DEPTH dotted projection: every item in a table tree is exposed
-    /// under its full dotted path with exact per-key semantics (the
-    /// `is_explicit` / OCC face for `matrix_rain.enabled`), while each table's
-    /// legacy whole-table opaque entry survives for its pre-dotted consumers.
-    /// An absent child is simply absent — an effective default is
-    /// presentation, not evidence.
+    /// Full-depth dotted projection: each item in a table tree is exposed under its
+    /// dotted path with per-key semantics, while each table keeps its whole-table
+    /// opaque entry. An absent child is absent; an effective default is presentation.
     #[test]
     fn parse_values_projects_dotted_keys() {
         let values =
@@ -1755,11 +1743,9 @@ include = ["nested"]
         assert!(!values.contains_key("packages.include"));
     }
 
-    /// The dotted key is a first-class OCC citizen: a patch expecting the OLD
-    /// child value conflicts once the file moved underneath it, exactly like a
-    /// flat key — and the winning write + blank-revert both go through the one
-    /// `apply_prefs_edits` transform (an emptied table is RETAINED: its header
-    /// and comments survive, and empty parses to the same defaults).
+    /// Dotted keys take part in OCC: a patch expecting the old child value conflicts
+    /// once the file moved, like a flat key; the winning write and blank-revert both go
+    /// through `apply_prefs_edits`, and an emptied table is retained.
     #[test]
     fn dotted_key_occ_conflict_write_and_blank_revert() {
         let mut service =
@@ -1799,9 +1785,8 @@ include = ["nested"]
             Some("false")
         );
 
-        // Blank = revert: the child (the table's last key) goes; the emptied
-        // [matrix_rain] header is RETAINED (it may carry user comments, and
-        // empty parses to the same defaults).
+        // Blank reverts: the table's last key goes, and the emptied [matrix_rain]
+        // header is retained (it may carry comments; empty parses to defaults).
         let rev = service.snapshot().revision;
         let reverted = service.patch(edit(
             rev,
@@ -1826,11 +1811,9 @@ include = ["nested"]
         assert_eq!(service.value("matrix_rain.enabled").unwrap(), None);
     }
 
-    /// DEPTH-2 dotted keys are projected and transacted exactly like depth-1:
-    /// a hand-set `sparkle_words.profanity.enabled` gets its own per-key entry
-    /// (the `is_explicit` face), a stale exact expectation CONFLICTS while the
-    /// current one APPLIES, and blank-revert removes only the leaf — the
-    /// emptied tables at BOTH depths are retained.
+    /// Depth-2 dotted keys behave like depth-1: `sparkle_words.profanity.enabled` gets
+    /// its own entry, a stale expectation conflicts while the current one applies, and
+    /// blank-revert removes only the leaf, retaining the emptied tables at both depths.
     #[test]
     fn depth_two_dotted_key_projection_occ_and_blank_revert() {
         let values = parse_values(
@@ -1902,9 +1885,7 @@ include = ["nested"]
             Some("false")
         );
 
-        // Blank = revert: only the leaf goes; the emptied tables at BOTH
-        // depths are RETAINED (headers/comments survive, and empty parses to
-        // the same defaults).
+        // Blank reverts only the leaf; the emptied tables at both depths are retained.
         let rev = service.snapshot().revision;
         let reverted = service.patch(edit(
             rev,

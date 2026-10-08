@@ -4,8 +4,6 @@
 
 //! VT conformance level tracking.
 //!
-//! Extracted from `aterm-core::vt_level` to `aterm-types` (Part of #5663).
-//!
 //! This module tracks which VT terminal level (VT100, VT220, VT320, VT420, VT520)
 //! each escape sequence belongs to. This enables:
 //!
@@ -33,7 +31,8 @@
 /// `VtLevel` intentionally does NOT implement `PartialOrd`/`Ord`. DA2 parameter
 /// values are assigned by DEC across decades with no ordering intent — e.g.,
 /// VT330 (param 18) and VT340 (param 19) are supersets of VT320 (param 24).
-/// Use capability methods (`supports_mouse()`, `supports_sixel()`, etc.) instead.
+/// Compare the DA2/DECSCL parameters (`da2_param()`, `decscl_param()`) or
+/// match on the variant instead.
 ///
 /// ```compile_fail
 /// use aterm_types::VtLevel;

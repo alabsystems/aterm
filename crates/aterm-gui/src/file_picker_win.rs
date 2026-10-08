@@ -48,17 +48,14 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::win_ffi::{
+    COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, Com, Guid, StepError, check,
+    co_create, wide,
+};
+
 // ---------------------------------------------------------------------------
 // GUIDs (from shobjidl_core.h)
 // ---------------------------------------------------------------------------
-
-#[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
-}
 
 /// `CLSID_FileOpenDialog` {DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}.
 const CLSID_FILE_OPEN_DIALOG: Guid = Guid {
@@ -79,21 +76,6 @@ const IID_IFILE_OPEN_DIALOG: Guid = Guid {
 // Vtables, in COM inheritance order. Slots before a called one are declared with
 // their real shapes and never invoked — their OFFSETS are load-bearing.
 // ---------------------------------------------------------------------------
-
-/// The 3-slot `IUnknown` prefix every COM vtable begins with; any interface
-/// pointer can be viewed through it for `Release` without caring which concrete
-/// interface it is.
-#[repr(C)]
-struct IUnknownVtbl {
-    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
-    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-}
-
-#[repr(C)]
-struct IUnknownRepr {
-    vtbl: *const IUnknownVtbl,
-}
 
 /// `COMDLG_FILTERSPEC` — one row of the dialog's file-type combo.
 #[repr(C)]
@@ -166,8 +148,6 @@ struct IShellItem {
     vtbl: *const IShellItemVtbl,
 }
 
-const CLSCTX_INPROC_SERVER: u32 = 0x1;
-const COINIT_APARTMENTTHREADED: u32 = 0x2;
 /// `RPC_E_CHANGED_MODE` — this thread is already in an apartment of the OTHER
 /// model. Not a failure for us: the dialog works from either, and the apartment
 /// we did not enter is not ours to leave.
@@ -201,15 +181,6 @@ const FOS_NODEREFERENCELINKS: u32 = 0x0010_0000;
 
 #[link(name = "ole32")]
 unsafe extern "system" {
-    fn CoInitializeEx(reserved: *mut c_void, co_init: u32) -> i32;
-    fn CoUninitialize();
-    fn CoCreateInstance(
-        rclsid: *const Guid,
-        outer: *mut c_void,
-        cls_ctx: u32,
-        riid: *const Guid,
-        ppv: *mut *mut c_void,
-    ) -> i32;
     fn CoTaskMemFree(block: *mut c_void);
 }
 
@@ -219,25 +190,8 @@ unsafe extern "system" {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny RAII so error paths cannot leak COM references or an apartment
+// Tiny RAII so error paths cannot leak an apartment (`Com` releases references)
 // ---------------------------------------------------------------------------
-
-/// An owned COM interface pointer (any interface — released through the
-/// `IUnknown` prefix every vtable shares), so the `?`-style early returns below
-/// cannot leak a reference.
-struct Com(*mut c_void);
-
-impl Drop for Com {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a live interface pointer obtained from
-        // CoCreateInstance/GetResult on this thread; every COM vtable begins with
-        // the IUnknown triple, so the prefix view is sound.
-        unsafe {
-            let unk = self.0.cast::<IUnknownRepr>();
-            ((*(*unk).vtbl).release)(self.0);
-        }
-    }
-}
 
 /// This thread's COM apartment for the duration of one picker call.
 ///
@@ -274,38 +228,6 @@ impl Drop for Apartment {
             unsafe { CoUninitialize() };
         }
     }
-}
-
-/// A failed step: which call, and its HRESULT — the whole error surface of this
-/// module (one warn line; a picker that cannot open must never be louder).
-type StepError = (&'static str, i32);
-
-fn check(hr: i32, step: &'static str) -> Result<(), StepError> {
-    if hr < 0 { Err((step, hr)) } else { Ok(()) }
-}
-
-/// NUL-terminated UTF-16, the `PCWSTR` shape every call below takes.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-unsafe fn co_create(clsid: &Guid, iid: &Guid, step: &'static str) -> Result<Com, StepError> {
-    let mut ppv: *mut c_void = std::ptr::null_mut();
-    // SAFETY: standard object creation; `ppv` receives the interface pointer only
-    // on success, and a success with a null pointer is rejected.
-    let hr = unsafe {
-        CoCreateInstance(
-            clsid,
-            std::ptr::null_mut(),
-            CLSCTX_INPROC_SERVER,
-            iid,
-            &mut ppv,
-        )
-    };
-    if hr < 0 || ppv.is_null() {
-        return Err((step, hr));
-    }
-    Ok(Com(ppv))
 }
 
 // ---------------------------------------------------------------------------

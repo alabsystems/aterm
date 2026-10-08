@@ -9,18 +9,16 @@
 //
 // Gated: no GPU or no font -> the test no-ops (returns), like the other parity gates.
 
-mod rain_common;
-
+use crate::common;
 use std::sync::Arc;
 
+use crate::rain_common::RainScene;
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::Theme;
-use rain_common::RainScene;
 
-mod common;
-use common::{backends, max_channel_delta};
+use crate::common::{backends, max_channel_delta};
 
 /// A NEAREST-1:1 free sprite (`aw/ah == w/h`, the cat bake==dest contract) at
 /// an on-grid pixel origin, under text (the default z).
@@ -43,11 +41,10 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     }
 }
 
-/// The shipping CatBaker atlas is `4 * cell_h` pixels wide, so its RGBA row
-/// pitch is usually NOT wgpu's 256-byte copy alignment (for example, a 21 px
-/// cell produces an 84 px / 336 byte row). Keep that real geometry covered:
-/// a synthetic 64 px atlas has an accidentally aligned 256-byte row
-/// and cannot detect a backend that silently drops ordinary kitty atlases.
+/// The CatBaker atlas is `4 * cell_h` pixels wide, so its row pitch is usually
+/// not wgpu's 256-byte copy alignment (a 21 px cell gives 336-byte rows). A
+/// synthetic 64 px atlas would be accidentally aligned and miss a backend that
+/// drops ordinary kitty atlases.
 #[test]
 fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     let theme = Theme::default();
@@ -84,11 +81,10 @@ fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     );
 }
 
-/// End-to-end regression for the exact channel that the native sparkle-word
-/// and cursor-companion cats share: a real `EffectsPipeline` must bake its
-/// sparse CatBaker atlas, emit the arbitrary-rect `FreeSprite`, and have that
-/// authored art survive the GPU present path. Synthetic solid/pattern atlases
-/// cannot detect a UV window that lands in CatBaker's transparent slot area.
+/// A real `EffectsPipeline` bakes its sparse CatBaker atlas, emits the
+/// arbitrary-rect `FreeSprite`, and the art survives the GPU present path
+/// (the channel native sparkle-word and companion cats share). Synthetic
+/// atlases cannot catch a UV window landing in CatBaker's transparent area.
 #[test]
 fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
     let theme = Theme::default();
@@ -149,11 +145,10 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
         "real CatBaker CPU/GPU parity exceeded the cat bar: {delta} > 2"
     );
 
-    // Native production composes both independent sprite atlases in one
-    // frame: PHOSPHOR rain first, then the feline free sprite. Keep the exact
-    // two-atlas transition non-vacuous on the incremental present path. The
-    // rain-only frame primes a resident offscreen; the next frame changes
-    // only by adding the real CatBaker sprite and must visibly differ.
+    // Production composes both sprite atlases in one frame: phosphor rain,
+    // then the feline free sprite. The rain-only frame primes a resident
+    // offscreen; the next frame adds only the CatBaker sprite and must differ
+    // on the incremental present path.
     let mut rain_term = Terminal::new(rows as u16, cols as u16);
     rain_term.process("\x1b[?25l████████".as_bytes());
     let rain_base = rain_term.cell_frame(rows, cols);

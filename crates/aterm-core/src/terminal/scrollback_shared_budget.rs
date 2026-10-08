@@ -2,30 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Process/module-wide scrollback byte-budget sharing (audit E1).
+//! Process-wide scrollback byte-budget sharing.
 //!
-//! A host embedding SEVERAL terminals in one memory space (orc: every pane of a
-//! renderer worker lives in one wasm module; a daemon holds many sessions in one
-//! process) needs TWO budget knobs, not one: the per-pane budget each
-//! `Scrollback` already enforces, and a GLOBAL cap so N panes cannot multiply
-//! the per-pane budget into an OOM. This module is the global half.
+//! A host embedding several terminals in one memory space (every pane of a wasm
+//! renderer worker, or a daemon's sessions) needs a global cap on top of each
+//! `Scrollback`'s per-pane budget, so N panes cannot multiply it into an OOM.
+//! This module is the global half.
 //!
-//! POLICY — equal shares, applied at touch time. The effective budget of a
-//! registered pane is `min(configured, global / live_panes)` (an unset global —
-//! `0` — leaves the configured budget alone). Panes only mutate their own
-//! `Scrollback` (a wasm pane is owned by JS; a daemon session by its own task),
-//! so a share change is APPLIED when that pane is next touched: the owner calls
+//! Policy: equal shares, applied at touch time. A registered pane's effective
+//! budget is `min(configured, global / live_panes)`; a global of `0` leaves the
+//! configured budget alone. Each pane owner calls
 //! [`ScrollbackBudgetShare::pending_effective`] at its mutation points and
-//! forwards any returned value to `Terminal::set_memory_budget`. Between a
-//! membership/global change and a pane's next touch its old share stays in
-//! force — bounded staleness (never more than one touch), zero cross-pane
-//! locking, and O(2 atomic loads) on the hot path.
+//! forwards any value to `Terminal::set_memory_budget`, so a share change takes
+//! effect at the pane's next touch: no cross-pane locking, two atomic loads on
+//! the hot path.
 //!
-//! Equal division deliberately trades utilization for predictability: a busy
-//! pane cannot borrow an idle pane's share, so the global bound needs no usage
-//! accounting on the ingest path and Σ(applied shares) ≤ global holds at every
-//! quiescent point (spec: `shared_budget_model`, Tier-1-bound in
-//! `tests/conformance_shared_budget.rs`).
+//! A busy pane cannot borrow an idle pane's share, so no usage accounting is
+//! needed and Σ(applied shares) ≤ global holds at every quiescent point (spec:
+//! `shared_budget_model`, bound in `tests/conformance_shared_budget.rs`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -44,9 +38,8 @@ pub fn set_global_scrollback_budget(bytes: usize) {
 
 /// One pane's membership in the global scrollback budget.
 ///
-/// Owned by the embedder NEXT TO its `Terminal` (not inside it — most
-/// `Terminal`s are test/tool instances that must not distort a host's share
-/// arithmetic). Registers on construction, deregisters on drop.
+/// Owned by the embedder next to its `Terminal`, not inside it, so test and
+/// tool terminals do not count. Registers on construction, deregisters on drop.
 #[derive(Debug)]
 pub struct ScrollbackBudgetShare {
     /// The pane's own configured budget (bytes) — the cap the host asked for.
@@ -92,10 +85,9 @@ impl ScrollbackBudgetShare {
         self.configured.min(global / live).max(1)
     }
 
-    /// Poll at the pane's mutation points: returns `Some(effective_bytes)` when
-    /// the effective budget CHANGED since last applied (the caller forwards it
-    /// to `Terminal::set_memory_budget`, which evicts to fit), `None` when the
-    /// applied value is already current.
+    /// Poll at the pane's mutation points: `Some(effective_bytes)` when the
+    /// effective budget changed since last applied (forward it to
+    /// `Terminal::set_memory_budget`), `None` otherwise.
     pub fn pending_effective(&mut self) -> Option<usize> {
         let effective = self.effective();
         if effective == self.applied {

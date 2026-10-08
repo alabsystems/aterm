@@ -82,7 +82,7 @@ impl TerminalHandler<'_> {
                 self.grid.reverse_line_feed();
             }
             b'J' => {
-                // Erase to end of screen (BCE: inherit SGR background, #7522).
+                // Erase to end of screen (BCE: inherit SGR background).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
@@ -90,7 +90,7 @@ impl TerminalHandler<'_> {
                 self.grid.erase_to_end_of_screen();
             }
             b'K' => {
-                // Erase to end of line (BCE: inherit SGR background, #7522).
+                // Erase to end of line (BCE: inherit SGR background).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
@@ -179,40 +179,38 @@ impl TerminalHandler<'_> {
             b'8' => self.cursor_state().restore_cursor_state(), // DECRC
             b'D' => {
                 // IND (Index)
-                // Defensive BCE template refresh (consistent with CSI S/T, #7522).
+                // Defensive BCE template refresh (consistent with CSI S/T).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
-                // Per VT510: when DECLRMM is active, IND at the scroll boundary
-                // scrolls only within horizontal margins (#7407).
-                // Line feed, honoring DECLRMM left/right margins (#7687).
+                // Line feed honoring DECLRMM: at the scroll boundary IND scrolls
+                // only within the horizontal margins (VT510).
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             b'M' => {
                 // RI (Reverse Index)
-                // Defensive BCE template refresh (consistent with CSI S/T, #7522).
+                // Defensive BCE template refresh (consistent with CSI S/T).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
                 // Per VT510: when DECLRMM is active, RI at the scroll boundary
-                // scrolls only within horizontal margins (#7407).
+                // scrolls only within horizontal margins.
                 self.grid
                     .reverse_line_feed_margined(self.modes.left_right_margin_mode);
             }
             b'E' => {
                 // NEL (Next Line)
-                // Defensive BCE template refresh (consistent with CSI S/T, #7522).
+                // Defensive BCE template refresh (consistent with CSI S/T).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
                 self.grid
                     .carriage_return_margin(self.modes.left_right_margin_mode);
-                // Per VT510: when DECLRMM is active, NEL at the scroll boundary
-                // scrolls only within horizontal margins (#7407).
-                // Line feed, honoring DECLRMM left/right margins (#7687).
+                // Line feed honoring DECLRMM: at the scroll boundary NEL scrolls
+                // only within the horizontal margins (VT510).
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             b'H' => {
@@ -249,16 +247,10 @@ impl TerminalHandler<'_> {
             }
             b'6' => {
                 // DECBI — Back Index (VT420+).
-                // If cursor is at the left margin, scroll content within the
-                // scroll region right by one column within horizontal margins,
-                // erasing the leftmost column. Otherwise, move cursor left by 1.
                 self.handle_decbi();
             }
             b'9' => {
                 // DECFI — Forward Index (VT420+).
-                // If cursor is at the right margin, scroll content within the
-                // scroll region left by one column within horizontal margins,
-                // erasing the rightmost column. Otherwise, move cursor right by 1.
                 self.handle_decfi();
             }
             b'Z' => {
@@ -298,13 +290,9 @@ impl TerminalHandler<'_> {
                     changed = row_data.line_size() != size;
                     row_data.set_line_size(size);
                 }
-                // A line-size change is a CONTENT change of the row: every
-                // reader keyed on `content_gen` (the scrolled-back viewport's
-                // proofs, the incoming-row apron memo, a peer polling
-                // `content_seq`) must see it. DECDWL/DECDHL also erase the
-                // hidden half below (which marks it), but DECSWL wrote only the
-                // row flag — so a strip memoized while the row was double-width
-                // slid in double-width after `ESC # 5` (audit, 2026-09-24).
+                // A line-size change is a content change of the row, so readers
+                // keyed on `content_gen` must see it. DECDWL/DECDHL also erase the
+                // hidden half below (which marks it); DECSWL writes only the flag.
                 if changed {
                     self.grid.mark_content_cell(row, 0);
                 }
@@ -321,7 +309,7 @@ impl TerminalHandler<'_> {
                         // Erase cell content in the second half — these cells
                         // are not visible in double-width mode. Without this,
                         // stale content reappears if the line is later switched
-                        // back to single-width via DECSWL (#7463).
+                        // back to single-width via DECSWL.
                         self.grid.erase_rect(row, half, row, cols.saturating_sub(1));
                         self.grid.extras_mut().clear_range(row, half, cols);
                     }
@@ -386,7 +374,7 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // 96-character set designation (ESC - / ESC . / ESC /) (#7547).
+        // 96-character set designation (ESC - / ESC . / ESC /).
         // Maps to G1/G2/G3 respectively (G0 cannot hold 96-char sets).
         match intermediates[0] {
             b'-' => {
@@ -417,20 +405,20 @@ impl TerminalHandler<'_> {
         )
     )]
     fn reset_terminal_state(&mut self) {
-        // RIS — delegates to shared reset_common_fields (#4114).
-        // Preserve host-configured policy flags across mode reset (#7336, #7878, #7898, #7937).
+        // RIS — delegates to shared reset_common_fields.
+        // Preserve host-configured policy flags across mode reset.
         let allow_osc52_query = self.modes.allow_osc52_query;
         let allow_osc52_set = self.modes.allow_osc52_set;
         let allow_window_ops = self.modes.allow_window_ops;
         let allow_notifications = self.modes.allow_notifications;
-        // #7937 F01-3: palette reconfigure is host policy; RIS must not
+        // Palette reconfigure is host policy; RIS must not
         // let a rogue program clear it (DoS) or set it (privilege
         // escalation / palette takeover).
         let allow_palette_reconfigure = self.modes.allow_palette_reconfigure;
-        // #7937 F01-2/#7960: the shell-integration nonce requirement is HOST
-        // policy. Byte-stream RIS (ESC c) must NOT clear it — otherwise a rogue
+        // The shell-integration nonce requirement is host
+        // policy. Byte-stream RIS (ESC c) must not clear it — otherwise a rogue
         // program writes `\x1b c` then forges OSC 133/633 prompt/command markers
-        // WITHOUT a nonce (shell_nonce_gate_ok returns true once the flag is
+        // without a nonce (shell_nonce_gate_ok returns true once the flag is
         // false). `Terminal::reset()` already preserves this; the two reset paths
         // had drifted, defeating exactly the anti-spoofing control.
         let require_shell_integration_nonce = self.modes.require_shell_integration_nonce;
@@ -442,7 +430,7 @@ impl TerminalHandler<'_> {
         // CJK ambiguous-width policy + OS light/dark appearance (see Terminal::reset).
         let ambiguous_width_double = self.modes.ambiguous_width_double;
         let color_scheme = self.modes.color_scheme;
-        // Note: CWD is NOT cleared on RIS as it represents actual filesystem state.
+        // Note: CWD is not cleared on RIS as it represents actual filesystem state.
         let mut groups = super::super::ResetGroups {
             kitty_keyboard: self.kitty_keyboard,
             xterm_keyboard: self.xterm_keyboard,
@@ -470,21 +458,17 @@ impl TerminalHandler<'_> {
         );
 
         // Invalidate BiDi render cache — mode flags are reset but the cache
-        // may hold stale resolutions from pre-reset content (#7488).
+        // may hold stale resolutions from pre-reset content.
         self.invalidate_bidi_all();
 
         // Hand the processing loop the RIS side effects this handler cannot
-        // reach — clearing secure keyboard entry and the parked selection —
-        // which it applies once advance_fast returns (#7153). The flag's name
-        // is historical: the parser itself is NOT reset (ESC c already left it
-        // in Ground; a reset after the whole chunk dropped any sequence left
-        // unfinished at its end, audit K6).
-        // Must be set AFTER reset_common_fields (which calls transient.reset()
-        // and would clear the flag if set beforehand).
+        // reach (secure keyboard entry, the parked selection), applied after
+        // advance_fast returns. The parser itself is not reset. Set after
+        // reset_common_fields, whose transient.reset() would clear it.
         self.transient.pending_parser_reset = true;
 
         // Restore host policy flags that should not be affected by ESC c
-        // (#7336, #7878, #7898, #7937).
+        //.
         self.modes.allow_osc52_query = allow_osc52_query;
         self.modes.allow_osc52_set = allow_osc52_set;
         self.modes.allow_window_ops = allow_window_ops;
@@ -506,7 +490,7 @@ impl TerminalHandler<'_> {
     /// DECBI — Back Index (ESC 6, VT420+).
     ///
     /// When the cursor is at the left margin (or column 0 when DECLRMM is not
-    /// active) AND within the vertical scroll region, scrolls content within
+    /// active) and within the vertical scroll region, scrolls content within
     /// the scroll region and horizontal margins right by one column, erasing
     /// the leftmost margin column with the BCE template. The cursor does not
     /// move.
@@ -525,7 +509,7 @@ impl TerminalHandler<'_> {
             0
         };
 
-        // Defensive BCE template refresh (consistent with DECIC/DECDC, #7522).
+        // Defensive BCE template refresh (consistent with DECIC/DECDC).
         if col == left_bound {
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -537,7 +521,7 @@ impl TerminalHandler<'_> {
             // At the left margin — scroll content right, but only
             // if the cursor row is within the scroll region. Per xterm,
             // DECBI at the left margin is a no-op when the cursor is
-            // outside the scroll region rows (#7692).
+            // outside the scroll region rows.
             let region = self.grid.scroll_region();
             let row = self.grid.cursor_row();
             if row >= region.top && row <= region.bottom {
@@ -558,7 +542,7 @@ impl TerminalHandler<'_> {
     /// DECFI — Forward Index (ESC 9, VT420+).
     ///
     /// When the cursor is at the right margin (or last column when DECLRMM is
-    /// not active) AND within the vertical scroll region, scrolls content
+    /// not active) and within the vertical scroll region, scrolls content
     /// within the scroll region and horizontal margins left by one column,
     /// erasing the rightmost margin column with the BCE template. The cursor
     /// does not move.
@@ -577,7 +561,7 @@ impl TerminalHandler<'_> {
             self.grid.cols().saturating_sub(1)
         };
 
-        // Defensive BCE template refresh (consistent with DECIC/DECDC, #7522).
+        // Defensive BCE template refresh (consistent with DECIC/DECDC).
         if col == right_bound {
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -589,7 +573,7 @@ impl TerminalHandler<'_> {
             // At the right margin — scroll content left, but only
             // if the cursor row is within the scroll region. Per xterm,
             // DECFI at the right margin is a no-op when the cursor is
-            // outside the scroll region rows (#7692).
+            // outside the scroll region rows.
             let region = self.grid.scroll_region();
             let row = self.grid.cursor_row();
             if row >= region.top && row <= region.bottom {

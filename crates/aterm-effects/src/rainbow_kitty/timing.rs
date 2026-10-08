@@ -1,61 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE SHARED NUMBERS** of Rainbow Kitty v2 — every constant and curve that
-//! more than one producer, or the glow *and* the synth, must agree on. Each is
-//! defined EXACTLY ONCE, here, with its law written beside it.
+//! The shared numbers of Rainbow Kitty v2: every constant and curve that more
+//! than one producer (or the glow and the synth) must agree on, each defined
+//! once here with its law beside it.
 //!
-//! Design of record: `RAINBOW-KITTY-V2.md` §8.1 ("three shared numbers, each
-//! defined once"), §2.5 (the seven named curves), §5.2 (the two coverage
-//! ceilings), §6.1-6.2 (the meteor's trigger and clock), §13 (the token
-//! bucket). Section references in this file are to that document.
+//! Section references are to `docs/design/RAINBOW-KITTY-V2.md`: §8.1 (shared
+//! numbers), §2.5 (the seven named curves), §5.2 (coverage ceilings), §6.1-6.2
+//! (the meteor's trigger and clock), §13 (the token bucket).
 //!
-//! ## Why one file
+//! Both `rainbow_kitty::meteor` and `trail_sound::rainbow_kitty_v2` read the
+//! distance→duration function, glint budget, shed count and fan hero count from
+//! here, so the landing and its bell cannot drift apart. A second definition of
+//! any number below is a bug, even if equal.
 //!
-//! v1's measured #1 *coupling* defect was two clocks for one gesture: the
-//! visual flight ran on `RAINBOW_METEOR_FLIGHT_S` (a fixed 0.12 s) while the
-//! audio run ran on `CURSOR_SWEEP_STEP_S`, so the bell and the landing drifted
-//! apart with distance and neither could be retuned without silently breaking
-//! the other. §8.1's ruling is structural, not stylistic: the distance→duration
-//! function, the glint budget, the shed count and the fan's hero count live in
-//! ONE module that both `rainbow_kitty::meteor` and
-//! `trail_sound::rainbow_kitty_v2` read. A second definition of any number
-//! below is a bug, however arithmetically equal it happens to be today.
+//! ## Not here
 //!
-//! ## What is NOT here
-//!
-//! The third shared number of §8.1 — **the arrival edge `t₀ + T`** — is an
-//! `Instant`, not a constant: it is minted by [`super::meteor`] at the spawn
-//! edge and read by the pin, the ring, the fan, the terminal flash, the kitty's
-//! `land_at` and the audio bell. It cannot live in a constants module; what
-//! lives here is the [`flight_ms`] that computes its offset, so that every
-//! reader derives the SAME instant from the SAME distance.
-//!
-//! Two numbers the design names beside these are deliberately NOT restated,
-//! because each already has exactly one owner and a copy here would be the
-//! drift this file exists to prevent:
-//!
-//! * **The caret's τ 220 ms cool** (§2.5, §7.1). The caret block is ticked by
-//!   the host, and its ignition heat — `TypingCadence`'s `energy`,
-//!   `CadenceParams::half_life` 220 ms in `cursor_trail` — IS that cool. v2
-//!   hands the host the display spine as `CaretSeam::paint` and the host
-//!   takes `max(paint, energy)`; nothing in this tree runs a 220 ms clock.
-//! * **"≤ 3 live glints, a fourth steals the oldest"** (§13, §14). That is a
-//!   VOICE cap — the GLINT row of §14's lane table — and the lane table
-//!   (`trail_sound::rainbow_kitty_v2::lane_cap`) owns every lane's cap. The
-//!   glow's half of the glint law is the token bucket below, which knows
-//!   nothing about voices.
+//! * **The arrival edge `t₀ + T`** is an `Instant` minted by [`super::meteor`]
+//!   at spawn and read by the pin, ring, fan, flash, the kitty's `land_at` and
+//!   the bell; [`flight_ms`] computes its offset so every reader derives the
+//!   same instant.
+//! * **The caret's τ 220 ms cool** belongs to the host: `TypingCadence`'s
+//!   `energy` (`CadenceParams::half_life` in `cursor_trail`). The host takes
+//!   `max(CaretSeam::paint, energy)`.
+//! * **"≤ 3 live glints, a fourth steals the oldest"** is a voice cap owned by
+//!   `trail_sound::rainbow_kitty_v2::lane_cap`; the glow's half is the token
+//!   bucket below.
 //!
 //! ## Units
 //!
-//! Durations are **milliseconds** (`f32`) unless a name ends in `_S`. Pixel
-//! figures are at `ch = 18`; callers scale by `ch/18`. Coverages are additive
-//! `0..=255` requests, pre-composite.
+//! Durations are milliseconds (`f32`) unless a name ends in `_S`. Pixel figures
+//! are at `ch = 18`; callers scale by `ch/18`. Coverages are additive `0..=255`
+//! requests, pre-composite.
 
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// 1. THE FLIGHT CLOCK (§8.1 no. 1, §6.2)
+// 1. The flight clock (§8.1 no. 1, §6.2)
 // ---------------------------------------------------------------------------
 
 /// Fixed cost of a flight in ms, before distance — the part of `T` that is
@@ -66,40 +47,31 @@ pub const FLIGHT_BASE_MS: f32 = 50.0;
 /// 130 ms of *raw* flight before the ceiling bites — see [`FLIGHT_MAX_MS`].
 pub const FLIGHT_PER_CELL_MS: f32 = 1.0;
 
-/// Floor of the flight clock. Below this the head cannot be seen to travel at
-/// all on a 60 Hz panel (T7: a 60 ms flight is ~2 effect frames there under
-/// the halving — every 60 Hz panel off the Intel-Mac arm — and 3-4 at panel
-/// rate on an Intel Mac, whose lane runs at 60 fps only while its drawable
-/// pool keeps up; `SHOULDER_FRAME_MS` has the arm), and a shorter gesture
-/// would read as a teleport with a smear.
+/// Floor of the flight clock: shorter flights are about two frames at 60 Hz
+/// and read as a teleport with a smear (`SHOULDER_FRAME_MS` has the frame-rate
+/// details).
 pub const FLIGHT_MIN_MS: f32 = 60.0;
 
-/// Ceiling of the flight clock. §2.1's T3 says release is the art but the
-/// *attack* is not: past 120 ms the caret has visibly arrived before its own
-/// meteor does, which is exactly the lag tell v2 exists to delete.
+/// Ceiling of the flight clock: past 120 ms the caret visibly arrives before
+/// its own meteor.
 pub const FLIGHT_MAX_MS: f32 = 120.0;
 
-/// **THE ONE DISTANCE→DURATION FUNCTION** (§8.1 no. 1):
+/// The distance→duration function (§8.1 no. 1):
 /// `T = clamp(50 + 1.0·cells, 60, 120)` ms.
 ///
-/// Read by ALL FOUR of the couplings §8.1 enumerates, and by nothing else:
+/// Read by exactly four couplings:
 ///
-/// 1. the visual flight — `meteor.rs`'s `T`, hence the arrival edge `t₀ + T`;
-/// 2. the audio rain spacing — see [`rain_spacing_ms`], which is a function of
-///    this value and not of distance directly;
-/// 3. the meteor bell's `Voice::delay` (§12.1), so the bell strikes on the
-///    landing frame rather than near it;
-/// 4. the Enter cadence's resolution delay (D9) — the resolution C, the tonic
-///    dyad and the faraway bell all fire at `flight_ms(cells)`, not at the
-///    fixed +60/+70 ms v1 used.
+/// 1. the visual flight (`meteor.rs`'s `T`, hence the arrival edge `t₀ + T`);
+/// 2. the audio rain spacing ([`rain_spacing_ms`] is a function of this value);
+/// 3. the meteor bell's `Voice::delay` (§12.1), so it strikes on the landing
+///    frame;
+/// 4. the Enter cadence's resolution delay (D9).
 ///
-/// `cells` is the path length in CELL WIDTHS, diagonals included:
-/// `cells = sqrt(dcol² + (drow·ch/cw)²)` (§6.2). Non-finite and negative input
-/// resolves to [`FLIGHT_MIN_MS`] — a NaN path is a bug upstream, and the floor
-/// is the answer that draws a correct short flight rather than a hang.
+/// `cells` is the path length in cell widths, diagonals included:
+/// `cells = sqrt(dcol² + (drow·ch/cw)²)`. Non-finite or negative input resolves
+/// to [`FLIGHT_MIN_MS`].
 ///
-/// Pinned by `flight_ms_is_shared_and_clamped` (§20.1): 8 → 60, 40 → 90,
-/// 200 → 120.
+/// Pinned by `flight_ms_is_shared_and_clamped`: 8 → 60, 40 → 90, 200 → 120.
 #[inline]
 #[must_use]
 pub fn flight_ms(cells: f32) -> f32 {
@@ -109,39 +81,31 @@ pub fn flight_ms(cells: f32) -> f32 {
     (FLIGHT_BASE_MS + FLIGHT_PER_CELL_MS * cells).clamp(FLIGHT_MIN_MS, FLIGHT_MAX_MS)
 }
 
-/// [`flight_ms`] as a [`Duration`], for the callers that add it to an
-/// `Instant` to mint the arrival edge. One conversion, so nobody rounds
-/// milliseconds to whole units on the way and lands a frame early.
+/// [`flight_ms`] as a [`Duration`], for minting the arrival edge; one
+/// conversion, so nobody rounds to whole milliseconds and lands a frame early.
 #[inline]
 #[must_use]
 pub fn flight(cells: f32) -> Duration {
     Duration::from_secs_f32(flight_ms(cells) / 1000.0)
 }
 
-/// Exponent of the landing's IMPACT curve — concave, so the middle band of
-/// jumps (16-40 cells) gets most of the new headroom and a wide-terminal
-/// Ctrl-A does not climb forever.
+/// Exponent of the landing's impact curve: concave, so 16-40 cell jumps get
+/// most of the headroom and a wide-terminal Ctrl-A does not climb forever.
 pub const IMPACT_EXP: f32 = 0.7;
 
 /// Where [`impact`] saturates: reached at ≈ 48 cells — a full line — so an
 /// 80- or 200-cell jump lands on the cap instead of past it.
 pub const IMPACT_MAX: f32 = 3.5;
 
-/// How HARD a jump lands — ONE shared magnitude read by every distance-graded
-/// landing law (fan count, fan reach, ring radius, ring life), so they cannot
-/// come apart.
+/// How hard a jump lands: one magnitude read by every distance-graded landing
+/// law (fan count, fan reach, ring radius, ring life), so the splash scales
+/// with the distance travelled (owner, 2026-09-08).
 ///
 /// `impact(cells) = clamp((cells / 8)^0.7, 1, 3.5)`: exactly `1.0` at the
-/// 8-cell meteor floor ([`JUMP_MIN_CELLS`]), so the floor landing is
-/// byte-identical to what it was before distance bought anything — 1.62 at
-/// 16 cells, 2.16 at 24, 3.09 at 40, and the cap from ≈ 48 on.
+/// 8-cell meteor floor ([`JUMP_MIN_CELLS`]), 1.62 at 16 cells, 2.16 at 24,
+/// 3.09 at 40, capped from ≈ 48 on.
 ///
-/// The owner's ask (2026-09-08): "a bigger impact splash that scales more
-/// with the distance traveled." Before this, count saturated at ~16 cells
-/// and reach at ~34; from 40 to 200 cells nothing grew at all.
-///
-/// Guards mirror [`flight_ms`]: a NaN, infinite or non-positive distance is
-/// the floor, never a panic and never a runaway.
+/// A NaN, infinite or non-positive distance is the floor.
 #[inline]
 #[must_use]
 pub fn impact(cells: f32) -> f32 {
@@ -158,87 +122,62 @@ const _: () = assert!(
     "the impact cap cannot be under the floor"
 );
 
-/// Head position on the path at `t = 0` — the frame the caret is first
-/// observed at its landing (D20: `p₀ = 0.28`, *everywhere*, in both halves).
-///
-/// This single number is the frame-0 law (T2) made arithmetic: v1 drew nothing
-/// on the spawn frame (`emit_rainbow_jumps`'s `len < 1.0 → continue`) and the
-/// eye read the whole gesture as late. See [`enter_at_speed`].
+/// Head position on the path at `t = 0`, the frame the caret is first seen at
+/// its landing (D20). Frame 0 always draws; see [`enter_at_speed`].
 pub const FLIGHT_P0: f32 = 0.28;
 
-/// Exponent of the `enter-at-speed` easing (§2.5). Chosen so the head is
-/// already past 0.40 of the path on the first ProMotion frame after spawn
-/// (+8.3 ms at `T = 100`) — see §6.2's frame table.
+/// Exponent of the `enter-at-speed` easing (§2.5): the head is past 0.40 of the
+/// path on the first ProMotion frame after spawn (+8.3 ms at `T = 100`).
 pub const FLIGHT_ENTER_EXP: f32 = 2.2;
 
-/// Milliseconds AFTER the arrival edge by which every meteor pixel is off the
-/// glass. §6.2 wrote 320 ("any meteor light after `T + 350` ms is a bug");
-/// **600 since 2026-09-08**, the owner's ruling: "I want the meteor to have
-/// rainbow! be a bigger more special rainbow impact!" — the 320 was restraint,
-/// and the impact now carries a 420 ms shockwave, a 260 ms splash and a
-/// shower of sparks whose longest lives 560 ms. The FLIGHT is untouched
-/// ([`flight_ms`]): responsiveness is the attack, and the attack did not
-/// move — only the release grew. Read by `meteor.rs` alone; the pool's
-/// `end()` is `arrival + this`, and every impact mark is asserted inside it
-/// at compile time there.
+/// Milliseconds after the arrival edge by which every meteor pixel is off the
+/// glass. The impact carries a 420 ms shockwave, a 260 ms splash and sparks
+/// living up to 560 ms; the flight itself ([`flight_ms`]) is unaffected. Read
+/// by `meteor.rs` alone: the pool's `end()` is `arrival + this`, and every
+/// impact mark is asserted inside it at compile time there.
 pub const FLIGHT_OFF_GLASS_MS: f32 = 600.0;
 
-/// The retire-previous finish (§6.9): a new meteor whose corridor comes within
-/// 1 `ch` of a live one jumps that one to its post-arrival fade with this `R`.
-/// Never a pop, never a fade-in-place.
+/// The retire-previous finish (§6.9): a new meteor within 1 `ch` of a live one
+/// sends that one to its post-arrival fade with this `R`, never a pop.
 pub const FLIGHT_RETIRE_MS: f32 = 60.0;
 
-/// **Cap 2 live meteors** (§6.9; v1 allowed 4 and they read as rulers piling
-/// up). A third evicts the oldest through the same [`FLIGHT_RETIRE_MS`]
-/// finish, so an eviction is a gesture and not a disappearance.
+/// At most two live meteors (§6.9). A third evicts the oldest through the
+/// [`FLIGHT_RETIRE_MS`] finish.
 pub const FLIGHT_MAX_LIVE: usize = 2;
 
-/// The same-row jump floor in cells (§6.1; v1's `RAINBOW_JUMP_MIN`, kept —
-/// "scrubbing must stay calm"). At or above this a move flies the full meteor
-/// anatomy; below it, see [`MINI_FAN_MAX_CELLS`].
+/// The same-row jump floor in cells (§6.1): scrubbing stays calm. At or above
+/// it a move flies the full meteor; below it see [`MINI_FAN_MAX_CELLS`].
 pub const JUMP_MIN_CELLS: u16 = 8;
 
 /// Smallest same-row hop that draws a mini-fan (§6.12 / D17). A one-cell move
 /// is typing or an arrow, and owns the ribbon head cell instead.
 pub const MINI_FAN_MIN_CELLS: u16 = 2;
 
-/// Largest same-row hop that draws a mini-fan — one below [`JUMP_MIN_CELLS`],
-/// so the two populations tile the whole range with no gap and no overlap
-/// (§6.12: no flight, no train, 1 m2 + 2 m3, gone by 245 ms).
+/// Largest same-row hop that draws a mini-fan, one below [`JUMP_MIN_CELLS`], so
+/// the two ranges tile with no gap (§6.12: no flight, no train, 1 m2 + 2 m3,
+/// gone by 245 ms).
 pub const MINI_FAN_MAX_CELLS: u16 = JUMP_MIN_CELLS - 1;
 
 // ---------------------------------------------------------------------------
-// 1b. THE PHRASE REST — one rest for the melody and the ribbon
-//     (Rainbow Path v3 §2.6, law S5, D-6; 2026-09-13)
+// 1b. The phrase rest: one rest for the melody and the ribbon (law S5)
 // ---------------------------------------------------------------------------
 
-/// A typing gap this long is a REST, and a rest RESOLVES the line (the
-/// melody's §3.1) and ENDS the phrase the ribbon is holding (the ribbon's
-/// grace). ONE number for both halves — this constant was the synth's
-/// `PHRASE_PAUSE_MS` and the ribbon's `LIFT_GRACE_S` 0.75 read from two
-/// places until 2026-09-13; the melody re-exports it and the ribbon's grace
-/// is derived from it, so the light and the song let go of a phrase on the
-/// same instant (S5).
+/// A typing gap this long is a rest: it resolves the melody's line and ends the
+/// phrase the ribbon holds. The melody re-exports it and the ribbon's grace
+/// derives from it, so light and song let go on the same instant (S5).
 ///
-/// **900, not v1's 600.** v1's 600 ms was tuned against a governor decay the
-/// melody's §16 row 11 sets to exactly 1.0; at 600 ms every ordinary
-/// think-pause resolves, and a line that resolves every few words has no
-/// line left. 900 ms is longer than a word-finding pause and shorter than a
-/// real stop.
+/// 900 ms is longer than a word-finding pause and shorter than a real stop.
 pub const PHRASE_PAUSE_MS: u32 = 900;
 
-/// The tempo multiple of the phrase rest (D-6, the owner's default 2.5;
-/// A/B 2.0 / 3.0): `phrase_rest_ms(ioi) = max(PHRASE_PAUSE_MS, 2.5 · ioi)`.
-/// At ≥ 2.8 cps (`ioi ≤ 360 ms`) the rest is the 900 ms floor and the
-/// melody is byte-identical to its pre-v3 self; a slower hand gets a
-/// proportionally longer rest in both halves, so the after-glow of a
-/// 2 cps hunt-and-peck line does not start its exit swoosh between two of
+/// Tempo multiple of the phrase rest (D-6):
+/// `phrase_rest_ms(ioi) = max(PHRASE_PAUSE_MS, 2.5 · ioi)`. At ≥ 2.8 cps
+/// (`ioi ≤ 360 ms`) the rest is the 900 ms floor; a slower hand gets a longer
+/// rest in both halves, so a 2 cps line does not start its exit swoosh between
 /// its own keys.
 pub const PHRASE_REST_IOI_MUL: f32 = 2.5;
 
-/// A gap longer than this is not typing at all: the IOI estimator RESTARTS
-/// at [`IOI_DEFAULT_MS`] rather than dragging a stale 600 ms average into
-/// the next burst.
+/// A gap longer than this is not typing: the IOI estimator restarts at
+/// [`IOI_DEFAULT_MS`].
 pub const IOI_RESET_MS: u32 = 2_000;
 /// IOI clamp floor / ceiling (ms), the melody's §9.6. The ceiling bounds the
 /// phrase rest too: `phrase_rest_ms` tops out at `2.5 · 600 = 1500 ms`.
@@ -248,16 +187,14 @@ pub const IOI_MAX_MS: f32 = 600.0;
 /// The IOI a fresh session assumes — 4 cps, which the melody's §9.6 table
 /// uses as the 0 dB reference for the whole loudness arc.
 pub const IOI_DEFAULT_MS: f32 = 250.0;
-/// EMA weight on the newest gap (§9.6). 0.5 is two-gap memory: fast enough
-/// that a burst is heard as a burst, slow enough that one stumbled key does
-/// not brighten the note after it.
+/// EMA weight on the newest gap (§9.6): two-gap memory, fast enough to hear a
+/// burst, slow enough that one stumbled key does not brighten the next note.
 pub const IOI_EMA_ALPHA: f32 = 0.5;
 
-/// **THE PHRASE REST**, ms, for a hand at `ioi_ms`: the longer of
-/// [`PHRASE_PAUSE_MS`] and [`PHRASE_REST_IOI_MUL`] tempos. Non-finite input
-/// reads as the default tempo. Read by the melody's rest
-/// (`MelodyV2::on_typed`) and by the ribbon's grace (`Ribbon::place`) — the
-/// one function S5 names.
+/// The phrase rest in ms for a hand at `ioi_ms`: the longer of
+/// [`PHRASE_PAUSE_MS`] and [`PHRASE_REST_IOI_MUL`] tempos; non-finite input
+/// reads as the default tempo. Read by the melody (`MelodyV2::on_typed`) and
+/// the ribbon's grace (`Ribbon::place`).
 #[inline]
 #[must_use]
 pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
@@ -269,20 +206,18 @@ pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
     (PHRASE_REST_IOI_MUL * ioi).max(PHRASE_PAUSE_MS as f32)
 }
 
-/// Whether a raw gap of `gap_ms` since the last key is a REST at tempo
-/// `ioi_ms` — the melody's `gap >= PHRASE_PAUSE_MS`, tempo-scaled.
+/// Whether a gap of `gap_ms` since the last key is a rest at tempo `ioi_ms`.
 #[inline]
 #[must_use]
 pub fn phrase_rest_reached(gap_ms: u32, ioi_ms: f32) -> bool {
     gap_ms as f32 >= phrase_rest_ms(ioi_ms)
 }
 
-/// **THE TEMPO'S ONE UPDATE** — the inter-onset EMA the melody has run
-/// since v2 (§9.6), lifted here so the ribbon runs the identical law on the
-/// identical keys: the first key of a session, or a gap of
-/// [`IOI_RESET_MS`] or more, restarts at [`IOI_DEFAULT_MS`]; a REST holds
-/// the tempo (the owner's ruling: the same text at two speeds plays the same
-/// degrees after every pause); otherwise the EMA on the clamped gap.
+/// The tempo update: the inter-onset EMA (§9.6), shared by melody and ribbon.
+/// The first key of a session, or a gap of [`IOI_RESET_MS`] or more, restarts
+/// at [`IOI_DEFAULT_MS`]; a rest holds the tempo (so the same text at two
+/// speeds plays the same degrees after a pause); otherwise the EMA on the
+/// clamped gap.
 #[inline]
 #[must_use]
 pub fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 {
@@ -297,7 +232,7 @@ pub fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// 2. THE SHARED COUNTS (§8.1, "plus two shared counts")
+// 2. The shared counts (§8.1)
 // ---------------------------------------------------------------------------
 
 /// Fewest shed fragments a meteor sputters, whatever the distance — a jump
@@ -311,13 +246,9 @@ pub const SHED_MAX: u16 = 6;
 /// Cells of path per shed fragment.
 pub const SHED_CELLS_PER: f32 = 12.0;
 
-/// **`SHED_N(cells) = clamp(cells/12, 3, 6)`** (§8.1, §5.6, §6.5 layer 5) —
-/// how many m3 grains a meteor sheds along its path as the head passes their
-/// hashed stations. Transient-lane and **silent**: the rain glints pair with
-/// the landing fan, not with these (D6).
-///
-/// Shared because §6.5's layer table sizes the quad budget from it and §12's
-/// gesture must not chime once per fragment.
+/// `SHED_N(cells) = clamp(cells/12, 3, 6)` (§8.1, §5.6, §6.5 layer 5): m3
+/// grains a meteor sheds along its path. Silent: the rain glints pair with the
+/// landing fan (D6). Shared because §6.5 sizes the quad budget from it.
 #[inline]
 #[must_use]
 pub fn shed_n(cells: f32) -> u16 {
@@ -327,21 +258,15 @@ pub fn shed_n(cells: f32) -> u16 {
     ((cells / SHED_CELLS_PER) as u16).clamp(SHED_MIN, SHED_MAX)
 }
 
-/// **`FAN_HERO_N = 5`** (§8.1, D6): the landing fan ALWAYS carries 1 gold m1 +
-/// 4 m2, and the meteor's five rain glints pair 1:1 with those five in throw
-/// order. The count is shared so the visual census
-/// (`the_fan_is_one_hero_four_m2_and_grains`) and the audio run length can
-/// never disagree — a sixth glint with no star to ride is the bug this
-/// constant exists to make impossible.
+/// `FAN_HERO_N = 5` (§8.1, D6): the landing fan always carries 1 gold m1 + 4
+/// m2, and the meteor's five rain glints pair 1:1 with them in throw order, so
+/// the visual census (`the_fan_is_one_hero_four_m2_and_grains`) and the audio
+/// run length agree.
 pub const FAN_HERO_N: usize = 5;
 
 /// Fan stars in total, ceiling included:
-/// `n = min(19 + 3.6·(impact − 1), 28) + party·8` never exceeds this (§6.5
-/// layer 11 wrote `min(5 + cells/1.8, 14) + party·4` under 18; **doubled
-/// 2026-09-08** — "a fan of coloured stars twice today's count" — and
-/// distance-graded the same day through [`impact`], which moves the count
-/// from the floor's 19 to the ceiling's 28 at the cap instead of saturating
-/// at 16 cells). Shared with the sky, which sizes its throw from it.
+/// `n = min(19 + 3.6·(impact − 1), 28) + party·8` never exceeds this. Shared
+/// with the sky, which sizes its throw from it.
 pub const FAN_MAX_N: usize = 36;
 
 /// Rain-glint spacing floor in ms (D19).
@@ -352,8 +277,7 @@ pub const RAIN_SPACING_MIN_MS: f32 = 18.0;
 pub const RAIN_SPACING_MAX_MS: f32 = 24.0;
 
 /// Spacing between the meteor's five rain glints, `s = clamp(T/5, 18, 24)` ms
-/// (D19) — a function of the SHARED flight clock, never of distance directly,
-/// so retuning [`flight_ms`] retunes the rain with it.
+/// (D19): a function of the flight clock, so retuning [`flight_ms`] retunes it.
 #[inline]
 #[must_use]
 pub fn rain_spacing_ms(flight_ms: f32) -> f32 {
@@ -364,17 +288,14 @@ pub fn rain_spacing_ms(flight_ms: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. THE KILL'S RETRACT SCHEDULE (§8.2, §27)
+// 2b. The kill's retract schedule (§8.2, §27)
 // ---------------------------------------------------------------------------
 
-/// **`12·n + 240` ms** — the kill's retract span (§8.2): a kill of `n` cells
-/// drains its suffix farthest-first over this long, and a Backspace (`n = 0`)
-/// over the base alone. Shared because three producers must agree on it: the
-/// ribbon retracts the cells on it, the insert's rewrite (§27) reuses it
-/// verbatim, and the sky finishes the retracted cells' field stars on it
-/// (§5.6: "its field stars die with their cells") — the ribbon owns the cell,
-/// stardust owns the star, and the two meet on the event edge because the
-/// star cannot read the cell per frame.
+/// `12·n + 240` ms: the kill's retract span (§8.2). A kill of `n` cells drains
+/// its suffix farthest-first over this long; a Backspace (`n = 0`) over the
+/// base alone. Shared by the ribbon (retracting cells), the insert's rewrite
+/// (§27) and the sky (finishing those cells' field stars, which cannot read
+/// the cell per frame).
 pub const KILL_RETRACT_BASE_MS: f32 = 240.0;
 
 /// Per-cell term of [`KILL_RETRACT_BASE_MS`]'s schedule.
@@ -402,66 +323,51 @@ pub fn kill_span_s(cells: u16) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// 3. THE TOKEN BUCKET (§8.1 no. 2, §13, D5)
+// 3. The token bucket (§8.1 no. 2, §13, D5)
 // ---------------------------------------------------------------------------
 
-/// Tokens the stardust bucket regains per second — hence "≤ 4 glints/s by
-/// construction" (§13). The bucket is refilled on the frame clock inside
-/// `tick()`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
+/// Tokens the stardust bucket regains per second, hence ≤ 4 glints/s (§13).
+/// Refilled in `tick()`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
 pub const GLINT_REFILL_PER_S: f32 = 4.0;
 
-/// Bucket depth. Three banked tokens let a burst of capitals chime as a burst
-/// (three glints inside one 250 ms window) without letting a long idle bank a
-/// whole arpeggio.
+/// Bucket depth: three banked tokens let a burst of capitals chime (three
+/// glints in 250 ms) without a long idle banking an arpeggio.
 ///
-/// The bucket's full law (D5), enforced at the ONE spend site —
-/// `stardust.rs`'s `deal_star` — and restated here beside its numbers: **only
-/// an m1 spends a token**, and a spent token cues exactly one glint at that
-/// star's column on that frame; an *earned* hero (capital, `!`, kitty Delight,
-/// the landing fan's own slot) with no token is **born anyway and is silent**
-/// (light is never rationed); a *dealt* hero with no token degrades to m2;
-/// m2/m3 never touch the bucket; meteor-lane stars are exempt entirely, and a
-/// meteor **empties** the bucket on its move edge, so typing heroes for the
-/// ~250 ms after a meteor are born as m2 — deliberately, because nothing may
-/// chime on top of the rain. The tokens are the WHOLE of the glow's law: how
-/// many glint voices may sound at once is the synth's lane cap (see the
-/// module doc's "What is NOT here").
+/// The bucket's law (D5), enforced at its one spend site (`stardust.rs`'s
+/// `deal_star`): only an m1 spends a token, cueing one glint at its column; an
+/// earned hero (capital, `!`, kitty Delight, the fan's slot) without a token is
+/// born silent; a dealt hero without one degrades to m2; m2/m3 never touch the
+/// bucket; meteor-lane stars are exempt, and a meteor empties the bucket on its
+/// move edge so nothing chimes over the rain. Voice concurrency is the synth's
+/// lane cap.
 pub const GLINT_CAP: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
-// 4. THE SEVEN NAMED CURVES (§2.5)
+// 4. The seven named curves (§2.5)
 // ---------------------------------------------------------------------------
 //
-// "The theme's only easing vocabulary." No linear fades; the single exception
-// is reduced motion (§6.11), whose 120 ms linear alpha is
-// `REDUCED_MOTION_FADE_MS` below and is deliberately NOT given a curve
-// function — it is a fade, not a member of the vocabulary.
+// The theme's only easing vocabulary; no linear fades except reduced motion's
+// `REDUCED_MOTION_FADE_MS`, which is deliberately not a curve function.
 
 /// Duration of the ribbon head cell's one ramp-in, seconds (v1's
 /// `RAINBOW_EDGE_IN_S`, kept verbatim). T3: *nothing else eases in.*
 pub const EDGE_IN_S: f32 = 0.018;
 
-/// `edge-in` — smoothstep over 18 ms. The one sanctioned attack in the theme
-/// (§2.5, §4): the ribbon head cell coming up to full at the hand.
-///
-/// Takes an AGE in seconds, not a normalized `u`, because its span is fixed by
-/// [`EDGE_IN_S`] and every call site has an age.
+/// `edge-in`: smoothstep over 18 ms, the theme's one attack (§2.5, §4): the
+/// ribbon head cell coming up at the hand. Takes an age in seconds, since its
+/// span is fixed by [`EDGE_IN_S`].
 #[inline]
 #[must_use]
 pub fn edge_in(age_s: f32) -> f32 {
     smoothstep01(age_s / EDGE_IN_S)
 }
 
-/// `enter-at-speed` — `p(u) = 1 − (1 − p₀)·(1 − u)^2.2`, `p₀ = 0.28`
-/// (§2.5, §6.2, D20). The meteor head's position along its path at `u = t/T`.
+/// `enter-at-speed`: `p(u) = 1 − (1 − p₀)·(1 − u)^2.2`, `p₀ = 0.28` (§2.5, §6.2,
+/// D20), the meteor head's position at `u = t/T`. `p(0) = p₀`, so the gesture
+/// is never seen starting from rest; `p(1) = 1` exactly.
 ///
-/// The whole point is `p(0) = p₀`, not `p(0) = 0`: the head is ALREADY 28 % of
-/// the way across on the frame the caret is observed at its landing, so the
-/// gesture is never seen starting from rest. `p(1) = 1` exactly.
-///
-/// Pinned by `meteor_enters_at_speed_never_from_rest` (§20.1): the head's
-/// displacement between spawn and spawn + 8 ms is ≥ `0.10·L` at every
-/// `T ∈ {60, 90, 120}`.
+/// Pinned by `meteor_enters_at_speed_never_from_rest`: displacement over the
+/// first 8 ms is ≥ `0.10·L` at every `T ∈ {60, 90, 120}`.
 #[inline]
 #[must_use]
 pub fn enter_at_speed(u: f32) -> f32 {
@@ -469,20 +375,18 @@ pub fn enter_at_speed(u: f32) -> f32 {
     1.0 - (1.0 - FLIGHT_P0) * (1.0 - u).powf(FLIGHT_ENTER_EXP)
 }
 
-/// `suck-in` — `u^1.8` (§2.5). The position law of any root or tail
-/// RETRACTING TOWARD THE CARET: the meteor train's colour root over its 300 ms
-/// `R` (§6.8), the ribbon's backspace retract, the pin's arms whipping inward.
-///
-/// T5: leaving marks move toward the caret; they do not fade in place.
+/// `suck-in`: `u^1.8` (§2.5). Position law of any root or tail retracting
+/// toward the caret: the meteor train's colour root over its 300 ms `R` (§6.8),
+/// the ribbon's backspace retract, the pin's arms. Leaving marks move toward
+/// the caret rather than fading in place.
 #[inline]
 #[must_use]
 pub fn suck_in(u: f32) -> f32 {
     clamp01(u).powf(1.8)
 }
 
-/// `spend` — `(1 − u)²` (§2.5). The ALPHA law of a retracting mark, and of the
-/// focus-lost ember (§8.2). Paired with [`suck_in`]: `suck_in` says where the
-/// mark went, `spend` says what it cost to get there.
+/// `spend`: `(1 − u)²` (§2.5). Alpha law of a retracting mark and the focus-lost
+/// ember (§8.2); paired with [`suck_in`] for position.
 #[inline]
 #[must_use]
 pub fn spend(u: f32) -> f32 {
@@ -490,15 +394,12 @@ pub fn spend(u: f32) -> f32 {
     v * v
 }
 
-/// `half-life` — `1` for a hold `H`, then `2^(−(age − H)/τ)` (§2.5, §5.6).
+/// `half-life`: `1` for a hold `H`, then `2^(−(age − H)/τ)` (§2.5, §5.6).
 ///
-/// The envelope of every star, and of the caret's landing re-light
-/// (`Engine::caret_paint`, which runs it on [`SPRING_SNAP_RESPONSE_S`] so the
-/// re-light and the flare share one edge). `hold_s` and `tau_s` are
-/// per-population (§5.6's table); the SHAPE is shared so a star's class can be
-/// read off its life without knowing which population minted it. §2.5's other
-/// half-life, the caret's τ 220 ms cool, is the HOST's (module doc, "What is
-/// NOT here") and is not run through this function.
+/// The envelope of every star and of the caret's landing re-light
+/// (`Engine::caret_paint`, run on [`SPRING_SNAP_RESPONSE_S`] so re-light and
+/// flare share an edge). `hold_s` and `tau_s` are per population; the shape is
+/// shared. The caret's 220 ms cool is the host's and does not use this.
 ///
 /// A non-positive `tau_s` is a step: full through the hold, then nothing.
 #[inline]
@@ -513,47 +414,37 @@ pub fn half_life(age_s: f32, hold_s: f32, tau_s: f32) -> f32 {
     (-(age_s - hold_s) / tau_s * std::f32::consts::LN_2).exp()
 }
 
-/// Star cull floor (D3): a star is dropped once [`half_life`] falls below
-/// this. `0.12` would leave a 36-cov grain vanishing at ~10/255 — invisible
-/// long before the arithmetic said so, which is how v1 shipped grains that
-/// "greyed out" instead of winking.
+/// Star cull floor (D3): a star is dropped once [`half_life`] falls below this,
+/// so grains wink out instead of greying.
 pub const STAR_CULL_ALPHA: f32 = 0.20;
 
-/// Chroma cull floor (C3, D3): coloured METEOR-TRAIN pixels are culled below
-/// this rather than allowed to go grey. Distinct from [`STAR_CULL_ALPHA`] on
-/// purpose — the train is a broad mark whose dim tail is still chromatic, a
-/// star is a point whose dim tail is nothing.
+/// Chroma cull floor (C3, D3): coloured meteor-train pixels are culled below
+/// this. Lower than [`STAR_CULL_ALPHA`] because the train's dim tail is still
+/// chromatic; a star's is nothing.
 pub const CHROMA_CULL_ALPHA: f32 = 0.12;
 
-/// `H + 2.32·τ` — the life a [`half_life`] envelope actually has, given
-/// [`STAR_CULL_ALPHA`] (§2.5, §5.6). `2.32 = log₂(1/0.20)`.
-///
-/// The published class lives (225 / 340 / 460 ms) are this function of the
-/// published `H`/`τ` pairs; a τ that does not reproduce its published life is
-/// a mis-transcription, not a taste call.
+/// `H + 2.32·τ`: the actual life of a [`half_life`] envelope given
+/// [`STAR_CULL_ALPHA`] (`2.32 = log₂(1/0.20)`). The class lives (225 / 340 /
+/// 460 ms) follow from their `H`/`τ` pairs.
 #[inline]
 #[must_use]
 pub fn half_life_life_s(hold_s: f32, tau_s: f32) -> f32 {
     hold_s + tau_s * -STAR_CULL_ALPHA.log2()
 }
 
-/// `spring-snap`'s response time, seconds (§2.5, §7.1). Read as the spring's
-/// NATURAL PERIOD: `ω = 2π/response`, so the mark is visually settled (residual
-/// under 1.5 %) at exactly `response`. Fixing the reading here, once, is what
-/// stops two producers from picking two different `ω` off the same "0.18 s".
+/// `spring-snap`'s response time in seconds (§2.5, §7.1), read as the natural
+/// period: `ω = 2π/response`, so the mark is settled (residual under 1.5%) at
+/// exactly `response`.
 pub const SPRING_SNAP_RESPONSE_S: f32 = 0.18;
 
 /// `spring-snap`'s natural frequency, rad/s (≈ 34.9) — see
 /// [`SPRING_SNAP_RESPONSE_S`].
 pub const SPRING_SNAP_OMEGA: f32 = 2.0 * std::f32::consts::PI / SPRING_SNAP_RESPONSE_S;
 
-/// `spring-snap` — a CRITICALLY DAMPED unit step (ζ = 1.0), response 0.18 s:
-/// `x(t) = 1 − (1 + ωt)·e^(−ωt)` (§2.5).
-///
-/// Used for the caret flare relaxing toward its field stop (§7.1) and for the
-/// kitty's landing. Critically damped means **no overshoot**: the caret must
-/// never dip past its own colour on the way back, because a caret that
-/// undershoots reads as "not arrived" (§7.1's second bullet).
+/// `spring-snap`: a critically damped unit step (ζ = 1.0), response 0.18 s:
+/// `x(t) = 1 − (1 + ωt)·e^(−ωt)` (§2.5). Used for the caret flare relaxing to
+/// its field stop (§7.1) and the kitty's landing. No overshoot: a caret that
+/// dips past its colour reads as not arrived.
 #[inline]
 #[must_use]
 pub fn spring_snap(age_s: f32) -> f32 {
@@ -565,25 +456,21 @@ pub fn spring_snap(age_s: f32) -> f32 {
 }
 
 /// `spring-whip`'s natural frequency, rad/s (§2.5).
-#[cfg(test)]
 pub const SPRING_WHIP_OMEGA: f32 = 24.0;
 
 /// `spring-whip`'s damping ratio (§2.5). Under 1, so it OVERSHOOTS — which is
 /// the point: the flying kitty is yanked backwards and springs past her
 /// resting lead before settling.
-#[cfg(test)]
 pub const SPRING_WHIP_ZETA: f32 = 0.6;
 
-/// `spring-whip` — the DAMPED unit step (ω = 24 rad/s, ζ = 0.6) of §2.5:
+/// `spring-whip`: the damped unit step (ω = 24 rad/s, ζ = 0.6) of §2.5:
 /// `x(t) = 1 − e^(−ζωt)·(cos ω_d t + (ζ/√(1−ζ²))·sin ω_d t)`,
 /// `ω_d = ω√(1−ζ²) = 19.2`.
 ///
-/// The flying kitty's lead on a meteor (§7.2): `lead = −0.30` cell at `t = 0`,
-/// springing to `+LEAD_MAX 0.22`, settled by ≈ 180 ms — which is
-/// `e^(−ζωt) = e^(−2.6) ≈ 0.07` at `t = 0.18`, the number the spec quotes.
+/// The flying kitty's lead on a meteor (§7.2): `−0.30` cell at `t = 0`,
+/// springing to `+LEAD_MAX 0.22`, settled by ≈ 180 ms (`e^(−ζωt) ≈ 0.07`).
 #[inline]
 #[must_use]
-#[cfg(test)]
 pub fn spring_whip(age_s: f32) -> f32 {
     if !age_s.is_finite() || age_s <= 0.0 {
         return 0.0;
@@ -595,45 +482,33 @@ pub fn spring_whip(age_s: f32) -> f32 {
     1.0 - env * ((wd * age_s).cos() + (z / root) * (wd * age_s).sin())
 }
 
-/// The ONE linear fade in the theme (§2.5, §6.11): under reduced motion every
-/// mark is static and its alpha runs to zero linearly over 120 ms at the end
-/// of its normal life. Deliberately a constant and not a curve function — it
-/// is the exception, and giving it an eighth entry in the vocabulary would
-/// invite an eighth easing.
+/// The theme's one linear fade (§2.5, §6.11): under reduced motion every mark is
+/// static and its alpha runs linearly to zero over 120 ms at the end of its life.
 pub const REDUCED_MOTION_FADE_MS: f32 = 120.0;
 
 // ---------------------------------------------------------------------------
-// 5. THE TWO COVERAGE CEILINGS (§5.2, D1)
+// 5. The two coverage ceilings (§5.2, D1)
 // ---------------------------------------------------------------------------
 //
-// "Two ceilings, one floor." One star FAMILY, two PRICES, because the two
-// lanes composite over different grounds: sky stars live above the ribbon for
-// 225-460 ms and are priced by the sparkle law; transient stars fly OVER INK
-// for ≤ 340 ms and are priced by the jump/transient cap. v1 carried a 33-entry
-// `RAINBOW_BAND_COV_CAPS` table *beside* `RAINBOW_UNDER_COV_CAP` — two ceilings
-// for one bed — and that is exactly what §19 deletes.
+// One star family, two prices: sky stars live above the ribbon for 225-460 ms
+// under the sparkle law; transient stars fly over ink for ≤ 340 ms under the
+// transient cap.
 
-/// The additive coverage ONE sky mark may request (v1's
-/// `RAINBOW_SPARKLE_COV_MAX`, unchanged). Field and strike stars are priced
-/// from this.
+/// The additive coverage one sky mark may request; field and strike stars are
+/// priced from it.
 pub const FIELD_STAR_COV_REQUEST_MAX: f32 = 61.0;
 
-/// `push_twinkle_star`'s own composite multiplier — its two crossing body bars
-/// plus its nucleus (`STAR_CORE_ADD 0.35`) stack to exactly this (v1's
-/// `STAR_STACK_ADD`). No class may add a duplicate core rect on top (D1).
+/// `push_twinkle_star`'s composite multiplier: two crossing body bars plus the
+/// nucleus (`STAR_CORE_ADD 0.35`). No class may add a duplicate core rect (D1).
 pub const STAR_STACK_ADD: f32 = 2.35;
 
-/// **CEILING 1 — the field / strike lane** (§5.2): a sky star's COMPOSITED
-/// centre may not exceed `STAR_STACK_ADD × 61 = 143`.
-///
-/// Every published class centre is at or under it: field m1 143, m2 130,
-/// m3 98. Pinned by `a_star_is_a_peak_not_a_blob` (§20.1) together with the
-/// ≥ 80/255 floor that makes a star a *peak*.
+/// Ceiling 1, the field/strike lane (§5.2): a sky star's composited centre may
+/// not exceed `STAR_STACK_ADD × 61 = 143`. Class centres: field m1 143, m2 130,
+/// m3 98. Pinned by `a_star_is_a_peak_not_a_blob` with the ≥ 80/255 peak floor.
 pub const FIELD_STAR_COV_CEIL: f32 = STAR_STACK_ADD * FIELD_STAR_COV_REQUEST_MAX;
 
-/// **CEILING 2 — the transient lane** (§5.2, D1): fan, shed, erase-throw and
-/// mini-fan stars fly OVER INK, so they are priced by v1's
-/// `RAINBOW_TRANSIENT_COV_CAP` instead. Class centres: m1 118, m2 80, m3 61.
+/// Ceiling 2, the transient lane (§5.2, D1): fan, shed, erase-throw and
+/// mini-fan stars fly over ink. Class centres: m1 118, m2 80, m3 61.
 pub const TRANSIENT_STAR_COV_CEIL: f32 = 118.0;
 
 /// L3's graded-jump roof (v1's `RAINBOW_JUMP_COV_CEIL`): the meteor's
@@ -641,12 +516,11 @@ pub const TRANSIENT_STAR_COV_CEIL: f32 = 118.0;
 pub const JUMP_COV_CEIL: f32 = 160.0;
 
 // ---------------------------------------------------------------------------
-// The laws that hold at compile time
+// Compile-time laws
 // ---------------------------------------------------------------------------
 //
-// Relations between the shared numbers that a mis-transcription would break
-// are pinned as CONST assertions, so the module does not compile with them
-// wrong — a test that merely re-evaluated a constant would be a tautology.
+// Relations between the shared numbers are const assertions, so a wrong value
+// does not compile.
 
 // §8.1 / D6: the fan's five paired stars fit inside the fan.
 const _: () = assert!(FAN_HERO_N <= FAN_MAX_N);
@@ -659,24 +533,20 @@ const _: () = assert!(FLIGHT_MAX_LIVE == 2);
 // D1: two ceilings are genuinely two numbers, and the field lane is the
 // brighter one.
 const _: () = assert!(FIELD_STAR_COV_CEIL > TRANSIENT_STAR_COV_CEIL);
-// §6.3 / L3: a full-grade head (`118 × 1.5 = 177`) asks for MORE than the
-// jump roof, so the roof genuinely binds — and the roof sits above the
-// transient ceiling, so an ungraded head is never clipped by it.
+// §6.3 / L3: a full-grade head (`118 × 1.5 = 177`) exceeds the jump roof, so
+// the roof binds; the roof is above the transient ceiling, so an ungraded head
+// is never clipped.
 const _: () = assert!(TRANSIENT_STAR_COV_CEIL * 1.5 > JUMP_COV_CEIL);
 const _: () = assert!(TRANSIENT_STAR_COV_CEIL < JUMP_COV_CEIL);
 // §2.5: the one sanctioned attack has a positive span.
 const _: () = assert!(EDGE_IN_S > 0.0);
-// §2.6 / S5: `phrase_rest_ms`'s `max` is genuinely two regimes, not a dead
-// branch. The floor binds up to an IOI of 360 ms (`2.5 × 360 = 900`, exactly
-// `PHRASE_PAUSE_MS`); above that crossover the tempo term binds, and it stays
-// at or above the floor all the way to the top of the clamp
-// (`2.5 × 600 = 1500 ms`). Both arms are reachable, so the rest a slow hand
-// gets is longer than the floor rather than pinned to it.
+// §2.6 / S5: both arms of `phrase_rest_ms`'s `max` are reachable. The floor
+// binds up to an IOI of 360 ms (`2.5 × 360 = 900`); above that the tempo term
+// binds, staying at or above the floor to the clamp's top (`2.5 × 600 = 1500`).
 const _: () = assert!(PHRASE_REST_IOI_MUL * IOI_MAX_MS >= PHRASE_PAUSE_MS as f32);
 const _: () = assert!(PHRASE_REST_IOI_MUL * 360.0 <= PHRASE_PAUSE_MS as f32);
-// The seconds form is the literal the ribbon's retract was baked with: a
-// correctly-rounded division of exact operands, bit-equal to `0.012` and
-// `0.240`, so the kill, the rewrite and the field-star finish share one clock.
+// The seconds form is bit-equal to `0.012` and `0.240`, so the kill, the
+// rewrite and the field-star finish share one clock.
 const _: () = assert!(
     KILL_RETRACT_PER_CELL_S == 0.012 && KILL_RETRACT_BASE_S == 0.240,
     "the seconds form is the literal the ribbon's retract was baked with"
@@ -706,14 +576,10 @@ pub fn smoothstep01(t: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// §20.1 `flight_ms_is_shared_and_clamped`: the three published points, the
-    /// two clamps, and monotonicity across the whole open range. This is the
-    /// number the synth resolves through the SAME function, so an off-by-one
-    /// here desynchronises the bell from the pin.
-    /// **S5's function** (Rainbow Path v3 §2.6): the floor at every tempo of
-    /// 2.8 cps or faster — where the melody is byte-identical to its pre-v3
-    /// self — and `2.5 · ioi` beyond it, capped by the IOI ceiling; the
-    /// tempo update is the melody's own law to the bit.
+    /// `flight_ms`: the three published points, both clamps, and monotonicity.
+    /// `phrase_rest_ms` (S5): the floor at 2.8 cps or faster, `2.5 · ioi`
+    /// beyond, capped by the IOI ceiling; the tempo update matches the melody's
+    /// law exactly.
     #[test]
     fn the_phrase_rest_is_the_floor_at_speed_and_the_tempo_multiple_below_it() {
         for ioi in [30.0, 100.0, 250.0, 360.0] {
@@ -744,10 +610,8 @@ mod tests {
         );
     }
 
-    /// `impact` is the ONE magnitude every distance-graded landing law reads,
-    /// so its shape is pinned here once: floor exactly 1 at the 8-cell meteor
-    /// floor (the floor landing must not change), non-decreasing over the whole
-    /// range, saturating at the cap, and total on garbage.
+    /// `impact`: exactly 1 at the 8-cell floor, non-decreasing, saturating at
+    /// the cap, and total on garbage.
     #[test]
     fn impact_is_monotone_floored_and_capped() {
         assert!(
@@ -861,9 +725,8 @@ mod tests {
         }
     }
 
-    /// §2.5, endpoint by endpoint. Every curve is pinned at both ends because
-    /// the ends are what the laws talk about: frame 0 exists (T2) and the mark
-    /// is gone by its published life (T6).
+    /// §2.5 curves pinned at both ends: frame 0 exists (T2) and the mark is gone
+    /// by its published life (T6).
     #[test]
     fn the_seven_curves_hit_their_endpoints() {
         // edge-in: 0 at birth, 1 at 18 ms, monotone between.
@@ -936,10 +799,9 @@ mod tests {
             peak > 1.02,
             "spring-whip must overshoot (ζ = 0.6), peak {peak}"
         );
-        // "Settled ≈ 180 ms" is the ENVELOPE's statement: at t = 0.18 the
-        // decay is e^(−ζωt) = e^(−2.592) ≈ 0.075, and the step response's
-        // amplitude factor is at most 1/√(1−ζ²) = 1.25, so the residual is
-        // bounded by 0.094 — never further out than a tenth.
+        // "Settled ≈ 180 ms" bounds the envelope: at t = 0.18 the decay is
+        // e^(−2.592) ≈ 0.075 and the amplitude factor ≤ 1/√(1−ζ²) = 1.25, so
+        // the residual is ≤ 0.094.
         let residual = (spring_whip(0.180) - 1.0).abs();
         let bound = (-SPRING_WHIP_ZETA * SPRING_WHIP_OMEGA * 0.180).exp()
             / (1.0 - SPRING_WHIP_ZETA * SPRING_WHIP_ZETA).sqrt();
@@ -971,8 +833,7 @@ mod tests {
                 "transient class {centre} under the grain floor"
             );
         }
-        // The relations BETWEEN the ceilings (D1, L3) are compile-time
-        // assertions beside the constants; a graded head's roof is pinned
-        // there, not here.
+        // Relations between the ceilings (D1, L3) are compile-time assertions
+        // beside the constants.
     }
 }

@@ -15,46 +15,9 @@
 //! `harness::upgrade_drive` tests (`upgrade_stall_tests.rs`), over the real
 //! reducer, gates, record transitions and the host's reading of each word.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
+use crate::walk::{only, reachable, walk};
 use aterm_spec::derive::{Model, harness_upgrade_never_strands_model};
 use aterm_spec::{interp, verify};
-
-type S = BTreeMap<&'static str, i64>;
-
-fn only(m: &Model, invariant: &str) -> Model {
-    let mut m = m.clone();
-    m.invariants.retain(|i| i.name == invariant);
-    m
-}
-
-fn run(m: &Model, actions: &[&str]) -> S {
-    let mut s = m.init_state();
-    for action in actions {
-        assert!(m.fire(action, &mut s), "{action} at {s:?}");
-    }
-    s
-}
-
-/// Every state `m` reaches, invariants unchecked.
-fn reachable(m: &Model) -> Vec<S> {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
-    let mut out = Vec::new();
-    while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
-            continue;
-        }
-        for a in &m.actions {
-            let mut next = s.clone();
-            if m.fire(a.name, &mut next) {
-                queue.push_back(next);
-            }
-        }
-        out.push(s);
-    }
-    out
-}
 
 /// The defects the fix and its reviews found, one knob each, and the
 /// invariant that catches each alone.
@@ -210,13 +173,13 @@ fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
     let asked = ["Announce", "Elapse", "Announce", "Elapse", "GiveUp"];
     let then = |more: &[&'static str]| -> Vec<&'static str> { [&asked[..], more].concat() };
     let review = then(&["Direct", "AgentReady", "Void"]);
-    let mut s = run(&m, &review);
+    let mut s = walk(&m, &review);
     assert_eq!((s["holding"], s["owed"], s["directed"]), (1, 1, 0));
     assert!(!m.action_enabled("DropRelease", &s), "{s:?}");
     assert!(m.fire("Release", &mut s));
     assert_eq!(s["holding"], 0, "released");
     let stale = interp::with_consts(&m, &[("StaleDirection", 1)]);
-    let mut s = run(&stale, &review);
+    let mut s = walk(&stale, &review);
     assert!(stale.action_enabled("DropRelease", &s) && !stale.action_enabled("Release", &s));
     for action in ["DropRelease", "Look"] {
         assert!(stale.fire(action, &mut s), "{action}: {s:?}");
@@ -225,17 +188,17 @@ fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
     assert!(!stale.check_invariant("NoDropOverAHold", &s), "{s:?}");
 
     // Taken up: dropped, the agent at work; the last word finds it so.
-    let mut s = run(&m, &then(&["Direct", "AgentGoesOn"]));
+    let mut s = walk(&m, &then(&["Direct", "AgentGoesOn"]));
     for action in ["DropRelease", "Look"] {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
     assert_eq!((s["holding"], s["stuck"], s["dropheld"]), (0, 0, 0));
 
     // Not answered yet: released; `UnansweredDirection` drops it instead.
-    let s = run(&m, &then(&["Direct"]));
+    let s = walk(&m, &then(&["Direct"]));
     assert!(!m.action_enabled("DropRelease", &s) && m.action_enabled("Release", &s));
     let unanswered = interp::with_consts(&m, &[("UnansweredDirection", 1)]);
-    let mut s = run(&unanswered, &then(&["Direct", "DropRelease"]));
+    let mut s = walk(&unanswered, &then(&["Direct", "DropRelease"]));
     assert!(
         !unanswered.action_enabled("AgentReady", &s),
         "a READY now answers nothing kept: {s:?}"
@@ -244,10 +207,10 @@ fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
     assert!(!unanswered.check_invariant("NeverStranded", &s), "{s:?}");
 
     // A READY someone spoke after is no consent to a restart.
-    let s = run(&m, &["Announce", "AgentReady", "Direct"]);
+    let s = walk(&m, &["Announce", "AgentReady", "Direct"]);
     assert!(!m.action_enabled("Restart", &s), "{s:?}");
     let over = interp::with_consts(&m, &[("ReadyOverDirection", 1)]);
-    let mut s = run(&over, &["Announce", "AgentReady", "Direct"]);
+    let mut s = walk(&over, &["Announce", "AgentReady", "Direct"]);
     assert!(over.fire("Restart", &mut s));
     assert!(!over.check_invariant("NoRestartOverDirection", &s), "{s:?}");
 
@@ -269,7 +232,7 @@ fn a_release_is_dropped_only_for_an_agent_that_took_other_work_up() {
 #[test]
 fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     let m = harness_upgrade_never_strands_model();
-    let mut limited = run(&m, &["LimitHits"]);
+    let mut limited = walk(&m, &["LimitHits"]);
     assert!(
         !m.action_enabled("Announce", &limited),
         "never while limited"
@@ -282,12 +245,12 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
 
     // Asked, and the limit hits during the wind-down: the clock is held, and
     // a window that ran out before the limit starts again after it.
-    let mut asked = run(&m, &["Announce", "LimitHits"]);
+    let mut asked = walk(&m, &["Announce", "LimitHits"]);
     assert!(!m.action_enabled("Elapse", &asked), "the clock is held");
     assert!(!m.action_enabled("GiveUp", &asked));
     assert!(m.fire("LimitResets", &mut asked));
     assert!(m.action_enabled("Elapse", &asked));
-    let mut due = run(&m, &["Announce", "Elapse", "LimitHits", "LimitResets"]);
+    let mut due = walk(&m, &["Announce", "Elapse", "LimitHits", "LimitResets"]);
     assert_eq!(due["window"], 0, "the whole window after the reset");
     assert!(!m.action_enabled("Announce", &due));
     assert!(m.fire("Elapse", &mut due));
@@ -295,7 +258,7 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     // Asked to the bound and never answered: released, and a READY that comes
     // before the release restarts it — or, held past the drain, is void and
     // the agent still released.
-    let tired = run(&m, &["Announce", "Elapse", "Announce", "Elapse", "GiveUp"]);
+    let tired = walk(&m, &["Announce", "Elapse", "Announce", "Elapse", "GiveUp"]);
     assert_eq!((tired["phase"], tired["owed"]), (2, 1));
     assert!(!m.action_enabled("Look", &tired), "a release is owed");
     let mut released = tired.clone();
@@ -317,7 +280,7 @@ fn a_limited_session_is_asked_after_its_reset_and_a_tired_one_is_released() {
     // A restart refused after READY: the round's markers go with it, and the
     // release is typed (the review's first blocker; `KeepReady` is the
     // defect, caught above).
-    let mut refused = run(&m, &["Announce", "AgentReady", "Abandon"]);
+    let mut refused = walk(&m, &["Announce", "AgentReady", "Abandon"]);
     assert_eq!(
         (refused["ready"], refused["live"], refused["owed"]),
         (0, 0, 1)
@@ -362,7 +325,7 @@ fn the_incident_as_it_ran_is_the_caught_negative_control() {
         }
     }
     assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
-    let fixed = run(&m, &["LimitHits"]);
+    let fixed = walk(&m, &["LimitHits"]);
     assert!(!m.action_enabled("Announce", &fixed));
 }
 
@@ -385,7 +348,7 @@ fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
         "Elapse",
         "GiveUp",
     ];
-    let s = run(&m, &tired);
+    let s = walk(&m, &tired);
     assert_eq!(
         (s["brk"], s["phase"], s["owed"], s["holding"]),
         (1, 2, 1, 1)
@@ -412,11 +375,11 @@ fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
 
     // THE INCIDENT AS IT RAN: the release, and the void, only at an idle point.
     let idle_only = interp::with_consts(&m, &[("IdleOnlyRelease", 1)]);
-    let mut s = run(&idle_only, &tired);
+    let mut s = walk(&idle_only, &tired);
     assert!(!idle_only.action_enabled("Release", &s), "{s:?}");
     assert!(idle_only.fire("Look", &mut s));
     assert!(!idle_only.check_invariant("NeverStranded", &s), "{s:?}");
-    let mut late = run(&idle_only, &tired);
+    let mut late = walk(&idle_only, &tired);
     assert!(idle_only.fire("AgentReady", &mut late));
     assert!(!idle_only.action_enabled("Void", &late), "{late:?}");
     assert!(idle_only.fire("Look", &mut late));
@@ -504,7 +467,7 @@ fn no_reachable_state_is_a_permanent_wait() {
 #[test]
 fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
     let m = harness_upgrade_never_strands_model();
-    let walk = [
+    let path = [
         "Announce",
         "Elapse",
         "Announce",
@@ -515,7 +478,7 @@ fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
         "Release",
         "Rests",
     ];
-    let mut s = run(&m, &walk);
+    let mut s = walk(&m, &path);
     assert_eq!(
         (s["phase"], s["rest"], s["owed"], s["holding"]),
         (2, 1, 0, 0)
@@ -530,7 +493,7 @@ fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
     }
 
     let terminal = interp::with_consts(&m, &[("Terminal", 1)]);
-    let mut s = run(&terminal, &walk);
+    let mut s = walk(&terminal, &path);
     assert!(!terminal.action_enabled("Rearm", &s), "{s:?}");
     assert!(terminal.fire("Look", &mut s), "{s:?}");
     assert!(!terminal.check_invariant("NeverStalls", &s), "{s:?}");

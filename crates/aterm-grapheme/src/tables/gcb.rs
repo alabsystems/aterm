@@ -1148,17 +1148,15 @@ pub(crate) fn gcb_class(c: char) -> GCB {
     if cp >= 0x110000 {
         return GCB::Other;
     }
-    // Indexed via `get(..).unwrap_or(0)`: the indices are in range for every
-    // valid `char` (cp < 0x110000 is guarded above), and 0 maps to GCB::Other —
-    // the same fallback the match below already uses — so behavior is identical
-    // while the verifier no longer needs the table-length bounds proof.
+    // `get(..).unwrap_or(0)`: indices are in range for every valid `char` (cp <
+    // 0x110000 is guarded above), and 0 maps to GCB::Other, the match's own
+    // fallback, so the verifier needs no table-length bounds proof.
     let block_idx = GCB_LEVEL1.get((cp >> 8) as usize).copied().unwrap_or(0) as usize;
     let offset = (cp & 0xFF) as usize;
     let byte_idx = block_idx * 128 + offset / 2;
     let byte = GCB_LEVEL2.get(byte_idx).copied().unwrap_or(0);
-    // Constant shift amounts (no data-dependent shift): rustc emits no runtime
-    // shift-overflow assert for these, which discharges the hardened
-    // panic-boundary obligation the full verifier could not model for `>> shift`.
+    // Constant shift amounts, so rustc emits no runtime shift-overflow assert
+    // (a panic boundary the verifier cannot model for `>> shift`).
     let raw = if offset % 2 == 0 {
         byte & 0x0F
     } else {
@@ -1691,11 +1689,8 @@ static INCB_RANGES: [(u32, u32, u8); 403] = [
 #[inline]
 pub(crate) fn incb_class(c: char) -> InCB {
     let cp = c as u32;
-    // Early-out: INCB_RANGES is sorted ascending with minimum start 0x0300 and
-    // maximum end 0xE01EF, so any codepoint outside [0x0300, 0xE01EF] already
-    // produces Err from the binary search -> InCB::None. This is exactly
-    // equivalent and collapses the ~9-comparison search into one branch for the
-    // dominant ASCII/Latin input.
+    // Early-out: INCB_RANGES spans [0x0300, 0xE01EF], so anything outside gives
+    // InCB::None without the binary search (the common ASCII/Latin case).
     if !(0x0300..=0xE01EF).contains(&cp) {
         return InCB::None;
     }

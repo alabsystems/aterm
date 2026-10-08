@@ -1,42 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Conformance: the real `poll()` obeys the DERIVED no-silent-loss discipline.
+//! Conformance: the real `poll()` obeys the derived no-silent-loss discipline.
 //!
-//! `aterm_spec::derive::subscribe_model()` is the drift-free model of the
-//! subscriber: a reader that has fallen behind the live ring window MUST receive
-//! a `Gap` (resync), never be silently delivered events as if nothing was lost —
-//! encoded as the model's `PollGap` guard `lo > cursor + 1` (and proven by `ty`,
-//! with a `Buggy=1` counterexample, in `aterm-spec/tests/derived_ring_ty.rs`).
-//!
-//! This binds that model to the CODE THAT ACTUALLY RUNS: it drives the real
-//! `Surface::subscribe`/`poll` (aterm-buffer's library read face; no product
-//! crate calls it today), projects each state onto the model
-//! variables `<<seq, lo, cursor, lost>>`, and asserts the real gap-vs-deliver
-//! decision equals `Model::action_enabled("PollGap", state)` — the model's own
-//! guard, not a re-stated predicate. So if `poll()` ever silently delivered to a
-//! behind reader (a silent loss), this test catches it. Unlike the `ty` tests,
-//! this is pure Rust (the model interpreter) + real code, so it always runs.
+//! `aterm_spec::derive::subscribe_model()`: a reader behind the live ring window
+//! must get a `Gap`, never events delivered as if nothing was lost (the
+//! `PollGap` guard `lo > cursor + 1`). The test drives the real
+//! `Surface::subscribe`/`poll`, projects onto `<<seq, lo, cursor, lost>>`, and
+//! asserts the real gap-vs-deliver decision equals the model's own
+//! `Model::action_enabled("PollGap", state)`. Pure Rust, so it always runs.
 
+use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, SubUpdate, Surface};
-mod support;
 use aterm_spec::derive::subscribe_model;
 use std::collections::BTreeMap;
-use support::{read_cap, write_cap};
 
-/// The real ring cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`); a cursor
-/// only falls behind once eviction passes it, i.e. after > CAP appends.
+/// The real ring cap (`aterm_buffer::MAX_LOG_EVENTS`); a cursor falls behind
+/// only after more than `CAP` appends.
 const CAP: u64 = 1 << 16;
 
-/// The oldest still-live seq (the ring head `lo`); 1 when empty — the same
-/// projection the ring conformance uses.
+/// The oldest live seq (the ring head `lo`); 1 when empty.
 fn oldest_live(s: &Surface) -> u64 {
     s.log().live().next().map(|e| e.seq.0).unwrap_or(1)
 }
 
-/// Project the subscriber state the model reasons about. `cursor_at` is tracked
-/// by the caller (the real `Cursor.at` is private but deterministic: it is the
-/// head at subscribe/poll time).
+/// Project the subscriber state. `cursor_at` is tracked by the caller: the real
+/// `Cursor.at` is private but is the head at subscribe/poll time.
 fn state(s: &Surface, cursor_at: u64) -> BTreeMap<&'static str, i64> {
     [
         ("seq", s.seq().0 as i64),
@@ -90,9 +79,8 @@ fn real_poll_behind_gaps_no_silent_loss() {
     let gapped = matches!(upd, SubUpdate::Gap { .. });
     let st = state(&s, cursor_at);
 
-    // The model forbids delivery (PollGap enabled, PollDeliver disabled): the real
-    // subscriber MUST gap. A silent delivery here would be exactly the bug the
-    // derived NoSilentLoss invariant catches.
+    // The model forbids delivery here (PollGap enabled), so the real subscriber
+    // must gap; a delivery would be a silent loss.
     assert!(
         m.action_enabled("PollGap", &st),
         "model: a behind reader must gap"

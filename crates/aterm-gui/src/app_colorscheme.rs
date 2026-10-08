@@ -166,22 +166,12 @@ impl App {
         // agreement with the palette pinned just above.
         self.session_factory.appearance = appearance;
 
-        // Renderer chrome. `Theme` is a 4×u32 POD without `PartialEq`; compare fields
-        // (the renderer bakes these in, so any change needs a backend rebuild).
+        // Renderer chrome (the renderer bakes these in, so any change needs a
+        // backend rebuild).
         let new_theme = self
             .config
             .theme_for_with_assets(appearance, &self.config_assets.themes);
-        let theme_changed = (
-            new_theme.fg,
-            new_theme.bg,
-            new_theme.cursor,
-            new_theme.selection,
-        ) != (
-            self.theme.fg,
-            self.theme.bg,
-            self.theme.cursor,
-            self.theme.selection,
-        );
+        let theme_changed = !crate::app_config::theme_eq(new_theme, self.theme);
         if theme_changed {
             // Colour-only swap: the face/atlas are untouched by a light/dark flip,
             // so push the theme onto the live backend instead of rebuilding it —

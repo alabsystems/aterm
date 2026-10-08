@@ -367,14 +367,6 @@ fn source_plain(source: &str) -> Option<String> {
     (!vendor.is_empty()).then(|| format!("from {vendor}"))
 }
 
-/// `checked 3 min ago` → `Checked 3 min ago`.
-fn sentence_case(text: &str) -> String {
-    let mut chars = text.chars();
-    chars.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(chars).collect()
-    })
-}
-
 /// WHEN, AS A PERSON READS IT (Phase 4: "local relative time, never raw UTC"): `just now`,
 /// `4 min ago`, `3 h ago` inside a day; then the LOCAL calendar — `yesterday 14:05`, a
 /// weekday within the week (`Mon 14:05`), `Sep 14` within the year, `Sep 14 2025` beyond —
@@ -1447,9 +1439,7 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     // local clock every time on the page is shown in.
     report.log_path = atpkg::packages_log::log_path();
     report.activity = atpkg::packages_log::tail(atpkg::packages_log::ACTIVITY_EVENTS);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     report.clock = LocalClock::read(now);
     report
 }
@@ -2328,7 +2318,7 @@ impl PackagesState {
             // names the key.
             Some("This build can\u{2019}t install packages.".to_string())
         } else if report.recorded {
-            recorded_detail(false).map(|recorded| sentence_case(&recorded))
+            recorded_detail(false).map(|recorded| crate::update_words::capitalize_first(&recorded))
         } else {
             Some("Click Check & Update Now to check.".to_string())
         };
@@ -2651,11 +2641,14 @@ impl PackagesState {
                     s.scan_complete && s.spotlight_noindex && s.exposed > s.would_migrate
                 }) =>
             {
-                let stuck = state.map_or(0, |s| s.exposed - s.would_migrate);
-                format!(
-                    "Nothing an apply can do — {stuck} target dir(s) stay open to Spotlight \
-                     (free-standing, or refused for now)"
-                )
+                let (stuck, open) =
+                    state.map_or((0, None), |s| (s.exposed - s.would_migrate, s.open));
+                // The CLI's own sentence, capitalized for the card.
+                let verdict = atpkg::machine::stay_open_verdict(stuck, open);
+                let mut c = verdict.chars();
+                c.next()
+                    .map(|f| f.to_uppercase().chain(c).collect())
+                    .unwrap_or_default()
             }
             _ if nothing_to_apply && state.is_some_and(|s| !s.scan_complete) => {
                 "Nothing to apply from what was seen — Universal Control is where [machine] \
@@ -2968,7 +2961,7 @@ fn pass_words(verb: &str) -> String {
         ("install", Some(program)) => format!("Install {program}"),
         ("uninstall", Some("--all")) => "ALab tools removal".to_string(),
         (other, rest) => {
-            let mut text = sentence_case(other);
+            let mut text = crate::update_words::capitalize_first(other);
             if let Some(rest) = rest {
                 text.push(' ');
                 text.push_str(rest);
@@ -4437,6 +4430,10 @@ mod tests {
             scan_complete: true,
             home,
             config_unreadable: false,
+            open: Some(atpkg::machine::OpenSplit {
+                free_standing: 1,
+                ..atpkg::machine::OpenSplit::default()
+            }),
         }
     }
 
@@ -4703,8 +4700,7 @@ mod tests {
         // an APPLY can do, which is not the same as the machine being settled.
         assert_eq!(
             done.machine.next,
-            "Nothing an apply can do — 1 target dir(s) stay open to Spotlight \
-             (free-standing, or refused for now)",
+            "Nothing an apply can do — 1 cargo target dir(s) stay open to Spotlight: 1 free-standing (`aterm pkg noindex apply <dir>` by name)",
         );
 
         // A home mismatch disables the button and names the reason.
@@ -5122,7 +5118,7 @@ mod tests {
                 // `spotlight_noindex` is ON and one dir is exposed that no pass can
                 // reach, so the machine is NOT where [machine] wants it — the verdict
                 // says what an apply can (not) do instead of calling it settled.
-                next: "Nothing an apply can do — 1 target dir(s) stay open to Spotlight (free-standing, or refused for now)",
+                next: "Nothing an apply can do — 1 cargo target dir(s) stay open to Spotlight: 1 free-standing (`aterm pkg noindex apply <dir>` by name)",
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -5136,7 +5132,7 @@ mod tests {
                 saved: (Leave, true),
                 universal_control: "Universal Control: disabled on this Mac",
                 spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
-                next: "Nothing an apply can do — 1 target dir(s) stay open to Spotlight (free-standing, or refused for now)",
+                next: "Nothing an apply can do — 1 cargo target dir(s) stay open to Spotlight: 1 free-standing (`aterm pkg noindex apply <dir>` by name)",
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -5912,10 +5908,7 @@ mod tests {
             "the index pin"
         );
         let flipped = ay.updated_at.expect("the current link's time");
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let wall = aterm_time::unix_secs().unwrap() as i64;
         assert!(
             (wall - 120..=wall + 5).contains(&flipped),
             "{flipped} vs {wall}"

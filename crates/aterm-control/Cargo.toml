@@ -23,3 +23,7 @@ conformance = []
 # The engine the verbs read and mutate. Every item used here is unconditional
 # (no feature gate), so a consumer's feature selection cannot change this crate.
 aterm-core = { workspace = true }
+# The wire's percent escape (`wire::pct_*` re-export it): its one copy lives in
+# this dependency-free leaf so clients that cannot link this crate share it.
+# Already in the graph through aterm-core.
+aterm-codec = { workspace = true }

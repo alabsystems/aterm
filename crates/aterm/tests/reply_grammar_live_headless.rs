@@ -27,14 +27,13 @@ use std::time::Duration;
 
 use aterm_types::control_verbs::{Framing, framing_of};
 
-#[path = "support/headless_boot.rs"]
-mod headless_boot;
-#[path = "support/launch_isolation.rs"]
-mod launch_isolation;
+use crate::headless_boot;
 
 use headless_boot::Instance;
 
-const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a reply may take before it is read as a hang (AGENTS.md: a hang
+/// detector is a minute, never a latency budget).
+const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token(inst: &Instance) -> String {
     let mut p = std::ffi::OsString::from(&inst.sock);

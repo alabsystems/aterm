@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Alt-screen (mode 1049) round-trip CORRECTNESS fuzz.
+//! Alt-screen (mode 1049) round-trip correctness fuzz.
 //!
 //! `ESC[?1049h` saves the cursor and switches to a cleared alternate buffer;
-//! `ESC[?1049l` switches back and restores the cursor — the mechanism vim, tmux,
-//! less, htop all use. A bug here (alt buffer aliasing the main, a botched
-//! restore) silently CORRUPTS the user's screen the moment they quit the editor
-//! — a classic, high-impact terminal defect. The engine panic-freedom fuzz only
-//! hits the exact mode numbers (1049) by low-probability chance, so this path is
-//! effectively unfuzzed, and the property that matters is CORRECTNESS, not just
-//! no-panic: after a round-trip, the main screen + cursor must be byte-identical
-//! to before. This paints a distinctive main screen, enters the alt buffer,
-//! scribbles arbitrary content there, exits, and asserts the main screen and
-//! cursor were restored exactly. Deterministic.
+//! `ESC[?1049l` switches back and restores the cursor. This paints a distinctive
+//! main screen, enters the alt buffer, writes arbitrary content, exits, and
+//! asserts the main screen and cursor are restored byte for byte.
+//! Deterministic.
 
 use aterm_core::terminal::Terminal;
 
@@ -40,7 +34,7 @@ fn read_screen(term: &Terminal) -> Vec<String> {
     out
 }
 
-/// Scribble arbitrary content (this runs INSIDE the alt buffer — it must not be
+/// Scribble arbitrary content (this runs inside the alt buffer — it must not be
 /// able to reach back and mutate the saved main screen).
 fn scribble(s: &mut u64, term: &mut Terminal) {
     const SAMPLES: &[&[u8]] = &[
@@ -66,7 +60,7 @@ fn alt_screen_1049_roundtrip_preserves_main_and_cursor() {
     let mut s: u64 = 0xA17E_5C2E_BEEF_0042;
     let mut term = Terminal::new(24, 80);
     for it in 0..2000u32 {
-        // Ensure we are on the MAIN screen, then paint a distinctive picture.
+        // Ensure we are on the main screen, then paint a distinctive picture.
         term.process(b"\x1b[?1049l\x1b[2J\x1b[H");
         let lines = 1 + next(&mut s) % 12;
         for line in 0..lines {

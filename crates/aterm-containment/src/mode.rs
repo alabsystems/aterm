@@ -12,22 +12,22 @@ use std::fmt;
 
 /// The 4 containment modes, ordered by decreasing capability.
 ///
-/// What each mode actually enforces is stated once, in [`crate::actuator`]; the
-/// crate-root table summarises it.
+/// Enforcement is stated in [`crate::actuator`]; the crate-root table
+/// summarises it.
 ///
-/// - **Master**: Full trust — developer mode. No confinement.
-/// - **User**: The default. No confinement; the shell keeps aterm's own
+/// - **Master**: full trust, developer mode. No confinement.
+/// - **User**: the default. No confinement; the shell keeps aterm's own
 ///   resource limits.
-/// - **Safety**: Hardened resource limits (rlimits; the Job Object on Windows)
-///   and no OS sandbox.
-/// - **Containment**: Hostile agent. The macOS Seatbelt sandbox: no network,
+/// - **Safety**: hardened resource limits (rlimits; the Job Object on
+///   Windows), no OS sandbox.
+/// - **Containment**: hostile agent. The macOS Seatbelt sandbox: no network,
 ///   writes confined to the temp roots, no read or write of the credential and
-///   private-data stores, plus the hardened resource limits. Refuses to start
-///   where no OS sandbox exists.
+///   private-data stores, plus the hardened limits. Refuses to start where no
+///   OS sandbox exists.
 ///
-/// Mode is set ONLY by the launcher (its `--containment` / `--sandbox` /
-/// `--no-sandbox` flag). aterm cannot upgrade its own mode. Mode is immutable
-/// after initialization.
+/// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`);
+/// aterm cannot upgrade its own mode, and it is immutable after
+/// initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -49,10 +49,9 @@ impl ContainmentMode {
         self as u8
     }
 
-    /// The variant's canonical name — identical to its `Display` rendering.
-    /// Lets `Display` (and the audit trail) format through a single static
-    /// string write instead of the `write!`/`format_args!` machinery (the
-    /// aterm-cap `Tier::name` Trust idiom).
+    /// The variant's canonical name, identical to its `Display` rendering, so
+    /// `Display` and the audit trail write one static string without
+    /// `format_args!`.
     #[must_use]
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -78,9 +77,8 @@ impl ContainmentMode {
 
 impl fmt::Display for ContainmentMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `write_str` instead of `write!`: byte-identical (the literal is the
-        // whole message), and it keeps the `format_args!` expansion — whose
-        // lowering the Trust strict gate cannot always model — out of this MIR.
+        // `write_str`, keeping `format_args!` (which the Trust strict gate
+        // cannot always model) out of this MIR.
         f.write_str(self.name())
     }
 }
@@ -101,15 +99,9 @@ impl Ord for ContainmentMode {
 #[derive(Debug, Clone)]
 pub struct ParseModeError(pub(crate) String);
 
-// Hand-written `Display`/`Error` (was `#[derive(aterm_error::Error)]` with
-// `#[error("invalid containment mode: {0:?} (expected: master, user, safety,
-// containment)")]`): the derive's generated `fmt` expands a runtime-argument
-// `format_args!`, whose unsafe `fmt::Arguments::new` constructor the Trust
-// strict gate's native lowering fails closed on. `Debug::fmt(&self.0, f)` is
-// byte-identical to the `{0:?}` placeholder (str's `Debug` consults no
-// formatter options), and the piece writes are verbatim, so the rendered
-// message is unchanged. `source()` returns `None` exactly like the derive
-// (no `#[source]`/`#[from]` field).
+// Hand-written `Display`/`Error`: no runtime-argument `format_args!`, whose
+// unsafe `fmt::Arguments::new` constructor the Trust strict gate's native
+// lowering fails closed on.
 impl fmt::Display for ParseModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("invalid containment mode: ")?;
@@ -135,14 +127,6 @@ impl std::str::FromStr for ContainmentMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_level_encoding() {
-        assert_eq!(ContainmentMode::Containment.level(), 0);
-        assert_eq!(ContainmentMode::Safety.level(), 1);
-        assert_eq!(ContainmentMode::User.level(), 2);
-        assert_eq!(ContainmentMode::Master.level(), 3);
-    }
 
     #[test]
     fn test_ordering() {

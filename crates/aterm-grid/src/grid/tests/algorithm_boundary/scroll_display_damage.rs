@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for `scroll_display` targeted damage patterns (#5227)
-//! and `content_scroll_delta` consumption (#5544).
+//! Tests for `scroll_display` targeted damage patterns and
+//! `content_scroll_delta` consumption.
 
 use super::*;
 
@@ -37,7 +37,7 @@ fn scroll_display_up_marks_top_rows_dirty() {
             "row {row} should be dirty after scroll_display up by 3"
         );
     }
-    // Rows below the scroll delta should NOT be dirty
+    // Rows below the scroll delta should not be dirty
     for row in 3..10u16 {
         assert!(
             !grid.damage().is_row_damaged(row),
@@ -79,7 +79,7 @@ fn scroll_display_down_marks_bottom_rows_dirty() {
             "row {row} should be dirty after scroll_display down by 3"
         );
     }
-    // Rows above the scroll delta should NOT be dirty
+    // Rows above the scroll delta should not be dirty
     for row in 0..7u16 {
         assert!(
             !grid.damage().is_row_damaged(row),

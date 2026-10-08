@@ -371,7 +371,7 @@ pub(crate) fn looks_like_raw_credential(value: &str) -> bool {
             .iter()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
     let google_api_key = value.starts_with("AIza") && value.len() >= 20 && token_chars();
-    let exact_hex = value.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit);
+    let exact_hex = aterm_codec::hex::is_hex(value, 64);
     let lowercase_digit = value.len() >= 32
         && bytes
             .iter()

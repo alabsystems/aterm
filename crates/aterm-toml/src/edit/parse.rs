@@ -5,9 +5,8 @@
 //!
 //! One parser serves both halves of the crate: it builds the formatting-
 //! preserving document, and [`crate::de`] deserializes out of that same tree.
-//! There is no second, faster, lossy parser, because two parsers means two
-//! answers to "is this file valid", and the whole point of retiring the
-//! third-party pair was to stop having two.
+//! There is no second, faster, lossy parser: two parsers would give two
+//! answers to "is this file valid".
 //!
 //! # What this rejects, and why that matters
 //!
@@ -31,6 +30,14 @@
 //! hostile `[[[[[…` would otherwise be a stack overflow — an abort, not an
 //! error. [`ParseLimits::max_depth`] bounds it; `tests/depth.rs` drives a
 //! generated 10,000-deep document at it.
+//!
+//! The bound is on the depth of the TREE, and every construct that deepens it
+//! spends from the one budget: header segments, dotted-key segments, arrays
+//! and inline tables alike. `Drop`, the encoder and the deserializer all walk
+//! that tree recursively, whichever construct built it. Budgeting the
+//! constructs separately let a 17 KB document of dotted keys inside nested
+//! inline tables — each within the limit on its own — build a tree 8,256
+//! tables deep, and `from_str` overflowed the stack on it.
 
 use core::ops::Range;
 
@@ -43,9 +50,11 @@ use crate::{Error, Result};
 /// Bounds applied to untrusted input.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParseLimits {
-    /// Maximum nesting of arrays and inline tables. 128 matches the limit the
-    /// crates this replaces enforce, so the differential corpus cannot disagree
-    /// with the oracle over a document one side accepts and the other refuses.
+    /// Maximum depth of the tree below the root: every table, array and
+    /// inline table between the document root and a value counts, however it
+    /// was spelled (a header segment, a dotted-key segment, a `[` or a `{`).
+    /// 128 is aterm's own bound, the same as aterm-json's `RECURSION_LIMIT`
+    /// and `serde_json`'s; the retired `toml_edit` refused at 80.
     pub(crate) max_depth: usize,
 }
 
@@ -90,7 +99,7 @@ pub(crate) fn parse_document(src: &str, limits: ParseLimits) -> Result<DocumentM
 
 /// Parse a STANDALONE value (`Value::from_str`).
 ///
-/// Strict, and deliberately so. MEASURED against the oracle: `toml_edit`
+/// Strict, and deliberately so. MEASURED against `toml_edit`
 /// 0.22.27 refuses ` 1 `, `1\n`, `# c\n1` and `1 # c` — a value is the WHOLE
 /// input or the input is not a value. Trivia around a value belongs to the line
 /// that carries it, and a parser that accepted `1 ` but not ` 1` would be a
@@ -284,19 +293,25 @@ impl<'a> Parser<'a> {
 
     fn document(&mut self) -> Result<DocumentMut> {
         let mut doc = DocumentMut::new();
-        let mut path: Vec<String> = Vec::new();
+        // The open table, as the POSITION of each header segment in its
+        // parent — see `current_table` for why not the names.
+        let mut path: Vec<usize> = Vec::new();
         // A leading UTF-8 BOM is not a key. `toml_edit` strips it outright
         // (`src/parser/document.rs`, `opt(b"\xEF\xBB\xBF")`), and PowerShell 5's
         // `Out-File`/`Set-Content` write one by default — a user who saves
         // `aterm.toml` from a Windows editor must not get a config that fails
         // to load, with a diagnostic pointing at an invisible byte. We step OVER
-        // it but leave `trivia_start` at 0, so the bytes ride along in the first
-        // entry's prefix decor and the document still round-trips byte for byte,
-        // which is strictly better than the oracle: it drops them.
-        let mut trivia_start = self.pos;
+        // it and the DOCUMENT keeps it (`DocumentMut::bom`), printed first, so
+        // the file still round-trips byte for byte, which is strictly better
+        // than the oracle, which drops the mark. Filed in the first entry's
+        // prefix, it moved with that text: removing the entry handed it to
+        // whatever printed next, and a key added in front of that left it
+        // mid-file, unparseable.
         if self.src.starts_with('\u{feff}') {
             self.pos = 3;
+            doc.bom = true;
         }
+        let mut trivia_start = self.pos;
         loop {
             self.eat_trivia()?;
             if self.eof() {
@@ -312,7 +327,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn table_header(&mut self, doc: &mut DocumentMut, trivia_start: usize) -> Result<Vec<String>> {
+    fn table_header(&mut self, doc: &mut DocumentMut, trivia_start: usize) -> Result<Vec<usize>> {
         let header_start = self.pos;
         let array = self.at(1) == Some(b'[');
         self.pos += if array { 2 } else { 1 };
@@ -357,14 +372,14 @@ impl<'a> Parser<'a> {
         decor: Decor,
         header_repr: RawString,
         span: Range<usize>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<usize>> {
         // Consumed by whichever branch reaches the LAST segment; the walk over
         // the earlier segments must not move them out of scope.
         let mut decor = Some(decor);
         let mut header_repr = Some(header_repr);
         let mut span = Some(span);
         let last = segs.len() - 1;
-        let mut names: Vec<String> = Vec::with_capacity(segs.len());
+        let mut positions: Vec<usize> = Vec::with_capacity(segs.len());
         let mut node: &mut Table = doc.as_table_mut();
 
         for (i, seg) in segs.into_iter().enumerate() {
@@ -375,7 +390,12 @@ impl<'a> Parser<'a> {
                     fresh.implicit = true;
                     node.insert_formatted(seg.key, Item::Table(fresh));
                 }
-                let existing = node.get_mut(&name).expect("just ensured present");
+                let position = node.items.position(&name).expect("just ensured present");
+                positions.push(position);
+                let existing = node
+                    .items
+                    .get_at_mut(position)
+                    .expect("a position the map just returned");
                 node = match existing {
                     // `closed` is NOT consulted here, on purpose. The spec
                     // closes a dotted-created table to REDEFINITION, not to
@@ -401,7 +421,6 @@ impl<'a> Parser<'a> {
                         );
                     }
                 };
-                names.push(name);
                 continue;
             }
 
@@ -459,19 +478,18 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            names.push(name);
+            positions.push(
+                node.items
+                    .position(&name)
+                    .expect("the header's table was just placed"),
+            );
         }
-        Ok(names)
+        Ok(positions)
     }
 
     // ---- key/value --------------------------------------------------------
 
-    fn keyval(
-        &mut self,
-        doc: &mut DocumentMut,
-        path: &[String],
-        trivia_start: usize,
-    ) -> Result<()> {
+    fn keyval(&mut self, doc: &mut DocumentMut, path: &[usize], trivia_start: usize) -> Result<()> {
         let key_start = self.pos;
         let segs = self.key_path()?;
         // The tree the header path and this dotted key build together is as
@@ -489,7 +507,9 @@ impl<'a> Parser<'a> {
         let value_prefix_start = self.pos;
         self.eat_ws();
         let value_prefix = self.src[value_prefix_start..self.pos].to_owned();
-        let mut value = self.value(0)?;
+        // The value sits as deep as the header path and the dotted key put it,
+        // so its own nesting spends from what they left.
+        let mut value = self.value(path.len() + segs.len())?;
         let value_suffix_start = self.pos;
         self.eat_line_end()?;
         let decor = value.decor_mut();
@@ -568,6 +588,8 @@ impl<'a> Parser<'a> {
 
     // ---- values -----------------------------------------------------------
 
+    /// Parse the value that fills a slot `depth` levels below the document
+    /// root (see [`ParseLimits::max_depth`]).
     fn value(&mut self, depth: usize) -> Result<Value> {
         if depth > self.limits.max_depth {
             return self.here(format!(
@@ -738,7 +760,9 @@ impl<'a> Parser<'a> {
             let value_prefix_start = self.pos;
             self.eat_ws();
             let value_prefix = self.src[value_prefix_start..self.pos].to_owned();
-            let mut value = self.value(depth + 1)?;
+            // Each segment of the dotted key is a table level, not just the
+            // brace: `{ a.b.c = … }` puts the value three levels down.
+            let mut value = self.value(depth + segs.len())?;
             let value_suffix_start = self.pos;
             self.eat_ws();
             let decor = value.decor_mut();
@@ -976,18 +1000,13 @@ impl<'a> Parser<'a> {
         if self.pos + digits > self.b.len() {
             return self.err(start..self.b.len(), "truncated unicode escape");
         }
-        // Validate the digit window as BYTES. Slicing `self.src` here was a
-        // PANIC: the window is a fixed width, so `self.pos + digits` lands
-        // inside a multi-byte character whenever one follows a short escape
-        // (`x = "\uab€"` aborted with "not a char boundary"), and that
-        // abort was reachable from every public entry point on untrusted file
-        // content. Once all `digits` bytes are proved ASCII the offset is a
-        // boundary by construction, which is also what makes the two spans
-        // below safe.
+        // Validate the digit window as BYTES: `self.pos + digits` can land
+        // inside a multi-byte character (`x = "\uab€"`), so slicing `self.src`
+        // first would panic. Once all `digits` bytes are ASCII the offset is a
+        // char boundary, which also makes the two spans below safe.
         //
-        // Checking `is_ascii_hexdigit` ourselves is the second half of the fix:
-        // `u32::from_str_radix` accepts a leading `+`, so `"\u+041"` decoded to
-        // `A` while both oracles — and TOML 1.0's `4HEXDIG` — reject it.
+        // `is_ascii_hexdigit`, not `from_str_radix` alone: that accepts a
+        // leading `+`, and TOML 1.0's `4HEXDIG` rejects `"\u+041"`.
         let window = &self.b[self.pos..self.pos + digits];
         if !window.iter().all(u8::is_ascii_hexdigit) {
             return self.err(
@@ -1171,13 +1190,21 @@ fn validate_float(text: &str) -> Option<String> {
 
 /// Resolve the table a key-value line belongs to, following the header path
 /// built by [`Parser::open_table`].
-fn current_table<'t>(root: &'t mut Item, path: &[String]) -> &'t mut Table {
+///
+/// The path is POSITIONS, not names, and that is a complexity bound, not a
+/// micro-optimisation: this runs once per key-value line, and looking each
+/// segment up by name hashes the header's whole text every time (10^11
+/// byte-steps for a 1 MB `[header]` over 100,000 lines). By position it is one
+/// step per segment, and the parse stays linear in its input. Positions are stable here
+/// because the parser only ever appends.
+fn current_table<'t>(root: &'t mut Item, path: &[usize]) -> &'t mut Table {
     let mut node = root
         .as_table_mut()
         .expect("document root is always a table");
-    for segment in path {
+    for &position in path {
         node = match node
-            .get_mut(segment)
+            .items
+            .get_at_mut(position)
             .expect("header path was created when the header parsed")
         {
             Item::Table(t) => t,

@@ -6,12 +6,7 @@
 //!
 //! ## Design
 //!
-//! Extreme compression cell - 8 bytes total (vs previous 12 bytes).
-//!
-//! Memory savings: 33% reduction
-//! For 10,000 lines x 200 cols = 2M cells:
-//!   Before: 24 MB
-//!   After:  16 MB
+//! Every cell is 8 bytes (16 MB for 10,000 lines x 200 cols).
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────┐
@@ -39,11 +34,12 @@
 //! - Hyperlinks: URL storage
 //! - Underline color: separate color storage
 //!
-//! Expected: <1% of cells need overflow.
+//! Few cells need overflow.
 //!
 //! ## Verification
 //!
-//! - Kani proof: `cell_pack_unpack_roundtrip`
+//! - Kani proofs: `cell_kani_proofs.rs` (`cell_bmp_codepoint_roundtrip`,
+//!   `cell_flags_roundtrip`, `packed_colors_indexed_roundtrip`, ...)
 //! - Compile-time assert: `size_of::<Cell>() == 8`
 
 pub use super::cell_colors::{PackedColor, PackedColors};
@@ -285,29 +281,17 @@ impl Cell {
     /// triggers a debug assertion. Callers handling non-BMP characters
     /// should use `set_overflow_index` with the CellExtras overflow table.
     ///
-    /// # Verification (Trust L0)
+    /// # Verification
     ///
-    /// The non-BMP `debug_assert!` below is an **intentional, documented
-    /// caller-misuse contract**: `set_char` only accepts BMP scalar values,
-    /// and passing a non-BMP `char` is a bug the caller is expected to avoid
-    /// (route it through `set_overflow_index`). Under Trust's strict L0 gate
-    /// this surfaces as an accepted refutation — the solver's counterexample
-    /// is exactly `cp = 0x10000` (the first non-BMP codepoint), i.e. the
-    /// contract boundary itself. It is *not* dischargeable in a
-    /// behavior-preserving way: proving it away would require either a
-    /// `#[requires(c as u32 <= 0xFFFF)]` precondition (a contract) or deleting
-    /// the assert (which changes debug-build behavior — the misuse would no
-    /// longer be caught). Both are out of scope for the verify campaign, so
-    /// this obligation is documented rather than discharged. The kani proofs
-    /// (`cell_kani_proofs.rs`) cover the BMP contract only, mirroring this.
+    /// The non-BMP `debug_assert!` is a deliberate caller-misuse check, so
+    /// Trust's L0 gate reports it as an accepted refutation at `cp = 0x10000`.
+    /// Discharging it would need a `requires` precondition or removing the
+    /// assert, so it stays documented. The Kani proofs (`cell_kani_proofs.rs`)
+    /// cover the BMP contract only.
     ///
-    /// The masked cast `(cp & 0xFFFF) as u16` is provably lossless
-    /// (`x & 0xFFFF <= u16::MAX`) — the full verifier proves the identical
-    /// `u32 -> u16` cast pattern at other sites — but on this obligation the
-    /// interval engine returns UNKNOWN with "canonical Trust JSON transport
-    /// parse failed", a transport-layer gap in the toolchain (not a logic
-    /// gap), plausibly downstream of the accepted debug_assert refutation
-    /// polluting this proof unit.
+    /// The masked cast `(cp & 0xFFFF) as u16` is lossless; the interval engine
+    /// reports UNKNOWN here because of a toolchain transport gap, not a logic
+    /// gap.
     #[inline]
     #[allow(
         clippy::cast_possible_truncation,
@@ -329,12 +313,10 @@ impl Cell {
         self.char_data = char_data;
         // Clear structural flags: COMPLEX (not a multi-codepoint character),
         // WIDE (set_char always writes a single-width BMP character), and
-        // WIDE_CONTINUATION (the cell is no longer a continuation spacer).
-        // Without this, DECFRA fill_rect over wide characters leaves stale
-        // WIDE flags (#7478), and fill_rect over wide continuation cells
-        // leaves stale bit 10 — misread as PROTECTED since
-        // WIDE_CONTINUATION and PROTECTED share the same bit (#7641).
-        // Copy-modify-write for packed struct.
+        // WIDE_CONTINUATION (no longer a spacer). Otherwise DECFRA over wide
+        // characters would leave stale WIDE flags, and over continuations a
+        // stale bit 10 misread as PROTECTED. Copy-modify-write for the packed
+        // struct.
         let mut flags = self.flags;
         flags.remove(CellFlags::COMPLEX);
         flags.remove(CellFlags::WIDE);

@@ -221,6 +221,72 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
         );
     }
 
+    // A read that could not PROVE the installed bundle (round eight, #80, and its
+    // review): it spends none of the unreadable count, and has a bound of its
+    // own — the day's due looks over unproven reads each ask for an observation
+    // and count, and at the bound the re-sample moves to the next day, still
+    // owed and asking nothing. The next day counts afresh; a proven read with
+    // room then releases it, and a proven absence counts to the unread bound
+    // from where it was.
+    let mut doubt = model.init_state();
+    assert!(model.fire("TrialHasRoom", &mut doubt));
+    assert!(model.fire("Decide", &mut doubt));
+    assert!(model.fire("TrialUnproven", &mut doubt));
+    assert!(model.fire("Decide", &mut doubt));
+    assert_eq!(
+        (doubt["doubts"], doubt["owed"], doubt["pending"]),
+        (0, 1, 0),
+        "a look before the day counts nothing"
+    );
+    let bound = unproven_looks(&model);
+    for _day in 0..2 {
+        assert!(model.fire("DayPasses", &mut doubt));
+        for look in 1..=bound {
+            assert!(model.fire("Decide", &mut doubt));
+            assert_eq!(
+                (
+                    doubt["doubts"],
+                    doubt["pending"],
+                    doubt["owed"],
+                    doubt["looks"]
+                ),
+                (look, 1, 1, 0),
+                "look {look}: counted on its own count, and another observation asked for"
+            );
+        }
+        assert!(model.fire("Decide", &mut doubt));
+        assert_eq!(
+            (
+                doubt["latched"],
+                doubt["owed"],
+                doubt["day"],
+                doubt["doubts"],
+                doubt["pending"]
+            ),
+            (1, 1, 0, 0, 0),
+            "at the bound: the re-sample moves to the next day, still owed"
+        );
+    }
+    let mut proven = doubt.clone();
+    assert!(model.fire("DayPasses", &mut proven));
+    assert!(model.fire("Decide", &mut proven));
+    assert!(model.fire("TrialReadAgain", &mut proven));
+    assert!(model.fire("Decide", &mut proven));
+    assert_eq!(
+        (proven["latched"], proven["owed"], proven["doubts"]),
+        (0, 0, 0),
+        "a proven read with room releases the re-sample and clears the count"
+    );
+    let mut gone = doubt.clone();
+    assert!(model.fire("DayPasses", &mut gone));
+    assert!(model.fire("TrialUnreadable", &mut gone));
+    assert!(model.fire("Decide", &mut gone));
+    assert_eq!(
+        (gone["looks"], gone["doubts"], gone["pending"]),
+        (1, 0, 1),
+        "a proven absence counts to the unread bound"
+    );
+
     // NEGATIVE CONTROL, one arc per mutant.
     let buggy = interp::with_buggy(&model, 1);
     // GAP 14'S OWN `Decide` (0.94.0), looking at the newer release before the
@@ -331,6 +397,32 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
         "the promise stands and nothing asks"
     );
     assert!(!buggy.check_invariant("NoRetryPromisedPastTheBound", &forever));
+    // THE RE-PROMISE WITH NO BOUND (round eight #80 as first landed): over reads
+    // that prove nothing, the look at the bound keeps the day due and asks again.
+    let mut again = buggy.init_state();
+    assert!(buggy.fire("TrialHasRoom", &mut again));
+    assert!(buggy.fire("Decide", &mut again));
+    assert!(buggy.fire("TrialUnproven", &mut again));
+    assert!(buggy.fire("DayPasses", &mut again));
+    for _ in 0..=unproven_looks(&buggy) {
+        assert!(buggy.fire("Decide", &mut again));
+    }
+    assert_eq!(
+        (again["day"], again["owed"], again["pending"]),
+        (1, 1, 1),
+        "still due, still asking, past the bound"
+    );
+    assert!(!buggy.check_invariant("UnprovenLooksAreBounded", &again));
+}
+
+/// The model's `UnprovenLooks` bound.
+fn unproven_looks(model: &aterm_spec::derive::Model) -> i64 {
+    model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "UnprovenLooks")
+        .map(|(_, value)| *value)
+        .expect("the model names its bound")
 }
 
 /// The model's `UnreadLooks` bound.

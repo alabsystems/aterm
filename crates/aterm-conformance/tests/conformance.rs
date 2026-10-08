@@ -126,7 +126,7 @@ fn cursor_up_down_forward_back() {
 
 #[test]
 fn newline_at_bottom_scrolls() {
-    // fill 24 rows, then one more newline scrolls "row0" off the top
+    // fill all 3 rows, then one more newline scrolls row 0 off the top
     let mut s = aterm_conformance::Screen::new(3, 80);
     s.feed(b"A\r\nB\r\nC"); // rows: A / B / C, cursor on last row
     s.feed(b"\r\nD"); // scroll: A off, now B / C / D

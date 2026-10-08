@@ -31,6 +31,14 @@
 //! searchable suffix up front. Pinned by the slicing-oracle tests below,
 //! including the combined cap-plus-eviction regime.
 //!
+//! The equality covers refusals too. A regex that exhausts its per-line scan
+//! budget on any verified row makes the one-shot search return
+//! [`SearchOptionsError::InvalidRegex`], never `Ok` with the matches found
+//! before the scan gave up; so [`results`](BudgetedSearch::results) and
+//! [`results_range`](BudgetedSearch::results_range) return the same error from
+//! then on. They are the only way to read this engine's matches, so no reader
+//! can be handed a truncated list as if it were the whole.
+//!
 //! ## Staleness
 //!
 //! `BudgetedSearch` knows nothing about content generations — it searches the
@@ -189,8 +197,7 @@ impl BudgetedSearch {
                 .base_row
                 .saturating_add(final_evicted_prefix(self.rows_fed, self.max_cached_lines));
             aterm_log::warn!(
-                "budgeted search exceeded {} cached-line comparison limit; \
-                 search results may be incomplete below line {}",
+                "search past the {}-line cache; results incomplete below line {}",
                 self.max_cached_lines,
                 lowest,
             );
@@ -201,9 +208,27 @@ impl BudgetedSearch {
         // Once capped, further verification cannot change the result set (the
         // batch path stops scanning at the cap too). Because verification only
         // begins at the final retained suffix, later eviction can never remove
-        // capped matches and expose an unverified hole.
-        if self.matches.len() < MAX_SEARCH_MATCHES {
+        // capped matches and expose an unverified hole. Once the scan budget
+        // is exhausted the answer is the refusal whatever later rows hold, so
+        // they are not scanned either.
+        if self.matches.len() < MAX_SEARCH_MATCHES && !self.scan_exhausted() {
             self.verify_row(abs_row, &text);
+        }
+    }
+
+    /// Has the regex verifier given up on a row because the row cost more
+    /// than its step budget? Sticky (the compiled pattern records it, and that
+    /// pattern is private to this search), so it covers every row fed so far.
+    fn scan_exhausted(&self) -> bool {
+        matches!(&self.matcher, RowMatcher::Regex(re) if re.step_limit_exceeded())
+    }
+
+    /// The refusal a one-shot search over the same rows returns, if any.
+    fn refusal(&self) -> Result<(), SearchOptionsError> {
+        if self.scan_exhausted() {
+            Err(SearchIndex::regex_scan_budget_exhausted())
+        } else {
+            Ok(())
         }
     }
 
@@ -234,8 +259,14 @@ impl BudgetedSearch {
     /// completed budgeted search equals a one-shot search over the same rows.
     /// This is a full snapshot; resumable frontends should use
     /// [`results_range`](Self::results_range) to bound per-turn copying.
-    #[must_use]
-    pub fn results(&self) -> SearchResults {
+    ///
+    /// # Errors
+    /// [`SearchOptionsError::InvalidRegex`] once a regex scan has exhausted
+    /// its per-line step budget on any row fed so far, exactly as the one-shot
+    /// search refuses it: the matches found up to there are a prefix of the
+    /// truth, not the result (module docs).
+    pub fn results(&self) -> Result<SearchResults, SearchOptionsError> {
+        self.refusal()?;
         let capped = self.matches.len() >= MAX_SEARCH_MATCHES;
         let evicted = self.verify_from > 0;
         let lowest = self.final_lowest_retained_line;
@@ -250,7 +281,7 @@ impl BudgetedSearch {
         } else {
             self.matches.clone()
         };
-        SearchResults::new(matches, evicted || capped, lowest)
+        Ok(SearchResults::new(matches, evicted || capped, lowest))
     }
 
     /// Number of matches accumulated so far.
@@ -268,8 +299,16 @@ impl BudgetedSearch {
     /// `matches` is only the requested stable slice. Verification starts at
     /// the completed index's final retained suffix, so a slice already handed
     /// to a caller can never be invalidated by a later eviction pass.
-    #[must_use]
-    pub fn results_range(&self, start: usize, limit: usize) -> SearchResults {
+    ///
+    /// # Errors
+    /// The refusal [`results`](Self::results) returns, for the same reason:
+    /// a slice of an exhausted scan's matches is not a slice of the result.
+    pub fn results_range(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> Result<SearchResults, SearchOptionsError> {
+        self.refusal()?;
         let start = start.min(self.matches.len());
         let end = start.saturating_add(limit).min(self.matches.len());
         let capped = self.matches.len() >= MAX_SEARCH_MATCHES;
@@ -280,7 +319,11 @@ impl BudgetedSearch {
                 .first()
                 .is_none_or(|first| first.line >= lowest)
         );
-        SearchResults::new(self.matches[start..end].to_vec(), evicted || capped, lowest)
+        Ok(SearchResults::new(
+            self.matches[start..end].to_vec(),
+            evicted || capped,
+            lowest,
+        ))
     }
 
     /// Verify matches on the supplied row `abs_row`, appending to
@@ -322,8 +365,7 @@ impl BudgetedSearch {
                     if cap.start() == cap.end() {
                         continue;
                     }
-                    let start_col = col_map.byte_to_column(cap.start());
-                    let end_col = col_map.byte_to_column(cap.end());
+                    let (start_col, end_col) = col_map.span(cap.start(), cap.end());
                     if start_col == end_col {
                         continue;
                     }
@@ -378,7 +420,7 @@ mod tests {
                 search.feed_row(rows[search.rows_fed()]);
             }
         }
-        search.results()
+        search.results().expect("budgeted search must succeed")
     }
 
     fn sample_rows() -> Vec<&'static str> {
@@ -428,7 +470,7 @@ mod tests {
             assert!(owned.is_complete());
             assert_eq!(
                 owned.results(),
-                one_shot(&rows, 7, query, case_sensitive, is_regex),
+                Ok(one_shot(&rows, 7, query, case_sensitive, is_regex)),
                 "query={query:?} cs={case_sensitive} rx={is_regex}"
             );
         }
@@ -527,7 +569,7 @@ mod tests {
                     search.feed_row(row_refs[search.rows_fed()]);
                 }
             }
-            assert_eq!(search.results(), oracle, "slice={slice}");
+            assert_eq!(search.results().as_ref(), Ok(&oracle), "slice={slice}");
         }
     }
 
@@ -572,7 +614,7 @@ mod tests {
                     search.feed_row(rows[search.rows_fed()]);
                 }
             }
-            assert_eq!(search.results(), oracle, "slice={slice}");
+            assert_eq!(search.results().as_ref(), Ok(&oracle), "slice={slice}");
         }
     }
 
@@ -581,6 +623,43 @@ mod tests {
     fn invalid_regex_fails_at_construction() {
         let err = BudgetedSearch::new("f(oo", false, true, 0, 10);
         assert!(matches!(err, Err(SearchOptionsError::InvalidRegex(_))));
+    }
+
+    /// A regex scan that exhausts its per-line step budget is refused, exactly
+    /// as the one-shot search over the same rows refuses it — never `Ok` with
+    /// the matches found before it gave up and `incomplete == false`. Rows
+    /// before the exhausted one still read as a partial result; from that row
+    /// on, every reader refuses. One search over budget, and a `find_iter`
+    /// whose per-match searches each fit but together re-walk the row
+    /// quadratically.
+    #[test]
+    fn an_exhausted_regex_scan_is_refused_like_the_one_shot() {
+        let wide = format!("{}z", "x".repeat(4095));
+        let run = "a".repeat(4096);
+        for (pattern, row) in [("(?:x?){1020}z", wide.as_str()), (r"\w+=|\w", run.as_str())] {
+            let rows = ["x z aa", row, "after"];
+            let mut index = SearchIndex::new();
+            for (i, text) in rows.iter().enumerate() {
+                index.index_line(i, text);
+            }
+            let oracle = index.search_results_opts(pattern, true, true);
+            assert!(
+                matches!(&oracle, Err(SearchOptionsError::InvalidRegex(m)) if m.contains("too expensive")),
+                "{pattern:?} must exhaust the one-shot scan: {oracle:?}"
+            );
+            let mut search =
+                BudgetedSearch::new(pattern, true, true, 0, rows.len()).expect("compiles");
+            search.feed_row(rows[0]);
+            assert!(
+                search.results().is_ok(),
+                "{pattern:?}: no row has exhausted yet"
+            );
+            for text in &rows[1..] {
+                search.feed_row(text);
+            }
+            assert_eq!(search.results(), oracle, "{pattern:?}");
+            assert_eq!(search.results_range(0, usize::MAX), oracle, "{pattern:?}");
+        }
     }
 
     /// Partial results are a prefix of the final results (progressive display
@@ -595,7 +674,7 @@ mod tests {
         let mut seen: Vec<SearchMatch> = Vec::new();
         for row in &rows {
             search.feed_row(row);
-            let partial = search.results();
+            let partial = search.results().expect("a literal search is never refused");
             assert!(partial.matches.len() >= previous, "match count is monotone");
             assert_eq!(
                 &partial.matches[..seen.len()],
@@ -606,9 +685,13 @@ mod tests {
             seen = partial.matches;
         }
         assert!(search.is_complete());
-        let done = search.results();
+        let done = search.results().expect("a literal search is never refused");
         search.feed_row("needle beyond the window");
-        assert_eq!(search.results(), done, "overfeed must not change results");
+        assert_eq!(
+            search.results().as_ref(),
+            Ok(&done),
+            "overfeed must not change results"
+        );
         assert_eq!(done, one_shot(&rows, 0, "needle", false, false));
     }
 
@@ -625,7 +708,7 @@ mod tests {
         for row in rows.iter().take(14) {
             search.feed_row(row);
         }
-        let first = search.results_range(0, 2);
+        let first = search.results_range(0, 2).expect("literal");
         assert!(first.matches.len() <= 2);
         assert!(first.matches.iter().all(|m| m.line >= 12));
         assert!(first.incomplete);
@@ -634,13 +717,15 @@ mod tests {
         for row in rows.iter().skip(14) {
             search.feed_row(row);
         }
-        let final_results = search.results();
+        let final_results = search.results().expect("literal");
         assert_eq!(
             &final_results.matches[..first.matches.len()],
             first.matches.as_slice(),
             "an emitted delta must remain a prefix after later eviction"
         );
-        let second = search.results_range(first.matches.len(), 2);
+        let second = search
+            .results_range(first.matches.len(), 2)
+            .expect("literal");
         assert!(second.matches.len() <= 2);
         assert_eq!(second.lowest_retained_line, first.lowest_retained_line);
         assert_eq!(

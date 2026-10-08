@@ -29,7 +29,7 @@
 \* scribble mutates the main buffer) and 1049l forget to restore the cursor;
 \* Buggy=FALSE is the correct, isolated, cursor-restoring implementation.
 \*
-\* SHAPE MATTERS (ty constraints, per Snapshot.tla): invariants use bounded
+\* SHAPE MATTERS (ty constraints, as the retired Snapshot.tla learned): invariants use bounded
 \* integer quantifiers only, and no action assigns a scalar via
 \* `x' = IF..THEN..ELSE`; we branch the whole action with formula-level IF.
 

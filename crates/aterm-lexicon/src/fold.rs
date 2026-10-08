@@ -40,12 +40,10 @@ pub fn fold(s: &str) -> String {
 /// re-implemented look-alike fold would drift.
 pub fn fold_into(s: &str, out: &mut String) {
     out.clear();
-    // `clear()` left `out.len() == 0`, so this reserves exactly `s.len()` —
-    // identical behavior; the saturating form keeps `len + additional` provably
-    // in range for the verifier, which cannot see `clear`'s effect on `len`.
-    // The reserve is only a pre-allocation hint (push grows amortized), so the
-    // clamp bounds the up-front allocation the verifier must budget for; probed
-    // tokens are far shorter than the clamp, making this a no-op in practice.
+    // After `clear()` this reserves `s.len()`; the saturating form keeps
+    // `len + additional` provably in range for the verifier, which cannot see
+    // `clear`'s effect on `len`. The reserve is only a hint, and the clamp
+    // bounds the up-front allocation the verifier must budget for.
     out.reserve(s.len().saturating_sub(out.len()).min(4096));
     for c in s.chars() {
         if is_strippable_mark(c) {
@@ -126,10 +124,9 @@ fn base_letter(c: char) -> Option<char> {
 /// This is the witness the scanner's marks-required gate keys on: a lexicon
 /// surface that loses marks in folding (Vietnamese `đm` → `dm`, whose entry
 /// says the tone marks are essential) compiles to a bare-ASCII key that plain
-/// ASCII typing would otherwise complete (`dm` mid-`dmg` fired the curse
-/// bonk, 2026-08-29). Such a surface only matches a token that itself folds
-/// marks away — `đm`, `ĐM`, or a decomposed `d` + combining stroke — never
-/// the bare skeleton.
+/// ASCII typing would otherwise complete (`dm` mid-`dmg`). Such a surface
+/// only matches a token that itself folds marks away — `đm`, `ĐM`, or a
+/// decomposed `d` + combining stroke — never the bare skeleton.
 #[must_use]
 pub fn has_foldable_marks(s: &str) -> bool {
     s.chars().any(|c| {
@@ -151,8 +148,7 @@ pub fn has_foldable_marks(s: &str) -> bool {
 fn is_strippable_mark(c: char) -> bool {
     // ASCII cannot be a combining mark, and the ranges below say so: the lowest
     // starts at U+0300. Terminal text is overwhelmingly ASCII and this runs per
-    // character of every folded token, so the whole list was being walked to
-    // return `false`.
+    // character of every folded token.
     if c.is_ascii() {
         return false;
     }

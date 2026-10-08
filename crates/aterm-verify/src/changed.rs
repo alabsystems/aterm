@@ -316,6 +316,173 @@ pub struct Touched {
     pub libraries: Vec<String>,
     /// The first changed path that re-plans every unit, if any.
     pub replanned: Option<String>,
+    /// Members with a library whose changed files are all outside what its
+    /// library's verification compiles ([`lib_inputs`]: its own `tests/`,
+    /// `benches/`, `examples/`, or a `src/**/<x>_tests.rs` declared only under
+    /// `cfg(test)`), sorted: the lane leaves them out and says so.
+    pub tests_only: Vec<String>,
+}
+
+/// A member's directories that hold other targets, never its library: its
+/// integration tests, benches and examples are crates of their own, so a change
+/// confined to them cannot move what `targo trust check --lib` verifies.
+pub const NON_LIB_DIRS: [&str; 3] = ["tests", "benches", "examples"];
+
+/// The changed paths a library's verification can read ([`touched_since`]):
+/// every path but one under its owning manifest's [`NON_LIB_DIRS`] entry that
+/// `names(manifest dir, entry)` says the member's own `src/` or `build.rs`
+/// never names in an `include*!` or a `#[path]` (aterm-render includes its
+/// font fixture from `tests/`, aterm-grapheme its Unicode tables).
+///
+/// WHY (measured 2026-10-05): a commit that changed only `aterm-verify`'s
+/// `tests/` re-verified its library for 1,140 s, the longest row of that gate,
+/// to prove the same MIR again. A path no manifest owns is kept as it is.
+///
+/// A UNIT-TEST MODULE FILE TOO (2026-10-06): a `src/**/<x>_tests.rs` that
+/// `test_module(manifest dir, path in it)` finds declared only under a
+/// `cfg(test)` ([`src_declares_only_for_tests`]) — the shape the inline test
+/// modules moved to that day, which rustc leaves out of the non-test lib's
+/// dep-info.
+#[must_use]
+pub fn lib_inputs(
+    paths: &[String],
+    manifests: &Manifests,
+    names: &dyn Fn(&str, &str) -> bool,
+    test_module: &dyn Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    let mut named: BTreeMap<(String, &str), bool> = BTreeMap::new();
+    paths
+        .iter()
+        .filter(|p| {
+            let Some(dir) = owning_dir(p, manifests) else {
+                return true;
+            };
+            let rel = p.strip_prefix(dir).and_then(|r| r.strip_prefix('/'));
+            if let Some(rel) = rel
+                && rel.starts_with("src/")
+                && rel.ends_with("_tests.rs")
+                && test_module(dir, rel)
+            {
+                return false;
+            }
+            let Some(entry) = rel.and_then(|r| {
+                NON_LIB_DIRS
+                    .into_iter()
+                    .find(|d| r.strip_prefix(d).is_some_and(|rest| rest.starts_with('/')))
+            }) else {
+                return true;
+            };
+            *named
+                .entry((dir.to_string(), entry))
+                .or_insert_with(|| names(dir, entry))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The directory of the nearest manifest above a repo-relative path, member or
+/// not ([`owning_member`]'s walk).
+fn owning_dir<'a>(path: &'a str, manifests: &Manifests) -> Option<&'a str> {
+    let mut dir = parent_dir(path);
+    while !dir.is_empty() {
+        if manifests.package_at(dir).is_some() {
+            return Some(dir);
+        }
+        dir = parent_dir(dir);
+    }
+    None
+}
+
+/// Does the member at `root/dir` name its `entry` directory where its library
+/// can read it: a line of `build.rs` or of a `.rs` under `src/` that holds
+/// `<entry>/` and an `include` macro or a `#[path`. Lexical and generous: a
+/// comment or a test-only include counts too, which only keeps a path in.
+#[must_use]
+pub fn src_names_dir(root: &Path, dir: &str, entry: &str) -> bool {
+    fn walk(p: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let member = root.join(dir);
+    let mut files = vec![member.join("build.rs")];
+    walk(&member.join("src"), &mut files);
+    let needle = format!("{entry}/");
+    files.iter().any(|f| {
+        std::fs::read_to_string(f).is_ok_and(|text| {
+            text.lines()
+                .any(|l| l.contains(&needle) && (l.contains("include") || l.contains("#[path")))
+        })
+    })
+}
+
+/// Is `rel` (a `src/**/<x>_tests.rs` of the member at `root/dir`) declared only
+/// as a unit-test module: every line of the member's `src/` and `build.rs` that
+/// names it — `"<file name>"` anywhere, or `mod <stem>;` — is a `#[path = …]`
+/// or a `mod` declaration with `#[cfg(test)]` or `#[cfg(all(test, …))]` on one
+/// of the two lines above it, and none is an include. Lexical and strict: a
+/// file named nowhere, an `any(…)` or a `not(…)` cfg, an include or anything
+/// else keeps the path a library input.
+#[must_use]
+pub fn src_declares_only_for_tests(root: &Path, dir: &str, rel: &str) -> bool {
+    fn walk(p: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let Some(name) = rel.rsplit('/').next() else {
+        return false;
+    };
+    let stem = name.trim_end_matches(".rs");
+    let quoted = format!("\"{name}\"");
+    let member = root.join(dir);
+    let mut files = vec![member.join("build.rs")];
+    walk(&member.join("src"), &mut files);
+    let test_cfg = |l: &str| {
+        let l = l.trim();
+        l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test,")
+    };
+    let mut declared = false;
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim();
+            let mod_line = t
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .strip_prefix("mod ")
+                .is_some_and(|m| m.trim_end_matches(';').trim() == stem);
+            if !l.contains(&quoted) && !mod_line {
+                continue;
+            }
+            let path_attr = t.starts_with("#[path") && !t.contains("include");
+            let guarded = lines[i.saturating_sub(2)..i].iter().any(|p| test_cfg(p));
+            if !(path_attr || mod_line) || !guarded {
+                return false;
+            }
+            declared = true;
+        }
+    }
+    declared
 }
 
 /// The members whose OWN files changed since the merge-base of HEAD and
@@ -342,10 +509,20 @@ pub fn touched_since(
         return Err("`targo tree` returned no workspace members".to_string());
     }
     let manifests = manifests_near(root, &paths);
-    let (seeds, replanned) = seeds(&paths, &manifests, &members.names());
-    let mut libraries: BTreeSet<String> = seeds
+    let names = members.names();
+    let has_lib = |name: &String| members.0.iter().any(|m| &m.name == name && m.has_lib);
+    let inputs = lib_inputs(
+        &paths,
+        &manifests,
+        &|dir, entry| src_names_dir(root, dir, entry),
+        &|dir, rel| src_declares_only_for_tests(root, dir, rel),
+    );
+    let (seeds, replanned) = seeds(&inputs, &manifests, &names);
+    let mut libraries: BTreeSet<String> = seeds.into_iter().filter(has_lib).collect();
+    let tests_only: Vec<String> = self::seeds(&paths, &manifests, &names)
+        .0
         .into_iter()
-        .filter(|name| members.0.iter().any(|m| &m.name == name && m.has_lib))
+        .filter(|name| has_lib(name) && !libraries.contains(name))
         .collect();
     libraries.extend(forks_touched(&paths, &admitted_forks(root)));
     Ok(Touched {
@@ -353,7 +530,25 @@ pub fn touched_since(
         merge_base,
         libraries: libraries.into_iter().collect(),
         replanned,
+        tests_only,
     })
+}
+
+/// The first path changed since the merge-base of HEAD and `base` (the paths
+/// [`touched_since`] reads) that begins with one of `prefixes`, if any.
+///
+/// # Errors
+/// Not a git checkout, no merge-base, or an unlistable diff.
+pub fn first_touched(
+    root: &Path,
+    path_env: &OsStr,
+    base: &str,
+    prefixes: &[&str],
+) -> Result<Option<String>, String> {
+    let (_, paths) = changed_paths(root, path_env, base)?;
+    Ok(paths
+        .into_iter()
+        .find(|p| prefixes.iter().any(|x| p.starts_with(x))))
 }
 
 /// The Trust lane's fork roster, relative to the repository root.
@@ -522,16 +717,25 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
     })
 }
 
-/// The merge-base of HEAD and `base`, and every path changed since it: tracked
-/// changes INCLUDING the working tree (the `--changed` tier exists to be run
-/// BEFORE the commit), untracked non-ignored files, and the edits an
-/// assume-unchanged or skip-worktree flag hides. `Err` says which read failed.
+/// The merge-base of HEAD and `base`, and every path changed since it
+/// ([`crate::identity::changes_since`], the listing the gate's identity reads):
+/// tracked changes INCLUDING the working tree (the `--changed` tier exists to
+/// be run BEFORE the commit), untracked non-ignored files, and the edits an
+/// assume-unchanged or skip-worktree flag hides (2026-09-13: without them a
+/// flagged crate's edit selected 0 crates and went VERIFY: PASS). `Err` says
+/// which read failed.
 fn changed_paths(
     root: &Path,
     path_env: &OsStr,
     base: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let git = |args: &[&str]| stdout_of(Command::new("git").args(args), root, path_env);
+    let git = |args: &[&str]| {
+        stdout_of(
+            crate::identity::git(root, path_env).args(args),
+            root,
+            path_env,
+        )
+    };
     if git(&["rev-parse", "--git-dir"]).is_none() {
         return Err("this is not a git checkout, so there is no diff to scope by".to_string());
     }
@@ -541,27 +745,9 @@ fn changed_paths(
     else {
         return Err(format!("no merge-base between HEAD and '{base}'"));
     };
-    let (Some(tracked), Some(untracked)) = (
-        git(&["diff", "--name-only", &mb]),
-        git(&["ls-files", "--others", "--exclude-standard"]),
-    ) else {
+    let Some(paths) = crate::identity::changes_since(root, path_env, &mb) else {
         return Err("git could not list the changed files".to_string());
     };
-    // Plus every edit an assume-unchanged or skip-worktree flag hides from `git
-    // diff` (2026-09-13, review of batch B, round 3): without them a flagged
-    // crate's edit selected 0 crates, built nothing, and went VERIFY: PASS.
-    let Some(hidden) = crate::identity::flag_hidden_edits(root, path_env) else {
-        return Err("git could not list the index-flagged edits".to_string());
-    };
-    let paths = tracked
-        .lines()
-        .chain(untracked.lines())
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .chain(hidden)
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect();
     Ok((mb, paths))
 }
 
@@ -776,6 +962,132 @@ mod tests {
         assert!(none.is_empty() && clean.is_none());
     }
 
+    /// A LIBRARY'S INPUTS (2026-10-05): a change under a member's own `tests/`,
+    /// `benches/` or `examples/` is no input of its library unless the member
+    /// names that directory in an include; `src/`, the manifest, a look-alike
+    /// directory (`tests_util/`, a nested `src/tests/`) and a path no manifest
+    /// owns always are. The answer is asked once per directory.
+    #[test]
+    fn a_change_under_tests_benches_or_examples_is_no_library_input_unless_included() {
+        let manifests: Manifests = [("crates/a", Some("a")), ("crates/b", Some("b"))]
+            .into_iter()
+            .collect();
+        let paths: Vec<String> = [
+            "crates/a/tests/it.rs",
+            "crates/a/tests/common/mod.rs",
+            "crates/a/benches/x.rs",
+            "crates/a/examples/e.rs",
+            "crates/a/src/lib.rs",
+            "crates/a/src/tests/mod.rs",
+            "crates/a/tests_util/x.rs",
+            "crates/a/Cargo.toml",
+            "crates/b/tests/fixtures/font.ttf",
+            "docs/x.md",
+            "crates/a/src/moved_tests.rs",
+            "crates/a/src/kept_tests.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let kept = lib_inputs(
+            &paths,
+            &manifests,
+            &|dir, entry| {
+                asked.borrow_mut().push(format!("{dir} {entry}"));
+                dir == "crates/b" && entry == "tests"
+            },
+            &|_, rel| rel == "src/moved_tests.rs",
+        );
+        assert_eq!(
+            kept,
+            [
+                "crates/a/src/lib.rs",
+                "crates/a/src/tests/mod.rs",
+                "crates/a/tests_util/x.rs",
+                "crates/a/Cargo.toml",
+                "crates/b/tests/fixtures/font.ttf",
+                "docs/x.md",
+                "crates/a/src/kept_tests.rs",
+            ]
+        );
+        let mut asked = asked.into_inner();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                "crates/a benches",
+                "crates/a examples",
+                "crates/a tests",
+                "crates/b tests"
+            ]
+        );
+    }
+
+    /// A UNIT-TEST MODULE FILE: left out only when every line naming it is a
+    /// `#[path]` or `mod` declaration under `cfg(test)` / `cfg(all(test, …))`;
+    /// a file named nowhere, an include, a `not(…)` or `any(…)` cfg, or an
+    /// unguarded `mod` keeps it in.
+    #[test]
+    fn a_tests_file_is_left_out_only_when_declared_for_tests_alone() {
+        let root = crate::mktemp_dir("atv-testmod").expect("mktemp");
+        let src = root.join("crates/m/src/sub");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let decl = |body: &str| {
+            std::fs::write(src.join("parent.rs"), body).expect("write");
+            src_declares_only_for_tests(&root, "crates/m", "src/sub/x_tests.rs")
+        };
+        assert!(!decl("pub fn f() {}\n"), "named nowhere");
+        assert!(decl("#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod tests;\n"));
+        assert!(decl(
+            "#[cfg(all(test, unix))]\n#[path = \"x_tests.rs\"]\nmod tests;\n"
+        ));
+        assert!(decl("#[cfg(test)]\nmod x_tests;\n"));
+        assert!(!decl(
+            "#[cfg(not(test))]\n#[path = \"x_tests.rs\"]\nmod tests;\n"
+        ));
+        assert!(!decl(
+            "#[cfg(any(test, feature = \"t\"))]\n#[path = \"x_tests.rs\"]\nmod tests;\n"
+        ));
+        assert!(!decl("#[path = \"x_tests.rs\"]\nmod tests;\n"), "unguarded");
+        assert!(!decl("mod x_tests;\n"), "an unguarded mod");
+        assert!(
+            !decl(
+                "#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod tests;\nconst T: &str = include_str!(\"x_tests.rs\");\n"
+            ),
+            "also included"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The include probe reads `build.rs` and every `.rs` under `src/`, and only
+    /// a line that names the directory beside an include or a `#[path` counts.
+    #[test]
+    fn the_include_probe_finds_a_named_directory_and_ignores_prose() {
+        let root = crate::mktemp_dir("atv-libinputs").expect("mktemp");
+        let src = root.join("crates/m/src/deep");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("x.rs"), "// see tests/ for more\n").expect("write");
+        assert!(
+            !src_names_dir(&root, "crates/m", "tests"),
+            "prose is no include"
+        );
+        std::fs::write(
+            src.join("y.rs"),
+            "const F: &[u8] = include_bytes!(\"../../tests/f.ttf\");\n",
+        )
+        .expect("write");
+        assert!(src_names_dir(&root, "crates/m", "tests"));
+        assert!(!src_names_dir(&root, "crates/m", "examples"));
+        std::fs::write(
+            root.join("crates/m/build.rs"),
+            "#[path = \"examples/support.rs\"] mod s;\n",
+        )
+        .expect("write");
+        assert!(src_names_dir(&root, "crates/m", "examples"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// AN ADMITTED FORK IS A LIBRARY THE LANE VERIFIES (2026-09-27, review):
     /// a change inside its directory touches it, and so does a submodule bump,
     /// which lists only the gitlink ABOVE the crates. Negative controls: a
@@ -803,6 +1115,61 @@ mod tests {
         );
         assert!(touched(&["vendor/smol_str_extra/src/lib.rs"]).is_empty());
         assert!(touched(&["vendor/astream-other", "crates/aterm-grid/src/lib.rs"]).is_empty());
+    }
+
+    /// WHAT A CHANGE TOUCHED, WHATEVER THE CALLER'S GIT CONFIG HIDES (2026-10-02):
+    /// a file moved out of crate `a` lists `a`'s side too (rename detection
+    /// printed only `b`'s, so `--changed` never built the `a` it broke), a gitlink
+    /// bump under `diff.ignoreSubmodules = all` is still listed (it listed
+    /// nothing, and the Trust lane selected no fork), and a non-ASCII path is
+    /// listed as itself (`core.quotePath` printed it quoted, owned by no crate).
+    #[test]
+    fn a_move_an_ignored_gitlink_and_a_quoted_path_are_each_listed() {
+        let repo = crate::mktemp_dir("atv-changed-listed").expect("mktemp");
+        let sub = repo.join("vendor/astream");
+        let path_env = std::env::var_os("PATH").unwrap_or_default();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::identity::git(dir, &path_env)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "advice.addEmbeddedRepo=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        for dir in ["crates/a/src", "crates/b/src", "vendor/astream"] {
+            std::fs::create_dir_all(repo.join(dir)).expect("dir");
+        }
+        std::fs::write(repo.join("crates/a/src/x.rs"), "pub fn x() {}\n").expect("write");
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&repo, &["init", "-q"]);
+        for (key, value) in [
+            ("diff.renames", "true"),
+            ("diff.ignoreSubmodules", "all"),
+            ("core.quotePath", "true"),
+        ] {
+            git(&repo, &["config", key, value]);
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["branch", "shared"]);
+        git(&repo, &["mv", "crates/a/src/x.rs", "crates/b/src/x.rs"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        git(&repo, &["add", "vendor/astream"]);
+        git(&repo, &["commit", "-qm", "move x out of a; bump astream"]);
+        std::fs::write(repo.join("crates/b/src/é.rs"), "\n").expect("write");
+        let listed = changed_paths(&repo, &path_env, "shared").map(|(_, paths)| paths);
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(
+            listed.expect("listed"),
+            [
+                "crates/a/src/x.rs",
+                "crates/b/src/x.rs",
+                "crates/b/src/é.rs",
+                "vendor/astream"
+            ]
+        );
     }
 
     /// The roster's `admitted` rows, each found by the manifest that declares

@@ -1,73 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TYPING-MOMENTUM GLOW — the cursor glows with how fast you are typing, and
-//! cools down when you stop. While it is warm it does not blink.
+//! Typing-momentum glow: the cursor glows with how fast you type and cools when
+//! you stop. While warm it does not blink (owner, 2026-09-08).
 //!
-//! Owner, 2026-09-08, verbatim: *"the blinking cursor is annoying, I want some
-//! momentum glow for typing faster that cools down."*
+//! # Not [`crate::typing_momentum::TypingMomentum`]
 //!
-//! # Why this is not [`crate::typing_momentum::TypingMomentum`]
-//!
-//! That metric is RATE-NORMALISED by law — a key-repeat flood and a 30 ms
-//! sprint build at the same 0.65/s (its module doc, and the pin
-//! `flood_and_sprint_build_at_the_same_pace`) — so 3 keys/s and 30 keys/s
-//! would glow identically, the opposite of "for typing faster". Its τ = 2 s
-//! and 2.9 s-to-full arc gate cat drama, not a light. And it advances only on
-//! echo-correlated spawns inside an enabled `CursorGlow`, so it is off when
-//! `cursor_trail` is off. This glow is a CURSOR feature: any style, any shape,
-//! trail on or off. What IS reused is the integrator pattern (a `Copy` state,
-//! an `Option<Instant>` stamp, lazy decay, snap-to-zero), because that pattern
-//! is what makes a metric pure in the injected `now` and free of the wall
-//! clock.
+//! That metric is rate-normalised (a key-repeat flood and a 30 ms sprint build
+//! at the same pace; `flood_and_sprint_build_at_the_same_pace`), so it cannot
+//! glow brighter for faster typing; its τ = 2 s arc gates cat drama; and it
+//! advances only on echo-correlated spawns inside an enabled `CursorGlow`. This
+//! glow is a cursor feature for any style or shape, trail on or off. It reuses
+//! the integrator pattern (a `Copy` state, an `Option<Instant>` stamp, lazy
+//! decay, snap-to-zero), which keeps it pure in the injected `now`.
 //!
 //! # The law
 //!
-//! * One key credits [`MOMENTUM_GLOW_KEY_CREDIT`] (0.10) from wherever the
-//!   decayed value is, clamped to 1. A steady rate `r` keys/s therefore
-//!   equilibrates at `K / (1 − exp(−1/(r·τ)))`: with τ = 1.2 s that is 0.18 at
-//!   1/s, 0.29 at 2/s, 0.53 at 4/s, and 1.0 (clamped) from ≈ 8/s — momentum IS
-//!   monotone in rate, which is the whole ask.
-//! * Between keys the value decays on [`MOMENTUM_GLOW_TAU_S`]: half in 0.83 s,
-//!   and from 1.0 down to the blink-suppression floor
-//!   ([`MOMENTUM_GLOW_HOT`], 0.02) in `τ·ln 50 ≈ 4.7 s` — the "cools down".
-//! * Only PRINTABLE typing feeds it. Deletes, kills, navigation never build,
-//!   and they need no drain either: silence already cools it.
-//! * While the value is at or above the floor the cursor is HOT: the host pins
-//!   a Blinking* style to its Steady* twin (the same precedence the rainbow
-//!   twinkle already uses) and the halo is on glass. Fully cooled, the cursor
-//!   is exactly what it was — the configured style, blinking or not.
+//! * One key adds [`MOMENTUM_GLOW_KEY_CREDIT`] (0.10) to the decayed value,
+//!   clamped to 1. A steady rate `r` keys/s settles at `K / (1 − exp(−1/(r·τ)))`:
+//!   with τ = 1.2 s that is 0.18 at 1/s, 0.29 at 2/s, 0.53 at 4/s, and 1.0 from
+//!   ≈ 8/s, monotone in rate.
+//! * Between keys it decays on [`MOMENTUM_GLOW_TAU_S`]: half in 0.83 s, and from
+//!   1.0 to the floor ([`MOMENTUM_GLOW_HOT`], 0.02) in `τ·ln 50 ≈ 4.7 s`.
+//! * Only printable typing feeds it; deletes, kills and navigation neither build
+//!   nor drain it.
+//! * At or above the floor the cursor is hot: the host pins a Blinking* style to
+//!   its Steady* twin (the rainbow twinkle's precedence) and the halo is drawn.
+//!   Fully cooled, the cursor is exactly the configured one.
 //!
 //! # What it draws
 //!
 //! A soft additive halo around the cursor cell (three stacked discs, premul
-//! coverage capped at [`COV_CAP`] like every sibling body effect) and a warm
-//! tint on the block body, both ramping amber → gold → white-hot with
-//! momentum. On a light theme the halo is a source-over veil ending at a deep
-//! orange instead of white, because white sinks into paper. Everything is
-//! quantised to `u8` so the fingerprint SETTLES and the effect lane releases
-//! once the light stops visibly changing, even while the value is still > 0.
-//! The halo is emitted in WINDOW px (`Geom::cell_center` + `push_fx_rect`),
-//! the contract of the `cursor_glow_add` stream it joins: at a real window's
-//! origin it surrounds the caret cell (`halo_surrounds_the_caret_in_a_padded_
-//! headed_window`), and at origin (0,0) it is byte-identical to the grid form.
+//! coverage capped at [`COV_CAP`]) and a warm tint on the block body, both
+//! ramping amber → gold → white-hot. On a light theme the halo is a source-over
+//! veil ending at deep orange, since white sinks into paper. Everything is
+//! quantised to `u8` so the fingerprint settles and the lane releases once the
+//! light stops changing, even while the value is still > 0. The halo is in
+//! window px (`Geom::cell_center` + `push_fx_rect`), the `cursor_glow_add`
+//! stream's contract (`halo_surrounds_the_caret_in_a_padded_headed_window`); at
+//! origin (0,0) it matches the grid form.
 //!
-//! Off (disabled, intensity 0, degenerate geometry, no cursor, or cold) is
-//! BYTE-IDENTICAL to no effect: `fill: None`, `hot: false`, `fp: 0`, and the
-//! scratch untouched — the contract every cursor body effect keeps.
+//! Off (disabled, intensity 0, degenerate geometry, no cursor, or cold) equals
+//! no effect: `fill: None`, `hot: false`, `fp: 0`, scratch untouched.
 
 use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
 
 use crate::cursor_glow::Geom;
-// WINDOW-ABSOLUTE on purpose. The halo lands in `cursor_glow_add`, whose
-// quads are window px (`GlowQuad`'s INVARIANTS: the producer folds in the
-// grid origin, the renderer adds NO offset). The first cut went through
-// `push_grid_rect` with a grid-relative centre, which is byte-identical at
-// origin (0,0) — every unit test's geometry — and displaced by exactly
-// (origin_x, origin_y) in a real window: the halo floated in the chrome head
-// band, 84 px above and 24 px left of the caret (capture, 2026-09-08). The
-// Fire arm in `cursor_glow/spawn.rs` documents the same trap.
+// Window-absolute: the halo lands in `cursor_glow_add`, whose quads are window
+// px (the producer folds in the grid origin; the renderer adds no offset). A
+// grid-relative centre would match only at origin (0,0) and float into the
+// chrome band in a real window. The Fire arm in `cursor_glow/spawn.rs` notes
+// the same trap.
+use crate::effect_util::mix_rgb;
 use crate::effect_util::push_fx_rect as push_rect;
 
 /// What one printable key adds, from wherever the decayed value is.
@@ -76,17 +61,14 @@ pub const MOMENTUM_GLOW_KEY_CREDIT: f32 = 0.10;
 /// The cool-down time constant in seconds (half-life ≈ 0.83 s).
 pub const MOMENTUM_GLOW_TAU_S: f32 = 1.2;
 
-/// At or above this the cursor is HOT: blink is suppressed and the halo is
-/// on glass. Below it the cursor is exactly the configured cursor. Chosen to
-/// match the rainbow twinkle's settled-energy floor.
+/// At or above this the cursor is hot: blink suppressed, halo drawn. Below it
+/// the cursor is exactly the configured one. Matches the rainbow twinkle's
+/// settled-energy floor.
 ///
-/// WHICH VALUE IS COMPARED MATTERS, and two published readings get it wrong on
-/// purpose: `TypingRate::hot` and `TypingRate::cold_at` test the RAW decayed
-/// rate, while the gate that decides the glass ([`MomentumGlow::tick`]) tests
-/// the raw rate SCALED BY `intensity`. Those part company for any intensity
-/// below ~1, so `hot` answers a question about the typing rate, not about
-/// whether anything is drawn. Read `MomentumGlow::is_active` (which reads the
-/// latched, post-intensity value) for the glass.
+/// `TypingRate::hot` and `TypingRate::cold_at` compare the raw decayed rate,
+/// while [`MomentumGlow::tick`] compares the rate scaled by `intensity`, so
+/// `hot` describes typing, not drawing. For the glass read
+/// `MomentumGlow::is_active` (the latched, post-intensity value).
 pub const MOMENTUM_GLOW_HOT: f32 = 0.02;
 
 /// Snap-to-exact-zero threshold: below this the value reads 0 and the state
@@ -134,9 +116,9 @@ impl TypingRate {
         self.at = Some(now);
     }
 
-    /// The analytic instant the decaying value crosses the HOT floor —
-    /// `stamp + τ·ln(v/floor)` — or `None` while unstamped / already cold.
-    /// Lets a frame-rate-independent host schedule the exact release.
+    /// The analytic instant the decaying value crosses the hot floor,
+    /// `stamp + τ·ln(v/floor)`, or `None` while unstamped or already cold, so a
+    /// host can schedule the exact release.
     #[must_use]
     #[cfg(test)]
     pub fn cold_at(&self, tau: f32) -> Option<Instant> {
@@ -208,9 +190,9 @@ impl MomentumGlow {
         *self = Self::default();
     }
 
-    /// The effect lane is live while the light is HOT and still CHANGING —
-    /// the same fingerprint law the rainbow body keeps, so a settled glow
-    /// early-outs the present even while the value is still > 0.
+    /// The lane is live while the light is hot and still changing (the rainbow
+    /// body's fingerprint law), so a settled glow skips the present while the
+    /// value is still > 0.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last != self.fp_prev
@@ -219,18 +201,10 @@ impl MomentumGlow {
     /// While hot the host needs a frame every ~33 ms (the present gate dedups
     /// identical u8 frames); cold needs nothing.
     ///
-    /// READS THE SAME QUANTITY THE GLASS DOES. This asked `TypingRate::hot`,
-    /// which tests the RAW rate, while [`Self::tick`] goes inert on
-    /// `raw * intensity < MOMENTUM_GLOW_HOT`. Since intensity is at most 1 the
-    /// two can only disagree one way — the deadline says "keep waking" for an
-    /// effect that draws nothing — and it disagrees precisely when intensity is
-    /// low, which on the shipped path is the motion-amplitude preference times
-    /// the load-shed envelope. That is a 33 ms wake loop for an inert effect
-    /// exactly under reduced motion and load shed, the two states that asked for
-    /// less work.
-    ///
-    /// It takes the config now rather than a bare `tau_s` so it cannot read a
-    /// different number than the gate again.
+    /// Reads the same quantity the glass does, `raw * intensity` against
+    /// `MOMENTUM_GLOW_HOT` (not the raw rate), so reduced motion or load shed
+    /// (low intensity) never leave a wake loop for an inert effect. Takes the
+    /// config so it cannot read a different number than [`Self::tick`].
     #[must_use]
     #[cfg(test)]
     pub fn next_change_deadline(&self, now: Instant, cfg: &MomentumGlowConfig) -> Option<Instant> {
@@ -282,10 +256,9 @@ impl MomentumGlow {
 
         // The halo: three stacked discs around the cell centre, reaching
         // `radius_cells` beyond the cell at full momentum. The centre is the
-        // cell's WINDOW-px centre (`origin + (index + 0.5)·cell`, the anchor
-        // every emitter shares) and the discs go through `push_fx_rect`, so
-        // the light sits on the caret in a padded, headed window and not at
-        // the same numbers measured from the window corner.
+        // cell's window-px centre (`origin + (index + 0.5)·cell`) and the discs
+        // go through `push_fx_rect`, so the light sits on the caret in a padded,
+        // headed window.
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let (cx, cy) = geom.cell_center(cr, cc);
         let rx_full = cw * (0.55 + cfg.radius_cells * s);
@@ -357,9 +330,8 @@ fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Colour temperature with momentum: amber → gold → warm white → white-hot on
-/// a dark theme; on a light theme the top is a deep orange, because white
-/// sinks into paper.
+/// Colour temperature with momentum: amber → gold → warm white → white-hot on a
+/// dark theme; on a light theme the top is a deep orange.
 #[inline]
 #[must_use]
 pub fn ramp(a: f32, dark_theme: bool) -> u32 {
@@ -377,17 +349,6 @@ pub fn ramp(a: f32, dark_theme: bool) -> u32 {
     } else {
         mix_rgb(WARM_WHITE, top, (a - 0.75) / 0.25)
     }
-}
-
-#[inline]
-fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let ch = |sh: u32| {
-        let x = ((a >> sh) & 0xff) as f32;
-        let y = ((b >> sh) & 0xff) as f32;
-        ((x + (y - x) * t).round().clamp(0.0, 255.0)) as u32
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 #[cfg(test)]
@@ -423,14 +384,9 @@ mod tests {
         }
     }
 
-    /// THE WAKE DEADLINE AGREES WITH THE GLASS. `next_change_deadline` asked
-    /// `TypingRate::hot`, which tests the RAW decayed rate, while `tick` goes
-    /// inert on `raw * intensity < MOMENTUM_GLOW_HOT`. Intensity is at most 1,
-    /// so the two can only disagree one way: the deadline says "keep waking" for
-    /// an effect that draws nothing — and it does so precisely when intensity is
-    /// low, which on the shipped path is the motion-amplitude preference times
-    /// the load-shed envelope. A 33 ms wake loop for an inert effect, under
-    /// exactly the two states that asked for less work.
+    /// The wake deadline agrees with the glass: at low intensity (reduced motion
+    /// times the load-shed envelope) where `raw * intensity` is below the hot
+    /// floor, `tick` draws nothing and no deadline is asked for.
     #[test]
     fn the_wake_deadline_never_outlives_what_the_glass_draws() {
         let t0 = Instant::now();
@@ -445,7 +401,7 @@ mod tests {
             "fixture: the raw rate is hot"
         );
 
-        // POSITIVE CONTROL at full intensity: drawn, and a deadline asked for.
+        // Positive control at full intensity: drawn, and a deadline asked for.
         out.clear();
         let full = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out);
         assert!(full.hot, "fixture: at intensity 1 it is on glass");
@@ -470,8 +426,8 @@ mod tests {
     }
 
     /// Feed keys at `rate` keys/s from `t0` for `secs`; returns the instant of
-    /// the LAST key — the value is read there, not one gap later, because a
-    /// gap of silence is exactly the cool-down the other test measures.
+    /// the last key (the value is read there, since silence is the cool-down
+    /// the other test measures).
     fn script(r: &mut TypingRate, t0: Instant, rate: f32, secs: f32) -> Instant {
         let gap = Duration::from_secs_f32(1.0 / rate);
         let mut t = t0;
@@ -485,9 +441,8 @@ mod tests {
         t
     }
 
-    /// The ask, verbatim: "momentum glow for typing FASTER". So the value
-    /// must be strictly increasing in the key rate — the property the
-    /// rate-normalised family metric deliberately does NOT have.
+    /// The value is strictly increasing in the key rate (which the
+    /// rate-normalised family metric deliberately is not).
     #[test]
     fn rises_with_key_rate() {
         let t0 = Instant::now();
@@ -506,9 +461,8 @@ mod tests {
         assert!(vals[0] <= 0.25, "1 key/s is a warm ember: {vals:?}");
     }
 
-    /// "…that cools down": monotone non-increasing in silence, half-life at
-    /// τ·ln 2, exactly zero at the end, and the analytic crossing agrees with
-    /// the sampled one.
+    /// Cooling: monotone non-increasing in silence, half-life at τ·ln 2, exactly
+    /// zero at the end, and the analytic crossing matches the sampled one.
     #[test]
     fn cooldown_is_monotone_and_snaps_to_exact_zero() {
         let t0 = Instant::now();
@@ -606,9 +560,9 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// Pure in the injected `now`: two engines fed one script agree bit for
-    /// bit, and sampling at 60 Hz or 7 Hz agrees at shared instants (lazy
-    /// decay trusts no dt).
+    /// Pure in the injected `now`: two engines fed one script agree bit for bit,
+    /// and 60 Hz and 7 Hz sampling agree at shared instants (lazy decay trusts
+    /// no dt).
     #[test]
     fn deterministic_given_timestamps() {
         let t0 = Instant::now();
@@ -729,14 +683,11 @@ mod tests {
         assert_eq!(ramp(1.0, true), 0x00FF_FFFF);
     }
 
-    /// THE SITING LAW. The halo joins `cursor_glow_add`, a WINDOW-ABSOLUTE
-    /// stream, so in a real window — the captured one: cell 15×28, pad 24,
-    /// head 80, origin (24, 84) — the halo's bounding box SURROUNDS the caret
-    /// cell on every side and its centre of light is the cell's own centre.
-    /// The grid-relative form this replaces put the blob at (157, 126) for a
-    /// caret at (174..189, 196..224): 84 px up in the chrome band, 24 px left.
-    /// And at origin (0,0), head 0, the window form is byte-identical to the
-    /// grid form (the identity law every sibling emitter keeps).
+    /// Siting: the halo joins the window-absolute `cursor_glow_add` stream, so in
+    /// a real window (cell 15×28, pad 24, head 80, origin (24, 84)) its bounding
+    /// box surrounds the caret cell on every side with its centre of light at
+    /// the cell's centre. At origin (0,0), head 0, the window form equals the
+    /// grid form.
     #[test]
     fn halo_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();
@@ -793,9 +744,8 @@ mod tests {
             assert!(i32::from(q.y) >= real.fx_top() && i32::from(q.y + q.h) <= real.fx_bot());
         }
 
-        // The identity law: at origin (0,0) the window form IS the grid form —
-        // the same bytes the grid-relative emitter produced, so nothing that
-        // was measured at the origin moves.
+        // Identity at origin (0,0): the window form produces the grid form's
+        // bytes.
         let g0 = geom();
         let mut grid_form = Vec::new();
         let mut h = MomentumGlow::default();
@@ -827,8 +777,8 @@ mod tests {
         );
     }
 
-    /// The lane releases when the light stops CHANGING, not when the value
-    /// reaches zero: after the quantised output settles, `is_active` is false
+    /// The lane releases when the light stops changing, not when the value
+    /// reaches zero: once the quantised output settles, `is_active` is false
     /// while `value` is still > 0.
     #[test]
     fn fingerprint_settles_so_the_lane_releases() {

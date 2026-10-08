@@ -180,10 +180,9 @@ impl Uri {
 }
 
 /// ASCII-case-insensitive `strip_prefix` (schemes are case-insensitive).
-fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = text.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &text[prefix.len()..])
+pub(crate) fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let (head, rest) = text.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 /// Split `host[:port]`, handling the `[v6]:port` bracket form.

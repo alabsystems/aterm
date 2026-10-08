@@ -60,11 +60,11 @@ use crate::{App, Lease, SessionCtx, WindowId};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-/// How long the rig waits for something that MUST happen: the pumped main
-/// thread answering the turn's momentum read. A hang detector, never a latency
-/// budget: the rig pumps without pause, so the answer is milliseconds away
-/// alone, and one that never comes still fails.
-const MUST_HAPPEN: Duration = Duration::from_secs(60);
+// How long the rig waits for something that MUST happen: the pumped main
+// thread answering the turn's momentum read. A hang detector, never a latency
+// budget: the rig pumps without pause, so the answer is milliseconds away
+// alone, and one that never comes still fails.
+use aterm_spec::wait::MUST_HAPPEN;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
@@ -969,5 +969,303 @@ fn a_peers_lease_let_go_before_its_wakes_ran_is_caught_up_by_the_timer() {
         assert_eq!(rig.rows(), 1);
         assert_eq!(rig.winches(), [ROWS - 1], "one re-grid, the birth");
         rig.no_focus_byte();
+    });
+}
+
+impl Rig {
+    /// The WINDOW, re-grid by re-grid: each chrome re-grid the App APPLIED
+    /// (`app_presence::take_chrome_regrids_applied`) is one resize of the
+    /// engine and the PTY from the OS window's size, and the program looks at
+    /// its size after each — as its `SIGWINCH` handler does, run once per
+    /// resize, however close together they land. [`Self::pump`] samples the
+    /// chrome rows only between wakes, so two re-grids inside one would reach
+    /// it as one.
+    fn apply_regrids(&mut self) {
+        for (wid, chrome) in crate::app_presence::take_chrome_regrids_applied() {
+            if wid != self.wid {
+                continue;
+            }
+            self.chrome = chrome;
+            let rows = ROWS - (chrome - self.base_chrome);
+            self.term.lock().unwrap().resize(rows, COLS);
+            aterm_pty::resize(self.master, rows, COLS);
+            let seen = rows_of(self.slave);
+            if seen != self.program_rows {
+                self.program_rows = seen;
+                self.seen.push(Seen::Winch(seen));
+                let paint = Rig::paint(seen, "winch");
+                self.program_write(&paint);
+            }
+            self.read_output();
+        }
+    }
+}
+
+/// THE LIFT OF AN UPDATE HANDOFF'S PARK moves the grid once or not at all
+/// (`App::release_update_handoff_park`, `Wake::UpdateHandoffFinished`).
+///
+/// The sequence two reviewers confirmed on the parent's failed or aborted
+/// park: the presence row is up (a settling turn bore it); the handoff parks;
+/// the want drops, so the fold's quiet starts UNDER the park's hold and is
+/// overdue by the time the park lifts; a band row is posted while parked and
+/// the band, frozen, reserves nothing for it. At the lift the band's growth
+/// commits at once and the overdue fold commits too. Before the fix the wake
+/// refreshed the presence rows while the park still stood (held), cleared
+/// it, grew the band (re-grid N → N-1), and the next timer turn folded the
+/// row (re-grid N-1 → N): two `SIGWINCH`es under a program on the alternate
+/// screen, the second to a size it already had.
+///
+/// Now both counts commit inside ONE re-grid batch: the chrome rows end
+/// where they started, the one re-grid moves nothing, and the program sees
+/// no resize at all.
+///
+/// NEGATIVE CONTROL (run by reverting the lift to its old order — refresh,
+/// finish, sync, no batch): the program sees `[ROWS - 1, ROWS]`.
+#[test]
+fn a_parks_lift_commits_the_held_fold_and_the_bands_growth_in_one_regrid() {
+    use aterm_messages::presence::FOLD_QUIET;
+    crate::fabric::with_link_reset(|| {
+        let mut rig = Rig::driver_geometry_rig(false);
+        let wid = rig.wid;
+        // A settling turn's lease bears the presence row.
+        *rig.ctx.turn_lease.lock().unwrap() = Some(Lease::Turn {
+            id: 90,
+            driver: None,
+            typing: false,
+        });
+        rig.settle();
+        assert_eq!(rig.rows(), 1, "the settling lease bore the row");
+        assert_eq!(rig.winches(), [ROWS - 1], "the birth");
+        let before = rig.app.chrome_rows(wid);
+
+        // The park: the parent's half of the freeze.
+        rig.app.pending_update_handoff = Some(crate::messages_host::tests::parked());
+        // The want drops under the park: the fold is held, its quiet started.
+        *rig.ctx.turn_lease.lock().unwrap() = None;
+        rig.settle();
+        assert_eq!(rig.rows(), 1, "the fold is held under the park");
+        let view = &mut rig.app.windows.get_mut(&wid).expect("the window").presence;
+        assert!(
+            view.fold_since.is_some(),
+            "the quiet started under the hold"
+        );
+        // The park outlasted the quiet.
+        view.fold_since = view
+            .fold_since
+            .and_then(|at| at.checked_sub(FOLD_QUIET * 2));
+        view.born_at = view.born_at.and_then(|at| at.checked_sub(FOLD_QUIET * 2));
+
+        // A band row posted under the park: the band reserves nothing yet.
+        let band = rig.app.message_band_rows;
+        rig.app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "posted under the park",
+            )
+            .line("why"),
+        );
+        assert_eq!(rig.app.message_band_rows, band, "the band is frozen");
+        rig.settle();
+        assert_eq!(
+            rig.app.chrome_rows(wid),
+            before,
+            "nothing moved under the park"
+        );
+        let _ = crate::app_presence::take_chrome_regrids_applied();
+
+        // THE WAKE: the attempt failed, and its finish clears the park.
+        rig.app
+            .release_update_handoff_park(|app| app.pending_update_handoff = None);
+        rig.apply_regrids();
+        // The loop's next turn: the presence timer, if it armed.
+        let now = Instant::now();
+        if rig.app.presence_deadline(now).is_some_and(|at| at <= now) {
+            let _ = rig.app.presence_tick(now);
+        }
+        rig.apply_regrids();
+        rig.settle();
+
+        assert_eq!(rig.rows(), 0, "the overdue fold committed");
+        assert_eq!(rig.app.message_band_rows, band + 1, "the band grew");
+        assert_eq!(rig.app.chrome_rows(wid), before, "a row for a row");
+        assert_eq!(
+            rig.winches(),
+            [ROWS - 1],
+            "the lift resized the program's terminal (only the birth may)"
+        );
+        rig.no_focus_byte();
+    });
+}
+
+/// THE LIFT OF A SUCCESSOR'S FREEZE moves the grid ONCE
+/// (`App::release_successor_commit_freeze`, the Commit wake's own call).
+///
+/// The successor holds its presence rows and its band until Commit
+/// (`incoming_handoff_pending`): a settling turn's lease asks for the
+/// presence row under the freeze, and a band row is posted under it. At
+/// Commit both commit — the row is born and the band grows — and each
+/// shrinks the grid by one. Re-gridded one by one they are two `SIGWINCH`es
+/// (`[ROWS - 1, ROWS - 2]`), the first to a size the program keeps for
+/// microseconds; in the Commit's one batch they are one, straight to
+/// `ROWS - 2`.
+///
+/// NEGATIVE CONTROL (run by making `with_chrome_regrid_batch` pass straight
+/// through): the program sees `[ROWS - 1, ROWS - 2]`.
+#[test]
+fn a_successors_commit_births_the_row_and_grows_the_band_in_one_regrid() {
+    crate::fabric::with_link_reset(|| {
+        let mut rig = Rig::driver_geometry_rig(false);
+        let wid = rig.wid;
+        let before = rig.app.chrome_rows(wid);
+
+        // The successor before Commit: the freeze.
+        rig.app.incoming_handoff_pending = true;
+        // A settling turn's lease asks for the presence row: held.
+        *rig.ctx.turn_lease.lock().unwrap() = Some(Lease::Turn {
+            id: 91,
+            driver: None,
+            typing: false,
+        });
+        rig.settle();
+        assert_eq!(rig.rows(), 0, "the birth is held until Commit");
+        // A band row posted under the freeze: the band reserves nothing yet.
+        let band = rig.app.message_band_rows;
+        rig.app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "posted before Commit",
+            )
+            .line("why"),
+        );
+        assert_eq!(rig.app.message_band_rows, band, "the band is frozen");
+        rig.settle();
+        assert_eq!(
+            rig.app.chrome_rows(wid),
+            before,
+            "nothing moved before Commit"
+        );
+        assert!(rig.winches().is_empty(), "no resize before Commit");
+        let _ = crate::app_presence::take_chrome_regrids_applied();
+
+        // THE COMMIT WAKE: the freeze is gone, then the lift.
+        rig.app.incoming_handoff_pending = false;
+        rig.app.release_successor_commit_freeze();
+        rig.apply_regrids();
+        rig.settle();
+
+        assert_eq!(rig.rows(), 1, "the row was born at Commit");
+        assert_eq!(rig.app.message_band_rows, band + 1, "the band grew");
+        assert_eq!(rig.app.chrome_rows(wid), before + 2, "two chrome rows");
+        assert_eq!(
+            rig.winches(),
+            [ROWS - 2],
+            "the lift resized the program's terminal once"
+        );
+        rig.no_focus_byte();
+    });
+}
+
+/// THE SCROLLBACK AN UPDATE LEFT BEHIND is said in the Commit's one re-grid,
+/// and the import's settle moves the grid no more
+/// (`App::say_carried_history_loss`, warm successor P6, finding 1).
+///
+/// The outgoing process counts the history lines it could not carry at its
+/// park (`AdoptedHistory::dropped`: 99,744 under the measured `yes` flood).
+/// The band's row for them was posted when the import worker's wake settled
+/// (`App::settle_handoff_history`), 40-70 ms after the Commit's lift: a
+/// second re-grid, one row less and a `SIGWINCH` after the freeze had
+/// visibly ended. Now the row grows the band inside the Commit's batch. The
+/// settle posts nothing when the imports failed nothing, and re-words that
+/// row in place when one failed here: the band keeps its row count either
+/// way.
+///
+/// NEGATIVE CONTROL (run 2026-09-29 by deleting the
+/// `say_carried_history_loss` call from `release_successor_commit_freeze`):
+/// the band has no row after the Commit (`left: 0, right: 1`); the settle
+/// grew it, the second re-grid. The same with the whole fix reverted. And a
+/// settle that re-posts an unchanged summary (its `loss != said` dropped)
+/// fails `failed here 0: … said once`: the row folded the restatement in as
+/// a repeat.
+#[test]
+fn a_commit_says_the_scrollback_left_behind_in_its_one_regrid() {
+    const DROPPED: u64 = 99_744;
+    crate::fabric::with_link_reset(|| {
+        for failed_here in [0_u64, 34] {
+            let mut rig = Rig::driver_geometry_rig(false);
+            let band = rig.app.message_band_rows;
+
+            // The successor before Commit, its adopted session carrying the
+            // lines its parent counted as left behind.
+            rig.app.incoming_handoff_pending = true;
+            let session = &mut rig
+                .app
+                .pool
+                .sessions
+                .get_mut(&0)
+                .expect("session 0")
+                .session;
+            session.handoff_history = Some(crate::handoff_history::AdoptedHistory {
+                dropped: DROPPED,
+                lost: DROPPED,
+                ..Default::default()
+            });
+            // Every step below is synchronous, so one turn of the rig's main
+            // thread (`Rig::pump`) sees what it moved; nothing here waits.
+            rig.pump();
+            let _ = crate::app_presence::take_chrome_regrids_applied();
+
+            // THE COMMIT WAKE: the lift, then the import starts.
+            rig.app.incoming_handoff_pending = false;
+            rig.app.release_successor_commit_freeze();
+            rig.apply_regrids();
+            rig.pump();
+            assert_eq!(rig.app.message_band_rows, band + 1, "the row, at Commit");
+            assert_eq!(
+                rig.winches(),
+                [ROWS - 1],
+                "the Commit's one re-grid carries the row"
+            );
+            let jobs = rig.app.pool.take_handoff_histories();
+
+            // THE IMPORT'S WAKE (`Wake::HandoffHistorySettled`).
+            let mut reports = crate::handoff_history::run_imports(jobs);
+            if failed_here > 0 {
+                reports[0].failed_lines = failed_here;
+                reports[0].failed = Some("the sidecar arrived with another sha".to_string());
+            }
+            rig.app.settle_handoff_history(&reports);
+            rig.apply_regrids();
+            rig.pump();
+
+            // The one row says the settled count — the row the band's own
+            // words make for every line left behind, in its one tab — once:
+            // a settle that restated the Commit's words would have folded in
+            // as a repeat.
+            let settled =
+                crate::update_words::scrollback_left_behind(DROPPED + failed_here, 1, 0, 0, 0)
+                    .normalized();
+            assert!(
+                rig.app
+                    .messages
+                    .live_rows()
+                    .any(|row| row.msg.key == settled.key
+                        && row.msg.detail == settled.detail
+                        && row.repeats == 1),
+                "failed here {failed_here}: the row counts every line, said once"
+            );
+            assert_eq!(
+                rig.app.message_band_rows,
+                band + 1,
+                "failed here {failed_here}: one row for the update"
+            );
+            assert_eq!(
+                rig.winches(),
+                [ROWS - 1],
+                "failed here {failed_here}: the settle re-grids nothing"
+            );
+            rig.no_focus_byte();
+        }
     });
 }

@@ -4,7 +4,7 @@
 //! Bounded, identity-free recovery records for closed views and tabs.
 //!
 //! These ledgers are deliberately separate. `Cmd-Shift-T` consumes only [`ClosedTab`]
-//! records; the named Reopen Closed View command consumes only [`ClosedView`] records.
+//! records; the named Reopen Closed Pane command consumes only [`ClosedView`] records.
 //! A candidate is removed only by an explicit token commit after reconstruction succeeds,
 //! so an unavailable document/app never destroys the user's last recovery path.
 

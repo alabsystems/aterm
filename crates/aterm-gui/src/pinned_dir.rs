@@ -705,7 +705,7 @@ mod imp {
             }
             let result = (|| {
                 (&file.file).write_all(bytes)?;
-                file.file.sync_all()
+                crate::durable::sync_all(&file.file)
             })();
             if let Err(error) = result {
                 let _ = file.remove_exact();
@@ -1703,7 +1703,7 @@ mod imp {
         }
 
         pub(crate) fn sync(&self) -> io::Result<()> {
-            self.leaf().sync_all()
+            crate::durable::sync_all(self.leaf())
         }
 
         pub(crate) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -1852,7 +1852,7 @@ mod imp {
             }
             let result = (|| {
                 (&file.file).write_all(bytes)?;
-                file.file.sync_all()
+                crate::durable::sync_all(&file.file)
             })();
             if let Err(error) = result {
                 let _ = file.remove_exact();
@@ -3016,43 +3016,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A DIRECTORY LOCK IS AN OPEN FILE DESCRIPTION OF ITS OWN, let go at
+    /// once. `open_directory_lock` opens the retained directory anew rather
+    /// than `dup`ing the pin's descriptor: two locks through ONE pin exclude
+    /// each other (a `dup` shares the pin's description, and `flock` lets a
+    /// second take through the same description succeed), and a lease's
+    /// release owes nothing to the pin, which stays open throughout. Its
+    /// holder lets it go by `LOCK_UN` (`ArtifactPathLease`'s drop; here
+    /// [`HeldAdvisoryLock`]), so the release lands even while a child forked
+    /// under the lock has yet to exec — the child is made for real
+    /// ([`crate::parked_fork::ParkedChild`]) and parked through the check, so
+    /// nothing is waited out. NEGATIVE CONTROL: the close alone leaves the
+    /// lock taken in that child's copy until it execs — what this test, which
+    /// released by dropping the `File`, used to wait out on a 10 s stopwatch
+    /// whenever a sibling test's fork landed in its window.
+    ///
+    /// [`HeldAdvisoryLock`]: crate::native_document_host::HeldAdvisoryLock
     #[test]
     fn directory_lock_has_an_independent_unlock_lifetime() {
+        use crate::native_document_host::HeldAdvisoryLock;
+        use crate::parked_fork::ParkedChild;
+        use std::fs::TryLockError;
+
         let root = unique_dir("directory-lock");
         std::fs::create_dir_all(&root).unwrap();
-        let first_pin = PinnedDir::open(&root).unwrap();
-        let second_pin = PinnedDir::open(&root).unwrap();
-        let first_lock = first_pin.open_directory_lock().unwrap();
-        let second_lock = second_pin.open_directory_lock().unwrap();
+        let pin = PinnedDir::open(&root).unwrap();
+        let contender = pin.open_directory_lock().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the contender's probe; the one take it makes is let go by `unlock` below"
+        )]
+        let try_contender = || contender.try_lock();
+        let refused = || matches!(try_contender(), Err(TryLockError::WouldBlock));
 
-        first_lock.try_lock().unwrap();
-        assert!(matches!(
-            second_lock.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        drop(first_lock);
-        // The property under test IS drop-release, so the drop stays — but
-        // `flock` rides the open-file-description, and a concurrent test's
-        // `fork()`ed child (any `pre_exec` Command or raw fork) that arrived
-        // between our open and this drop holds a duplicate of `first_lock`'s
-        // descriptor and keeps the lock alive until its execve/_exit —
-        // measured up to ~523 ms under pathological load. Wait that transient
-        // out. A real regression — a duplicate tied to the still-open
-        // `first_pin`, or a descriptor stashed in a static — never releases
-        // and still fails the budget.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match second_lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => {
-                    panic!("dropping the lease handle must release its directory lock: {error:?}")
-                }
-            }
-        }
+        let lease = HeldAdvisoryLock::try_lock(pin.open_directory_lock().unwrap())
+            .expect("the lease takes the directory lock");
+        assert!(
+            refused(),
+            "a second lock through one pin is its own description"
+        );
+        let child = ParkedChild::fork();
+        drop(lease);
+        try_contender().expect("the dropped lease's lock is free at once, its pin still open");
+        assert!(
+            child.still_parked(),
+            "the child forked under it had yet to exec"
+        );
+        child.release();
+        contender.unlock().unwrap();
 
+        // NEGATIVE CONTROL: released by the close alone, the lock lives on in
+        // the parked child's copy of the description, until that child execs.
+        let lease = pin.open_directory_lock().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the negative control: a lock let go by the close alone"
+        )]
+        lease.try_lock().unwrap();
+        let child = ParkedChild::fork();
+        drop(lease);
+        assert!(
+            refused(),
+            "control: closed, not unlocked, the child's copy holds it"
+        );
+        child.release();
+
+        drop((contender, pin));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3240,7 +3269,7 @@ mod tests {
         // A LIVENESS CHECK, NOT A STOPWATCH (the load-sensitive test audit of
         // 2026-09-27). Losing O_NONBLOCK does not make this open slow — it makes
         // it block until a writer appears, which here is never. So the call runs
-        // on a helper and the answer is awaited for 30 s: any finite bound
+        // on a helper and the answer is awaited for a minute: any finite bound
         // catches that regression (and reports it, where the old inline call
         // would have hung the suite before its 1 s assertion was reached), while
         // a test thread kept off the CPU for a second no longer fails a correct
@@ -3254,7 +3283,7 @@ mod tests {
             );
         });
         let refused = answer
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("O_NONBLOCK must make a writerless FIFO fail rather than block");
         assert!(refused, "a FIFO is not a regular file to replace");
 

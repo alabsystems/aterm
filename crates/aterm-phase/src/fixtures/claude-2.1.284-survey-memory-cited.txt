@@ -1,0 +1,16 @@
+# claude-code 2.1.284 · HAND-BUILT 2026-09-28 (no live capture yet): the card's rows are synthesized from the 2.1.284 render code (VM, the plugin and memory cards, Cle) and checked against the store binary's literals; the framing rows are the real captures' (survey-open.txt, wait_bg6.out)
+  Free disk is 31 GiB.
+
+✻ Cooked for 52m 54s · done 12:31 PM
+
+● Claude recalled a memory:
+
+  The owner prefers small commits and reviews each diff before it lands.
+
+  How was Claude's recollection? (optional)
+  1: Bad    2: Fine   3: Good   4: Unsure 0: Dismiss
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active

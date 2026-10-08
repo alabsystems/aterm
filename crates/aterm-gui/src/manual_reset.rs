@@ -598,7 +598,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_reader_that_ends_without_answering_runs_the_reset_directly() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let s = crate::stub_session(7);
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::spawn::GatherMsg>(4);
         let generation = s.ctx.reset_lane.open(tx);
@@ -617,24 +617,21 @@ mod tests {
             )
         });
         let msg = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the reset was queued on the lane");
         assert!(matches!(msg, crate::spawn::GatherMsg::Reset(_)));
         // The "reader" ends without answering.
         s.ctx.reset_lane.close_if(generation);
-        let started = Instant::now();
         drop(msg);
         drop(rx);
+        // Answered by the disconnect, not the timeout: the first cut answered `Err`
+        // after the full `REPLY_TIMEOUT`, which `a report, not a timeout` refuses —
+        // no stopwatch needed to tell the two apart.
         let report = asker
             .join()
             .expect("the asker thread")
             .expect("a report, not a timeout")
             .expect("waited for");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "answered by the disconnect, not the timeout: {:?}",
-            started.elapsed()
-        );
         assert_eq!(report.reverted, vec!["mouse"]);
         assert!(
             !s.term

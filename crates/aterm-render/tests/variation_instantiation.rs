@@ -600,9 +600,11 @@ fn rb_variation_cache_tracks_coords() {
 /// and skip when the host has none.
 #[cfg(not(target_os = "macos"))]
 fn host_variable_mono() -> Option<Vec<u8>> {
-    // Cascadia Mono is aterm's Windows default primary and ships with Windows 11 as
-    // a VARIABLE face (`wght` 200..400..700) — the whole reason this gap was worth
-    // closing. The rest are the usual Linux placements of the same family.
+    // Cascadia Mono ships with Windows 11 as a VARIABLE face (`wght` 200..400..700),
+    // what `font_family = "Cascadia Mono"` names there — the whole reason this gap
+    // was worth closing (aterm's unconfigured Windows default is now the bundled
+    // STATIC Cascadia Mono PL, with real styled files). The rest are the usual
+    // Linux placements of the same family.
     const CANDIDATES: &[&str] = &[
         r"C:\Windows\Fonts\CascadiaMono.ttf",
         r"C:\Windows\Fonts\CascadiaCode.ttf",

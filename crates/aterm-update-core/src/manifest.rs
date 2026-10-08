@@ -5,8 +5,7 @@
 //! every GitHub release. ONE serde type both sides of the wire compile against:
 //! the publisher (`crates/aterm-release`) emits it via [`Manifest::to_toml`] and
 //! the updater client parses it via [`Manifest::parse`], so publisher/client field
-//! agreement is enforced by the compiler instead of being hand-synced with a shell
-//! script (the old `tools/gen-appcast.sh` contract this replaces).
+//! agreement is enforced by the compiler.
 //!
 //! The wire format is `schema = 1` **permanently**, and parse semantics are frozen
 //! to what the already-deployed v0.25 fleet accepts:

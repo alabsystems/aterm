@@ -2,37 +2,32 @@
 // Copyright 2026 Andrew Yates
 
 //! The dog roster's bake path: one authored breed head
-//! ([`crate::dog_glyphs_gen::DOG_GLYPHS`]) rasterized into one EXACT-SIZE
+//! ([`crate::dog_glyphs_gen::DOG_GLYPHS`]) rasterized into one exact-size
 //! straight-alpha RGBA8 tile, cached in a small LRU, and handed to the shared
 //! cat atlas through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
-//! This is the [`crate::pet_baker`] pattern applied verbatim to the typed-word
-//! dog cameo — same rasterizer ([`fill_path_fixed`]), same fill resolution
-//! ([`resolve_layer`] over [`ResolvedFills`]), same structural budgets, no patch
-//! strip and no eyes axis (a breed head authors its own expression). Two
-//! deliberate deltas from the pet:
+//! The [`crate::pet_baker`] pattern for the typed-word dog cameo: same
+//! rasterizer ([`fill_path_fixed`]), same fill resolution ([`resolve_layer`]
+//! over [`ResolvedFills`]), same budgets, no patch strip and no eyes axis. Two
+//! deltas from the pet:
 //!
-//! * **No iris axis.** The dog roster authors no `Recolor::Iris` layers — dog
-//!   eyes are the adaptive eye ink (below), so an iris key axis could only
-//!   fragment the cache. [`DogBakeKey::fills`] passes a fixed mid-ramp stop.
-//! * **Adaptive eye ink.** Cat heads carry the gaze machinery that guarantees
-//!   eye legibility; a dog head is one static bake, so its `GlyphRole::Eye`
-//!   layers resolve to [`ResolvedFills::eye_ink`] — the context ink that is
-//!   dark on pale coats and pale on dark coats — instead of the authored fixed
-//!   fill. Glints stay authored (`GlyphRole::Detail`, white).
+//! * **No iris axis.** Dog eyes use the adaptive eye ink, so
+//!   [`DogBakeKey::fills`] passes a fixed mid-ramp stop.
+//! * **Adaptive eye ink.** A dog head is one static bake without gaze
+//!   machinery, so its `GlyphRole::Eye` layers resolve to
+//!   [`ResolvedFills::eye_ink`] (dark on pale coats, pale on dark) instead of
+//!   the authored fill. Glints stay authored (`GlyphRole::Detail`, white).
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
-use crate::cat_baker::{
-    CatColorKey, MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS, ResolvedFills, resolve_layer,
-};
+use crate::cat_baker::{CatColorKey, ResolvedFills, paint_outline_halo, resolve_layer};
 use crate::cat_glyphs_gen::GlyphRole;
 use crate::dog_glyphs_gen::{DOG_GLYPHS, DogGlyphId};
+use crate::pet_baker::{ExactTileBaker, ExactTileKey, host_tile_id};
 
 /// The fixed [`EYE_RAMP`](crate::cat_baker::EYE_RAMP) stop passed through
-/// [`ResolvedFills::from_context`] for the dog bake. The roster authors no
-/// `Recolor::Iris` layers, so this can never touch a texel — it exists only
-/// because the resolver's signature demands an index.
+/// [`ResolvedFills::from_context`] for the dog bake. No dog layer uses
+/// `Recolor::Iris`, so it never touches a texel; the signature requires it.
 const DOG_IRIS_STOP: u8 = 2;
 
 /// FNV namespace salt eaten FIRST by [`DogBakeKey::host_id`], so a dog key's
@@ -82,21 +77,15 @@ impl DogBakeKey {
     /// (the [`crate::pet_baker`] contract, in a salted namespace of its own).
     #[must_use]
     pub fn host_id(&self) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        let mut eat = |b: u64| {
-            h ^= b;
-            h = h.wrapping_mul(FNV_PRIME);
-        };
-        eat(DOG_HOST_SALT);
-        eat(self.breed as u64);
-        eat(u64::from(self.coat));
-        eat(u64::from(self.colors.accent));
-        eat(u64::from(self.colors.background));
-        eat(u64::from(self.w));
-        eat(u64::from(self.h));
-        h | (1 << 63)
+        host_tile_id(&[
+            DOG_HOST_SALT,
+            self.breed as u64,
+            u64::from(self.coat),
+            u64::from(self.colors.accent),
+            u64::from(self.colors.background),
+            u64::from(self.w),
+            u64::from(self.h),
+        ])
     }
 }
 
@@ -118,94 +107,29 @@ pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> T
         } else {
             resolve_layer(layer, fills)
         };
-        if matches!(layer.role, GlyphRole::Outline)
-            && let Some(underlay) = fills.outline_underlay
-        {
-            let halo = (xform.scale_x.min(xform.scale_y) * 0.04).clamp(0.75, 1.25);
-            for (dx, dy) in [(halo, 0.0), (-halo, 0.0), (0.0, halo), (0.0, -halo)] {
-                fill_path_fixed(
-                    &mut tile,
-                    layer.paths,
-                    underlay,
-                    alpha,
-                    PathTransform {
-                        dx: xform.dx + dx,
-                        dy: xform.dy + dy,
-                        ..xform
-                    },
-                );
-            }
+        if matches!(layer.role, GlyphRole::Outline) {
+            paint_outline_halo(&mut tile, layer, fills, alpha, xform);
         }
         fill_path_fixed(&mut tile, layer.paths, col, alpha, xform);
     }
     tile
 }
 
-/// One resident tile: its key, its texels, and the frame it was last touched on.
-struct DogSlot {
-    key: DogBakeKey,
-    tile: Tile,
-    last_used: u64,
+impl ExactTileKey for DogBakeKey {
+    fn size(&self) -> (u16, u16) {
+        (self.w, self.h)
+    }
+
+    fn bake_tile(&self) -> Tile {
+        self.bake()
+    }
 }
 
 /// Host-side LRU of exact-size dog tiles — the [`crate::pet_baker::PetBaker`]
-/// structure verbatim (see its docs for the budget rationale).
-///
-/// `Default` is a valid empty baker: the first
-/// [`begin_frame`](DogBaker::begin_frame) adopts the cell metrics.
-#[derive(Default)]
-pub struct DogBaker {
-    slots: Vec<DogSlot>,
-    bytes: usize,
-    cell_w: u16,
-    cell_h: u16,
-    clock: u64,
-    bakes_left: u32,
-    version: u64,
-}
+/// structure itself (see its docs for the budget rationale).
+pub type DogBaker = ExactTileBaker<DogBakeKey>;
 
 impl DogBaker {
-    /// Per-tick prologue: advance the LRU clock, reset the per-frame cold-bake
-    /// budget, and wholesale-clear on a cell-metric change. Call exactly once
-    /// per PRESENTED frame.
-    pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
-        self.clock = self.clock.wrapping_add(1);
-        self.bakes_left = MAX_BAKES_PER_FRAME;
-        if (cell_w, cell_h) != (self.cell_w, self.cell_h) {
-            self.clear();
-            self.cell_w = cell_w;
-            self.cell_h = cell_h;
-        }
-    }
-
-    /// Drop every resident tile and bump the version; silent when already empty.
-    pub fn clear(&mut self) {
-        if self.slots.is_empty() {
-            return;
-        }
-        self.slots.clear();
-        self.bytes = 0;
-        self.version = self.version.wrapping_add(1);
-    }
-
-    /// Monotonic bake/clear counter — fold it into the frame fingerprint.
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
-    /// Resident tile count (`≤ MAX_SLOTS`).
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Resident texel bytes (`≤ MAX_ATLAS_BYTES`).
-    #[doc(hidden)]
-    #[cfg(test)]
-    pub fn resident_bytes(&self) -> usize {
-        self.bytes
-    }
-
     /// The authored aspect (width ÷ height) of a breed head, from its asset
     /// viewbox. Clamped away from zero so a degenerate asset cannot produce a
     /// NaN/∞ destination rect.
@@ -213,63 +137,12 @@ impl DogBaker {
     pub fn aspect(breed: DogGlyphId) -> f32 {
         (f32::from(DOG_GLYPHS[breed as usize].aspect_x1000) / 1000.0).max(0.001)
     }
-
-    /// Look `key` up, baking on a miss when the per-frame budget allows.
-    /// Returns straight-alpha RGBA8, exactly `key.w · key.h · 4` bytes — ready
-    /// for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile) with
-    /// [`DogBakeKey::host_id`]. `None` means "not this frame" — keep drawing
-    /// the previous tile and ask again next frame.
-    pub fn tile(&mut self, key: &DogBakeKey) -> Option<&[u8]> {
-        if key.w == 0 || key.h == 0 {
-            return None;
-        }
-        let want = usize::from(key.w) * usize::from(key.h) * 4;
-        if want > MAX_ATLAS_BYTES {
-            return None;
-        }
-        if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
-            self.slots[i].last_used = self.clock;
-            return Some(self.slots[i].tile.pixels());
-        }
-        if self.bakes_left == 0 {
-            return None;
-        }
-        self.bakes_left -= 1;
-        let tile = key.bake();
-        while !self.slots.is_empty()
-            && (self.slots.len() >= MAX_SLOTS || self.bytes + want > MAX_ATLAS_BYTES)
-        {
-            self.evict_lru();
-        }
-        self.bytes += tile.pixels().len();
-        self.slots.push(DogSlot {
-            key: *key,
-            tile,
-            last_used: self.clock,
-        });
-        self.version = self.version.wrapping_add(1);
-        Some(self.slots[self.slots.len() - 1].tile.pixels())
-    }
-
-    /// Drop the least-recently-used slot, lowest index breaking ties.
-    fn evict_lru(&mut self) {
-        let Some(victim) = self
-            .slots
-            .iter()
-            .enumerate()
-            .min_by_key(|(idx, s)| (s.last_used, *idx))
-            .map(|(idx, _)| idx)
-        else {
-            return;
-        };
-        self.bytes -= self.slots[victim].tile.pixels().len();
-        self.slots.remove(victim);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cat_baker::{MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS};
     use crate::dog_glyphs_gen::{DOG_GLYPH_IDS, DOG_HEADS};
 
     /// Find a breed by a substring of its authored asset id.
@@ -336,7 +209,7 @@ mod tests {
         assert_eq!(first, direct.pixels());
     }
 
-    /// EXACT-SIZE, no patch strip, and the key axes actually move texels.
+    /// Exact-size, no patch strip, and the key axes actually move texels.
     #[test]
     fn tiles_are_exact_size_and_axes_are_wired() {
         let mut b = DogBaker::default();

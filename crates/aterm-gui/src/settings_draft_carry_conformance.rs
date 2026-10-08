@@ -113,10 +113,14 @@ impl Rig {
             .map(|draft| draft.text)
     }
 
+    /// The successor said which draft it lost — on glass, or, before its Commit,
+    /// settled and held to be said AT the Commit that makes the loss its own (the
+    /// review of round eight's lead U61: before it the parent still holds the
+    /// draft, and a successor stood down must have written nothing).
     fn successor_said_a_loss(&self) -> bool {
-        self.successor
-            .as_ref()
-            .is_some_and(|successor| drafts_loss_row(successor).is_some())
+        self.successor.as_ref().is_some_and(|successor| {
+            drafts_loss_row(successor).is_some() || successor.carried_settings_drafts_loss_owed()
+        })
     }
 
     /// Every model variable, read from real state.
@@ -159,25 +163,7 @@ impl Rig {
         let before = self.project();
         op(self);
         let after = self.project();
-        let mut expected = before.clone();
-        for action in actions {
-            assert!(
-                self.model.fire(action, &mut expected),
-                "{label}: the model cannot fire {action} from {expected:?} (real: {before:?} -> \
-                 {after:?})"
-            );
-        }
-        assert_eq!(
-            after, expected,
-            "{label}: the real step is not {actions:?} (from {before:?})"
-        );
-        for invariant in &self.model.invariants {
-            assert!(
-                self.model.check_invariant(invariant.name, &after),
-                "{label}: {} broken at {after:?}",
-                invariant.name
-            );
-        }
+        crate::conformance_support::assert_fired(&self.model, label, actions, &before, &after);
     }
 
     /// Type `text` into [`FIELD`] of the outgoing Settings view, as the
@@ -369,7 +355,18 @@ impl Rig {
             );
             return false;
         }
-        self.step(label, &["Commit"], |rig| rig.phase = 3);
+        self.step(label, &["Commit"], |rig| {
+            rig.phase = 3;
+            // The successor's Commit wake: its freeze lifts, and what it owed
+            // (a loss of carried drafts among it) is said now.
+            if let Some(successor) = rig.successor.as_mut() {
+                successor.incoming_handoff_pending = false;
+                #[cfg(unix)]
+                successor.release_successor_commit_freeze();
+                #[cfg(not(unix))]
+                successor.say_carried_settings_drafts_loss();
+            }
+        });
         true
     }
 
@@ -465,6 +462,8 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
         outer_x: None,
         outer_y: None,
         maximized: None,
+        inner_px: None,
+        presence_row: false,
         show: crate::restore::WindowShow::UNKNOWN,
         tabs: Vec::new(),
         native_tabs: Vec::new(),
@@ -610,7 +609,16 @@ fn an_unreadable_carry_degrades_without_refusing() {
         None,
         "nothing it could not read is reopened"
     );
-    let row = drafts_loss_row(rig.successor()).expect("the loss is said on glass");
+    assert!(
+        drafts_loss_row(rig.successor()).is_none()
+            && rig.successor().carried_settings_drafts_loss_owed(),
+        "before Commit the parent still holds the draft: the loss is held, not said"
+    );
+    assert!(
+        rig.commit("commit"),
+        "a successor that holds its loss commits"
+    );
+    let row = drafts_loss_row(rig.successor()).expect("the loss is said on glass at Commit");
     assert_eq!(row.title, "Couldn't reopen a Settings draft");
     assert!(
         row.detail
@@ -618,10 +626,6 @@ fn an_unreadable_carry_degrades_without_refusing() {
             .any(|line| line == "1 draft could not be read"),
         "{:?}",
         row.detail
-    );
-    assert!(
-        rig.commit("commit"),
-        "a successor that said its loss commits"
     );
 }
 

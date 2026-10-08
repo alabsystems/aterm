@@ -12,6 +12,9 @@ description = "aterm — a std-only command-line client for the aterm introspect
 [[bin]]
 name = "aterm-ctl"
 path = "src/main.rs"
+# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
+# harness ran 0 tests in every gate. Integration tests still get the binary.
+test = false
 
 [dependencies]
 # Engine-side socket naming/discovery decisions, shared with the server so
@@ -21,6 +24,17 @@ aterm-types = { workspace = true }
 # sockets on Unix; AF_UNIX-over-winsock on Windows). Workspace crate, std-only
 # — this binary stays free of third-party dependencies.
 aterm-uds = { workspace = true }
+# The control wire's percent escape (`sessions` titles, `conn`), the one copy
+# the server's `aterm_control::wire::pct_*` re-export. Workspace crate, std-only.
+aterm-codec = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories removed on drop (the tests' sockets live in them).
+# Workspace crate, std-only, zero dependencies.
+aterm-tempfile = { workspace = true }
+# The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
+# in the graph via aterm-types.
+aterm-time = { workspace = true }
 
 [lints]
 workspace = true

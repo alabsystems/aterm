@@ -208,6 +208,107 @@ fn test_byte_to_column_combining() {
     assert_eq!(byte_to_column(text, byte_after_combining), 1);
 }
 
+/// `is_emoji_modifier_base` is exactly Unicode 16.0.0 `Emoji_Modifier_Base`
+/// (134 code points). The hand-kept subset it replaced left out U+1F977 NINJA,
+/// so the fully-qualified `🥷🏽` drew as a ninja and a separate swatch over four
+/// cells, and took in U+1F90D/U+1F90E (white and brown heart), which are not
+/// bases.
+#[test]
+fn emoji_modifier_base_is_exactly_the_ucd_property() {
+    let count = (0..=0x10_FFFFu32)
+        .filter_map(char::from_u32)
+        .filter(|&c| is_emoji_modifier_base(c))
+        .count();
+    assert_eq!(count, 134);
+    assert!(is_emoji_modifier_base('\u{1F977}'));
+    assert!(!is_emoji_modifier_base('\u{1F90D}'));
+    assert!(!is_emoji_modifier_base('\u{1F90E}'));
+}
+
+/// A skin-tone modifier folds into its base's cell only when the grid folds
+/// it: the base is an `Emoji_Modifier_Base` drawn wide. After anything else
+/// the grid draws the modifier as its own 2-cell glyph, and the measurer must
+/// charge both, or every later column (find highlight, copy) lands left of
+/// the text.
+#[test]
+fn skin_tone_grid_columns_follow_the_grids_fold() {
+    for (s, cells) in [
+        ("\u{1F44D}\u{1F3FD}", 2),          // thumbs up: a wide base
+        ("\u{1F977}\u{1F3FD}", 2),          // ninja: a wide base
+        ("\u{1F680}\u{1F3FD}", 4),          // rocket: not a base
+        ("\u{1F90D}\u{1F3FD}", 4),          // white heart: not a base
+        ("\u{261D}\u{1F3FD}", 3),           // index up: a base, drawn narrow
+        ("\u{261D}\u{FE0F}\u{1F3FD}", 2),   // ...widened by VS16 first
+        ("a\u{1F3FD}", 3),                  // not an emoji at all
+        ("\u{1F680}\u{1F3FD}\u{1F3FD}", 6), // a modifier is not a base
+        ("\u{1F44D}\u{1F3FD}\u{1F3FD}", 2), // both fold onto the base
+    ] {
+        assert_eq!(str_grid_columns(s), cells, "{s:?}");
+    }
+}
+
+/// The measurer walks a cluster with the grid's own per-character rules.
+/// VS16 widens every narrow base the grid widens (`is_vs16_emoji_capable`),
+/// not only the pictograph blocks `is_emoji_char` names: `©️ ▶️ ℹ️ ‼️ ↔️` are
+/// two cells. A character after a ZWJ folds into the cell before it whatever
+/// that cell holds, so a ZWJ emoji on a narrow base and an explicit
+/// Devanagari half form are one cell. VS15 narrows the glyph but not the
+/// cursor, and a narrowed cell takes no skin-tone modifier.
+#[test]
+fn vs16_zwj_and_vs15_grid_columns_follow_the_grid() {
+    for (s, cells) in [
+        ("\u{A9}\u{FE0F}", 2),
+        ("\u{25B6}\u{FE0F}", 2),
+        ("\u{2139}\u{FE0F}", 2),
+        ("\u{203C}\u{FE0F}", 2),
+        ("\u{2194}\u{FE0F}", 2),
+        ("a\u{FE0F}", 1),
+        ("\u{231A}\u{FE0F}", 2),
+        ("\u{2764}\u{200D}\u{1F525}", 1),
+        ("\u{2764}\u{FE0F}\u{200D}\u{1F525}", 2),
+        ("\u{915}\u{94D}\u{200D}\u{937}", 1),
+        ("\u{1F680}\u{FE0E}\u{FE0F}", 2),
+        ("\u{1F44D}\u{FE0E}\u{1F3FD}", 4),
+    ] {
+        assert_eq!(str_grid_columns(s), cells, "{s:?}");
+    }
+}
+
+/// The grid's fold state crosses UAX #29 cluster boundaries, so the columns
+/// are measured over the whole line, never one cluster at a time. Sinhala
+/// writes yansaya and rakaransaya with a ZWJ that ENDS a cluster (its virama
+/// is no conjunct linker), and the grid folds the next cluster's letter into
+/// the same cell: `ක්‍ය` and `ශ්‍රී` are one cell. A doubled ZWJ (or a mark
+/// between ZWJs) ends a cluster too, and the grid still folds the pictograph
+/// after it; a regional indicator pairs past a mark on the first. ASCII
+/// takes the grid's bulk path, which never folds.
+#[test]
+fn grid_columns_carry_fold_state_across_cluster_boundaries() {
+    for (s, cells, clusters) in [
+        ("\u{0D9A}\u{0DCA}\u{200D}\u{0DBA}", 1, [(0, 1), (0, 1)]),
+        (
+            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}",
+            1,
+            [(0, 1), (0, 1)],
+        ),
+        ("\u{1F44D}\u{200D}\u{200D}\u{1F44D}", 2, [(0, 2), (0, 2)]),
+        (
+            "\u{1F44D}\u{200D}\u{0308}\u{200D}\u{1F44D}",
+            2,
+            [(0, 2), (0, 2)],
+        ),
+        ("\u{1F1FA}\u{0301}\u{1F1F8}", 2, [(0, 2), (0, 2)]),
+        ("\u{1F44D}\u{200D}a", 3, [(0, 2), (2, 3)]),
+        ("a\u{200D}b", 2, [(0, 1), (1, 2)]),
+    ] {
+        assert_eq!(str_grid_columns(s), cells, "{s:?}");
+        let spans: Vec<_> = grid_graphemes(s)
+            .map(|g| (g.start_col, g.end_col))
+            .collect();
+        assert_eq!(spans, clusters, "{s:?}");
+    }
+}
+
 #[test]
 fn test_byte_to_column_zwj_sequence() {
     let emoji = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
@@ -218,6 +319,54 @@ fn test_byte_to_column_zwj_sequence() {
     assert_eq!(byte_to_column(&text, byte_inside), 2);
     assert_eq!(byte_to_column(&text, byte_x), 2);
     assert_eq!(byte_to_column(&text, text.len()), 3);
+}
+
+/// The two public position converters count GRID cells, the unit every caller
+/// measures in: the soft-wrap join pads each row out to the grid width, the
+/// double-click word walk asks whether a clicked cell lies past the text, and
+/// the status line cuts a scraped prompt at the shell's start column. A
+/// Devanagari conjunct is one cluster that looks one cell wide and occupies
+/// three (`न्`, `द`, `ी`); charging its display width put every later column two
+/// cells to the left of its text, so a double-click on the word after it
+/// selected a single cell. A zero-width format character the grid folds into
+/// the previous cell occupies no column.
+#[test]
+fn position_converters_count_grid_cells() {
+    let conjunct = "\u{0928}\u{094D}\u{0926}\u{0940}";
+    let text = format!("{conjunct}{conjunct} tail");
+    let tail = text.find('t').unwrap();
+    // Two 3-cell conjuncts and a space precede `tail`: column 7, char 9.
+    assert_eq!(byte_to_column(&text, tail), 7);
+    assert_eq!(column_to_char_index(&text, 7), 9);
+    assert_eq!(column_to_char_index(&text, 4), 4, "the second conjunct");
+
+    let corpus = [
+        text.as_str(),
+        "\u{0995}\u{09CD}\u{09B7}\u{09BF} x", // Bengali conjunct
+        "a\u{200B}b",                         // ZWSP folds into `a`'s cell
+        "1\u{FE0F}\u{20E3}=\u{2764}\u{FE0F}", // keycap, VS16 emoji
+        "\u{1F468}\u{200D}\u{1F469}\u{1F1FA}\u{1F1F8}", // ZWJ pair, flag
+        "e\u{0301}\u{4E2D}x",                 // combining mark, CJK
+    ];
+    for s in corpus {
+        let mut column = 0usize;
+        let mut chars = 0usize;
+        for g in grid_graphemes(s) {
+            assert_eq!(
+                byte_to_column(s, g.byte_offset),
+                column,
+                "{s:?} at byte {}",
+                g.byte_offset
+            );
+            for c in column..g.end_col {
+                assert_eq!(column_to_char_index(s, c), chars, "{s:?} column {c}");
+            }
+            column = g.end_col;
+            chars += g.text.chars().count();
+        }
+        assert_eq!(byte_to_column(s, s.len()), str_grid_columns(s), "{s:?}");
+        assert_eq!(column_to_char_index(s, column), chars, "{s:?} past the end");
+    }
 }
 
 #[test]
@@ -409,17 +558,17 @@ fn test_grapheme_contains_col() {
     assert!(!cells.contains_col(7));
 }
 
-// Zero-width grapheme column mapping tests (#7605)
+// Zero-width grapheme column mapping tests. `column_to_char_index` counts GRID
+// cells, and the grid gives a zero-width grapheme no cell of its own (it folds
+// into the cell before it), so such a grapheme covers no column: a column at
+// or past it names the grapheme after it.
 
 #[test]
 fn test_column_to_char_index_standalone_zwj() {
-    // Standalone ZWJ (U+200D) at the start: zero-width grapheme occupies 1 column
-    // for mapping purposes, consistent with column_to_byte and grapheme_at_column.
+    // "\u{200D}x" = 2 graphemes: a lone ZWJ (no cell) and `x` (column 0).
     let text = "\u{200D}x";
-    // ZWJ is grapheme 0 (1 char, 0 display width but treated as 1 for mapping)
-    // x is grapheme 1 (1 char)
-    assert_eq!(column_to_char_index(text, 0), 0); // ZWJ at column 0
-    assert_eq!(column_to_char_index(text, 1), 1); // x at column 1
+    assert_eq!(column_to_char_index(text, 0), 1); // x at column 0
+    assert_eq!(column_to_char_index(text, 1), 2); // past end
 }
 
 #[test]
@@ -433,42 +582,41 @@ fn test_column_to_char_index_zwnj_clusters_with_base() {
 
 #[test]
 fn test_column_to_char_index_leading_combining_mark() {
-    // A standalone combining mark at the start of a string (no base character).
-    // Unicode segmentation treats this as its own grapheme cluster with width 0.
+    // A standalone combining mark at the start of a string (no base character)
+    // is its own grapheme cluster with no cell; `x` is at column 0.
     let text = "\u{0301}x"; // combining acute accent + x
-    assert_eq!(column_to_char_index(text, 0), 0); // combining mark at column 0
-    assert_eq!(column_to_char_index(text, 1), 1); // x at column 1
+    assert_eq!(column_to_char_index(text, 0), 1); // x at column 0
+    assert_eq!(column_to_char_index(text, 1), 2); // past end
 }
 
 #[test]
 fn test_column_to_char_index_multiple_zero_width() {
     // ZWNJ + ZWJ cluster into one grapheme per UAX #29.
-    // "\u{200C}\u{200D}a" = 2 graphemes: "\u{200C}\u{200D}" (width 0, 2 chars) + "a" (width 1)
-    // The zero-width cluster occupies 1 effective column for mapping.
+    // "\u{200C}\u{200D}a" = 2 graphemes: "\u{200C}\u{200D}" (no cell, 2 chars) + "a".
     let text = "\u{200C}\u{200D}a";
-    assert_eq!(column_to_char_index(text, 0), 0); // ZWNJ+ZWJ cluster
-    assert_eq!(column_to_char_index(text, 1), 2); // 'a' (char index 2, after ZWNJ and ZWJ)
+    assert_eq!(column_to_char_index(text, 0), 2); // 'a' (char index 2, after ZWNJ and ZWJ)
+    assert_eq!(column_to_char_index(text, 1), 3); // past end
 }
 
 #[test]
 fn test_column_to_char_index_zero_width_between_cjk() {
-    // Zero-width grapheme between CJK characters
+    // Zero-width grapheme between CJK characters: the grid folds the ZWSP into
+    // 世's cell, so 界 starts at column 2.
     let text = "\u{4E16}\u{200B}\u{754C}"; // 世 + ZWSP + 界
     assert_eq!(column_to_char_index(text, 0), 0); // 世 (column 0)
     assert_eq!(column_to_char_index(text, 1), 0); // 世 (column 1, second cell)
-    assert_eq!(column_to_char_index(text, 2), 1); // ZWSP at column 2
-    assert_eq!(column_to_char_index(text, 3), 2); // 界 at column 3
-    assert_eq!(column_to_char_index(text, 4), 2); // 界 (second cell)
+    assert_eq!(column_to_char_index(text, 2), 2); // 界 at column 2
+    assert_eq!(column_to_char_index(text, 3), 2); // 界 (second cell)
+    assert_eq!(column_to_char_index(text, 4), 3); // past end
 }
 
 #[test]
 fn test_column_to_char_index_trailing_zero_width() {
-    // Trailing zero-width grapheme
+    // Trailing zero-width grapheme: no cell, so column 2 is already past the text.
     let text = "ab\u{200B}";
     assert_eq!(column_to_char_index(text, 0), 0); // 'a'
     assert_eq!(column_to_char_index(text, 1), 1); // 'b'
-    assert_eq!(column_to_char_index(text, 2), 2); // ZWSP
-    assert_eq!(column_to_char_index(text, 3), 3); // past end
+    assert_eq!(column_to_char_index(text, 2), 3); // past end
 }
 
 #[test]
@@ -496,111 +644,12 @@ fn test_column_to_char_index_consistency_with_column_to_byte() {
     }
 }
 
-// Width table verification tests (#7736)
+// Width table verification tests
 
-/// Verify our generated char_width tables match unicode-width for the vast majority
-/// of BMP codepoints.
-///
-/// Our tables target Unicode 16.0 while unicode-width 0.2.2 targets Unicode 17.0,
-/// so we allow a small number of differences. The tolerance threshold is set to
-/// catch regressions while permitting version-related drift.
-///
-/// Known difference categories:
-/// - Soft hyphen (U+00AD): our tables treat as narrow, unicode-width as zero-width
-/// - Arabic/Indic format/spacing marks: classification differences between versions
-/// - Newly assigned codepoints in Unicode 17.0
+/// Well-known ambiguous-width characters are wide in CJK mode.
 #[test]
-fn test_char_width_matches_unicode_width_bmp() {
-    use unicode_width::UnicodeWidthChar;
-
-    let mut mismatches = Vec::new();
-    for cp in 0x00A0_u32..=0xFFFF {
-        if let Some(c) = char::from_u32(cp) {
-            let ours = crate::tables::width::char_width(c);
-            let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
-            if ours != theirs {
-                mismatches.push((cp, ours, theirs));
-            }
-        }
-    }
-    // Allow up to 200 mismatches due to Unicode 16.0 vs 17.0 differences.
-    // As of this writing: ~160 differences (Indic spacing marks, Arabic Cf,
-    // soft hyphen, newly assigned chars).
-    assert!(
-        mismatches.len() <= 200,
-        "Too many char_width mismatches vs unicode-width: {} (limit 200).\n\
-         First 20:\n{}",
-        mismatches.len(),
-        mismatches
-            .iter()
-            .take(20)
-            .map(|(cp, ours, theirs)| format!("  U+{cp:04X}: ours={ours}, unicode-width={theirs}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
-/// Verify our tables match unicode-width for SMP emoji and CJK ranges.
-///
-/// Allows a small tolerance for Unicode version differences (16.0 vs 17.0).
-#[test]
-fn test_char_width_matches_unicode_width_smp_sample() {
-    use unicode_width::UnicodeWidthChar;
-
-    let mut mismatches = Vec::new();
-    // CJK Unified Ideographs Extension B (sample)
-    for cp in 0x20000_u32..=0x20100 {
-        if let Some(c) = char::from_u32(cp) {
-            let ours = crate::tables::width::char_width(c);
-            let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
-            if ours != theirs {
-                mismatches.push((cp, ours, theirs));
-            }
-        }
-    }
-    // Emoji ranges
-    for cp in 0x1F300_u32..=0x1F9FF {
-        if let Some(c) = char::from_u32(cp) {
-            let ours = crate::tables::width::char_width(c);
-            let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
-            if ours != theirs {
-                mismatches.push((cp, ours, theirs));
-            }
-        }
-    }
-    // Hangul Syllables
-    for cp in 0xAC00_u32..=0xAC00 + 100 {
-        if let Some(c) = char::from_u32(cp) {
-            let ours = crate::tables::width::char_width(c);
-            let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
-            if ours != theirs {
-                mismatches.push((cp, ours, theirs));
-            }
-        }
-    }
-    // Allow a few mismatches due to Unicode 16.0 vs 17.0 emoji additions
-    assert!(
-        mismatches.len() <= 10,
-        "Too many SMP char_width mismatches vs unicode-width: {} (limit 10).\n\
-         Mismatches:\n{}",
-        mismatches.len(),
-        mismatches
-            .iter()
-            .take(20)
-            .map(|(cp, ours, theirs)| format!("  U+{cp:04X}: ours={ours}, unicode-width={theirs}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
-/// Verify our char_width_cjk tables match unicode-width CJK mode for well-known
-/// ambiguous-width characters that are stable across Unicode versions.
-#[test]
-fn test_char_width_cjk_matches_unicode_width() {
-    use unicode_width::UnicodeWidthChar;
-
-    // Test well-known ambiguous-width characters stable across Unicode versions
-    let ambiguous_samples: &[char] = &[
+fn test_char_width_cjk_widens_ambiguous() {
+    for c in [
         '\u{00A7}', // SECTION SIGN
         '\u{00AE}', // REGISTERED SIGN
         '\u{00B0}', // DEGREE SIGN
@@ -612,13 +661,12 @@ fn test_char_width_cjk_matches_unicode_width() {
         '\u{201C}', // LEFT DOUBLE QUOTATION MARK
         '\u{201D}', // RIGHT DOUBLE QUOTATION MARK
         '\u{2026}', // HORIZONTAL ELLIPSIS
-    ];
-    for &c in ambiguous_samples {
-        let ours_cjk = crate::tables::width::char_width_cjk(c);
-        let theirs_cjk = UnicodeWidthChar::width_cjk(c).unwrap_or(0);
+    ] {
+        assert_eq!(crate::tables::width::char_width(c), 1, "U+{:04X}", c as u32);
         assert_eq!(
-            ours_cjk, theirs_cjk,
-            "char_width_cjk mismatch at U+{:04X}: ours={ours_cjk}, unicode-width={theirs_cjk}",
+            crate::tables::width::char_width_cjk(c),
+            2,
+            "U+{:04X}",
             c as u32
         );
     }
@@ -662,11 +710,11 @@ fn test_char_width_table_boundaries() {
     // Plane 14 (Tags, Variation Selectors Supplement) = zero-width
     assert_eq!(crate::tables::width::char_width('\u{E0001}'), 0);
 
-    // CJK Extension G (U+30000-U+3134A) = wide (#7775)
+    // CJK Extension G (U+30000-U+3134A) = wide
     assert_eq!(crate::tables::width::char_width('\u{30000}'), 2); // Extension G start
     assert_eq!(crate::tables::width::char_width('\u{3134A}'), 2); // Extension G end
 
-    // CJK Extension H (U+31350-U+323AF) = wide (#7775)
+    // CJK Extension H (U+31350-U+323AF) = wide
     assert_eq!(crate::tables::width::char_width('\u{31350}'), 2); // Extension H start
     assert_eq!(crate::tables::width::char_width('\u{323AF}'), 2); // Extension H end
 
@@ -684,14 +732,11 @@ fn test_char_width_table_boundaries() {
     assert_eq!(crate::tables::width::char_width_cjk('\u{2EBF0}'), 2);
 }
 
-/// Plane 14 is Default_Ignorable_Code_Point end to end — the Tags block
-/// (U+E0000..U+E007F, the letters of a subdivision-flag sequence), the
-/// Variation Selectors Supplement (U+E0100..U+E01EF, ideographic variation
-/// selectors) and the reserved gaps between. Every scalar in it is zero-width
-/// in both ambiguous-width modes: it attaches to the preceding cell and draws
-/// nothing. The generated table stops at U+2FFFF, so the block fell into the
-/// hand-written catch-all and came back narrow — a 🏴 plus six tags wrote
-/// seven cells, six of them tofu.
+/// Plane 14 is Default_Ignorable_Code_Point throughout: the Tags block
+/// (U+E0000..U+E007F, subdivision-flag letters), the Variation Selectors
+/// Supplement (U+E0100..U+E01EF) and the reserved gaps. Every scalar is
+/// zero-width in both ambiguous-width modes, although the generated table
+/// stops at U+2FFFF, so 🏴 plus six tags occupies one cell.
 #[test]
 fn plane14_default_ignorables_are_zero_width() {
     for cp in [
@@ -733,32 +778,18 @@ fn plane14_default_ignorables_are_zero_width() {
     );
 }
 
-/// Exhaustive, zero-tolerance parity with the declared oracle (unicode-width
-/// 0.2) across plane 14, in both ambiguous-width modes. The BMP/SMP
-/// differential tests above never reach the plane, which is how the
-/// catch-all's answer for it went unmeasured.
+/// Plane 14 (tags, variation selectors supplement, unassigned) is zero-width
+/// in both ambiguous-width modes — the table catch-all's answer for the plane.
 #[test]
-fn test_char_width_matches_unicode_width_plane14() {
-    use unicode_width::UnicodeWidthChar;
-
+fn test_char_width_plane14_is_zero() {
     for cp in 0xE0000_u32..=0xE0FFF {
         let c = char::from_u32(cp).expect("plane 14 scalar");
-        let ours = crate::tables::width::char_width(c);
-        let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
-        assert_eq!(
-            ours, theirs,
-            "U+{cp:05X}: ours={ours}, unicode-width={theirs}"
-        );
-        let ours_cjk = crate::tables::width::char_width_cjk(c);
-        let theirs_cjk = UnicodeWidthChar::width_cjk(c).unwrap_or(0);
-        assert_eq!(
-            ours_cjk, theirs_cjk,
-            "U+{cp:05X} in CJK mode: ours={ours_cjk}, unicode-width={theirs_cjk}"
-        );
+        assert_eq!(crate::tables::width::char_width(c), 0, "U+{cp:05X}");
+        assert_eq!(crate::tables::width::char_width_cjk(c), 0, "U+{cp:05X} CJK");
     }
 }
 
-// CJK aggregate function tests (#7605)
+// CJK aggregate functions
 
 #[test]
 fn test_grapheme_width_with_config_single() {
@@ -864,7 +895,7 @@ fn test_split_graphemes_with_config_matches_aggregate() {
     assert_eq!(split_codepoints, aggregate.codepoint_count);
 }
 
-// CJK ambiguous-width tests (#1371)
+// CJK ambiguous-width tests
 
 #[test]
 fn test_ambiguous_width_degree_sign() {

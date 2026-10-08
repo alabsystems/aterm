@@ -7,8 +7,9 @@
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
 //! [--release-credentials <profile.toml>]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
-//! `check [--commit REV]`, `verify [vX.Y.Z]`,
-//! `yank <build> [--release-credentials <profile.toml>]`.
+//! `check [--commit REV]`, `measure verdict`, `trust verdict|judge|pending|prover|admit|conclude|compare`,
+//! `verify [vX.Y.Z]`,
+//! `yank <build> [--release-credentials <profile.toml>] --mac-only|--linux-artifacts DIRECTORY`.
 
 use std::process::Command;
 
@@ -30,8 +31,7 @@ pub const RETIRED_UNMIRRORED_FLAG: &str = "--retire-unmirrored";
 
 /// The one sentence [`RETIRED_UNMIRRORED_FLAG`] is refused with.
 pub const RETIRED_UNMIRRORED_REFUSAL: &str = "--retire-unmirrored is retired: a cut publishes \
-     once, straight onto the release channel, so there is no origin release left unmirrored — \
-     a cut the channel's floors refuse before its head PATCH is `--abandon vX.Y.Z`'s case";
+     once, onto the channel; withdraw an unpublished cut with `ship cut --abandon vX.Y.Z`";
 
 /// Why a real or rehearsal cut that says nothing about Linux is refused.
 pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --linux-artifacts \
@@ -68,7 +68,7 @@ USAGE
         --min-build N      emit an operator apply floor into the manifest
         --gate             additionally run tools/verify.sh --full and the
                            whole-tree tools/trust-gate-all.sh inline (green,
-                           they file the MEASURE and TRUST receipts a real cut
+                           they file the MEASURE receipt and TRUST facts a real cut
                            requires for the tree it builds)
         --rehearse O/R     full real cut published to the scratch channel O/R,
                            which must be PUBLIC (provisional number, no ledger
@@ -87,13 +87,10 @@ USAGE
         --mac-only         ship no Linux build, on purpose; a real or rehearsal
                            cut must say this or --linux-artifacts
         --no-paint-smoke   EMERGENCY ONLY: skip the self-check's paint smoke
-                           (the 29-keystroke pixel proof that the just-built
-                           bundle actually paints its flagship effect — the
-                           check born from v0.48.0/v0.49.0 shipping the rainbow
-                           trail dark, docs/RELEASE-PROOF-DISCIPLINE.md).
-                           Refused on a notarized real cut unless
-                           ATERM_NO_PAINT_SMOKE_ACK=this-cut-may-ship-dark is
-                           also set
+                           (the pixel proof that the built bundle paints its
+                           flagship effect; docs/RELEASE-PROOF-DISCIPLINE.md).
+                           A notarized real cut also needs
+                           ATERM_NO_PAINT_SMOKE_ACK=this-cut-may-ship-dark
         --release-credentials <profile.toml>
                            the signing profile: a rostered, unrevoked machine
                            key and its notary credential. A cut without one
@@ -101,9 +98,10 @@ USAGE
                            ~/.aterm/release-credentials.toml when it exists)
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
-                           ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh
-                           FIRST — provision refuses without a Trust toolchain.
-                           Then: make THIS machine a publisher. Seeds the newest
+                           ON A BARE MACHINE (no Trust toolchain) run
+                           tools/bootstrap-publisher.sh --id <machine-id> instead:
+                           it installs Trust, then runs provision.
+                           Makes THIS machine a publisher. Seeds the newest
                            master-signed roster pair from the channel release
                            into dist/, audits the WHOLE publishing stack — Trust
                            stage2 (real smoke-compile), the targo/tippy/ty
@@ -140,35 +138,110 @@ USAGE
                            pre-claim gates that read only the commit and this
                            repository's receipt store — the release notes, the
                            predecessor's handoff fixtures, the handoff policy,
-                           the MEASURE receipt, the whole-tree TRUST receipt —
+                           the MEASURE receipt, the whole-tree TRUST facts —
                            with the compiler this machine's cut builds with?
                            The cut's own gate code, run for REV: no build of
                            aterm, seconds. Answers only as REV's own cutter
                            (built from REV, or with its cutter sources
                            unchanged since) and refuses to answer otherwise.
                            Exits 1 naming each gate that would refuse and its
-                           remedy. publish/pre-promote builds REV's own cutter
-                           in a throwaway worktree and runs it before `pub
-                           promote` publishes the source, so a source those
-                           gates would stop a cut of is never published
-                           (v0.96.0, v0.99.0)
+                           remedy
+  targo --unverified ship trust verdict [--commit REV] [--prover BIN-DIR]
+                           the whole-tree Trust lane's verdict for REV (default
+                           HEAD), JUDGED NOW: the facts a whole-tree run filed
+                           for REV's tree less its floors (the ratchet and
+                           tools/trust-gate-memory.tsv), from the prover the
+                           cut builds with (--prover names its bin/; default:
+                           the cut's own), held to REV's own floors. The cut's
+                           own judge, one line; exit 0 VERIFIED, 1 not, 2 could
+                           not answer. A commit that changes only the floors
+                           reuses the facts of the run before it — no new run —
+                           its floors held to the merge contract's up-only rule
+                           against the run's
+  targo --unverified ship measure verdict [--commit REV] [--prover BIN-DIR]
+                           was REV's tree (default HEAD) MEASURED, with the
+                           compiler whose bin/ is BIN-DIR (default: the one the
+                           cut builds with)? The cut's own MEASURE judge, over
+                           this repository's receipt store and, read-only, each
+                           checkout aterm-release.receiptsFrom names (newest
+                           receipt about these bytes, compiler and build
+                           decides); one line naming the store it read; exit 0
+                           MEASURED, 1 not, 2 could not answer
+  targo --unverified ship trust judge [--commit REV] [--prover BIN-DIR] [--update-ratchet [--reason WHY]]
+                           the lane's whole report for REV's stored facts,
+                           judged against the WORKING tree's
+                           tools/trust-gate-ratchet.tsv; --update-ratchet writes
+                           it as the lane's --update-ratchet would (a first
+                           floor, a high-water mark, a total corrected, a
+                           re-base onto this prover it meets — never a
+                           lowering); with --reason WHY, a floor another prover
+                           recorded that the facts fall below is lowered onto
+                           this prover, WHY in its fifth column; working floors
+                           the up-only rule refuses against the run's are named
+                           LOWERED, and fail
+  targo --unverified ship trust pending [--commit REV] [--prover BIN-DIR]
+                           the libraries REV's stored facts leave undecided
+                           (trustd did not admit them, or lapsed budgets could
+                           cover their shortfall), one per line: what
+                           tools/trust-gate-all.sh --remeasure runs again
+  targo --unverified ship trust prover --driver <targo>
+  targo --unverified ship trust admit --plan <file>
+  targo --unverified ship trust conclude --plan <file> [--update-ratchet]
+                           tools/trust-gate-all.sh's own calls: the pinned
+                           driver's prover identity, the libraries this host
+                           refuses for memory before the run, and the lane's
+                           end (measure the logs, judge, file the facts)
+  targo --unverified ship trust compare --base <plan> --candidate <plan>
+        [--base-logdir DIR] [--candidate-logdir DIR] [--tsv FILE] [--base-prover ID]
+        [--ratchet FILE] [--retractions FILE] [--trust-repo DIR]
+        [--candidate-trust-commit SHA] [--base-trust-commit SHA] [--obligations-tsv FILE]
+                           THE CANDIDATE GATE (D27; tools/trust-gate-candidate.sh
+                           runs it): two whole-tree runs of one aterm tree on one
+                           machine — the published seal's and a candidate
+                           toolchain's — compared library by library and,
+                           from each check's per-obligation record, obligation
+                           by obligation. An obligation the seal proved that
+                           the candidate does not refuses, whatever it gains
+                           elsewhere, unless the retraction ledger
+                           (--retractions) names it as a false proof retracted
+                           by a trust commit the candidate's own contains (read
+                           in --trust-repo); a library given no result in its
+                           wall budget, or no usable record, refuses; where the
+                           seal's own check gave none, the candidate is held to
+                           the floor the seal's prover recorded (--ratchet,
+                           default the base plan's) and refused when there is
+                           none. --obligations-tsv lists each lost obligation
+                           by its ledger key. Exit 0 PUBLISH-OK, 1
+                           PUBLISH-REFUSED, 2 could not compare (also refused):
+                           runs of different trees, machines, scopes, budgets
+                           or slot counts, a run that did not conclude or
+                           captured no records, the same prover twice, nothing
+                           compared at all, a ledger that does not read or that
+                           a candidate contradicts
+  targo --unverified ship trust obligations --report <report.ndjson> --package <name>
+        --repo <checkout> [--manifest <path>] --out <file>
+                           tools/trust-gate-all.sh --obligations's own call: one
+                           check's proof report reduced to its per-obligation
+                           record (exit 1, and why, when it cannot vouch for it)
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
-                           explicit killed-machine recovery: exact-CAS rotate
-                           its fence only after operator stop proof; abandon
-                           unpublished state or validate + finish a published
-                           exact-identity cut
+                           finish or withdraw the cut of a machine that died
+                           mid-cut: withdraw it if unpublished, verify and finish
+                           it if published. Run only once its old cutter process
+                           has exited (--old-publisher-stopped says so).
+        --no-draft-was-posted
+                           you checked the channel's releases page and it shows
+                           no release for vX.Y.Z (needed when the journal is lost)
   targo --unverified ship verify [vX.Y.Z]
                            re-run the post-publish check anytime
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
-                           publish + fully verify a min_build-ratcheted
-                           successor FIRST; only then delete the inert bad
-                           build's origin tag and demote its channel release to
-                           a prerelease (crash-convergent cleanup). That
-                           successor is a REAL cut, so it takes the cut's
-                           signing input and means exactly what it means there
-                           — with the paper master armed it refuses pre-claim
-                           without it, having deleted nothing
+                 (--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
+                  [--linux-worker ARCH=HOST:REPO]... | --mac-only)
+                           publish and verify a successor FIRST (a real cut with
+                           min_build = <build>+1, signed with
+                           --release-credentials, declaring Linux as any cut
+                           must); only then delete the bad build's origin tag
+                           and demote its channel release to a prerelease
 ";
 
 /// A parsed invocation. `Cut.abandon` rides outside [`publish::CutOptions`]
@@ -212,6 +285,15 @@ pub enum Cmd {
     Verify {
         version: Option<String>,
     },
+    /// `trust <verb>` — the whole-tree Trust lane's facts and their judge
+    /// ([`crate::trust_facts`]).
+    Trust(crate::trust_facts::TrustCmd),
+    /// `measure verdict [--commit REV] [--prover BIN-DIR]` — the cutter's
+    /// MEASURE judge, for the release scripts ([`gates::run_measure_verdict`]).
+    MeasureVerdict {
+        commit: String,
+        prover: Option<std::path::PathBuf>,
+    },
     Yank {
         build: u64,
         /// A yank PUBLISHES a successor before it deletes anything, so it takes
@@ -229,11 +311,36 @@ pub fn run() -> i32 {
     let cmd = match parse(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("aterm-release: {e}\n");
-            eprint!("{USAGE}");
+            eprintln!("aterm-release: {e}\nusage: {} help", publish::SHIP_COMMAND);
             return 2;
         }
     };
+    // The trust verbs answer three ways (0 / 1 / 2: pass, fail, could not
+    // run), which the lane and the release scripts read; every other verb is
+    // ok or not.
+    // `trust prover` and a `trust conclude` that files nothing read no git, so
+    // a directory that is no checkout (the lane's self-test) is no refusal;
+    // the verbs that do read git fail there on their own.
+    if let Cmd::Trust(t) = cmd {
+        let root = repo_root()
+            .ok()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let code = crate::trust_facts::run_cmd(&root, t);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return code;
+    }
+    if let Cmd::MeasureVerdict { commit, prover } = &cmd {
+        let code = match repo_root() {
+            Ok(root) => crate::gates::run_measure_verdict(&root, commit, prover.as_deref()),
+            Err(e) => {
+                eprintln!("aterm-release measure verdict: {e}");
+                2
+            }
+        };
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return code;
+    }
     let outcome = dispatch(cmd);
     // The ONE flush in the binary, and it earns its place. Everything above prints to
     // stdout; this prints to stderr. Under `… 2>&1 | tee provision.log` — the obvious
@@ -244,21 +351,37 @@ pub fn run() -> i32 {
     match outcome {
         Ok(()) => 0,
         Err(e) => {
-            // A message that names its own verdict word KEEPS it. `provision` ends in
-            // "NOT DONE — 1 waiting: the certificate errand is at Apple", whose remedy is
-            // to wait; printing FAILED in front of that is the tool contradicting itself
-            // in the one line the shell shows. `tally`'s own doc already conceded the
-            // point — the counting phrase was fixed and the sentence around it was not.
-            //
-            // The exit code stays 1 either way: a script must never read "waiting" as
-            // ready.
-            if e.to_string().starts_with("NOT DONE") {
-                eprintln!("aterm-release: {e}");
-            } else {
-                eprintln!("aterm-release: FAILED — {e}");
-            }
+            // A message that names its own verdict word KEEPS it: "NOT DONE — 1 waiting",
+            // "CHECK ONLY — nothing was written", "… COULD NOT RUN", "… NARROWED", "…
+            // FAILED — fix the tree". Printing FAILED in front of those contradicts the
+            // message, or doubles it. The exit code stays 1 either way: a script must
+            // never read "waiting" as ready.
+            eprintln!("{}", failure_line(&e.to_string()));
             1
         }
+    }
+}
+
+/// Verdict words a failure message may already carry; [`failure_line`] keeps them.
+const OWN_VERDICT: [&str; 5] = [
+    "NOT DONE",
+    "CHECK ONLY",
+    "COULD NOT RUN",
+    "NARROWED",
+    "FAILED",
+];
+
+/// The last line a failed verb prints: `FAILED —` in front of the message unless
+/// the message names its own verdict.
+pub fn failure_line(msg: &str) -> String {
+    let own = OWN_VERDICT.iter().any(|w| match *w {
+        "NOT DONE" | "CHECK ONLY" => msg.starts_with(w),
+        _ => msg.contains(&format!(" {w} —")) || msg.contains(&format!(" {w}:")),
+    });
+    if own {
+        format!("aterm-release: {msg}")
+    } else {
+        format!("aterm-release: FAILED — {msg}")
     }
 }
 
@@ -413,9 +536,8 @@ fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, Strin
                     "recover requires --old-publisher-stopped, got {acknowledgement:?}"
                 ));
             }
-            // Recovery signs, so it accepts the one credentials flag — and nothing
-            // else. It used to refuse every extra argument, which was correct when
-            // the key was ambient and is wrong now that it must be named.
+            // Recovery signs, so it accepts the credentials flag: the key must be
+            // named, never ambient.
             let mut release_credentials: Option<std::path::PathBuf> = None;
             let mut no_draft_posted = false;
             while let Some(arg) = it.next() {
@@ -455,7 +577,8 @@ fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, Strin
         }
         "yank" => {
             let build = it.next().ok_or(
-                "yank needs the bad release's build number: targo --unverified ship yank <build>",
+                "yank needs the bad release's build number: targo --unverified ship yank <build> \
+                 --release-credentials <profile.toml> --mac-only|--linux-artifacts DIRECTORY",
             )?;
             let build: u64 = build
                 .parse()
@@ -465,7 +588,10 @@ fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, Strin
             // so a yank that cannot forward that answer cannot retire a bad build
             // at all. Same flag, same spelling, same meaning as `cut`.
             //
-            // And ONLY that one: every other cut flag either contradicts what
+            // The Linux declaration is forwarded too: the successor is a real
+            // cut, and a real cut that says nothing about Linux is refused.
+            //
+            // Nothing else: every other cut flag either contradicts what
             // a yank's successor is (--dry-run/--rehearse publish nothing to
             // prove, --resume belongs to the journal) or is the yank's own
             // decision (--min-build is fixed at bad build + 1), so accepting one
@@ -481,18 +607,138 @@ fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, Strin
                             it.next().ok_or("--release-credentials needs a path")?,
                         ));
                     }
+                    "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
+                        yank_linux(&mut opts).take(flag, &mut it)?;
+                    }
                     RETIRED_STRAND_FLAG => return Err(RETIRED_STRAND_REFUSAL.to_string()),
                     extra => {
                         return Err(format!(
-                            "yank takes one build number and optionally --release-credentials \
-                             <profile.toml> (got {extra:?})"
+                            "yank takes one build number, optionally --release-credentials \
+                             <profile.toml>, and the cut's Linux flags (got {extra:?})"
                         ));
                     }
                 }
             }
+            let linux = yank_linux(&mut opts);
+            linux.check()?;
+            // The successor is a real cut, so it declares Linux like one.
+            if !linux.declared() {
+                return Err(format!("yank publishes a cut first; {MAC_ONLY_REFUSAL}"));
+            }
             Ok(Cmd::Yank { build, opts })
         }
+        "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
+        "measure" => parse_measure(&mut it),
         other => Err(format!("unknown command {other:?}")),
+    }
+}
+
+/// `measure verdict [--commit REV] [--prover BIN-DIR]`.
+fn parse_measure<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<Cmd, String> {
+    match it.next() {
+        Some("verdict") => {}
+        Some(other) => return Err(format!("unknown measure verb {other:?} (only: verdict)")),
+        None => return Err("measure needs a verb: verdict".to_string()),
+    }
+    let (mut commit, mut prover) = (None, None);
+    while let Some(flag) = it.next() {
+        let slot = match flag {
+            "--commit" => &mut commit,
+            "--prover" => &mut prover,
+            other => return Err(format!("measure verdict: unknown flag {other:?}")),
+        };
+        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        if value.is_empty() || value.starts_with('-') {
+            return Err(format!("{flag} needs a value, got {value:?}"));
+        }
+        if slot.replace(value.to_string()).is_some() {
+            return Err(format!("{flag} given twice"));
+        }
+    }
+    Ok(Cmd::MeasureVerdict {
+        commit: commit.unwrap_or_else(|| "HEAD".to_string()),
+        prover: prover.map(std::path::PathBuf::from),
+    })
+}
+
+/// The Linux declaration a cut makes, and a yank forwards to its successor cut:
+/// `--linux-artifacts DIRECTORY [--linux-target ARCH]... [--linux-worker
+/// ARCH=HOST:REPO]... | --mac-only`.
+struct LinuxFlags<'o> {
+    artifacts: &'o mut Option<std::path::PathBuf>,
+    targets: &'o mut Vec<String>,
+    workers: &'o mut Vec<String>,
+    mac_only: &'o mut bool,
+}
+
+impl LinuxFlags<'_> {
+    /// Consume one of the four Linux flags (and its value).
+    fn take<'a>(
+        &mut self,
+        flag: &str,
+        it: &mut impl Iterator<Item = &'a str>,
+    ) -> std::result::Result<(), String> {
+        match flag {
+            "--linux-artifacts" => {
+                if self.artifacts.is_some() {
+                    return Err("--linux-artifacts given twice".into());
+                }
+                *self.artifacts = Some(std::path::PathBuf::from(
+                    it.next().ok_or("--linux-artifacts needs a directory")?,
+                ));
+            }
+            "--linux-worker" => {
+                let spec = it
+                    .next()
+                    .ok_or("--linux-worker needs ARCH=DESTINATION:REPOSITORY")?;
+                crate::buildplan::linux::Worker::parse(spec)?;
+                self.workers.push(spec.to_string());
+            }
+            "--mac-only" => *self.mac_only = true,
+            _ => {
+                let triple = match it.next().ok_or("--linux-target needs aarch64 or x86_64")? {
+                    "aarch64" => "aarch64-unknown-linux-gnu",
+                    "x86_64" => "x86_64-unknown-linux-gnu",
+                    other => {
+                        return Err(format!("unsupported Linux release architecture {other:?}"));
+                    }
+                };
+                if self.targets.iter().any(|t| t == triple) {
+                    return Err("duplicate --linux-target".into());
+                }
+                self.targets.push(triple.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The flags must agree with each other.
+    fn check(&self) -> std::result::Result<(), String> {
+        if !self.targets.is_empty() && self.artifacts.is_none() {
+            return Err("--linux-target requires --linux-artifacts".into());
+        }
+        if !self.workers.is_empty() && self.artifacts.is_none() {
+            return Err("--linux-worker requires --linux-artifacts (where its pair lands)".into());
+        }
+        if *self.mac_only && self.artifacts.is_some() {
+            return Err("--mac-only and --linux-artifacts contradict each other".into());
+        }
+        Ok(())
+    }
+
+    /// Whether a declaration was made at all.
+    fn declared(&self) -> bool {
+        *self.mac_only || self.artifacts.is_some()
+    }
+}
+
+/// The Linux declaration a yank forwards to its successor cut.
+fn yank_linux(opts: &mut verify::YankOptions) -> LinuxFlags<'_> {
+    LinuxFlags {
+        artifacts: &mut opts.linux_artifacts,
+        targets: &mut opts.linux_targets,
+        workers: &mut opts.linux_workers,
+        mac_only: &mut opts.mac_only,
     }
 }
 
@@ -509,34 +755,14 @@ fn parse_cut<'a>(
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
-            "--linux-artifacts" => {
-                if opts.linux_artifacts.is_some() {
-                    return Err("--linux-artifacts given twice".into());
+            "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
+                LinuxFlags {
+                    artifacts: &mut opts.linux_artifacts,
+                    targets: &mut opts.linux_targets,
+                    workers: &mut opts.linux_workers,
+                    mac_only: &mut opts.mac_only,
                 }
-                opts.linux_artifacts = Some(std::path::PathBuf::from(
-                    it.next().ok_or("--linux-artifacts needs a directory")?,
-                ));
-            }
-            "--linux-worker" => {
-                let spec = it
-                    .next()
-                    .ok_or("--linux-worker needs ARCH=DESTINATION:REPOSITORY")?;
-                crate::buildplan::linux::Worker::parse(spec)?;
-                opts.linux_workers.push(spec.to_string());
-            }
-            "--mac-only" => opts.mac_only = true,
-            "--linux-target" => {
-                let triple = match it.next().ok_or("--linux-target needs aarch64 or x86_64")? {
-                    "aarch64" => "aarch64-unknown-linux-gnu",
-                    "x86_64" => "x86_64-unknown-linux-gnu",
-                    other => {
-                        return Err(format!("unsupported Linux release architecture {other:?}"));
-                    }
-                };
-                if opts.linux_targets.iter().any(|t| t == triple) {
-                    return Err("duplicate --linux-target".into());
-                }
-                opts.linux_targets.push(triple.into());
+                .take(flag, it)?;
             }
             // An EMERGENCY ESCAPE, not a setting — publish::paint_smoke_policy
             // owns the refusal on notarized real cuts and the ack it demands.
@@ -575,9 +801,6 @@ fn parse_cut<'a>(
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
-    if !opts.linux_targets.is_empty() && opts.linux_artifacts.is_none() {
-        return Err("--linux-target requires --linux-artifacts".into());
-    }
     // Mode exclusivity: each of abandon/resume is a whole flow of its own —
     // silently ignoring a second flag would do something the operator did not
     // ask for, on the one command where that costs a burned ledger number.
@@ -615,16 +838,16 @@ fn parse_cut<'a>(
     if opts.dry_run && opts.rehearse.is_some() {
         return Err("--dry-run and --rehearse are mutually exclusive".to_string());
     }
-    if !opts.linux_workers.is_empty() && opts.linux_artifacts.is_none() {
-        return Err("--linux-worker requires --linux-artifacts (where its pair lands)".into());
+    LinuxFlags {
+        artifacts: &mut opts.linux_artifacts,
+        targets: &mut opts.linux_targets,
+        workers: &mut opts.linux_workers,
+        mac_only: &mut opts.mac_only,
     }
-    if opts.mac_only && opts.linux_artifacts.is_some() {
-        return Err("--mac-only and --linux-artifacts contradict each other".into());
-    }
-    // LINUX IS DECLARED, NEVER DEFAULTED AWAY (2026-09-28). A real or rehearsal cut
-    // without `--linux-artifacts` used to go out Mac-only in silence, and every
-    // Linux install stayed on the build it had: v0.86.0 through v0.93.0 all
-    // shipped that way before anyone noticed. Refused here — before a gate, a
+    .check()?;
+    // LINUX IS DECLARED, NEVER DEFAULTED AWAY. A cut without `--linux-artifacts`
+    // would go out Mac-only in silence, leaving every Linux install on the build it
+    // had. Refused here — before a gate, a
     // lease or a claim — unless the operator says `--mac-only` out loud. A dry
     // run publishes nothing and a resume or abandon already has its shape; a
     // cutter handed its cut by another was held to this by that one.
@@ -700,6 +923,16 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),
         Cmd::Yank { build, opts } => verify::run_yank(&repo_root()?, build, &opts),
+        Cmd::Trust(t) => match crate::trust_facts::run_cmd(&repo_root()?, t) {
+            0 => Ok(()),
+            code => Err(Error::new(format!("trust exited {code}"))),
+        },
+        Cmd::MeasureVerdict { commit, prover } => {
+            match crate::gates::run_measure_verdict(&repo_root()?, &commit, prover.as_deref()) {
+                0 => Ok(()),
+                code => Err(Error::new(format!("measure verdict exited {code}"))),
+            }
+        }
     }
 }
 

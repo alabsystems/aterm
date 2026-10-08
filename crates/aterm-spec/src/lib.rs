@@ -20,10 +20,11 @@
 //! Prefer DERIVED models over hand-written `.tla`: write a bounded state machine
 //! once as a Rust [`derive::Model`] (or via the [`ty_model`] macro) and the
 //! `ty`-checkable spec AND the executable interpreter are generated from that one
-//! source, so they cannot drift from each other or from the code. See
-//! `docs/RFC-ty-embed-derived-tla.md` and the `AGENTS.md` at the repo root for the
-//! workflow (Tier-0 `ty check` of the derived spec; Tier-1 conformance binding the
-//! model to the real code). Existing models: [`derive::ring_model`],
+//! source, so they cannot drift from each other. The model itself is authored, so
+//! it can drift from the code; Tier-1 conformance is what binds the two. See the
+//! [`derive`] module docs and the `AGENTS.md` at the repo root for the workflow
+//! (Tier-0 `ty check` of the derived spec; Tier-1 conformance binding the model to
+//! the real code). Existing models: [`derive::ring_model`],
 //! [`derive::kernel_model`], [`derive::subscribe_model`], [`derive::snapshot_model`],
 //! [`derive::transact_model`], [`derive::cursor_model`],
 //! [`derive::read_image_seq_model`] (the A-3 read_image snapshot-seq protocol),
@@ -53,12 +54,17 @@ pub use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled, ty_model};
 // live in `xref` (TRUST_NATIVE_TLA §2.1).
 pub use inventory;
 
+mod compiled;
 pub mod derive;
 pub mod harness_manifest;
 pub mod interp;
 pub mod ir;
+pub mod rng;
 pub mod tla_check;
 pub mod verify;
+// `std::thread::sleep` and `Instant::now` panic on the browser target.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod wait;
 pub mod xref;
 
 /// Bind a `#[kani::proof]` harness to a model `(machine, action)` — the kani half of

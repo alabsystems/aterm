@@ -24,7 +24,8 @@ pub trait Sink {
 
     fn extend_from_slice_wild(&mut self, data: &[u8], copy_len: usize);
 
-    /// Copies `len` bytes starting from `start` to the end of the Sink.
+    /// Copies `wild_len` bytes from `start` to the end of the Sink and
+    /// advances by `copy_len`.
     /// # Panics
     /// Panics if `start` >= `pos`.
     fn extend_from_within(&mut self, start: usize, wild_len: usize, copy_len: usize);
@@ -32,19 +33,12 @@ pub trait Sink {
     fn extend_from_within_overlapping(&mut self, start: usize, num_bytes: usize);
 }
 
-/// SliceSink is used as target to de/compress data into a preallocated and possibly uninitialized
-/// `&[u8]`
-/// space.
+/// A `Sink` over a preallocated `&mut [u8]`.
 ///
-/// # Handling of Capacity
-/// Extend methods will panic if there's insufficient capacity left in the Sink.
-///
-/// # Invariants
-///   - Bytes `[..pos()]` are always initialized.
+/// Extend methods panic when capacity runs out.
 pub struct SliceSink<'a> {
-    /// The working slice, which may contain uninitialized bytes
     output: &'a mut [u8],
-    /// Number of bytes in start of `output` guaranteed to be initialized
+    /// Bytes written so far.
     pos: usize,
 }
 
@@ -56,14 +50,13 @@ impl<'a> SliceSink<'a> {
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // documented '# Panics if pos is out of bounds' constructor contract
     pub fn new(output: &'a mut [u8], pos: usize) -> Self {
-        // SAFETY: Caller guarantees that all elements of `output[..pos]` are initialized.
+        // SAFETY: the caller has written `output[..pos]`.
         let _ = &mut output[..pos]; // bounds check pos
         SliceSink { output, pos }
     }
 }
 
 impl Sink for SliceSink<'_> {
-    /// Pushes a byte to the end of the Sink.
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // caller-contract read (`pos < pos()`); OOB panics by documented Sink contract
     fn byte_at(&mut self, pos: usize) -> u8 {
@@ -95,7 +88,6 @@ impl Sink for SliceSink<'_> {
         self.pos += len;
     }
 
-    /// Extends the Sink with `data`.
     #[inline]
     fn extend_from_slice(&mut self, data: &[u8]) {
         self.extend_from_slice_wild(data, data.len())
@@ -104,22 +96,13 @@ impl Sink for SliceSink<'_> {
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // documented Sink contract: extend methods panic on insufficient capacity
     fn extend_from_slice_wild(&mut self, data: &[u8], copy_len: usize) {
-        // `copy_len <= data.len()` is the documented caller contract. The
-        // guard asserting it lives at the one non-trivial call site
-        // (`copy_literals_wild` — same message, same abort, one frame
-        // earlier, before any side effect); `extend_from_slice` passes
-        // `data.len()` and satisfies it trivially. It cannot live HERE: an
-        // explicit assert! inside a trust::skip'd TRAIT-IMPL method leaks to
-        // every caller as an obligation the native lane cannot bind (flip 1,
-        // trust reports/absent-callee-gate-vs-trust-skip-2026-07-06.md) and
-        // fatally poisons them with an absent-callee row.
+        // Caller contract: `copy_len <= data.len()`. No assert here: an
+        // assert! in a trust::skip'd trait-impl method leaks to every caller
+        // as an obligation the verifier cannot bind.
         slice_copy(data, &mut self.output[self.pos..(self.pos) + data.len()]);
         self.pos += copy_len;
     }
 
-    /// Copies `len` bytes starting from `start` to the end of the Sink.
-    /// # Panics
-    /// Panics if `start` >= `pos`.
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // documented Sink contract: extend methods panic on insufficient capacity
     fn extend_from_within(&mut self, start: usize, wild_len: usize, copy_len: usize) {

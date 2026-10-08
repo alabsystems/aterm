@@ -5,46 +5,38 @@
 //! (`aterm_spec::derive::native_update_history_carry_model`): a self-update
 //! carries every history line of a tab, or counts it.
 //!
-//! Every path of the machine — the export, up to two lines of output and a
-//! rewrap in any order, the park, a sidecar corrupted on disk or not, a
-//! scrollback the successor's pane clears before the import or not, and the
-//! successor's import — is driven through the REAL code on real engines:
-//! `HistoryExporter` writes the sidecar from a live `Terminal`, the park is
-//! `Terminal::checkpoint_carry` (at the machine's `Cap`) plus
-//! [`capture_head`], the join is [`stamp_manifest`] (which calls [`join`]),
-//! the successor's take-before-proof is [`incoming`], its adopt is the real
-//! `spawn::hydrate_adopted_engine` (the restore, the keys reserved and the
-//! claim kept), and its import is [`run_imports`]. The environment is real
-//! too: output is `Terminal::process`, the rewrap `Terminal::resize` one
-//! column narrower, the corruption one flipped byte in the named sidecar, and
-//! the clear an `ESC [3J` the adopted engine processes. The export runs
-//! without FOLLOWING (the fork lane's shape): the machine's `Export` is where
-//! the export's last look ended, and the launched lane's following — which
-//! only moves that point later — is pinned by
+//! Every path of the machine (the export, up to two lines of output and a
+//! rewrap in any order, the park, an optionally corrupted sidecar, an
+//! optional scrollback clear before the import, and the import) is driven
+//! through the real code on real engines: `HistoryExporter` writes the sidecar
+//! from a live `Terminal`; the park is `Terminal::checkpoint_carry` (at the
+//! machine's `Cap`) plus [`capture_head`]; the join is [`stamp_manifest`]
+//! (which calls [`join`]); the take-before-proof is [`incoming`]; the adopt is
+//! `spawn::hydrate_adopted_engine`; the import is [`run_imports`]. Output is
+//! `Terminal::process`, the rewrap a resize one column narrower, the
+//! corruption one flipped byte in the sidecar, the clear an `ESC [3J`. The
+//! export runs without following (the fork lane's shape); the launched lane's
+//! following is pinned by
 //! `a_following_export_takes_what_lands_after_its_first_pass`.
 //!
-//! Projection, after every step, onto the machine's variables: `exp` — the
-//! export's fenced line count; `total` — the parent's history at the park;
-//! `carried` — [`carried_history`] of the checkpoint; `take` — what the join
-//! named; `dropped` — the record's `history_dropped`; `held` — the
-//! successor's history, counted after the import; `failed` — the report's
-//! `failed_lines`. Where nothing was lost the successor's history is also
-//! compared with the parent's LINE FOR LINE — a count alone could hide the
-//! wrong lines.
+//! Projection after every step: `exp` — the export's fenced line count;
+//! `total` — the parent's history at the park; `carried` —
+//! [`carried_history`] of the checkpoint; `take` — what the join named;
+//! `dropped` — the record's `history_dropped`; `held` — the successor's
+//! history after the import; `failed` — the report's `failed_lines`. Where
+//! nothing was lost, the successor's history is also compared line for line.
 //!
-//! NEGATIVE CONTROL: the machine's `Buggy = 1` member (a fallback that counts
-//! nothing, a sidecar named over a moved history, a failed sidecar dropped
-//! without a count, a cleared history put back) is replayed along the same
-//! real paths, and on each of its four defect paths the real code lands
-//! somewhere the buggy machine does not — so a pass here is never vacuous.
+//! Negative control: the `Buggy = 1` machine's four defect paths are replayed
+//! on the real code, and on each the real code lands where the buggy machine
+//! does not.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 use aterm_spec::derive::Model;
 
+use super::tests::history;
 use super::*;
 use crate::session_store::{SessionHandoff, SessionRecord};
 
@@ -79,17 +71,6 @@ fn constant(model: &Model, name: &str) -> i64 {
         .unwrap_or_else(|| panic!("the machine declares `{name}`"))
 }
 
-fn history(t: &Terminal) -> Vec<String> {
-    let grid = t.main_grid();
-    (0..grid.scrollback_lines())
-        .map(|i| {
-            grid.get_history_line(i)
-                .map(|l| l.to_string().trim_end().to_string())
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
 fn record() -> SessionRecord {
     SessionRecord {
         local_id: 1,
@@ -120,8 +101,10 @@ fn record() -> SessionRecord {
         claim_known: false,
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
+        render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        journal_key: None,
     }
 }
 
@@ -155,6 +138,7 @@ impl Real {
             let mut remaining = MAX_AGGREGATE_BYTES;
             let mut adopted = incoming(
                 &manifest.sessions[0],
+                false,
                 false,
                 &self.named(),
                 self.dir.path(),
@@ -191,7 +175,7 @@ impl Real {
                     false,
                 )
                 .expect("the export worker starts")
-                .finish(Duration::from_secs(30));
+                .finish(aterm_spec::wait::MUST_HAPPEN);
                 self.exp = results
                     .exports
                     .iter()
@@ -265,7 +249,7 @@ impl Real {
     }
 }
 
-/// THE PROJECTION: the real system's facts, under the machine's names, for
+/// The projection: the real system's facts, under the machine's names, for
 /// every variable the steps so far have defined.
 fn project(real: &Real) -> State {
     let mut s = State::new();
@@ -324,8 +308,8 @@ fn paths(model: &Model) -> Vec<Vec<&'static str>> {
     out
 }
 
-/// Run `path` on the real system and on `model`, and return where each
-/// disagrees (empty: the real code IS the machine along this path).
+/// Run `path` on the real system and on `model`, and return where they
+/// disagree (empty: the real code matches the machine along this path).
 fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
     let mut real = Real::new(model);
     let mut state = model.init_state();
@@ -357,7 +341,7 @@ fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
     out
 }
 
-/// TIER-1: every path of the committed machine, on the real code.
+/// Tier-1: every path of the committed machine, on the real code.
 #[test]
 #[aterm_spec::spec_unmodeled(
     machine = "NativeUpdateHistoryCarry",
@@ -395,10 +379,9 @@ fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
 )]
 fn the_real_history_carry_is_the_derived_machine() {
     let model = aterm_spec::derive::native_update_history_carry_model();
-    // Every interleaving of up to two lines of output and a rewrap (nine); on
-    // the two that name a sidecar, a corruption, a clear, both, or neither
-    // (four each), and on the seven that name none a clear or not (two each):
-    // twenty-two.
+    // Nine interleavings of up to two lines and a rewrap; the two that name a
+    // sidecar branch four ways (corruption, clear, both, neither), the seven
+    // others two ways (clear or not): twenty-two paths.
     let all = paths(&model);
     assert_eq!(all.len(), 22, "the machine's paths: {all:?}");
     let mut failures = Vec::new();
@@ -416,10 +399,10 @@ fn the_real_history_carry_is_the_derived_machine() {
     );
 }
 
-/// NEGATIVE CONTROL: the `Buggy = 1` machine's four defect paths each end
-/// where the real code does not — the real carry counts the fallback, refuses
-/// the moved history, counts the failed sidecar, and leaves a cleared
-/// scrollback cleared.
+/// Negative control: each of the `Buggy = 1` machine's four defect paths ends
+/// where the real code does not (the real carry counts the fallback, refuses
+/// the moved history, counts the failed sidecar, keeps a cleared scrollback
+/// cleared).
 #[test]
 fn the_buggy_machine_is_not_the_real_history_carry() {
     let buggy =

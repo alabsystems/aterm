@@ -29,7 +29,9 @@ use super::Model;
 /// `older` — the successor is an OLDER build, which parses the layout but
 /// ignores the field that carries drafts. `restored`/`succ` — the successor
 /// reopened the view, and the draft its view holds (`Surfaced`: it could not
-/// reopen the carried draft and said so, with the text, in the message center).
+/// reopen the carried draft and says so, with the text, in the message center —
+/// at the Commit that makes the loss its own, since before it the parent still
+/// holds the draft and a successor stood down must have written nothing).
 ///
 /// The environment's moves are the person's (`Type` — typing continues while
 /// the successor boots, until the Commit), the lane choice (`Park` to a

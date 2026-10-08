@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Callback registration API for Terminal.
-//!
-//! Contains all `set_*_callback` methods, `resize()`, and related state queries.
-//! Extracted from mod.rs to reduce file size.
+//! Callback registration for `Terminal`: the `set_*_callback` methods,
+//! `resize()` and the resize offload.
 
 use super::{ClipboardOperation, Terminal, types};
 #[cfg(any(test, target_os = "linux"))]
@@ -18,48 +16,39 @@ mod resize_conpty_tests;
 impl Terminal {
     /// Resize the terminal.
     ///
-    /// The active grid is resized with reflow appropriate to its type:
-    /// - Primary screen: reflow enabled (soft-wrapped lines unwrap/rewrap)
-    /// - Alt screen: reflow disabled (app manages layout, redraws after SIGWINCH)
-    ///
-    /// The inactive grid (saved in `alt_grid`) uses the opposite reflow mode.
-    /// This matches xterm, Alacritty, kitty, and Terminal behavior (#4164).
+    /// The primary screen reflows (soft-wrapped lines rewrap); the alt screen
+    /// does not (the app redraws after SIGWINCH). The inactive grid in
+    /// `alt_grid` uses its own mode, as in xterm, Alacritty and kitty.
     ///
     /// Dimensions are clamped by the grid to
-    /// `1..=`[`MAX_GRID_ROWS`](crate::grid::MAX_GRID_ROWS)`/`[`MAX_GRID_COLS`](crate::grid::MAX_GRID_COLS)
-    /// (§5.8 ingress bound), so a hostile resize cannot request an
-    /// arbitrarily large cell allocation.
+    /// `1..=`[`MAX_GRID_ROWS`](crate::grid::MAX_GRID_ROWS)`/`[`MAX_GRID_COLS`](crate::grid::MAX_GRID_COLS),
+    /// so a hostile resize cannot request an arbitrarily large allocation.
     ///
     /// This is [`resize_with_policy`](Self::resize_with_policy) under
-    /// [`ResizePolicy::Native`] — the grid is the frame, as under a Unix PTY.
+    /// [`ResizePolicy::Native`]: the grid is the frame, as under a Unix PTY.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.resize_with_policy(rows, cols, ResizePolicy::Native);
     }
 
     /// [`resize`](Self::resize) with the seam policy the PTY backend requires.
     ///
-    /// The host picks the policy from what sits behind the PTY, never from the
-    /// platform alone: under Windows ConPTY conhost repaints the whole viewport
-    /// after every resize, row-0-anchored, so the row accounting at the
-    /// history/viewport seam must match that repaint or lines are lost
-    /// (revealed history painted over) or duplicated (a re-seated tail painted
-    /// twice) — see [`ResizePolicy`] for the measurements. Both grids get the
-    /// policy: conhost repaints the alt screen exactly as it repaints the main
-    /// one, and the saved grid must keep the same seam law for when it returns.
+    /// The host picks the policy from what sits behind the PTY: under Windows
+    /// ConPTY conhost repaints the whole viewport after every resize,
+    /// row-0-anchored, so the history/viewport seam accounting must match that
+    /// repaint or lines are lost or duplicated (see [`ResizePolicy`]). Both grids
+    /// get the policy, since conhost repaints the alt screen the same way.
     pub fn resize_with_policy(&mut self, rows: u16, cols: u16, policy: ResizePolicy) {
         // The resize journal's pre-resize facts (geometry, screen, open 2026
         // frame), consumed by `finalize_resize` — see `resize_journal`.
-        let origin = self.resize_origin();
+        let origin = self.resize_origin(policy);
         // Captured BEFORE the resize: afterwards both grids carry the new width.
         let cols_changed = self.grid.cols() != cols;
-        // Likewise the height: `finalize_resize` needs the SHRINK amount, and the
-        // grid publishes only the rows-GROW shift (`take_last_resize_row_shift`).
-        // Both grids are always resized to the same `rows`, so one capture serves.
+        // `finalize_resize` needs the shrink amount; the grid publishes only the
+        // grow shift. Both grids are resized to the same `rows`.
         let rows_before = self.grid.rows();
-        // Inline images live only as cell EXTRAS on rows that carry no glyph, and
-        // reflow copies extras only for the cells inside `Row::len()`. Pin the
-        // image rows' lengths first or every on-screen image is dropped by the
-        // rewrap — see `image_reflow`.
+        // Inline images live as cell extras on rows with no glyph, and reflow
+        // copies extras only within `Row::len()`: pin image rows' lengths first
+        // (see `image_reflow`).
         if cols_changed {
             self.pin_image_rows_for_width_change(cols);
         }
@@ -81,17 +70,16 @@ impl Terminal {
         self.finalize_resize(cols_changed, rows_before, origin);
     }
 
-    /// Resize, but move the width-change off-screen scrollback rewrap OFF the
-    /// caller's thread (the L0 whole-Mac-freeze fix).
+    /// Resize with the width-change rewrap of off-screen scrollback moved off
+    /// the caller's thread.
     ///
-    /// The visible grid(s) are resized synchronously (bounded by the viewport)
-    /// and the unbounded tiered scrollback of the primary-content grid (the
-    /// active primary, or the saved primary while an alt screen is up) is
-    /// detached in O(1). The returned `Send` job carries that history for
-    /// off-thread rewrap via [`PendingScrollbackReflow::reflow`]; pass the result
-    /// to [`Terminal::finish_resize_offload`] to re-attach it. Returns `None`
-    /// when there is nothing to offload (no width change / no tiered store), in
-    /// which case this is equivalent to [`Terminal::resize`].
+    /// The visible grids resize synchronously (bounded by the viewport), and the
+    /// tiered scrollback of the primary-content grid (the active primary, or the
+    /// saved primary while alt is up) is detached in O(1). The returned `Send`
+    /// job rewraps it via [`PendingScrollbackReflow::reflow`]; pass the result to
+    /// [`Terminal::finish_resize_offload`]. `None` when there is nothing to
+    /// offload (no width change or no tiered store): then this equals
+    /// [`Terminal::resize`].
     pub fn resize_offloading_scrollback(
         &mut self,
         rows: u16,
@@ -101,11 +89,10 @@ impl Terminal {
     }
 
     /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) with
-    /// the seam policy the PTY backend requires — the offloaded twin of
-    /// [`resize_with_policy`](Self::resize_with_policy), same reasoning. Under
-    /// [`ResizePolicy::ConPty`] the re-attach performs no deficit fill (there is
-    /// no `pending_fill_target`), so a repaint conhost sends BEFORE the worker
-    /// re-attaches is never shifted under a re-seated history line.
+    /// a seam policy, the offloaded twin of
+    /// [`resize_with_policy`](Self::resize_with_policy). Under
+    /// [`ResizePolicy::ConPty`] the re-attach does no deficit fill, so a conhost
+    /// repaint that arrives before the re-attach is never shifted.
     pub fn resize_offloading_scrollback_with_policy(
         &mut self,
         rows: u16,
@@ -113,17 +100,17 @@ impl Terminal {
         policy: ResizePolicy,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
         // Captured BEFORE the resize, as in `resize`.
-        let origin = self.resize_origin();
+        let origin = self.resize_origin(policy);
         let cols_changed = self.grid.cols() != cols;
         let rows_before = self.grid.rows();
         // Same image pin as the synchronous path: the offloaded resize still
-        // rewraps the VISIBLE grid inline, which is where the placements live.
+        // rewraps the visible grid inline, which is where the placements live.
         if cols_changed {
             self.pin_image_rows_for_width_change(cols);
         }
         let pending = if self.modes.alternate_screen {
-            // Alt active: current (alt) grid is app-managed; the SAVED PRIMARY
-            // holds the scrollback that reflows.
+            // Alt active: the alt grid is app-managed; the saved primary holds
+            // the scrollback that reflows.
             self.grid.resize_no_reflow_with_policy(rows, cols, policy);
             self.alt_grid.as_mut().and_then(|saved_primary| {
                 saved_primary.resize_offloading_scrollback_with_policy(rows, cols, policy)
@@ -142,20 +129,16 @@ impl Terminal {
         pending
     }
 
-    /// Re-attach an off-thread-rewrapped scrollback store from a prior
-    /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback), onto
-    /// the primary-content grid (active primary, or the saved primary while an
-    /// alt screen is up). A no-op if that grid re-acquired a tiered store while
-    /// the reflow ran (see [`Grid::reattach_reflowed_scrollback`]).
+    /// Re-attach a scrollback store rewrapped off-thread by
+    /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) onto
+    /// the primary-content grid. A no-op if that grid re-acquired a tiered store
+    /// meanwhile (see [`Grid::reattach_reflowed_scrollback`]).
     ///
-    /// CONVERGENCE (RFL-3): if the grid's width changed while the reflow ran
-    /// (a superseding drag step, throttled to detach nothing at the time), the
-    /// just-attached store is wrapped at a stale width; it is immediately
-    /// re-detached at the CURRENT width and returned. Drive the returned job
-    /// exactly like the original (`reflow`/`reflow_step`, then this method
-    /// again) — at most one extra pass per settled drag. Dropping it without
-    /// [`Self::abort_resize_offload`] would wedge the detach window — hence
-    /// the `must_use`.
+    /// If the width changed while the reflow ran, the store is stale: it is
+    /// re-detached at the current width and returned. Drive that job like the
+    /// original and call this again (at most one extra pass per settled drag);
+    /// dropping it without [`Self::abort_resize_offload`] would wedge the detach
+    /// window.
     #[must_use = "drive the returned convergence job and re-attach it (or abort), or the detach window wedges"]
     pub fn finish_resize_offload(
         &mut self,
@@ -169,13 +152,10 @@ impl Terminal {
         target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed))
     }
 
-    /// Abort an in-flight offloaded resize whose reflow will NEVER re-attach — the
-    /// worker panicked or its thread died before
-    /// [`finish_resize_offload`](Self::finish_resize_offload). Returns the
-    /// primary-content grid (active primary, or the saved primary under an alt
-    /// screen) to a bounded state so the detach window does not wedge the grid for
-    /// the rest of the session; see [`Grid::abort_reflow_offload`]. Idempotent /
-    /// a no-op if the grid already re-attached.
+    /// Abort an offloaded resize whose reflow will never re-attach (the worker
+    /// panicked or died before [`finish_resize_offload`](Self::finish_resize_offload)),
+    /// returning the primary-content grid to a bounded state so the detach
+    /// window does not wedge it; see [`Grid::abort_reflow_offload`]. Idempotent.
     pub fn abort_resize_offload(&mut self) {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -187,11 +167,10 @@ impl Terminal {
         }
     }
 
-    /// THRU-5: attach (or detach) the off-thread compression worker on the
-    /// primary-content grid (active primary, or the saved primary under an alt
-    /// screen) — the grid that owns the tiered scrollback. While attached, the
-    /// reader-thread ingest path defers lazy-buffer draining to the worker so the
-    /// LZ4/zstd promotion spike stays off the PTY-drain critical path. See
+    /// Attach or detach the off-thread compression worker on the
+    /// primary-content grid (the one owning the tiered scrollback). While
+    /// attached, ingest defers lazy-buffer draining to the worker, keeping
+    /// LZ4/zstd promotion off the PTY-drain path. See
     /// [`Grid::set_compress_offload_active`](aterm_grid::Grid::set_compress_offload_active).
     pub fn set_compress_offload_active(&mut self, active: bool) {
         let target = if self.modes.alternate_screen {
@@ -204,9 +183,8 @@ impl Terminal {
         }
     }
 
-    /// THRU-5: lines staged in the primary-content grid's lazy buffer awaiting
-    /// off-thread promotion — the compression worker's backlog (0 if none). The
-    /// worker polls this to decide whether to keep draining.
+    /// Lines staged in the primary-content grid's lazy buffer awaiting
+    /// off-thread promotion (the compression worker's backlog; 0 if none).
     #[must_use]
     pub fn lazy_backlog_len(&self) -> usize {
         if self.modes.alternate_screen {
@@ -218,11 +196,10 @@ impl Terminal {
         }
     }
 
-    /// THRU-5: drain up to `max_lines` of the primary-content grid's staged
-    /// backlog into its tiered store (bounded LZ4/zstd promotion), returning the
-    /// number of lines still staged afterward. The caller holds the term lock;
-    /// this is the worker's per-batch drive that keeps each hold short. See
-    /// [`Grid::drain_lazy_bounded`](aterm_grid::Grid::drain_lazy_bounded).
+    /// Drain up to `max_lines` of the primary-content grid's staged backlog into
+    /// its tiered store, returning the lines still staged. The caller holds the
+    /// terminal lock; the worker drives this per batch to keep each hold short.
+    /// See [`Grid::drain_lazy_bounded`](aterm_grid::Grid::drain_lazy_bounded).
     pub fn drain_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -232,14 +209,12 @@ impl Terminal {
         target.map_or(0, |grid| grid.drain_lazy_bounded(max_lines))
     }
 
-    /// THRU-5: one bounded drain OPPORTUNITY for a host polling mid-flood (the
-    /// compression worker's once-a-second trickle, a wasm host's per-frame
-    /// drain), on the same backlog [`drain_lazy_bounded`](Self::drain_lazy_bounded)
-    /// drains: the batch is skipped while the flood path is cutting that
-    /// backlog AND the stream delivered a batch or more since the previous
-    /// opportunity, so one flood leaves one marker and a slow tail is still
-    /// promoted. See
-    /// [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded).
+    /// One bounded drain opportunity for a host polling mid-flood (the
+    /// compression worker's trickle, a wasm host's per-frame drain), on the same
+    /// backlog as [`drain_lazy_bounded`](Self::drain_lazy_bounded). Skipped while
+    /// the flood path is cutting that backlog and a batch arrived since the last
+    /// opportunity, so one flood leaves one marker and a slow tail still gets
+    /// promoted. See [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded).
     pub fn trickle_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -249,14 +224,10 @@ impl Terminal {
         target.map_or(0, |grid| grid.trickle_lazy_bounded(max_lines))
     }
 
-    /// Shared post-resize side effects for [`resize`](Self::resize) and the
-    /// offloaded path: the resize journal entry, selection invalidation, the
-    /// DEC-2048 in-band size report, and the debug structural-invariant
-    /// self-check.
-    ///
-    /// `cols_changed`, `rows_before` and `origin` are all captured by the caller
-    /// BEFORE the resize: by the time this runs the grids carry the new geometry
-    /// and the old one is unrecoverable.
+    /// Shared post-resize side effects: the resize journal entry, selection
+    /// handling, the DEC 2048 in-band size report and the debug invariant check.
+    /// `cols_changed`, `rows_before` and `origin` are captured by the caller
+    /// before the resize.
     fn finalize_resize(
         &mut self,
         cols_changed: bool,
@@ -266,107 +237,65 @@ impl Terminal {
         // Read before the journal drains the shape: a grow that handed a whole
         // resize undo back puts the pre-flap selection back below.
         let undone = self.grid.last_resize_shape().undone;
-        // Journal first, from the ACTIVE grid's own row accounting. It is a
-        // separate record from `take_last_resize_row_shift` below, so the
-        // selection custody that drains that one is untouched.
+        // Journal first, from the active grid's row accounting (a separate record
+        // from `take_last_resize_row_shift`, which selection custody drains).
         self.journal_resize(origin);
-        // SELECTION CUSTODY Phase 3: only a WIDTH change invalidates coordinates.
-        //
-        // This used to clear unconditionally, on the reasoning that "reflow
-        // invalidates all row/col coordinates (#4056)". True for a width change —
-        // rewrap renumbers rows — but a ROWS-ONLY resize (window height, font zoom,
-        // a horizontal divider drag) does not rewrap anything: row identity is
-        // intact and only `visible_rows` moved. Clearing there threw away a
-        // selection for a resize that could not have invalidated it.
-        //
-        // The rows-only case re-runs the EXISTING, kani-proven range check rather
-        // than a second implementation of the same bounds reasoning: delta 0, the
-        // new live-bottom row count, and the actual scrollback floor.
-        //
-        // `cols_changed` must be captured by the CALLER before the resize — by the
-        // time we run, both grids already carry the new width and the old one is
-        // gone.
+        // Only a width change invalidates coordinates (rewrap renumbers rows). A
+        // rows-only resize keeps row identity, so it re-runs the existing range
+        // check with delta 0, the new live-bottom row count and the scrollback
+        // floor.
         if cols_changed {
             // A width change never keeps a grid resize undo, so none is open.
             self.resize_undo_selection = None;
             self.text_selection.clear();
-            // The PARKED selection (see `post_process`) is anchored in the other
-            // grid, which this resize rewrapped too. It must go for the same reason
-            // — and unconditionally, because `finish_resize_offload` /
-            // `abort_resize_offload` mutate that grid's scrollback AFTER this runs,
-            // with no selection call anywhere. That is sound only while the offload
-            // path stays width-only; narrow this clear and it reopens silently.
+            // The parked selection's grid was rewrapped too. Cleared
+            // unconditionally because `finish_resize_offload` /
+            // `abort_resize_offload` later mutate that grid's scrollback with no
+            // selection call; sound only while the offload path is width-only.
             self.parked_text_selection.clear();
         } else {
-            // A rows-GROW that revealed retained history re-labelled the newest ring
-            // lines as the top of the viewport, so every pre-resize row — the
-            // selection's anchors included — now sits `revealed` rows FURTHER DOWN.
-            // `Grid::resize_with_reflow_mode` already follows that shift for the
-            // cursor and the saved cursor; the selection is compensated here, because
-            // it lives on the Terminal rather than the Grid.
+            // A rows grow that revealed retained history moves every pre-resize
+            // row `revealed` rows down, as `Grid::resize_with_reflow_mode` does for
+            // the cursors; the selection lives on the Terminal, so it follows here.
+            // `adjust_for_scroll` subtracts its delta, so the move is `-revealed`.
+            // Read from the active grid; each grid records its own shift. Below the
+            // floor anchors clamp, which is only correct with this delta.
             //
-            // `adjust_for_scroll`'s delta is SUBTRACTED from each anchor row, so
-            // moving content DOWN by `revealed` is a delta of `-revealed`. Passing 0
-            // (as this did when the narrowing first landed) leaves the anchors above
-            // their content: the highlight covers different text and a copy returns
-            // something the user never selected. Read from the ACTIVE grid — `resize`
-            // resizes both grids and each records its own shift.
-            //
-            // Below-floor is now a CLAMP, not a clear (SELECTION CUSTODY Phase 4), and
-            // that is only sound with the `-revealed` delta above: with the old delta
-            // of 0 the clear was the single thing masking the mis-anchor, and clamping
-            // instead would leave a live highlight anchored `revealed` rows off its
-            // content after any window-height drag or font zoom.
-            //
-            // A rows-only SHRINK needs its own transform, and it is NOT a uniform
-            // delta. `take_last_resize_row_shift()` is only ever SET on a grow
-            // (`reflow.rs`), so a shrink used to run `adjust_for_scroll(0, ..)` —
-            // anchors unchanged — on the premise that "no content moves under the
-            // eye". False: `adjust_row_count_rows_only` performs the #7662
-            // bottom-push, so the bottom `demoted` viewport rows become the NEWEST
-            // history while the top rows stay put. Live-top anchors really are
-            // unchanged, but every SCROLLBACK anchor gains `demoted` lines above it,
-            // and a delta of 0 left it that many rows off its content — silently, and
-            // in the wrong-copy direction. `adjust_for_rows_shrink` is that piecewise
-            // map; see its doc for the three regimes.
+            // A rows-only shrink is not a uniform delta: `adjust_row_count_rows_only`
+            // pushes the bottom `demoted` viewport rows into history while top rows
+            // stay, so scrollback anchors gain `demoted` lines above them.
+            // `adjust_for_rows_shrink` is that piecewise map (see its doc).
             let selection_before = self.text_selection.clone();
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
             let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
             if demoted > 0 {
-                // `revealed` carries the shrink's ACTUAL relabel distance, which is
-                // the demote count and not the height delta: TRIM drops trailing
-                // blank rows without moving anything, so a shrink that only trims
-                // moves the selection by zero. Using `demoted` here would push every
-                // anchor off its content by the trimmed count.
+                // `revealed` is the shrink's actual relabel distance (the demote
+                // count), not the height delta: trimming trailing blank rows moves
+                // nothing.
                 self.text_selection
                     .adjust_for_rows_shrink(max_rows, revealed, floor);
             } else {
                 self.text_selection
                     .adjust_for_scroll(-revealed, max_rows, floor);
             }
-            // THE RESIZE UNDO's host half: the transform above clamps an anchor
-            // on a row the alt grid demoted (no history to anchor it in), so the
-            // grow's reveal lands it a row low even though the grid put every
-            // cell back. The selection the first shrink found is kept and put
-            // back when the grid hands its undo back whole. Active screen only:
-            // the parked selection is the MAIN screen's, which keeps history and
-            // never opens an undo.
+            // Resize undo: the transform above clamps an anchor on a row the alt
+            // grid demoted, so the grow would land it a row low even though every
+            // cell came back. Keep the selection the first shrink found and put it
+            // back when the grid hands its undo back whole. Active screen only; the
+            // parked (main) selection's grid keeps history and opens no undo.
             self.follow_resize_undo_selection(selection_before, undone);
-            // The parked selection gets the identical treatment against the OTHER
-            // grid — `resize` resized both, and each recorded its own shift. Its
-            // floor must come from that grid: while alt is up the ACTIVE grid's
-            // `scrollback_lines()` is 0, which would evict every scrollback anchor
-            // the main screen is holding. `max_rows` is shared, both grids having
-            // been resized to the same `rows` — which is also why `demoted` is
-            // shared: the same height delta ran over both.
+            // The parked selection gets the same treatment against the other grid,
+            // with that grid's floor (the active alt grid's `scrollback_lines()` is 0
+            // and would evict every scrollback anchor). `max_rows` and `demoted` are
+            // shared: both grids ran the same height change.
             if let Some(parked_grid) = self.alt_grid.as_mut() {
                 let parked_revealed = i32::from(parked_grid.take_last_resize_row_shift());
                 let parked_floor =
                     i32::try_from(parked_grid.scrollback_lines()).unwrap_or(i32::MAX);
                 if demoted > 0 {
-                    // The parked grid ran the same shapes and recorded its OWN
+                    // The parked grid ran the same shapes and recorded its own
                     // demote count — read it, never the active grid's.
                     self.parked_text_selection.adjust_for_rows_shrink(
                         max_rows,
@@ -382,12 +311,10 @@ impl Terminal {
                 }
             }
         }
-        // DEC mode 2048: emit an in-band size report on every resize so a
-        // subscribed app (neovim 0.10+) learns the new geometry without an ioctl.
-        // Honor the response-buffer cap: like the DECSET arm, this writes the
-        // buffer directly (not via the capped send_response sink), so a resize
-        // storm against a host that is not draining responses must not grow it
-        // past MAX_RESPONSE_BUFFER_SIZE. The report is <= 48 bytes.
+        // DEC mode 2048: send an in-band size report on every resize. This writes
+        // the response buffer directly, so honor its cap: a resize storm against
+        // a host not draining responses must not grow it past
+        // MAX_RESPONSE_BUFFER_SIZE. The report is <= 48 bytes.
         if self.modes.in_band_size_reports
             && self.transient.response_buffer.len().saturating_add(48)
                 <= super::MAX_RESPONSE_BUFFER_SIZE
@@ -402,9 +329,8 @@ impl Terminal {
                 ch,
             );
         }
-        // INTEGRITY-SELFCHECK (M7): resize/reflow is the other major grid mutation
-        // boundary; validate the structural invariants here too in debug builds.
-        // Free in release; covered by the reflow proptests (no false-fail).
+        // INTEGRITY-SELFCHECK: resize/reflow is the other major grid mutation
+        // boundary. Debug builds only.
         #[cfg(debug_assertions)]
         self.grid.assert_structural_invariants();
     }
@@ -414,13 +340,12 @@ impl Terminal {
         self.bell_callback = Some(Box::new(callback));
     }
 
-    /// Install the host resolver for Kitty NON-DIRECT transmission mediums (`t=f`/
-    /// `t=t`/`t=s`). The engine hands the host `(medium, path-or-name)` and the host
-    /// returns the raw image bytes (or `None` to reject). The HOST owns the I/O and
-    /// the security policy — whether to read host files / shared memory off a terminal
-    /// escape at all (fail-closed: default is no resolver ⇒ non-direct mediums are
-    /// skipped), which paths are permitted, and any size cap. The engine itself never
-    /// touches the filesystem or shared memory, so it stays pure and wasm-safe.
+    /// Install the host resolver for Kitty non-direct transmission mediums
+    /// (`t=f`/`t=t`/`t=s`). The engine hands the host `(medium, path-or-name)`
+    /// and gets the image bytes or `None`. The host owns the I/O and the security
+    /// policy (whether to read files or shared memory at all, which paths, size
+    /// caps); with no resolver installed, non-direct mediums are skipped. The
+    /// engine stays pure and wasm-safe.
     pub fn set_kitty_file_resolver<F>(&mut self, resolver: F)
     where
         F: Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>>
@@ -430,57 +355,15 @@ impl Terminal {
         self.kitty_file_resolver = Some(Box::new(resolver));
     }
 
-    /// Set desktop notification callback (OSC 9).
-    ///
-    /// The callback is invoked when an application sends a notification escape
-    /// sequence (OSC 9 without a subcommand). The UI layer should display a
-    /// system notification with the provided message.
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// terminal.set_notification_callback(|message| {
-    ///     // Display system notification with the message
-    ///     show_notification("Terminal", message);
-    /// });
-    /// ```
-    ///
-    /// The callback receives the notification message as a `&str`.
-    ///
-    /// # Supported Sequences
-    ///
-    /// - `ESC ] 9 ; message BEL` - Simple notification (Terminal/ConEmu style)
-    /// - `ESC ] 9 ; message ST`  - ST terminator variant
+    /// Set the desktop notification callback for OSC 9 without a subcommand
+    /// (`ESC ] 9 ; message BEL|ST`); it receives the message.
     pub fn set_notification_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
         self.notifications.callback = Some(Box::new(callback));
     }
 
-    /// Set a callback for dynamic color changes (OSC 10/11/12, OSC 110/111/112).
-    ///
-    /// The callback is invoked when the terminal's default foreground, background,
-    /// or cursor color changes via escape sequences.
-    ///
-    /// # Arguments
-    ///
-    /// The callback receives:
-    /// - `target: ColorTarget` — which color changed (foreground, background, cursor, etc.)
-    /// - `color: Rgb` — the new color value
-    /// - `op: ColorChangeOp` — whether the color was set, reset, or made dynamic
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// use aterm_core::terminal::ColorTarget;
-    ///
-    /// terminal.set_color_change_callback(|target, color, op| {
-    ///     match target {
-    ///         ColorTarget::Foreground => update_fg(color),
-    ///         ColorTarget::Background => update_bg(color),
-    ///         ColorTarget::Cursor => update_cursor(color),
-    ///         _ => {}
-    ///     }
-    /// });
-    /// ```
+    /// Set the callback for dynamic color changes (OSC 10/11/12, 110/111/112):
+    /// it receives which color changed, its new value and whether it was set,
+    /// reset or made dynamic.
     #[cfg(test)]
     pub fn set_color_change_callback<F>(&mut self, callback: F)
     where
@@ -489,23 +372,9 @@ impl Terminal {
         self.color.change_callback = Some(Box::new(callback));
     }
 
-    /// Set a callback for dynamic color queries (OSC 10/11/12 with `?`).
-    ///
-    /// When an application queries the terminal's foreground, background, or
-    /// cursor color, this callback is consulted first. If it returns
-    /// `Some(Rgb)`, that color is used in the escape sequence response
-    /// instead of the terminal's internal palette value. Returning `None`
-    /// falls back to the palette color.
-    ///
-    /// This is useful when the host UI renders different colors than the
-    /// terminal palette stores (e.g., theme overrides, system appearance).
-    ///
-    /// # Arguments
-    ///
-    /// The callback receives a [`ColorTarget`](super::ColorTarget):
-    /// - `Foreground` — OSC 10 `?`
-    /// - `Background` — OSC 11 `?`
-    /// - `Cursor` — OSC 12 `?`
+    /// Set the callback consulted first for dynamic color queries (OSC 10/11/12
+    /// `?`), for a host that renders colors other than the palette's. `Some`
+    /// answers the query; `None` falls back to the palette.
     #[cfg(test)]
     pub fn set_color_query_callback<F>(&mut self, callback: F)
     where
@@ -514,38 +383,9 @@ impl Terminal {
         self.color.query_callback = Some(Box::new(callback));
     }
 
-    /// Set advanced desktop notification callback (OSC 99/777).
-    ///
-    /// The callback is invoked when a complete notification is received via OSC 99
-    /// (kitty protocol) or OSC 777 (rxvt-unicode protocol).
-    ///
-    /// The kitty notification protocol supports:
-    /// - Separate title and body
-    /// - Urgency levels (low, normal, critical)
-    /// - Notification IDs for updates
-    ///
-    /// OSC 777 format: `ESC ] 777 ; notify ; title ; body ST`
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// use aterm_core::terminal::{Notification, NotificationUrgency};
-    ///
-    /// terminal.set_advanced_notification_callback(|notification| {
-    ///     let title = notification.title.as_deref().unwrap_or("Terminal");
-    ///     let body = notification.body.as_deref().unwrap_or("");
-    ///     let urgent = matches!(notification.urgency, NotificationUrgency::Critical);
-    ///     show_system_notification(title, body, urgent);
-    /// });
-    /// ```
-    ///
-    /// # Supported Sequences
-    ///
-    /// - `ESC ] 99 ; i=ID:p=title:d=0 ST` + `ESC ] 99 ; i=ID:p=body:d=1 ST`
-    /// - `ESC ] 99 ; p=body:u=2:d=1 ST` - Single message with critical urgency
-    /// - `ESC ] 777 ; notify ; title ; body ST` - rxvt-unicode style notification
-    ///
-    /// See <https://sw.kovidgoyal.net/kitty/desktop-notifications/> for protocol details.
+    /// Set the callback for complete OSC 99 (kitty: title, body, urgency, id)
+    /// and OSC 777 (`ESC ] 777 ; notify ; title ; body ST`) notifications.
+    /// See <https://sw.kovidgoyal.net/kitty/desktop-notifications/>.
     pub fn set_advanced_notification_callback<F: FnMut(types::Notification) + Send + 'static>(
         &mut self,
         callback: F,
@@ -553,45 +393,9 @@ impl Terminal {
         self.notifications.advanced_callback = Some(Box::new(callback));
     }
 
-    /// Set clipboard callback for OSC 52 operations.
-    ///
-    /// The callback is invoked when an application sends OSC 52 to set or clear
-    /// the clipboard, and (optionally) when querying clipboard contents.
-    ///
-    /// Clipboard queries (Pd = "?") are ignored by default for security.
-    ///
-    /// To enable queries, set `TerminalConfig::allow_osc52_query = true` via
-    /// [`apply_config`](Self::apply_config).
-    ///
-    /// The callback receives a [`ClipboardOperation`] and should:
-    /// - For `Set` operations: copy the content to the appropriate clipboard(s)
-    /// - For `Query` operations: return the clipboard content (or None if denied)
-    /// - For `Clear` operations: clear the clipboard content
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// use aterm_core::terminal::{ClipboardOperation, Terminal};
-    ///
-    /// let mut terminal = Terminal::new(24, 80);
-    /// terminal.set_clipboard_callback(|op| {
-    ///     match op {
-    ///         ClipboardOperation::Set { content, .. } => {
-    ///             // Copy to system clipboard (platform-specific)
-    ///             println!("Set clipboard: {}", content);
-    ///             None
-    ///         }
-    ///         ClipboardOperation::Query { .. } => {
-    ///             // Return clipboard content (or None to deny)
-    ///             Some("clipboard content".to_string())
-    ///         }
-    ///         ClipboardOperation::Clear { .. } => {
-    ///             // Clear clipboard
-    ///             None
-    ///         }
-    ///     }
-    /// });
-    /// ```
+    /// Set the OSC 52 clipboard callback. `Set` and `Clear` return `None`;
+    /// `Query` returns the contents, or `None` to deny. Queries (`Pd = ?`) are
+    /// ignored unless `TerminalConfig::allow_osc52_query` is set.
     pub fn set_clipboard_callback<F>(&mut self, callback: F)
     where
         F: FnMut(ClipboardOperation) -> Option<String> + Send + 'static,
@@ -599,12 +403,8 @@ impl Terminal {
         self.clipboard.callback = Some(Box::new(callback));
     }
 
-    /// Set a callback for window operations (CSI t - XTWINOPS).
-    ///
-    /// The callback is invoked when window manipulation or query sequences are received.
-    /// For manipulation operations (iconify, move, resize), perform the operation and
-    /// return `None`. For query operations (report state, position, size), return the
-    /// appropriate `WindowResponse`.
+    /// Set the XTWINOPS (`CSI t`) callback: perform a manipulation and return
+    /// `None`, or answer a query with its `WindowResponse`.
     ///
     /// # Example
     ///
@@ -653,7 +453,7 @@ mod offload_tests {
         t
     }
 
-    /// A width-change offload on the PRIMARY screen rewraps history off-thread and
+    /// A width-change offload on the primary screen rewraps history off-thread and
     /// loses none of it across the detach → reflow → re-attach round trip.
     #[test]
     fn offloaded_resize_primary_preserves_scrollback() {
@@ -684,9 +484,8 @@ mod offload_tests {
         );
     }
 
-    /// Claude Code runs in the ALT screen; a resize there must still offload — and
-    /// preserve — the SAVED PRIMARY's scrollback (this is the exact context of the
-    /// reported freeze).
+    /// On the alt screen a resize still offloads and preserves the saved
+    /// primary's scrollback.
     #[test]
     fn offloaded_resize_alt_screen_preserves_saved_primary() {
         let mut t = term_with_history(24, 80, 500);
@@ -712,15 +511,14 @@ mod offload_tests {
         );
     }
 
-    /// The compression worker's trickle works the SAME backlog its drain
-    /// drains — the saved primary's under an alt screen too: an opportunity
-    /// right after a flood that outran it skips, and the next one, with
-    /// nothing new arrived, promotes a batch (the cut's marker first).
+    /// The compression worker's trickle works the same backlog its drain does
+    /// (the saved primary's under an alt screen): an opportunity right after a
+    /// flood that outran it skips, and the next, with nothing new, promotes a
+    /// batch (the cut's marker first).
     #[test]
     fn trickle_skips_a_flood_that_outruns_it_on_the_backlog_the_worker_drains() {
-        // A 2 MB budget holds fewer staged `L<n>` rows than the 20k floor, so
-        // the floor is the cap; the store's 100k limit is far away, so the
-        // drops are a real cut.
+        // A 2 MB budget holds fewer staged rows than the 20k floor, so the floor
+        // is the cap; the store's 100k limit is far away, so drops are a real cut.
         let sb = Scrollback::new(64, 512, 2_000_000);
         let mut t = Terminal::with_scrollback(24, 80, 8, sb);
         t.set_compress_offload_active(true);

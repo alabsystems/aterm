@@ -141,7 +141,7 @@ fn rescan(
     epoch: u64,
     now: Instant,
 ) {
-    engine.rescan_from_cells_with_geom(
+    engine.rescan_from_cells_with_geom_at_cursor(
         &cells.cells,
         &cells.line_sizes,
         ROWS,
@@ -157,6 +157,7 @@ fn rescan(
             cols: COLS as u16,
         },
         cells.default_bg,
+        None,
     );
 }
 

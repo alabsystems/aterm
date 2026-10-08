@@ -30,7 +30,7 @@
 //!
 //! What is emitted here is the channel of every shipped binary: only a development
 //! build honours a runtime repoint (`[update]` owner/repo in aterm.toml,
-//! `source::REPOINT_IS_A_DEV_SEAM`); the env overrides are gone (2026-09-23).
+//! `source::REPOINT_IS_A_DEV_SEAM`).
 //!
 //! Best-effort by construction: an unreadable manifest, an absent key, or a
 //! non-`OWNER/REPO` value degrades to the next rung rather than failing the build.
@@ -62,11 +62,9 @@ fn main() {
 
     let url = std::env::var("CARGO_PKG_REPOSITORY").unwrap_or_default();
     // The SOURCE/publish repo, derived from `repository` alone and NEVER from
-    // `update_channel`. Emitted separately because the two slugs answer different
-    // questions and only coincidentally matched before the public mirror existed:
-    // consumers that mean "the account this project is published under" (the
-    // token chain's private-repo target; the absent-key fallback for the atpkg
-    // index account below) must not follow the update channel when it is
+    // `update_channel`: consumers that mean "the account this project is published
+    // under" (the token chain's private-repo target; the absent-key fallback for the
+    // atpkg index account below) must not follow the update channel when it is
     // repointed at a mirror.
     let (publish_owner, publish_repo) =
         parse_github_owner_repo(&url).unwrap_or(("alabsystems", "aterm"));
@@ -77,10 +75,8 @@ fn main() {
     // The account the SIGNED PACKAGE INDEX lives under, from its own tracked key.
     // Neither slug above fits: `update_channel` is the app-update knob the
     // account-bound index (§8) must not follow, and `repository` is the private
-    // staging repo — a tokenless default-configured install 404s there, which
-    // orphaned every such install from the published registry. Absent/malformed
-    // degrades to the publish owner (the pre-key behavior), per the best-effort
-    // contract above.
+    // staging repo a tokenless default-configured install 404s on. Absent/malformed
+    // degrades to the publish owner, per the best-effort contract above.
     let index_owner = table_string(&workspace_text, "workspace.metadata.atpkg", "account")
         .filter(|s| valid_segment(s))
         .unwrap_or_else(|| publish_owner.to_string());
@@ -89,10 +85,7 @@ fn main() {
     println!("cargo:rustc-env=ATERM_PUBLISH_OWNER={publish_owner}");
     println!("cargo:rustc-env=ATERM_PUBLISH_REPO={publish_repo}");
     println!("cargo:rustc-env=ATERM_ATPKG_INDEX_OWNER={index_owner}");
-    // Re-derive if either input changes. `repository` is inherited via
-    // `repository.workspace = true` and `update_channel` lives only in the
-    // workspace root, so that manifest is the authoritative file; watch this
-    // crate's manifest too for belt-and-suspenders.
+    // Both inputs live in the workspace root manifest; this crate's is watched too.
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_REPOSITORY");

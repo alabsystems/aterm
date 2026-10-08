@@ -196,11 +196,10 @@ pub(crate) enum Outcome {
 /// `cert_dir` is the ONE folder the operator named for the browser errand (`--cert-dir`):
 /// the request is copied there and the issued certificate is looked for there. `None`
 /// means nothing outside `~/.aterm/apple` is read or written — in particular NOT
-/// `~/Downloads`. Until 2026-09-13 the wait polled `read_dir(~/Downloads)` every three
-/// seconds unasked; run from an aterm shell that makes aterm the app responsible for a
-/// "would like to access files in your Downloads folder" dialog (TCC audit of
-/// 2026-09-12, `atpkg::protected`). A folder macOS guards is read only when the operator
-/// names it, because naming it is the consent.
+/// `~/Downloads`: from an aterm shell, reading it makes aterm the app responsible for a
+/// "would like to access files in your Downloads folder" dialog (`atpkg::protected`). A
+/// folder macOS guards is read only when the operator names it, because naming it is
+/// the consent.
 pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -449,12 +448,7 @@ fn await_then_install(
         return Outcome::Waiting {
             what: waiting_text(id, invalid, &rejected, None, &watch),
             // The SAME errand, from the SAME function, minus the paragraph about a wait
-            // that does not happen here. There used to be a second, hand-maintained
-            // paragraph for this path, and the two had already drifted: the paragraph
-            // said the Account Holder rule is about CREATING a certificate and that the
-            // download is matched by public key; the numbered form had truncated the
-            // first into an ambiguity and dropped the second entirely. Two spellings of
-            // one fact is how a tool tells an operator two different things.
+            // that does not happen here: two spellings of one fact drift apart.
             next: errand_lines(csr, false, &watch).join("\n"),
         };
     }
@@ -506,10 +500,9 @@ fn await_then_install(
         label = "";
     }
     // Nothing is printed after this loop. The errand ends with the trap, and the trap
-    // has to be the last thing on the screen: it used to be followed by "waiting for the
-    // certificate to appear…", which is exactly the sentence that reads as permission to
-    // go to the portal and take whatever is already in the list. The wait's own facts now
-    // live INSIDE the errand, above the trap, where they belong.
+    // has to be the last thing on the screen: a trailing "waiting for the certificate…"
+    // reads as permission to go to the portal and take whatever is already in the list.
+    // The wait's own facts live INSIDE the errand, above the trap.
     for line in errand_lines(upload, true, &watch) {
         step(label, &line);
         label = "";
@@ -602,9 +595,9 @@ fn has_terminal() -> bool {
 /// same test signature [`verdict`] runs, aimed at the certificate the operator actually
 /// pinned rather than at whichever one `security find-identity` happened to list first.
 ///
-/// Why this exists: `find-identity`'s order is not stable across runs (MEASURED on m3,
-/// 2026-08-18: two valid certificates for the team, and consecutive `provision --check`
-/// runs proved a different `ids[0]` each time), so an audit that blesses only `ids[0]`
+/// Why this exists: `find-identity`'s order is not stable across runs (MEASURED: with two
+/// valid certificates for the team, consecutive `provision --check` runs proved a
+/// different `ids[0]` each time), so an audit that blesses only `ids[0]`
 /// and then fails the profile for pinning "the other one" flips between PASS and FAIL
 /// with no change on the machine — and its "fix" (rewrite the profile) would just chase
 /// the enumeration order. A pin that names a valid identity that proves it can sign is
@@ -667,13 +660,9 @@ fn paired_with_installed(key: &Option<PathBuf>, sha1: &str) -> bool {
 /// The SPKI digest of the certificate the identity `sha1` names, for the pairing proof
 /// above.
 ///
-/// It used to pipe the WHOLE `find-certificate -a … -p` stream into `openssl x509`, which
-/// parses the first block and stops — so on a machine with two Developer ID certificates
-/// the comparison was made against whichever the keychain happened to list first. Two
-/// overlapping certificates is not an exotic state: it is what a renewal looks like, and
-/// `apple_identity_check` has a message for it. (The same pipe could also lose to EPIPE
-/// once openssl stopped reading, which `capture` maps to `None` — the identical false
-/// branch.) Select by digest instead.
+/// Selected by digest: piping the whole `find-certificate -a … -p` stream into `openssl
+/// x509` parses only the first block, and two overlapping Developer ID certificates is
+/// what a renewal looks like.
 fn installed_cert_spki(sha1: &str) -> Option<String> {
     let pem = installed_leaf_pem(sha1)?;
     let der = capture(
@@ -863,14 +852,13 @@ fn plural(n: usize) -> &'static str {
 
 /// The verdict when no certificate has arrived.
 ///
-/// `csr` is `Some` wherever a request has been SURFACED to a path the operator can act
-/// on, and it selects the strong half of [`rejected_note`]: "this is not a download
-/// problem: upload <path>". Passing `None` there — which the timeout used to do — chose
-/// the weak half, "if the browser saved the .cer elsewhere, move it into a watched folder",
-/// which tells the operator their file is fine and merely misplaced. That reading is
-/// precisely what sends them back to the portal to create a second certificate. The
-/// non-interactive path keeps `None` on purpose: nothing has been surfaced there, so the
-/// search-location fact is the true one.
+/// `csr` is `Some` wherever a request has been SURFACED to a path the operator can act on, and it
+/// selects the strong half of [`rejected_note`]: "this is not a download problem: upload <path>".
+/// `None` chooses the weak half, "if the browser saved the .cer elsewhere, move it into a watched
+/// folder", which tells the operator their file is fine and merely misplaced. That reading is
+/// precisely what sends them back to the portal to create a second certificate. The non-interactive
+/// path keeps `None` on purpose: nothing has been surfaced there, so the search-location fact is
+/// the true one.
 fn waiting_text(
     id: &str,
     invalid: usize,
@@ -945,7 +933,7 @@ fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
 /// is printed by — so the label is [`APPLE_LABEL`], the name every other line about this
 /// certificate carries, and the continuations land in the same column. A question that
 /// arrives under a different gutter reads as a different subject, which is not what a
-/// permanent choice should look like. This used to count its own thirteen spaces by hand.
+/// permanent choice should look like.
 ///
 /// # Both answers state their cost
 ///
@@ -995,8 +983,9 @@ fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
 /// places name it: `ensure_notary` stores it, `write_credentials_profile` writes it,
 /// `provision::notary_check` live-tests it, and the cut reads it back.
 ///
-/// Per-machine revocability lives where it actually bites: the app-specific password
-/// behind it, which should be minted per machine at https://account.apple.com (Sign-In and Security → App-Specific Passwords).
+/// Per-machine revocability lives where it actually bites: the app-specific password behind it,
+/// which should be minted per machine at https://account.apple.com (Sign-In and Security →
+/// App-Specific Passwords).
 pub(crate) const NOTARY_PROFILE: &str = "notary";
 
 /// Store a notarytool credential in this machine's keychain.
@@ -1039,9 +1028,8 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
          3. copy the xxxx-xxxx-xxxx-xxxx string\n\
          then paste it at the password prompt below.",
     );
-    // Through the grid, like every other line: this used to be a hand-counted
-    // `"\n  notary   "` — column 11 against a column-13 grid — printed directly under a
-    // `notary` step line, so the one prompt and the line explaining it did not align.
+    // Through the grid, like every other line, so the prompt aligns with the `notary`
+    // step line above it.
     //
     // And "blank to skip" names its CONSEQUENCE. A blank answer returns `Waiting`, which
     // is a `Check::Todo`, which defers the mint — so on a first run "skip" does not skip
@@ -1212,29 +1200,18 @@ fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
 ///
 /// # Why it is numbered lines and not a paragraph
 ///
-/// It was one five-sentence paragraph, and the paragraph failed in the field exactly the
-/// way a paragraph does: the operator skimmed it, went to the portal, saw a Developer ID
-/// certificate already in the list, and downloaded THAT — a certificate issued days
-/// earlier from a different request, holding a different key, whose private half was on
-/// another machine entirely. The tool then refused it in silence while the heartbeat said
-/// "still waiting", and the operator reasonably concluded the tool had hung. One of team
-/// A66A9P66Z7's five PERMANENT Developer ID slots was spent to fix a download.
-///
-/// Two sentences of that paragraph would have prevented it. Neither was reachable by
-/// skimming, because both sat mid-paragraph among three others. So: numbered lines, the
-/// upload target on a line of its own, and the trap stated LAST — the position a reader's
-/// eye actually lands on.
+/// As a paragraph it was skimmed: an operator downloaded a certificate already in the
+/// portal's list (issued from a different request, its private key on another machine),
+/// the tool refused it in silence, and one of the team's five PERMANENT Developer ID
+/// slots was spent to fix a download. So: numbered lines, the upload target on a line of
+/// its own, and the trap stated LAST — the position a reader's eye actually lands on.
 ///
 /// # Why there is no second spelling
 ///
-/// There used to be a `errand()` paragraph beside this list for the non-interactive path,
-/// and within one revision the two disagreed: the paragraph said the Account Holder rule
-/// is specifically about CREATING a Developer ID certificate (it is — a delegate can sign
-/// in and see the list, which is why "nobody else" alone stops a legitimate role account
-/// for the wrong reason), and that the download is matched by PUBLIC KEY (which is the
-/// mechanism that makes the trap below credible rather than a rule to be argued with).
-/// The list had truncated the first and dropped the second. Both are restored here, and
-/// the other path now joins these same lines.
+/// Both paths join these same lines: two spellings drift. Two facts here matter: the
+/// Account Holder rule is about CREATING a Developer ID certificate (a delegate can sign
+/// in and see the list), and the download is matched by PUBLIC KEY (which makes the trap
+/// credible rather than a rule to be argued with).
 ///
 /// `waiting` is the one thing that legitimately differs between the two callers: only the
 /// interactive path then sits in a loop, so only it may promise one.
@@ -1347,9 +1324,8 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
 /// `~/.aterm/apple` always — it is aterm's own. `named` is the ONE extra folder the
 /// operator gave with `--cert-dir`, and naming it is the consent: it may be `~/Downloads`
 /// or any other folder macOS guards, and the note printed before the errand says so.
-/// Nothing else is ever read. Until 2026-09-13 `~/Downloads` was polled unasked every
-/// three seconds for the whole wait — from an aterm shell, aterm is the app responsible
-/// for that folder's consent dialog (the 2026-09-12 TCC audit; `atpkg::protected`).
+/// Nothing else is ever read: from an aterm shell, aterm is the app responsible for a
+/// guarded folder's consent dialog (`atpkg::protected`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Watch {
     /// `~/.aterm/apple`, or `None` without a `$HOME` (then only `named` is read).
@@ -1423,9 +1399,9 @@ impl Watch {
 /// Best-effort by design: on any failure the hidden canonical path still works, and the
 /// Finder reveal merely pre-selects the file for the operator.
 ///
-/// Never called with a folder the operator did not name. It used to write into
-/// `~/Downloads` unconditionally — a write into a folder macOS guards, by a process whose
-/// responsible app is the terminal it runs in, is that terminal's consent dialog.
+/// Never called with a folder the operator did not name: a write into a folder macOS
+/// guards, by a process whose responsible app is the terminal it runs in, is that
+/// terminal's consent dialog.
 #[cfg(unix)]
 fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
     let visible = named.join(format!("devid-{id}.certSigningRequest"));
@@ -1607,7 +1583,7 @@ fn digest(der: &[u8]) -> Option<String> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+    aterm_codec::hex::is_hex(&hex, 64).then_some(hex)
 }
 
 /// Run 2: check the certificate before touching the keychain, then import it and the key
@@ -1831,8 +1807,7 @@ fn import_idempotent(args: &[&str]) -> Result<(), String> {
 /// Developer ID generations share the common name this code filters on. So the DN decides
 /// only which of Apple's two published files to TRY first; what decides installation is
 /// RFC 5280's Authority Key Identifier, the field whose whole job is naming the issuing
-/// key. With the name no longer load-bearing, both files are tried and whichever actually
-/// issued the leaf is the one installed.
+/// key. Both files are tried and whichever actually issued the leaf is the one installed.
 ///
 /// MEASURED on this platform (LibreSSL 3.3.6, the openssl macOS ships): `openssl verify`
 /// has no `-partial_chain`, so verifying a leaf against a bare intermediate is not
@@ -2163,16 +2138,10 @@ fn cert_common_name(subject: &str) -> Option<String> {
 /// the pairing, and touches nothing that matters: the copy lives in a private directory
 /// that is removed either way.
 ///
-/// The probe path used to be `${TMPDIR}/aterm-provision-probe-<sha1>` — derived only from
-/// a digest this tool PRINTS, in a directory that is world-writable whenever TMPDIR is
-/// /tmp (sudo, cron, a CI shell). Two things followed. A second run of the audit — two
-/// terminals, or a wrapper script beside a human — removed the file between the first
-/// run's copy and its `codesign`, and a failed probe is not a small lie: `verdict` turns
-/// it into Blocked, which defers the mint and prints a `set-key-partition-list` remedy for
-/// a keychain that is already correct. And `fs::copy` FOLLOWS symlinks, so a pre-created
-/// name was a target to overwrite rather than an error. Both go away with a per-run
-/// directory (`create_dir` fails on an existing entry) and `create_new` on the file
-/// inside.
+/// A per-run directory (`create_dir` fails on an existing entry) and `create_new` on the
+/// file inside: a predictable path in a world-writable TMPDIR lets a concurrent audit
+/// remove the copy before `codesign` (a false Blocked with a wrong remedy), and
+/// `fs::copy` FOLLOWS a pre-created symlink.
 fn prove_can_sign(sha1: &str) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = temp_run_dir("probe")?;
@@ -2365,8 +2334,7 @@ mod tests {
     /// directly above a wait loop, so that sentence told the operator to re-run a command
     /// that was at that moment sitting in one.
     ///
-    /// Both paths are asserted against the SAME function. There used to be two texts, and
-    /// the non-interactive one is the one nobody re-reads, so it is the one that rots.
+    /// Both paths are asserted against the SAME function.
     #[test]
     fn the_errand_names_the_request_the_role_and_the_sub_ca() {
         let watch = Watch::new(None);
@@ -2403,10 +2371,8 @@ mod tests {
     }
 
     /// `provision` reads `~/.aterm/apple` and the ONE folder the operator named — never
-    /// `~/Downloads` on its own initiative. The 2026-09-12 TCC audit found the wait
-    /// polling `read_dir(~/Downloads)` every three seconds for thirty minutes: from an
-    /// aterm shell, aterm is the app responsible for the "would like to access files in
-    /// your Downloads folder" dialog that costs. Naming the folder is the consent.
+    /// `~/Downloads` on its own initiative: from an aterm shell, aterm is the app
+    /// responsible for that folder's consent dialog. Naming the folder is the consent.
     #[test]
     fn nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it() {
         let own = Watch::new(None);
@@ -2582,8 +2548,8 @@ mod tests {
         assert!(rejected_note(&[], Some(&csr), &watch).is_none());
     }
 
-    /// Two overlapping Developer ID certificates is what a RENEWAL looks like, and the
-    /// pairing proof used to compare against whichever the keychain listed first. The
+    /// Two overlapping Developer ID certificates is what a RENEWAL looks like, so the
+    /// pairing proof selects by digest, not by keychain order. The
     /// stream shape is MEASURED: `security find-certificate -a -p -Z` prints a SHA-256
     /// line, a SHA-1 line, then the block.
     #[test]

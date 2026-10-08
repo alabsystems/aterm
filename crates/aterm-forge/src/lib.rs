@@ -1,45 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-forge` — the owned-fork production line for aterm's third-party
+//! `aterm-forge`: the owned-fork production line for aterm's third-party
 //! surface, behind the `targo --unverified forge` alias.
 //!
 //! # Why this exists
 //!
-//! The shipped `aterm` binary on aarch64-apple-darwin resolves dozens of
-//! packages aterm did not write, carrying hundreds of thousands of lines of
-//! Rust; the Linux cell resolves hundreds of them and millions of lines. That
-//! metric EXCLUDES the same-owner astream submodule under `vendor/`:
-//! `loc::measure` sets `is_third_party` by inverting
-//! `provenance::is_first_party`, which rosters `vendor/astream` as aterm's own.
-//! The exact counts are `measured::MAC_ARM` / `measured::LINUX`. It is that
-//! surface — code aterm did not write, compiled into the shipped binary — for
-//! which `.cargo/config.toml` disables in-compilation verification
-//! (`-Ztrust-verify=off`), as an explicitly temporary opt-out.
+//! The shipped `aterm` binary resolves many packages aterm did not write
+//! (counts in `measured::MAC_ARM` / `measured::LINUX`; the same-owner astream
+//! submodule is excluded via `provenance::is_first_party`). For that surface
+//! every build lane disables in-compilation verification (`-Ztrust-verify=off`,
+//! appended by `targo --unverified`; `.cargo/config.toml` carried it until
+//! 2026-10-07) as a temporary opt-out, and `targo trust` switches every
+//! dependency unit off itself.
 //!
-//! Every pinned count is read from `measured` (`src/measured.rs`) — the single
-//! place the baseline lives, so an extraction that shrinks the surface costs
-//! ONE edit rather than fourteen red tests. This prose deliberately carries no
-//! digits: the copy it used to carry said 50 / ~451k and 198 / ~2.80M, and went
-//! stale within two days when the astream classifier landed and the real
-//! figures became 47 / 440,327 and 195 / 2,788,536. A copy goes stale the way
-//! copies do; name the constant instead.
+//! Forge shrinks it on a measured, ratcheted, provenance-carrying basis: it
+//! surveys the graph, attributes each package's true cost, notarizes every fork
+//! against its pristine upstream, and refuses silent regressions. Pinned counts
+//! live only in `measured`; prose names the constant rather than copying
+//! digits.
 //!
-//! Forge is the instrument for shrinking that surface on a measured, ratcheted,
-//! provenance-carrying basis: it SURVEYS the graph, ATTRIBUTES each package's
-//! true cost, NOTARIZES every fork against its pristine upstream, and refuses to
-//! let any of those numbers regress silently.
+//! # What it does not claim
 //!
-//! # What it does NOT claim
-//!
-//! Carving does not delete `-Ztrust-verify=off`. Those are per-target rustflags
-//! applied to every compiled unit, and `targo trust` marks every build script
-//! off unconditionally — so while a single third-party build script remains (10
-//! do, in the macOS shipped graph per `measured::MAC_ARM`), no amount of source
-//! deletion retires the
-//! flag. What forge delivers is a smaller, owned, monotonically-decreasing
-//! surface with `-p` handles and ratchet rows. The last mile needs
-//! `-Ztrust-verify-include-dependencies` or a written build-script policy.
+//! Carving does not delete `-Ztrust-verify=off`: the build lane applies it to
+//! every unit, and `targo trust` marks every build script off, so while any
+//! third-party build script remains the flag stays. Forge delivers a smaller,
+//! owned, decreasing surface with `-p` handles and ratchet rows; the last mile
+//! needs `-Ztrust-verify-include-dependencies` or a build-script policy.
 //!
 //! # Module map
 //!
@@ -54,9 +41,6 @@
 //! | [`policy`] | `vendor/forge.toml` — the fork ledger, hand-edited, held to the tree by `check` |
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
-//! | [`mirror`] | Lane 1 generator: `Cargo.lock` → enforced `local-registry` |
-//! | [`mirror_bundle`] | Lane 1 delivery: one deterministic, verified-before-unpack bundle |
-//! | [`mirror_config`] | the shippable `[source]` fragment, split from `.cargo/config.toml` |
 //! | [`check`] | the gate reporter: all of the above, no compilation |
 //! | `measured` | test-only: the pinned per-cell baseline, in ONE place |
 
@@ -67,15 +51,23 @@ pub mod check;
 mod direct_vendor;
 pub mod dominator;
 pub mod loc;
-/// THE pinned measurement baseline, read by every test that asserts a real
-/// number about this tree. Test-only on purpose: the shipped verbs MEASURE, and
-/// a verb that consulted a hard-coded count would be reporting the answer it
-/// was told instead of the one the graph has.
+/// The pinned measurement baseline, read by every test that asserts a real
+/// number about this tree. Test-only: shipped verbs measure, never consult it.
 #[cfg(test)]
 pub mod measured;
-pub mod mirror;
-pub mod mirror_bundle;
-pub mod mirror_config;
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// The workspace root (aterm-forge sits two levels under it).
+    pub(crate) fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/aterm-forge sits two levels under the workspace root")
+            .to_path_buf()
+    }
+}
 pub mod model;
 pub mod policy;
 pub mod provenance;
@@ -95,7 +87,7 @@ pub mod exit {
 }
 
 /// The house verdict shape, mirroring `aterm_census::CensusOutcome`: the log is
-/// RETURNED rather than printed so each consumer routes it (xtask → stderr,
+/// returned rather than printed so each consumer routes it (xtask → stderr,
 /// build gate → compile error).
 pub struct Outcome {
     pub ok: bool,

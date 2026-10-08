@@ -22,13 +22,16 @@
 //! (in the retired `notice.rs`, `privacy_notice_once`) but never wired, so nothing at launch ever
 //! told the owner there was one switch to flip, and the per-folder dialogs
 //! stayed the only surface. The owner's direction (2026-09-07) is that aterm
-//! consolidate this into one prompt. This module is that prompt: ONE decision
-//! row on the message band (docs/DESIGN-unified-messages-2026-09-21.md §6
-//! R15–R17; the retired floating card was the same question, 2026-09-07 →
-//! 2026-09-22), with two capsules — *Open Settings*, which deep-links to the
-//! Full Disk Access pane, and *Not now*, which records the answer so the row
-//! never nags. The words are [`FDA_TITLE`] and [`FDA_DETAIL`]; the message
-//! itself is `message_reporters::file_access_question`.
+//! consolidate this into one prompt. This module is that prompt: ONE entry of
+//! the exceptions digest, "To look at" (owner rule, 2026-09-28: a thing that can
+//! wait is one dismissable line, filed in the log, never a row that persists on
+//! the glass), with one button — *Open Settings*, which deep-links to the Full
+//! Disk Access pane. It began as a decision row on the message band
+//! (docs/DESIGN-unified-messages-2026-09-21.md §6 R15–R17, with a *Not now*
+//! that recorded a marker; the floating card before it was the same question,
+//! 2026-09-07 → 2026-09-22). The entry is `message_reporters::file_access_entry`,
+//! its words are [`FDA_WHAT`], [`FDA_WHY`] and [`FDA_THEN`] with three lines behind
+//! `Details ›`; the old `Not now` marker still ends the question for good.
 //!
 //! # What it is not
 //!
@@ -44,88 +47,97 @@
 //! the owner may already have enabled it. The card names unconfirmed access,
 //! and its Settings follow-up asks the owner to leave an enabled switch on.
 //!
-//! # When it shows — every condition, because each one is a way to be wrong
+//! # When it shows — once per real need, never at launch
 //!
-//! [`decide`] is the decision and it is pure. The card is due only when ALL
-//! of these hold, and [`NotDue`] names which one failed so the log says why:
+//! The card used to be a per-process machine that offered itself at every
+//! start: eight posts in 3.8 days, six of them within half a second of an
+//! update, none tied to any dialog (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md`
+//! §3.4, as amended 2026-09-28). It is now NEED-driven. The question is about
+//! ONE thing — the "access data from other apps" dialog, whose Allow is
+//! forgotten as soon as the responsible instance ends — and it is raised only
+//! when that dialog has actually been shown for a program of this aterm, or
+//! aterm's own protected read was refused ([`NeedCause`]), and at most once per
+//! EPOCH: an epoch ends when a verified grant later reads as off, or
+//! [`RENEW_AFTER`] passes.
 //!
-//! * `[privacy] enabled` and `[privacy] notice` are on — re-read before every
-//!   lifecycle step, so disabling either also retires a pending or visible card;
-//! * the instance has a window — a headless instance holds the inert probe
-//!   arm and could only ever invent a verdict;
-//! * *Not now* is not on record — that answer latches for the life of the
-//!   config directory;
-//! * the probe actually OBSERVED `denied` — `unknown` (the probe refused, or
-//!   the lane is off) is not a denial and earns no card; a pending worker is
-//!   not a verdict, so its launch-time marker waits for the completed result;
-//! * the running bundle's designated requirement is grant-STABLE
-//!   (`DrClass::Identity`): a grant keyed to an ad-hoc cdhash dies on the next
-//!   build (§2.2), so offering it would offer nothing. That is the whole
-//!   identity test — a dev bundle signed with a stable identity may hold a
-//!   grant of its own, so being a dev build is not by itself a refusal.
+//! [`decide_need`] is the decision and it is pure; [`NotDue`] names the rule
+//! that said no, so the log says why. In order, the first that applies wins:
+//! the `[privacy]` switches; a headless instance; a prompt for a service the
+//! card is not about; *Not now* on record; a grant-UNSTABLE build (an ad-hoc
+//! cdhash grant dies on the next build); the grant already held; the owner
+//! already acted on a window older than the act ([`NotDue::OwnerActed`]); the
+//! probe not having OBSERVED `denied`; an ask already made this epoch.
 //!
-//! A grant is never latched: the probe says `granted` on every launch while
-//! it holds, and if the owner later removes it (a `tccutil reset`, a macOS
-//! upgrade), the card is simply due again. Only *Not now* is remembered.
+//! [`decide_launch`] runs once per process at the first park and NEVER posts
+//! anything: it only acknowledges a grant (the ✓ record) and logs.
 //!
-//! # The two markers
+//! # The three files, and what each records
 //!
-//! One file beside `aterm.toml` ([`MARKER`]) carries one token:
-//! * `not-now` — the owner's answer; the card is not offered again;
-//! * `opened` — the owner pressed *Open Settings* and the outcome is not yet
-//!   known. It exists for Apple's own sheet, which tells the owner the app
-//!   "will not have full disk access until it is quit" and offers Quit &
-//!   Reopen: the NEXT process, finding `opened` beside a probe that now reads
-//!   `granted`, shows the ✓ confirmation once and clears the marker, so the
-//!   flip is acknowledged whichever process observes it. Finding `opened`
-//!   beside `denied` is not an answer: the card is due again.
+//! * [`MARKER`] (`privacy-access-card-answered`) — `not-now` (the owner's
+//!   answer, permanent) or `opened` (the owner pressed *Open Settings* and the
+//!   outcome is not yet known). The NEXT process, finding `opened` beside a
+//!   probe that now reads `granted`, shows the ✓ record once and clears it.
+//! * [`RECORD`] (`privacy-fda-record`) — four unix-second facts (`asked_at`,
+//!   `opened_at`, `verified_at`, `verified_build`), each written as the MAX of
+//!   the old and new value so two processes cannot move a field backwards.
+//!   This is what makes "once" survive an update: the successor is a new
+//!   process with a fresh [`CardState`] and finds the same record.
 //!
 //! # Lifetime, in one process
 //!
 //! [`CardState`] is the per-process machine the event loop drives from its
-//! park point: the launch-time worker warms the signing identity and reads the
-//! marker OFF the event loop (`codesign` and a disk read, neither of which may
-//! stall the loop), the main thread decides against a completed CACHED probe
-//! (a pending probe is waited on with the watch's own patience, [`WATCH_FOR`]),
-//! and a due card posts its row — keyed `privacy.fda`, so there is only ever
-//! one — and WATCHES two things: the probe, for the grant, for at most
-//! [`WATCH_FOR`]; and the row itself, through `center.live(id)`. The
-//! prompt-free access probe runs on a detached worker, with at most one in
-//! flight; the event loop never joins it or calls its `open()`. An active
-//! watch has a bounded refresh deadline, returning focus invalidates the
-//! observation, and worker completion wakes the app. All windows read that
-//! same App-owned result. This observes whether access became effective; it
-//! does not read the System Settings switch or establish the permissions of
-//! sessions adopted from another process. Nothing displaces the row: the
-//! band ranks a decision row first and holds it for its own patience, so the
-//! slot arbitration the floating card needed — a wait for the slot, a return
-//! after displacement, a ✓ that queued behind another card — is gone with the
-//! slot. A row that folds unanswered ([`CardState::on_row_retired`]) is not
-//! latched: it returns after a day or at the next launch. Only an actually
-//! shown, unanswered offer gets that daily return; quiet decisions, exhausted
-//! initial attempts and a row the owner acted on stay settled.
+//! park point. `Idle` runs the launch check once (a worker warms the signing
+//! identity and reads the marker and the record OFF the event loop). A need
+//! event ([`CardState::on_need`]) re-arms a `Settled` card into `Deciding`;
+//! the main thread decides against a completed CACHED probe (a pending probe
+//! is waited on with the watch's own patience, [`WATCH_FOR`]); a due card posts
+//! ONE question through the host seam (`App::raise_fda_need`) and WATCHES the
+//! probe for the grant, for at most [`WATCH_FOR`], and the question itself
+//! through `center.live(id)`. The prompt-free access probe runs on a detached
+//! worker; the event loop never joins it or calls its `open()`. This observes
+//! whether access became effective; it does not read the System Settings
+//! switch. `Settled` means "not currently active", not "done for this
+//! process": a later need may re-arm it, and [`decide_need`] alone decides
+//! whether that asks anything.
+//!
+//! # The words: one source
+//!
+//! Every string the owner reads about this question is a const here, and the
+//! exceptions digest imports them rather than retyping them
+//! ([`FDA_WHAT`], [`FDA_WHY`], [`FDA_THEN`], [`FDA_GRANTS`], [`FDA_AFTER`],
+//! [`FDA_DETAIL`], [`FDA_TITLE`]). None claims anything S1 (when a running
+//! process sees a new grant) or S4 (which services a held grant silences)
+//! decides. The fence lives in
+//! `message_reporters::the_file_access_message_is_honest_and_fence_clean`.
 //!
 //! # No protected-folder literal lives here
 //!
 //! Nothing in this module names a folder or touches one (`grep_guard` B13).
-//! The card's whole contact with the filesystem is the marker beside
-//! `aterm.toml`, through [`crate::config_marker`].
+//! The card's whole contact with the filesystem is the marker and the record
+//! beside `aterm.toml`, through [`crate::config_marker`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aterm_containment::consent::{DrClass, FdaState};
+use aterm_containment::consent::{DrClass, FdaState, Folder};
 
 /// The marker beside `aterm.toml` (the config-dir latch idiom of
 /// `connections`' first-use notice, [`crate::config_marker`]).
 pub(crate) const MARKER: &str = "privacy-access-card-answered";
 
-/// A marker holds one token; anything bigger is something else wearing the
-/// name and reads as "never answered" — the card shows, which errs toward
-/// disclosure.
+/// A marker holds one token; anything bigger reads as "never answered", so the
+/// card shows (erring toward disclosure).
 pub(crate) const MAX_MARKER_BYTES: usize = 64;
 
-/// How long, after the card is raised, the instance keeps re-checking the
+/// The record beside `aterm.toml`: four `key=value` lines. A second file, so
+/// an older build reading the marker pair behaves exactly as it did.
+pub(crate) const RECORD: &str = "privacy-fda-record";
+
+/// A record is four short lines; anything bigger is something else wearing
+/// the name and reads as an empty record.
+pub(crate) const MAX_RECORD_BYTES: usize = 160;
+
+/// How long, after the question is raised, the instance keeps re-checking the
 /// probe for the grant — and how long a due card waits on a probe that is
 /// still pending before it is retired unraised. Bounded so a process that
 /// outlives an unanswered card does not carry a per-park check forever; fresh
@@ -134,79 +146,130 @@ pub(crate) const MAX_MARKER_BYTES: usize = 64;
 pub(crate) const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How long the launch one-shot waits for its worker's verdict before asking
-/// again. A verdict CAN be lost: an uncommitted incoming handoff drops every
-/// wake but Commit, and the tick that starts the one-shot has no way to know a
-/// wake it posted was dropped.
+/// again. A verdict can be lost: an uncommitted incoming handoff drops every
+/// wake but Commit.
 const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How many verdicts the one-shot will wait for before giving up for the life
 /// of the process.
 pub(crate) const DECIDE_ATTEMPTS: u8 = 3;
 
-/// How long a card that lifted away UNANSWERED — no marker written, the owner
-/// never pressed it — waits before it is offered again in the same process.
-/// The card was launch-only: an update that landed overnight raised it to an
-/// empty room, it expired, and the owner met the next morning's dialogs with
-/// no card and no pointer to Settings until the next update. A card the owner
-/// answered is never re-offered (the marker decides that, in every process).
-pub(crate) const REOFFER_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long after an ask the next one may be made in the same epoch (the row
+/// host; the digest host's entry stands instead, with its own `resurface`).
+/// The dialogs the question explains recur, so a weekly pointer is not
+/// nagging; an ask is never repeated inside the week.
+pub(crate) const RENEW_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// The row's title (R15): the ASK — a question, so it claims nothing.
+/// How long an owner who pressed *Open Settings* is presumed to have acted
+/// ([`NotDue::OwnerActed`]): a window that STARTED BEFORE the press cannot be
+/// expected to see the switch, and asking again about it would be the
+/// non-actionable alert the owner ruled out.
+pub(crate) const OWNER_ACTED_HOLD: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How long a fresh process gives the window's own probe before a denied read
+/// beside a VERIFIED grant is believed. An update leaves the new build's first
+/// seconds inside the `.rollback` window, where a held grant can read off; the
+/// need is kept and decided again after this, and only a second denied read
+/// (the one this delay buys) marks the grant regressed.
+pub(crate) const LAUNCH_SETTLE: Duration = Duration::from_secs(90);
+
+/// Needs closer together than this are one need (a `find /` raises a burst of
+/// dialogs' worth of log lines in a second).
+pub(crate) const NEED_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// At most one `aterm.log` line per this interval says that macOS asked.
+pub(crate) const NEED_LOG_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The pre-digest ROW's title (R15): the ASK — a question, so it claims nothing.
+/// The digest entry leads with [`FDA_WHAT`] instead; this const is the retired
+/// row's (`message_reporters::file_access_question`, test-only since the seam
+/// hands the need to the digest), and the words of the doc below are why it
+/// stayed short.
 ///
-/// # What it says, and what it deliberately does not
+/// [`FDA_DETAIL`], behind Details, acknowledges that Full Disk Access may
+/// already be enabled (the probe does not read the Settings toggle). The copy
+/// names no folder, no coverage and no scope, and never promises the
+/// interruptions go away: it mitigates, never eliminates.
 ///
-/// The title asks for the grant. The first detail line ([`FDA_DETAIL`])
-/// acknowledges that the owner may already have enabled Full Disk Access: the
-/// current process's access probe does not read the System Settings toggle.
-/// It rides behind Details: the row paints its question alone (review round
-/// 2, 2026-09-23 — `File access not confirmed · Full Disk Access may already
-/// be enabled` was a status and a hedge, and never said what it asked). It
-/// does NOT name a folder, does NOT say which folders the grant covers, and
-/// does NOT promise the interruptions go away. Coverage is §7 S4's claim to
-/// make and S4 has not been run on this machine; scope is S1's and S1 has not
-/// been run either, so no scope sentence ships at all (§3.4's own escalation).
-/// The owner's ruling is that mitigating this annoyance is acceptable — so the
-/// row must never read as elimination.
+/// The title names the one action, a switch in Settings. The verb is
+/// deliberately not the button of the dialog the owner has just met ("Allow"),
+/// because the action asked for is a different one. The first detail line
+/// ([`FDA_WHY`]) says why, and [`FDA_GRANTS`] says what the switch grants (it
+/// grants a lot: every program run under aterm, agents included). It does NOT
+/// name a folder, does NOT say which services the grant covers, does NOT say
+/// when a running process sees it and does NOT promise the interruptions go
+/// away: coverage is §7 S4's claim to make, timing is S1's, and the owner's
+/// ruling is that mitigating this annoyance is acceptable, so the row must
+/// never read as elimination.
 ///
 /// # Why it is short
 ///
 /// The band's width law keeps a decision row's capsules whole and shortens
 /// the words, so on an ordinary window the question must fit beside "Open
-/// Settings" and "Not now" or the owner sees two buttons and no ask. Title
-/// and detail together are held under ~75 characters (pinned by
+/// Settings" and "Not now" or the owner sees two buttons and no ask. Title and
+/// first detail together are held under ~75 characters (pinned by
 /// `message_reporters::the_file_access_message_is_honest_and_fence_clean`).
-///
-/// # Why the wording is a const, and why it is here
-///
-/// A row that fires once per install is a string nobody re-reads in the
-/// running app, so it is the easiest place in the product for an unmeasured
-/// claim to sit unchallenged. Pinned as one const beside the decision it
-/// belongs to, it is one grep away and the copy fence can hold it.
-pub(crate) const FDA_TITLE: &str = "Allow Full Disk Access?";
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const FDA_TITLE: &str = "Turn on Full Disk Access?";
 
-/// The row's first detail line (R15): the switch may already be on — a failed
-/// probe does not read it. See [`FDA_TITLE`] for the fence it lives under.
+/// The entry's `what` in the exceptions digest (glass-title form, cap 48).
+/// Consumed by `message_reporters::file_access_entry` (design-exceptions §8.2),
+/// which imports it instead of retyping it.
+pub(crate) const FDA_WHAT: &str = "macOS keeps asking for access";
+
+/// The entry's `what` when no prompt was seen: macOS refused aterm's own read
+/// under a protected root ([`NeedCause::ProtectedRead`]). Same cap as
+/// [`FDA_WHAT`].
+pub(crate) const FDA_WHAT_DENIED: &str = "macOS refused aterm a protected read";
+
+/// The entry's `what` when a grant aterm had verified reads off again
+/// (`NeedWords::regressed`). Same cap as [`FDA_WHAT`].
+pub(crate) const FDA_WHAT_REGRESSED: &str = "Full Disk Access reads off again";
+
+/// WHY the owner is needed, first: an Allow is forgotten when aterm updates.
+/// True of both kinds of tab — for a live tab the Allow is scoped to the
+/// window and ends when the window is replaced; for a tab that survived an
+/// update it ends earlier, with that program — so "when aterm updates" is an
+/// upper bound. Row `detail[0]`; the digest's `Need.why` (cap 90).
+pub(crate) const FDA_WHY: &str = "macOS forgets an Allow when aterm updates";
+
+/// The ONE action, as an imperative: the entry's `Then::press` sentence (cap 90:
+/// no `; `, no ` or `, no newline, no restart phrase). Imported by the digest
+/// host like [`FDA_WHAT`].
+pub(crate) const FDA_THEN: &str = "turn on aterm in Full Disk Access";
+
+/// What the switch GRANTS, said where the ask is. A disclosure of a
+/// consequence Apple's own pane states ("data like Mail, Messages, Safari"),
+/// not a promise of a benefit: it says nothing about which prompts the switch
+/// silences or when a running process sees it. Row `detail[2]`; a `more` line
+/// of the digest entry.
+pub(crate) const FDA_GRANTS: &str = "Full Disk Access lets programs you run in aterm, agents included, read protected data such as Mail and Messages";
+
+/// What aterm DOES next, true whatever S1 answers. Row `detail[4]`.
+pub(crate) const FDA_AFTER: &str = "aterm checks now and after each update, and says so in \
+                                    aterm's Messages once Full Disk Access is on";
+
+/// The hedge, always shown: a failed probe does not read the switch, and a
+/// window may not yet see a switch that is on. Row `detail[5]`.
 pub(crate) const FDA_DETAIL: &str = "Full Disk Access may already be enabled";
 
 /// The ✓ row that supersedes the question once the probe observes the grant
 /// (R17; `message_reporters::file_access_granted`). It names the fact and
 /// stops: which services the grant covers and how far it reaches are §7 S4's
-/// and S1's measurements, and neither has been run. The success glyph is the
-/// row's own; the words carry no marker. The question's own noun, one
-/// clause (audit 2026-09-24): it is a record's title.
+/// and S1's measurements. The success glyph is the row's own; the words carry
+/// no marker. The question's own noun, one clause (audit 2026-09-24): it is a
+/// record's title.
 pub(crate) const GRANTED_CAPTION: &str = "Full Disk Access granted";
 
-/// The words the row takes after *Open Settings* (R16): `openURL:` reports
-/// only that System Settings TOOK the URL, never that it scrolled to the row,
-/// so the route in words (`route`, from `menu::privacy_settings_path_words`)
-/// goes out on every outcome, FIRST — a terse restate is the outcome and the
-/// route (the owner's attention rule, 2026-09-23). Behind it: finding aterm
-/// there — an app has a switch in that list only once it is listed, and the
-/// `+` is how a human adds it — what to do if it is already on, and what
-/// aterm does next (re-checks its probe); nothing the B10/B12 phrase fence
-/// forbids. One sentence in the `"<title> — <detail>"` shape;
-/// `messages_host::route_words` splits it at the dash into the row's title
-/// and at its `; ` joints into the row's detail lines, the route the first.
+/// The words the row takes after *Open Settings*. `openURL:` reports only that
+/// System Settings took the URL, never that it scrolled to the row, so the
+/// route in words (`route`, from `menu::privacy_settings_path_words`) goes out
+/// on every outcome, first. Behind it: how to find aterm there (the `+` adds
+/// an unlisted app), what to do if it is already on, and that aterm re-checks
+/// its probe; nothing the B10/B12 phrase fence forbids. One sentence in the
+/// `"<title> — <detail>"` shape: `messages_host::route_words` splits it at the
+/// dash into title and at `; ` into detail lines, the route first
+/// (owner, 2026-09-23).
 pub(crate) fn opened_settings_caption(opened: bool, route: &str) -> String {
     if opened {
         format!(
@@ -221,14 +284,106 @@ pub(crate) fn opened_settings_caption(opened: bool, route: &str) -> String {
     }
 }
 
+/// What made the card think the owner is needed. Data only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NeedCause {
+    /// The sentinel saw `AUTHREQ_PROMPTING` for our own subject. `service` is
+    /// `Some(folder)` when it is one of the four the roster knows and `None`
+    /// for any other service; `session` is the tab the prompting program
+    /// belongs to, when it resolved (best effort, never a gate).
+    PromptObserved {
+        service: Option<Folder>,
+        session: Option<u64>,
+    },
+    /// aterm's own read under a protected root took `EPERM`. `session` is
+    /// `None` for aterm's own instance-level work (the warm-up).
+    ProtectedRead { session: Option<u64> },
+}
+
+impl NeedCause {
+    /// The tab's session, when the cause names one.
+    pub(crate) const fn session(self) -> Option<u64> {
+        match self {
+            Self::PromptObserved { session, .. } => session,
+            Self::ProtectedRead { session } => session,
+        }
+    }
+}
+
+/// The data the words are built from, so the reporter stays pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NeedWords {
+    pub(crate) cause: NeedCause,
+    /// The 1-based tab number the prompting program belongs to, when it
+    /// resolved. Never a path, never a program name.
+    pub(crate) tab_number: Option<usize>,
+    /// A verified grant later read as off: the epoch is a new one.
+    pub(crate) regressed: bool,
+}
+
+impl NeedWords {
+    /// The event line (the retired row's `detail[1]`): what macOS did, in one
+    /// sentence, from the cause. The digest entry holds three `more` lines and
+    /// they are the consts', so this one goes to `aterm.log` (`raise_fda_need`).
+    pub(crate) fn event_line(&self) -> String {
+        if self.regressed {
+            return "Full Disk Access was on for aterm and macOS now reports it off".to_owned();
+        }
+        let in_tab = self
+            .tab_number
+            .map_or_else(String::new, |n| format!(" in tab {n}"));
+        match self.cause {
+            NeedCause::PromptObserved { .. } => {
+                let mut what = Folder::AppData.label().to_owned();
+                if let Some(first) = what.get_mut(..1) {
+                    first.make_ascii_lowercase();
+                }
+                format!("macOS asked to let a program{in_tab} read {what}")
+            }
+            NeedCause::ProtectedRead { .. } => {
+                format!("macOS refused aterm a read of protected files{in_tab}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl PendingDecision {
+    /// A launch-check half as the worker would deliver it: `marker` on disk,
+    /// no record.
+    pub(crate) fn launch(marker: Option<Marker>) -> Self {
+        Self {
+            marker,
+            record: AccessRecord::default(),
+            why: DecideWhy::Launch,
+        }
+    }
+}
+
+#[cfg(test)]
+impl NeedWords {
+    /// A sample need for tests of the reporter and the host: an app-data
+    /// prompt from tab 1, first epoch.
+    pub(crate) fn sample() -> Self {
+        Self {
+            cause: NeedCause::PromptObserved {
+                service: Some(Folder::AppData),
+                session: Some(1),
+            },
+            tab_number: Some(1),
+            regressed: false,
+        }
+    }
+}
+
 /// What the marker records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Marker {
-    /// The owner pressed *Not now*: the card is not offered again for the
-    /// life of the config directory.
+    /// *Not now* was pressed: the card is not offered again for the life of
+    /// the config directory.
     NotNow,
-    /// The owner pressed *Open Settings* and the outcome is not yet known —
-    /// see the module doc. Consumed by the decision that resolves it.
+    /// *Open Settings* was pressed and the outcome is not yet known (see the
+    /// module doc). Consumed by the decision that resolves it.
     Opened,
 }
 
@@ -265,13 +420,14 @@ pub(crate) fn read_marker(config_path: Option<&Path>) -> Option<Marker> {
         .and_then(|text| Marker::parse(&text))
 }
 
-/// Every marker write in this process holds this: the owner's answer and an
-/// `opened` can be recorded from two workers at once, and `record_marker`'s
-/// keep-`not-now` check must see the other's write, not race it.
+/// Every marker and record write in this process holds this: the owner's
+/// answer and an `opened` can be recorded from two workers at once, and
+/// `record_marker`'s keep-`not-now` check (and the record's read-merge-write)
+/// must see the other's write, not race it.
 static MARKER_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Record `marker`. Best-effort, worker thread only: an unwritable config
-/// directory means the card comes back at the next launch, which errs toward
+/// directory means the card comes back at the next need, which errs toward
 /// disclosure. An `opened` never replaces a `not-now` (see the body).
 pub(crate) fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Result<()> {
     let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
@@ -281,10 +437,9 @@ pub(crate) fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::
             "no config directory to record the answer in",
         ));
     };
-    // An `opened` never replaces a `not-now`. That answer is the owner's, and
-    // the Security page's *Open Privacy & Security…* — which `key` can press
-    // exactly like a hand — is not an answer to the card: replacing it would
-    // bring back a question the owner declined for good.
+    // An `opened` never replaces a `not-now`: the Security page's *Open Privacy
+    // & Security…* (which `key` can press) is not an answer to the card, and
+    // replacing the marker would bring back a declined question.
     if marker == Marker::Opened
         && crate::config_marker::read_marker(&path, MAX_MARKER_BYTES)
             .and_then(|text| Marker::parse(&text))
@@ -295,9 +450,8 @@ pub(crate) fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::
     crate::config_marker::write_marker(&path, marker.as_str(), MAX_MARKER_BYTES)
 }
 
-/// Clear an `opened` marker once the grant it was waiting on has been
-/// acknowledged. Only an `opened` marker is touched: a `not-now` answer is
-/// the owner's and stays. Worker thread only.
+/// Clear an `opened` marker once its grant has been acknowledged. A `not-now`
+/// answer is never touched. Worker thread only.
 pub(crate) fn clear_opened(config_path: Option<&Path>) -> std::io::Result<()> {
     let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path) else {
@@ -312,7 +466,227 @@ pub(crate) fn clear_opened(config_path: Option<&Path>) -> std::io::Result<()> {
     crate::config_marker::remove_marker(&path)
 }
 
-/// Everything the decision reads. All of it observed; none of it inferred.
+/// What the record file holds: unix seconds, each field independent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccessRecord {
+    /// When the question was last raised.
+    pub(crate) asked_at: Option<u64>,
+    /// When the owner last pressed *Open Settings* (through either surface).
+    pub(crate) opened_at: Option<u64>,
+    /// When the window's own probe last read the grant as held.
+    pub(crate) verified_at: Option<u64>,
+    /// The build number that was running then.
+    pub(crate) verified_build: Option<u64>,
+}
+
+impl AccessRecord {
+    /// The field-wise MAX of two records: no field ever moves backwards, so
+    /// two processes writing at once cannot undo each other.
+    pub(crate) fn merged(self, other: Self) -> Self {
+        let max = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        Self {
+            asked_at: max(self.asked_at, other.asked_at),
+            opened_at: max(self.opened_at, other.opened_at),
+            verified_at: max(self.verified_at, other.verified_at),
+            verified_build: max(self.verified_build, other.verified_build),
+        }
+    }
+
+    /// The file's text: only the fields that are set.
+    pub(crate) fn render(&self) -> String {
+        let mut out = String::new();
+        for (key, value) in [
+            ("asked_at", self.asked_at),
+            ("opened_at", self.opened_at),
+            ("verified_at", self.verified_at),
+            ("verified_build", self.verified_build),
+        ] {
+            if let Some(value) = value {
+                out.push_str(&format!("{key}={value}\n"));
+            }
+        }
+        out
+    }
+
+    /// Parse a record's text. STRICT: a line that is not `key=<unsigned>` for
+    /// one of the four keys makes the whole file "not a record this code
+    /// wrote" and it reads as empty (the card errs toward speaking once,
+    /// never toward a crash or a guess).
+    pub(crate) fn parse(text: &str) -> Self {
+        let mut record = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Self::default();
+            };
+            let Ok(value) = value.trim().parse::<u64>() else {
+                return Self::default();
+            };
+            let slot = match key.trim() {
+                "asked_at" => &mut record.asked_at,
+                "opened_at" => &mut record.opened_at,
+                "verified_at" => &mut record.verified_at,
+                "verified_build" => &mut record.verified_build,
+                _ => return Self::default(),
+            };
+            *slot = Some(value);
+        }
+        record
+    }
+}
+
+/// Where the record lives for this config, or `None` with no config path.
+pub(crate) fn record_path(config_path: Option<&Path>) -> Option<PathBuf> {
+    config_path
+        .and_then(Path::parent)
+        .map(|dir| dir.join(RECORD))
+}
+
+/// The recorded facts; empty when there is no record. A disk read — worker
+/// thread only.
+pub(crate) fn read_record(config_path: Option<&Path>) -> AccessRecord {
+    record_path(config_path)
+        .and_then(|path| crate::config_marker::read_marker(&path, MAX_RECORD_BYTES))
+        .map(|text| AccessRecord::parse(&text))
+        .unwrap_or_default()
+}
+
+/// Merge `update` into the record on disk (field-wise max, under the shared
+/// write lock) and return what is there now. Best-effort, worker thread only.
+pub(crate) fn write_record(
+    config_path: Option<&Path>,
+    update: AccessRecord,
+) -> std::io::Result<AccessRecord> {
+    let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(path) = record_path(config_path) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no config directory to keep the record in",
+        ));
+    };
+    let current = crate::config_marker::read_marker(&path, MAX_RECORD_BYTES)
+        .map(|text| AccessRecord::parse(&text))
+        .unwrap_or_default();
+    let merged = current.merged(update);
+    if merged != current || !path.exists() {
+        crate::config_marker::write_marker(&path, &merged.render(), MAX_RECORD_BYTES)?;
+    }
+    Ok(merged)
+}
+
+/// This process's start, in unix seconds. Set by [`note_process_start`] at the
+/// top of the GUI's entry; a successor is a new process and so a new value.
+static PROCESS_STARTED_AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The current unix time in seconds (`0` if the clock is before the epoch).
+pub(crate) fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Stamp this process's start. Idempotent: the first call wins.
+pub(crate) fn note_process_start() {
+    let _ = PROCESS_STARTED_AT.set(now_unix_secs());
+}
+
+/// When this process started, in unix seconds ([`note_process_start`]; a
+/// process that never stamped reports its first ask, which errs toward the
+/// window being NEWER than any press, i.e. toward speaking).
+pub(crate) fn process_started_at() -> u64 {
+    *PROCESS_STARTED_AT.get_or_init(now_unix_secs)
+}
+
+/// Why a worker was started: the launch check (never asks) or a need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecideWhy {
+    Launch,
+    Need(NeedCause),
+}
+
+/// The worker's half of a decision, held by the host while a pending probe is
+/// waited on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingDecision {
+    pub(crate) marker: Option<Marker>,
+    pub(crate) record: AccessRecord,
+    pub(crate) why: DecideWhy,
+}
+
+/// The host-side state of the card that is not the lifecycle machine: the
+/// in-flight decision, the last need, the words, and a cache of what the
+/// worker read from disk merged with what this process wrote since. One
+/// struct so `App` carries one field.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CardHost {
+    /// A verdict that arrived while the probe was still pending.
+    pub(crate) pending: Option<PendingDecision>,
+    /// The cause the IN-FLIGHT need worker was started for (kept across a
+    /// lapse so the retry decides the same need, not a launch check).
+    pub(crate) need: Option<NeedCause>,
+    /// The latest need that arrived while the card could not decide it (busy,
+    /// launch check still to run, an incoming handoff uncommitted, no event
+    /// loop). Decided when the card is idle again.
+    pub(crate) kept_need: Option<NeedCause>,
+    /// The words of the question that is due.
+    pub(crate) words: Option<NeedWords>,
+    /// The record on disk, as last read, merged with this process's writes.
+    pub(crate) record: AccessRecord,
+    /// The marker on disk, as last read or written.
+    pub(crate) marker: Option<Marker>,
+    /// Need events counted this process.
+    pub(crate) needs: u32,
+    /// The last need that was not coalesced ([`NEED_DEBOUNCE`]).
+    pub(crate) need_last: Option<Instant>,
+    /// The last time a need was written to `aterm.log` ([`NEED_LOG_EVERY`]).
+    pub(crate) need_logged: Option<Instant>,
+    /// A kept need must not be decided again before this
+    /// ([`NotDue::Settling`]).
+    pub(crate) settle_retry_at: Option<Instant>,
+}
+
+/// The `state=` token of the `access_card` line of `aterm ctl privacy`: where
+/// the question stands, from the marker, the record and the window's own probe.
+/// `quiet` (never asked, or the week has run out), `asked`, `opened` (the owner
+/// pressed *Open Settings* and no verification followed), `granted`, `declined`.
+pub(crate) fn report_state(
+    marker: Option<Marker>,
+    record: &AccessRecord,
+    fda: FdaState,
+    now_secs: u64,
+) -> &'static str {
+    if marker == Some(Marker::NotNow) {
+        return "declined";
+    }
+    if fda == FdaState::Granted {
+        return "granted";
+    }
+    // `opened` lapses with the rule it reports (`OwnerActed`): past the hold the
+    // card would ask again, so the token must not tell a reader nothing more
+    // will be asked.
+    if record.opened_at.is_some_and(|at| {
+        now_secs < at.saturating_add(OWNER_ACTED_HOLD.as_secs())
+            && record.verified_at.is_none_or(|verified| verified <= at)
+    }) {
+        return "opened";
+    }
+    if record.asked_at.is_some_and(|at| {
+        now_secs < at.saturating_add(RENEW_AFTER.as_secs())
+            && record.verified_at.is_none_or(|verified| verified <= at)
+    }) {
+        return "asked";
+    }
+    "quiet"
+}
+
+/// Everything the launch decision reads. All of it observed; none of it
+/// inferred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CardFacts {
     /// `[privacy] enabled && [privacy] notice`.
@@ -325,6 +699,17 @@ pub(crate) struct CardFacts {
     pub(crate) dr: DrClass,
 }
 
+/// Everything the need decision reads: the launch facts plus the clock, this
+/// process's age and why the card was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NeedFacts {
+    pub(crate) card: CardFacts,
+    pub(crate) now_secs: u64,
+    /// When THIS process started ([`process_started_at`]).
+    pub(crate) process_started_at: u64,
+    pub(crate) cause: NeedCause,
+}
+
 /// Why the card is NOT due — one named reason, for the log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NotDue {
@@ -332,7 +717,7 @@ pub(crate) enum NotDue {
     Off,
     /// A headless instance cannot observe a denial.
     Headless,
-    /// The owner already answered *Not now*.
+    /// *Not now* is already on record.
     Answered,
     /// The probe reports the grant is held.
     Granted,
@@ -341,6 +726,26 @@ pub(crate) enum NotDue {
     NotObservedDenied,
     /// A grant keyed to this requirement class would not survive a rebuild.
     GrantUnstable(DrClass),
+    /// The prompt was for a service this card is not about (its Allow is
+    /// durable, so one answer ends it): a log line only.
+    NotThisClass,
+    /// The owner pressed *Open Settings* and this window started before the
+    /// press: it cannot be expected to see the switch, and asking again would
+    /// be the non-actionable alert the owner ruled out.
+    OwnerActed,
+    /// The question was already asked this epoch.
+    RecentlyAsked,
+    /// The launch check never asks: the card waits for a real need.
+    NoNeedYet,
+    /// The launch check found the grant held, as it was before.
+    Held,
+    /// A grant was verified before and the probe reads off now; the words of
+    /// the next ask will say so.
+    ReadsOffAfterVerified,
+    /// A verified grant reads off inside [`LAUNCH_SETTLE`] of this process
+    /// starting: not concluded. The host keeps the need and decides it again
+    /// once the window has settled.
+    Settling,
 }
 
 impl std::fmt::Display for NotDue {
@@ -354,66 +759,233 @@ impl std::fmt::Display for NotDue {
             Self::GrantUnstable(dr) => {
                 write!(f, "dr={}: a grant would not survive a rebuild", dr.as_str())
             }
+            Self::NotThisClass => f.write_str("a prompt for a service whose Allow is durable"),
+            Self::OwnerActed => f.write_str(
+                "the owner opened Settings and this window started before that; it may not see the switch",
+            ),
+            Self::RecentlyAsked => f.write_str("already asked this epoch"),
+            Self::NoNeedYet => {
+                f.write_str("no need yet: the card asks only after macOS shows the dialog")
+            }
+            Self::Held => f.write_str("full disk access is held, as verified before"),
+            Self::ReadsOffAfterVerified => {
+                f.write_str("full disk access was verified before and reads off now")
+            }
+            Self::Settling => f.write_str(
+                "full disk access was verified before and reads off in this process's first \
+                 seconds; read again once it has settled",
+            ),
         }
     }
 }
 
-/// What the launch-time decision resolved to.
+/// What the need decision resolved to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    /// Post the row once the cached probe confirms the denial.
-    Offer,
-    /// The owner opened Settings from an earlier process and the grant is now
-    /// held: post the ✓ confirmation once and clear the `opened` marker.
+pub(crate) enum NeedVerdict {
+    /// Raise the question once the cached probe confirms the denial.
+    /// `regressed`: a verified grant later read as off, so the words say so.
+    Ask { regressed: bool },
+    /// Nothing to show, and why.
+    Quiet(NotDue),
+}
+
+/// What the launch decision resolved to. NEVER an ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchVerdict {
+    /// The grant the owner started (or was asked for) is now held: record it
+    /// once (the ✓ record), clear the `opened` marker, write `verified_at`.
     Confirm,
     /// Nothing to show, and why.
     Quiet(NotDue),
 }
 
-/// THE DECISION. Pure over the facts and the marker; see the module doc for
-/// why each condition exists. An `opened` marker is not an answer — it only
-/// turns a `granted` verdict into a one-time confirmation.
-pub(crate) fn decide(facts: &CardFacts, marker: Option<Marker>) -> Verdict {
-    if !facts.offered {
-        return Verdict::Quiet(NotDue::Off);
+/// What the card's lifecycle machine records of a decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Post the question once the cached probe confirms the denial.
+    Offer,
+    /// Post the ✓ record and clear the `opened` marker.
+    Confirm,
+    /// Nothing to show, and why.
+    Quiet(NotDue),
+}
+
+impl From<&NeedVerdict> for Verdict {
+    fn from(verdict: &NeedVerdict) -> Self {
+        match verdict {
+            NeedVerdict::Ask { .. } => Self::Offer,
+            NeedVerdict::Quiet(why) => Self::Quiet(why.clone()),
+        }
     }
-    if facts.headless {
-        return Verdict::Quiet(NotDue::Headless);
+}
+
+impl From<&LaunchVerdict> for Verdict {
+    fn from(verdict: &LaunchVerdict) -> Self {
+        match verdict {
+            LaunchVerdict::Confirm => Self::Confirm,
+            LaunchVerdict::Quiet(why) => Self::Quiet(why.clone()),
+        }
+    }
+}
+
+/// Whether a need verdict is the ANOMALY the log keeps a trace of: macOS showed
+/// a dialog for a program of this aterm while this process reads Full Disk
+/// Access as granted (a program whose macOS record does not match the
+/// window's). It asks nothing, since the switch is on and the owner has
+/// nothing to do; the log line is the only trace.
+pub(crate) fn is_prompt_while_granted(cause: NeedCause, verdict: &NeedVerdict) -> bool {
+    matches!(cause, NeedCause::PromptObserved { .. })
+        && matches!(verdict, NeedVerdict::Quiet(NotDue::Granted))
+}
+
+/// THE NEED DECISION. Pure over the facts, the marker and the record; see the
+/// module doc for why each rule exists. The first that applies wins.
+pub(crate) fn decide_need(
+    facts: &NeedFacts,
+    marker: Option<Marker>,
+    record: &AccessRecord,
+) -> NeedVerdict {
+    let card = &facts.card;
+    if !card.offered {
+        return NeedVerdict::Quiet(NotDue::Off);
+    }
+    if card.headless {
+        return NeedVerdict::Quiet(NotDue::Headless);
+    }
+    if let NeedCause::PromptObserved { service, .. } = facts.cause
+        && service != Some(Folder::AppData)
+    {
+        return NeedVerdict::Quiet(NotDue::NotThisClass);
     }
     if marker == Some(Marker::NotNow) {
-        return Verdict::Quiet(NotDue::Answered);
+        return NeedVerdict::Quiet(NotDue::Answered);
+    }
+    if !card.dr.grant_stable() {
+        return NeedVerdict::Quiet(NotDue::GrantUnstable(card.dr));
+    }
+    if card.fda == FdaState::Granted {
+        return NeedVerdict::Quiet(NotDue::Granted);
+    }
+    // A VERIFIED GRANT THAT READS OFF IN A FRESH PROCESS DOES NOT CONCLUDE: the
+    // probe may have raced the update (the `.rollback` window). The host keeps
+    // the need and decides it again after `LAUNCH_SETTLE`; a second denied read
+    // is what marks the grant regressed.
+    if card.fda == FdaState::Denied
+        && record.verified_at.is_some()
+        && facts.now_secs
+            < facts
+                .process_started_at
+                .saturating_add(LAUNCH_SETTLE.as_secs())
+    {
+        return NeedVerdict::Quiet(NotDue::Settling);
+    }
+    // THE OWNER WHO ACTED. `opened` is set, the hold has not lapsed, no
+    // verification is newer than the press, and this process started BEFORE
+    // the press. If a grant reaches running processes, the probe would already
+    // read `granted` (the rule above); if it does not, this window cannot see
+    // the switch, and a further ask is exactly the alert that cannot be acted
+    // on. A window that started AFTER the press and still reads `denied` is
+    // evidence the switch is off, and the renewal below decides.
+    if let Some(opened_at) = record.opened_at
+        && facts.now_secs < opened_at.saturating_add(OWNER_ACTED_HOLD.as_secs())
+        && record
+            .verified_at
+            .is_none_or(|verified| verified <= opened_at)
+        && facts.process_started_at < opened_at
+    {
+        return NeedVerdict::Quiet(NotDue::OwnerActed);
+    }
+    if card.fda != FdaState::Denied {
+        return NeedVerdict::Quiet(NotDue::NotObservedDenied);
+    }
+    if let Some(asked_at) = record.asked_at
+        && facts.now_secs < asked_at.saturating_add(RENEW_AFTER.as_secs())
+        && record
+            .verified_at
+            .is_none_or(|verified| verified <= asked_at)
+    {
+        return NeedVerdict::Quiet(NotDue::RecentlyAsked);
+    }
+    NeedVerdict::Ask {
+        regressed: record.verified_at.is_some(),
+    }
+}
+
+/// THE LAUNCH DECISION: runs once per process at the first park and never
+/// posts a question. An `opened` marker (or an ask on record) beside a probe
+/// that now reads `granted` is confirmed once; everything else is a log line.
+pub(crate) fn decide_launch(
+    facts: &CardFacts,
+    marker: Option<Marker>,
+    record: &AccessRecord,
+) -> LaunchVerdict {
+    if !facts.offered {
+        return LaunchVerdict::Quiet(NotDue::Off);
+    }
+    if facts.headless {
+        return LaunchVerdict::Quiet(NotDue::Headless);
+    }
+    if marker == Some(Marker::NotNow) {
+        return LaunchVerdict::Quiet(NotDue::Answered);
     }
     match facts.fda {
-        FdaState::Granted if marker == Some(Marker::Opened) => return Verdict::Confirm,
-        FdaState::Granted => return Verdict::Quiet(NotDue::Granted),
-        FdaState::Unknown => return Verdict::Quiet(NotDue::NotObservedDenied),
-        FdaState::Denied => {}
+        FdaState::Granted => {
+            if marker == Some(Marker::Opened)
+                || (record.asked_at.is_some() && record.verified_at.is_none())
+            {
+                LaunchVerdict::Confirm
+            } else if record.verified_at.is_some() {
+                LaunchVerdict::Quiet(NotDue::Held)
+            } else {
+                LaunchVerdict::Quiet(NotDue::Granted)
+            }
+        }
+        FdaState::Denied if record.verified_at.is_some() => {
+            LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified)
+        }
+        FdaState::Denied | FdaState::Unknown => LaunchVerdict::Quiet(NotDue::NoNeedYet),
     }
-    if !facts.dr.grant_stable() {
-        return Verdict::Quiet(NotDue::GrantUnstable(facts.dr));
-    }
-    Verdict::Offer
+}
+
+/// Whether a new process should RE-ASSERT a standing question at its launch
+/// check: the record says it was asked, no grant was verified after, and the
+/// owner has neither declined nor acted (`marker` is empty). Only the digest
+/// host acts on it (`App::reassert_fda_need`); the row host has nothing to
+/// re-assert, a row being a moment and not a standing fact.
+pub(crate) fn should_reassert(
+    record: &AccessRecord,
+    marker: Option<Marker>,
+    fda: FdaState,
+) -> bool {
+    marker.is_none()
+        && fda != FdaState::Granted
+        && record.asked_at.is_some()
+        && record
+            .verified_at
+            .is_none_or(|verified| verified <= record.asked_at.unwrap_or(0))
 }
 
 /// The per-process lifecycle of the card, driven from the event loop's park
-/// point. Every transition is a method so the machine is table-testable
+/// point. Every transition is a method, so the machine is table-testable
 /// without an `App`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CardPhase {
     /// Nothing asked yet — the launch-time one-shot has not run.
     Idle,
-    /// The worker is warming the identity and reading the marker, since
-    /// `since` — stamped so a verdict that never arrives ([`DECIDE_TIMEOUT`])
-    /// is asked for again instead of waiting for a wake that cannot come.
+    /// The worker is warming the identity and reading the marker and the
+    /// record, since `since` — stamped so a verdict that never arrives
+    /// ([`DECIDE_TIMEOUT`]) is asked for again instead of waiting for a wake
+    /// that cannot come.
     Deciding { since: Instant },
-    /// Due; the row is posted at the next park whose cached probe still reads
-    /// `denied` (a pending probe is waited on, for at most [`WATCH_FOR`]).
+    /// Due; the question is raised at the next park whose cached probe still
+    /// reads `denied` (a pending probe is waited on, for at most
+    /// [`WATCH_FOR`]).
     Due,
-    /// The row is posted since `since` (or the owner opened Settings then);
-    /// the instance watches the probe for the grant and the row for its end.
+    /// The question is raised since `since` (or the owner opened Settings
+    /// then); the instance watches the probe for the grant and the question
+    /// for its end.
     Watching { since: Instant },
-    /// The episode ended. An actually shown but unanswered offer may return
-    /// after REOFFER_AFTER; explicit answers and quiet decisions remain settled.
+    /// Not currently active. A later need ([`CardState::on_need`]) re-arms it.
     Settled,
 }
 
@@ -424,17 +996,17 @@ pub(crate) struct CardState {
     /// When the offer became due — the anchor of a due card's wait on a
     /// pending probe.
     due_since: Option<Instant>,
-    /// When the row was FIRST posted in this process: what makes an expired
-    /// episode an "actually shown" one, which is the only kind that returns.
+    /// When the question was FIRST raised in this episode.
     first_raised: Option<Instant>,
     /// The owner pressed something on the row (Open Settings, or Details).
-    /// A row the owner acted on is never re-offered in this process.
     owner_acted: bool,
-    /// How many times the launch one-shot has asked its worker for a verdict
+    /// How many times the one-shot has asked its worker for a verdict
     /// ([`DECIDE_ATTEMPTS`]).
     decide_attempts: u8,
-    /// When the card settled unanswered, for [`REOFFER_AFTER`].
-    settled_at: Option<Instant>,
+    /// A need arrived while the card was busy (launch check under way, or a
+    /// question already raised): it is re-evaluated the moment the phase
+    /// settles ([`CardState::take_pending_need`]).
+    pending_need: bool,
 }
 
 impl CardState {
@@ -443,9 +1015,9 @@ impl CardState {
             phase: CardPhase::Idle,
             due_since: None,
             decide_attempts: 0,
-            settled_at: None,
             first_raised: None,
             owner_acted: false,
+            pending_need: false,
         }
     }
 
@@ -458,8 +1030,7 @@ impl CardState {
     /// probe cannot extend a phase's lifetime.
     pub(crate) fn lifecycle_deadline(self) -> Option<Instant> {
         match self.phase {
-            CardPhase::Idle => None,
-            CardPhase::Settled => self.settled_at.map(|at| at + REOFFER_AFTER),
+            CardPhase::Idle | CardPhase::Settled => None,
             CardPhase::Deciding { since } => Some(since + DECIDE_TIMEOUT),
             CardPhase::Due => self.due_since.map(|since| since + WATCH_FOR),
             CardPhase::Watching { since } => Some(since + WATCH_FOR),
@@ -469,19 +1040,13 @@ impl CardState {
     /// Retire an expired probe wait or grant watch BEFORE asking for another
     /// observation. Deciding uses its bounded retry path instead; this method
     /// never consumes a marker that the next process may still acknowledge.
-    /// A watch that ends with the row posted and never pressed is the
-    /// UNANSWERED path: it settles with the daily return.
     pub(crate) fn expire_wait(&mut self, now: Instant) -> bool {
         if matches!(self.phase, CardPhase::Due | CardPhase::Watching { .. })
             && self
                 .lifecycle_deadline()
                 .is_some_and(|deadline| now >= deadline)
         {
-            let unanswered = self.first_raised.is_some() && !self.owner_acted;
             self.settle();
-            if unanswered {
-                self.settled_at = Some(now);
-            }
             true
         } else {
             false
@@ -489,19 +1054,23 @@ impl CardState {
     }
 
     /// Admit one lifecycle step against the CURRENT settings, including a
-    /// pending worker verdict or a posted row. Turning the notice off is an
-    /// answer for this process: a late worker cannot bring it back. The host
-    /// also resolves the card's own rows (`resolve_key_prefix("privacy.")`).
+    /// pending worker verdict or a raised question. Turning the notice off is
+    /// an answer for this process: a late worker cannot bring it back. The
+    /// host also resolves the card's own rows (`resolve_key_prefix("privacy.")`).
     pub(crate) fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
         if enabled && notice {
             true
         } else {
             self.settle();
+            // A need kept from before is answered too: re-enabling the notice
+            // waits for a NEW need.
+            self.pending_need = false;
             false
         }
     }
 
-    /// The one-shot fired: a worker is deciding. Only from [`CardPhase::Idle`].
+    /// The launch one-shot fired: a worker is deciding. Only from
+    /// [`CardPhase::Idle`].
     pub(crate) fn begin_deciding(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Idle {
             return false;
@@ -511,6 +1080,51 @@ impl CardState {
         true
     }
 
+    /// A NEED arrived (macOS showed the dialog, or aterm's own read was
+    /// refused). From `Settled` the card re-arms into `Deciding` with a fresh
+    /// attempt budget and a clean episode, and `true` says the host should
+    /// start its worker. In any other phase the need is kept
+    /// ([`Self::take_pending_need`]) and `false` is returned: `Idle` has its
+    /// launch check still to run, `Deciding` has a verdict coming, and a `Due`
+    /// or `Watching` card already covers it.
+    pub(crate) fn on_need(&mut self, now: Instant) -> bool {
+        if self.phase != CardPhase::Settled {
+            self.pending_need = true;
+            return false;
+        }
+        *self = Self {
+            phase: CardPhase::Deciding { since: now },
+            decide_attempts: 1,
+            ..Self::new()
+        };
+        true
+    }
+
+    /// Keep a need without acting on it (the host cannot decide right now: an
+    /// incoming handoff is uncommitted, or there is no event loop yet). It is
+    /// given up by [`Self::take_pending_need`] once the card is settled.
+    pub(crate) fn defer_need(&mut self) {
+        self.pending_need = true;
+    }
+
+    /// The grant answers a need that was kept before it: drop the kept need
+    /// without deciding it (the dialog it stands for predates the grant, and
+    /// a later dialog is a new need).
+    pub(crate) fn discard_pending_need(&mut self) {
+        self.pending_need = false;
+    }
+
+    /// Whether a need was kept while busy; consumed by the call. Only a
+    /// `Settled` card gives it up (the host then calls [`Self::on_need`]).
+    pub(crate) fn take_pending_need(&mut self) -> bool {
+        if self.phase == CardPhase::Settled && self.pending_need {
+            self.pending_need = false;
+            true
+        } else {
+            false
+        }
+    }
+
     /// The worker's verdict has not arrived within [`DECIDE_TIMEOUT`].
     pub(crate) fn deciding_lapsed(&self, now: Instant) -> bool {
         matches!(self.phase, CardPhase::Deciding { since }
@@ -518,10 +1132,9 @@ impl CardState {
     }
 
     /// A lapsed decision: ask again from `Idle`, or settle for good once
-    /// [`DECIDE_ATTEMPTS`] have been spent. `true` when another attempt will be
-    /// made. DECIDING IS NOT A TERMINAL STATE — a dropped wake (the incoming
-    /// handoff swallows every non-Commit wake until it commits) must not make
-    /// the card silently dead for the life of the process.
+    /// [`DECIDE_ATTEMPTS`] are spent. `true` when another attempt will be made.
+    /// Deciding is not terminal, so a dropped wake (an incoming handoff swallows
+    /// every non-Commit wake until it commits) cannot silently kill the card.
     pub(crate) fn reopen_deciding(&mut self) -> bool {
         if self.decide_attempts >= DECIDE_ATTEMPTS {
             self.settle();
@@ -533,13 +1146,12 @@ impl CardState {
 
     /// The main thread decided. A verdict that arrives in any phase but
     /// [`CardPhase::Deciding`] is stale (a second worker, a re-entrant wake)
-    /// and is ignored. `Confirm` settles here: the caller posts the ✓ row
-    /// (nothing queues behind another surface any more) and clears the marker.
+    /// and is ignored. `Confirm` settles here: the caller posts the ✓ record
+    /// and clears the marker.
     pub(crate) fn on_decided(&mut self, verdict: &Verdict, now: Instant) -> bool {
         if !matches!(self.phase, CardPhase::Deciding { .. }) {
             return false;
         }
-        self.settled_at = None;
         self.phase = match verdict {
             Verdict::Offer => {
                 self.due_since.get_or_insert(now);
@@ -550,7 +1162,7 @@ impl CardState {
         true
     }
 
-    /// Whether the row may be posted at `now`: only while due, and only
+    /// Whether the question may be raised at `now`: only while due, and only
     /// inside the wait a pending probe is given ([`WATCH_FOR`] from
     /// `due_since`) — a probe that never completes does not keep a card due
     /// for the life of the process.
@@ -561,7 +1173,7 @@ impl CardState {
         !self.expire_wait(now)
     }
 
-    /// The row was posted at `now`.
+    /// The question was raised at `now`.
     pub(crate) fn on_raised(&mut self, now: Instant) {
         if self.phase == CardPhase::Due {
             self.phase = CardPhase::Watching { since: now };
@@ -569,36 +1181,33 @@ impl CardState {
         }
     }
 
-    /// The owner opened the row's Details: read, never re-offered in this
-    /// process; the watch continues.
+    /// The owner opened the row's Details: read; the watch continues.
     pub(crate) fn on_owner_acted(&mut self) {
         if matches!(self.phase, CardPhase::Watching { .. }) {
             self.owner_acted = true;
         }
     }
 
-    /// The row left the band without a press — it folded on its own
-    /// patience, and neither capsule nor Details was ever touched. That is
-    /// the unanswered path: settled, with the daily return an actually shown,
-    /// unanswered offer gets (`true`). A row the owner acted on keeps its
-    /// watch (`false`): Open Settings restated it to the route words and the
-    /// grant may still be observed after those fold; Details marked it read.
-    pub(crate) fn on_row_retired(&mut self, now: Instant) -> bool {
+    /// The row left the band without a press — it folded on its own patience,
+    /// and neither capsule nor Details was ever touched. That is the
+    /// unanswered path: settled (`true`); `asked_at` is on record, so the next
+    /// ask waits for [`RENEW_AFTER`]. A row the owner acted on keeps its watch
+    /// (`false`): Open Settings restated it to the route words and the grant
+    /// may still be observed after those fold; Details marked it read.
+    pub(crate) fn on_row_retired(&mut self) -> bool {
         if !matches!(self.phase, CardPhase::Watching { .. }) || self.owner_acted {
             return false;
         }
         self.settle();
-        self.settled_at = Some(now);
         true
     }
 
     /// The owner pressed *Open Settings* through either UI: start a bounded
-    /// watch even if the automatic card was idle or settled. The host admits
-    /// this explicit gesture against current settings before calling it.
+    /// watch even if the card was idle or settled. The host admits this
+    /// explicit gesture against current settings before calling it.
     pub(crate) fn on_opened_settings(&mut self, now: Instant) {
         self.phase = CardPhase::Watching { since: now };
         self.owner_acted = true;
-        self.settled_at = None;
     }
 
     /// Whether the probe should be re-checked at `now`. True only while
@@ -607,33 +1216,10 @@ impl CardState {
         matches!(self.phase, CardPhase::Watching { .. }) && !self.expire_wait(now)
     }
 
-    /// Nothing more in this process: *Not now*, the grant observed, or the
-    /// decision said no.
+    /// Nothing more in this episode: *Not now*, the grant observed, or the
+    /// decision said no. A later need may re-arm the card.
     pub(crate) fn settle(&mut self) {
         self.phase = CardPhase::Settled;
-        self.settled_at = None;
-    }
-
-    /// A card that settled UNANSWERED is offered again after
-    /// [`REOFFER_AFTER`]: back to `Idle`, attempts reset, `true`. A card the
-    /// owner pressed is never re-offered here — its marker settles every later
-    /// decision in every process. Only a shown unanswered row's end sets
-    /// settled_at; neither quiet decisions nor exhausted retries poll daily.
-    pub(crate) fn reoffer_due(&mut self, now: Instant) -> bool {
-        if self.phase != CardPhase::Settled || self.owner_acted {
-            return false;
-        }
-        if self
-            .settled_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= REOFFER_AFTER)
-        {
-            // A fresh episode: the prior day's anchors and the retry budget
-            // would otherwise expire or refuse the new offer at once.
-            *self = Self::new();
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -646,12 +1232,15 @@ impl Default for CardState {
 #[cfg(test)]
 mod tests {
     use super::{
-        CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT, FDA_DETAIL, FDA_TITLE,
-        GRANTED_CAPTION, MARKER, MAX_MARKER_BYTES, Marker, NotDue, REOFFER_AFTER, Verdict,
-        WATCH_FOR, clear_opened, decide, marker_path, opened_settings_caption, read_marker,
-        record_marker,
+        AccessRecord, CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT, FDA_AFTER,
+        FDA_DETAIL, FDA_GRANTS, FDA_THEN, FDA_TITLE, FDA_WHAT, FDA_WHAT_DENIED, FDA_WHAT_REGRESSED,
+        FDA_WHY, GRANTED_CAPTION, LAUNCH_SETTLE, LaunchVerdict, MARKER, MAX_MARKER_BYTES,
+        MAX_RECORD_BYTES, Marker, NEED_LOG_EVERY, NeedCause, NeedFacts, NeedVerdict, NeedWords,
+        NotDue, OWNER_ACTED_HOLD, RECORD, RENEW_AFTER, Verdict, WATCH_FOR, clear_opened,
+        decide_launch, decide_need, is_prompt_while_granted, marker_path, read_marker, read_record,
+        record_marker, record_path, report_state, should_reassert, write_record,
     };
-    use aterm_containment::consent::{DrClass, FdaState};
+    use aterm_containment::consent::{DrClass, FdaState, Folder};
     use std::time::{Duration, Instant};
 
     fn denied_release() -> CardFacts {
@@ -663,10 +1252,10 @@ mod tests {
         }
     }
 
-    /// The two bounded waiting phases share one expiry contract. The clock
-    /// step represents the host reaching the current phase's absolute
-    /// deadline; it cannot be extended by a pending observation. The
-    /// historical first-offer omission is the negative control.
+    /// The two bounded waiting phases share one expiry contract: the clock step
+    /// is the host reaching the phase's absolute deadline, which a pending
+    /// observation cannot extend. `Buggy = 1` (a due card that never expires)
+    /// is the negative control.
     fn bounded_wait_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardBoundedWait {
@@ -693,9 +1282,9 @@ mod tests {
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
-    /// Tier-1 drives the real due and watching states to just before and
-    /// exactly at their actual scheduled expiry. Repeated pending
-    /// observations need not arrive for expiry to settle.
+    /// Drives the real due and watching states to just before and exactly at
+    /// their scheduled expiry; expiry settles without further pending
+    /// observations.
     #[test]
     fn bounded_wait_conforms_at_each_real_phase_deadline() {
         let now = Instant::now();
@@ -739,11 +1328,8 @@ mod tests {
             assert!(model.check_invariant("NoWorkPastCap", &expected));
             assert_eq!(
                 actual.lifecycle_deadline(),
-                actual
-                    .first_raised
-                    .is_some()
-                    .then_some(deadline + REOFFER_AFTER),
-                "only a shown unanswered offer schedules a daily return"
+                None,
+                "a settled card owns no deadline: there is no daily return any more"
             );
             assert!(!actual.raise_allowed(deadline));
             assert!(!actual.wants_probe(deadline));
@@ -782,9 +1368,8 @@ mod tests {
         assert!(!actual.on_decided(&Verdict::Offer, now));
     }
 
-    /// The live settings guard over the existing lifecycle phases. The
-    /// historical guard ran only at launch: disabling a visible or queued
-    /// card left it eligible to return. `Buggy=1` replays that omission.
+    /// The live settings guard over the lifecycle phases: disabling a visible
+    /// or queued card retires it for good. `Buggy = 1` guards only at launch.
     fn current_policy_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardCurrentPolicy {
@@ -817,6 +1402,12 @@ mod tests {
                     enabled = 1;
                     notice = 1;
                 }
+                // A NEED re-arms a settled card (`CardState::on_need`). It is
+                // taken only while both switches are on; `Buggy = 1` is a
+                // re-arm that ignores them, which breaks `DisabledSettles`.
+                action Rearm when (phase == 4 && (Buggy == 1 || (enabled == 1 && notice == 1))) {
+                    phase = 1;
+                }
                 invariant Bounds: enabled <= 1 && notice <= 1 && phase <= 4;
                 invariant DisabledSettles: enabled == 1 && notice == 1 || phase == 4;
             }
@@ -829,9 +1420,9 @@ mod tests {
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
-    /// Tier-1: drive all five shipping phases, then disable either or both
-    /// settings. A late verdict and re-enabling cannot resurrect a settled
-    /// card. The old omitted guard is projected as the negative control.
+    /// Tier-1: drive all five phases, then disable either or both settings; a
+    /// late verdict or re-enabling cannot resurrect a settled card. The
+    /// launch-only guard is projected as the negative control.
     #[test]
     fn current_policy_conforms_in_every_real_phase() {
         fn phase_value(state: CardState) -> i64 {
@@ -898,75 +1489,258 @@ mod tests {
             caught_old_guards, 9,
             "three active phases, three disabled policies"
         );
+
+        // A NEED re-arms a settled card only under both switches; the host
+        // admits the current policy first, so a disabled card is never armed.
+        for (enabled, notice) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut actual = CardState::new();
+            actual.settle();
+            let mut expected = model.init_state();
+            for action in ["Begin", "Decide", "Raise", "Finish"] {
+                assert!(model.fire(action, &mut expected));
+            }
+            if !enabled {
+                assert!(model.fire("DisableMaster", &mut expected));
+            }
+            if !notice {
+                assert!(model.fire("DisableNotice", &mut expected));
+            }
+            assert_eq!(expected["phase"], 4);
+            let admitted = actual.admit_current_policy(enabled, notice);
+            assert_eq!(admitted, model.action_enabled("Rearm", &expected));
+            if admitted {
+                assert!(actual.on_need(now));
+                assert!(model.fire("Rearm", &mut expected));
+                assert_eq!(phase_value(actual), expected["phase"]);
+            } else {
+                assert_eq!(actual.phase(), CardPhase::Settled);
+                // The old omitted guard: re-arming regardless.
+                let mut buggy = expected.clone();
+                buggy.insert("phase", 1);
+                assert!(!model.check_invariant("DisabledSettles", &buggy));
+            }
+        }
     }
 
-    /// Every condition is a way to be wrong, and each failure is named. The
-    /// order is the order a reader would want explained: the switch, the
-    /// instance, the answer, the verdict, the identity. And the one marker
-    /// that is not an answer — `opened` — turns `granted` into a one-time
-    /// confirmation and nothing else.
+    fn need_facts(cause: NeedCause) -> NeedFacts {
+        NeedFacts {
+            card: denied_release(),
+            now_secs: 10_000_000,
+            process_started_at: 9_999_000,
+            cause,
+        }
+    }
+
+    fn app_data_prompt() -> NeedCause {
+        NeedCause::PromptObserved {
+            service: Some(Folder::AppData),
+            session: Some(1),
+        }
+    }
+
+    /// A VERIFIED GRANT THAT READS OFF IN A FRESH PROCESS DOES NOT CONCLUDE.
+    /// An update's first seconds sit inside the `.rollback` window, where a
+    /// held grant can read off; the need is neither asked nor marked
+    /// regressed, and after `LAUNCH_SETTLE` the same facts do conclude.
     #[test]
-    fn the_card_is_due_only_when_every_condition_holds() {
-        assert_eq!(decide(&denied_release(), None), Verdict::Offer);
-
-        let off = CardFacts {
-            offered: false,
-            ..denied_release()
+    fn a_verified_grant_reading_off_in_a_fresh_process_is_settling_not_regressed() {
+        let verified = AccessRecord {
+            verified_at: Some(9_000_000),
+            ..AccessRecord::default()
         };
-        assert_eq!(decide(&off, None), Verdict::Quiet(NotDue::Off));
-
-        let headless = CardFacts {
-            headless: true,
-            ..denied_release()
-        };
-        assert_eq!(decide(&headless, None), Verdict::Quiet(NotDue::Headless));
-
-        assert_eq!(
-            decide(&denied_release(), Some(Marker::NotNow)),
-            Verdict::Quiet(NotDue::Answered)
-        );
-        assert_eq!(
-            decide(&denied_release(), Some(Marker::Opened)),
-            Verdict::Offer,
-            "opened-but-still-denied is not an answer: the card is due again"
-        );
-
-        let granted = CardFacts {
-            fda: FdaState::Granted,
-            ..denied_release()
-        };
-        assert_eq!(decide(&granted, None), Verdict::Quiet(NotDue::Granted));
-        assert_eq!(
-            decide(&granted, Some(Marker::Opened)),
-            Verdict::Confirm,
-            "the flip the owner started in an earlier process is acknowledged once"
-        );
-        assert_eq!(
-            decide(&granted, Some(Marker::NotNow)),
-            Verdict::Quiet(NotDue::Answered)
-        );
-        let unknown = CardFacts {
-            fda: FdaState::Unknown,
-            ..denied_release()
+        let fresh = NeedFacts {
+            process_started_at: 10_000_000 - 5,
+            ..need_facts(app_data_prompt())
         };
         assert_eq!(
-            decide(&unknown, None),
-            Verdict::Quiet(NotDue::NotObservedDenied),
-            "unknown is not denied"
+            decide_need(&fresh, None, &verified),
+            NeedVerdict::Quiet(NotDue::Settling)
         );
+        let settled = NeedFacts {
+            process_started_at: 10_000_000 - LAUNCH_SETTLE.as_secs(),
+            ..fresh.clone()
+        };
+        assert_eq!(
+            decide_need(&settled, None, &verified),
+            NeedVerdict::Ask { regressed: true },
+            "the second denied read marks the grant regressed"
+        );
+        // Never verified: nothing to doubt, so a fresh process asks at once.
+        assert_eq!(
+            decide_need(&fresh, None, &AccessRecord::default()),
+            NeedVerdict::Ask { regressed: false }
+        );
+    }
 
-        for dr in [DrClass::Cdhash, DrClass::Unsigned, DrClass::Unknown] {
-            let unstable = CardFacts {
-                dr,
+    /// A PROMPT WHILE THE PROBE READS GRANTED ASKS NOTHING and is the one case
+    /// the log keeps a trace of; aterm's own refused read is not that anomaly.
+    #[test]
+    fn a_prompt_while_the_probe_reads_granted_logs_an_anomaly_and_asks_nothing() {
+        let granted = NeedFacts {
+            card: CardFacts {
+                fda: FdaState::Granted,
                 ..denied_release()
+            },
+            ..need_facts(app_data_prompt())
+        };
+        let verdict = decide_need(&granted, None, &AccessRecord::default());
+        assert_eq!(verdict, NeedVerdict::Quiet(NotDue::Granted));
+        assert!(is_prompt_while_granted(app_data_prompt(), &verdict));
+        assert!(!is_prompt_while_granted(
+            NeedCause::ProtectedRead { session: None },
+            &verdict
+        ));
+        assert!(!is_prompt_while_granted(
+            app_data_prompt(),
+            &NeedVerdict::Ask { regressed: false }
+        ));
+    }
+
+    /// `state=opened` lapses with the rule it reports: past `OWNER_ACTED_HOLD`
+    /// the card asks again, so the token must not say nothing more is coming.
+    #[test]
+    fn the_opened_state_lapses_with_the_owner_acted_hold() {
+        let record = AccessRecord {
+            opened_at: Some(1_000_000),
+            ..AccessRecord::default()
+        };
+        let hold = OWNER_ACTED_HOLD.as_secs();
+        assert_eq!(
+            report_state(None, &record, FdaState::Denied, 1_000_000 + hold - 1),
+            "opened"
+        );
+        assert_eq!(
+            report_state(None, &record, FdaState::Denied, 1_000_000 + hold),
+            "quiet"
+        );
+    }
+
+    /// Every rule is a way to be wrong, and each refusal is named, in the order
+    /// a reader would want explained: the switch, the instance, the class of
+    /// prompt, the answer, the identity, the grant, the owner who acted, the
+    /// probe, the epoch. An `opened` marker is NOT an answer.
+    #[test]
+    fn decide_need_is_a_table_of_named_refusals_then_an_ask() {
+        let none = AccessRecord::default();
+        let facts = need_facts(app_data_prompt());
+        assert_eq!(
+            decide_need(&facts, None, &none),
+            NeedVerdict::Ask { regressed: false }
+        );
+        assert_eq!(
+            decide_need(&facts, Some(Marker::Opened), &none),
+            NeedVerdict::Ask { regressed: false },
+            "an opened marker is not an answer"
+        );
+        let off = NeedFacts {
+            card: CardFacts {
+                offered: false,
+                ..denied_release()
+            },
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&off, None, &none),
+            NeedVerdict::Quiet(NotDue::Off)
+        );
+        let headless = NeedFacts {
+            card: CardFacts {
+                headless: true,
+                ..denied_release()
+            },
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&headless, None, &none),
+            NeedVerdict::Quiet(NotDue::Headless)
+        );
+        // A prompt for any other service is a log line only; an unknown one too.
+        for service in [Some(Folder::Documents), Some(Folder::Desktop), None] {
+            let other = need_facts(NeedCause::PromptObserved {
+                service,
+                session: None,
+            });
+            assert_eq!(
+                decide_need(&other, None, &none),
+                NeedVerdict::Quiet(NotDue::NotThisClass),
+                "{service:?}"
+            );
+        }
+        // aterm's own refused read is a need of its own kind.
+        let eperm = need_facts(NeedCause::ProtectedRead { session: Some(2) });
+        assert_eq!(
+            decide_need(&eperm, None, &none),
+            NeedVerdict::Ask { regressed: false }
+        );
+        assert_eq!(
+            decide_need(&facts, Some(Marker::NotNow), &none),
+            NeedVerdict::Quiet(NotDue::Answered)
+        );
+        for dr in [DrClass::Cdhash, DrClass::Unsigned, DrClass::Unknown] {
+            let unstable = NeedFacts {
+                card: CardFacts {
+                    dr,
+                    ..denied_release()
+                },
+                ..facts.clone()
             };
             assert_eq!(
-                decide(&unstable, None),
-                Verdict::Quiet(NotDue::GrantUnstable(dr)),
+                decide_need(&unstable, None, &none),
+                NeedVerdict::Quiet(NotDue::GrantUnstable(dr)),
                 "{dr:?} is not grant-stable"
             );
         }
-
+        let granted = NeedFacts {
+            card: CardFacts {
+                fda: FdaState::Granted,
+                ..denied_release()
+            },
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&granted, None, &none),
+            NeedVerdict::Quiet(NotDue::Granted)
+        );
+        let not_observed = NeedFacts {
+            card: CardFacts {
+                fda: FdaState::Unknown,
+                ..denied_release()
+            },
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&not_observed, None, &none),
+            NeedVerdict::Quiet(NotDue::NotObservedDenied),
+            "unknown is not denied"
+        );
+        // The epoch: asked inside the week is refused, the week renews it.
+        let asked = AccessRecord {
+            asked_at: Some(facts.now_secs - 60),
+            ..none
+        };
+        assert_eq!(
+            decide_need(&facts, None, &asked),
+            NeedVerdict::Quiet(NotDue::RecentlyAsked)
+        );
+        let week = RENEW_AFTER.as_secs();
+        let inside = NeedFacts {
+            now_secs: facts.now_secs - 61 + week,
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&inside, None, &asked),
+            NeedVerdict::Quiet(NotDue::RecentlyAsked),
+            "one second short of asked_at + the week is still inside it"
+        );
+        let renewed = NeedFacts {
+            now_secs: facts.now_secs - 60 + week,
+            ..facts.clone()
+        };
+        assert_eq!(
+            decide_need(&renewed, None, &asked),
+            NeedVerdict::Ask { regressed: false },
+            "the renewal boundary is exact"
+        );
         // Every reason renders as one sentence a log line can carry.
         for reason in [
             NotDue::Off,
@@ -975,10 +1749,217 @@ mod tests {
             NotDue::Granted,
             NotDue::NotObservedDenied,
             NotDue::GrantUnstable(DrClass::Cdhash),
+            NotDue::NotThisClass,
+            NotDue::OwnerActed,
+            NotDue::RecentlyAsked,
+            NotDue::NoNeedYet,
+            NotDue::Held,
+            NotDue::ReadsOffAfterVerified,
         ] {
             let line = reason.to_string();
             assert!(!line.is_empty() && !line.contains('\n'), "{line:?}");
         }
+    }
+
+    /// A grant verified earlier and read as off now opens a NEW epoch: the ask
+    /// is allowed at once (the epoch it belonged to is over) and its words say
+    /// so, and once asked it is `RecentlyAsked` again.
+    #[test]
+    fn an_ask_after_a_verified_grant_reads_regressed_and_opens_a_new_epoch() {
+        let facts = need_facts(app_data_prompt());
+        let t = facts.now_secs;
+        let record = AccessRecord {
+            asked_at: Some(t - 3600),
+            verified_at: Some(t - 1800),
+            verified_build: Some(7),
+            ..AccessRecord::default()
+        };
+        assert_eq!(
+            decide_need(&facts, None, &record),
+            NeedVerdict::Ask { regressed: true },
+            "an ask made before the verification does not bar the new epoch"
+        );
+        let asked_again = AccessRecord {
+            asked_at: Some(t - 10),
+            ..record
+        };
+        assert_eq!(
+            decide_need(&facts, None, &asked_again),
+            NeedVerdict::Quiet(NotDue::RecentlyAsked)
+        );
+    }
+
+    /// The launch check NEVER asks: it confirms a grant, or it says why not.
+    #[test]
+    fn decide_launch_never_asks_and_confirms_only_an_opened_grant() {
+        let none = AccessRecord::default();
+        let denied = denied_release();
+        assert_eq!(
+            decide_launch(&denied, None, &none),
+            LaunchVerdict::Quiet(NotDue::NoNeedYet),
+            "a denied probe alone raises nothing"
+        );
+        assert_eq!(
+            decide_launch(&denied, Some(Marker::Opened), &none),
+            LaunchVerdict::Quiet(NotDue::NoNeedYet),
+            "opened-but-still-denied is not an answer, and not a question either"
+        );
+        let off = CardFacts {
+            offered: false,
+            ..denied_release()
+        };
+        assert_eq!(
+            decide_launch(&off, None, &none),
+            LaunchVerdict::Quiet(NotDue::Off)
+        );
+        let headless = CardFacts {
+            headless: true,
+            ..denied_release()
+        };
+        assert_eq!(
+            decide_launch(&headless, None, &none),
+            LaunchVerdict::Quiet(NotDue::Headless)
+        );
+        assert_eq!(
+            decide_launch(&denied, Some(Marker::NotNow), &none),
+            LaunchVerdict::Quiet(NotDue::Answered)
+        );
+        let granted = CardFacts {
+            fda: FdaState::Granted,
+            ..denied_release()
+        };
+        assert_eq!(
+            decide_launch(&granted, None, &none),
+            LaunchVerdict::Quiet(NotDue::Granted)
+        );
+        assert_eq!(
+            decide_launch(&granted, Some(Marker::Opened), &none),
+            LaunchVerdict::Confirm,
+            "the flip the owner started in an earlier process is acknowledged once"
+        );
+        let asked = AccessRecord {
+            asked_at: Some(5),
+            ..none
+        };
+        assert_eq!(
+            decide_launch(&granted, None, &asked),
+            LaunchVerdict::Confirm,
+            "a grant after an ask is acknowledged whichever gesture made it"
+        );
+        let verified = AccessRecord {
+            asked_at: Some(5),
+            verified_at: Some(9),
+            ..none
+        };
+        assert_eq!(
+            decide_launch(&granted, None, &verified),
+            LaunchVerdict::Quiet(NotDue::Held),
+            "already verified: nothing to say again"
+        );
+        assert_eq!(
+            decide_launch(&granted, Some(Marker::NotNow), &none),
+            LaunchVerdict::Quiet(NotDue::Answered)
+        );
+        assert_eq!(
+            decide_launch(&denied, None, &verified),
+            LaunchVerdict::Quiet(NotDue::ReadsOffAfterVerified),
+            "quiet and LOGGED; the next ask's words say it regressed"
+        );
+        let unknown = CardFacts {
+            fda: FdaState::Unknown,
+            ..denied_release()
+        };
+        assert_eq!(
+            decide_launch(&unknown, None, &none),
+            LaunchVerdict::Quiet(NotDue::NoNeedYet)
+        );
+        // Re-assertion (the digest host): asked, not verified after, and the
+        // owner neither declined nor acted.
+        assert!(should_reassert(&asked, None, FdaState::Denied));
+        assert!(!should_reassert(
+            &asked,
+            Some(Marker::Opened),
+            FdaState::Denied
+        ));
+        assert!(!should_reassert(
+            &asked,
+            Some(Marker::NotNow),
+            FdaState::Denied
+        ));
+        assert!(!should_reassert(&asked, None, FdaState::Granted));
+        assert!(!should_reassert(&none, None, FdaState::Denied));
+        assert!(!should_reassert(&verified, None, FdaState::Denied));
+    }
+
+    /// THE OWNER WHO ACTED (the reviewer's scenario): `Open Settings`, the
+    /// switch on, `Later` on Apple's sheet, a window that still reads
+    /// `denied`, the renewal elapsed, a program of that older window prompts.
+    /// Nothing is asked. A window that started AFTER the press, and the
+    /// lapsing of the hold, allow the ask again.
+    #[test]
+    fn an_owner_who_opened_settings_is_not_asked_again_by_an_older_window() {
+        let t = 10_000_000_u64;
+        let record = AccessRecord {
+            asked_at: Some(t - 100),
+            opened_at: Some(t - 50),
+            ..AccessRecord::default()
+        };
+        let older_window = NeedFacts {
+            now_secs: t + RENEW_AFTER.as_secs() + 1,
+            process_started_at: t - 5_000,
+            ..need_facts(app_data_prompt())
+        };
+        assert_eq!(
+            decide_need(&older_window, None, &record),
+            NeedVerdict::Quiet(NotDue::OwnerActed),
+            "the week elapsed and the probe reads denied, but this window predates the press"
+        );
+        // The hold lapses after fourteen days.
+        let lapsed = NeedFacts {
+            now_secs: t - 50 + OWNER_ACTED_HOLD.as_secs(),
+            ..older_window.clone()
+        };
+        assert_eq!(
+            decide_need(&lapsed, None, &record),
+            NeedVerdict::Ask { regressed: false },
+            "the hold lapses after fourteen days and the week has long elapsed"
+        );
+        let just_inside = NeedFacts {
+            now_secs: t - 51 + OWNER_ACTED_HOLD.as_secs(),
+            ..older_window.clone()
+        };
+        assert_eq!(
+            decide_need(&just_inside, None, &record),
+            NeedVerdict::Quiet(NotDue::OwnerActed)
+        );
+        // A window that started after the press and still reads denied is
+        // evidence the switch is off: the weekly renewal decides.
+        let newer_window = NeedFacts {
+            process_started_at: t,
+            ..older_window.clone()
+        };
+        assert_eq!(
+            decide_need(&newer_window, None, &record),
+            NeedVerdict::Ask { regressed: false }
+        );
+        let newer_soon = NeedFacts {
+            now_secs: t + 60,
+            process_started_at: t,
+            ..older_window.clone()
+        };
+        assert_eq!(
+            decide_need(&newer_soon, None, &record),
+            NeedVerdict::Quiet(NotDue::RecentlyAsked)
+        );
+        // A verification newer than the press ends the owner's act.
+        let verified = AccessRecord {
+            verified_at: Some(t),
+            ..record
+        };
+        assert_eq!(
+            decide_need(&older_window, None, &verified),
+            NeedVerdict::Ask { regressed: true }
+        );
     }
 
     /// The marker: path beside `aterm.toml`, one token, round-trips through
@@ -989,10 +1970,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aterm-consent-card-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            aterm_time::since_epoch().unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let config = dir.join("aterm.toml");
@@ -1044,20 +2022,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The route and grant words are held to the same fences as the question
-    /// (`message_reporters::the_file_access_message_is_honest_and_fence_clean`
-    /// holds [`FDA_TITLE`]/[`FDA_DETAIL`]): the restart-phrase ruling, no
-    /// coverage or scope claim, no promise of elimination — and each is one
-    /// line, in the `"<title> — <detail>"` shape the row splits at, with no
-    /// pictogram of its own (the glyph column is the band's).
+    /// EVERY string the owner reads about this question comes from here, in
+    /// one place the exceptions digest imports, and all of it passes the same
+    /// fences: the restart-phrase ruling (B12), no coverage or scope claim, no
+    /// promise of elimination, the digest's `Need` grammar (`then`: one
+    /// imperative, no `; `, no ` or `, no newline) and its caps.
     #[test]
-    fn the_route_and_grant_words_are_fence_clean() {
-        let route = "System Settings \u{25b8} Privacy & Security \u{25b8} Full Disk Access";
-        for text in [
-            GRANTED_CAPTION.to_string(),
-            opened_settings_caption(true, route),
-            opened_settings_caption(false, route),
-        ] {
+    fn the_entry_words_come_from_the_need_and_pass_every_fence() {
+        let tab = NeedWords {
+            cause: app_data_prompt(),
+            tab_number: Some(1),
+            regressed: false,
+        };
+        let no_tab = NeedWords {
+            tab_number: None,
+            ..tab
+        };
+        let regressed = NeedWords {
+            regressed: true,
+            ..tab
+        };
+        let eperm = NeedWords {
+            cause: NeedCause::ProtectedRead { session: Some(2) },
+            tab_number: Some(2),
+            regressed: false,
+        };
+        assert_eq!(
+            tab.event_line(),
+            "macOS asked to let a program in tab 1 read other applications' data"
+        );
+        assert_eq!(
+            no_tab.event_line(),
+            "macOS asked to let a program read other applications' data",
+            "the tab is omitted when unresolved, never guessed"
+        );
+        assert_eq!(
+            regressed.event_line(),
+            "Full Disk Access was on for aterm and macOS now reports it off"
+        );
+        assert_eq!(
+            eperm.event_line(),
+            "macOS refused aterm a read of protected files in tab 2"
+        );
+        let all = [
+            FDA_TITLE.to_owned(),
+            FDA_WHAT.to_owned(),
+            FDA_WHAT_DENIED.to_owned(),
+            FDA_WHAT_REGRESSED.to_owned(),
+            FDA_WHY.to_owned(),
+            FDA_THEN.to_owned(),
+            FDA_GRANTS.to_owned(),
+            FDA_AFTER.to_owned(),
+            FDA_DETAIL.to_owned(),
+            GRANTED_CAPTION.to_owned(),
+            tab.event_line(),
+            no_tab.event_line(),
+            regressed.event_line(),
+            eperm.event_line(),
+        ];
+        for text in &all {
             let lower = text.to_ascii_lowercase();
             for banned in [
                 "restart",
@@ -1069,10 +2092,6 @@ mod tests {
                 "next launch",
                 "reboot",
                 "launch aterm again",
-            ] {
-                assert!(!lower.contains(banned), "{banned:?} in {text:?}");
-            }
-            for unmeasured in [
                 "cover",
                 "documents",
                 "desktop",
@@ -1082,221 +2101,572 @@ mod tests {
                 "retires",
                 "this process",
                 "new processes",
-            ] {
-                assert!(!lower.contains(unmeasured), "{unmeasured:?} in {text:?}");
-            }
-            for promise in [
+                "stops the",
+                "ends the",
                 "never again",
                 "no more",
                 "eliminat",
-                "not be interrupted",
-                "never be interrupted",
                 "without interruption",
             ] {
-                assert!(!lower.contains(promise), "{promise:?} in {text:?}");
+                assert!(!lower.contains(banned), "{banned:?} in {text:?}");
             }
-            if text == GRANTED_CAPTION {
-                assert!(
-                    aterm_messages::text::glass_title_fault(&text).is_none(),
-                    "a record title in the title form: {text:?}"
-                );
-                assert!(text.contains("Full Disk Access"), "the question's noun");
-            } else {
-                assert!(text.contains(" \u{2014} "), "title — detail: {text:?}");
-            }
-            assert!(!text.contains('\n'));
-            assert!(
-                text.chars().next().is_some_and(char::is_alphanumeric),
-                "no pictogram in the words; the band's glyph column carries it: {text:?}"
-            );
+            assert!(!text.contains('\n'), "{text:?}");
         }
-        for opened in [true, false] {
-            let text = opened_settings_caption(opened, route);
-            assert!(text.contains(route));
-            assert!(text.contains("if already enabled, leave it on"));
-            assert!(!text.contains("turn on aterm"));
+        // The digest's grammar and caps.
+        assert!(FDA_THEN.chars().count() <= 90 && FDA_WHY.chars().count() <= 90);
+        assert!(!FDA_THEN.contains("; ") && !FDA_THEN.contains(" or "));
+        assert!(FDA_GRANTS.chars().count() <= 200 && FDA_AFTER.chars().count() <= 200);
+        for what in [FDA_WHAT, FDA_WHAT_DENIED, FDA_WHAT_REGRESSED] {
             assert!(
-                text.contains('+'),
-                "the whole route, listing included: {text}"
+                aterm_messages::text::glass_title_fault(what).is_none(),
+                "{what}"
             );
+            assert!(what.chars().count() <= 48, "{what}");
         }
-        assert_eq!(
-            opened_settings_caption(true, route)
-                .split_once(" \u{2014} ")
-                .map(|(t, _)| t),
-            Some("Opened System Settings")
+        assert!(aterm_messages::text::glass_title_fault(FDA_TITLE).is_none());
+        assert!(FDA_TITLE.ends_with('?'), "the title is the ask");
+        assert!(FDA_TITLE.chars().count() + FDA_WHY.chars().count() <= 75);
+        // WHY first, WHAT the switch grants, and nothing S1 or S4 decides.
+        assert!(FDA_WHY.contains("forgets an Allow"));
+        assert!(
+            FDA_GRANTS.contains("read protected data"),
+            "what the switch grants"
         );
-        assert_eq!(
-            opened_settings_caption(false, route)
-                .split_once(" \u{2014} ")
-                .map(|(t, _)| t),
-            Some("System Settings did not open")
-        );
-        assert!(FDA_TITLE.chars().count() + FDA_DETAIL.chars().count() <= 75);
+        assert!(FDA_GRANTS.contains("agents included"));
+        // NEED_LOG_EVERY is a rate limit, not a promise about the dialog.
+        assert!(NEED_LOG_EVERY >= Duration::from_secs(60 * 60));
     }
 
-    fn reoffer_model() -> aterm_spec::derive::Model {
+    /// THE ASKED-ONCE MODEL (replaces the daily-return `AccessCardReoffer`). One
+    /// question per EPOCH, however many process generations an update brings;
+    /// the only legitimate resets are `Regress` (a verified grant reads off), a
+    /// `Renew` (a week) and the lapsing of the owner's hold, and `Update` is
+    /// none of them. `opened`/`fresh` say an owner who acted on an older window
+    /// is not asked again. `Buggy = 1` reproduces two histories: the 8-posts-in-
+    /// 3.8-days shape (`Need, Ask, Update, Need, Ask`: a new process forgot it
+    /// had asked) AND the reviewer's owner (`Need, Ask, Open, Renew, Need, Ask`:
+    /// an ask to an owner who followed the instruction and whose window is
+    /// older than the press). Time is abstracted: `Renew` is `RENEW_AFTER`
+    /// elapsing and `HoldLapses` is `OWNER_ACTED_HOLD` elapsing, which is
+    /// longer, so it renews the ask as well.
+    fn asked_once_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
-            AccessCardReoffer {
+            AccessCardAskedOnce {
                 const Buggy = 0;
-                var phase = 0;
-                var answered = 0;
-                var armed = 0;
+                const Cap = 3;
+                var gen = 0;
+                var asked = 0;
+                var raised = 0;
+                var granted = 0;
+                var need = 0;
+                var opened = 0;
                 var fresh = 1;
-                action Offer when (phase == 0) { phase = 1; }
-                action Quiet when (phase == 0) { phase = 2; }
-                action Answer when (phase == 1) {
-                    phase = 2; answered = 1; armed = 0;
+                var acted_ask = 0;
+                action Need when (need == 0) { need = 1; }
+                action Ask when (need == 1 && granted == 0 && asked == 0 && (opened == 0 || fresh == 1 || Buggy == 1)) {
+                    asked = 1; raised = raised + 1; need = 0;
+                    acted_ask = if opened == 1 && fresh == 0 { 1 } else { acted_ask };
                 }
-                action Expire when (phase == 1) {
-                    phase = 2; armed = if answered == 0 { 1 } else { 0 };
+                action Suppress when (need == 1 && (asked == 1 || granted == 1 || (opened == 1 && fresh == 0 && Buggy == 0))) { need = 0; }
+                action Open when (asked == 1 && opened == 0 && granted == 0) { opened = 1; fresh = 0; }
+                action HoldLapses when (opened == 1 && fresh == 0) { opened = 0; fresh = 1; asked = 0; raised = 0; }
+                action Grant when (granted == 0) { granted = 1; }
+                action Regress when (granted == 1) { granted = 0; asked = 0; raised = 0; opened = 0; fresh = 1; }
+                action Renew when (asked == 1 && granted == 0) { asked = 0; raised = 0; }
+                action Update when (gen <= Cap - 1) {
+                    gen = gen + 1; need = 0; fresh = 1;
+                    asked = if Buggy == 1 { 0 } else { asked };
                 }
-                action Return when (phase == 2 && armed == 1) {
-                    phase = 0; answered = 0; armed = 0;
-                    fresh = if Buggy == 1 { 0 } else { 1 };
-                }
-                action Open when (phase <= 2) {
-                    phase = 1; answered = 1; armed = 0; fresh = 1;
-                }
-                invariant FreshReturn: phase > 0 || fresh == 1;
-                invariant AnswerStopsReoffer: armed == 0 || (phase == 2 && answered == 0);
-                invariant Bounds: phase <= 2 && answered <= 1 && armed <= 1 && fresh <= 1;
+                invariant AtMostOncePerEpoch: raised <= 1;
+                invariant NoAskToAnOwnerWhoActedOnAnOlderWindow: acted_ask == 0;
             }
         }
     }
 
-    /// The daily return, driven three ways: the watch expiring on a posted
-    /// row (`Expire`), the row folding under the watch (`Fold` — the same
-    /// unanswered path, `on_row_retired`), and the Settings gesture that
-    /// restarts a settled watch with the owner's press on record.
     #[test]
-    fn reoffer_and_settings_watch_conform_to_the_real_card_lifecycle() {
-        use std::collections::BTreeMap;
-        let model = reoffer_model();
+    fn asked_once_model_proves_and_catches_the_historical_shapes() {
+        let model = asked_once_model();
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-        let project = |s: CardState| {
-            BTreeMap::from([
-                (
-                    "phase",
-                    match s.phase {
-                        CardPhase::Idle => 0,
-                        CardPhase::Watching { .. } => 1,
-                        CardPhase::Settled => 2,
-                        _ => panic!("fixture projects only completed transitions"),
-                    },
-                ),
-                ("answered", i64::from(s.owner_acted)),
-                ("armed", i64::from(s.settled_at.is_some())),
-                (
-                    "fresh",
-                    i64::from(
-                        s.phase != CardPhase::Idle
-                            || (s.first_raised.is_none() && s.due_since.is_none()),
-                    ),
-                ),
+    }
+
+    /// The real rules, driven through simulated restarts. The record is carried
+    /// ON DISK between generations (a new `CardState` and a new process start
+    /// each time, the record file the only memory), the model's actions are
+    /// fired in lockstep, and its variables are projected from the real state.
+    struct Epochs {
+        dir: std::path::PathBuf,
+        config: std::path::PathBuf,
+        fda: FdaState,
+        now: u64,
+        started: u64,
+        generation: i64,
+        raised: i64,
+        need: bool,
+        acted_ask: bool,
+        /// The historical defect: a process that keeps no record.
+        forgets_record: bool,
+        /// The reviewer's defect: an ask that ignores the window's age.
+        ignores_window_age: bool,
+        /// A negative control: the run is EXPECTED to depart from the model,
+        /// so its guards are not asserted (its invariants are the check).
+        lenient: bool,
+    }
+
+    impl Epochs {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aterm-asked-once-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = dir.join("aterm.toml");
+            Self {
+                dir,
+                config,
+                fda: FdaState::Denied,
+                now: 10_000_000,
+                started: 10_000_000,
+                generation: 0,
+                raised: 0,
+                need: false,
+                acted_ask: false,
+                forgets_record: false,
+                ignores_window_age: false,
+                lenient: false,
+            }
+        }
+
+        fn record(&self) -> AccessRecord {
+            read_record(Some(&self.config))
+        }
+
+        fn facts(&self) -> NeedFacts {
+            NeedFacts {
+                card: CardFacts {
+                    fda: self.fda,
+                    ..denied_release()
+                },
+                now_secs: self.now,
+                process_started_at: if self.ignores_window_age {
+                    u64::MAX
+                } else {
+                    self.started
+                },
+                cause: app_data_prompt(),
+            }
+        }
+
+        fn verdict(&self) -> NeedVerdict {
+            decide_need(&self.facts(), None, &self.record())
+        }
+
+        fn write(&self, update: AccessRecord) {
+            write_record(Some(&self.config), update).unwrap();
+        }
+
+        fn project(&self) -> std::collections::BTreeMap<&'static str, i64> {
+            let record = self.record();
+            let granted = self.fda == FdaState::Granted;
+            let live = |at: Option<u64>, span: Duration| {
+                at.is_some_and(|at| {
+                    self.now < at + span.as_secs()
+                        && (granted || record.verified_at.is_none_or(|v| v <= at))
+                })
+            };
+            let asked = live(record.asked_at, RENEW_AFTER);
+            let opened = live(record.opened_at, OWNER_ACTED_HOLD);
+            let fresh = !opened || self.started >= record.opened_at.unwrap_or(0);
+            std::collections::BTreeMap::from([
+                ("gen", self.generation),
+                ("asked", i64::from(asked)),
+                ("raised", self.raised),
+                ("granted", i64::from(granted)),
+                ("need", i64::from(self.need)),
+                ("opened", i64::from(opened)),
+                ("fresh", i64::from(fresh)),
+                ("acted_ask", i64::from(self.acted_ask)),
             ])
-        };
-        for actions in [
-            &["Offer", "Expire", "Return", "Offer", "Answer"][..],
-            &["Offer", "Fold", "Return", "Offer", "Fold"][..],
-            &["Quiet", "Open", "Expire"][..],
-        ] {
-            let mut card = CardState::new();
-            let mut state = model.init_state();
-            let mut now = Instant::now();
-            for action in actions {
-                let fired = match *action {
-                    "Offer" => {
-                        assert!(card.begin_deciding(now));
-                        assert!(card.on_decided(&Verdict::Offer, now));
-                        assert!(card.raise_allowed(now));
-                        card.on_raised(now);
-                        "Offer"
+        }
+
+        /// Do the real thing the model action stands for; `Err` if a decision
+        /// disagrees with the model's guard.
+        fn apply(
+            &mut self,
+            model: &aterm_spec::derive::Model,
+            action: &str,
+            before: &std::collections::BTreeMap<&'static str, i64>,
+        ) -> Result<(), String> {
+            self.now += 1;
+            match action {
+                "Need" => self.need = true,
+                "Ask" | "Suppress" => {
+                    // The host keeps a need that arrives inside the new
+                    // process's `LAUNCH_SETTLE` and decides it once the
+                    // window has settled (`NotDue::Settling`): the model's
+                    // decision moment is that later one.
+                    self.now = self.now.max(self.started + LAUNCH_SETTLE.as_secs());
+                    let verdict = self.verdict();
+                    let asks = matches!(verdict, NeedVerdict::Ask { .. });
+                    if asks != (action == "Ask") {
+                        return Err(format!("the real decision {verdict:?} is not {action}"));
                     }
-                    "Quiet" => {
-                        assert!(card.begin_deciding(now));
-                        assert!(card.on_decided(&Verdict::Quiet(NotDue::Granted), now));
-                        "Quiet"
+                    let other = if action == "Ask" { "Suppress" } else { "Ask" };
+                    if !self.lenient && model.action_enabled(other, before) {
+                        return Err(format!("the model allows {other} too"));
                     }
-                    "Answer" => {
-                        card.on_owner_acted();
-                        card.settle();
-                        "Answer"
+                    self.need = false;
+                    if asks {
+                        self.acted_ask =
+                            self.acted_ask || (before["opened"] == 1 && before["fresh"] == 0);
+                        self.raised += 1;
+                        self.write(AccessRecord {
+                            asked_at: Some(self.now),
+                            ..AccessRecord::default()
+                        });
                     }
-                    "Expire" => {
-                        now += WATCH_FOR;
-                        assert!(card.expire_wait(now));
-                        assert_eq!(
-                            card.lifecycle_deadline(),
-                            (!card.owner_acted).then_some(now + REOFFER_AFTER)
-                        );
-                        "Expire"
-                    }
-                    // The row folded on its own patience, long before the
-                    // watch would have: the model's Expire, reached sooner.
-                    "Fold" => {
-                        now += Duration::from_secs(600);
-                        assert!(card.on_row_retired(now));
-                        assert_eq!(card.lifecycle_deadline(), Some(now + REOFFER_AFTER));
-                        "Expire"
-                    }
-                    "Return" => {
-                        assert!(!card.reoffer_due(now + REOFFER_AFTER - Duration::from_nanos(1)));
-                        now += REOFFER_AFTER;
-                        assert!(card.reoffer_due(now));
-                        "Return"
-                    }
-                    "Open" => {
-                        card.on_opened_settings(now);
-                        "Open"
-                    }
-                    _ => unreachable!(),
-                };
-                let actual = project(card);
-                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                    &model,
-                    &[],
-                    &state,
-                    &actual,
-                    Some(fired),
-                    "real access-card reoffer",
-                );
-                assert!(ok, "{action}: {actual:?}: {why}");
-                if fired == "Return" {
-                    let mut stale = card;
-                    stale.first_raised = Some(now - REOFFER_AFTER);
-                    let broken = project(stale);
-                    assert!(!model.check_invariant("FreshReturn", &broken));
-                    assert!(!model.successors(fired, &state).contains(&broken));
                 }
-                if fired == "Open" {
-                    let mut old = actual.clone();
-                    old.insert("phase", 2); // old Watching-only gesture lost this request
-                    assert!(!model.successors(fired, &state).contains(&old));
+                "Open" => self.write(AccessRecord {
+                    opened_at: Some(self.now),
+                    ..AccessRecord::default()
+                }),
+                "HoldLapses" => {
+                    self.now += OWNER_ACTED_HOLD.as_secs() + 1;
+                    self.raised = 0;
                 }
-                state = actual;
+                "Grant" => {
+                    self.fda = FdaState::Granted;
+                    self.write(AccessRecord {
+                        verified_at: Some(self.now),
+                        verified_build: Some(7),
+                        ..AccessRecord::default()
+                    });
+                }
+                "Regress" => {
+                    self.fda = FdaState::Denied;
+                    self.raised = 0;
+                }
+                "Renew" => {
+                    self.now += RENEW_AFTER.as_secs() + 1;
+                    self.raised = 0;
+                }
+                "Update" => {
+                    self.generation += 1;
+                    self.need = false;
+                    self.started = self.now;
+                    if self.forgets_record {
+                        let _ = std::fs::remove_file(record_path(Some(&self.config)).unwrap());
+                    }
+                }
+                other => return Err(format!("unknown action {other}")),
             }
-            let last = actions.last().copied();
-            if last == Some("Fold") {
-                assert!(
-                    card.reoffer_due(now + REOFFER_AFTER),
-                    "a row that folds unanswered returns the next day too"
-                );
-            } else {
-                assert!(!card.reoffer_due(now + REOFFER_AFTER * 2));
-                assert_eq!(
-                    card.lifecycle_deadline(),
-                    None,
-                    "answered/quiet cards do not poll daily"
-                );
-            }
+            Ok(())
         }
     }
 
-    /// A VERDICT THAT NEVER ARRIVES DOES NOT KILL THE CARD (2026-09-09). An
-    /// uncommitted incoming handoff drops every wake but Commit, so the card's
-    /// own verdict can be swallowed. Deciding therefore lapses, asks again, and
-    /// gives up only after [`DECIDE_ATTEMPTS`] — never silently forever.
+    impl Drop for Epochs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run a scenario in lockstep; returns the last projected state.
+    fn run_epochs(
+        epochs: &mut Epochs,
+        actions: &[&str],
+    ) -> std::collections::BTreeMap<&'static str, i64> {
+        let model = asked_once_model();
+        let mut expected = model.init_state();
+        assert_eq!(epochs.project(), expected, "both start in the same state");
+        for action in actions {
+            let before = expected.clone();
+            assert!(
+                model.action_enabled(action, &before),
+                "{action}: the model forbids it in {before:?}"
+            );
+            epochs
+                .apply(&model, action, &before)
+                .unwrap_or_else(|why| panic!("{action}: {why}"));
+            assert!(model.fire(action, &mut expected));
+            assert_eq!(
+                epochs.project(),
+                expected,
+                "{action}: the real state departs from the model"
+            );
+        }
+        expected
+    }
+
+    /// TIER 1: the real `decide_need` and record persistence across process
+    /// generations follow the model, action by action, and the model's
+    /// invariants hold in every state reached.
+    #[test]
+    fn asked_once_conforms_across_process_generations() {
+        let model = asked_once_model();
+        for (tag, actions) in [
+            (
+                "eight-updates",
+                &[
+                    "Need", "Ask", "Update", "Need", "Suppress", "Update", "Need", "Suppress",
+                ][..],
+            ),
+            (
+                "opened-then-updated",
+                &["Need", "Ask", "Open", "Update", "Need", "Suppress"][..],
+            ),
+            (
+                "owner-acted",
+                &["Need", "Ask", "Open", "Renew", "Need", "Suppress"][..],
+            ),
+            (
+                "hold-lapses",
+                &["Need", "Ask", "Open", "HoldLapses", "Need", "Ask"][..],
+            ),
+            (
+                "grant-and-regress",
+                &[
+                    "Need", "Ask", "Grant", "Need", "Suppress", "Regress", "Need", "Ask",
+                ][..],
+            ),
+            (
+                "renews-weekly",
+                &["Need", "Ask", "Renew", "Need", "Ask"][..],
+            ),
+            (
+                "granted-first",
+                &["Grant", "Update", "Regress", "Need", "Ask"][..],
+            ),
+        ] {
+            let mut epochs = Epochs::new(tag);
+            let end = run_epochs(&mut epochs, actions);
+            assert!(model.check_invariant("AtMostOncePerEpoch", &end), "{tag}");
+            assert!(
+                model.check_invariant("NoAskToAnOwnerWhoActedOnAnOlderWindow", &end),
+                "{tag}"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROLS: the two defects the model exists for, replayed on
+    /// the real rules, are caught by its invariants.
+    #[test]
+    fn asked_once_catches_the_process_that_forgets_and_the_ask_that_ignores_the_window() {
+        let model = asked_once_model();
+        // 1. Per-process behaviour: a new process keeps no record (the 8 posts
+        //    in 3.8 days). The real rules ask a second time in one epoch.
+        let mut forgetful = Epochs::new("forgets");
+        forgetful.forgets_record = true;
+        forgetful.lenient = true;
+        let model_free = |epochs: &mut Epochs, action: &str| {
+            let before = epochs.project();
+            epochs.apply(&model, action, &before).unwrap();
+        };
+        for action in ["Need", "Ask", "Update", "Need", "Ask"] {
+            model_free(&mut forgetful, action);
+        }
+        assert_eq!(forgetful.raised, 2, "the per-process card asks twice");
+        assert!(
+            !model.check_invariant("AtMostOncePerEpoch", &forgetful.project()),
+            "the invariant reports it"
+        );
+        // 2. The reviewer's owner: an ask that ignores how old the window is.
+        let mut blind = Epochs::new("blind");
+        blind.ignores_window_age = true;
+        blind.lenient = true;
+        for action in ["Need", "Ask", "Open", "Renew", "Need", "Ask"] {
+            model_free(&mut blind, action);
+        }
+        assert!(
+            blind.acted_ask,
+            "asked an owner who acted on an older window"
+        );
+        assert!(
+            !model.check_invariant("NoAskToAnOwnerWhoActedOnAnOlderWindow", &blind.project()),
+            "the invariant reports it"
+        );
+    }
+
+    /// THE INCIDENT REPLAY: the owner's eight process starts in 3.8 days and
+    /// the three dialogs (17:28:00, 17:55:12, 18:26:50) raise exactly ONE
+    /// entry, then `RecentlyAsked`, on the real rules with the record carried
+    /// through the file.
+    #[test]
+    fn the_owners_8_updates_and_3_dialogs_raise_one_entry() {
+        let mut epochs = Epochs::new("incident");
+        let mut asks = 0;
+        let mut quiet = Vec::new();
+        // Eight starts (a start is a new process: a new CardState and start
+        // time; the record is the only memory), each followed by dialogs.
+        for start in 0..8 {
+            epochs.now += 3 * 60 * 60;
+            epochs.started = epochs.now;
+            let mut card = CardState::new();
+            assert!(card.begin_deciding(Instant::now()));
+            assert!(card.on_decided(
+                &Verdict::from(&LaunchVerdict::Quiet(NotDue::NoNeedYet)),
+                Instant::now()
+            ));
+            assert_eq!(
+                card.phase(),
+                CardPhase::Settled,
+                "start {start}: no launch ask"
+            );
+            if start == 1 || start == 4 || start == 6 {
+                // A dialog was shown for a program of this process.
+                epochs.now += 60;
+                match epochs.verdict() {
+                    NeedVerdict::Ask { .. } => {
+                        asks += 1;
+                        epochs.write(AccessRecord {
+                            asked_at: Some(epochs.now),
+                            ..AccessRecord::default()
+                        });
+                    }
+                    NeedVerdict::Quiet(why) => quiet.push(why),
+                }
+            }
+        }
+        assert_eq!(asks, 1, "one entry across eight updates and three dialogs");
+        assert_eq!(quiet, [NotDue::RecentlyAsked, NotDue::RecentlyAsked]);
+    }
+
+    /// The record is four `key=value` lines, written as a field-wise max (two
+    /// processes cannot move a field backwards), and a foreign file is NO
+    /// record.
+    #[test]
+    fn the_access_record_round_trips_and_a_foreign_file_is_no_record() {
+        let epochs = Epochs::new("record");
+        let config = Some(epochs.config.as_path());
+        assert_eq!(read_record(config), AccessRecord::default());
+        assert!(write_record(None, AccessRecord::default()).is_err());
+        let first = AccessRecord {
+            asked_at: Some(100),
+            opened_at: Some(200),
+            verified_at: None,
+            verified_build: None,
+        };
+        assert_eq!(write_record(config, first).unwrap(), first);
+        assert_eq!(read_record(config), first);
+        // An older value never replaces a newer one; a new field is added.
+        let merged = write_record(
+            config,
+            AccessRecord {
+                asked_at: Some(50),
+                opened_at: Some(300),
+                verified_at: Some(400),
+                verified_build: Some(9),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            AccessRecord {
+                asked_at: Some(100),
+                opened_at: Some(300),
+                verified_at: Some(400),
+                verified_build: Some(9),
+            },
+            "opened_at is written as a max"
+        );
+        assert_eq!(AccessRecord::parse(&merged.render()), merged);
+        assert!(merged.render().len() <= MAX_RECORD_BYTES);
+        let maximal = AccessRecord {
+            asked_at: Some(u64::MAX),
+            opened_at: Some(u64::MAX),
+            verified_at: Some(u64::MAX),
+            verified_build: Some(u64::MAX),
+        };
+        assert!(
+            maximal.render().len() <= MAX_RECORD_BYTES,
+            "four maximal fields still fit the bound"
+        );
+        // A foreign file, an unknown key, a bad number, or an oversized file
+        // reads as an empty record: the card errs toward speaking once.
+        let path = epochs.dir.join(RECORD);
+        for foreign in [
+            "hello\n",
+            "asked_at=abc\n",
+            "asked_at=1\nsecret=2\n",
+            "asked_at=1\nnot a line\n",
+        ] {
+            std::fs::write(&path, foreign).unwrap();
+            assert_eq!(read_record(config), AccessRecord::default(), "{foreign:?}");
+        }
+        std::fs::write(&path, "asked_at=1\n".repeat(MAX_RECORD_BYTES)).unwrap();
+        assert_eq!(read_record(config), AccessRecord::default(), "oversized");
+        // A hand edit with blank lines and spaces still reads.
+        std::fs::write(&path, "\nasked_at = 12\n\nverified_at=13\n").unwrap();
+        assert_eq!(
+            read_record(config),
+            AccessRecord {
+                asked_at: Some(12),
+                verified_at: Some(13),
+                ..AccessRecord::default()
+            }
+        );
+    }
+
+    /// `on_need` re-arms a SETTLED card (and only that); a need that arrives
+    /// while the card is busy is kept and given up when it settles; the daily
+    /// return is gone (`REOFFER_AFTER`, `reoffer_due` and their deadline).
+    #[test]
+    fn on_need_re_arms_a_settled_card_and_reoffer_no_longer_exists() {
+        let t0 = Instant::now();
+        let mut s = CardState::new();
+        // Idle: the launch check has not run; the need waits for it.
+        assert!(!s.on_need(t0));
+        assert_eq!(s.phase(), CardPhase::Idle);
+        assert!(!s.take_pending_need(), "only a settled card gives it up");
+        assert!(s.begin_deciding(t0));
+        assert!(!s.on_need(t0), "a verdict is coming: the need is kept");
+        assert!(s.on_decided(&Verdict::Quiet(NotDue::NoNeedYet), t0));
+        assert_eq!(s.phase(), CardPhase::Settled);
+        assert!(s.take_pending_need(), "re-evaluated the moment it settles");
+        assert!(!s.take_pending_need(), "and only once");
+        // Settled -> Deciding with a fresh episode and a full attempt budget.
+        assert!(s.on_need(t0 + Duration::from_secs(1)));
+        assert!(matches!(s.phase(), CardPhase::Deciding { .. }));
+        assert_eq!(
+            s.lifecycle_deadline(),
+            Some(t0 + Duration::from_secs(1) + DECIDE_TIMEOUT)
+        );
+        assert!(s.on_decided(&Verdict::Offer, t0));
+        assert_eq!(s.phase(), CardPhase::Due);
+        // A Due or Watching card already covers a further need.
+        assert!(!s.on_need(t0));
+        assert!(s.raise_allowed(t0));
+        s.on_raised(t0);
+        assert!(!s.on_need(t0));
+        assert!(!s.take_pending_need(), "still watching");
+        // The row folding unanswered settles it, with NO daily return.
+        assert!(s.on_row_retired());
+        assert_eq!(s.phase(), CardPhase::Settled);
+        assert_eq!(s.lifecycle_deadline(), None);
+        assert!(
+            s.take_pending_need(),
+            "the need kept while watching returns"
+        );
+        // A retry budget is fresh for every need: three lapses, then settled.
+        let mut lapses = CardState::new();
+        lapses.settle();
+        assert!(lapses.on_need(t0));
+        for attempt in 1..=DECIDE_ATTEMPTS {
+            assert!(lapses.deciding_lapsed(t0 + DECIDE_TIMEOUT));
+            assert_eq!(lapses.reopen_deciding(), attempt < DECIDE_ATTEMPTS);
+            if attempt < DECIDE_ATTEMPTS {
+                assert!(lapses.begin_deciding(t0));
+            }
+        }
+        assert_eq!(lapses.phase(), CardPhase::Settled);
+    }
+
+    /// A verdict that never arrives does not kill the card: an uncommitted
+    /// incoming handoff drops every wake but Commit, so Deciding lapses, asks
+    /// again, and gives up only after [`DECIDE_ATTEMPTS`].
     #[test]
     fn a_swallowed_verdict_is_asked_for_again_and_then_given_up_on() {
         let t0 = Instant::now();
@@ -1315,7 +2685,7 @@ mod tests {
         }
         assert_eq!(s.phase(), CardPhase::Settled, "the attempts are spent");
         assert!(!s.begin_deciding(t0), "and it does not start again");
-        // A verdict that DOES arrive still ends the deciding phase.
+        // A verdict that does arrive still ends the deciding phase.
         let mut ok = CardState::new();
         assert!(ok.begin_deciding(t0));
         assert!(ok.on_decided(&Verdict::Offer, t0));
@@ -1328,7 +2698,7 @@ mod tests {
         let mut s = CardState::new();
         assert_eq!(s.phase(), CardPhase::Idle);
         assert!(!s.wants_probe(t0), "idle: nothing to watch");
-        assert!(!s.on_row_retired(t0), "idle: no row to lose");
+        assert!(!s.on_row_retired(), "idle: no row to lose");
         assert!(s.begin_deciding(Instant::now()));
         assert!(!s.begin_deciding(Instant::now()), "the one-shot fires once");
         assert!(matches!(s.phase(), CardPhase::Deciding { .. }));
@@ -1345,7 +2715,7 @@ mod tests {
             "a second verdict is stale"
         );
         assert!(!s.wants_probe(t0), "due but not posted: no watch yet");
-        assert!(!s.on_row_retired(t0), "not posted: no row to lose");
+        assert!(!s.on_row_retired(), "not posted: no row to lose");
         assert!(s.raise_allowed(t0), "the first raise is always allowed");
         s.on_raised(t0);
         assert_eq!(s.phase(), CardPhase::Watching { since: t0 });
@@ -1370,8 +2740,8 @@ mod tests {
         assert_eq!(c.phase(), CardPhase::Settled);
         assert_eq!(c.lifecycle_deadline(), None);
 
-        // Opening Settings restarts the window and marks the owner's press:
-        // the row's fold is not an unanswered end after that.
+        // Opening Settings restarts the window and records the press, so the
+        // row's fold is no longer an unanswered end.
         let t2 = t0 + Duration::from_secs(20);
         let mut o = CardState::new();
         assert!(o.begin_deciding(Instant::now()));
@@ -1379,7 +2749,7 @@ mod tests {
         o.on_raised(t0);
         o.on_opened_settings(t2);
         assert_eq!(o.phase(), CardPhase::Watching { since: t2 });
-        assert!(!o.on_row_retired(t2 + Duration::from_secs(90)));
+        assert!(!o.on_row_retired());
         assert_eq!(o.phase(), CardPhase::Watching { since: t2 });
         assert!(o.wants_probe(t2 + WATCH_FOR - Duration::from_secs(1)));
         assert!(!o.wants_probe(t2 + WATCH_FOR), "the watch is bounded");
@@ -1405,7 +2775,7 @@ mod tests {
         b.on_raised(t0);
         b.on_owner_acted();
         assert!(b.wants_probe(t0 + Duration::from_secs(1)));
-        assert!(!b.on_row_retired(t0 + Duration::from_secs(1)));
+        assert!(!b.on_row_retired());
         assert_eq!(b.phase(), CardPhase::Watching { since: t0 });
         assert!(!b.wants_probe(t0 + WATCH_FOR));
         assert_eq!(b.lifecycle_deadline(), None, "read rows do not return");
@@ -1424,32 +2794,26 @@ mod tests {
         w.settle();
         assert_eq!(w.phase(), CardPhase::Settled);
         assert!(!w.wants_probe(t0));
-        assert!(!w.on_row_retired(t0));
+        assert!(!w.on_row_retired());
         assert_eq!(CardState::default(), CardState::new());
     }
 
     /// THE ROW'S OWN END (design §3.10): a posted row that folds on its Ask
-    /// hold with nothing pressed is the unanswered path — settled, with the
-    /// daily return — while a row the owner acted on keeps its watch, and a
-    /// settled or unposted card has no row to lose.
+    /// hold with nothing pressed is the unanswered path — settled, and NOT
+    /// returned to (`asked_at` is on record; the next ask waits for the week)
+    /// — while a row the owner acted on keeps its watch, and a settled or
+    /// unposted card has no row to lose.
     #[test]
-    fn a_row_that_folds_unanswered_settles_with_a_daily_return() {
+    fn a_row_that_folds_unanswered_settles_and_does_not_come_back_daily() {
         let t0 = Instant::now();
-        let folded = t0 + Duration::from_secs(600);
         let mut s = CardState::new();
         assert!(s.begin_deciding(t0));
         assert!(s.on_decided(&Verdict::Offer, t0));
         s.on_raised(t0);
-        assert!(s.on_row_retired(folded));
+        assert!(s.on_row_retired());
         assert_eq!(s.phase(), CardPhase::Settled);
-        assert_eq!(s.lifecycle_deadline(), Some(folded + REOFFER_AFTER));
-        assert!(
-            !s.on_row_retired(folded),
-            "settled: nothing to retire twice"
-        );
-        assert!(!s.reoffer_due(folded + REOFFER_AFTER - Duration::from_secs(1)));
-        assert!(s.reoffer_due(folded + REOFFER_AFTER));
-        assert_eq!(s.phase(), CardPhase::Idle, "a fresh episode");
-        assert_eq!(s.lifecycle_deadline(), None);
+        assert_eq!(s.lifecycle_deadline(), None, "no daily return");
+        assert!(!s.on_row_retired(), "settled: nothing to retire twice");
+        assert!(!s.take_pending_need(), "no need was kept");
     }
 }

@@ -214,7 +214,9 @@ fn ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet(
         "history removal does not relocate the pet"
     );
     assert!(world.under_text_clear(body(after), 0.0));
-    assert!(after.under_ink || world.clear(body(after), 0.0));
+    // Ink under the drawn body puts it under the glyphs; the caret's
+    // keep-off ring is protection, not ink, and does not.
+    assert!(after.under_ink || world.ink_clearance(body(after), 0.0) == Some(true));
     assert_ne!(s.brain.console_attention(), PetAttention::Contact);
 }
 
@@ -223,11 +225,10 @@ fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
     for (erase, removes_live_ink) in [(b"\x1b[2J".as_slice(), true), (b"\x1b[3J", false)] {
         let mut s = Scene::new(true);
         // The reading perch is the escort's own stand, inside the caret's
-        // keep-off ring by construction (`pet_escort_primacy`), so beside a
-        // VISIBLE caret the halo is always within the contact margin of the
-        // body. Hide the caret after seating — as `work()` does for the other
-        // scenes here — and move the selection: the body holds its spot at its
-        // last real home with clear ground on every side, so what follows
+        // keep-off ring (`pet_escort_primacy`), so beside a visible caret the
+        // halo is always within the body's contact margin. Hiding the caret
+        // after seating (as `work()` does) and moving the selection leaves the
+        // body at its last home with clear ground around it, so what follows
         // measures ink contact rather than cursor proximity.
         s.select(9, 12);
         s.warm();

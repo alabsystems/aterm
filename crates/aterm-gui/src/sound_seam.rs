@@ -93,7 +93,7 @@ pub(crate) struct HostSoundTerms {
 /// therefore a regression the conformance runs.
 ///
 /// `resolved` is the RESOLVED config (`App::glow_config`), never the one
-/// `tick_cursor_fx` folds: a dark trail under Reduce Motion or load shed is
+/// `cursor_frame` folds: a dark trail under Reduce Motion or load shed is
 /// still `trail_on`, and only the person's own knobs may say otherwise.
 pub(crate) fn verb_seam_inputs(
     resolved: &aterm_effects::cursor_glow::GlowConfig,

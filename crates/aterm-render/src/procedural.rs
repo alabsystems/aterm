@@ -1147,18 +1147,7 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
     // The k-th mask in 1..=62 skipping the two whole-column masks.
-    let mut mask = 0u32;
-    let mut idx = 0u32;
-    for cand in 1..=62u32 {
-        if cand == 21 || cand == 42 {
-            continue;
-        }
-        if idx == k {
-            mask = cand;
-            break;
-        }
-        idx += 1;
-    }
+    let mask = k + 1 + u32::from(k >= 20) + u32::from(k >= 40);
     let (w, h) = (c.w, c.h);
     let xm = eighth(4, w); // shared half-column boundary (matches ▌/▐)
     let y1 = (h + 1) / 3; // upper/middle split (round)

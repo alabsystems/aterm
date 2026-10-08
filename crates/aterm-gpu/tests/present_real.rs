@@ -1,29 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE PRESENT-REAL THEOREM (Headless Present-Real, PHASE 2): the same
-// `RenderInput` presented through a COPYABLE SWAPCHAIN with the video tap and
-// through the headless VIRTUAL target (`present_virtual`) with the tap must
-// yield BYTE-IDENTICAL harvested frames. Both arms run the ONE extracted
-// `present_to_view` compose-and-blit seam, so parity is by construction — this
-// suite pins it empirically so any future drift between the arms (a forgotten
-// pass, a format/size divergence, a tap rewire) is a red CI, not a silent lie
-// in the recording artifact.
+// Present-real parity: the same `RenderInput` presented through a copyable
+// swapchain with the video tap and through the headless virtual target
+// (`present_virtual`) yields byte-identical harvested frames. Both arms share
+// the `present_to_view` compose-and-blit seam; this suite catches drift
+// between them (a missing pass, a format/size divergence, a tap rewire).
 //
-// The swapchain arm is `present_swapchain_standin_for_test`: the REAL
-// `present_input` path after its acquire (same seam, same blit pipeline, same
-// uniform bytes) against a texture carrying exactly a copyable swapchain's
-// configuration (`RENDER_ATTACHMENT | COPY_SRC`, the `pick_surface_format` SDR
-// default) — only `present()` itself (pure WSI, no pixel effect) is absent,
-// since a headless test has no compositor.
+// The swapchain arm is `present_swapchain_standin_for_test`: the real
+// `present_input` path after acquire, against a texture configured like a
+// copyable swapchain (`RENDER_ATTACHMENT | COPY_SRC`, the
+// `pick_surface_format` SDR default); only the pixel-free `present()` is absent.
 //
-// Variants cover the swapchain-only layers single-frame tools miss — the ones
-// the tap exists for: the additive GLOW quads, the radial HALOS, the under-
-// glyph flame body + charred cores, the comet TRAIL, the half-res gaussian
-// BLOOM, the SDR glow-boost CROWN (the blit-pass One/One draw), the settings
-// TRAY, the bell INVERT, and the scissored second present.
+// Variants cover the swapchain-only layers: glow quads, radial halos, the
+// under-glyph flame body and charred cores, the comet trail, half-res bloom,
+// the SDR glow-boost crown, the settings tray, bell invert, and the
+// scissored second present.
 //
-// Gated like the differential harness: no GPU / no system font -> no-op.
+// No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
@@ -32,27 +26,10 @@ use aterm_render::{
     TrailCell, band_offset, band_offset_y, place_frame_bands, premul_rgb,
 };
 
-fn gpu_or_skip(px: f32, theme: Theme) -> Option<aterm_gpu::GpuRenderer> {
-    match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => {
-            // THE FLIP: present_real is the wgpu present-theorem harness (its
-            // stand-in textures and taps are wgpu-typed) — the WGPU ORACLE by
-            // name. The armed twin lives in the metal armed differentials
-            // (`metal_present_bytes_for_test` + the tap-ring differential).
-            #[cfg(target_os = "macos")]
-            let g = {
-                let mut g = g;
-                g.disarm_metal_for_oracle();
-                g
-            };
-            Some(g)
-        }
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            None
-        }
-    }
-}
+// The wgpu present-theorem harness (its stand-in textures and taps are
+// wgpu-typed). The Metal twin is the armed differentials
+// (`metal_present_bytes_for_test` and the tap-ring differential).
+use crate::common::wgpu_oracle_or_skip as gpu_or_skip;
 
 fn opts(half_res: bool) -> CaptureOpts {
     CaptureOpts {
@@ -63,9 +40,8 @@ fn opts(half_res: bool) -> CaptureOpts {
     }
 }
 
-/// Harvest-and-compare: the two takes must agree on geometry, frame count, and
-/// EVERY frame's exact bytes (timestamps excluded — the clock is the one
-/// honest difference between two runs).
+/// The two takes agree on geometry, frame count and every frame's bytes
+/// (timestamps excluded).
 fn assert_takes_byte_identical(label: &str, swap: &VideoTake, virt: &VideoTake) {
     assert_eq!(
         (swap.w, swap.h, swap.device_px, swap.half_res, swap.format),
@@ -90,11 +66,10 @@ fn assert_takes_byte_identical(label: &str, swap: &VideoTake, virt: &VideoTake) 
     }
 }
 
-/// One theorem round: present every input of `seq` through BOTH arms (fresh
-/// per-window state each arm; the tap armed for the whole sequence) and demand
-/// byte-identical harvests. `reset_glow_ease_for_test` runs before each arm so
-/// the SDR crown's attack envelope — the one deliberately wall-clock term in
-/// the pass — starts both arms from the identical eased budget.
+/// Present every input of `seq` through both arms (fresh per-window state,
+/// tap armed throughout) and require byte-identical harvests.
+/// `reset_glow_ease_for_test` runs before each arm so the SDR crown's
+/// wall-clock attack envelope starts equal.
 fn round(
     label: &str,
     gpu: &mut aterm_gpu::GpuRenderer,
@@ -137,10 +112,10 @@ fn round(
     (take_a, take_b)
 }
 
-/// Deck a base text frame out with the full EMBERFORGE effect stack: additive
-/// glow quads, radial halos, under-glyph flame body, charred glyph cores, a
-/// per-pixel fire patch + the glyph contrast-halo strength it engulfs, a
-/// comet trail, and the fire block-fill override.
+/// Add the full fire effect stack to a base text frame: glow quads, radial
+/// halos, under-glyph flame body, charred glyph cores, a per-pixel fire patch
+/// with the glyph contrast-halo it engulfs, a comet trail and the fire
+/// block-fill override.
 fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
     let fire = 0x00FF_6A00; // warm ember orange
     for (i, a) in [60u8, 120, 190, 240].iter().enumerate() {
@@ -189,9 +164,8 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         col: 2,
         fg: 0x0020_100A,
     });
-    // A live per-pixel fire patch + a contrast-halo strength on the engulfed
-    // glyph, so the theorem covers the fire-field pass AND the glyph_halo
-    // deco-over pass (the halo keys on `fire_halo` + a live `fire_patch`).
+    // A live fire patch plus contrast-halo strength on the engulfed glyph,
+    // covering the fire-field pass and the glyph_halo pass.
     input.fire_patch.push(FirePatch {
         row: 2,
         x: (2 * cw) as u16,
@@ -223,9 +197,8 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
     input.cursor_fill_override = Some(fire);
 }
 
-/// The theorem over a PLAIN TEXT frame plus a SCISSORED second present (one
-/// changed row): the base compose, the letterbox blit, and the dirty-row
-/// repaint path agree byte-for-byte between the arms.
+/// A plain text frame plus a scissored second present (one changed row): the
+/// base compose, letterbox blit and dirty-row repaint agree between arms.
 #[test]
 fn present_real_theorem_text_and_scissored_present() {
     let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
@@ -256,13 +229,11 @@ fn present_real_theorem_text_and_scissored_present() {
     );
 }
 
-/// A raw window is commonly a few pixels larger than its integer-cell frame
-/// after a font zoom. Drive that exact geometry through the PRODUCTION present
-/// seam and require every harvested swapchain pixel to equal the CPU placement
-/// reference. The live OSC-11 background distinguishes the bands from the
-/// configured theme, while the coloured bottom-right cell makes clipping the
-/// trailing content observable even on an SDR stand-in whose clear is otherwise
-/// the same colour as the expected band.
+/// A raw window a few pixels larger than its integer-cell frame (common after
+/// a font zoom), driven through the production present seam: every harvested
+/// swapchain pixel equals the CPU placement reference. The OSC-11 background
+/// distinguishes the bands from the theme, and the coloured bottom-right cell
+/// makes clipping of trailing content observable.
 #[test]
 fn production_present_resolves_odd_bands_and_trailing_content() {
     let theme = Theme::default();
@@ -279,14 +250,13 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     // the present bands to the frame's OSC-11 colour.
     term.process(b"\x1b]11;rgb:2222/4444/6666\x1b\\");
     term.process(b"$ production present +7px");
-    // No padding + a vivid last-cell background makes the final source columns
-    // and rows non-background pixels. Disable wrap/cursor so the write neither
+    // No padding and a vivid last-cell background make the final columns and
+    // rows non-background. Wrap and cursor are off so the write neither
     // scrolls nor covers the sentinel cell.
     term.process(b"\x1b[?7l\x1b[?25l\x1b[6;28H\x1b[48;2;255;0;255m \x1b[0m");
     let mut input = term.cell_frame(rows, cols);
-    // `cell_frame` leaves this host-resolved presentation field unset; the GUI
-    // fills it from the live terminal colours before presenting. Reproduce that
-    // host seam explicitly so the band must follow OSC 11 rather than the theme.
+    // `cell_frame` leaves this unset; the GUI fills it from live terminal
+    // colours before presenting, so the band must follow OSC 11.
     input.default_bg = 0x0022_4466;
     let live_bg = input.default_bg & 0x00ff_ffff;
     assert_ne!(
@@ -369,10 +339,9 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     // pixel is magenta, not the live band colour.
     assert_eq!(source.pixels[fw * fh - 1] & 0x00ff_ffff, 0x00ff_00ff);
 
-    // Tier-1 conformance: normalize this real odd-band present onto the bounded
-    // SurfaceCoverage machine (frame=4, raw surface=5). Exact equality above is
-    // the real-code witness for full coverage; all four raw-destination corners
-    // are the live OSC-11 band witness.
+    // Tier-1 conformance: project this odd-band present onto the bounded
+    // SurfaceCoverage model (frame=4, raw surface=5). The four raw corners
+    // witness the live OSC-11 band.
     let live_rgba = [0x22, 0x44, 0x66, 0xff];
     let pixel = |x: usize, y: usize| {
         let start = (y * dw + x) * 4;
@@ -396,9 +365,8 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         "shipping GPU pixels must implement the ty-proven full-surface transition"
     );
 
-    // Negative control: project the deleted frame-sized viewport. It covers
-    // only the logical frame and leaves the band stale, so both model
-    // invariants reject the state.
+    // Negative control: a frame-sized viewport covers only the logical frame
+    // and leaves the band stale; both invariants reject it.
     let mut old_frame_viewport = model.init_state();
     assert!(model.fire("Zoom", &mut old_frame_viewport));
     old_frame_viewport.insert("covered", 4);
@@ -408,10 +376,9 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     assert!(!model.check_invariant("RemainderUsesLiveBackground", &old_frame_viewport));
 }
 
-/// A one-shot exact-destination capture can run during an active video without
-/// consuming, decimating, or otherwise perturbing the recorder. Both copies are
-/// appended after the final presentation pass in the same encoder, so their
-/// harvested bytes must be identical.
+/// A one-shot exact-destination capture during an active video does not
+/// perturb the recorder: both copies are appended after the final pass in
+/// the same encoder and harvest identical bytes.
 #[test]
 fn one_shot_presented_snapshot_is_independent_from_video() {
     let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
@@ -455,19 +422,16 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
     );
 }
 
-/// The theorem over the FULL FIRE STACK at full res with the GPU bloom ON and
-/// the SDR glow-boost crown engaged — every swapchain-only pass the tap exists
-/// to capture (glow, halo, under, char_fg, fire field, glyph contrast-halo,
-/// trail, bloom, crown) agrees byte-for-byte between the arms.
+/// The full fire stack at full res with GPU bloom and the SDR glow-boost crown
+/// on: every swapchain-only pass agrees byte-for-byte between the arms.
 #[test]
 fn present_real_theorem_fire_glow_bloom_halo_crown() {
     let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
         return;
     };
     gpu.set_bloom(true);
-    // The heat shimmer stays ON (the theorem should cover the whole parity
-    // class) with its one wall-clock term PINNED, so both arms compose the
-    // identical refraction — the shimmer analogue of `reset_glow_ease_for_test`.
+    // Heat shimmer stays on with its wall-clock phase pinned, so both arms
+    // compose the same refraction.
     gpu.set_shimmer_phase_for_test(Some(0.40));
     gpu.set_sdr_glow_boost(0.5);
     let (rows, cols) = (6usize, 28usize);
@@ -542,8 +506,7 @@ fn present_real_theorem_half_res_harvest() {
     );
 }
 
-/// The theorem over the BELL-INVERT chrome (a blit-uniform arm) — the last
-/// present-time layer distinct from the streams above.
+/// The bell-invert chrome (a blit-uniform arm) agrees between the arms.
 #[test]
 fn present_real_theorem_bell_invert() {
     let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {

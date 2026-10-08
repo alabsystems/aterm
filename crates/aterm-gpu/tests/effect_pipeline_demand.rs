@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE DEMAND-DRIVEN EFFECT PIPELINES, END TO END ON A REAL DEVICE.
+// Demand-driven effect pipelines on a real device: `encode_frame` consults
+// `frame_effect_pipelines` (unit-tested in `renderer.rs`), so a frame with no
+// effect stream compiles nothing, and the first frame carrying one builds only
+// what it needs. Prints the per-slot compile cost.
 //
-// `renderer.rs` already unit-tests `frame_effect_pipelines` — the pure predicate
-// that says WHICH pipelines one frame binds. What no test covered is that
-// `encode_frame` actually consults it, that a frame carrying no effect stream
-// therefore compiles nothing on real hardware, and what the first frame that
-// DOES carry one pays. This binary answers all three against a live adapter, and
-// prints the per-slot compile cost so the launch budget has a measured number
-// instead of a remembered one.
-//
-// Gated: no GPU / no system font -> the test no-ops (returns).
+// No GPU / no system font: no-op.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{GlowQuad, Theme};
 
-mod common;
-use common::backends;
+use crate::common::backends;
 
 /// The one glow quad a cursor effect publishes, in cell (1,1).
 fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
@@ -36,15 +30,9 @@ fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
     }
 }
 
-/// A frame with the shipped Windows defaults — no cursor trail, no glow, no
-/// rain, no sparkle words, no sprites — must leave EVERY effect pipeline
-/// unbuilt, and the first frame that publishes one glow quad must build exactly
-/// `glow_add` and nothing else.
-///
-/// This is the standing proof of the demand gate at the seam that matters. A
-/// launch compiling the nine effect pipelines eagerly cost 136.13 ms of every
-/// window open on this machine, all of it on time-to-first-present, for pixels
-/// the shipped config never draws.
+/// A frame with the shipped defaults (no cursor trail, glow, rain, sparkle
+/// words or sprites) leaves every effect pipeline unbuilt, and the first frame
+/// publishing one glow quad builds exactly `glow_add`.
 #[test]
 fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_add() {
     let theme = Theme::default();
@@ -97,9 +85,8 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
         builds, 1,
         "the demand pass must build each slot exactly once"
     );
-    // THE MEASURED NUMBER this bundle is about: what a launch pays the first
-    // time a frame carries a glow stream. On an effects-off config no frame
-    // should carry one at all, so a launch should pay none of it.
+    // Report what the first glow-carrying frame pays; an effects-off config
+    // never pays it.
     eprintln!(
         "MEASURED glow_add demand build = {:.2} ms",
         build_ns as f64 / 1.0e6
@@ -114,13 +101,9 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
     );
 }
 
-/// What the four expensive slots cost, so the warm-up seam's existence is
-/// justified by a measurement rather than by memory. `warm_effect_pipelines`
-/// builds every slot off the frame path; this prints the total and the count.
-///
-/// Deliberately NOT an assertion on the milliseconds — that would be a
-/// machine-speed test. The assertion is that the warm-up leaves the whole set
-/// resident, which is the property the config-apply seam relies on.
+/// Prints what the four expensive slots cost. `warm_effect_pipelines` builds
+/// every slot off the frame path; the assertion is that the whole set is
+/// resident afterwards (not on timing), which config-apply relies on.
 #[test]
 fn the_warm_up_seam_builds_every_slot_off_the_frame_path() {
     let theme = Theme::default();

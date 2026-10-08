@@ -2730,6 +2730,9 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
 /// The pet's durable identity survives so the next lawful sighting uses the
 /// same companion. Raw focus loss is not itself a retirement proof: a live
 /// typed-wake or recording pin keeps the same presentation surface admitted.
+/// What the NEXT frame draws is `PetSurfaceSeam`'s law: an owner switch
+/// crossfades from a non-interactive ghost of the old body, drawn only at the
+/// very pixels it occupied, never moved and never a hit target.
 ///
 /// `Buggy = 1` reproduces the retained-coordinate defect: retiring boundaries
 /// keep the old body and hit target, allowing them to jump into a replacement
@@ -3318,7 +3321,8 @@ pub fn publish_ordering_model() -> Model {
 /// REPLY FIDELITY (the ERR-after-delivery defect). Once a forwarded verb has been
 /// DELIVERED to the child, a later relay-stage failure must NOT report `ERR` to
 /// the client (a false "didn't happen" for an op that did). `delivered` and
-/// `reported_err` are booleans. A failure BEFORE delivery — the dial or the
+/// `reported_err` are booleans. A failure BEFORE delivery — the dial, a
+/// sibling's token that cannot be read once the connection exists, or the
 /// handshake write — is reported (`DialFail`: the honest `ERR forward`), and
 /// nothing is delivered after it. `Buggy = 1` reports a relay failure after
 /// delivery (the original `connect_and_relay` returning the relay error),
@@ -3328,7 +3332,8 @@ pub fn publish_ordering_model() -> Model {
 ///
 /// Tier-1: aterm-gui's `reply_fidelity_conformance` drives the shipping
 /// `proxy::deliver_then_relay` against a real child socket — the real relay, a
-/// relay that fails after delivery, and a dial with no listener — projecting
+/// relay that fails after delivery, a dial with no listener, a child that
+/// never accepts, and a sibling with no token to present — projecting
 /// `delivered` from what the child actually read and `reported_err` from the
 /// result the caller turns into `ERR forward`.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
@@ -3372,7 +3377,7 @@ pub fn reply_fidelity_model() -> Model {
 /// change once. Mixing the two would need the invariant to be about a rate
 /// rather than a count, and a rate invariant that has to be true of both
 /// scenarios ends up asserting less than either. The steady arm is covered by
-/// `app_kitty`'s own tests, which drive the real gate across `TENURE`.
+/// `aterm_effects::companion_look`'s own tests, which drive the real gate across `TENURE`.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
 // returns is what `ty` machine-checks.

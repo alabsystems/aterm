@@ -10,25 +10,15 @@ pub struct DamageTracker {
     pub(crate) row_bits: Vec<u64>,
     /// Per-row column damage bounds: (min_col, max_col) if damaged.
     row_bounds: Vec<RowDamageBounds>,
-    /// Monotone count of MARK CALLS made on this tracker (D-2 row-revision
-    /// clock). Bumped by every `mark_*` entry point below — including a mark
-    /// that sets no new bit, which is exactly the case the bitset itself
-    /// cannot report.
+    /// Monotone count of mark calls, including marks that set no new bit.
     ///
-    /// WHY IT MUST COUNT REDUNDANT MARKS: the per-row revision fold
-    /// (`GridPresentation::fold_row_revisions`) stamps a row when the row is
-    /// damaged, and must be able to tell "this row's bit has been set since the
-    /// last fold, unchanged" from "this row was written AGAIN since the last
-    /// fold". The bitset is identical in both cases. Without this counter a
-    /// second write to an already-damaged row, straddling a fold, would leave
-    /// two snapshots carrying the SAME revision for a row whose content
-    /// differs — a stale frame on the user's screen.
+    /// The per-row revision fold (`GridPresentation::fold_row_revisions`) uses
+    /// it to tell a row written again since the last fold from one merely still
+    /// marked; the bitset is identical in both cases.
     ///
-    /// SURVIVES `clear`: the counter is a monotone clock, not damage state, so
-    /// resetting the session must not rewind it (a rewind would make a later
-    /// mark compare equal to a pre-reset fold). `Damage::Full` has no tracker
-    /// and therefore no counter, which is why the fold's full arm re-stamps
-    /// unconditionally instead of consulting it.
+    /// Survives `clear`, since a rewind would make a later mark compare equal
+    /// to a pre-reset fold. `Damage::Full` has no tracker, so the fold's full
+    /// arm re-stamps unconditionally.
     pub(crate) mark_seq: u64,
 }
 
@@ -80,10 +70,7 @@ impl DamageTracker {
         }
     }
 
-    /// Mark a wide (double-width) cell pair as damaged in a single call.
-    ///
-    /// Equivalent to `mark_cell(row, col); mark_cell(row, col + 1)` but
-    /// avoids the redundant bounds check, bit OR, and branch.
+    /// Mark a wide cell pair as damaged in one call (one bounds check).
     #[inline]
     pub(crate) fn mark_wide_cell(&mut self, row: u16, col: u16) {
         self.mark_seq = self.mark_seq.wrapping_add(1);
@@ -152,11 +139,8 @@ impl DamageTracker {
         }
     }
 
-    /// Clear all damage, reusing existing allocations.
-    ///
-    /// When `rows` matches the current capacity (the common frame-to-frame case),
-    /// zeroes buffers in-place with zero heap allocation. When `rows` changed
-    /// (terminal resize), resizes the buffers.
+    /// Clear all damage, zeroing buffers in place when `rows` is unchanged and
+    /// resizing them otherwise.
     pub(crate) fn clear(&mut self, rows: u16) {
         let needed_words = (rows as usize).div_ceil(64);
         let needed_bounds = rows as usize;

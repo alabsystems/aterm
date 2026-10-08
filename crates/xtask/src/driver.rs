@@ -9,21 +9,18 @@
 //! Discovery reads `$TRUST_STAGE2_BIN` first (the gate hands every child the
 //! directory its header names) and REFUSES a candidate that is not the pin: a
 //! `targo` with no branded `trustc` beside it. A refused or absent toolchain is
-//! a refusal here too, never a fall-through to some other `cargo` — on
-//! 2026-09-18 an impostor at `$TRUST_STAGE2_BIN` (a script printing `targo
-//! 0.0.0-fake`) became `gate cells`' compiler and was announced as the pinned
-//! toolchain, and a `$CARGO`, PATH or bare-`cargo` rung is the same hole with a
-//! different entrance.
+//! a refusal here too, never a fall-through to a `$CARGO`, PATH or bare
+//! `cargo`, any of which would let an impostor run under the pin's name.
 //!
 //! THE CROSS LANES ARE NOT HERE. The foreign cells ride rustup's `stable` (a
 //! STOCK EXCEPTION: the Trust sysroot carries only the host std, E0463 for
 //! every cross triple; rust-toolchain.toml lists them), driven by that
 //! toolchain's own `cargo` and `rustc` (`gate::RustupToolchain`).
 //!
-//! Two facts about targo decide the shape below (measured 2026-09-18): the lane
-//! flag is PER VERB — `check`/`test`/`build`/`run` refuse an implicit lane, while
-//! `metadata` and `tree` refuse `--unverified` outright — and the outer lane does
-//! not reach children, so a gate started by `targo --unverified run -p xtask`
+//! Two facts about targo decide the shape below: the lane flag is PER VERB —
+//! `check`/`test`/`build`/`run` refuse an implicit lane, while `metadata` and
+//! `tree` refuse `--unverified` outright — and the outer lane does not reach
+//! children, so a gate started by `targo --unverified run -p xtask`
 //! names the lane on every child it spawns.
 
 use std::path::{Path, PathBuf};
@@ -37,10 +34,9 @@ pub(crate) struct CargoDriver {
     pub(crate) trustc: PathBuf,
 }
 
-/// The verbs targo calls compilation commands — the only ones that take (and,
-/// for `check`/`test`/`build`, require) `--unverified`. A verb not listed gets
-/// no flag, which is right for every non-compiling verb and loud (targo's own
-/// refusal) for a compiling one this list has not learned.
+/// targo's compiling verbs — the only ones that take (and, for
+/// `check`/`test`/`build`, require) `--unverified`. An unlisted compiling verb
+/// fails loudly with targo's own refusal.
 const LANE_VERBS: &[&str] = &["build", "check", "test", "run", "bench", "doc", "rustc"];
 
 impl CargoDriver {
@@ -98,8 +94,8 @@ pub(crate) fn cargo_driver() -> Result<&'static CargoDriver, &'static str> {
 /// of `gate forge`) spawns `$CARGO` when set and a bare `targo` otherwise. Only
 /// ever SETS an unset variable, at the top of a gate verb before any thread
 /// exists — the single-threaded-startup ordering is the real argument; the
-/// write goes through [`aterm_log::env::set`], the binary's one env lock, which
-/// the toolchain's `env_mutation` lint also asks for.
+/// write goes through [`aterm_log::env::set`], the binary's one env lock (the
+/// toolchain's `env_mutation` lint asks for it).
 pub(crate) fn export_driver_as_cargo() -> Result<&'static CargoDriver, &'static str> {
     let driver = cargo_driver()?;
     if std::env::var_os("CARGO").is_none_or(|c| c.is_empty()) {
@@ -137,17 +133,11 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "xtask-driver-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch(name: &str) -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix(&format!("xtask-driver-{name}-"))
+            .tempdir()
+            .expect("scratch dir")
     }
 
     fn touch_exe(p: &Path) {
@@ -160,8 +150,8 @@ mod tests {
         }
     }
 
-    /// The `-vV` shape both compilers print — the store's `trustc -vV` verbatim
-    /// (2026-09-18, build 9192), with the `trust:` row a stock rustc lacks.
+    /// The `-vV` shape both compilers print — a store `trustc -vV` verbatim,
+    /// with the `trust:` row a stock rustc lacks.
     #[test]
     fn parse_reads_the_host_row_from_trustc_and_rustc_alike() {
         let trustc = "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)\nbinary: trustc\n\
@@ -190,13 +180,10 @@ mod tests {
     /// An ACCEPTED toolchain is driven by its own `targo` and answers through
     /// the `trustc` beside it; a REFUSED one (a `targo` that is not the pin) is
     /// neither the driver nor the compiler, even with both files right there.
-    /// Measured 2026-09-18 before this seam existed:
-    /// `TRUST_STAGE2_BIN=<impostor>/bin xtask gate cells --cell mac-arm`
-    /// announced the impostor as "the pinned toolchain" and ran it.
     #[test]
     fn a_refused_stage2_is_neither_the_driver_nor_the_compiler() {
         let dir = scratch("refused");
-        let stage2 = dir.join("impostor/bin");
+        let stage2 = dir.path().join("impostor/bin");
         touch_exe(&stage2.join("targo"));
         touch_exe(&stage2.join("trustc"));
         let accepted = aterm_verify::Toolchain {
@@ -229,11 +216,11 @@ mod tests {
     #[test]
     fn discovery_of_an_impostor_stage2_is_refused_and_not_driven() {
         let dir = scratch("impostor-discover");
-        let stage2 = dir.join("bin");
+        let stage2 = dir.path().join("bin");
         touch_exe(&stage2.join("targo"));
         let toolchain = aterm_verify::Toolchain::discover_with_store(
             Some(&stage2),
-            &dir.join("home"),
+            &dir.path().join("home"),
             None,
             &OsString::new(),
             Some("trust"),
@@ -255,7 +242,7 @@ mod tests {
         for verb in ["build", "check", "test", "run", "bench", "doc", "rustc"] {
             assert_eq!(CargoDriver::lane_args(verb), &["--unverified"], "{verb}");
         }
-        // Measured 2026-09-18: `targo --unverified metadata` is refused.
+        // `targo --unverified metadata` is refused.
         assert_eq!(CargoDriver::lane_args("metadata"), &[] as &[&str]);
         assert_eq!(
             d.display("metadata", &["--no-deps", "--format-version", "1"]),

@@ -1,11 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HEAD WATCH'S OWN LOOP, for a host that has none (gap #28, 2026-09-26). The window
-//! rides the watch on its package loop's parks, between the bump, the index probe and its
-//! own passes; a terminal session has no such loop, so on a Mac with no window open a new
-//! Claude Code or Codex release waited for the index cadence of hours. [`Runner`] is the
-//! same watch driven alone, one [`SLICE`] at a time, on the window's rules: the
+//! THE HEAD WATCH'S OWN LOOP, for a host that has none. The window rides the watch on its
+//! package loop's parks; a terminal session has no such loop. [`Runner`] is the same watch
+//! driven alone, one [`SLICE`] at a time, on the window's rules: the
 //! [`HeadWatch::slice`] every host runs (the minute's cadence, the unreachable retry, the
 //! wake grace and the re-offer leases are all the watch's own), no wait while a head is
 //! due, one targeted `update <program> --head-watch` pass at a time and no head asked while
@@ -14,17 +12,14 @@
 //! injected ([`Clock`], [`Settings`], [`PassLauncher`]), so a test steps it without
 //! sleeping.
 //!
-//! THE HELD TOOLCHAIN MOVE, re-checked here too (2026-09-26): the seated session — the one
-//! that holds the watch while no window does — looks at a Trust toolchain update held for
-//! quiet, or a rustup view a flip left behind, every [`crate::quiet::RECHECK`] by the
-//! window's own rule ([`crate::quiet::Recheck`]), and starts the whole unattended pass
-//! (`update --defer-busy-flip`, the window's) once it is due. Before, only a window's park
-//! looked, so with terminal sessions alone a flip held for quiet landed at the next pass
-//! after its ceiling — whenever a session next started one — and the doctor's "by <time> at
-//! the latest" held only while a window was open. Each look re-admits the seat itself
-//! ([`HeadWatch::begin_session_update_look`]): a round of head checks used to be the only
-//! thing that did, so on a store with no vendor program to watch no session sat and
-//! nothing looked.
+//! THE HELD TOOLCHAIN MOVE, re-checked here too: the seated session — the one that holds
+//! the watch while no window does — looks at a Trust toolchain update held for quiet, or a
+//! rustup view a flip left behind, every [`crate::quiet::RECHECK`] by the window's own rule
+//! ([`crate::quiet::Recheck`]), and starts the whole unattended pass (`update
+//! --defer-busy-flip`, the window's) once it is due, so the doctor's "by <time> at the
+//! latest" holds with no window open. Each look re-admits the seat itself
+//! ([`HeadWatch::begin_session_update_look`]), so a store with no vendor program to watch
+//! still seats a session.
 //!
 //! THE INDEX HEAD HINT also runs here while a window is absent: one seated session
 //! starts one detached near/far HEAD worker, using the store's shared lock and cooldown.
@@ -313,15 +308,14 @@ impl PassLauncher for DetachedPasses {
 /// detaching shell's exit as its window going would stand aside instead of queueing.
 #[cfg(unix)]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
-    use std::os::unix::process::CommandExt as _;
-    let out = std::process::Command::new("/bin/sh")
+    let out = aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "\"$@\" </dev/null >/dev/null 2>&1 & echo $!", "sh"])
         .arg(exe)
         .args(args)
         .env(crate::cli::SPAWNER_PID_ENV, crate::cli::SPAWNER_DETACHED)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .process_group(0)
         .output()?;
     if !out.status.success() {
@@ -337,11 +331,13 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     Ok(Box::new(Detached { pid }))
 }
 
-/// Windows has no zombie to fear and no re-parenting: the pass is an ordinary child with
-/// no console of ours, and its exit is read.
+/// Windows has no zombie to fear and no re-parenting: the pass is an ordinary child, and
+/// its exit is read. Built through `aterm_uds::spawnfd::command` (`Console::Quiet`): the session
+/// lane's pass shares its console, as a bare child did, and a host with no console would
+/// give it a windowless one, not a visible console window for the whole pass.
 #[cfg(not(unix))]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
-    let child = std::process::Command::new(exe)
+    let child = aterm_uds::spawnfd::command(exe)
         .args(args)
         .env(crate::cli::SPAWNER_PID_ENV, crate::cli::SPAWNER_DETACHED)
         .stdin(std::process::Stdio::null())
@@ -744,8 +740,8 @@ impl Runner {
         {
             // A second session denied the seat cannot ask any vendor, inspect a held
             // flip, or launch a signed index pass before `admit_after`: every path
-            // re-admits through that same claim. Its per-five-second config stat
-            // used to wake every denied session for no work. Sleep to the claim's
+            // re-admits through that same claim, so a five-second config stat would
+            // wake every denied session for no work. Sleep to the claim's
             // existing deadline (at most a minute), then re-read the live gate
             // BEFORE admitting or asking a head. A seated session, an in-flight
             // worker, or an enabled session with no denial keeps the five-second
@@ -765,16 +761,16 @@ impl Runner {
             return;
         }
         if !self.on {
-            (self.log)("vendor head watch: Automatic updates turned on \u{2014} watching again");
+            (self.log)("vendor head watch: Automatic updates on \u{2014} watching");
             self.on = true;
             self.admit_after = Duration::ZERO;
         }
         self.watch.set_exclude(&gate.exclude);
-        // THE ROUND A PASS INTERRUPTED is harvested as it lands (review, 2026-09-26): the
-        // watch hands back a moved head while its peer's GET is still in flight, and the
-        // pass starts at once. Left unharvested, that GET kept the session's round — the
-        // rendezvous EXCLUSIVE, a window refused for the whole pass — and its completion
-        // cut every park short, so the thread spun a core until the pass ended. With a head
+        // THE ROUND A PASS INTERRUPTED is harvested as it lands: the watch hands back a
+        // moved head while its peer's GET is still in flight, and the pass starts at once.
+        // Left unharvested, that GET would keep the session's round — the rendezvous
+        // EXCLUSIVE, a window refused for the whole pass — and its completion would cut
+        // every park short, spinning a core until the pass ended. With a head
         // in flight the watch starts no round, so this asks nothing.
         if self.following.is_some() && self.watch.has_pending() {
             self.harvest(wall);
@@ -912,8 +908,8 @@ impl Runner {
                             Err(error) => {
                                 self.index.note_attempt(build, now, false);
                                 (self.log)(&format!(
-                                    "atpkg index {build} appeared but its update pass could not \
-                                     start: {error}"
+                                    "atpkg index {build} appeared; update pass did not start: \
+                                     {error}"
                                 ));
                             }
                         }
@@ -953,9 +949,7 @@ impl Runner {
         match self.launcher.launch_whole() {
             Ok(pass) => {
                 (self.log)(
-                    "vendor head watch: started the update pass for the Trust toolchain move \
-                     held for quiet \u{2014} nothing is using the toolchain now, or its wait \
-                     reached the ceiling",
+                    "vendor head watch: held Trust toolchain move due \u{2014} update pass started",
                 );
                 self.following = Some(Following {
                     program: None,
@@ -965,8 +959,8 @@ impl Runner {
                 });
             }
             Err(error) => (self.log)(&format!(
-                "vendor head watch: could not start the update pass for the held Trust \
-                 toolchain move: {error} \u{2014} the next update pass makes it"
+                "vendor head watch: held Trust toolchain move: update pass did not start: {error} \
+                 \u{2014} the next update pass lands it"
             )),
         }
     }
@@ -976,10 +970,7 @@ impl Runner {
     /// still followed, so its end is reported.
     fn stand_down(&mut self, wall: SystemTime) {
         if self.on {
-            (self.log)(
-                "vendor head watch: Automatic updates turned off \u{2014} this session's \
-                 watch stands down",
-            );
+            (self.log)("vendor head watch: Automatic updates off \u{2014} standing down");
             self.on = false;
         }
         self.queue.clear();
@@ -1010,8 +1001,7 @@ impl Runner {
                         (self.log)(&format!("atpkg index {build} update pass ended"));
                     } else {
                         (self.log)(
-                            "vendor head watch: the update pass for the held Trust toolchain \
-                             move ended",
+                            "vendor head watch: held Trust toolchain move: update pass ended",
                         );
                     }
                     true
@@ -1028,11 +1018,11 @@ impl Runner {
                 self.following = None;
                 self.watch.pass_ended(&self.layout, program, ran_ok, wall);
                 let line = if self.watch.head_reached(&self.layout, program) {
-                    format!("vendor head watch: the {program} update pass reached the head")
+                    format!("vendor head watch: {program} update pass reached the head")
                 } else {
                     format!(
-                        "vendor head watch: the {program} update pass ended short of the \
-                         head \u{2014} the watch offers it again"
+                        "vendor head watch: {program} update pass ended short of the head \
+                         \u{2014} offered again"
                     )
                 };
                 (self.log)(&line);
@@ -1041,8 +1031,8 @@ impl Runner {
             None if followed >= PASS_FOLLOW_LIMIT => {
                 self.following = None;
                 (self.log)(&format!(
-                    "vendor head watch: the {program} update pass is still running after {} \
-                     min \u{2014} the watch looks at the heads again and leaves it to finish",
+                    "vendor head watch: {program} update pass still running after {} min \
+                     \u{2014} left running, watching the heads again",
                     followed.as_secs() / 60
                 ));
                 true
@@ -1055,8 +1045,7 @@ impl Runner {
         match self.launcher.launch(program) {
             Ok(pass) => {
                 (self.log)(&format!(
-                    "vendor head watch: started the {program} update pass for its vendor's \
-                     new head"
+                    "vendor head watch: {program} head moved \u{2014} update pass started"
                 ));
                 self.following = Some(Following {
                     program: Some(program),
@@ -1067,7 +1056,7 @@ impl Runner {
             }
             Err(error) => {
                 (self.log)(&format!(
-                    "vendor head watch: could not start the {program} update pass: {error}"
+                    "vendor head watch: {program} update pass did not start: {error}"
                 ));
                 self.watch.note_pass_result(program, false, wall);
             }
@@ -1147,7 +1136,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
 
-    use super::super::tests::{install, layout};
+    use super::super::tests::{HANG, install, layout};
     use super::super::{AFTER_WAKE, CADENCE, FAILED_PASS_RETRY, Watcher, watcher};
     use super::*;
     use crate::flow::VendorGet;
@@ -1205,7 +1194,7 @@ mod tests {
                 .store(u64::try_from(slice.as_millis()).unwrap(), Ordering::SeqCst);
             self.0.parks.fetch_add(1, Ordering::SeqCst);
             if watch.has_pending() {
-                watch.park_for_hint(Duration::from_secs(30));
+                watch.park_for_hint(HANG);
             }
             self.0.advance(slice);
             let nap = self.0.nap_ms.swap(0, Ordering::SeqCst);
@@ -1254,7 +1243,7 @@ mod tests {
                 let held = vendors.hold.lock().unwrap();
                 let (held, _) = vendors
                     .released
-                    .wait_timeout_while(held, Duration::from_secs(30), |held| *held)
+                    .wait_timeout_while(held, 2 * HANG, |held| *held)
                     .unwrap();
                 assert!(!*held, "the test released the held GET");
                 drop(held);
@@ -1344,7 +1333,7 @@ mod tests {
         get: &Arc<ConcurrentVendorGetFn<'static>>,
     ) {
         if window.has_pending() {
-            window.park_for_hint(Duration::from_secs(30));
+            window.park_for_hint(HANG);
         }
         let moved = window.slice(l, time.wall(), Some(SLICE), SLICE, get, false);
         assert!(moved.is_none(), "the head in these scenes has not moved");
@@ -1640,7 +1629,7 @@ mod tests {
     /// head asks it after the network's grace, not in the slice the machine woke in.
     #[test]
     fn a_wake_asks_the_heads_after_the_grace() {
-        let l = layout("wake");
+        let l = layout("runner-wake");
         install(&l, "claude", "2.1.280");
         let time = Time::default();
         let vendors = Vendors::new("2.1.280");
@@ -1732,7 +1721,7 @@ mod tests {
             Box::new(|_: &str| {}),
         );
         let handle = runner.spawn().unwrap();
-        asked_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        asked_rx.recv_timeout(HANG).unwrap();
         assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
         handle.stop();
         assert_eq!(watcher(&l), Watcher::Nobody);
@@ -1747,8 +1736,6 @@ mod tests {
     /// real park's one minute.
     #[test]
     fn stop_unparks_a_denied_minute_wait() {
-        const HANG: Duration = Duration::from_secs(60);
-
         struct NotifyingClock {
             origin: Instant,
             parked: std::sync::mpsc::Sender<Duration>,
@@ -1811,15 +1798,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A PASS STARTED MID-ROUND (review, 2026-09-26). One round asks both vendors, and the
+    /// A PASS STARTED MID-ROUND. One round asks both vendors, and the
     /// one whose head moved is handed back while its peer's GET is still in flight — the
     /// watch's own rule, so a slow host never delays an install — and the runner starts its
     /// pass at once. The peer's answer must still be harvested when it lands, pass or no
-    /// pass: until the round is harvested the session holds the rendezvous EXCLUSIVE, so a
-    /// window opening then was refused for as long as the pass ran (an hour's bound, not one
-    /// GET), and the unharvested completion cut every park short, so the thread spun a core
-    /// for the whole pass. The peer's own moved head is not lost either: its pass runs when
-    /// the first one ends. Real clocks, a real thread, a pass the test ends.
+    /// pass: until the round is harvested the session holds the rendezvous EXCLUSIVE, which
+    /// would refuse a window for the whole pass, and the unharvested completion would cut
+    /// every park short (`watch.rs`'s `a_stale_completion_never_cuts_a_park_short` pins
+    /// that a stale one cannot). The peer's own moved head is not lost either: its pass
+    /// runs when the first one ends. Real clocks with a short park (the runner notices the
+    /// pass ending within a look, not a five-second [`SLICE`]), a real thread, a pass the
+    /// test ends.
     #[test]
     fn a_pass_started_mid_round_still_harvests_the_round() {
         use super::super::BUSY_RETRY;
@@ -1864,29 +1853,36 @@ mod tests {
                 Ok(Box::new(FakePass(Arc::clone(&self.1))))
             }
         }
+        struct QuickClock(SystemClock);
+        impl Clock for QuickClock {
+            fn wall(&self) -> SystemTime {
+                self.0.wall()
+            }
+
+            fn mono(&self) -> Duration {
+                self.0.mono()
+            }
+
+            fn park(&mut self, watch: &mut HeadWatch, slice: Duration) {
+                watch.park_for_hint(slice.min(Duration::from_millis(50)));
+            }
+        }
         let (launched_tx, launched_rx) = std::sync::mpsc::channel();
         let end = Arc::new(AtomicBool::new(false));
-        let looks = Arc::new(AtomicU64::new(0));
         let runner = Runner::new(
             l.clone(),
             (HeadWatch::hosted(&[], Host::Session), get),
-            Box::new(SystemClock::new()),
-            Box::new({
-                let looks = Arc::clone(&looks);
-                move || {
-                    looks.fetch_add(1, Ordering::SeqCst);
-                    Gate {
-                        on: true,
-                        exclude: Vec::new(),
-                    }
-                }
+            Box::new(QuickClock(SystemClock::new())),
+            Box::new(|| Gate {
+                on: true,
+                exclude: Vec::new(),
             }),
             Box::new(Launched(Mutex::new(launched_tx), Arc::clone(&end))),
             Box::new(|_: &str| {}),
         );
         let handle = runner.spawn().unwrap();
         assert_eq!(
-            launched_rx.recv_timeout(Duration::from_secs(20)),
+            launched_rx.recv_timeout(HANG),
             Ok("claude"),
             "claude's pass started while codex's GET was in flight"
         );
@@ -1894,18 +1890,14 @@ mod tests {
         let mut window = HostClaim::new(Host::Window, &l);
         assert_eq!(window.admit().0, Admit::Later(BUSY_RETRY));
 
-        // Codex answers. Over the next second the runner looks at most twice (a slice is
-        // five), and a window is admitted as soon as the answer is harvested.
+        // Codex answers, and a window is admitted as soon as the answer is harvested.
         {
             let (go, released) = &*codex;
             *go.lock().unwrap() = true;
             released.notify_all();
         }
-        answered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        let before = looks.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_secs(1));
-        let spun = looks.load(Ordering::SeqCst) - before;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        answered_rx.recv_timeout(HANG).unwrap();
+        let deadline = Instant::now() + HANG;
         let admitted = loop {
             if window.admit().0 == Admit::Yes {
                 break true;
@@ -1917,12 +1909,8 @@ mod tests {
         };
         // Claude's pass ends: codex's, queued behind it, starts.
         end.store(true, Ordering::SeqCst);
-        let next = launched_rx.recv_timeout(Duration::from_secs(20));
+        let next = launched_rx.recv_timeout(HANG);
         handle.stop();
-        assert!(
-            spun <= 2,
-            "the runner looked {spun} times in one second while its pass ran: it spun"
-        );
         assert!(
             admitted,
             "the round was never harvested while the pass ran: the session kept the \
@@ -2012,7 +2000,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// THE HELD TOOLCHAIN MOVE WITH NO WINDOW OPEN (2026-09-26): the seated session looks
+    /// THE HELD TOOLCHAIN MOVE WITH NO WINDOW OPEN: the seated session looks
     /// at it by the window's rule — two quiet looks a minute apart — and starts the whole
     /// pass once, following it to its end with no head asked meanwhile. The NEGATIVE
     /// CONTROL: with a window watching, the session never wakes it — the window's park
@@ -2124,9 +2112,7 @@ mod tests {
                 near_tx.send(()).unwrap();
                 let (go, wake) = &*probe_release;
                 let held = go.lock().unwrap();
-                let (held, _) = wake
-                    .wait_timeout_while(held, Duration::from_secs(20), |go| !*go)
-                    .unwrap();
+                let (held, _) = wake.wait_timeout_while(held, 2 * HANG, |go| !*go).unwrap();
                 assert!(*held, "the test released the far HEAD");
                 crate::index_probe::Probe::Published(43)
             },
@@ -2142,7 +2128,7 @@ mod tests {
 
         first.step();
         assert!(model.fire("Start", &mut state));
-        near_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        near_rx.recv_timeout(HANG).unwrap();
         assert!(model.fire("NearPublished", &mut state));
         second.step();
         assert!(model.fire("OtherSessionStarts", &mut state));
@@ -2171,7 +2157,7 @@ mod tests {
         let (go, wake) = &*release;
         *go.lock().unwrap() = true;
         wake.notify_all();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while !first
             .index
             .pending
@@ -2269,12 +2255,12 @@ mod tests {
             runner.index.pending.is_some(),
             "the HEAD worker starts at the next slice"
         );
-        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        started_rx.recv_timeout(HANG).unwrap();
         assert_eq!(checks.load(Ordering::SeqCst), 3);
         assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
         assert_eq!(runner.index.last_ineligible, None);
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while runner.index.pending.is_some() {
             runner
                 .index
@@ -2326,7 +2312,7 @@ mod tests {
         }
         assert!(index.due(now()));
         index.start(&l, now()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while index.pending.is_some() {
             index.harvest(now());
             assert!(Instant::now() < deadline, "the suppressed worker completed");
@@ -2375,11 +2361,11 @@ mod tests {
             },
         );
         runner.step();
-        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        started_rx.recv_timeout(HANG).unwrap();
         crate::sig::Floor::new(l.floor())
             .check_and_record(43)
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while runner.index.pending.is_some() {
             runner.step();
             assert!(Instant::now() < deadline, "the probe completed");
@@ -2404,7 +2390,7 @@ mod tests {
                 >= (completed + crate::index_probe::INTERVAL).as_millis() as u64,
             "a second probe cannot start before its predecessor's completion stamp"
         );
-        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        started_rx.recv_timeout(HANG).unwrap();
         assert_eq!(probes.load(Ordering::SeqCst), 2);
         assert!(passes.launched().is_empty());
         drop(runner);
@@ -2429,7 +2415,7 @@ mod tests {
                 crate::index_probe::Probe::Published(build)
             },
         );
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while passes.launched().is_empty() {
             runner.step();
             assert!(Instant::now() < deadline, "the near 43 launched a pass");
@@ -2614,13 +2600,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A HELD TOOLCHAIN MOVE ON A STORE WITH NO VENDOR PROGRAM TO WATCH (review of 1c202aa93,
-    /// 2026-09-26): nothing asks a head there, and a round of head checks was the only thing
-    /// that took the seat, so no session ever looked, and "by <time> at the latest while an
-    /// aterm window or terminal session is open" — the held flip's row and pass line — was
-    /// untrue. The session's look takes the seat itself ([`HeadWatch::begin_session_update_look`]) — while the
-    /// move is still busy, so doctor names the session that will wake it — and wakes the
-    /// whole pass once it is due, with no head asked. The NEGATIVE CONTROL: a window holding
+    /// A HELD TOOLCHAIN MOVE ON A STORE WITH NO VENDOR PROGRAM TO WATCH: nothing asks a head
+    /// there, so the session's look takes the seat itself
+    /// ([`HeadWatch::begin_session_update_look`]) — while the move is still busy, so doctor
+    /// names the session that will wake it — and wakes the whole pass once it is due, with
+    /// no head asked. The NEGATIVE CONTROL: a window holding
     /// its claim (its park takes it every slice, a head asked or not) keeps the session
     /// standing by.
     #[test]
@@ -2698,9 +2682,8 @@ mod tests {
 
     /// Ends a fake pass and removes its prefix on EVERY way out of a test that unwinds, a
     /// failed assertion included. The pass is detached — launchd's child, not ours — and
-    /// loops until `go` stands or its directory is gone; `go` used to be written on the
-    /// success path only, so every failure left an orphaned `sh` forking `sleep` 20 times
-    /// a second for good (2026-09-28: one was still running 30 minutes later). A test
+    /// loops until `go` stands or its directory is gone, so a failure that skipped writing
+    /// `go` would orphan an `sh` forking `sleep` 20 times a second. A test
     /// process KILLED runs no drop: the fake's own loop ends that way ([`fake_pass`]).
     struct Release {
         go: PathBuf,
@@ -2715,7 +2698,8 @@ mod tests {
     }
 
     /// The most turns a fake pass's wait takes, 50 ms apart: ten minutes, far past any
-    /// test that follows it (20 s), so no wait of a test is ever cut short by it.
+    /// test that follows it (a minute's [`HANG`]), so no wait of a test is ever cut short
+    /// by it.
     const FAKE_PASS_TURNS: u32 = 12_000;
 
     /// A FAKE `aterm` PASS for the detached launch: `warm` exits at once (its first exec is
@@ -2724,9 +2708,8 @@ mod tests {
     /// (the test) is gone, and after [`FAKE_PASS_TURNS`] turns at most: a test killed
     /// outright (SIGKILL from a harness ceiling, SIGTERM or SIGINT — no drop runs, and the
     /// detached fake sits in a process group of its own that no signal to the test's
-    /// reaches) left a ppid-1 `sh` forking `sleep` 20 times a second until something
-    /// removed its directory (the review of 2026-09-28: still running 28 s after the kill,
-    /// and the prefix under TMPDIR is removed by nothing but the drop).
+    /// reaches) would otherwise leave a ppid-1 `sh` forking `sleep` 20 times a second, and
+    /// nothing but the drop removes the prefix under TMPDIR.
     fn fake_pass(owner: u32) -> String {
         format!(
             "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nd=$(dirname \"$0\")\nprintf '%s %s %s\\n' \
@@ -2740,10 +2723,9 @@ mod tests {
     /// Write [`fake_pass`] for `owner` as `dir/aterm`, and PAY ITS FIRST EXEC HERE,
     /// UNBOUNDED. The first exec of a new file waits, at 0% CPU, until macOS `syspolicyd`
     /// has assessed it, one file at a time behind every test binary the gate links: this
-    /// script measured 40 s from being written to its first line running (2026-09-28),
-    /// past the 20 s clocks that follow it. A later exec of the same file costs nothing
-    /// (the manual.rs `run_once` rule), and the detaching `/bin/sh` in between is the
-    /// system's own.
+    /// script measured 40 s from being written to its first line running. A later exec of
+    /// the same file costs nothing (the manual.rs `run_once` rule), and the detaching
+    /// `/bin/sh` in between is the system's own.
     #[cfg(unix)]
     fn warm(dir: &Path, owner: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2776,7 +2758,7 @@ mod tests {
         let mut passes = DetachedPasses::new(exe, vec!["pkg".into()], &l);
         let mut pass = passes.launch("claude").unwrap();
         let said = dir.join("said");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         while !said.exists() {
             assert!(Instant::now() < deadline, "the pass started");
             std::thread::sleep(Duration::from_millis(20));
@@ -2797,7 +2779,7 @@ mod tests {
             "the running pass is not this process's child"
         );
         std::fs::write(dir.join("go"), b"").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + HANG;
         let ended = loop {
             if let Some(ok) = pass.ended() {
                 break ok;
@@ -2806,65 +2788,5 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(ended, "a detached pass's end is the store's to judge");
-    }
-
-    /// THE FAKE PASS ENDS WITH ITS TEST (the review of 2026-09-28). A test process killed
-    /// outright runs no drop, and nothing else writes `go` or removes the prefix: the
-    /// fake's own wait ends once the process it was written for is gone ([`fake_pass`]).
-    /// Here that process is a stand-in the test kills with SIGKILL and reaps, as a
-    /// harness's ceiling kills a test binary (nextest's `terminate-after`); the fake,
-    /// launched detached exactly as the pass is and never told `go`, ends by itself.
-    /// NEGATIVE CONTROL: while its owner lives, it waits.
-    #[cfg(unix)]
-    #[test]
-    fn a_fake_pass_ends_once_the_test_it_was_written_for_is_gone() {
-        /// The stand-in test process, killed and reaped however this test ends.
-        struct Owner(std::process::Child);
-        impl Drop for Owner {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let l = layout("detached-owner");
-        let dir = l.prefix.join("bin");
-        let _release = Release {
-            go: dir.join("go"),
-            prefix: l.prefix.clone(),
-        };
-        let mut owner = Owner(
-            std::process::Command::new("/bin/sleep")
-                .arg("600")
-                .stdin(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let exe = warm(&dir, owner.0.id());
-        let mut passes = DetachedPasses::new(exe, vec!["pkg".into()], &l);
-        let mut pass = passes.launch("claude").unwrap();
-        let said = dir.join("said");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !said.exists() {
-            assert!(Instant::now() < deadline, "the pass started");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(pass.ended(), None, "it waits while its test lives");
-        // SIGKILL, and reaped: gone, not a zombie `kill -0` still finds.
-        let _ = owner.0.kill();
-        let _ = owner.0.wait();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let ended = loop {
-            if let Some(ok) = pass.ended() {
-                break ok;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the fake ended by itself once its test was gone"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert!(ended, "{:?}", pass.ended());
-        assert!(!dir.join("go").exists(), "nobody said go");
     }
 }

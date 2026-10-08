@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Core terminal types: capabilities.
-//!
-//! Extracted from `aterm-core::terminal::types::core` to break circular
-//! dependencies and enable independent compilation (Part of #5663, #2341).
 
 // ============================================================================
 // Terminal Capabilities
@@ -77,11 +74,12 @@ impl TerminalCapabilities {
             // transfers, the file/shm mediums behind the host's opt-in resolver,
             // placement ids, `I=` numbers, every delete selector (frames
             // included), source rectangles, `z<0` under text, Unicode
-            // placeholders with their virtual placements, relative placements,
-            // and frame loading, composition and selection. What is not built is
-            // listed on `handle_complete_kitty_command`, with what each does
-            // instead. Pinned by `kitty_graphics_advertised_after_kitty_core`
-            // below.
+            // placeholders with their virtual placements, relative placements
+            // (a virtual parent's included), in-cell offsets, images layered by
+            // z, and frame loading, composition (PNG included), selection and
+            // playback. What is not built is listed on
+            // `handle_complete_kitty_command`, with what it does instead. Pinned
+            // by `kitty_graphics_advertised_after_kitty_core` below.
             kitty_graphics: true,
             clipboard: true,
             shell_integration: true,

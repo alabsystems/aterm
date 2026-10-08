@@ -7,12 +7,10 @@
 //! rather than emit only our injection dir — otherwise fish would lose its
 //! own vendor conf.d lookup paths.
 //!
-//! This test MUTATES the process environment (`remove_var("XDG_DATA_DIRS")`)
-//! and `prepare_fish` READS it. Inside the crate's multi-test unit binary
-//! that was a race against sibling tests calling `prepare_into` on parallel
-//! test threads, so it lives here as a SINGLE-test-per-binary integration
-//! test — the same convention as aterm-containment's `init_from_env_*` and
-//! aterm-render's `no_procedural_glyphs_env`.
+//! This test MUTATES the process environment and `prepare_fish` READS it, so
+//! it lives outside the crate's unit-test binary, where sibling tests call
+//! `prepare_into` on parallel threads; inside `shell_suite` the one lock of
+//! `aterm_log::env::scoped_unset` serialises it with the other env test.
 
 use aterm_shell_integration::{ShellType, prepare_into};
 

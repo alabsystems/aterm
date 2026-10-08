@@ -2,38 +2,25 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! MIRI-only memory safety tests for aterm-grid.
+//! Miri-only memory safety tests for the unsafe paths in PageStore, PageSlice
+//! and Row.
 //!
-//! These tests exercise the unsafe paths in PageStore, PageSlice, and Row
-//! directly (without the terminal FFI layer), catching undefined behavior
-//! that unit tests and Kani cannot detect at runtime.
+//! Run with (STOCK EXCEPTION: Trust ships no cargo-miri or rust-src):
+//!   cargo +nightly miri test -p aterm-grid --test grid_suite -- grid_miri:: --test-threads=1
 //!
-//! Run with (STOCK EXCEPTION — Trust ships no cargo-miri and no rust-src; measured
-//! 2026-09-28: `targo --unverified miri --version` → "no such command: `miri`"):
-//!   cargo +nightly miri test -p aterm-grid --test grid_miri -- --test-threads=1
-//!
-//! Covers:
-//! - PageStore allocation, free-list recycling, lazy zeroing
-//! - Row::new / Row::resize PageSlice lifecycle
-//! - Row write_char / write_char_styled unchecked access paths
-//! - Row write_wide_char dual-cell unchecked write
-//! - Wide char overwrite cleanup (fixup_wide_char_overwrite)
-//! - Multi-row aliasing: writes to one row must not corrupt another
-//! - Grid::resize reflow (PageSlice replacement under reallocation)
-//!
-//! Part of memory_verification phase: standalone aterm-grid MIRI coverage.
+//! Covers PageStore allocation, free-list recycling and lazy zeroing; the
+//! Row::new / Row::resize PageSlice lifecycle; unchecked write paths (narrow,
+//! styled, wide) and wide-overwrite cleanup; cross-row aliasing; and
+//! Grid::resize reflow replacing PageSlices.
 
 #![cfg(miri)]
 
 use aterm_grid::{Cell, CellFlags, Grid, PackedColor, PageStore, Row};
 
-// =========================================================================
 // PageStore allocation and recycling
-// =========================================================================
 
-/// Allocate rows, drop them, reallocate — exercises PageSlice pointer
-/// validity when new allocations share the same PageStore after prior
-/// PageSlice references are dropped.
+/// Allocate, drop, reallocate: PageSlice pointers stay valid when new
+/// allocations reuse the PageStore.
 #[test]
 fn miri_page_store_alloc_reuse() {
     let mut pages = PageStore::new();
@@ -84,9 +71,7 @@ fn miri_page_store_preheat_reuse() {
     assert_eq!(row.get(0).unwrap().char(), 'P');
 }
 
-// =========================================================================
 // Row::new and basic read/write
-// =========================================================================
 
 /// Basic Row::new → write → read round-trip.
 #[test]
@@ -129,9 +114,7 @@ fn miri_row_write_char_styled() {
     }
 }
 
-// =========================================================================
 // Row::resize — PageSlice replacement
-// =========================================================================
 
 /// Resize row larger: new cells should be empty, existing content preserved.
 #[test]
@@ -191,9 +174,7 @@ fn miri_row_resize_sequence() {
     }
 }
 
-// =========================================================================
 // Wide character write paths (dual-cell get_unchecked)
-// =========================================================================
 
 /// write_wide_char exercises the dual-cell unsafe write path.
 #[test]
@@ -279,9 +260,7 @@ fn miri_row_wide_char_overwrite_second_half() {
     assert_eq!(row.get(3).unwrap().char(), 'Y');
 }
 
-// =========================================================================
 // Multi-row aliasing: writes to one row must not corrupt another
-// =========================================================================
 
 /// Two rows from same PageStore must not alias.
 #[test]
@@ -351,9 +330,7 @@ fn miri_many_rows_page_boundary() {
     }
 }
 
-// =========================================================================
 // Grid::resize reflow
-// =========================================================================
 
 /// Grid resize triggers reflow which replaces PageSlice backing stores.
 #[test]
@@ -406,9 +383,7 @@ fn miri_grid_resize_stress() {
     }
 }
 
-// =========================================================================
 // Row bulk operations: cells_mut and copy_from
-// =========================================================================
 
 /// cells_mut returns a mutable slice that is safe to write.
 #[test]

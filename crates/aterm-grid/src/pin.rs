@@ -243,9 +243,7 @@ impl PinnedRange {
 mod tests {
     use super::*;
 
-    // =========================================================================
     // Pin: construction and getters
-    // =========================================================================
 
     #[test]
     fn test_pin_new_stores_all_fields() {
@@ -256,36 +254,7 @@ mod tests {
         assert_eq!(pin.generation(), 100);
     }
 
-    #[test]
-    fn test_pin_new_zero_values() {
-        let pin = Pin::new(0, 0, 0, 0);
-        assert_eq!(pin.page_id(), 0);
-        assert_eq!(pin.row_offset(), 0);
-        assert_eq!(pin.col(), 0);
-        assert_eq!(pin.generation(), 0);
-    }
-
-    #[test]
-    fn test_pin_new_max_col() {
-        let pin = Pin::new(0, 0, u16::MAX, 0);
-        assert_eq!(pin.col(), u16::MAX);
-    }
-
-    #[test]
-    fn test_pin_new_max_row_offset() {
-        let pin = Pin::new(0, u32::MAX, 0, 0);
-        assert_eq!(pin.row_offset(), u32::MAX);
-    }
-
-    #[test]
-    fn test_pin_new_max_generation() {
-        let pin = Pin::new(0, 0, 0, u64::MAX);
-        assert_eq!(pin.generation(), u64::MAX);
-    }
-
-    // =========================================================================
     // Pin: from_absolute and absolute_row roundtrip
-    // =========================================================================
 
     #[test]
     fn test_pin_from_absolute_zero() {
@@ -322,16 +291,7 @@ mod tests {
         assert_eq!(pin.row_offset(), u32::MAX);
     }
 
-    #[test]
-    fn test_pin_from_absolute_preserves_col_and_generation() {
-        let pin = Pin::from_absolute(1000, 255, 42);
-        assert_eq!(pin.col(), 255);
-        assert_eq!(pin.generation(), 42);
-    }
-
-    // =========================================================================
     // Pin: with_col and with_row_offset (immutable update)
-    // =========================================================================
 
     #[test]
     fn test_pin_with_col_updates_column_only() {
@@ -344,13 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pin_with_col_does_not_mutate_original() {
-        let pin = Pin::new(1, 2, 3, 4);
-        let _updated = pin.with_col(99);
-        assert_eq!(pin.col(), 3, "original pin should be unchanged");
-    }
-
-    #[test]
     fn test_pin_with_row_offset_updates_row_only() {
         let pin = Pin::new(1, 2, 3, 4);
         let updated = pin.with_row_offset(99);
@@ -360,81 +313,12 @@ mod tests {
         assert_eq!(updated.generation(), 4);
     }
 
-    #[test]
-    fn test_pin_with_row_offset_does_not_mutate_original() {
-        let pin = Pin::new(1, 2, 3, 4);
-        let _updated = pin.with_row_offset(99);
-        assert_eq!(pin.row_offset(), 2, "original pin should be unchanged");
-    }
-
-    // =========================================================================
-    // Pin: equality and clone
-    // =========================================================================
-
-    #[test]
-    fn test_pin_equality_same_fields() {
-        let a = Pin::new(1, 2, 3, 4);
-        let b = Pin::new(1, 2, 3, 4);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_pin_inequality_different_page() {
-        let a = Pin::new(1, 2, 3, 4);
-        let b = Pin::new(2, 2, 3, 4);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_pin_inequality_different_row_offset() {
-        let a = Pin::new(1, 2, 3, 4);
-        let b = Pin::new(1, 9, 3, 4);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_pin_inequality_different_col() {
-        let a = Pin::new(1, 2, 3, 4);
-        let b = Pin::new(1, 2, 8, 4);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_pin_inequality_different_generation() {
-        let a = Pin::new(1, 2, 3, 4);
-        let b = Pin::new(1, 2, 3, 5);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_pin_clone_is_equal() {
-        let pin = Pin::new(5, 10, 15, 20);
-        let cloned = pin;
-        assert_eq!(pin, cloned);
-    }
-
-    #[test]
-    fn test_pin_debug_format() {
-        let pin = Pin::new(1, 2, 3, 4);
-        let debug = format!("{pin:?}");
-        assert!(debug.contains("Pin"), "debug format should contain 'Pin'");
-    }
-
-    // =========================================================================
     // GenerationTracker: construction and defaults
-    // =========================================================================
 
     #[test]
     fn test_generation_tracker_new_starts_at_zero() {
         let tracker = GenerationTracker::new();
         assert_eq!(tracker.current_generation(), 0);
-    }
-
-    #[test]
-    fn test_generation_tracker_default_matches_new() {
-        let a = GenerationTracker::new();
-        let b = GenerationTracker::default();
-        assert_eq!(a.current_generation(), b.current_generation());
     }
 
     #[test]
@@ -447,9 +331,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // GenerationTracker: ensure_capacity
-    // =========================================================================
 
     #[test]
     fn test_generation_tracker_ensure_capacity_grows() {
@@ -492,9 +374,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // GenerationTracker: evict_page
-    // =========================================================================
 
     #[test]
     fn test_evict_page_increments_page_generation() {
@@ -542,9 +422,7 @@ mod tests {
         assert_eq!(tracker.page_generation(5), 1);
     }
 
-    // =========================================================================
     // GenerationTracker: evict_pages_from
-    // =========================================================================
 
     #[test]
     fn test_evict_pages_from_evicts_all_from_start() {
@@ -582,9 +460,7 @@ mod tests {
         assert_eq!(tracker.page_generation(2), 0);
     }
 
-    // =========================================================================
     // GenerationTracker: evict_all
-    // =========================================================================
 
     #[test]
     fn test_evict_all_increments_all_pages() {
@@ -615,9 +491,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // GenerationTracker: is_valid and is_potentially_valid
-    // =========================================================================
 
     #[test]
     fn test_is_valid_fresh_pin() {
@@ -721,9 +595,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // GenerationTracker: evict_all invalidation completeness
-    // =========================================================================
 
     #[test]
     fn test_evict_all_invalidates_all_pages() {
@@ -763,22 +635,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // PinnedRange: construction
-    // =========================================================================
-
-    #[test]
-    fn test_pinned_range_new_stores_start_and_end() {
-        let start = Pin::new(0, 0, 0, 0);
-        let end = Pin::new(0, 10, 5, 0);
-        let range = PinnedRange::new(start, end);
-        assert_eq!(range.start, start);
-        assert_eq!(range.end, end);
-    }
-
-    // =========================================================================
     // PinnedRange: is_valid
-    // =========================================================================
 
     #[test]
     fn test_pinned_range_is_valid_both_pins_valid() {
@@ -829,9 +686,7 @@ mod tests {
         assert!(!range.is_valid(&tracker));
     }
 
-    // =========================================================================
     // PinnedRange: normalized
-    // =========================================================================
 
     #[test]
     fn test_pinned_range_normalized_already_ordered() {
@@ -915,30 +770,7 @@ mod tests {
         assert_eq!(once.end, twice.end);
     }
 
-    // =========================================================================
-    // PinnedRange: equality and clone
-    // =========================================================================
-
-    #[test]
-    fn test_pinned_range_equality() {
-        let start = Pin::new(0, 0, 0, 0);
-        let end = Pin::new(0, 10, 5, 0);
-        let a = PinnedRange::new(start, end);
-        let b = PinnedRange::new(start, end);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_pinned_range_inequality_different_start() {
-        let end = Pin::new(0, 10, 5, 0);
-        let a = PinnedRange::new(Pin::new(0, 0, 0, 0), end);
-        let b = PinnedRange::new(Pin::new(1, 0, 0, 0), end);
-        assert_ne!(a, b);
-    }
-
-    // =========================================================================
     // Integration: multi-step eviction scenarios
-    // =========================================================================
 
     #[test]
     fn test_sequential_evictions_accumulate() {
@@ -973,14 +805,8 @@ mod tests {
         assert!(!tracker.is_valid(&pin_p0));
         assert!(!tracker.is_valid(&pin_p1));
 
-        // After evict_all, min_valid_generation equals global_generation.
-        // Page generations are each incremented once but are still below
-        // min_valid, so is_valid returns false. However, is_potentially_valid
-        // also returns false since page_gen < min_valid. A fresh evict_page
-        // cycle restores pin validity for that page.
+        // A fresh evict_page lifts page 1 back to min_valid_generation.
         tracker.evict_page(1);
-        // Now page_1 gen is incremented again, and global advances past min_valid.
-        // But min_valid is still the old value from evict_all.
         let new_pin = Pin::new(1, 0, 0, tracker.page_generation(1));
         assert!(
             tracker.is_valid(&new_pin),

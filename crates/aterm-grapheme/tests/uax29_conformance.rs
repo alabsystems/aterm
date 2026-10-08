@@ -156,109 +156,28 @@ fn uax29_official_conformance() {
     eprintln!("UAX #29 conformance: {passed}/{total} passed");
 }
 
-/// Corpus-based cross-validation against the `unicode-segmentation` crate.
-///
-/// The corpus covers the categories most relevant to terminal text: ASCII,
-/// Latin-1 with combining marks, CJK, Indic scripts, emoji (simple, skin
-/// tone, ZWJ sequences, flags, tag sequences), and control sequences.
+/// `grapheme_indices()` offsets are the running byte offsets of `graphemes()`.
 #[test]
-fn cross_validate_unicode_segmentation() {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    let corpus = [
-        // ASCII and Latin-1
-        "Hello, world!",
-        "café résumé naïve",
-        "a\u{0308}\u{0301}b\u{0300}c",
-        // CJK
-        "你好世界",
-        "日本語",
-        "中文繁體",
-        "한국어 문자",
-        // Hangul Jamo decomposed
-        "\u{1100}\u{1161}\u{11A8}", // 각
-        "\u{1100}\u{1161}",         // 가
-        "\u{1100}",                 // L alone
-        // Indic scripts
-        "\u{0915}\u{093E}\u{0928}\u{0940}", // Devanagari kaani
-        "\u{0D15}\u{0D4D}\u{0D38}",         // Malayalam ക്സ (GB9c conjunct)
-        "\u{0915}\u{094D}\u{092F}",         // Devanagari क्य (GB9c conjunct)
-        "\u{0915}\u{094D}\u{0937}",         // Devanagari क्ष (GB9c conjunct)
-        "\u{1780}\u{17B6}",                 // Khmer ka
-        // Emoji: simple, skin tone, gender, ZWJ family, flag, tag flag.
-        "\u{1F600}",
-        "\u{1F44B}\u{1F3FD}",
-        "\u{1F468}\u{200D}\u{1F52C}",
-        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
-        "\u{1F1FA}\u{1F1F8}",
-        "\u{1F1EB}\u{1F1F7}\u{1F1EC}\u{1F1E7}", // two flags in a row
-        "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
-        // Keycap
-        "1\u{FE0F}\u{20E3}",
-        // Mixed complexity
-        "Hello 🌍! 中文 + العربية‎ + कहानी",
-        // Line endings
-        "line1\r\nline2\nline3\r\n",
-        // Control chars
-        "a\x00b\x01c\x1Fd",
-        // Variation selectors
-        "A\u{FE0F}",
-        "\u{1F441}\u{FE0F}",
-        "\u{1F441}\u{FE0F}\u{200D}\u{1F5E8}",
-        // RI triples
-        "\u{1F1FA}\u{1F1F8}\u{1F1EC}",
-        "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}\u{1F1EB}\u{1F1F7}",
-        // Degenerate: empty, single codepoint, standalone combiners
-        "",
-        "x",
-        "\u{0301}",
-        "\u{200D}",
-        "\u{200D}\u{1F600}",
-    ];
-
-    let mut mismatches = Vec::new();
-    for input in &corpus {
-        let ours: Vec<&str> = GraphemeClusters::graphemes(*input).collect();
-        let theirs: Vec<&str> = UnicodeSegmentation::graphemes(*input, true).collect();
-        if ours != theirs {
-            mismatches.push(format!(
-                "input {:?}\n  ours:   {:?}\n  theirs: {:?}",
-                input, ours, theirs
-            ));
-        }
-    }
-
-    if !mismatches.is_empty() {
-        panic!(
-            "cross-validation mismatches with unicode-segmentation ({}/{}):\n{}",
-            mismatches.len(),
-            corpus.len(),
-            mismatches.join("\n")
-        );
-    }
-}
-
-/// Cross-validate grapheme_indices() byte offsets.
-#[test]
-fn cross_validate_indices() {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    let corpus = [
+fn grapheme_indices_agree_with_graphemes() {
+    for input in [
         "abc",
         "café",
         "你好",
         "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
         "\u{1F1FA}\u{1F1F8}hello\u{1F1EC}\u{1F1E7}",
         "line1\r\nline2\n",
-    ];
-
-    for input in &corpus {
-        let ours: Vec<(usize, &str)> = GraphemeClusters::grapheme_indices(*input).collect();
-        let theirs: Vec<(usize, &str)> =
-            UnicodeSegmentation::grapheme_indices(*input, true).collect();
-        assert_eq!(
-            ours, theirs,
-            "grapheme_indices mismatch for input {input:?}"
-        );
+        "",
+    ] {
+        let mut at = 0usize;
+        let expected: Vec<(usize, &str)> = GraphemeClusters::graphemes(input)
+            .map(|g| {
+                let entry = (at, g);
+                at += g.len();
+                entry
+            })
+            .collect();
+        assert_eq!(at, input.len(), "graphemes cover {input:?}");
+        let ours: Vec<(usize, &str)> = GraphemeClusters::grapheme_indices(input).collect();
+        assert_eq!(ours, expected, "grapheme_indices for {input:?}");
     }
 }

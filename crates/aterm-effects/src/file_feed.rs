@@ -14,6 +14,8 @@
 use std::io::{self, Read as _};
 use std::path::Path;
 
+use aterm_hash::Fnv1a64;
+
 #[cfg(feature = "test-open-probe")]
 #[derive(Clone)]
 struct OpenProbeState {
@@ -219,15 +221,12 @@ pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<St
     })
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fingerprint_fold(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+/// Delimit and fold the byte count so the result is a content fingerprint,
+/// not merely the raw streaming hasher state.
+fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
+    hash.write_u8(0xff);
+    hash.write(&len.to_le_bytes());
+    hash.finish()
 }
 
 /// Fingerprint UTF-8 contents that were already admitted through
@@ -236,9 +235,9 @@ fn fingerprint_fold(mut hash: u64, bytes: &[u8]) -> u64 {
 /// same-handle bytes without reopening a pathname and introducing an ABA race.
 #[must_use]
 pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {
-    let hash = fingerprint_fold(FNV_OFFSET, contents.as_bytes());
-    let hash = fingerprint_fold(hash, &[0xff]);
-    fingerprint_fold(hash, &(contents.len() as u64).to_le_bytes())
+    let mut hash = Fnv1a64::new();
+    hash.write(contents.as_bytes());
+    seal_fingerprint(hash, contents.len() as u64)
 }
 
 fn invalid_utf8() -> io::Error {
@@ -259,7 +258,7 @@ pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Re
     check_observed_size(&file, max_bytes)?;
     let read_limit = limit_plus_sentinel(max_bytes)?;
     let mut total = 0usize;
-    let mut hash = FNV_OFFSET;
+    let mut hash = Fnv1a64::new();
     let mut read_buffer = [0u8; 8 * 1024];
     let mut carry = [0u8; 3];
     let mut carry_len = 0usize;
@@ -278,7 +277,7 @@ pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Re
         if total > max_bytes {
             return Err(too_large(max_bytes));
         }
-        hash = fingerprint_fold(hash, &read_buffer[..count]);
+        hash.write(&read_buffer[..count]);
 
         let mut utf8_buffer = [0u8; 8 * 1024 + 3];
         utf8_buffer[..carry_len].copy_from_slice(&carry[..carry_len]);
@@ -301,10 +300,7 @@ pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Re
     if carry_len != 0 {
         return Err(invalid_utf8());
     }
-    // Delimit and fold the byte count so this remains a content fingerprint,
-    // not merely the raw streaming hasher state.
-    hash = fingerprint_fold(hash, &[0xff]);
-    Ok(fingerprint_fold(hash, &(total as u64).to_le_bytes()))
+    Ok(seal_fingerprint(hash, total as u64))
 }
 
 #[cfg(test)]

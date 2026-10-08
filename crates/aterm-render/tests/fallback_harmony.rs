@@ -18,7 +18,7 @@
 //!   derived models `FallbackScaleClamp`, `WideCentre` and `FallbackBandClip`
 //!   (`aterm_spec::derive::{fallback_scale_clamp_model, wide_center_model,
 //!   fallback_band_clip_model}`) carry the clamp/balance/in-band invariants;
-//!   `cargo test -p aterm-spec --test derived_ring_ty` runs the REAL `ty`
+//!   `targo --unverified test -p aterm-spec --test spec_suite -- derived_ring_ty::` runs the REAL `ty`
 //!   binary over each bounded state space, PROVING every invariant at
 //!   `Buggy=0` and CATCHING the pre-W8 defect at `Buggy=1` (counterexample).
 //! * **Tier-1 (concrete, this file)** — the real `f32`/integer functions are
@@ -30,31 +30,25 @@
 //!   the box-drawing rounding-law precedent — the lattice sweeps here are the
 //!   binding layer for the arithmetic half.
 //!
-//! ## W8 (g)/(h): the horizontal pair
+//! ## W8 (h): the column band
 //!
 //! The row band had no column twin, so a fallback glyph wider than its cell
 //! painted straight over its neighbours: STIX Two Math designs U+27F5..U+27FC
 //! 1.499 em wide, the x-height normalization scales that UP ~11%, and the
 //! result covered ~2.9 cells inside a ONE-cell grid box (the grid itself is
 //! right — these are East_Asian_Width Neutral, so `wcwidth` and aterm agree
-//! on 1 — so the defect is purely a PAINT overrun). (g) `condense_ink_w` +
-//! `condense_coverage` area-resample such a glyph along x until it fits and
-//! centre it; (h) `clamp_to_col_band` is the backstop under it.
+//! on 1 — so the defect is purely a PAINT overrun). `fallback_fit_scale`
+//! shrinks such a glyph into its box; `clamp_to_col_band` is the backstop
+//! that trims the rounding fringe the fit leaves.
 //!
-//! The condense law is integer-only, so it has no `ty` model — `div_ceil` is
-//! division, the documented WAIVER class `area_overlap` already carries — and
-//! the exhaustive lattice below is the binding layer. The column clamp needs
-//! no new model at all: it is a one-line wrapper over the same
-//! `clamp_to_band` core as the row clamp, so the EXISTING `FallbackBandClip`
-//! model twins both (its arithmetic is axis-free). The genuinely new proof
-//! obligation is the ANTI-FIGHT law — two mechanisms on one axis must not be
-//! able to disagree — pinned by `condense_then_clamp_never_fight`.
+//! The column clamp needs no new model: it is a one-line wrapper over the
+//! same `clamp_to_band` core as the row clamp, so the EXISTING
+//! `FallbackBandClip` model twins both (its arithmetic is axis-free).
 
 use aterm_render::{
-    CJK_SCALE_MAX, CJK_SCALE_MIN, CONDENSE_MAX_RATIO, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN,
-    clamp_to_col_band, clamp_to_row_band, condense_coverage, condense_ink_w, fallback_cell_count,
-    fallback_cjk_scale, fallback_fit_scale, fallback_weight_rank, fallback_xheight_scale,
-    materialized_cell_span, wide_center_offset,
+    CJK_SCALE_MAX, CJK_SCALE_MIN, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN, clamp_to_col_band,
+    clamp_to_row_band, fallback_cell_count, fallback_cjk_scale, fallback_fit_scale,
+    fallback_weight_rank, fallback_xheight_scale, wide_center_offset,
 };
 
 // ---- (1) normalization clamps ----
@@ -356,11 +350,14 @@ fn fallback_cell_count_matches_terminal_cjk_policy() {
 /// then the policy reloads narrow without reflowing the old cell, so both spans
 /// coexist in one materialized row and must reach distinct fitted raster keys.
 /// A zero-width combining overlay on the narrow instance stays span 0.
+#[cfg(feature = "embedded-font")]
 #[test]
 fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
     use aterm_core::config::TerminalConfig;
     use aterm_core::terminal::Terminal;
-    use aterm_render::{FaceId, Renderer, Theme, display_face_bytes, embedded_font};
+    use aterm_render::{
+        FaceId, Renderer, Theme, display_face_bytes, embedded_font, materialized_cell_span,
+    };
 
     let primary_bytes = display_face_bytes("pixel").expect("bundled primary");
     let fallback_bytes = embedded_font();
@@ -528,74 +525,9 @@ fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     assert!(trimmed > 0 && untouched > 0);
 }
 
-// ---- (g) condense-to-cell + (h) column-band clip ----
+// ---- (h) column-band clip ----
 
-/// T1. Exhaustive over the whole `(ink_w, box_w)` lattice: every clause of
-/// the `condense_ink_w` totality law at once. The pre-fix behaviour (the
-/// identity — width-1 fallback glyphs got no horizontal treatment at all) is
-/// shown to violate the fit law on exactly the shapes that overran.
-#[test]
-fn condense_ink_w_never_widens_and_fits_exhaustively() {
-    let (mut identity, mut exact_fit, mut floored) = (0u32, 0u32, 0u32);
-    for ink_w in 0..=64usize {
-        for box_w in 0..=32usize {
-            let out = condense_ink_w(ink_w, box_w);
-            // NEVER WIDENS.
-            assert!(
-                out <= ink_w,
-                "condense widened: {ink_w} -> {out} (box {box_w})"
-            );
-            // BOUNDED DISTORTION: never squeezed past CONDENSE_MAX_RATIO:1.
-            assert!(
-                out >= ink_w.div_ceil(CONDENSE_MAX_RATIO),
-                "condense past the {CONDENSE_MAX_RATIO}:1 floor: {ink_w} -> {out} (box {box_w})"
-            );
-            // NON-VANISHING.
-            if ink_w >= 1 {
-                assert!(
-                    out >= 1,
-                    "condense erased the ink: {ink_w} -> 0 (box {box_w})"
-                );
-            }
-            // IDENTITY IFF ALREADY FITTING (or a degenerate cell box).
-            let fits = box_w == 0 || ink_w <= box_w;
-            assert_eq!(
-                out == ink_w,
-                fits,
-                "identity law: ink={ink_w} box={box_w} -> {out}"
-            );
-            if fits {
-                identity += 1;
-                continue;
-            }
-            // FITS WHEN ACHIEVABLE, and then EXACTLY.
-            if ink_w <= CONDENSE_MAX_RATIO * box_w {
-                assert_eq!(
-                    out, box_w,
-                    "fit is not exact: ink={ink_w} box={box_w} -> {out}"
-                );
-                exact_fit += 1;
-                // Negative control: the pre-fix identity (`out == ink_w`)
-                // overruns the box on precisely these shapes.
-                assert!(ink_w > box_w, "negative control classification");
-            } else {
-                assert_eq!(out, ink_w.div_ceil(CONDENSE_MAX_RATIO));
-                assert!(
-                    out > box_w,
-                    "the floor regime must still overrun (that is why (h) exists)"
-                );
-                floored += 1;
-            }
-        }
-    }
-    // Non-vacuity: all three arms are actually reached.
-    assert!(
-        identity > 0 && exact_fit > 0 && floored > 0,
-        "lattice missed an arm: identity={identity} exact={exact_fit} floored={floored}"
-    );
-}
-
-/// T2. The two band clamps really are ONE proven core: over the same lattice
+/// The two band clamps really are ONE proven core: over the same lattice
 /// the row test sweeps, the column wrapper agrees with the row wrapper
 /// pointwise — which is what lets `fallback_band_clip_model` legitimately
 /// twin both, instead of the column axis needing a cloned Tier-0 model.
@@ -626,117 +558,6 @@ fn col_band_clamp_agrees_with_row_band_clamp() {
         }
     }
     assert!(trimmed > 0);
-}
-
-/// T3. THE ANTI-FIGHT OBLIGATION — the reason belt-and-braces is safe here.
-/// Whenever the condense fitted the glyph (regimes "already fitting" and
-/// "exact fit"), the backstop clamp is the EXACT identity: it can never trim
-/// ink the condense already placed. And the complement: the two mechanisms
-/// both act only when `ink_w > CONDENSE_MAX_RATIO * box_w`, i.e. precisely
-/// when no legible fit exists.
-#[test]
-fn condense_then_clamp_never_fight() {
-    let (mut inert, mut both_act) = (0u32, 0u32);
-    for ink_w in 0..=64usize {
-        for box_w in 1..=32usize {
-            let new_w = condense_ink_w(ink_w, box_w);
-            for bleed in 1..=16usize {
-                let band_w = box_w + 2 * bleed;
-                if new_w <= box_w {
-                    let left = wide_center_offset(box_w as i32, new_w as i32);
-                    assert_eq!(
-                        clamp_to_col_band(left + bleed as i32, new_w, band_w),
-                        (0, new_w),
-                        "the backstop trimmed a fitted glyph: ink={ink_w} box={box_w} \
-                         bleed={bleed} -> new_w={new_w} left={left}"
-                    );
-                    inert += 1;
-                } else {
-                    // The only regime where both mechanisms act.
-                    assert!(
-                        ink_w > CONDENSE_MAX_RATIO * box_w,
-                        "the condense left an overrun outside the floor regime: \
-                         ink={ink_w} box={box_w} -> {new_w}"
-                    );
-                    both_act += 1;
-                }
-            }
-        }
-    }
-    assert!(
-        inert > 0 && both_act > 0,
-        "inert={inert} both_act={both_act}"
-    );
-}
-
-/// T4. The x-only area filter's own laws over several coverage patterns:
-/// shape, identity, the no-seam law (a solid row stays solid), mass
-/// preservation to rounding, non-annihilation, and totality on every zero
-/// dimension.
-#[test]
-fn condense_coverage_preserves_mass_and_solid_rows() {
-    // Totality on degenerate dimensions.
-    assert!(condense_coverage(&[], 0, 3, 2).is_empty());
-    assert!(condense_coverage(&[1, 2, 3], 3, 0, 2).is_empty());
-    assert!(condense_coverage(&[1, 2, 3], 3, 1, 0).is_empty());
-
-    let mut condensed = 0u32;
-    for w in 1..=24usize {
-        for h in 1..=3usize {
-            // Four patterns: solid, one lit column, a ramp, alternating.
-            let patterns: Vec<Vec<u8>> = vec![
-                vec![255u8; w * h],
-                (0..w * h)
-                    .map(|i| if i % w == w / 2 { 255 } else { 0 })
-                    .collect(),
-                (0..w * h).map(|i| ((i % w) * 255 / w) as u8).collect(),
-                (0..w * h)
-                    .map(|i| if i % 2 == 0 { 200 } else { 20 })
-                    .collect(),
-            ];
-            for (pi, src) in patterns.iter().enumerate() {
-                for new_w in 1..=w {
-                    let out = condense_coverage(src, w, h, new_w);
-                    assert_eq!(out.len(), new_w * h, "shape law (w={w} h={h} new={new_w})");
-                    if new_w == w {
-                        assert_eq!(&out, src, "identity at new_w == w");
-                        continue;
-                    }
-                    condensed += 1;
-                    for y in 0..h {
-                        let irow = &src[y * w..y * w + w];
-                        let orow = &out[y * new_w..y * new_w + new_w];
-                        // NO SEAM: an all-255 row stays all-255.
-                        if irow.iter().all(|&v| v == 255) {
-                            assert!(
-                                orow.iter().all(|&v| v == 255),
-                                "solid row seamed (p{pi} w={w} new={new_w}): {orow:?}"
-                            );
-                        }
-                        // MASS: sum(out)*w == sum(in)*new_w, to the per-output
-                        // round-to-nearest bound of w/2 each.
-                        let (si, so) = (
-                            irow.iter().map(|&v| u64::from(v)).sum::<u64>(),
-                            orow.iter().map(|&v| u64::from(v)).sum::<u64>(),
-                        );
-                        let (a, b) = (so * w as u64, si * new_w as u64);
-                        assert!(
-                            a.abs_diff(b) <= (new_w * w).div_ceil(2) as u64,
-                            "mass drifted (p{pi} w={w} new={new_w} y={y}): {a} vs {b}"
-                        );
-                        // NON-ANNIHILATION: ink in, ink out (within the floor).
-                        if si > 0 && new_w * CONDENSE_MAX_RATIO >= w {
-                            assert!(
-                                so > 0,
-                                "condense annihilated a lit row (p{pi} w={w} new={new_w})"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    assert!(condensed > 0);
 }
 
 // ---- (e) weight/italic ranking ----
@@ -826,10 +647,8 @@ fn ct_probe_is_total_and_sound() {
 #[test]
 fn cjk_fallback_glyph_is_banded_and_wide() {
     use aterm_render::{FaceId, GlyphClass, Renderer, Theme};
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system mono font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     // Without this, `glyph_key` answers while the fallback parse is still in
     // flight and PROVISIONALLY routes every candidate to the primary — which
     // made the skip guard below fire on every host, i.e. the test always
@@ -875,13 +694,11 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
             (2 * cell_w) as f32,
             "a wide fallback glyph owns its 2-cell box (force_fontdue={force_fontdue})"
         );
-        // W8 (g)/(h) non-regression: a 2-cell glyph NEVER enters the condense
-        // — the stage is gated `cw == 1`, structurally, because the CoreText
-        // raster width includes the antialiasing pad, so an ideograph whose
-        // ink fits its box perfectly can still report `w > 2 * cell_w` and be
-        // squashed by a fit test alone. The width assertion below is the
-        // teeth: a condense that reached this glyph would fold its ink into
-        // one cell.
+        // Non-regression: a 2-cell glyph is fitted to its 2-cell box, never
+        // folded into one cell — the CoreText raster width includes the
+        // antialiasing pad, so an ideograph whose ink fits its box perfectly
+        // can still report `w > 2 * cell_w`. The width assertion below is the
+        // teeth.
         assert!(
             img.xmin() >= 0 && img.xmin() + img.width() as i32 <= 2 * cell_w as i32,
             "a wide fallback glyph escapes its 2-cell box: xmin={} w={} cell_w={cell_w} \
@@ -892,7 +709,7 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
         assert!(
             img.width() > cell_w,
             "a wide ideograph's ink no longer spans past one cell (w={} cell_w={cell_w}) — \
-             the cw == 2 gate on the condense has regressed (force_fontdue={force_fontdue})",
+             the 2-cell fit has regressed (force_fontdue={force_fontdue})",
             img.width()
         );
     }
@@ -904,10 +721,8 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
 #[test]
 fn narrow_fallback_symbol_is_bounded_to_one_cell() {
     use aterm_render::{FaceId, GlyphClass, Renderer, StyleBits, Theme};
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system mono font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     let key = r.glyph_key('\u{26A0}');
     if !matches!(
@@ -1019,10 +834,8 @@ fn native_cjk_face_leads_the_macos_chain() {
         eprintln!("SKIP: Hiragino Sans GB not installed");
         return;
     }
-    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
-        eprintln!("SKIP: no system mono font found");
-        return;
-    };
+    let mut r = Renderer::from_system(16.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     let pick = r.debug_fallback_pick_path('\u{4E2D}');
     assert_eq!(
         pick.as_deref(),
@@ -1060,10 +873,8 @@ fn long_arrows_never_leave_their_cell() {
     let mut checked = 0u32;
     let mut condensed = 0u32;
     for px in [12.0f32, 16.0, 24.0] {
-        let Some(mut r) = Renderer::from_system(px, Theme::default()) else {
-            eprintln!("SKIP: no system mono font found");
-            return;
-        };
+        let mut r = Renderer::from_system(px, Theme::default())
+            .expect("no font: build with aterm-render's default embedded-font feature");
         r.debug_block_on_lazy_fallbacks();
         for force_fontdue in [false, true] {
             if force_fontdue {
@@ -1123,10 +934,8 @@ fn long_arrows_never_leave_their_cell() {
 fn a_long_arrow_does_not_shear_a_box_drawing_row() {
     use aterm_core::terminal::Terminal;
     use aterm_render::{Renderer, Theme};
-    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
-        eprintln!("SKIP: no system mono font found");
-        return;
-    };
+    let mut r = Renderer::from_system(18.0, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
     r.debug_block_on_lazy_fallbacks();
     let (cw, ch) = r.cell_size();
     let (rows, cols) = (1usize, 5usize);

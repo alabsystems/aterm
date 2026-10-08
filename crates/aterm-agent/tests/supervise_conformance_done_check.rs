@@ -1,29 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorDoneCheck` (aterm-spec
-//! `supervisor_done_check_model`): the REAL turn-end decider
-//! (`decide_turn_end`, with the real `TurnEndState` it keeps) driven along
-//! EVERY reachable state of the model.
+//! Tier-1 for `SupervisorDoneCheck` (aterm-spec `supervisor_done_check_model`):
+//! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`)
+//! driven along every reachable state of the model.
 //!
-//! Each model action is mirrored on the real side: someone else's turn is a
-//! point `observe`d with real work and nothing of the policy's awaited (its
-//! last words a done report, or progress, or a `529 Overloaded` wall); the
-//! policy's `Continue`, `Check` and `WallAct` are the real decider's own act
-//! at that point — decided past the point's back-off and the wall's wait, on
-//! the real ladder's clock — recorded with `acted`; a yield is the next
-//! point `observe`d with real work, its last words progress, or a done
-//! report (the vendor's phrase after a continuation or a wall's act, the
-//! `DONE` the check asks for after the check), or the wall again. At every
-//! state the real verdict is checked against the model — it types the
-//! continuation exactly where `Continue` is enabled, the check exactly where
-//! `Check` is, the wall's retry exactly where `WallAct` is, and nothing on a
-//! done task — and the real state's done reports are the model's `done`.
-//! NEGATIVE CONTROLS: at a done report, and on a done task, the `Buggy = 1`
-//! model continues where the real decider types the check, or nothing; and
-//! at a wall someone else's turn ended on after the task was done, the
-//! `Buggy = 1` model does nothing where the real decider retries (the review
-//! of 2026-09-27) — so a green walk is not vacuous.
+//! Someone else's turn is a point observed with real work (its last words a
+//! done report, progress, or a `529 Overloaded` wall); the policy's `Continue`,
+//! `Check` and `WallAct` are the decider's own acts on the real ladder's
+//! clock, recorded with `acted`; a yield is the next point observed. At every
+//! state the decider types the continuation, the check and the wall's retry
+//! exactly where the model enables them and nothing on a done task, and its
+//! done reports are the model's `done`. Negative controls: the `Buggy = 1`
+//! model continues at a done report where the real decider checks, and does
+//! nothing at a wall after the task was done where the real decider retries.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -61,6 +51,7 @@ fn point(said: &str, walled: bool, worked: Option<Duration>) -> TurnEndReading {
             String::new()
         },
         reset_at: None,
+        jitter: Duration::ZERO,
         resumes_by_itself: false,
         composer: Composer::Empty,
         said_tail: Some(said.to_string()),
@@ -82,6 +73,7 @@ fn point(said: &str, walled: bool, worked: Option<Duration>) -> TurnEndReading {
         sandbox_fell: None,
         thread_model: None,
         upgrade_goal: false,
+        account: None,
     }
 }
 
@@ -237,7 +229,7 @@ fn tier1_the_real_decider_checks_a_done_report_and_leaves_a_done_task() {
         );
     }
 
-    // NEGATIVE CONTROLS: at a done report, and on a done task, the Buggy
+    // Negative controls: at a done report, and on a done task, the Buggy
     // model continues — the real decider types the check, then nothing.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let mut real = Real {

@@ -21,9 +21,8 @@
 //! assert_eq!(back, KeyCode::Enter);
 //! ```
 //!
-//! Extracted from `aterm-core::plugins::types` as part of the monolith split
-//! (#2341) to allow `aterm-editor` and `aterm-core::plugins` to share these
-//! types without a circular dependency.
+//! Lives here so `aterm-editor` and `aterm-core::plugins` share these types
+//! without a circular dependency.
 
 /// Key codes for key events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +84,7 @@ bitflags! {
 impl From<KeyModifiers> for crate::keyboard::Modifiers {
     fn from(m: KeyModifiers) -> Self {
         // SAFETY invariant: bit layouts are identical, enforced by
-        // `test_bit_layout_matches_keyboard_modifiers` below.
+        // `bit_layout_matches_keyboard_modifiers` below.
         crate::keyboard::Modifiers::from_bits_truncate(m.bits())
     }
 }
@@ -98,16 +97,33 @@ impl From<crate::keyboard::Modifiers> for KeyModifiers {
 }
 
 /// Error when converting between `input::KeyCode` and `keyboard::Key`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, aterm_error::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyConversionError {
     /// Function key number is outside the supported protocol range F1-F24.
-    #[error("function key F{0} is outside the supported protocol range F1-F24")]
     FunctionKeyOutOfRange(u8),
     /// Protocol key has no application-level representation.
-    #[error("protocol key {0:?} has no application-level representation")]
     ProtocolOnlyKey(crate::keyboard::NamedKey),
 }
+
+impl std::fmt::Display for KeyConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FunctionKeyOutOfRange(n) => {
+                f.write_str("function key F")?;
+                std::fmt::Display::fmt(n, f)?;
+                f.write_str(" is outside the supported protocol range F1-F24")
+            }
+            Self::ProtocolOnlyKey(k) => {
+                f.write_str("protocol key ")?;
+                std::fmt::Debug::fmt(k, f)?;
+                f.write_str(" has no application-level representation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyConversionError {}
 
 /// Bridge from application-level `KeyCode` to protocol-level `keyboard::Key`.
 ///

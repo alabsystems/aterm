@@ -99,9 +99,9 @@ pub struct IndexCache {
     /// — root writes such a prefix and EVERY user must traverse and execute out of it, so
     /// it is published `0755`. A `0700` system prefix installs a toolchain only root can
     /// run and fails at the first non-root invocation with a bare `Permission denied`.
-    /// `store` runs at the START of every resolve and nothing later in a pass widens the
-    /// prefix back, so the unconditional hardening re-entered that regression (7d968b2fe)
-    /// through the cache writer.
+    /// `store` runs on every resolve that reaches the source, and
+    /// nothing later in a pass widens the prefix back, so the unconditional hardening
+    /// re-entered that regression (7d968b2fe) through the cache writer.
     ///
     /// `None` is a cache that is NOT under an install prefix (the path-only
     /// [`IndexCache::new`]): private state, hardened `0700` as before.
@@ -190,11 +190,11 @@ impl IndexCache {
         let Some(parent) = self.path.parent() else {
             return;
         };
-        // The cache is written at the very START of an install, before the flow creates any
-        // prefix dir — create/harden the (vetted) parent so the first fetch is cached too,
-        // with the mode the PREFIX SHAPE calls for. The parent here IS `layout.prefix`, so
-        // hardening it `0700` unconditionally published a root-owned SYSTEM prefix
-        // owner-only on every resolve — and nothing later in the pass widens it back.
+        // The cache can be the first thing written under the prefix — create/harden the
+        // (vetted) parent so the first fetch is cached too, with the mode the PREFIX SHAPE
+        // calls for. The parent here IS `layout.prefix`, so hardening it `0700`
+        // unconditionally published a root-owned SYSTEM prefix owner-only on every resolve
+        // — and nothing later in the pass widens it back.
         if self.ensure_parent(parent).is_err() {
             return;
         }
@@ -341,11 +341,12 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn tmp(label: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atpkg-cache-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d.join("index-cache.toml")
+    /// The cache file's path inside a fresh scratch directory, which the returned guard
+    /// removes when the test ends.
+    fn tmp(label: &str) -> (crate::testdir::Dir, PathBuf) {
+        let d = crate::testdir::dir(&format!("atpkg-cache-{label}-"));
+        let file = d.join("index-cache.toml");
+        (d, file)
     }
 
     fn cand(label: &str) -> Candidate {
@@ -360,7 +361,7 @@ mod tests {
 
     #[test]
     fn store_then_load_same_source_round_trips() {
-        let p = tmp("rt");
+        let (_scratch, p) = tmp("rt");
         let c = IndexCache::new(p.clone());
         c.store("github:o/r", &[cand("v1"), cand("v0")]);
         let back = c.load("github:o/r").expect("same source loads");
@@ -383,7 +384,7 @@ mod tests {
 
     #[test]
     fn load_rejects_other_source() {
-        let p = tmp("other");
+        let (_scratch, p) = tmp("other");
         let c = IndexCache::new(p.clone());
         c.store("dir:/tmp/reg", &[cand("v1")]);
         assert!(
@@ -399,7 +400,7 @@ mod tests {
     /// replaced by the next successful fetch rather than failing the whole read.
     #[test]
     fn a_pre_roster_cache_entry_decodes_but_authorizes_nothing() {
-        let p = tmp("legacy");
+        let (_scratch, p) = tmp("legacy");
         fs::write(
             &p,
             "schema = 1\nsource = \"github:o/r\"\nfetched_at = \"\"\n\
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn load_none_on_missing_or_garbage() {
-        let p = tmp("garbage");
+        let (_scratch, p) = tmp("garbage");
         let c = IndexCache::new(p.clone());
         assert!(c.load("any").is_none(), "absent cache is None");
         fs::write(&p, "this is not valid toml {{{").unwrap();
@@ -431,7 +432,7 @@ mod tests {
 
     #[test]
     fn store_skips_empty_candidate_set() {
-        let p = tmp("empty");
+        let (_scratch, p) = tmp("empty");
         let c = IndexCache::new(p.clone());
         c.store("github:o/r", &[cand("v1")]); // good cache
         c.store("github:o/r", &[]); // an empty "success" must NOT clobber it
@@ -445,7 +446,7 @@ mod tests {
 
     #[test]
     fn sparse_oversized_and_overcount_cache_fail_closed() {
-        let p = tmp("bounded");
+        let (_scratch, p) = tmp("bounded");
         let file = fs::File::create(&p).unwrap();
         file.set_len((MAX_INDEX_CACHE_BYTES + 1) as u64).unwrap();
         assert!(IndexCache::new(p.clone()).load("any").is_none());
@@ -463,7 +464,7 @@ mod tests {
     fn fifo_and_symlink_cache_return_without_blocking() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let p = tmp("special");
+        let (_scratch, p) = tmp("special");
         let p_c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
         // SAFETY: `p_c` is a live NUL-terminated path in our private fixture.
         assert_eq!(unsafe { libc::mkfifo(p_c.as_ptr(), 0o600) }, 0);
@@ -486,7 +487,7 @@ mod tests {
     /// prefix with `aterm pkg doctor` reporting nothing to reclaim.
     #[test]
     fn a_store_that_cannot_land_leaves_no_temp_behind() {
-        let p = tmp("tmp-leak");
+        let (_scratch, p) = tmp("tmp-leak");
         let parent = p.parent().unwrap().to_path_buf();
         fs::create_dir(&p).unwrap();
         let c = IndexCache::new(p.clone());
@@ -530,7 +531,7 @@ mod tests {
         };
 
         // AT the ceiling: admissible through both readers, and the label survives intact.
-        let p = tmp("label-at-ceiling");
+        let (_scratch, p) = tmp("label-at-ceiling");
         let at = "L".repeat(MAX_CACHED_LABEL_BYTES);
         write_doc(&p, &at);
         let c = IndexCache::new(p.clone());
@@ -541,7 +542,7 @@ mod tests {
         let _ = fs::remove_dir_all(p.parent().unwrap());
 
         // ONE BYTE OVER: refused by both readers, whole document.
-        let p2 = tmp("label-over-ceiling");
+        let (_scratch, p2) = tmp("label-over-ceiling");
         write_doc(&p2, &"L".repeat(MAX_CACHED_LABEL_BYTES + 1));
         let c2 = IndexCache::new(p2.clone());
         assert!(
@@ -551,7 +552,7 @@ mod tests {
         let _ = fs::remove_dir_all(p2.parent().unwrap());
 
         // WRITE path: an oversize label is never written, and never clobbers a good cache.
-        let p3 = tmp("label-write");
+        let (_scratch, p3) = tmp("label-write");
         fs::write(&p3, "sentinel").unwrap();
         IndexCache::new(p3.clone()).store("src", &[cand(&"L".repeat(MAX_CACHED_LABEL_BYTES + 1))]);
         assert_eq!(
@@ -566,7 +567,7 @@ mod tests {
     /// build writes is, of course, still read.
     #[test]
     fn unknown_schema_fails_closed() {
-        let p = tmp("schema");
+        let (_scratch, p) = tmp("schema");
         IndexCache::new(p.clone()).store("src", &[cand("v1")]);
         let c = IndexCache::new(p.clone());
         assert!(
@@ -625,8 +626,8 @@ mod tests {
     /// the documented catastrophe: root writes such a prefix and EVERY user must traverse
     /// and execute out of it, so [`Layout::ensure_dir`] publishes it `0755`; a `0700` one
     /// installs a toolchain nobody but root can run, and no later step widens it back
-    /// (the only `ensure_dir(&prefix)` calls run at lock time and on the pin verbs, both
-    /// BEFORE the flow resolves).
+    /// (the `ensure_dir(&prefix)` calls run at lock time, on the pin verbs and as the flow
+    /// resolves, all BEFORE this write).
     ///
     /// Proving it unprivileged takes the two halves apart, because no non-root process
     /// can create a directory under a root-owned chain: the LAYOUT is system-shaped (a
@@ -641,7 +642,7 @@ mod tests {
             return; // no root-owned chain here; the $HOME half below still runs
         };
         let system_path = layout.prefix.clone();
-        let p = tmp("sys-parent");
+        let (_scratch, p) = tmp("sys-parent");
         let parent = p.parent().unwrap().to_path_buf();
         // Start from the private mode, so only the routing under test can widen it.
         fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -673,7 +674,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_home_shaped_prefix_keeps_the_cache_parent_private() {
-        let p = tmp("home-parent");
+        let (_scratch, p) = tmp("home-parent");
         let parent = p.parent().unwrap().to_path_buf();
         fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let layout = Layout {

@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TEST-ONLY: a scripted CPU presenter, so a headless `App` can run the REAL
-//! redraw path end to end — compose, damage consume, the CPU present
-//! transaction, the dropped-present re-arm, the bounded retry — and a test can
-//! read back exactly what reached "glass".
+//! Test-only: a scripted CPU presenter, so a headless `App` runs the real
+//! redraw path (compose, damage consume, CPU present, dropped-present re-arm,
+//! bounded retry) and a test reads back exactly what reached the glass.
 //!
 //! In a test build [`super::CpuSurface`] is [`TestCpuSurface`]: the platform
-//! presenter (still what `CpuPresenter::new` builds, so every production
-//! construction site compiles and behaves unchanged) or a
-//! [`ScriptedPresenter`], which a test installs directly — no `winit` window,
-//! no WindowServer.
+//! presenter (what `CpuPresenter::new` builds) or a [`ScriptedPresenter`] a
+//! test installs directly, with no `winit` window and no WindowServer.
 //!
-//! The scripted glass models a RETAINING surface, the strict case for the
-//! damage-bounded copy: after a successful commit the next acquisition hands
-//! back a buffer of `age() == 1` that still holds exactly what the glass shows,
-//! and a failed commit discards what was painted into it. A retry that trusted
-//! a stale renderer cache over such a buffer would copy nothing and leave the
-//! glass without the frame it dropped — the failure mode the present-retry
-//! end-to-end tests exist to catch.
+//! The scripted glass models a retaining surface: after a successful commit the
+//! next acquisition returns a buffer of `age() == 1` that still holds what the
+//! glass shows, and a failed commit discards what was painted into it. A retry
+//! that trusted a stale renderer cache over such a buffer would copy nothing and
+//! leave the dropped frame off the glass.
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -48,7 +43,7 @@ pub(crate) enum ScriptedOutcome {
 pub(crate) struct ScriptedPresenter {
     width: usize,
     height: usize,
-    /// What the last SUCCESSFUL commit put on screen.
+    /// What the last successful commit put on screen.
     glass: Vec<u32>,
     /// The retained buffer `buffer_mut` hands out.
     back: Vec<u32>,

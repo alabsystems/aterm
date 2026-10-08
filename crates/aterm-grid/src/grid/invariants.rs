@@ -2,23 +2,16 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! TLA+ specification invariant checking for the terminal grid.
-//!
-//! This module provides debug-build verification that Grid state
-//! matches the formal TLA+ specification invariants.
+//! Debug-build checks that Grid state satisfies the formal spec's invariants.
 
 use super::Grid;
 
 impl Grid {
-    /// Assert TLA+ specification invariants in debug builds.
-    ///
-    /// Validates key invariants from the Terminal.tla specification.
-    /// See individual `assert_*` helpers for details.
+    /// Assert the grid's spec invariants (see the `assert_*` helpers).
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if any invariant is violated.
-    /// Does nothing in release builds for performance.
+    /// Panics if any invariant is violated.
     #[cfg(test)]
     #[inline]
     pub fn assert_invariants(&self) {
@@ -28,11 +21,13 @@ impl Grid {
             self.assert_wide_char_consistent();
             self.assert_scroll_region_valid();
             self.assert_ring_buffer_valid();
+            self.assert_keys_cover_retained_rows();
         }
     }
 
     /// Assert the O(1) grid invariants — `CursorInBounds`, `ScrollRegionValid` +
-    /// `DisplayOffsetValid`, and the ring-buffer structure — the subset of
+    /// `DisplayOffsetValid`, the ring-buffer structure and `KeysCoverRetained`
+    /// — the subset of
     /// [`Self::assert_invariants`] cheap enough to run on every `process` batch.
     /// The O(cells) `WideCharConsistent` walk is
     /// [`Self::assert_wide_char_consistent`], which the no-panic fuzzers
@@ -49,6 +44,28 @@ impl Grid {
         self.assert_cursor_in_bounds();
         self.assert_scroll_region_valid();
         self.assert_ring_buffer_valid();
+        self.assert_keys_cover_retained_rows();
+    }
+
+    /// KeysCoverRetained: `absolute_row_counter >= visible_rows +
+    /// scrollback_lines()` — every retained row has an absolute key at or
+    /// above 0. While it holds, the two maps of an absolute row name one row:
+    /// a shell's OSC 133 mark is RECORDED through `visible_to_absolute`
+    /// (`counter − visible + r`) and READ BACK (`line`, `blocks`, `blocktext`)
+    /// through `oldest_absolute_row()` (`counter − visible − scrollback`,
+    /// saturating at 0) plus the history count. Below it the read map
+    /// saturates and the write map does not, and every later mark reads back
+    /// as a row above its prompt (tab #1, 2026-10-01: a rows-only grow of a
+    /// grid with nothing evicted appended rows under a fixed counter).
+    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    fn assert_keys_cover_retained_rows(&self) {
+        let retained =
+            u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
+        assert!(
+            self.storage.absolute_row_counter >= retained,
+            "KeysCoverRetained violated: absolute_row_counter {} < {retained} retained rows",
+            self.storage.absolute_row_counter
+        );
     }
 
     /// CursorInBounds: cursor.row < visible_rows && cursor.col < cols
@@ -68,15 +85,11 @@ impl Grid {
         );
     }
 
-    /// WideCharConsistent + WideCharNotAtEnd: wide chars have continuations
-    /// and don't appear at the last column.
-    ///
-    /// Held by the writers, not by luck: every wide write clears an orphaned
-    /// half at both edges of what it overwrites (`fixup_wide_char_write`, and
-    /// `fixup_wide_chars_in_range` before the bulk wide-run writes — the
-    /// 2026-06-30 fix for the dangling-WIDE case the fuzzer found). O(cells),
-    /// so it is not part of the per-batch
-    /// [`Self::assert_structural_invariants`] self-check.
+    /// WideCharConsistent + WideCharNotAtEnd: wide chars have continuations and
+    /// never sit in the last column. The writers clear orphaned halves at both
+    /// edges of what they overwrite (`fixup_wide_char_write`,
+    /// `fixup_wide_chars_in_range`). O(cells), so not part of
+    /// [`Self::assert_structural_invariants`].
     ///
     /// # Panics
     ///
@@ -84,19 +97,28 @@ impl Grid {
     /// last column.
     #[cfg(any(debug_assertions, test, feature = "testing"))]
     pub fn assert_wide_char_consistent(&self) {
+        // Walks each row's cell slice once (`Row::get` per cell re-derives the
+        // slice from its page every call, which dominated debug fuzz runs).
+        // Bounded by the grid's column count exactly as the per-cell `get`
+        // walk was: pairs (col, col + 1) with col + 1 < cols, both in the row.
+        let cols = usize::from(self.storage.cols);
         for row_idx in 0..self.storage.visible_rows {
             if let Some(row) = self.row(row_idx) {
-                for col in 0..self.storage.cols.saturating_sub(1) {
-                    if let Some(cell) = row.get(col)
-                        && cell.is_wide()
-                        && let Some(next_cell) = row.get(col + 1)
-                    {
+                let cells = row.as_slice();
+                let walked = &cells[..cells.len().min(cols)];
+                // A plain index loop: slice indexing is a MIR primitive, where
+                // a range or slice iterator costs calls per cell in a debug
+                // build (this runs after every fuzz step).
+                let mut col = 0;
+                while col + 1 < walked.len() {
+                    if walked[col].is_wide() {
                         assert!(
-                            next_cell.is_wide_continuation(),
+                            walked[col + 1].is_wide_continuation(),
                             "TLA+ WideCharConsistent violated: wide char at ({row_idx}, {col}) missing continuation at ({row_idx}, {})",
                             col + 1
                         );
                     }
+                    col += 1;
                 }
                 let last_col = self.storage.cols.saturating_sub(1);
                 if let Some(cell) = row.get(last_col) {
@@ -136,9 +158,8 @@ impl Grid {
     /// ring buffer structural invariants.
     #[cfg(any(debug_assertions, test, feature = "testing"))]
     fn assert_ring_buffer_valid(&self) {
-        // Ring buffer must always contain at least one row — the constructor
-        // enforces rows.max(1). Empty rows would cause division-by-zero in
-        // all `% self.storage.rows.len()` modular arithmetic (row_index, scroll, erase).
+        // The ring always has a row (the constructor enforces rows.max(1));
+        // every `% rows.len()` depends on it.
         assert!(
             !self.storage.rows.is_empty(),
             "RowsNonEmpty violated: ring buffer has zero rows"
@@ -149,9 +170,7 @@ impl Grid {
             self.storage.ring_head,
             self.storage.rows.len()
         );
-        // total_lines tracks visible + scrollback. It cannot exceed the
-        // allocated row count, and must be at least visible_rows (the grid
-        // always has enough rows for the visible area).
+        // visible_rows <= total_lines <= allocated rows.
         assert!(
             self.storage.total_lines <= self.storage.rows.len(),
             "TotalLinesValid violated: total_lines ({}) > rows.len() ({})",
@@ -164,10 +183,8 @@ impl Grid {
             self.storage.total_lines,
             self.storage.visible_rows
         );
-        // ring_head advances only in Phase 2 (reuse) of scroll_up, which
-        // only fires when total_lines == rows.len() (at capacity). Reflow
-        // and erase_scrollback reset ring_head to 0. Therefore ring_head > 0
-        // implies the buffer is at full capacity.
+        // ring_head advances only when scroll_up reuses rows at capacity;
+        // reflow and erase_scrollback reset it. So ring_head > 0 implies full.
         assert!(
             self.storage.ring_head == 0 || self.storage.total_lines == self.storage.rows.len(),
             "RingHeadCapacity violated: ring_head={} but total_lines ({}) != rows.len() ({})",

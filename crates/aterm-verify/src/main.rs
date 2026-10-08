@@ -140,6 +140,7 @@ fn main() {
     // it off.
     let log = open_log(&parsed, &run_root);
 
+    let host_memory = exec::host_memory_bytes();
     let mut ctx = Ctx::new_with_tools(run_root, parsed.mode, scope, env, scratch.clone(), tools)
         .with_prelude(prelude)
         .with_progress_log(log.as_ref().and_then(|(_, f)| f.try_clone().ok()))
@@ -148,16 +149,20 @@ fn main() {
                 .stage_timeout
                 .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
         )
-        .with_gui_smoke_skipped(parsed.skip_gui_smoke)
+        .with_no_windows(parsed.no_windows)
+        .with_compile_qos(parsed.compile_qos)
         .with_baseline(parsed.baseline)
-        .with_nearest_base(parsed.nearest_base)
         .with_notes(identity::own_output_note(&excluded))
         .in_snapshot_of(snap.caller.clone(), snap.tree.clone(), snap.notes.clone())
         // AFTER the snapshot is chosen, because the git stamp is resolved from the
         // root this run will actually build — and BEFORE any stage runs, because the
         // whole point is that every child of one run is given the same answer.
         .with_pinned_child_facts(parsed.test_threads)
-        .with_test_jobs(parsed.test_jobs);
+        .with_test_jobs(parsed.test_jobs)
+        .with_host_memory(host_memory.map(|(bytes, _)| bytes))
+        .with_host_memtotal(host_memory.is_some_and(|(_, memtotal)| memtotal))
+        .with_host_usable(host_memory.and_then(|(bytes, _)| exec::host_usable_bytes(bytes)))
+        .with_memory_build_jobs();
     if let Some(gib) = parsed.disk_floor_gib {
         ctx = ctx.with_disk_floor(gib * aterm_verify::disk::GIB);
     }
@@ -246,10 +251,10 @@ fn choose_source(
         snapshot: parsed
             .snapshot
             .clone()
-            .unwrap_or_else(|| snapshot::default_root(root)),
+            .unwrap_or_else(|| snapshot::default_root(&snapshot::snapshot_home(root, &path_env))),
         path_env: &path_env,
         lane_env: snapshot::lane_env_from_process(),
-        trustc_commit: tools.identity(&path_env, scratch).commit,
+        trustc_commit: identity::ToolchainIdentity::of(tools, &path_env, scratch).commit,
     })
 }
 

@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OSC / escape-sequence policy engine data model and built-in profiles (Phase 2 of #7874)"
+description = "OSC / escape-sequence policy engine data model and built-in profiles"
 
 [features]
 default = []
@@ -15,17 +15,8 @@ default = []
 [dependencies]
 serde = { workspace = true }
 aterm-toml = { workspace = true }
-# aterm_time::Instant is a byte-identical re-export of std on native, but uses
-# the JS clock on wasm32 (where std::time::Instant::now() panics) — keeps the
-# TokenBucket rate-limiter on the engine-wide aterm_time discipline.
+# std's Instant on native; the JS clock on wasm32, where std's panics.
 aterm-time = { workspace = true }
-
-[dev-dependencies]
-criterion = "0.5"
-
-[[bench]]
-name = "policy_engine_hotpath"
-harness = false
 
 [lints]
 workspace = true
