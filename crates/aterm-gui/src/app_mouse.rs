@@ -6496,7 +6496,10 @@ mod pointer_license_tests {
         );
     }
 
-    fn echo(app: &mut App, geom: Geom) -> (u64, &'static str, bool) {
+    /// The glow's echo admission as of `now`: a test whose key is pressed at one
+    /// instant and judged later must not let a loaded machine age the typed hint
+    /// (it lives 250 ms) between the two.
+    fn echo_at(app: &mut App, geom: Geom, now: Instant) -> (u64, &'static str, bool) {
         let wid = WindowId(0);
         let term = app.front_terminal(wid).unwrap().term.clone();
         term_lock(&term).process(b"a");
@@ -6504,13 +6507,10 @@ mod pointer_license_tests {
         let cfg = app.glow_config();
         let ws = app.windows.get_mut(&wid).unwrap();
         let mut out = Vec::new();
-        ws.fx.cursor_mut().glow.tick(
-            Some((cursor.row, cursor.col)),
-            Instant::now(),
-            &cfg,
-            geom,
-            &mut out,
-        );
+        ws.fx
+            .cursor_mut()
+            .glow
+            .tick(Some((cursor.row, cursor.col)), now, &cfg, geom, &mut out);
         (
             ws.fx.cursor_mut().glow.spawns(),
             ws.fx
@@ -6536,8 +6536,9 @@ mod pointer_license_tests {
         // as `inflight`. Reported motion must match this existing behavior.
         let (mut control, _reader, geom) = fixture(0);
         press(&mut control);
+        let pressed = Instant::now();
         control.clear_move_license(wid);
-        let cleared_echo = echo(&mut control, geom);
+        let cleared_echo = echo_at(&mut control, geom, pressed);
         assert_eq!(cleared_echo, (1, "inflight", true));
         for controller in [false, true] {
             for mode in [0, 1000, 1002, 1003] {
@@ -6545,16 +6546,14 @@ mod pointer_license_tests {
                     let (mut app, mut reader, geom) = fixture(mode);
                     let _ = read_input(&mut reader);
                     press(&mut app);
+                    // Every freshness check of this case is made AS OF the key: the typed
+                    // hint lives 250 ms and a loaded machine overruns that between the
+                    // key and the checks (seen 2026-10-09).
+                    let pressed = Instant::now();
                     assert_eq!(read_input(&mut reader), b"a");
                     let mut before = model.init_state();
                     assert!(model.fire("PressArmsLicense", &mut before));
-                    assert!(
-                        app.windows[&wid]
-                            .fx
-                            .cursor()
-                            .glow
-                            .move_licensed(Instant::now())
-                    );
+                    assert!(app.windows[&wid].fx.cursor().glow.move_licensed(pressed));
                     let col = if same_pixel { 3 } else { 4 };
                     if controller {
                         assert_eq!(
@@ -6593,14 +6592,11 @@ mod pointer_license_tests {
                         assert!(bytes.starts_with(b"\x1b[<35;"), "{bytes:?}");
                     }
                     let ws = &app.windows[&wid];
-                    let live = ws.fx.cursor().glow.move_licensed(Instant::now());
+                    let live = ws.fx.cursor().glow.move_licensed(pressed);
                     assert_eq!(live, !reported, "{mode}/{controller}/{same_pixel}");
+                    assert_eq!(ws.fx.cursor().trail.move_licensed(pressed), !reported);
                     assert_eq!(
-                        ws.fx.cursor().trail.move_licensed(Instant::now()),
-                        !reported
-                    );
-                    assert_eq!(
-                        echo(&mut app, geom),
+                        echo_at(&mut app, geom, pressed),
                         if reported {
                             cleared_echo
                         } else {

@@ -3796,10 +3796,16 @@ pub(crate) fn output_bounded_within(
 
 /// [`PROBE_TIMEOUT`], or a test's shorter one (`ShorterProbes`, unix tests only).
 fn probe_timeout() -> std::time::Duration {
+    // A test waits for a probe the way it waits for anything that must happen: a
+    // hang detector, never the production ceiling, which is a latency budget for a
+    // wedged binary (a probe that runs a script, three forks and an `cat` took
+    // longer than 5 s on a machine under a build storm, 2026-10-09, and read as
+    // "unknown"). A leg that wedges a probe on purpose sets its own, shorter bound.
     #[cfg(all(test, unix))]
-    if let Some(bound) = PROBE_TIMEOUT_IN_TEST.with(std::cell::Cell::get) {
-        return bound;
-    }
+    return PROBE_TIMEOUT_IN_TEST
+        .with(std::cell::Cell::get)
+        .unwrap_or(aterm_spec::wait::MUST_HAPPEN);
+    #[cfg(not(all(test, unix)))]
     PROBE_TIMEOUT
 }
 

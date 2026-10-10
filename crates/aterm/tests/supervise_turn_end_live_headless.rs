@@ -1351,7 +1351,16 @@ fn a_short_turn_loop_backs_off_growing_and_never_escalates() {
     // before the loop's connection is made, it waits for no read of it
     // ([`FAKE_WORKER`]), so the loop starts on it or on its end. Every spell
     // after it, a continuation's, lasts until the loop has read it.
-    drawn(&events, "busy");
+    //
+    // "Taken" is the INSTANCE's screen, not the worker's record of drawing:
+    // the worker's `draw-busy` stamp is made before its bytes cross the pty
+    // and the instance parses them, and a loop that connected in that gap
+    // read the ready screen as its first point (seq 531 in the stress
+    // run that caught it, 2026-10-10). That first point counts as a short
+    // turn, so `go`'s own turn made the second and the back-offs read
+    // 2, 2, 2 for 1, 2, 2. The instance's screen is read by the loop too, so
+    // it can only have left ready by the time the loop looks.
+    await_match(&inst, &sid, "Deliberating|suite.is.green");
     let sup = Supervisor::start_with(
         &inst,
         &sid,

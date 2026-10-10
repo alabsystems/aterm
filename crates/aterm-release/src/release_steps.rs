@@ -1466,6 +1466,29 @@ fn scrub(cmd: &mut Command) {
     }
 }
 
+/// The identity a release's handoff fixtures are written as: its version and the
+/// reservation the shipped binary stamps (build n, release commit C).
+fn fixture_pins(c: &Candidate, reserved: &Reservation) -> crate::fixtures::Pins {
+    crate::fixtures::Pins {
+        version: c.version.clone(),
+        build: reserved.build,
+        commit: reserved.commit.clone(),
+    }
+}
+
+/// Where the clone's release cache stages them.
+fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
+    crate::snapshot::CacheRoot::for_repo(repo)
+        .map(|cache| cache.handoff_fixtures())
+        .map_err(|e| {
+            Refusal::new(
+                format!("the release cache: {e}"),
+                format!("run {RELEASE_COMMAND} again once it is readable"),
+            )
+            .could_not_run()
+        })
+}
+
 fn tail(path: &Path, n: usize) -> Vec<String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
@@ -1758,6 +1781,14 @@ pub fn release_shape(release: &aterm_json::Value, version: &str) -> Vec<String> 
         bad.push(
             "aterm-appcast.toml is missing — installed copies read it to find this release".into(),
         );
+    }
+    for name in crate::channel::SOURCE_ATTESTATION_ASSETS {
+        if !assets.contains_key(name) {
+            bad.push(format!(
+                "{name} is missing — the signed source manifest `pub publish` attaches \
+                 (`pub sign-release aterm` attaches it to a published release)"
+            ));
+        }
     }
     let retired: Vec<&String> = assets
         .keys()
@@ -2519,6 +2550,15 @@ impl Backend for Real {
         let attested = std::fs::read_to_string(self.repo.join("publish/.out/attestation.json"))
             .ok()
             .is_some_and(|t| attestation_promotes(&t, &c.commit));
+        let fixtures = match crate::fixtures::on_commit(&git, "origin/main", &c.version) {
+            Ok(Some(found)) => Answer::yes(format!(
+                "v{}'s handoff fixtures are on main ({} desks)",
+                c.version,
+                found.desks.len()
+            )),
+            Ok(None) => Answer::no(format!("v{}'s handoff fixtures are not on main", c.version)),
+            Err(e) => Answer::no(e.to_string()),
+        };
         Facts {
             cut: self.cut_journal(),
             engine: self.engine_rows(Some(&c.commit)),
@@ -2526,6 +2566,7 @@ impl Backend for Real {
             trusted,
             built,
             measured,
+            fixtures,
         }
     }
 
@@ -2709,6 +2750,106 @@ impl Backend for Real {
                 )
                 .detail(text.lines().skip(1).take(8).map(str::to_string))
             })
+    }
+
+    fn stage_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<String, Refusal> {
+        let pins = fixture_pins(c, reserved);
+        let root = fixture_root(&self.repo)?;
+        let log = self.log_path(self.step);
+        let this = &*self;
+        // a cold build of minutes, as the guard's: a forwarded child
+        let mut run = |cmd: &mut Command| -> std::io::Result<std::process::Output> {
+            scrub(cmd);
+            cmd.env("TRUST_STAGE2_BIN", &prover.bin);
+            let out = this.output_forwarded(cmd)?;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+            {
+                let _ = f.write_all(&out.stdout);
+                let _ = f.write_all(&out.stderr);
+            }
+            Ok(out)
+        };
+        crate::fixtures::stage(
+            &prover.bin.join("targo"),
+            &this.repo,
+            &root,
+            &pins,
+            &mut run,
+        )
+        .map(|staged| staged.words(&pins))
+        .map_err(|e| {
+            let text = e.to_string();
+            Refusal::new(
+                text.lines().next().unwrap_or("").to_string(),
+                format!(
+                    "fix it on main (targo --unverified test -p aterm-gui --lib -- {} with \
+                         the pins {} names), then {RELEASE_COMMAND} --commit origin/main",
+                    crate::fixtures::generator_args().join(" "),
+                    crate::gates::HANDOFF_FIXTURE_README
+                ),
+            )
+            .detail(text.lines().skip(1).take(8).map(str::to_string))
+        })
+    }
+
+    fn land_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<String, Refusal> {
+        let pins = fixture_pins(c, reserved);
+        let again = || {
+            format!(
+                "run {RELEASE_COMMAND} again, which lands them on the tip it finds (or add them \
+                 by hand: {}, \"By hand\")",
+                crate::gates::HANDOFF_FIXTURE_README
+            )
+        };
+        let git = self.git();
+        let fetched = crate::ledger::git_ok(&git, &["fetch", "origin", "main"]);
+        if fetched.is_ok()
+            && let Ok(Some(found)) = crate::fixtures::on_commit(&git, "origin/main", &c.version)
+        {
+            return Ok(crate::fixtures::Landed::Already {
+                tip: self
+                    .git_out(&["rev-parse", "origin/main"])
+                    .unwrap_or_default(),
+                desks: found.desks,
+            }
+            .words(&pins));
+        }
+        let root = fixture_root(&self.repo)?;
+        let mut words = Vec::new();
+        let staged = match crate::fixtures::staged(&root, &pins) {
+            Some(staged) => staged,
+            None => {
+                // the cache lost them: the cut tree is the release commit now, the same
+                // producer, so write them again before landing them
+                words.push(self.stage_fixtures(c, reserved, prover)?);
+                crate::fixtures::staged(&root, &pins).ok_or_else(|| {
+                    Refusal::new(
+                        format!(
+                            "v{}'s handoff fixtures were written and are gone",
+                            c.version
+                        ),
+                        again(),
+                    )
+                })?
+            }
+        };
+        let landed = crate::fixtures::land(&git, &staged, &pins, crate::ledger::MAX_CLAIM_ATTEMPTS)
+            .map_err(|e| Refusal::new(e.to_string(), again()))?;
+        words.push(landed.words(&pins));
+        Ok(words.join("; "))
     }
 
     fn audit(&mut self, machine_id: &str) -> Vec<Finding> {
@@ -3240,6 +3381,8 @@ mod tests {
             ("aterm-appcast.toml.sig", 100),
             ("aterm-machines.toml", 900),
             ("aterm-machines.toml.sig", 100),
+            ("SHA256SUMS", 680_000),
+            ("SHA256SUMS.sig", 64),
         ]
     }
 
@@ -3254,7 +3397,7 @@ mod tests {
         let mut seeded = lean();
         seeded[0].1 = 1_070_000_000;
         seeded.push(("aterm-0.6.0-x86_64.dmg", 9));
-        seeded.retain(|(n, _)| *n != "aterm-mac.zip.sha256");
+        seeded.retain(|(n, _)| *n != "aterm-mac.zip.sha256" && *n != "SHA256SUMS.sig");
         seeded[2].1 = 1;
         let bad = release_shape(&release(&seeded, "the batteries-included image"), "0.6.0");
         for needle in [
@@ -3263,6 +3406,7 @@ mod tests {
             "aterm-mac.zip.sha256 is missing",
             "retired macOS asset(s) present: aterm-0.6.0-x86_64.dmg",
             "describes a seeded download (batteries-included)",
+            "SHA256SUMS.sig is missing",
         ] {
             assert!(bad.iter().any(|p| p.contains(needle)), "{needle}: {bad:#?}");
         }

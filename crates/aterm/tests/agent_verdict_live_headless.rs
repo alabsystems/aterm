@@ -72,7 +72,14 @@ fn status_until(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("{what}: not within {within:?}; last status: {last}");
+    // The screen rides along: a status that never moves says nothing of whether
+    // the launch line was typed, echoed, run or failed.
+    let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
+    let tree = headless_boot::process_tree(inst);
+    panic!(
+        "{what}: not within {within:?}; last status: {last}\nscreen:\n{screen}\n\
+         processes under the instance (pid ppid stat wchan etime command):\n{tree}"
+    );
 }
 
 /// The fake worker: a Claude-shaped busy screen (transcript row, spinner,
@@ -515,6 +522,18 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let _ = sub.wait();
 }
 
+/// WHAT IT WRITES AT START (`x`, backspace, space, backspace: a cell written and
+/// erased in place, so the rows end as they were). The status sweep names a
+/// foreground group when it CHANGES and once more 500 ms later
+/// (`PROGRAM_NAME_CONFIRM`), then only when the screen moves. A launch that is silent
+/// until `go` gave a read made while `bash -c 'exec -a claude …'` was still between
+/// fork and exec (a loaded machine stretches that past 500 ms) nothing to be re-read
+/// on, so `program=` stood at the interpreter for the whole 60 s hang detector -
+/// seen in the gate and in stress rounds, reproduced by a 1.2 s `sleep` before the
+/// `exec`. A real Claude Code moves the screen the moment it runs; this does too. (A
+/// cursor-only move does not: it leaves the screen's sequence number alone and the
+/// sweep never looks.)
+///
 /// A fake Claude Code LAUNCH, drawn as 2.1.283 draws one (measured frame by
 /// frame on 2026-09-26: aterm-phase's `LAUNCH_*` fixtures): nothing of it on
 /// the screen — the shell's rows stand, as they do between the launch (or
@@ -525,6 +544,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
 /// keeps it (measured with the cursor on 2026-09-27).
 const FAKE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
+printf 'x\b \b'
 rule=$(printf '%120s' '' | sed 's/ /─/g')
 while [ ! -e "$go" ]; do sleep 0.05; done
 printf '\033[?1049h\033[2J\033[H'
@@ -533,6 +553,8 @@ printf '\033[4;3H'
 while :; do sleep 1; done
 "#;
 
+/// (It writes the same start-up cell as [`FAKE_LAUNCH`], for the same reason.)
+///
 /// The same launch under Claude Code's INLINE renderer (its classic
 /// main-screen one, measured on 2.1.283 on 2026-09-26: aterm-phase's
 /// `INLINE_*` fixtures): the REPL drawn on the MAIN grid under the launch
@@ -543,6 +565,7 @@ while :; do sleep 1; done
 const FAKE_INLINE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 quit="$2"
+printf 'x\b \b'
 rule=$(printf '%120s' '' | sed 's/ /─/g')
 while [ ! -e "$go" ]; do sleep 0.05; done
 printf ' Claude Code v2.1.283\n\n%s\n❯ \n%s\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n' "$rule" "$rule"

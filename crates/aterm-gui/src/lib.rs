@@ -29378,9 +29378,9 @@ fn warm_prologue(
 /// review) — the caller puts it back once session 0 has spawned. `None`, and the
 /// factory untouched, for every other launch: a person's `-e` runs in its first tab.
 fn withhold_bootstrap_payload(
-    exec_command: &mut Option<Vec<String>>,
+    exec_command: &mut Option<Vec<std::ffi::OsString>>,
     relaunch_of_running: bool,
-) -> Option<Vec<String>> {
+) -> Option<Vec<std::ffi::OsString>> {
     if relaunch_of_running {
         exec_command.take()
     } else {
@@ -34757,7 +34757,7 @@ pub(crate) mod test_log {
 mod relaunch_payload_tests {
     #[test]
     fn only_an_updates_relaunch_withholds_the_bootstrap_payload() {
-        let payload = Some(vec!["./deploy.sh".to_string()]);
+        let payload = Some(vec![std::ffi::OsString::from("./deploy.sh")]);
         let mut factory = payload.clone();
         assert_eq!(super::withhold_bootstrap_payload(&mut factory, false), None);
         assert_eq!(

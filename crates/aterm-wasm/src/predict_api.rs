@@ -9,8 +9,11 @@
 //! 1. [`predict_char`](AtermTerminal::predict_char) /
 //!    [`predict_backspace`](AtermTerminal::predict_backspace) on the keydown
 //!    whose bytes the host writes to the PTY, and
-//!    [`predict_line_submit`](AtermTerminal::predict_line_submit) on Enter
-//!    (the submit boundary — the password-prompt safety seam),
+//!    [`predict_line_submit`](AtermTerminal::predict_line_submit) on a key that
+//!    writes a line terminator (Enter in any spelling, Ctrl+J, Ctrl+M), and
+//!    [`predict_unmodelled_input`](AtermTerminal::predict_unmodelled_input) on
+//!    EVERY other key whose bytes reach the PTY and on a paste (the epoch
+//!    boundaries — the password-prompt safety seam),
 //! 2. [`predict_reconcile`](AtermTerminal::predict_reconcile) after `process()`
 //!    applies a chunk of child output to the grid,
 //! 3. [`predict_overlay`](AtermTerminal::predict_overlay) when composing a
@@ -70,13 +73,14 @@ impl AtermTerminal {
         }
         let cur = self.term.cursor();
         let cols = self.term.grid().cols();
+        let coords = self.term.content_scroll_state().coordinate_generation();
         self.predict
-            .predict_char(ch, (cur.row, cur.col), cols, Instant::now())
+            .predict_char(ch, (cur.row, cur.col), coords, cols, Instant::now())
     }
 
     /// Register a Backspace: cancels our OWN trailing guess only (erasing
-    /// already-committed real content is left to the program's echo). Returns
-    /// whether state changed.
+    /// already-committed real content is left to the program's echo, and ends
+    /// the confirmation epoch). Returns whether a guess was cancelled.
     pub fn predict_backspace(&mut self) -> bool {
         if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
             self.predict.reset();
@@ -85,16 +89,31 @@ impl AtermTerminal {
         self.predict.predict_backspace(Instant::now())
     }
 
-    /// Register a plain Enter (the SUBMIT boundary — call when the host writes
-    /// the line terminator to the PTY). Ends the confirmation epoch: the NEXT
-    /// line must re-confirm an echo before `adaptive` displays anything.
-    /// LOAD-BEARING for password safety on a terminal scrolled to the bottom,
-    /// where the cursor REUSES one physical row across logical lines: without
-    /// it, a non-echoing password prompt landing on the same row as a just-
-    /// confirmed command would inherit that confirmation and flash the secret
-    /// (the native `note_line_submit` seam). Cheap no-op when nothing pends.
+    /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's
+    /// LF), Ctrl+J, Ctrl+M — not Alt+Enter, whose ESC prefix makes it any other
+    /// key. Ends the confirmation epoch: nothing typed after it displays
+    /// (`adaptive`) until an echo is confirmed again. LOAD-BEARING for password
+    /// safety: a password typed ahead of the prompt that follows still sits on
+    /// the proven row. The line's own unechoed tail keeps painting until its echo
+    /// (the native `note_line_submit` seam). Cheap.
     pub fn predict_line_submit(&mut self) {
         self.predict.note_line_submit();
+    }
+
+    /// Register any OTHER key the host did not hand to
+    /// [`predict_char`](Self::predict_char) /
+    /// [`predict_backspace`](Self::predict_backspace) — Tab, an arrow, a control
+    /// or Alt chord, an IME commit — and a paste: call when its bytes go to the
+    /// PTY. Ends the confirmation epoch like
+    /// [`predict_line_submit`](Self::predict_line_submit), and also retires the
+    /// guesses in flight: the key may erase them (Ctrl+W, Ctrl+H), and a guess
+    /// left over the erased cell is a ghost of the erased text. Which keys submit
+    /// a line is the program's call, so this is the seam for every key that is
+    /// not a terminator (the native `note_unmodelled_input`). Cheap.
+    pub fn predict_unmodelled_input(&mut self) {
+        // ICF barrier (see `predict_reset`): keep this export's body distinct.
+        std::hint::black_box(2u8);
+        self.predict.note_unmodelled_input();
     }
 
     /// Reconcile pending guesses against the grid — call after `process()`
@@ -129,8 +148,11 @@ impl AtermTerminal {
         // aterm-gui already carries; the wasm binding never received it.
         let mut scratch = std::mem::take(&mut self.pred_row_scratch);
         let mut cached: Option<u16> = None;
+        // Rows that moved under the guesses (output scrolled the screen) retire
+        // them and their epoch inside the predictor.
+        let coords = self.term.content_scroll_state().coordinate_generation();
         let (term, predict) = (&self.term, &mut self.predict);
-        predict.reconcile(Some((cur.row, cur.col)), no_echo, now, |r, c| {
+        predict.reconcile(Some((cur.row, cur.col)), coords, no_echo, now, |r, c| {
             if cached != Some(r) {
                 term.render_row_into(r as usize, &mut scratch);
                 cached = Some(r);
@@ -182,12 +204,13 @@ impl AtermTerminal {
     /// changed (`resize` calls this automatically). The confirmation epoch is
     /// forgotten, while this session's learned link RTT remains useful.
     pub fn predict_reset(&mut self) {
-        // ICF barrier: `reset` and `note_line_submit` currently compile to identical
-        // bodies, and LLVM MergeFunctions folds the two exported shims — after which
-        // wasm-bindgen binds BOTH JS methods to the one surviving export (observed:
-        // generated glue called predict_line_submit from predict_reset). Harmless
-        // while semantics coincide; a silent misroute the day they diverge. black_box
-        // keeps this shim's body distinct so the exports stay separate.
+        // ICF barrier: `reset`, `note_line_submit` and `note_unmodelled_input` could
+        // compile to identical bodies, and LLVM MergeFunctions folds the exported
+        // shims — after which wasm-bindgen binds BOTH JS methods to the one surviving
+        // export (observed: generated glue called predict_line_submit from
+        // predict_reset). Harmless while semantics coincide; a silent misroute the
+        // day they diverge. black_box keeps this shim's body distinct so the exports
+        // stay separate.
         std::hint::black_box(0u8);
         self.predict.reset();
     }
@@ -371,13 +394,37 @@ mod tests {
         t.predict_line_submit();
         assert!(
             t.predict_overlay().is_empty(),
-            "submit flushes pending guesses"
+            "a fast link paints nothing, before or after the submit"
         );
         assert!(t.predict_char('s'), "the password keystroke is tracked…");
         assert!(
             t.predict_overlay().is_empty(),
             "…but never displayed on the unconfirmed new line (no leak)"
         );
+    }
+
+    #[test]
+    fn only_a_line_terminator_carries_the_guesses_in_flight() {
+        // The two boundary exports differ in what they do to the pixels already
+        // painted: a terminator keeps the line's unechoed tail, any other key
+        // (Ctrl+W, Ctrl+H) may have erased it and retires it.
+        let Some(mut t) = terminal() else {
+            return;
+        };
+        t.set_predictive_echo("always");
+        assert!(t.predict_char('a'));
+        t.predict_line_submit();
+        assert_eq!(
+            t.predict_overlay(),
+            vec![0, 0, u32::from('a')],
+            "Enter keeps the tail on glass"
+        );
+        t.predict_unmodelled_input();
+        assert!(
+            t.predict_overlay().is_empty(),
+            "a key that may have erased the tail retires it"
+        );
+        assert!(t.predict_next_deadline_ms().is_none(), "nothing left armed");
     }
 
     #[test]

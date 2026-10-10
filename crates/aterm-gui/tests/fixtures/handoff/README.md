@@ -106,7 +106,7 @@ lenient (law L3 of the 2026-09-22/23 audit).
 | `seamless-<pid>-<nonce>.h<id>.heldgrid` / `.heldalt` | Each held pane's main and inactive grid sidecars, exactly as written (from v0.100.0, for a pane kept open after its command exited). |
 | `seamless-<pid>-<nonce>.h<id>.hist` / `.h<id>.ctl` | Each held pane's history-carry and control-carry sidecars, exactly as written (from v0.101.0). |
 | `s<id>.meta.json` | A copy of the meta JSON the manifest embeds for session `<id>`, extracted so it can be reviewed. The guard checks that it equals the embedded copy. |
-| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). From v0.97.0 the parent also records `park_carry_ceiling` (the ceiling the park captured under, from the successor's handoff policy), and each session row `rung` (the `CarryRung` the ladder carried it at: `full` or `stripped-links`, and on a policy desk `visible-only` or `repaint`) and `links_stripped` (how many of its lines lost their OSC 8 links), and from v0.98.0 `history_links_stripped` (how many lines of its `.hist` sidecar the export wrote with their OSC 8 links dropped). The policy desks (v0.97.0's, which `generator-v0.97.0-policy.rs.txt` wrote, and v0.98.0's, which `generator.rs.txt` wrote) add `repaint` (whether the producer flagged the session for a redraw) and `history_dropped` (the lines of its history this hop leaves behind, counted) on each row, and v0.98.0's parents record `park_carry_ceiling` as the policy's `visible` or `repaint`. The guard checks the v0.94.0 fields (`history_take`, `history_lost`, `fg_holder`) against the manifest and the sidecar's bytes, and against what this build takes and imports; the v0.95.0 fields against the checkpoint this build reassembles from the meta; and `repaint` and `history_dropped` against what this build adopts and imports (a row without them repaints nothing and drops nothing). It does not read `park_carry_ceiling`, `rung`, `links_stripped` or `history_links_stripped`. From v0.100.0 the parent also records each held pane (`[[held]]`): its `local_id`, `rows`, `cols`, `alt_grid` and how its command ended (`exit_code` or `exit_signal`), which the guard checks against what this build shows. From v0.101.0 each session row also records `output_state` (whether the meta carries the engine's in-flight output state) and, for a session that owes it, `render_debt` (`"<shift>,<pushed>"`), and each held pane `sid`, `history_take` (the lines its `.h<id>.hist` sidecar carries), `history_dropped`, `control` (whether it names a `.h<id>.ctl` sidecar) and `failure_seen`. The guard checks all of them but `history_dropped` against what this build adopts and shows (a row without `render_debt` owes nothing). |
+| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). From v0.97.0 the parent also records `park_carry_ceiling` (the ceiling the park captured under, from the successor's handoff policy), and each session row `rung` (the `CarryRung` the ladder carried it at: `full` or `stripped-links`, and on a policy desk `visible-only` or `repaint`) and `links_stripped` (how many of its lines lost their OSC 8 links), and from v0.98.0 `history_links_stripped` (how many lines of its `.hist` sidecar the export wrote with their OSC 8 links dropped). The policy desks (v0.97.0's, which `generator-v0.97.0-policy.rs.txt` wrote, and v0.98.0's, which that release's `generator.rs.txt` wrote; both in git history) add `repaint` (whether the producer flagged the session for a redraw) and `history_dropped` (the lines of its history this hop leaves behind, counted) on each row, and v0.98.0's parents record `park_carry_ceiling` as the policy's `visible` or `repaint`. The guard checks the v0.94.0 fields (`history_take`, `history_lost`, `fg_holder`) against the manifest and the sidecar's bytes, and against what this build takes and imports; the v0.95.0 fields against the checkpoint this build reassembles from the meta; and `repaint` and `history_dropped` against what this build adopts and imports (a row without them repaints nothing and drops nothing). It does not read `park_carry_ceiling`, `rung`, `links_stripped` or `history_links_stripped`. From v0.100.0 the parent also records each held pane (`[[held]]`): its `local_id`, `rows`, `cols`, `alt_grid` and how its command ended (`exit_code` or `exit_signal`), which the guard checks against what this build shows. From v0.101.0 each session row also records `output_state` (whether the meta carries the engine's in-flight output state) and, for a session that owes it, `render_debt` (`"<shift>,<pushed>"`), and each held pane `sid`, `history_take` (the lines its `.h<id>.hist` sidecar carries), `history_dropped`, `control` (whether it names a `.h<id>.ctl` sidecar) and `failure_seen`. The guard checks all of them but `history_dropped` against what this build adopts and shows (a row without `render_debt` owes nothing). |
 
 The bytes are unchanged with one exception. The manifest names each grid
 sidecar by its absolute path in the producer's private directory, and the
@@ -152,7 +152,7 @@ desk for the shape v0.92.0 changed:
 
 Added after v0.94.0's, from the v0.93.0 tag (73a9b424007d), because installs
 of v0.93.0 still hand off to every later release. `generator-v0.93.0.rs.txt`
-is the exact code that wrote them. v0.93.0's producer sits between the other
+(git history, at 86b918a4e) is the exact code that wrote them. v0.93.0's producer sits between the other
 two:
 
 - Its capture is already the producer ladder: `carry_for_wire` for each
@@ -262,7 +262,8 @@ The new desk:
   checkpoint carries none of the shell's history, and the marks it carries
   sit on the saved primary.
 
-`generator-v0.95.0.rs.txt` is the exact code that wrote them.
+`generator-v0.95.0.rs.txt` (git history, at 86b918a4e) is the exact code that
+wrote them.
 
 ## The v0.97.0 desks
 
@@ -273,7 +274,8 @@ was never cut (`RELEASES.ledger` has no build for it and origin has no tag),
 so no install runs its producer.
 
 Two generators ran at the v0.97.0 tag. The `generator.rs.txt` of that time
-(bf99347d0) wrote the nine desks. `generator-v0.97.0-policy.rs.txt`, written
+(bf99347d0) wrote the nine desks. `generator-v0.97.0-policy.rs.txt` (git
+history, at 86b918a4e), written
 independently, wrote the same shapes plus the two policy desks. Only its `policy-visible` and
 `policy-repaint` are checked in: its own copies of the other desks are the
 same shapes as the first generator's, and its `stripped-links` desk is the
@@ -490,12 +492,13 @@ The new desk:
 
 The same thirteen desks, written by v0.101.0's producer. No shape v0.101.0
 changed needs a desk of its own: each one is carried by a desk that already
-stands for it, so `REQUIRED_DESKS` is unchanged. `generator.rs.txt` is the
-v0.101.0 generator, the one that writes all thirteen desks, and the template
-for the next release; its header lists what changed from v0.100.0's. It ran
-once at the v0.101.0 tag (8ed1063a8dff) with `SOURCE_DATE_EPOCH=1791501389`
-and both commit pins, and v0.101.0's own consumer adopted every desk exactly,
-including each held pane's history import.
+stands for it, so `REQUIRED_DESKS` is unchanged. The v0.101.0 generator, the
+one that writes all thirteen desks, is in git history as `generator.rs.txt`
+before v0.102.0's replaced it; its header lists what changed from v0.100.0's.
+It ran once at the v0.101.0 tag (8ed1063a8dff) with
+`SOURCE_DATE_EPOCH=1791501389` and both commit pins, and v0.101.0's own
+consumer adopted every desk exactly, including each held pane's history
+import.
 
 v0.101.0's capture ladder, worker order and history carry for the handed
 sessions are v0.100.0's. Every handed session's grid, control and history
@@ -563,7 +566,7 @@ link dropped, as on the screen. v0.101.0's own consumer kept those links
 clickable, so `h2.hist`'s two links and `h3.hist`'s one are checked against
 this build's consumer only.
 
-As a template, `generator.rs.txt` predates one API change. Since 08ec7b748
+As a template, v0.101.0's generator predates one API change. Since 08ec7b748
 (2026-10-08) the build stamp is `aterm_types::version::BuildStamp`, installed
 with `aterm_types::version::install`. `crate::build_info` no longer exports
 `BuildStamp` or `install_build_stamp`, so `fx_install_release_stamp` does not
@@ -581,10 +584,82 @@ fields, and each one is what the release's shipped binary stamps:
   `true`. About and `aterm ctl version` on that binary show them.
 
 The git fields and `build_number` come from the same three pins as before.
+v0.102.0's generator made this change.
 
 `rendezvous.toml` is v0.100.0's transport: the same claim frame, grant header,
 body and descriptor order. Only the identity fields differ: the producer, the
 target, the birth record, the device terms and the proof over them.
+
+## The v0.102.0 desks
+
+The same thirteen desks, written by v0.102.0's producer. No shape v0.102.0
+changed needs a desk of its own, so `REQUIRED_DESKS` is unchanged.
+The v0.102.0 generator, the one that writes all thirteen desks, is in git
+history as `generator.rs.txt` (at 86b918a4e); its header lists what changed
+from v0.101.0's. It is the last one adapted by hand at a tag: from it the
+generator moved into the tree, its per-release inputs derived, and the release
+cut runs it ("How a release adds its fixtures"). It ran once at the v0.102.0 tag (2071fe140d49) with
+`SOURCE_DATE_EPOCH=1791603642` and both commit pins, and v0.102.0's own
+consumer adopted every desk exactly, including each held pane's history
+import.
+
+v0.102.0's capture ladder, worker order, history carry, control carry and
+writer are v0.101.0's. Every grid, control, history and layout sidecar of
+every desk, the held panes' included, is byte for byte the one v0.101.0
+wrote. Only the metas (and with them each manifest, its digests and the
+proof) moved:
+
+- Every meta, the held panes' included, carries one more mode key,
+  `"win32_input_enabled":false`: the console-host capability
+  (`TerminalModes::win32_input_enabled`, serde-default), which a Unix
+  session's posture leaves off (`Terminal::set_console_host_posture`).
+  Beyond it a meta changed only in the shell marks' wall-clock times
+  (`*_time_ms`: `colour-and-shell` s0 and s1, `shell-integration` s0 and s1,
+  `policy-visible` s1), and in one value below.
+- The DECSC slot follows its text across a resize (`Grid::lend_saved_cursor`,
+  xterm's `AdjustSavedCursor`). `incident-55x149`'s Claude Code saved its
+  cursor from the prompt on row 55 of 56, and the message band's one-row
+  shrink demotes the saved primary's top row into history. Its
+  `saved_cursor_main` is now row 54, after `$ claude`, where v0.101.0's stayed
+  on row 55, a row the 55-row grid no longer has. A slot a shrink still
+  leaves past the grid (one on a blank row the shrink trims) is the shape
+  every earlier release's `incident-55x149` carries, so the guard keeps
+  checking this build admits it, and no desk is added for it. The render
+  debt (`-1,0`) is unchanged.
+- The release's own inputs: the successor is build 1791700000, newer than
+  v0.102.0 (`proof_target_build`), the update row reads
+  `Installing aterm v0.103.0`, and the policy desks' successor seals its
+  `[[ranges]]` rescue for v0.102.0's build (1791603642).
+
+v0.102.0 also changed, without reaching these bytes: its consumer imports a
+held pane's scrollback with every link dropped, as on the held screen
+(`handoff_history::import`'s `held_pane`), and the generator's self-check
+restores each held pane as `App::restore_held_leaf` now does
+(`held_pane_session`, then `held_pane_history`) and asserts exactly that; the
+park notes which messages its window carry took (`park_window_carry`) and
+Commit closes the others as ended with the parent (`close_uncarried_messages`,
+ruling 441 (d)); the screen capture reads a continued row at its history
+length (`checkpoint_lines`), which changes no row here; and an agent leaf
+names the Claude home and login it ran under (`AgentRestore::home`,
+`::login`), which no handoff leaf carries. `parent.toml` records nothing new,
+so the guard checks nothing new: the slot and the mode key are inside each
+meta, which the guard holds byte for byte and inside the screen digest.
+
+The generator installs `aterm_types::version::BuildStamp` now
+(`fx_install_release_stamp`). Its git fields and build number come from the
+three pins, and `producer_version` is read from it (`build_info::version()`)
+rather than spelled. Its compiler fields are the v0.102.0 cut's, read off the
+shipped arm64 slice (`strings` of `lipo -thin arm64` of the cut's
+`aterm.app/Contents/MacOS/aterm`: the version line `rustc 1.99.0-dev
+(321aaeda7 2026-09-17) (trustc 0.1.0)`, commit
+`321aaeda75478038420d97830f14724c33c8dc39`, Trust `0.1.0`), with host
+`aarch64-apple-darwin`, the `release` profile, the `--unverified` lane's
+`trust_verify = "off"` and `release_build = true`. None of those reaches a
+fixture byte.
+
+`rendezvous.toml` is v0.101.0's transport: the same claim frame, grant
+header, body, descriptor order and device terms. Only the producer, the
+target, the birth record and the proof over them differ.
 
 ## The rendezvous transport
 
@@ -638,185 +713,123 @@ For every release in `PINNED_RENDEZVOUS` it asserts that:
 Changing `CLAIM_MAGIC` to `ATRZ2C`, or pushing the Commit end before the
 readiness end, turns it red.
 
-All nine releases with fixtures are pinned: v0.91.0, v0.92.0, v0.93.0,
-v0.94.0, v0.95.0, v0.97.0, v0.98.0, v0.100.0 and v0.101.0 (v0.96.0 and
-v0.99.0 were never cut). Each file was
-written by the capture at the end of `generator.rs.txt`, appended on its own to
+All ten releases with fixtures are pinned: v0.91.0, v0.92.0, v0.93.0,
+v0.94.0, v0.95.0, v0.97.0, v0.98.0, v0.100.0, v0.101.0 and v0.102.0 (v0.96.0 and
+v0.99.0 were never cut). Through v0.102.0 each file was written by the
+capture at the end of that release's generator, appended to
 `seamless_carry_tests.rs` in a worktree at the tag and run with the tag's
-commit and ledger build number (step 3 below). Through v0.100.0 every API it
+commit and ledger build number; from v0.103.0 the release's cut writes it
+("How a release adds its fixtures"). The guard pins every release
+`PINNED_DESKS` pins. Through v0.100.0 every API it
 used was present from v0.91.0 on. v0.101.0's parent also checks the
 dialler's code, so its `accept_claim` takes a `DialerCode`, and the capture
 passes `DialerCode::this_process()`. Only the target, birth record, device
 terms and proof differ between the files.
 
-## Adding the next release's fixtures
+## How a release adds its fixtures
 
-Do this once for each release, after its tag exists (see docs/RELEASING.md,
-"Every release adds its handoff fixtures").
+`targo --unverified ship release` does it. There is no hand step.
 
-`ship cut` enforces it, before the claim, in two gates
-(`crates/aterm-release/src/gates.rs`):
+THE GENERATOR is `crates/aterm-gui/src/seamless_fixture_generator_tests.rs`, a child
+of the carry tests (`seamless::carry_tests::fixture_generator`), compiled into
+every `targo --unverified test -p aterm-gui --lib` build. It calls the
+release's own policy reader, capture ladder, history carry, writer and
+consumer, so a producer change that breaks it fails to compile instead of
+rotting, and each release's tree carries the generator that matches its
+producer. Its two tests are `#[ignore]`d and run only by name:
+`generate_handoff_fixtures` writes every desk in `REQUIRED_DESKS`, and
+`generate_rendezvous_fixture` (macOS) writes `rendezvous.toml` with the
+guard's own capture (`capture_transport`). Each self-checks: the release's own
+consumer must adopt every desk exactly, held panes and history imports
+included.
 
-- `gates::handoff_fixture_gate` refuses unless this release's directory
-  exists, at least one desk in it holds a `parent.toml`, and `PINNED_DESKS`
-  has a row for it. The rows must also cover every desk in `REQUIRED_DESKS`
-  whose floor is at or below this release: one pinned desk is no longer
-  enough. The gate reads both tables from the source of
-  `seamless_fixture_tests.rs`, so keep them in their shape: one
-  `("vX.Y.0", "<desk>")` pair per row. In `PINNED_DESKS` the release is the
-  one whose fixtures hold the desk; in `REQUIRED_DESKS` it is the desk's
-  floor, the first release that must write it. `targo --unverified ship release`
-  asks the cut's own gate before anything is staged.
-- `gates::handoff_fixture_guard_gate` runs the guard itself in the cut tree
-  (`targo --unverified test -p aterm-gui --lib` filtered to
-  `seamless::fixture_tests::`, in its own target directory), and refuses on a
-  failing test, or when no test ran.
+Nothing in it is edited per release. Every release input is derived at run
+time:
 
-"This release" is the newest version in `RELEASES.ledger`, other than the one
-being cut, whose `vX.Y.0` tag is on origin. So a recut asks for the same
-directory as its first attempt, and a claim that was abandoned and then
-skipped is passed over for the release before it. The fixtures can only come
-from the tag, so add them while it is fresh. A `--dry-run` of the next cut
-shows whether they are in.
+- `ATERM_BUILD_GIT_COMMIT` (12 digits), `ATERM_BUILD_GIT_COMMIT_FULL` and
+  `SOURCE_DATE_EPOCH`: the release commit the tag names and the ledger's build
+  number, the pins the release build hands `crates/aterm/build.rs`
+  (`aterm-release`'s `buildplan`). `fx_install_release_stamp` installs the
+  stamp the shipped binary carries, so `producer_version`, `producer_commit`
+  and each manifest's `outgoing_build` are the release's. It refuses to run
+  without them.
+- The version: the tree's `[workspace.package] version`.
+- The stamp's compiler: `trustc -vV` of `$TRUST_STAGE2_BIN` (the release's
+  prover), else of the `trustc` on PATH; the `release` profile, the
+  `--unverified` lane's `off` and `release_build`. None of these reaches a
+  fixture byte.
+- The successor: a build a day newer than the release (`fx_target_build`,
+  `proof_target_build`), at the next MINOR (`fx_successor_version`: the update
+  row reads `Installing aterm vX.(Y+1).0`), verified an hour after it was built.
+- The policy desks' `[[ranges]]` rescue names the release's own build.
 
-1. Make a worktree at the tag, outside the repo tree. The `.noindex` suffix
-   keeps Spotlight out of it:
+THE CUT (`crates/aterm-release/src/fixtures.rs`):
 
-   ```sh
-   git worktree add --detach ~/aterm-vX.Y.0.noindex vX.Y.0
-   ```
+1. Step 9 (`preflight`), once step 7 has reserved the release's identity
+   (build n and the release commit C) and before anything is staged, published
+   or claimed: both tests run in the cut tree, `targo --unverified test -p
+   aterm-gui --lib -- generate_handoff_fixtures generate_rendezvous_fixture
+   --ignored --test-threads 1` in `target-fixture-guard` (removed after), with
+   C's and n's pins and the prover's `TRUST_STAGE2_BIN`, into the release cache
+   (`<clone>-release.noindex/handoff-fixtures/vX.Y.0-<n>-<C12>/`, outside the
+   clone). A failing test, a desk `REQUIRED_DESKS` asks of the release left
+   out, a missing `rendezvous.toml`, or a desk not written as C and n refuses
+   the release with nothing claimed or published. A re-run that finds the
+   identity staged runs nothing; a reservation the ledger passed, reserved
+   anew, is written afresh.
+2. Step 13 (`after-cut`), once the cut has published the release: one commit
+   on origin/main's tip adds `vX.Y.0/` and its `("vX.Y.0", "<desk>")` rows in
+   `PINNED_DESKS`, pushed as a fast-forward of main, the compare-and-swap. A
+   lost race rebuilds the commit on the new tip (five tries, as the ledger
+   claim); any other push failure refuses the step, and running the release
+   again lands what is staged. A tip whose fixtures for the release already
+   pass the next cut's gate is left alone. A tip holding `vX.Y.0/` in a shape
+   that gate refuses is someone's work and is never overwritten. If the cache
+   lost the staging, step 13 writes it again first, from the cut tree.
 
-   If its `target` is a dangling symlink, `mkdir -p target.noindex` inside it.
-   A worktree does not check out submodules. Check out the tag's own
-   `vendor/astream`:
+`--dry-run` says what both steps would do.
 
-   ```sh
-   git -C ~/aterm-vX.Y.0.noindex submodule update --init vendor/astream
-   ```
+The rendezvous guard pins every release `PINNED_DESKS` pins, so a release adds
+its rows in that one table (until 2026-10-10 a second table,
+`PINNED_RENDEZVOUS`, listed them again).
 
-   A symlink to the main tree's checkout is right
-   only when `git ls-tree <tag> vendor/astream` names the same commit as the
-   main tree.
-2. Append `generator.rs.txt` (in this directory) to that worktree's
-   `crates/aterm-gui/src/seamless_carry_tests.rs`, and adapt it to that
-   release's API:
-   - `fx_capture` must be that release's own capture path. The template
-     copies v0.101.0's fork lane. The pool is walked in session-id order.
-     Each session is carried by `carry_for_wire_within` under the park's
-     policy ceiling, at the budgets `App::capture_parked_screens` prices. A
-     partial sequence no carry holds, or one the carry would only swallow
-     that is not a picture, is carried only over a quiet PTY. Every session's
-     control carry is taken (without the differ's state below a rung that
-     keeps the screen), and so is the render debt of a carried alternate
-     screen. Then `settle_wire_carries` runs over the pool. Last come the
-     held panes (`fx_capture_held`, `App::capture_held_screens`), each with
-     its sid, its scrollback's fence and its control carry. The repaint set
-     is the sessions whose rung has `CarryRung::needs_repaint`. If the
-     release changed the capture, copy the change.
-   - `fx_write` must run the release's own steps in its order. In v0.101.0
-     that is:
-     1. the policy read (`fx_park_policy`: the release's checked-in
-        `publish/handoff-policy.toml` read out of a bundle, or a successor's
-        `[[ranges]]` rescue for a policy desk);
-     2. the PTYs, the capture, and the records stamped with the foreground
-        holders and render debts;
-     3. the layout, folded into the caps and committed
-        (`commit_handoff_layout`);
-     4. the fork lane's history plan (`HistoryPlan::deferred_under`, over
-        the handed sessions and the held panes);
-     5. the worker: its policy check, its layout round trip, the control
-        carry's export (`export_for`, with the turn-id count it writes as
-        `next_turn_id`), the history carry's export with the held panes'
-        exports taken out (`take_held`), and `stamp_manifest`;
-     6. `write_outgoing_with_held`, then the layout sidecar
-        (`handoff_diet::seal_layout`).
-   - Give every record field and layout leaf field the release added a value
-     that a real session would carry, and keep the generator's self-check
-     passing.
-   - Write every desk in `REQUIRED_DESKS`: the thirteen desks
-     `generator.rs.txt` writes, the two policy desks among them, each parked
-     under the ceiling its desk names (`fx_park_policy`). Each session names
-     the rung its desk stands for. Add a desk for any shape the release
-     changed, and add it to `REQUIRED_DESKS` with this release as its floor,
-     `("vX.Y.0", "<desk>")`, so this release and every later one must write
-     it. Never move an existing row's floor, and never give a new row an
-     earlier floor than the release that first writes it. The fixtures of the
-     releases before it are frozen and can never gain the desk.
-   - Build each layout the way `App::capture_manifest` does, with the legacy
-     mirrors (`tabs`, `native_tabs`, `tab_order`) and, on macOS, `show` beside
-     `restored_tabs`, or take it from a real `capture_handoff_layout` on a
-     headless `App`. Through v0.98.0 `fx_window` built `restored_tabs` only;
-     from v0.100.0 it derives the mirrors and `show` from the tabs it is
-     given, and from v0.101.0 each window's `inner_px` (`fx_inner_px`).
-3. Run the generator, still in the worktree:
+A release that changes its producer's shape changes the generator in the same
+commit, adds a desk for the shape to `REQUIRED_DESKS` with itself as the floor,
+`("vX.Y.0", "<desk>")`, and says what changed in a section of its own here.
+Never move an existing row's floor, and never give a new row an earlier floor
+than the release that first writes it: the fixtures of the releases before it
+are frozen and can never gain the desk. Build each layout the way
+`App::capture_manifest` does (`fx_window`), and give every record field the
+release adds a value a real session would carry.
 
-   ```sh
-   ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
-   ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
-   SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
-   ATERM_HANDOFF_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
-     targo --unverified test -p aterm-gui --lib -- generate_handoff_fixtures --ignored
-   ```
+### By hand
 
-   It refuses a desk that the release's own capture would not park, or that
-   its own consumer would not adopt exactly.
+For a release whose cut did not write them (one cut by an older cutter), run
+the release's own generator at its tag, in a worktree under `~/Developer`
+(AGENTS.md), never in the shared checkout:
 
-   The three pins are the release's build stamp. Since 2026-10-05 the stamp
-   is the binary's (`crates/aterm/build.rs` emits it and `main` installs it).
-   This library's test binary reads a fixed test stamp instead (build
-   3000000000, commit `7e57b1d0c0de`), and no compile-time variable reaches
-   it. So the generator reads the pins at run time and installs what the
-   shipped binary's build script stamped from them
-   (`fx_install_release_stamp`, first, before anything reads provenance).
-   It refuses to run without them. At a tag that contains 08ec7b748, rewrite
-   `fx_install_release_stamp` for `aterm_types::version` first. The v0.101.0
-   section says how.
-   - The commit pins keep `producer_commit` the release's commit. They reach
-     no fixture byte except that `parent.toml` field and the rendezvous
-     record's target and the proof over it. The tag is annotated, so take the commit it points at
-     (`git rev-parse 'vX.Y.0^{commit}'`, and `--short=12` for the short
-     one), not the tag object's own sha.
-   - `SOURCE_DATE_EPOCH` makes the build number the one the release was cut
-     with. Each manifest's `outgoing_build` is then what the shipped binary
-     writes, and the wire caps and history export judge the hop from that
-     build.
+```sh
+git worktree add --detach ~/Developer/aterm-vX.Y.0.noindex vX.Y.0
+git -C ~/Developer/aterm-vX.Y.0.noindex submodule update --init vendor/astream
+git worktree add -b test/handoff-fixtures-vXY0 ~/Developer/aterm-wt-fxXY0 origin/main
+cd ~/Developer/aterm-vX.Y.0.noindex
+OUT=~/Developer/aterm-wt-fxXY0/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0
+ATERM_BUILD_GIT_COMMIT=$(git rev-parse --short=12 'vX.Y.0^{commit}') \
+ATERM_BUILD_GIT_COMMIT_FULL=$(git rev-parse 'vX.Y.0^{commit}') \
+SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
+ATERM_HANDOFF_FIXTURE_OUT=$OUT ATERM_RENDEZVOUS_FIXTURE_OUT=$OUT \
+  targo --unverified test -p aterm-gui --lib -- \
+  generate_handoff_fixtures generate_rendezvous_fixture --ignored --test-threads 1
+```
 
-   A generator that predates the runtime stamp (v0.100.0's and older) takes
-   only the two compile-time pins, and run on a tag after 2026-10-05 it
-   writes the test stamp's build.
-   Then write the release's `rendezvous.toml` with the rendezvous capture, the
-   section at the end of `generator.rs.txt` (from `THE RENDEZVOUS TRANSPORT
-   CAPTURE` on). Append that section alone, with `fx_rfc3339` and
-   `fx_install_release_stamp`, if the desk generator is not appended, and run
-   it the same way:
-
-   ```sh
-   ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
-   ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
-   SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
-   ATERM_RENDEZVOUS_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
-     targo --unverified test -p aterm-gui --lib -- generate_rendezvous_fixture --ignored
-   ```
-
-   It refuses a build whose commit is not the tag's 12 digits and a descriptor
-   it cannot identify.
-4. In the main tree, add the new `(release, desk)` rows to `PINNED_DESKS` and
-   the `"vX.Y.0"` row to `PINNED_RENDEZVOUS` in `seamless_fixture_tests.rs`, and
-   run the guard:
-
-   ```sh
-   targo --unverified test -p aterm-gui --lib -- fixture_tests
-   ```
-
-5. Commit the new directory with the pinned rows. Do not commit the generator
-   in the release worktree. Commit it here, beside the fixtures: as
-   `generator.rs.txt` when this release is the newest one with fixtures (it
-   is then the next release's template), otherwise as
-   `generator-vX.Y.0.rs.txt`. Then remove the worktree:
-
-   ```sh
-   git worktree remove --force ~/aterm-vX.Y.0.noindex
-   ```
+The tag is annotated, so take the commit it points at, not the tag object's own
+sha. Then, in the landing worktree, add the release's `("vX.Y.0", "<desk>")`
+rows to `PINNED_DESKS` in `seamless_fixture_tests.rs`, run `targo --unverified
+test -p aterm-gui --lib -- fixture_tests`, commit, land, and remove both
+worktrees. A tag older than v0.103.0 has no generator in its tree: the one each
+release used is in git history (`git show
+86b918a4e:crates/aterm-gui/tests/fixtures/handoff/README.md`, "Adding the next
+release's fixtures", says how one was appended and adapted at a tag).
 
 ## `render_debt` (additive, from v0.101.0)
 

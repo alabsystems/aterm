@@ -521,7 +521,14 @@ fn classify(ty: TarEntryType) -> EntryKind {
 /// Executables (any `x` bit set) become `0o755`, everything else `0o644`, dirs `0o755`.
 /// Deterministic, so the post-extraction [`crate::tree::tree_root`] matches what the
 /// publish-side producer (Phase 6) computes the same way.
-fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
+///
+/// THE ONE MODE RULE of a staged tree, whatever lane laid it: the archive members
+/// ([`Layer::regular`], [`Layer::directory`]), the directories a folding lane makes on a
+/// member's way ([`make_dir_exact`]), and the `.app` bundle the `dmg` lane's `ditto`
+/// copied (`install::vet_copied_tree`, AT3 in docs/AUDIT-atpkg-inputs-2026-10-04.md),
+/// so no lane lays a bit another one strips. The `raw-binary` lane's one file is the
+/// executable class, `0o755`.
+pub(crate) fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     if is_dir || entry_mode & 0o111 != 0 {
         0o755
     } else {
@@ -917,6 +924,11 @@ pub(crate) fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, Extra
 /// The file and link creates make the same decision for the last component
 /// ([`Layer::regular`], [`Layer::symlink`], [`Layer::hardlink`]); this is the one maker of
 /// directories for every folding lane and for the links a stage adds afterwards.
+///
+/// Each directory it makes is given the directory mode of [`safe_mode`], `0755`, as a
+/// directory MEMBER is: `mkdir` alone leaves `0777 & ~umask`, so before 2026-10-10 a
+/// directory no member named (every parent of a file in an archive that lists no
+/// directories) was group-writable under umask `002` and world-writable under `000`.
 pub(crate) fn make_dir_exact(
     root: &Path,
     dir: &Path,
@@ -947,6 +959,8 @@ pub(crate) fn make_dir_exact(
                         io_at(e, "create_dir", &cur)
                     }
                 })?;
+                crate::platform::set_mode(&cur, safe_mode(0, true))
+                    .map_err(|e| io_at(e, "set_mode", &cur))?;
                 tree.record_dir(parent, name.to_vec())
             }
         };
@@ -2415,6 +2429,91 @@ mod tests {
         );
         // The extracted tree has a stable tree_root.
         assert_eq!(crate::tree::tree_root(&root).unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The env that turns [`probe_stages_its_directories_0755_under_an_open_umask`] on:
+    /// the scratch directory it stages under.
+    #[cfg(unix)]
+    const OPEN_UMASK_ENV: &str = "ATPKG_EXTRACT_OPEN_UMASK_DIR";
+    /// That probe's name, as `--exact` wants it.
+    #[cfg(unix)]
+    const OPEN_UMASK_PROBE: &str =
+        "extract::tests::probe_stages_its_directories_0755_under_an_open_umask";
+
+    /// The child half of [`a_folding_lane_makes_every_directory_0755_whatever_the_umask`]:
+    /// under umask `000`, a tar.zst whose files arrive with no directory member of their
+    /// own (`share/` and `share/doc/` exist only as their parents) and one that names its
+    /// directory (`bin/`) stages every directory at `0755`, the archive lanes' one
+    /// directory mode (`safe_mode`), not at `0777 & ~umask`. Outside that child (the env
+    /// unset) it does nothing: the umask is the whole process's, so it is set only in a
+    /// process running this one test.
+    #[cfg(unix)]
+    #[test]
+    fn probe_stages_its_directories_0755_under_an_open_umask() {
+        let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
+            return;
+        };
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
+        unsafe { libc::umask(0) };
+        let d = PathBuf::from(dir);
+        let root = d.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = make_archive_moded(
+            &d,
+            "implicit",
+            &[
+                ("share/doc/readme", b'0', "", b"hello", 0o644),
+                ("bin/", b'5', "", b"", 0o777),
+                ("bin/tool", b'0', "", b"#!/bin/sh\n", 0o755),
+            ],
+        );
+        let tree = extract_tar_zst_tree(
+            &archive,
+            &root,
+            10_000_000,
+            10_000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let (fused, walked) = fused_and_walked(tree, &root);
+        assert_eq!(fused, walked);
+        for dir in ["share", "share/doc", "bin"] {
+            let mode = std::fs::metadata(root.join(dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o755, "{dir}: staged under umask 000");
+        }
+    }
+
+    /// AT3's check of the archive lanes (2026-10-10): the directories a folding lane
+    /// makes because a member's path passes through them are made by
+    /// [`make_dir_exact`], and they get the same `0755` a directory member gets, whatever
+    /// umask the stage runs under; a plain `mkdir` left them at `0777 & ~umask`, so a
+    /// stage under umask `002` (what Debian's `login.defs` gives a user whose group is
+    /// their own) laid them group-writable and one under `000` world-writable. The umask is
+    /// process-wide, so the stage runs in a child of this test binary that runs only
+    /// [`probe_stages_its_directories_0755_under_an_open_umask`].
+    #[cfg(unix)]
+    #[test]
+    fn a_folding_lane_makes_every_directory_0755_whatever_the_umask() {
+        let d = dest("open-umask");
+        let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
+            .env(OPEN_UMASK_ENV, d.as_os_str())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the probe under umask 000: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

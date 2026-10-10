@@ -224,6 +224,15 @@ pub(super) struct ShellIntegrationState {
     /// already evicted from scrollback. A `Cell` so the `&self` accessors can
     /// count.
     pub(super) eviction_reads: std::cell::Cell<u64>,
+    /// The newest block whose evicted COMMAND, and whose evicted OUTPUT, a
+    /// read has found (`blocks_api::BlockSide`'s order). An evicted block
+    /// stays evicted, and so is every older one (ids and rows only grow), so a
+    /// read of a block no newer than these is counted but is not news.
+    pub(super) eviction_seen: [std::cell::Cell<Option<u64>>; 2],
+    /// How many times a read found a NEWER block's side evicted (the news
+    /// `eviction_seen` admits). Only the 1st, 2nd, 4th … of them is logged: a
+    /// program can start blocks at will.
+    pub(super) eviction_news: std::cell::Cell<u64>,
     /// Which integration body the shell runs: the 16 lowercase hex digits of
     /// its script folder, as the body signs before every prompt
     /// (`633;P;AtermIntegration=<rev>;id=<nonce>`). Recorded only from a mark
@@ -245,6 +254,8 @@ impl ShellIntegrationState {
             next_block_id: 0,
             completed_seq: 0,
             eviction_reads: std::cell::Cell::new(0),
+            eviction_seen: [const { std::cell::Cell::new(None) }; 2],
+            eviction_news: std::cell::Cell::new(0),
             integration_rev: None,
         }
     }

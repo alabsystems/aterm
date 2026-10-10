@@ -1448,7 +1448,7 @@ fn write_stage_refusal(
         })
         .map_or(1, |prior| prior.attempts.saturating_add(1));
     let parent = dest.parent().unwrap_or(build_dir);
-    std::fs::create_dir_all(parent)?;
+    make_build_parent(build_dir)?;
     let tmp = parent.join(format!(".refused.tmp-{}", std::process::id()));
     let mut body = String::from(STAGE_REFUSAL_HEADER);
     body.push_str("\nsha256=");
@@ -1477,7 +1477,7 @@ fn write_stage_refusal(
         .collect();
     body.push_str(&one_line);
     body.push('\n');
-    std::fs::write(&tmp, body.as_bytes())?;
+    write_record_temp(&tmp, body.as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -1690,6 +1690,34 @@ pub fn clear_all_stage_refusals(layout: &Layout) -> usize {
 /// that the delete did not touch) a store that still claimed the build was installed.
 pub(crate) fn incoming_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".incoming-")
+}
+
+/// Write the temp of a small record that is renamed into place beside a build (the
+/// shim-environment sidecar, the stage-refusal memo): created `0644`, which the umask can
+/// only narrow, never `0666 & ~umask` as `std::fs::write` creates it. A record its group
+/// or every user could rewrite would let them steer what a later verb believes about the
+/// build (AT3, 2026-10-10).
+pub(crate) fn write_record_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(tmp);
+    crate::platform::open_create_write(tmp, 0o644)?.write_all(bytes)
+}
+
+/// Make the directory a build lives in (`store/<program>/`, and `store/` above it) when
+/// it is missing, each at the stage's one directory mode
+/// ([`crate::extract::safe_mode`], `0755`) whatever the umask
+/// ([`crate::platform::make_dirs_born`]). Every writer that can be first to need it
+/// (the stage, the shim-environment sidecar, the refusal record) makes it here: from
+/// `create_dir_all` it was born `0777 & ~umask`, and a `store/<program>/` its group or
+/// every user could write lets them rename a build away and put their own in its place
+/// (AT3, 2026-10-10). One that exists is left exactly as it is.
+pub(crate) fn make_build_parent(build_dir: &Path) -> std::io::Result<()> {
+    match build_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            crate::platform::make_dirs_born(parent, crate::extract::safe_mode(0, true))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The sibling the OUTGOING tree is moved to during a swap: `<build>.superseded-<pid>`.
@@ -1931,9 +1959,10 @@ pub(crate) struct Synced {
 ///
 /// Symlinks are never followed and never opened: a link has no contents of its own, and
 /// the directory entry naming it is flushed with its directory. A file this process
-/// cannot OPEN is one it cannot flush — the `dmg` lane copies a vendor bundle with its
-/// modes preserved, so an unreadable member is possible, and failing a whole install over
-/// one would be strictly worse than the gap this closes.
+/// cannot OPEN is one it cannot flush, and failing a whole install over one would be
+/// strictly worse than the gap this closes. No lane lays one any more: every staged
+/// file is `0644` or `0755` (`extract::safe_mode`), the `dmg` lane's copied bundle
+/// included since 2026-10-10 (AT3).
 pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
     let mut counts = Synced::default();
     let mut stack = vec![root.to_path_buf()];

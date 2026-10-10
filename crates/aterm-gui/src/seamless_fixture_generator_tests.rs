@@ -1,99 +1,81 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// THE HANDOFF FIXTURE GENERATOR — not compiled here. This is the exact code
-// that wrote every desk of `v0.101.0/` and its `rendezvous.toml`, and the
-// template for the next release: it writes all thirteen desks in
-// `REQUIRED_DESKS`. It ran ONCE for the desks and once for the rendezvous
-// record, at the v0.101.0 tag (8ed1063a8dff), appended, uncommitted, to
-// `crates/aterm-gui/src/seamless_carry_tests.rs`, with
-// `ATERM_BUILD_GIT_COMMIT=8ed1063a8dff`,
-// `ATERM_BUILD_GIT_COMMIT_FULL=8ed1063a8dff8f15f9fd692788e9d31ca978a9aa` and
-// `SOURCE_DATE_EPOCH=1791501389` (the release's build number in
-// `RELEASES.ledger`). Since 2026-10-05 those no longer reach this library at
-// compile time: provenance is the binary's stamp (`build_info::BuildStamp`,
-// installed by its `main`), and the library's own test binary reads a fixed
-// test stamp (build 3000000000). So the generator reads them at run time and
-// installs the stamp the shipped binary carries (`fx_install_release_stamp`),
-// which keeps `parent.toml`'s `producer_commit` the release's commit and each
-// manifest's `outgoing_build` the one the shipped binary writes. This file is
-// byte for byte the code that ran.
-//
-// It reuses that file's `FakeApp`, `old_session`, `ENV_LOCK`, `pipe_pair`,
-// `restore_env`, `this_build` and `child_proof_from` (and
-// `ladder_tests::assert_only_over_cap_links_dropped`), and runs that release's
-// own policy reader, capture ladder, history carry, writer and consumer. It is
-// v0.100.0's generator (in git history as this file before v0.101.0's) with
-// what v0.101.0's producer changed. v0.101.0's capture ladder, worker order and
-// history carry for the handed sessions are v0.100.0's: every handed session's
-// grid, control and history sidecar is the bytes v0.100.0 wrote. What changed
-// and reaches these bytes:
-//
-// - THE OUTPUT-STATE CARRY (round eight of the update audit, finding 502). The
-//   meta carries the engine's in-flight output state (`output_state`: the REP
-//   character, an SGR 58 underline colour, an open OSC 8 link, a VT52 address
-//   in progress, a pending ZWJ, the XTPUSHSGR stack, the XTSAVE'd modes) to a
-//   successor that `carries_output_state` (every one newer than the producer).
-//   Every session that printed anything has a REP character, so every meta of
-//   every desk carries it; the self-check asserts it crosses. With it an open
-//   link or a VT52 address is no park hazard to such a successor, and on the
-//   fork lane a swallowed PICTURE (a kitty APC, an OSC 1337 image, a sixel
-//   string) is carried over queued output too (`fx_capture`).
-// - THE RENDER DEBT (the render stream's R08). The record carries the rows the
-//   engine owed a carried alternate screen (`render_debt = "<shift>,<pushed>"`,
-//   `stamp_render_debts`). `incident-55x149`'s Claude Code, resized from 56 to
-//   55 rows in 1049 and never fully redrawn, owes `-1,0`: that desk stands for
-//   the debt, and no other session owes anything.
-// - THE HELD PANES' SCROLLBACK AND CONTROL CARRY (round eight, findings 21, 39
-//   and 730, and U34). A held pane's scrollback is exported after the handed
-//   sessions' (`App::history_sessions`), joined against the fence its held
-//   capture took and named as `.h<id>.hist`; its turn ledger and archive fence
-//   ride `.h<id>.ctl`; its manifest entry names both, its session id and
-//   whether the person had seen its failure. `held-pane`'s two panes carry all
-//   of it, and the self-check imports each one's history and asserts it is its
-//   parent's, cell for cell.
-// - THE WORKER'S TURN-ID COUNT AND WORDS (round seven's finding 22, round
-//   eight's 40 and 714). The manifest's `next_turn_id` is the ids the process
-//   minted plus `TURN_ID_RESERVE` (`turn_ids_for_handoff`), so every desk
-//   carries one, and the control carry spells its records in the successor's
-//   words (`export_for`, `StatusWords::for_target`).
-// - THE WINDOW'S SIZE (P6 finding 4) AND THE MESSAGES' CAPTURE TIME (U62's
-//   review). Every layout window and the window carry name the raw inner size
-//   (`inner_px`: here the exact frame of the grid and its message band at this
-//   build's default metrics), and the window carry says when its messages were
-//   captured (`messages_captured_unix_ms`). No window here has a presence row.
-// - THE POLICY READS `[[ranges]]` (5afd825d6). A policy read holds the whole
-//   file (`PolicyRead::Parsed(PolicyFile)`), and a cut seals a rescue only as
-//   a range naming its producers, with its reason and the top-level hull; the
-//   policy desks' successor seals one naming v0.101.0's build, and the producer
-//   follows it.
-// - Followed, without reaching these bytes: the layout capture folds a desk
-//   past the layout's caps (`fold_into_caps`; none here is), the layout sidecar
-//   is sealed (`handoff_diet::seal_layout`), the parent checks a dialler's code
-//   (`DialerCode`, the rendezvous capture's only adaptation), and the record's
-//   `journal_key` and the handoff leaf's `agent` stay empty, as on a desk whose
-//   process wrote its own crash journal image and owes no relaunch.
-//
-// README.md in this directory says how to adapt it for the next release.
 
-// ------------------------------------------ HANDOFF FIXTURE GENERATOR (P0-7)
-//
-// Appended, uncommitted, to a RELEASE worktree's `seamless_carry_tests.rs`:
-// writes that release's producer bytes for each desk into
-// `$ATERM_HANDOFF_FIXTURE_OUT/<desk>/` for the main tree's cross-version
-// guard (`seamless_fixture_tests.rs`). See the fixture README.
+//! THE HANDOFF FIXTURE GENERATOR: what THIS release's producer writes, for every
+//! desk in `REQUIRED_DESKS` and for the rendezvous transport, recorded so every
+//! later release's guard (`seamless_fixture_tests.rs`) can run it through its
+//! consumer (`tests/fixtures/handoff/README.md`).
+//!
+//! It is compiled into every `aterm-gui` library test build, beside the carry
+//! tests whose helpers it reuses (`FakeApp`, `old_session`, `ENV_LOCK`,
+//! `pipe_pair`, `restore_env`, `this_build`, `child_proof_from`), and calls the
+//! release's own policy reader, capture ladder, history carry, writer and
+//! consumer, and the guard's own rendezvous capture. An API change that breaks
+//! it fails to compile, and each release's tree carries the generator that
+//! matches its producer. Its two entry tests are `#[ignore]`d: they write a
+//! release's bytes and run only by name.
+//!
+//! `targo --unverified ship release` runs them in the cut tree once the
+//! release's identity is reserved, before anything is claimed, into the
+//! release cache, and lands what they wrote on main after the cut
+//! (`aterm-release`'s `fixtures.rs`). By hand (a release cut by an older
+//! cutter; the README's fallback):
+//!
+//! ```text
+//! ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit commit> \
+//! ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
+//! SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
+//! ATERM_HANDOFF_FIXTURE_OUT=<dir>/vX.Y.0 ATERM_RENDEZVOUS_FIXTURE_OUT=<dir>/vX.Y.0 \
+//!   targo --unverified test -p aterm-gui --lib -- generate_ --ignored --test-threads 1
+//! ```
+//!
+//! EVERY RELEASE INPUT IS DERIVED, never spelled. The three pins are the ones
+//! the release build hands `crates/aterm/build.rs` (`aterm-release`'s
+//! `buildplan`): the release commit the tag names and the ledger's build
+//! number. [`fx_install_release_stamp`] installs the stamp the shipped binary
+//! carries from them, so `producer_version`, `producer_commit` and each
+//! manifest's `outgoing_build` are the release's. The version is this tree's
+//! (`[workspace.package] version`), the compiler that of the release's prover
+//! (`$TRUST_STAGE2_BIN/trustc -vV`, else `trustc -vV` on PATH), the successor
+//! a build a day newer than the release (`fx_target_build`), at the next MINOR
+//! (`fx_successor_version`), and the policy desks' `[[ranges]]` rescue names
+//! the release's own build. Nothing here is edited per release: a release that
+//! changes its producer's shape changes this code with it, adds a desk for the
+//! shape to `REQUIRED_DESKS` with itself as the floor, and says what changed in
+//! the README's section for it.
+//!
+//! What v0.102.0's generator (the one that wrote `v0.102.0/`, adapted by hand
+//! at the tag) changed from v0.101.0's is in the README's v0.102.0 section;
+//! this is that generator, with its per-release inputs derived.
+
+use super::*;
+
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
-/// A successor NEWER than v0.101.0 (build 1791501389): the hop these desks
-/// stand for. It decides the wire caps (`WireCaps::for_target`: the parser and
-/// the output-state carries), that the history is exported at all, the held
-/// panes' too (`handoff_history::exports_for_target`), and the words the
-/// control carry spells its records in (`StatusWords::for_target`).
-const FIXTURE_TARGET_BUILD: u64 = 1_791_600_000;
+/// The successor these desks hand to: a build a day NEWER than this release's
+/// own (`SOURCE_DATE_EPOCH`, installed by [`fx_install_release_stamp`]), the
+/// hop every install of this release makes. It decides the wire caps
+/// (`WireCaps::for_target`: the parser and the output-state carries), that the
+/// history is exported at all, the held panes' too
+/// (`handoff_history::exports_for_target`), and the words the control carry
+/// spells its records in (`StatusWords::for_target`).
+fn fx_target_build() -> u64 {
+    crate::running_build_number() + FX_SUCCESSOR_AFTER_SECS
+}
+/// How long after this release its successor was built (a day).
+const FX_SUCCESSOR_AFTER_SECS: u64 = 86_400;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
-/// v0.101.0's decode-authority budget (`app_update_handoff`'s private
-/// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`), copied: the capture prices history
-/// against it.
-const FX_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// The successor's version, as the update row names it
+/// (`update_words::installing`): the next MINOR after this release's.
+fn fx_successor_version() -> String {
+    let version = crate::build_info::version();
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Some(major)), Some(Some(minor)), Some(Some(_)), None) => {
+            format!("{major}.{}.0", minor + 1)
+        }
+        _ => panic!("this release's version {version:?} is MAJOR.MINOR.PATCH"),
+    }
+}
 /// The exit ledger's last row id each desk's store carries
 /// (`SessionHandoff::roster_seq`, v0.100.0's): seven shells exited before
 /// the park.
@@ -125,48 +107,130 @@ fn fx_rfc3339(epoch: u64) -> String {
 }
 
 /// THE RELEASE'S OWN BUILD STAMP, installed before anything reads provenance.
-/// Since 2026-10-05 provenance is the BINARY's (`crates/aterm/build.rs` emits
-/// it and the binary's `main` installs it, `build_info::install_build_stamp`),
-/// and this library's own test binary reads a fixed test stamp (build
-/// 3000000000, commit `7e57b1d0c0de`): `ATERM_BUILD_GIT_COMMIT` and
-/// `SOURCE_DATE_EPOCH` no longer reach it at compile time. So the generator
-/// reads them (and `ATERM_BUILD_GIT_COMMIT_FULL`) at run time and installs
-/// exactly what the shipped binary's build script stamped from the same pins:
-/// a clean tree, built at the tag (no commits since it), at the ledger's build
-/// number. The first install wins, so this runs first.
+/// Provenance is the BINARY's (`crates/aterm/build.rs` emits it and the
+/// binary's `main` installs it), and this library's own test binary reads a
+/// fixed test stamp (build 3000000000, commit `7e57b1d0c0de`): the pins never
+/// reach it at compile time. So the generator reads the three the release
+/// build hands that build script (`ATERM_BUILD_GIT_COMMIT`,
+/// `ATERM_BUILD_GIT_COMMIT_FULL`, `SOURCE_DATE_EPOCH`: the release commit the
+/// tag names and the ledger's build number) at run time, and installs exactly
+/// what the build script stamps from them: a clean tree at that commit, no
+/// commits past it. The first install wins, so this runs first, and the
+/// assertion at its end proves this process reads it.
+///
+/// The rest of `aterm_types::version::BuildStamp` is the shipped binary's too:
+/// the version is this tree's `[workspace.package] version`; the compiler is the
+/// release's prover ([`fx_release_compiler`]); and the profile, verification
+/// state and release marker are the release lane's (`targo --unverified ship
+/// release`: the `release` profile, the `--unverified` lane's `off`, the
+/// cutter's `ATERM_RELEASE_BUILD`). None of the compiler, profile or
+/// verification fields reaches a fixture byte.
 fn fx_install_release_stamp() {
     let var = |name: &str| {
-        std::env::var(name).unwrap_or_else(|_| panic!("set {name} (see ../README.md)"))
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| panic!("set {name} (tests/fixtures/handoff/README.md)"))
     };
     let commit = var("ATERM_BUILD_GIT_COMMIT");
     let full = var("ATERM_BUILD_GIT_COMMIT_FULL");
     let build = var("SOURCE_DATE_EPOCH");
     assert!(
-        commit.len() == 12 && full.len() == 40 && full.starts_with(&commit),
-        "the tag's 12-digit and 40-digit commit: {commit} {full}"
+        commit.len() == 12
+            && full.len() == 40
+            && full.starts_with(&commit)
+            && full.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the release commit's 12-digit and 40-digit spellings: {commit} {full}"
     );
     let epoch = build.parse::<u64>().expect("the release's build number");
+    let compiler = fx_release_compiler();
     let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
-    crate::build_info::install_build_stamp(crate::build_info::BuildStamp {
+    aterm_types::version::install(aterm_types::version::BuildStamp {
+        app_version: env!("CARGO_PKG_VERSION"),
         git_commit: leak(commit.clone()),
         git_commit_full: leak(full),
         git_dirty: "false",
         build_time: leak(fx_rfc3339(epoch)),
         build_number: leak(build),
         dev_commits: "0",
+        compiler_version_line: leak(compiler.version_line),
+        compiler_commit: leak(compiler.commit),
+        compiler_host: leak(compiler.host),
+        compiler_trust_version: leak(compiler.trust_version),
+        compiler_flavor: "t",
+        build_profile: "release",
+        trust_verify: "off",
+        release_build: true,
     });
     assert_eq!(
-        (crate::running_build_number(), crate::build_info::git_commit()),
-        (epoch, commit.as_str()),
+        (
+            crate::running_build_number(),
+            crate::build_info::git_commit(),
+            crate::build_info::version(),
+        ),
+        (epoch, commit.as_str(), env!("CARGO_PKG_VERSION")),
         "the release's stamp is the one this process reads"
     );
+}
+
+/// The `-vV` fields of the compiler that built the release.
+struct FxCompiler {
+    version_line: String,
+    commit: String,
+    host: String,
+    trust_version: String,
+}
+
+/// THE RELEASE'S COMPILER: `trustc -vV` of the release's prover, the
+/// `$TRUST_STAGE2_BIN` the cutter builds the release with and hands every
+/// child it runs (the toolchain's discovery order puts it first), else the
+/// `trustc` on PATH. Read as `crates/aterm/build.rs` reads it (its
+/// `parse_rustc_vv`), and refused unless it is Trust: a release is built by
+/// nothing else.
+fn fx_release_compiler() -> FxCompiler {
+    let trustc = std::env::var_os("TRUST_STAGE2_BIN")
+        .filter(|bin| !bin.is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("trustc"),
+            |bin| std::path::PathBuf::from(bin).join("trustc"),
+        );
+    let out = aterm_uds::spawnfd::command(&trustc)
+        .arg("-vV")
+        .output()
+        .unwrap_or_else(|e| panic!("the release's compiler: {} -vV: {e}", trustc.display()));
+    assert!(
+        out.status.success(),
+        "the release's compiler: {} -vV exited {}",
+        trustc.display(),
+        out.status
+    );
+    let vv = String::from_utf8(out.stdout).expect("trustc -vV prints UTF-8");
+    let field = |key: &str| {
+        vv.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| panic!("{} -vV names no `{key}`: {vv}", trustc.display()))
+    };
+    FxCompiler {
+        version_line: vv
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| panic!("{} -vV printed nothing", trustc.display()))
+            .to_string(),
+        commit: field("commit-hash:"),
+        host: field("host:"),
+        trust_version: field("trust:"),
+    }
 }
 
 struct FxSession {
     record: SessionRecord,
     term: Arc<Mutex<Terminal>>,
     turns: Arc<Mutex<TurnLedger>>,
-    /// The rung v0.101.0's ladder carries this session at: `Full` for every
+    /// The rung this release's ladder carries this session at: `Full` for every
     /// honest desk, `StrippedLinks` for a screen holding a line record over
     /// the wire's per-record cap. The capture asserts it, and that the
     /// self-check (`settle_wire_carries`) lowers nothing.
@@ -381,7 +445,7 @@ fn fx_window(
     fx_window_in(rows, cols, 0, tabs)
 }
 
-/// A window's raw inner size as v0.101.0's capture reads it off the window
+/// A window's raw inner size as this release's capture reads it off the window
 /// (`WindowState::win_px`, written as `WindowLayout::inner_px` and, for window
 /// 0, `WindowCarry::inner_px`): an unzoomed window is exactly the frame of its
 /// grid and the chrome rows above it (`App::window_frame_px_for`), here the
@@ -475,7 +539,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
     // (`App::carried_messages`, which every park calls).
     let mut app = crate::App::headless_for_test();
     if installing {
-        app.post_message(crate::update_words::installing("0.102.0"));
+        app.post_message(crate::update_words::installing(&fx_successor_version()));
     }
     let carried = app.carried_messages();
     let band_rows = u16::from(installing);
@@ -489,7 +553,8 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         inner_px: fx_inner_px(rows, cols, band_rows),
         presence_row: false,
         status_bar_rows: band_rows,
-        update_verified_unix_ms: installing.then_some(1_791_590_000_000),
+        // Verified an hour after the successor was built.
+        update_verified_unix_ms: installing.then_some((fx_target_build() + 3_600) * 1_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
         // Since v0.100.0 (`App::handoff_window_carry`): the font zoom, only
@@ -511,14 +576,25 @@ fn fx_shell(rows: u16, cols: u16, lines: usize, cwd: &str, flavour: u8) -> Termi
     for i in 0..lines {
         let row = match (i + usize::from(flavour)) % 9 {
             0 => format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % make test-{i}\r\n"),
-            1 => format!("\x1b[32mok\x1b[0m  crate::module::case_{i:04} \x1b[2m({i} ms)\x1b[0m\r\n"),
-            2 => format!("\x1b[38;2;120;200;255mtruecolor\x1b[0m \x1b[4:3m\x1b[58;5;196mcurly\x1b[0m line {i}\r\n"),
+            1 => {
+                format!("\x1b[32mok\x1b[0m  crate::module::case_{i:04} \x1b[2m({i} ms)\x1b[0m\r\n")
+            }
+            2 => format!(
+                "\x1b[38;2;120;200;255mtruecolor\x1b[0m \x1b[4:3m\x1b[58;5;196mcurly\x1b[0m line {i}\r\n"
+            ),
             3 => format!("日本語テキスト {i} 🎉 wide\r\n"),
             4 => format!("cafe\u{0301} na\u{0308}ive {i}\r\n"),
-            5 => format!("\x1b]8;id=l{i};https://example.invalid/doc/{i}\x1b\\link {i}\x1b]8;;\x1b\\ tail\r\n"),
-            6 => format!("\x1b[7mreverse\x1b[27m \x1b[3mitalic\x1b[23m \x1b[9mstrike\x1b[29m {i}\r\n"),
+            5 => format!(
+                "\x1b]8;id=l{i};https://example.invalid/doc/{i}\x1b\\link {i}\x1b]8;;\x1b\\ tail\r\n"
+            ),
+            6 => format!(
+                "\x1b[7mreverse\x1b[27m \x1b[3mitalic\x1b[23m \x1b[9mstrike\x1b[29m {i}\r\n"
+            ),
             7 => format!("{}\r\n", "-".repeat(usize::from(cols).min(40 + i % 30))),
-            _ => format!("drwxr-xr-x  12 dev  staff   384 Sep 23 10:{:02} dir{i}\r\n", i % 60),
+            _ => format!(
+                "drwxr-xr-x  12 dev  staff   384 Sep 23 10:{:02} dir{i}\r\n",
+                i % 60
+            ),
         };
         t.process(row.as_bytes());
     }
@@ -533,7 +609,10 @@ fn fx_editor(rows: u16, cols: u16, flavour: u8) -> Terminal {
     for r in 1..rows {
         t.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
     }
-    t.process(format!("\x1b[1;1H# notes {flavour}\x1b[{rows};1H\x1b[7m notes.md \x1b[0m\x1b[2;1H").as_bytes());
+    t.process(
+        format!("\x1b[1;1H# notes {flavour}\x1b[{rows};1H\x1b[7m notes.md \x1b[0m\x1b[2;1H")
+            .as_bytes(),
+    );
     t
 }
 
@@ -574,21 +653,7 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
     }
 }
 
-/// `app_update_handoff::optional_carry_fits` (private there), copied.
-fn fx_optional_carry_fits(
-    used: u64,
-    own_mandatory: u64,
-    optional: u64,
-    later_mandatory: u64,
-    ceiling: u64,
-) -> bool {
-    used.checked_add(own_mandatory)
-        .and_then(|total| total.checked_add(optional))
-        .and_then(|total| total.checked_add(later_mandatory))
-        .is_some_and(|total| total <= ceiling)
-}
-
-/// THE PARK'S POLICY, AS AN INSTALL OF v0.101.0 READS IT (plan P0-5,
+/// THE PARK'S POLICY, AS AN INSTALL OF THIS RELEASE READS IT (plan P0-5,
 /// 75f60b08c, eb807651f). The successor's `publish/handoff-policy.toml` is
 /// copied byte for byte into its bundle as `BUNDLE_PATH` by the cut; the
 /// producer's pre-verification reads it from there
@@ -604,7 +669,7 @@ fn fx_optional_carry_fits(
 /// `[[ranges]]` (5afd825d6) a cut seals one only as a range naming the
 /// producers it is for, with its reason, and the top-level keys as the hull
 /// every build before `[[ranges]]` follows alone (`PolicyFile::parse_for_cut`,
-/// which this asserts); v0.101.0 reads the range. The same reader and `adopt`
+/// which this asserts); this release reads the range. The same reader and `adopt`
 /// run over that file, so the ceiling the park captures under is the
 /// producer's own reading of it.
 fn fx_park_policy(
@@ -648,7 +713,7 @@ fn fx_park_policy(
     let adopted = policy::adopt(
         &read,
         build,
-        &format!("fixture successor build {FIXTURE_TARGET_BUILD}"),
+        &format!("fixture successor build {}", fx_target_build()),
     );
     if want == CarryCeiling::Full {
         assert!(
@@ -681,19 +746,7 @@ fn fx_park_policy(
     (park, adopted)
 }
 
-/// `app_update_handoff::capture_exceeds_policy` (private there), copied: the
-/// fork lane's worker reads the candidate's policy after the park and refuses
-/// a capture taken above it.
-fn fx_capture_exceeds_policy(
-    parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
-    adopted: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
-) -> bool {
-    parked_under
-        .zip(adopted)
-        .is_some_and(|(parked_under, policy)| policy.carry_ceiling() > parked_under)
-}
-
-/// What v0.101.0's park capture hands the worker for one desk.
+/// What this release's park capture hands the worker for one desk.
 struct FxCapture {
     screens: Vec<(u64, TerminalCheckpoint)>,
     repaint: Vec<u64>,
@@ -717,7 +770,7 @@ struct FxCapture {
     held: Vec<HeldScreen>,
 }
 
-/// v0.101.0's capture (`App::capture_parked_screens`) over a desk whose time
+/// This release's capture (`App::capture_parked_screens`) over a desk whose time
 /// is ample, on the fork lane, under the park's policy `ceiling`: the pool walked in
 /// SESSION-ID order (eb807651f), its mandatory visible grids reserved first,
 /// then each session carried by `carry_for_wire_within` with 256 lines of
@@ -728,7 +781,7 @@ struct FxCapture {
 /// (`fx_capture_held`). A parser left inside a sequence no carry holds, or one
 /// the carry would only swallow that is not a picture, is carried only over a
 /// quiet PTY (`handoff_masters_have_activity` on the session's own entry in
-/// `live`); over queued output v0.101.0's park misses instead
+/// `live`); over queued output this release's park misses instead
 /// (`CaptureFailure::MidSequence`), which no desk here stands for. The repaint
 /// set is the sessions whose rung `needs_repaint`.
 fn fx_capture(
@@ -795,7 +848,7 @@ fn fx_capture(
                 !crate::app_update_handoff::handoff_masters_have_activity(std::slice::from_ref(
                     entry
                 )),
-                "session {id}: v0.101.0 carries {state} only over a quiet PTY"
+                "session {id}: this release carries {state} only over a quiet PTY"
             );
         }
         if let Some(state) = guard.partial_sequence_state() {
@@ -814,19 +867,19 @@ fn fx_capture(
         let history_cells = u64::from(cols).saturating_mul(u64::from(carry));
         let history_bytes = checkpoint_capture_budget_bytes(rows, cols, carry)
             .map_or(u64::MAX, |carried| carried.saturating_sub(own_bytes));
-        let fits_cells = fx_optional_carry_fits(
+        let fits_cells = crate::app_update_handoff::optional_carry_fits(
             capture_cells,
             own_cells,
             history_cells,
             cells_reserve,
             max_handoff_aggregate_grid_cells(),
         );
-        let fits_bytes = fx_optional_carry_fits(
+        let fits_bytes = crate::app_update_handoff::optional_carry_fits(
             capture_budget,
             own_bytes,
             history_bytes,
             bytes_reserve,
-            FX_CAPTURE_BUDGET_BYTES,
+            crate::app_update_handoff::MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
         );
         let history = if !history_latched_off && fits_cells && fits_bytes {
             carry
@@ -836,7 +889,9 @@ fn fx_capture(
         assert!(
             checkpoint_capture_budget_bytes(rows, cols, 0)
                 .and_then(|bytes| capture_budget.checked_add(bytes))
-                .is_some_and(|total| total <= FX_CAPTURE_BUDGET_BYTES),
+                .is_some_and(
+                    |total| total <= crate::app_update_handoff::MAX_HANDOFF_CAPTURE_BUDGET_BYTES
+                ),
             "session {id}: inside the decode-authority budget"
         );
         let (checkpoint, rung, cause) =
@@ -888,13 +943,8 @@ fn fx_capture(
         // Since v0.100.0 every session's control carry travels (round seven,
         // finding 24): a rung that does not keep the screen it describes goes
         // without the DIFFER'S STATE only (`CarryRung::keeps_differ_state`).
-        let mut source = handoff_carry::capture_head(
-            id,
-            &guard,
-            &s.term,
-            &s.turns,
-            rung.keeps_differ_state(),
-        );
+        let mut source =
+            handoff_carry::capture_head(id, &guard, &s.term, &s.turns, rung.keeps_differ_state());
         if !rung.keeps_differ_state() {
             source.without_differ();
         }
@@ -907,7 +957,7 @@ fn fx_capture(
         });
     }
     let screen_digest =
-        settle_wire_carries(&mut wire, caps).expect("the v0.101.0 park commits this desk");
+        settle_wire_carries(&mut wire, caps).expect("this release's park commits this desk");
     for carry in &wire {
         let (_, rung, _) = rungs
             .iter()
@@ -960,7 +1010,7 @@ fn fx_capture(
     }
 }
 
-/// v0.101.0's held capture (`App::capture_held_screens`, round five's item
+/// This release's held capture (`App::capture_held_screens`, round five's item
 /// 19): every pooled pane NOT handed, in id order, its visible screen at the
 /// most faithful rung the successor's caps and the policy's ceiling admit,
 /// without scrollback, priced from what the handed screens left of the
@@ -1045,7 +1095,11 @@ fn fx_history_text(t: &Terminal) -> Vec<String> {
 fn fx_history_lines(t: &Terminal) -> Vec<aterm_core::scrollback::Line> {
     let grid = t.main_grid();
     (0..grid.scrollback_lines())
-        .map(|i| grid.get_history_line(i).expect("a history line reads back").into_owned())
+        .map(|i| {
+            grid.get_history_line(i)
+                .expect("a history line reads back")
+                .into_owned()
+        })
         .collect()
 }
 
@@ -1157,11 +1211,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let dir = crate::control_auth::socket_dir().expect("control dir");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // THE SUCCESSOR'S HANDOFF POLICY, read as every park of v0.101.0 reads it
+    // THE SUCCESSOR'S HANDOFF POLICY, read as every park of this release reads it
     // (`App::park_policy`): the ceiling this park captures under.
     let (park, adopted) = fx_park_policy(&scratch, desk.ceiling);
     let ceiling = park.carry_ceiling();
-    // Real PTYs, before the capture: v0.101.0's capture polls a mid-sequence
+    // Real PTYs, before the capture: this release's capture polls a mid-sequence
     // session's master, and the self-check below adopts them with this
     // release's own consumer, which refuses a master that is not a tty.
     let mut masters = Vec::new();
@@ -1196,7 +1250,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             })
             .collect(),
     };
-    let caps = WireCaps::for_target(FIXTURE_TARGET_BUILD);
+    let caps = WireCaps::for_target(fx_target_build());
     let capture = fx_capture(&desk.sessions, &desk.held, &fds.entries, caps, ceiling);
     let screens = &capture.screens;
     // THE FOREGROUND HOLDER the park reads for every session and stamps on
@@ -1227,7 +1281,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let mut connections = desk.connections.clone();
     connections.sort_by(|a, b| (&a.src, &a.dst, &a.op).cmp(&(&b.src, &b.dst, &b.op)));
     connections.dedup();
-    assert_eq!(connections, desk.connections, "{}: the desk's edges are each drawn once", desk.name);
+    assert_eq!(
+        connections, desk.connections,
+        "{}: the desk's edges are each drawn once",
+        desk.name
+    );
     let mut manifest = SessionHandoff {
         schema: SessionHandoff::SCHEMA,
         sessions: records,
@@ -1251,9 +1309,15 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // desk within them is left exactly as it was.
     let mut layout = desk.layout.clone();
     layout.fold_into_caps();
-    assert_eq!(layout, desk.layout, "{}: a desk within the caps is not folded", desk.name);
+    assert_eq!(
+        layout, desk.layout,
+        "{}: a desk within the caps is not folded",
+        desk.name
+    );
     let committed_layout = crate::app_update_handoff::commit_handoff_layout(&layout)
-        .unwrap_or_else(|refusal| panic!("{}: the park commits its layout: {refusal:?}", desk.name));
+        .unwrap_or_else(|refusal| {
+            panic!("{}: the park commits its layout: {refusal:?}", desk.name)
+        });
     // The fork lane's history plan, under the ceiling the park was taken
     // under (`HistoryPlan::deferred_under`): every pooled session, exported
     // by the worker once the capture is done (`App::history_sessions`, which
@@ -1263,9 +1327,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     assert!(
         crate::handoff_history::exports_for_target(
             crate::running_build_number(),
-            FIXTURE_TARGET_BUILD
+            fx_target_build()
         ),
-        "v0.101.0 exports history to this successor"
+        "this release exports history to its successor"
     );
     let plan = crate::handoff_history::HistoryPlan::deferred_under(ceiling, || {
         let mut sessions = crate::handoff_history::ExportSessions::from(
@@ -1301,7 +1365,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // (`capture_exceeds_policy`). The park read the same policy, so the
     // capture is never above it.
     assert!(
-        !fx_capture_exceeds_policy(Some(ceiling), adopted),
+        crate::app_update_handoff::capture_exceeds_policy(Some(ceiling), adopted).is_none(),
         "{}: the capture was taken under the policy the worker reads",
         desk.name
     );
@@ -1338,7 +1402,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let controls = handoff_carry::export_for(
         &capture.sources,
         turn_id_ceiling,
-        handoff_carry::StatusWords::for_target(FIXTURE_TARGET_BUILD),
+        handoff_carry::StatusWords::for_target(fx_target_build()),
     );
     manifest.next_turn_id = handoff_carry::manifest_turn_id(turn_id_ceiling);
     let mut results = plan.results(&dir);
@@ -1350,7 +1414,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .collect::<Vec<_>>(),
         !crate::handoff_history::exports_for_target(
             crate::running_build_number(),
-            FIXTURE_TARGET_BUILD,
+            fx_target_build(),
         ),
     );
     let verdicts = crate::handoff_history::stamp_manifest(
@@ -1393,7 +1457,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 .1
                 .history_lines,
         );
-        assert_eq!(joined.take, 0, "{}: session {local_id} names no sidecar", desk.name);
+        assert_eq!(
+            joined.take, 0,
+            "{}: session {local_id} names no sidecar",
+            desk.name
+        );
         assert_eq!(
             joined.dropped,
             parent_lines - carried,
@@ -1434,7 +1502,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         held_history,
         &nonce,
     )
-    .expect("the v0.101.0 writer publishes this desk");
+    .expect("this release's writer publishes this desk");
     assert_eq!(
         outgoing.screen_digest, capture.screen_digest,
         "{}: the written bytes are the committed ones",
@@ -1456,7 +1524,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     assert_eq!(layout, committed_layout);
     let proof = adoption_proof(
         &nonce,
-        FIXTURE_TARGET_BUILD,
+        fx_target_build(),
         FIXTURE_TARGET_COMMIT,
         &layout,
         &outgoing.screen_digest,
@@ -1496,15 +1564,25 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             || name.ends_with(".hist")
             || name.ends_with(".heldgrid")
             || name.ends_with(".heldalt");
-        assert!(keep, "{}: an attempt file this generator does not know: {name}", desk.name);
+        assert!(
+            keep,
+            "{}: an attempt file this generator does not know: {name}",
+            desk.name
+        );
         let bytes = std::fs::read(entry.path()).unwrap();
         if name == manifest_name {
             let text = String::from_utf8(bytes).unwrap();
             let paths = text.matches(&dir_text).count();
             let grids = screens.len()
-                + screens.iter().filter(|(_, cp)| cp.alt_grid.is_some()).count()
+                + screens
+                    .iter()
+                    .filter(|(_, cp)| cp.alt_grid.is_some())
+                    .count()
                 + held.len()
-                + held.iter().filter(|pane| pane.checkpoint.alt_grid.is_some()).count();
+                + held
+                    .iter()
+                    .filter(|pane| pane.checkpoint.alt_grid.is_some())
+                    .count();
             assert_eq!(paths, grids, "only the sidecar paths name the private dir");
             std::fs::write(
                 out.join(&name),
@@ -1542,7 +1620,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             carry.meta.as_bytes(),
         )
         .unwrap();
-        let cp = &screens.iter().find(|(id, _)| *id == rec.local_id).unwrap().1;
+        let cp = &screens
+            .iter()
+            .find(|(id, _)| *id == rec.local_id)
+            .unwrap()
+            .1;
         let take = rec
             .history
             .as_deref()
@@ -1566,7 +1648,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 &format!("{}: {hist}", desk.name),
                 &std::fs::read(out.join(&hist)).unwrap(),
             );
-            assert_eq!(cols, cp.cols, "{}: {hist} is wrapped at the grid's width", desk.name);
+            assert_eq!(
+                cols, cp.cols,
+                "{}: {hist} is wrapped at the grid's width",
+                desk.name
+            );
             let session = desk
                 .sessions
                 .iter()
@@ -1606,7 +1692,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             cp.modes.require_shell_integration_nonce,
         ));
         if let Some(nonce) = cp.shell_integration_nonce {
-            session_rows.push_str(&format!("shell_integration_nonce = \"{}\"\n", nonce.to_hex()));
+            session_rows.push_str(&format!(
+                "shell_integration_nonce = \"{}\"\n",
+                nonce.to_hex()
+            ));
         }
         session_rows.push_str(&format!(
             "history_take = {take}\nhistory_lost = {}\nfg_holder = {}\n",
@@ -1631,10 +1720,15 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         session_rows.push_str(&format!("rung = \"{rung}\"\nlinks_stripped = {stripped}\n"));
         // v0.98.0: how many lines of the session's `.hist` sidecar the export
         // wrote with their OSC 8 links dropped (`0` without a sidecar).
-        session_rows.push_str(&format!("history_links_stripped = {history_links_stripped}\n"));
+        session_rows.push_str(&format!(
+            "history_links_stripped = {history_links_stripped}\n"
+        ));
         // v0.101.0: whether the meta carries the engine's in-flight output
         // state (`output_state`), and the render debt the record carries.
-        session_rows.push_str(&format!("output_state = {}\n", !cp.output_state.is_default()));
+        session_rows.push_str(&format!(
+            "output_state = {}\n",
+            !cp.output_state.is_default()
+        ));
         if let Some(debt) = &rec.render_debt {
             session_rows.push_str(&format!("render_debt = \"{debt}\"\n"));
         }
@@ -1657,7 +1751,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // whether its control carry crossed and whether the person had seen its
     // failure.
     assert_eq!(
-        published.held.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
+        published
+            .held
+            .iter()
+            .map(|pane| pane.local_id)
+            .collect::<Vec<_>>(),
         held.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
         "{}: the writer names every held pane the capture kept",
         desk.name
@@ -1718,9 +1816,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         .collect::<Vec<_>>()
         .join(", ");
     let parent = format!(
-        "# What the v0.101.0 producer committed to for this desk. Generated by a\n\
-         # throwaway test in a v0.101.0 worktree; see ../../README.md.\n\
-         producer_version = \"0.101.0\"\n\
+        "# What the v{version} producer committed to for this desk. Written by the\n\
+         # release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.\n\
+         producer_version = \"{version}\"\n\
          producer_commit = \"{commit}\"\n\
          outgoing_build = {build}\n\
          park_carry_ceiling = \"{ceiling}\"\n\
@@ -1729,7 +1827,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
          dir_placeholder = \"{FIXTURE_DIR_PLACEHOLDER}\"\n\
          screen_digest = \"{screen}\"\n\
          layout_digest = \"{layout}\"\n\
-         proof_target_build = {FIXTURE_TARGET_BUILD}\n\
+         proof_target_build = {target_build}\n\
          proof_target_commit = \"{FIXTURE_TARGET_COMMIT}\"\n\
          proof_identities = [{identities}]\n\
          proof_count = {count}\n\
@@ -1738,8 +1836,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
          commit_wire = \"{commit_wire}\"\n\
          files = [{files}]\n\n\
          {session_rows}",
+        version = crate::build_info::version(),
         commit = crate::build_info::git_commit(),
         build = crate::running_build_number(),
+        target_build = fx_target_build(),
         ceiling = ceiling.as_str(),
         screen = fx_hex(&outgoing.screen_digest),
         layout = fx_hex(&layout),
@@ -1778,8 +1878,17 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     aterm_log::env::set(ENV_TARGET, this_build().unwrap());
     let mut incoming = take_incoming();
     assert_eq!(incoming.adopted.len(), desk.sessions.len(), "{}", desk.name);
-    assert_eq!(incoming.repainted_tabs(), capture.repaint.len(), "{}", desk.name);
-    assert!(incoming.layout.is_some(), "{}: the layout places every session", desk.name);
+    assert_eq!(
+        incoming.repainted_tabs(),
+        capture.repaint.len(),
+        "{}",
+        desk.name
+    );
+    assert!(
+        incoming.layout.is_some(),
+        "{}: the layout places every session",
+        desk.name
+    );
     // Since v0.98.0: a Settings leaf's unsaved drafts ride the layout, and
     // this release's own consumer places every one of them with its tab.
     assert_eq!(
@@ -1788,13 +1897,22 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         "{}: the Settings drafts are placed with their tabs",
         desk.name
     );
-    assert_eq!(incoming.unplaced_settings_drafts, (Vec::new(), 0), "{}", desk.name);
-    // v0.101.0's own consumer shows every held pane: its final screen at its
+    assert_eq!(
+        incoming.unplaced_settings_drafts,
+        (Vec::new(), 0),
+        "{}",
+        desk.name
+    );
+    // This release's own consumer shows every held pane: its final screen at its
     // geometry, without scrollback or a single link, how its command ended,
     // and since v0.101.0 its sid, whether the person had seen its failure, its
     // control carry and its scrollback's sidecar, taken before the proof.
     assert_eq!(
-        incoming.held.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
+        incoming
+            .held
+            .iter()
+            .map(|pane| pane.local_id)
+            .collect::<Vec<_>>(),
         held.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
         "{}: every held pane is shown",
         desk.name
@@ -1808,8 +1926,18 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             shown.local_id
         );
-        assert_eq!(shown.exit, sent.exit, "{}: held pane {}'s exit", desk.name, shown.local_id);
-        assert_eq!(shown.sid.as_ref(), Some(&sent.sid), "{}: held pane {}'s sid", desk.name, shown.local_id);
+        assert_eq!(
+            shown.exit, sent.exit,
+            "{}: held pane {}'s exit",
+            desk.name, shown.local_id
+        );
+        assert_eq!(
+            shown.sid.as_ref(),
+            Some(&sent.sid),
+            "{}: held pane {}'s sid",
+            desk.name,
+            shown.local_id
+        );
         assert_eq!(
             shown.failure_seen, sent.failure_seen,
             "{}: held pane {}'s seen failure",
@@ -1851,7 +1979,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             );
         }
     }
-    assert_eq!(incoming.screen_digest, Some(outgoing.screen_digest), "{}", desk.name);
+    assert_eq!(
+        incoming.screen_digest,
+        Some(outgoing.screen_digest),
+        "{}",
+        desk.name
+    );
     assert_eq!(incoming.layout_digest, Some(layout), "{}", desk.name);
     for adopted in &incoming.adopted {
         let rec = published
@@ -1860,13 +1993,21 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .find(|rec| rec.local_id == adopted.local_id)
             .unwrap();
         assert!(adopted.checkpoint.is_some(), "{}", desk.name);
-        let carried = &screens.iter().find(|(id, _)| *id == adopted.local_id).unwrap().1;
+        let carried = &screens
+            .iter()
+            .find(|(id, _)| *id == adopted.local_id)
+            .unwrap()
+            .1;
         let restored = adopted.checkpoint.as_ref().unwrap();
         assert_eq!(restored.grid, carried.grid, "{}", desk.name);
         // Both grids: a link-dense line on the saved primary is stripped in
         // the inactive grid's bytes.
         assert_eq!(restored.alt_grid, carried.alt_grid, "{}", desk.name);
-        assert_eq!(restored.shell_integration_nonce, carried.shell_integration_nonce, "{}", desk.name);
+        assert_eq!(
+            restored.shell_integration_nonce, carried.shell_integration_nonce,
+            "{}",
+            desk.name
+        );
         assert_eq!(
             restored.modes.require_shell_integration_nonce,
             carried.modes.require_shell_integration_nonce,
@@ -1876,15 +2017,34 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         // v0.95.0's meta: the numbering, the application's colours and the
         // shell-integration state cross the wire intact.
         assert_eq!(
-            (restored.absolute_row_counter, restored.alt_absolute_row_counter),
-            (carried.absolute_row_counter, carried.alt_absolute_row_counter),
+            (
+                restored.absolute_row_counter,
+                restored.alt_absolute_row_counter
+            ),
+            (
+                carried.absolute_row_counter,
+                carried.alt_absolute_row_counter
+            ),
             "{}: session {}'s absolute numbering crosses",
             desk.name,
             adopted.local_id
         );
-        assert_eq!(restored.color, carried.color, "{}: session {}'s colours cross", desk.name, adopted.local_id);
-        assert_eq!(restored.shell, carried.shell, "{}: session {}'s shell state crosses", desk.name, adopted.local_id);
-        assert_eq!(adopted.control.is_some(), rec.control.is_some(), "{}", desk.name);
+        assert_eq!(
+            restored.color, carried.color,
+            "{}: session {}'s colours cross",
+            desk.name, adopted.local_id
+        );
+        assert_eq!(
+            restored.shell, carried.shell,
+            "{}: session {}'s shell state crosses",
+            desk.name, adopted.local_id
+        );
+        assert_eq!(
+            adopted.control.is_some(),
+            rec.control.is_some(),
+            "{}",
+            desk.name
+        );
         // v0.101.0's meta and record additions: the in-flight output state
         // crosses the meta intact, and the render debt the record carries is
         // the one the successor seeds.
@@ -1927,7 +2087,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         );
         assert_eq!(
             adopted.history.withheld,
-            if rec.history_withheld { rec.history_dropped } else { 0 },
+            if rec.history_withheld {
+                rec.history_dropped
+            } else {
+                0
+            },
             "{}: session {}'s withheld lines are said as the policy's",
             desk.name,
             adopted.local_id
@@ -1939,7 +2103,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     // checkpoint says Ground). Either way the live parser still holds the
     // partial sequence, so a rolled-back handoff resumes byte-exactly.
     for (id, state, held) in &capture.abandoned {
-        let carried = &screens.iter().find(|(local_id, _)| local_id == id).unwrap().1;
+        let carried = &screens
+            .iter()
+            .find(|(local_id, _)| local_id == id)
+            .unwrap()
+            .1;
         if *held {
             assert!(
                 !carried.parser_ground && carried.parser.is_some(),
@@ -1962,7 +2130,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .lock()
             .unwrap()
             .partial_sequence_state();
-        assert_eq!(live, Some(*state), "{}: session {id}'s live parser is untouched", desk.name);
+        assert_eq!(
+            live,
+            Some(*state),
+            "{}: session {id}'s live parser is untouched",
+            desk.name
+        );
     }
     // The held panes, kept for their import after Commit.
     let held_shown = std::mem::take(&mut incoming.held);
@@ -1970,7 +2143,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         child_proof_from(incoming).unwrap_or_else(|| panic!("{}: the child proves", desk.name));
     let expected = adoption_proof(
         &nonce,
-        crate::build_info::build_number().parse::<u64>().unwrap_or(0),
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
         crate::build_info::git_commit(),
         &layout,
         &outgoing.screen_digest,
@@ -2003,21 +2178,30 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             item.local_id,
             &mut history,
         );
-        let report =
-            crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
-                session: item.local_id,
-                term: Arc::clone(&successor),
-                history,
-            }])
-            .remove(0);
-        assert_eq!(report.failed, None, "{}: session {}", desk.name, item.local_id);
+        let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+            session: item.local_id,
+            term: Arc::clone(&successor),
+            history,
+        }])
+        .remove(0);
+        assert_eq!(
+            report.failed, None,
+            "{}: session {}",
+            desk.name, item.local_id
+        );
         let record = published
             .sessions
             .iter()
             .find(|rec| rec.local_id == item.local_id)
             .unwrap();
         let dropped = record.history_dropped;
-        assert_eq!(report.lost(), dropped, "{}: session {}", desk.name, item.local_id);
+        assert_eq!(
+            report.lost(),
+            dropped,
+            "{}: session {}",
+            desk.name,
+            item.local_id
+        );
         assert_eq!(
             report.withheld(),
             if record.history_withheld { dropped } else { 0 },
@@ -2028,7 +2212,8 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         // Every line the policy let cross, and no other: the parent's whole
         // history under a `full` ceiling, its newest lines the checkpoint
         // carried (none) under one that withholds the scrollback.
-        let crossed = usize::try_from(report.imported + u64::from(checkpoint.history_lines)).unwrap();
+        let crossed =
+            usize::try_from(report.imported + u64::from(checkpoint.history_lines)).unwrap();
         assert_eq!(
             crossed as u64 + dropped,
             parent.len() as u64,
@@ -2133,7 +2318,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 );
             }
         }
-        assert_eq!(successor.shell_state(), source.shell_state(), "{}", desk.name);
+        assert_eq!(
+            successor.shell_state(),
+            source.shell_state(),
+            "{}",
+            desk.name
+        );
         assert_eq!(
             successor.completed_command_seq(),
             source.completed_command_seq(),
@@ -2182,10 +2372,13 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         }
     }
     // A HELD PANE'S SCROLLBACK CROSSES AS AN ADOPTED SESSION'S DOES (v0.101.0,
-    // round eight's finding 39): restored as `App::restore_held_leaf` restores
-    // it (the screen, then the import's keys reserved under the engine's
-    // first lock) and imported by the same worker after Commit, every line of
-    // the parent's history in front of the held screen, cell for cell.
+    // round eight's finding 39): restored as this release's `App::restore_held_leaf`
+    // restores it (`held_pane_session`, then `held_pane_history`: the import's
+    // keys reserved under the engine's first lock) and imported by the same
+    // worker after Commit, every line of the parent's history in front of the
+    // held screen, cell for cell. Since v0.102.0 the import drops every link
+    // of a held pane's lines, as its screen's are (`import`'s `held_pane`):
+    // nothing runs behind the pane, so a link there could only open a URL.
     for shown in held_shown {
         let sent = desk
             .held
@@ -2194,42 +2387,55 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .unwrap();
         let parent_lines = fx_history_lines(&sent.term.lock().unwrap());
         let cols = shown.checkpoint.cols;
-        let mut history = shown.history;
-        let successor = Arc::new(Mutex::new(Terminal::new(
-            shown.checkpoint.rows,
-            shown.checkpoint.cols,
-        )));
-        {
-            let mut engine = successor.lock().unwrap();
-            engine.restore_checkpoint(&shown.checkpoint);
-            if history.carry.is_some() {
-                history.reserve_in(&mut engine);
-                history.anchor_in(&engine);
-            }
-        }
-        let report =
-            crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
-                session: shown.local_id,
-                term: Arc::clone(&successor),
-                history,
-            }])
-            .remove(0);
-        assert_eq!(report.failed, None, "{}: held pane {}", desk.name, shown.local_id);
+        let session = crate::held_pane_session(
+            shown.local_id,
+            shown.sid.clone().expect("a held pane keeps its sid"),
+            &shown.checkpoint,
+            None,
+            aterm_types::Appearance::Dark,
+        );
+        let history = crate::held_pane_history(&session.term, shown.history).unwrap_or_else(|| {
+            panic!(
+                "{}: held pane {} owes the import",
+                desk.name, shown.local_id
+            )
+        });
+        let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+            session: shown.local_id,
+            term: Arc::clone(&session.term),
+            history,
+        }])
+        .remove(0);
         assert_eq!(
-            (report.imported, report.links_dropped),
-            (parent_lines.len() as u64, 0),
+            report.failed, None,
+            "{}: held pane {}",
+            desk.name, shown.local_id
+        );
+        assert_eq!(
+            (report.imported, report.links_dropped, report.held_pane),
+            (parent_lines.len() as u64, 0, true),
             "{}: held pane {} imports its parent's whole history",
             desk.name,
             shown.local_id
         );
-        let (want, _) = fx_carried_lines(&parent_lines, cols);
+        let (mut want, _) = fx_carried_lines(&parent_lines, cols);
+        for line in &mut want {
+            line.clear_hyperlinks();
+        }
+        let got = fx_history_lines(&session.term.lock().unwrap());
         fx_assert_same_lines(
-            &fx_history_lines(&successor.lock().unwrap()),
+            &got,
             &want,
             &format!(
-                "{}: held pane {}'s history after the import is its parent's",
+                "{}: held pane {}'s history after the import is its parent's, every link dropped",
                 desk.name, shown.local_id
             ),
+        );
+        assert!(
+            !got.iter().any(aterm_core::scrollback::Line::has_hyperlinks),
+            "{}: held pane {}'s scrollback shows no link",
+            desk.name,
+            shown.local_id
         );
     }
     for fd in slaves
@@ -2244,8 +2450,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
 fn fx_incident_desk() -> FxDesk {
     use crate::restore::RestoreManifest;
     // Session 0: Claude Code entered 1049 from a prompt on the LAST row of a
-    // 56-row grid, then the message band's row took one row away: the DECSC
-    // slot sits on row 55 of a 55-row grid (the 2026-09-22 incident).
+    // 56-row grid, then the message band's row took one row away (the
+    // 2026-09-22 incident). Through v0.101.0 the DECSC slot stayed on row 55
+    // of the 55-row grid; since v0.102.0 the shrink demotes the saved
+    // primary's top row into history and the slot rides up with its text
+    // (`Grid::lend_saved_cursor`, xterm's `AdjustSavedCursor`): row 54, after
+    // `$ claude`.
     let mut claude = fx_claude(0, 56, 149, 60);
     {
         let mut t = claude.term.lock().unwrap();
@@ -2256,9 +2466,10 @@ fn fx_incident_desk() -> FxDesk {
         let meta = CheckpointMeta::from_checkpoint(&cp);
         assert_eq!(meta.rows, 55);
         assert_eq!(
-            meta.saved_cursor_main.map(|saved| saved.cursor_row),
-            Some(55),
-            "the incident's slot rides raw"
+            meta.saved_cursor_main
+                .map(|saved| (saved.cursor_row, saved.cursor_col)),
+            Some((54, 8)),
+            "the incident's slot rode the shrink up with its prompt"
         );
     }
     claude.record.title = "claude".to_string();
@@ -2295,7 +2506,11 @@ fn fx_claude_desk() -> FxDesk {
         rung: CarryRung::Full,
         taken_links_stripped: 0,
     };
-    let shell = fx_session(1, "zsh", fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2));
+    let shell = fx_session(
+        1,
+        "zsh",
+        fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2),
+    );
     FxDesk {
         name: "claude-code-1049",
         nonce_seed: 0x0100_0002,
@@ -2471,7 +2686,9 @@ fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8
             .as_bytes(),
         );
     }
-    t.process(format!("\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]133;B;id={id}\x07").as_bytes());
+    t.process(
+        format!("\x1b]133;A;id={id}\x07dev@devhost {cwd} % \x1b]133;B;id={id}\x07").as_bytes(),
+    );
     t
 }
 
@@ -2620,8 +2837,10 @@ fn fx_marked_shell(
         t.process(format!("\x1b]133;D;{code}{sign}\x07").as_bytes());
     }
     t.process(
-        format!("\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \x1b]133;B{sign}\x07")
-            .as_bytes(),
+        format!(
+            "\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \x1b]133;B{sign}\x07"
+        )
+        .as_bytes(),
     );
     (t, sign)
 }
@@ -2651,7 +2870,8 @@ fn fx_colour_and_shell_desk() -> FxDesk {
     for (index, rgb) in base16.iter().enumerate() {
         theme.push_str(&format!("\x1b]4;{index};rgb:{rgb}\x1b\\"));
     }
-    theme.push_str("\x1b]10;rgb:ab/b2/bf\x1b\\\x1b]11;rgb:28/2c/34\x1b\\\x1b]12;rgb:52/8b/ff\x1b\\");
+    theme
+        .push_str("\x1b]10;rgb:ab/b2/bf\x1b\\\x1b]11;rgb:28/2c/34\x1b\\\x1b]12;rgb:52/8b/ff\x1b\\");
     let (mut build, sign) = fx_marked_shell(
         42,
         120,
@@ -2817,7 +3037,9 @@ fn fx_link_dense_desk() -> FxDesk {
     let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
     let mut runs = fx_shell(32, 110, 100, "/home/dev/src/aterm", 5);
     runs.process(b"gh run view 4242 --log-links\r\n");
-    runs.process("\x1b[1mRun 4242\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes());
+    runs.process(
+        "\x1b[1mRun 4242\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes(),
+    );
     runs.process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
     runs.process(b"\r\n");
     for step in 0..40 {
@@ -2826,7 +3048,13 @@ fn fx_link_dense_desk() -> FxDesk {
                 .as_bytes(),
         );
     }
-    runs.process(format!("{}gh run view 4243 --log-links\r\n", prompt("/home/dev/src/aterm")).as_bytes());
+    runs.process(
+        format!(
+            "{}gh run view 4243 --log-links\r\n",
+            prompt("/home/dev/src/aterm")
+        )
+        .as_bytes(),
+    );
     runs.process("\x1b[1mRun 4243\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes());
     runs.process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
     runs.process(b"\r\n");
@@ -2835,7 +3063,9 @@ fn fx_link_dense_desk() -> FxDesk {
     runs.process(prompt("/home/dev/src/aterm").as_bytes());
 
     let mut notes = fx_shell(32, 109, 600, "/home/dev/notes", 6);
-    notes.process(b"curl -s https://ci.example.test/api/runs/4242 | jq -r '.jobs[].log' | linkify\r\n");
+    notes.process(
+        b"curl -s https://ci.example.test/api/runs/4242 | jq -r '.jobs[].log' | linkify\r\n",
+    );
     notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
     notes.process(b"\r\n");
     notes.process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
@@ -2902,13 +3132,15 @@ fn fx_link_dense_desk() -> FxDesk {
 /// plan P2-2).
 fn fx_link_dense_history_desk() -> FxDesk {
     use crate::restore::{
-        NativeLeafRestore, RestoreManifest, RestoredSplitTree, RestoredView,
-        SettingsDraftRestore, SplitKind,
+        NativeLeafRestore, RestoreManifest, RestoredSplitTree, RestoredView, SettingsDraftRestore,
+        SplitKind,
     };
     let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
     let mut runs = fx_shell(32, 110, 300, "/home/dev/src/aterm", 7);
     runs.process(b"gh run view 4250 --log-links\r\n");
-    runs.process("\x1b[1mRun 4250\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes());
+    runs.process(
+        "\x1b[1mRun 4250\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes(),
+    );
     runs.process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
     runs.process(b"\r\n");
     for step in 0..400 {
@@ -2921,7 +3153,13 @@ fn fx_link_dense_history_desk() -> FxDesk {
             .as_bytes(),
         );
     }
-    runs.process(format!("{}gh run view 4251 --log-links\r\n", prompt("/home/dev/src/aterm")).as_bytes());
+    runs.process(
+        format!(
+            "{}gh run view 4251 --log-links\r\n",
+            prompt("/home/dev/src/aterm")
+        )
+        .as_bytes(),
+    );
     runs.process("\x1b[1mRun 4251\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes());
     runs.process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
     runs.process(b"\r\n");
@@ -2929,18 +3167,29 @@ fn fx_link_dense_history_desk() -> FxDesk {
     runs.process(b"\r\n");
     for line in 0..60 {
         runs.process(
-            format!("\x1b[31merror\x1b[0m[E0308]: mismatched types in crate{} at line {line}\r\n", line % 7)
-                .as_bytes(),
+            format!(
+                "\x1b[31merror\x1b[0m[E0308]: mismatched types in crate{} at line {line}\r\n",
+                line % 7
+            )
+            .as_bytes(),
         );
     }
     runs.process(prompt("/home/dev/src/aterm").as_bytes());
 
     let mut notes = fx_shell(32, 109, 500, "/home/dev/notes", 8);
-    notes.process(b"curl -s https://ci.example.test/api/runs/4251 | jq -r '.jobs[].log' | linkify\r\n");
+    notes.process(
+        b"curl -s https://ci.example.test/api/runs/4251 | jq -r '.jobs[].log' | linkify\r\n",
+    );
     notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
     notes.process(b"\r\n");
     for line in 0..80 {
-        notes.process(format!("- job {line:02}: \x1b[32mpassed\x1b[0m in {}s\r\n", 30 + line % 50).as_bytes());
+        notes.process(
+            format!(
+                "- job {line:02}: \x1b[32mpassed\x1b[0m in {}s\r\n",
+                30 + line % 50
+            )
+            .as_bytes(),
+        );
     }
     notes.process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
     notes.process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
@@ -2968,7 +3217,10 @@ fn fx_link_dense_history_desk() -> FxDesk {
         key: "font_family".to_string(),
         text: "Iosevka Term".to_string(),
     };
-    assert!(crate::restore::settings_draft_is_carriable(&draft.key, &draft.text));
+    assert!(crate::restore::settings_draft_is_carriable(
+        &draft.key,
+        &draft.text
+    ));
     let mut settings = NativeLeafRestore::settings("/text-fonts".to_string());
     settings.settings_drafts = vec![draft];
     FxDesk {
@@ -2998,7 +3250,13 @@ fn fx_link_dense_history_desk() -> FxDesk {
 /// A shell under aterm's signed integration with `commands` finished commands
 /// and a `cargo build` still running (OSC 133 phase 3), so the successor must
 /// complete a command the parent started.
-fn fx_building_shell(rows: u16, cols: u16, nonce: [u8; 32], commands: usize, flavour: u8) -> Terminal {
+fn fx_building_shell(
+    rows: u16,
+    cols: u16,
+    nonce: [u8; 32],
+    commands: usize,
+    flavour: u8,
+) -> Terminal {
     let (mut build, sign) = fx_marked_shell(
         rows,
         cols,
@@ -3136,7 +3394,6 @@ fn fx_policy_repaint_desk() -> FxDesk {
     }
 }
 
-
 /// v0.100.0's new shape: panes kept open by `--hold` after their command
 /// exited (round five, item 19; round six of the update audit, findings 21,
 /// 46 and 49). They are in the layout but never handed (no process, no PTY),
@@ -3152,7 +3409,10 @@ fn fx_held_pane_desk() -> FxDesk {
     let mut make = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", 4);
     make.process(b"make test\r\n");
     for i in 0..6 {
-        make.process(format!("   Compiling crate-{i} v0.1.0 (/home/dev/src/aterm/crates/crate-{i})\r\n").as_bytes());
+        make.process(
+            format!("   Compiling crate-{i} v0.1.0 (/home/dev/src/aterm/crates/crate-{i})\r\n")
+                .as_bytes(),
+        );
     }
     make.process(
         b"see \x1b]8;;https://ci.example.invalid/run/4521/log\x1b\\the log\x1b]8;;\x1b\\ for details\r\n",
@@ -3166,7 +3426,11 @@ fn fx_held_pane_desk() -> FxDesk {
         ceiling: aterm_update_core::handoff_policy::CarryCeiling::Full,
         window: fx_window_carry(ROWS, COLS * 2 + 1, false),
         sessions: vec![
-            fx_session(0, "zsh", fx_shell(ROWS, COLS, 200, "/home/dev/src/aterm", 1)),
+            fx_session(
+                0,
+                "zsh",
+                fx_shell(ROWS, COLS, 200, "/home/dev/src/aterm", 1),
+            ),
             fx_session(1, "zsh", fx_shell(ROWS, COLS, 80, "/home/dev", 7)),
         ],
         layout: RestoreManifest::new(vec![fx_window(
@@ -3240,236 +3504,24 @@ fn generate_handoff_fixtures() {
 
 // ============================================ THE RENDEZVOUS TRANSPORT CAPTURE
 //
-// Item 11 of the fifth update-robustness round. A RENDEZVOUS-ONLY capture,
-// appended on its own (not with the desk generator above) to
-// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at each release
-// tag, and run as
-//
-//   ATERM_BUILD_GIT_COMMIT=<tag's 12-digit commit> \
-//   SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
-//   ATERM_RENDEZVOUS_FIXTURE_OUT=<main tree>/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
-//     targo --unverified test -p aterm-gui --lib -- generate_rendezvous_fixture --ignored
-//
-// It writes `vX.Y.0/rendezvous.toml`: the claim frame that release's dialer
-// writes for a fixed secret; the grant header and body its parent sends for a
-// fixed nonce and sessions [(0,4000),(1,4001),(7,4002)], and the order its
-// descriptors arrive in, observed by a real receiver over a real bound
-// `Rendezvous` with openpty masters and two pipes; the launch environment's
-// names and value shapes; its own `ATERM_SEAMLESS_TARGET` and
+// Item 11 of the fifth update-robustness round. It writes
+// `$ATERM_RENDEZVOUS_FIXTURE_OUT/rendezvous.toml`: the claim frame this
+// release's dialer writes for a fixed secret; the grant header and body its
+// parent sends for a fixed nonce and sessions [(0,4000),(1,4001),(7,4002)],
+// and the order its descriptors arrive in, observed by a real receiver over a
+// real bound `Rendezvous` with openpty masters and two pipes; the launch
+// environment's names and value shapes; its own `ATERM_SEAMLESS_TARGET` and
 // `ATERM_HANDOFF_PARENT_BIRTH` values; and the adoption proof over the
-// recorded `st_rdev` terms. Everything it reaches is `pub(crate)` or private to
-// `seamless` (this module is a descendant), and present from v0.91.0 on. The
+// recorded `st_rdev` terms. The capture is the guard's own
+// (`fixture_tests::capture_transport`), over the guard's fixed inputs, so the
+// record and the guard's reading of this build can never drift apart. The
 // guard is `seamless::fixture_tests::every_shipped_producers_rendezvous_grants_this_successor`.
 
 #[cfg(target_os = "macos")]
 mod rendezvous_generator {
-    /// The fixed inputs every rendezvous capture runs over, in every release and in
-    /// this build: what a record holds is then the producer's SPELLING of them and
-    /// nothing else. Byte-identical to the guard's copy
-    /// (`seamless_fixture_tests.rs`).
-    const RZ_SECRET: &str = "3f9c2e71a0b84d56e1f7c3a92b0d4e68f5a1c7e39b2d0f86a4e1c5b7d93f0a2c";
-    const RZ_NONCE: &str = "c0ffee00aa55aa55c0ffee00aa55aa55";
-    const RZ_SESSIONS: [(u64, i32); 3] = [(0, 4000), (1, 4001), (7, 4002)];
-
-    /// What ONE build's rendezvous code does with the fixed inputs.
-    struct TransportCapture {
-        claim_frame: Vec<u8>,
-        grant_header: Vec<u8>,
-        grant_body: String,
-        descriptor_order: Vec<String>,
-        rendezvous_file_shape: String,
-        claim_hex_len: usize,
-    }
-
-    /// Lowercase hex of `bytes`.
-    fn hex_of(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    /// `fstat` of a live descriptor, or a panic naming it.
-    fn stat_of(fd: i32) -> libc::stat {
-        let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `fstat` writes one `struct stat` through the pointer.
-        assert_eq!(
-            unsafe { libc::fstat(fd, info.as_mut_ptr()) },
-            0,
-            "fstat {fd}"
-        );
-        // SAFETY: `fstat` returned 0, so it initialized the structure.
-        unsafe { info.assume_init() }
-    }
-
-    /// The file a descriptor names: `(st_dev, st_ino)`.
-    fn inode_of(fd: i32) -> (libc::dev_t, libc::ino_t) {
-        let info = stat_of(fd);
-        (info.st_dev, info.st_ino)
-    }
-
-    /// A fresh PTY: `(master, slave)`.
-    fn open_pty_pair() -> (i32, i32) {
-        let (mut master, mut slave) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills them on success.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty");
-        (master, slave)
-    }
-
-    /// THIS BUILD'S TRANSPORT over the fixed inputs, observed from outside: the
-    /// claim its dialer writes (read off a plain listener), and the grant its
-    /// parent sends over a real bound [`crate::handoff_rendezvous::Rendezvous`] to
-    /// a real claim — the header and every descriptor dequeued by one
-    /// `recv_with_fds`, the body after it, and each descriptor identified by what
-    /// it IS (a master by its `st_rdev`, a pipe end by its inode). The guard runs
-    /// this same function over the build under test.
-    fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
-        use std::io::Read as _;
-        use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
-
-        let listen = scratch.join("claim.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&listen).expect("a plain listener");
-        let dialer =
-            crate::handoff_rendezvous::dial_for_test(&listen, RZ_SECRET).expect("dial and claim");
-        let (mut accepted, _) = listener.accept().expect("accept the claim");
-        drop(dialer);
-        let mut claim_frame = Vec::new();
-        accepted
-            .read_to_end(&mut claim_frame)
-            .expect("read the claim");
-        drop((accepted, listener));
-        let _ = std::fs::remove_file(&listen);
-
-        let rendezvous =
-            crate::handoff_rendezvous::Rendezvous::bind(RZ_NONCE).expect("bind a rendezvous");
-        let file = rendezvous
-            .path()
-            .file_name()
-            .expect("a socket name")
-            .to_string_lossy()
-            .into_owned();
-        let rendezvous_file_shape = file
-            .replace(&format!("-{}-", std::process::id()), "-<pid>-")
-            .replace(&RZ_NONCE[..16], "<nonce16>");
-        let claim_hex_len = rendezvous.claim().len();
-        let dialer = crate::handoff_rendezvous::dial_for_test(rendezvous.path(), rendezvous.claim())
-            .expect("dial the rendezvous");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let own = i32::try_from(std::process::id()).expect("a pid fits pid_t");
-        // Since v0.101.0 the parent also checks the dialer's code
-        // (`DialerCode`): the capture's dialer is this process.
-        let peer = crate::handoff_rendezvous::admitted(
-            rendezvous.accept_claim(
-                Some(own),
-                &crate::handoff_rendezvous::DialerCode::this_process(),
-                deadline,
-                &|| false,
-            ),
-            "the claim is accepted",
-        );
-        let ptys = RZ_SESSIONS
-            .iter()
-            .map(|_| open_pty_pair())
-            .collect::<Vec<_>>();
-        let (ready_read, ready_write) = pipe_pair("rz ready");
-        let (commit_read, commit_write) = pipe_pair("rz commit");
-        // SAFETY: fresh pipe descriptors, owned from here.
-        let (ready_write, commit_read) = unsafe {
-            (
-                std::os::fd::OwnedFd::from_raw_fd(ready_write),
-                std::os::fd::OwnedFd::from_raw_fd(commit_read),
-            )
-        };
-        let sessions = RZ_SESSIONS
-            .iter()
-            .zip(&ptys)
-            .map(|((local_id, pid), (master, _))| {
-                // SAFETY: the master stays open until the end of this function.
-                (*local_id, *pid, unsafe {
-                    std::os::fd::BorrowedFd::borrow_raw(*master)
-                })
-            })
-            .collect::<Vec<_>>();
-        peer.transfer(
-            RZ_NONCE,
-            &sessions,
-            ready_write.as_fd(),
-            commit_read.as_fd(),
-            deadline,
-        )
-        .expect("the grant is sent");
-        dialer
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .expect("a read bound");
-        let mut header = [0u8; 8];
-        let received =
-            aterm_uds::fdpass::recv_with_fds(&dialer, &mut header, aterm_uds::fdpass::MAX_FDS)
-                .expect("the header and its descriptors");
-        if received.bytes < header.len() {
-            (&dialer)
-                .read_exact(&mut header[received.bytes..])
-                .expect("the rest of the header");
-        }
-        let mut body = vec![0u8; usize::from(u16::from_be_bytes([header[6], header[7]]))];
-        (&dialer).read_exact(&mut body).expect("the grant body");
-        let descriptor_order = received
-            .fds
-            .iter()
-            .map(|fd| {
-                let fd = fd.as_raw_fd();
-                if stat_of(fd).st_mode & libc::S_IFMT == libc::S_IFCHR {
-                    RZ_SESSIONS
-                        .iter()
-                        .zip(&ptys)
-                        .find(|(_, (master, _))| {
-                            crate::handoff_rendezvous::pty_device_term(*master)
-                                == crate::handoff_rendezvous::pty_device_term(fd)
-                        })
-                        .map_or_else(
-                            || "unknown-device".to_string(),
-                            |((local_id, _), _)| format!("session:{local_id}"),
-                        )
-                } else if inode_of(fd) == inode_of(ready_write.as_raw_fd()) {
-                    "ready".to_string()
-                } else if inode_of(fd) == inode_of(commit_read.as_raw_fd()) {
-                    "commit".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            })
-            .collect::<Vec<_>>();
-        drop(received);
-        drop((dialer, peer, rendezvous, ready_write, commit_read));
-        for fd in ptys
-            .into_iter()
-            .flat_map(|(master, slave)| [master, slave])
-            .chain([ready_read, commit_write])
-        {
-            aterm_pty::close_fd(fd);
-        }
-        TransportCapture {
-            claim_frame,
-            grant_header: header.to_vec(),
-            grant_body: String::from_utf8(body).expect("a UTF-8 grant body"),
-            descriptor_order,
-            rendezvous_file_shape,
-            claim_hex_len,
-        }
-    }
-
-    /// A plain pipe: `(read, write)`.
-    fn pipe_pair(label: &str) -> (i32, i32) {
-        let mut fds = [0i32; 2];
-        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "{label} pipe");
-        (fds[0], fds[1])
-    }
+    use crate::seamless::fixture_tests::{
+        RZ_NONCE, RZ_SECRET, RZ_SESSIONS, capture_transport, hex_of, open_pty_pair,
+    };
 
     /// `value` as a TOML basic string.
     fn toml_string(value: &str) -> String {
@@ -3487,7 +3539,7 @@ mod rendezvous_generator {
         out
     }
 
-    /// The literal a match arm of the release's own `app_update_handoff.rs`
+    /// The literal a match arm of this release's own `app_update_handoff.rs`
     /// gives the proof term for `lane` (`HandoffLane::OutOfBand => "device"`):
     /// the parent writes that literal into the successor's environment, and no
     /// function returns it.
@@ -3508,6 +3560,9 @@ mod rendezvous_generator {
     #[test]
     #[ignore = "writes a release fixture; run by name with --ignored"]
     fn generate_rendezvous_fixture() {
+        let _env = super::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::fx_install_release_stamp();
         let out = std::path::PathBuf::from(
             std::env::var_os("ATERM_RENDEZVOUS_FIXTURE_OUT")
@@ -3526,13 +3581,11 @@ mod rendezvous_generator {
             );
         }
 
-        let build = crate::build_info::build_number()
-            .parse::<u64>()
-            .expect("SOURCE_DATE_EPOCH set to the release's build number");
+        let build = crate::running_build_number();
         let commit = crate::build_info::git_commit();
         assert!(
             commit.len() == 12 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "ATERM_BUILD_GIT_COMMIT set to the tag's 12-digit commit, not {commit:?}"
+            "ATERM_BUILD_GIT_COMMIT set to the release's 12-digit commit, not {commit:?}"
         );
         let target_value = crate::seamless::encode_target_identity(build, commit);
         let parent_birth_value = crate::seamless::outgoing_parent_env()
@@ -3558,23 +3611,27 @@ mod rendezvous_generator {
         }
         let layout = [0x11u8; 32];
         let screen = [0x22u8; 32];
-        let proof = crate::seamless::adoption_proof(RZ_NONCE, build, commit, &layout, &screen, &terms)
-            .expect("a proof over the fixed inputs");
+        let proof =
+            crate::seamless::adoption_proof(RZ_NONCE, build, commit, &layout, &screen, &terms)
+                .expect("a proof over the fixed inputs");
 
         let mut toml = String::new();
         toml.push_str(
-            "# What this release's rendezvous transport does over fixed inputs. Generated by\n\
-             # `generate_rendezvous_fixture` in a worktree at the release's tag; see\n\
-             # ../README.md, \"The rendezvous transport\".\n",
+            "# What this release's rendezvous transport does over fixed inputs. Written by\n\
+             # `generate_rendezvous_fixture` (the release's own cut); see ../README.md,\n\
+             # \"The rendezvous transport\".\n",
         );
         let mut line = |key: &str, value: String| toml.push_str(&format!("{key} = {value}\n"));
         line(
             "producer_version",
-            toml_string(env!("CARGO_PKG_VERSION")),
+            toml_string(crate::build_info::version()),
         );
         line("producer_commit", toml_string(commit));
         line("claim_input", toml_string(RZ_SECRET));
-        line("claim_frame_hex", toml_string(&hex_of(&capture.claim_frame)));
+        line(
+            "claim_frame_hex",
+            toml_string(&hex_of(&capture.claim_frame)),
+        );
         line("grant_nonce", toml_string(RZ_NONCE));
         line(
             "grant_sessions",
@@ -3612,13 +3669,19 @@ mod rendezvous_generator {
             "rendezvous_file_shape",
             toml_string(&capture.rendezvous_file_shape),
         );
-        line("env_claim", toml_string(crate::handoff_rendezvous::ENV_CLAIM));
+        line(
+            "env_claim",
+            toml_string(crate::handoff_rendezvous::ENV_CLAIM),
+        );
         line("claim_hex_len", capture.claim_hex_len.to_string());
         line(
             "env_proof_term",
             toml_string(crate::handoff_rendezvous::ENV_PROOF_TERM),
         );
-        line("proof_term_launched", toml_string(&proof_term_of("OutOfBand")));
+        line(
+            "proof_term_launched",
+            toml_string(&proof_term_of("OutOfBand")),
+        );
         line("proof_term_fork", toml_string(&proof_term_of("Fork")));
         line("env_target", toml_string(crate::seamless::ENV_TARGET));
         line("target_value", toml_string(&target_value));

@@ -2348,6 +2348,9 @@ fn headless_split_capture_holds_advance_and_retain_without_ticking_effects() {
     let retained_at = t0 + Duration::from_millis(37);
     let next_trail_tick = t0 + Duration::from_secs(3);
     let last_trail_fire = t0 + Duration::from_millis(2);
+    let front_coords = term_lock(&app.front_terminal(wid).expect("front terminal").term)
+        .content_scroll_state()
+        .coordinate_generation();
     let predictor_deadline = {
         let window = app.windows.get_mut(&wid).expect("test window");
         window.next_trail_tick = Some(next_trail_tick);
@@ -2355,7 +2358,11 @@ fn headless_split_capture_holds_advance_and_retain_without_ticking_effects() {
         window
             .predictor
             .set_mode(crate::predict::PredictMode::Always);
-        assert!(window.predictor.predict_char('?', (0, 0), window.cols, t0));
+        assert!(
+            window
+                .predictor
+                .predict_char('?', (0, 0), front_coords, window.cols, t0)
+        );
         window
             .predictor
             .next_deadline()

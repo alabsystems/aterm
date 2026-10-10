@@ -41,6 +41,9 @@ mod cli;
 mod dmg;
 // The cutter's durability flushes, in one place (and a plain fsync under its tests).
 mod durable;
+// The release's own handoff fixtures: written before its claim, landed on main after
+// its cut, so the next cut finds them.
+mod fixtures;
 mod gates;
 mod ledger;
 // The producer half of the machine-roster tier: this machine's public identity, the

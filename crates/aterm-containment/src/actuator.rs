@@ -27,6 +27,11 @@
 //! - refuses every task port but a process's own — control, read, inspect and
 //!   name, its own children's included — so a contained `lldb`/`debugserver`
 //!   cannot attach to anything ([`crate::sbpl`] rule 2);
+//! - refuses every mach service lookup but the two directory queries that name
+//!   the user and their groups ([`crate::sbpl::MACH_LOOKUP_ALLOWLIST`]), so no
+//!   daemon outside the sandbox works for it: nothing it does reaches Launch
+//!   Services (`open`), Apple Events (`osascript`), login items, the preferences
+//!   or keychain daemons or the pasteboard ([`crate::sbpl`] rule 2);
 //! - confines WRITES to the temp roots (`/private/tmp`, `/private/var/tmp`, the
 //!   user's own `$TMPDIR`) and `/dev`, plus the shell's own history files, so
 //!   nothing it does can plant code that a later unsandboxed shell runs
@@ -235,9 +240,9 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
 #[must_use]
 pub fn applied_posture(home_scoped: bool) -> &'static str {
     if home_scoped {
-        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
+        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); no mach service lookup but user and group queries (launchd answers by its own policy); writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
     } else {
-        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); writes only to temp dirs; $HOME did not resolve, so credential stores and private data can still be read"
+        "OS sandbox applied: no network; no debugger attach (no task port but a process's own); no mach service lookup but user and group queries (launchd answers by its own policy); writes only to temp dirs; $HOME did not resolve, so credential stores and private data can still be read"
     }
 }
 
@@ -411,9 +416,14 @@ mod tests {
         let homeless = applied_posture(false);
         assert!(!homeless.contains("no access"), "{homeless}");
         assert!(!homeless.contains("shell history"), "{homeless}");
-        // The task-port pair is in the base profile, so it holds with no home too.
+        // The task-port pair and the mach-lookup allowlist are in the base
+        // profile, so they hold with no home too.
         for posture in [applied_posture(true), homeless] {
             assert!(posture.contains("no debugger attach"), "{posture}");
+            assert!(
+                posture.contains("no mach service lookup but user and group queries"),
+                "{posture}"
+            );
         }
     }
 
@@ -1265,18 +1275,64 @@ mod tests {
         );
     }
 
-    /// What tells [`launch_broker_probe_child`] to probe.
+    /// The names [`mach_lookup_probe_child`] looks up, comma-separated.
     #[cfg(target_os = "macos")]
-    const BROKER_PROBE: &str = "ATERM_LAUNCH_BROKER_PROBE";
+    const LOOKUP_PROBE: &str = "ATERM_MACH_LOOKUP_PROBE";
 
-    /// Re-entered by PROOF 8 under a profile: asks bootstrap for a send right to
-    /// each of [`crate::sbpl::DENIED_LAUNCH_BROKERS`] and prints the
-    /// `kern_return_t`s (`BROKERS <kr>/<kr>/…`). It only looks the names up; it
-    /// never sends a message, so nothing is launched. Run alone it does nothing.
+    /// What `bootstrap_look_up` answers when the sandbox refuses the lookup
+    /// (`BOOTSTRAP_NOT_PRIVILEGED`). A name no daemon serves answers 1102
+    /// instead, so 1100 is the profile's refusal and nothing else.
+    #[cfg(target_os = "macos")]
+    const REFUSED: &str = "1100";
+
+    /// The launch brokers: Launch Services' daemon and its open/open-URL
+    /// endpoints, the Apple Events daemon, and the `ServiceManagement` daemon
+    /// behind `SMAppService`/`SMJobBless`. Each starts, drives or registers a
+    /// process that does not inherit the sandbox (`open` of a `.command` file, a
+    /// scripted app, a login item). Until 2026-10-09 the profile denied exactly
+    /// these names; now they are refused because
+    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] does not name them, and PROOF 8
+    /// keeps asking for them as the negative control.
+    #[cfg(target_os = "macos")]
+    const LAUNCH_BROKERS: &[&str] = &[
+        "com.apple.coreservices.launchservicesd",
+        "com.apple.lsd.open",
+        "com.apple.lsd.openurl",
+        "com.apple.coreservices.appleevents",
+        "com.apple.xpc.smd",
+    ];
+
+    /// Daemons outside the sandbox that act for whoever looks them up, sampled
+    /// from what the tool set asked for under a profile refusing every lookup
+    /// (2026-10-09, `docs/HARDCORE_BACKLOG.md` P1), each reachable under the
+    /// launch-broker denylist the profile had before.
+    #[cfg(target_os = "macos")]
+    const CALLER_ACTING_DAEMONS: &[&str] = &[
+        // Writes preference domains into ~/Library/Preferences for its caller.
+        "com.apple.cfprefsd.daemon",
+        // The keychain daemon: item operations and the session's lock state.
+        "com.apple.SecurityServer",
+        // Adds and edits the user's login and background items.
+        "com.apple.backgroundtaskmanagementagent",
+        // The clipboard every other app pastes from.
+        "com.apple.pasteboard.1",
+        // Creates per-user directories, as root, for its caller.
+        "com.apple.bsd.dirhelper",
+        // Changes directory records (the allowlisted names only query).
+        "com.apple.system.opendirectoryd.api",
+        // Posts notifications into every app of the session.
+        "com.apple.distributed_notifications@Uv3",
+    ];
+
+    /// Re-entered by PROOFS 8 and 10 under a profile: asks bootstrap for a send
+    /// right to each name in [`LOOKUP_PROBE`] and prints the `kern_return_t`s
+    /// in that order (`LOOKUPS <kr>/<kr>/…`). It only looks the names up; it
+    /// never sends a message, so nothing is launched or changed. Run alone it
+    /// does nothing.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "PROOF 8's probe child; runs only when that proof re-enters it"]
-    fn launch_broker_probe_child() {
+    #[ignore = "PROOFS 8 and 10's probe child; runs only when one re-enters it"]
+    fn mach_lookup_probe_child() {
         unsafe extern "C" {
             static bootstrap_port: libc::mach_port_t;
             static mach_task_self_: libc::mach_port_t;
@@ -1290,13 +1346,13 @@ mod tests {
                 name: libc::mach_port_t,
             ) -> libc::kern_return_t;
         }
-        if std::env::var_os(BROKER_PROBE).is_none() {
+        let Ok(names) = std::env::var(LOOKUP_PROBE) else {
             return;
-        }
-        let codes: Vec<String> = crate::sbpl::DENIED_LAUNCH_BROKERS
-            .iter()
+        };
+        let codes: Vec<String> = names
+            .split(',')
             .map(|name| {
-                let name = std::ffi::CString::new(*name).expect("a service name has no NUL");
+                let name = std::ffi::CString::new(name).expect("a service name has no NUL");
                 let mut port: libc::mach_port_t = 0;
                 // SAFETY: `bootstrap_port` is libSystem's bootstrap send right,
                 // initialised before `main`; `bootstrap_look_up` reads the C
@@ -1309,63 +1365,122 @@ mod tests {
                 kr.to_string()
             })
             .collect();
-        println!("BROKERS {}", codes.join("/"));
+        println!("LOOKUPS {}", codes.join("/"));
     }
 
-    /// PROOF 8 (LAUNCH BROKERS, FULL generated Containment profile) — a contained
+    /// Each of `names` looked up by [`mach_lookup_probe_child`] under `profile`,
+    /// as `(name, kern_return_t)`. A lookup answers at once and asks nobody
+    /// anything (unlike PROOF 7's `task_for_pid`, which can wait on the
+    /// administrator dialog).
+    #[cfg(target_os = "macos")]
+    fn lookups<'n>(profile: &str, names: &[&'n str]) -> Vec<(&'n str, String)> {
+        let exe = std::env::current_exe().expect("this test binary");
+        let out = sandbox_wrap(
+            profile,
+            exe.to_str().expect("utf8 test binary path"),
+            &[
+                "--exact",
+                "actuator::tests::mach_lookup_probe_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+        )
+        .env(LOOKUP_PROBE, names.join(","))
+        .output()
+        .expect("run the probe child");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let codes = stdout
+            .lines()
+            .find_map(|line| line.split_once("LOOKUPS "))
+            .map(|(_, codes)| codes.trim().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no LOOKUPS line from the probe child; stdout={stdout:?} stderr={:?}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        let codes: Vec<String> = codes.split('/').map(str::to_string).collect();
+        assert_eq!(
+            codes.len(),
+            names.len(),
+            "one answer per name; got {codes:?} for {names:?}"
+        );
+        names.iter().copied().zip(codes).collect()
+    }
+
+    /// The answers whose code is not `want`.
+    #[cfg(target_os = "macos")]
+    fn answered_otherwise<'n>(answers: &[(&'n str, String)], want: &str) -> Vec<(&'n str, String)> {
+        answers
+            .iter()
+            .filter(|(_, kr)| kr != want)
+            .cloned()
+            .collect()
+    }
+
+    /// PROOF 8 (LAUNCH BROKERS, FULL generated Containment profile) — the
+    /// negative control of the deny-by-default `mach-lookup`: a contained
     /// process gets no port to Launch Services, the Apple Events daemon or the
-    /// `ServiceManagement` daemon, each of which starts, drives or registers a
-    /// process that does not inherit the sandbox (`open` of a `.command` file, a
-    /// scripted app, a login item). CONTROL: under `(allow default)` alone every
-    /// lookup succeeds, so the refusal is the profile's.
+    /// `ServiceManagement` daemon, because the allowlist does not name them.
+    /// CONTROL: under `(allow default)` alone every lookup succeeds, so the
+    /// refusal is the profile's.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_launch_brokers_denied() {
-        let exe = std::env::current_exe().expect("this test binary");
-        let probe = |profile: &str| {
-            let exe = exe.to_str().expect("utf8 test binary path");
-            let mut cmd = sandbox_wrap(
-                profile,
-                exe,
-                &[
-                    "--exact",
-                    "actuator::tests::launch_broker_probe_child",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ],
-            );
-            // A lookup answers at once and asks nobody anything (unlike PROOF 7's
-            // `task_for_pid`, which can wait on the administrator dialog).
-            let out = cmd
-                .env(BROKER_PROBE, "1")
-                .output()
-                .expect("run the probe child");
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            stdout
-                .lines()
-                .find_map(|line| line.split_once("BROKERS "))
-                .map(|(_, codes)| codes.trim().to_string())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "no BROKERS line from the probe child; stdout={stdout:?} stderr={:?}",
-                        String::from_utf8_lossy(&out.stderr)
-                    )
-                })
-        };
-
-        let control = probe("(version 1)(allow default)");
+        let control = lookups("(version 1)(allow default)", LAUNCH_BROKERS);
         assert!(
-            control.split('/').all(|kr| kr == "0"),
+            answered_otherwise(&control, "0").is_empty(),
             "CONTROL: an unsandboxed-equivalent probe must reach every launch broker, \
              or the denial below proves nothing; got {control:?}"
         );
-        let contained = probe(&containment_profile());
+        let contained = lookups(&containment_profile(), LAUNCH_BROKERS);
+        let reached = answered_otherwise(&contained, REFUSED);
         assert!(
-            contained.split('/').all(|kr| kr != "0"),
+            reached.is_empty(),
             "DENY FAILED: under the Containment profile every launch-broker lookup must be \
-             refused; got {contained:?} for {:?}",
-            crate::sbpl::DENIED_LAUNCH_BROKERS
+             refused ({REFUSED}); answered otherwise: {reached:?}"
+        );
+    }
+
+    /// PROOF 10 (DENY-BY-DEFAULT MACH-LOOKUP, FULL generated Containment
+    /// profile) — no daemon outside the sandbox works for a contained process:
+    /// a sample of daemons that act for their caller ([`CALLER_ACTING_DAEMONS`])
+    /// is refused (`kr` 1100), though no rule names them, while every
+    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] name is still reached (`kr` 0), so
+    /// the probe can succeed under this very profile. CONTROL: under
+    /// `(allow default)` alone every name is reached, so each refusal is the
+    /// profile's and each name is one some daemon serves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_mach_lookup_denied_by_default() {
+        let allowlist = crate::sbpl::MACH_LOOKUP_ALLOWLIST;
+        let names: Vec<&str> = CALLER_ACTING_DAEMONS
+            .iter()
+            .chain(allowlist)
+            .copied()
+            .collect();
+        let control = lookups("(version 1)(allow default)", &names);
+        assert!(
+            answered_otherwise(&control, "0").is_empty(),
+            "CONTROL: an unsandboxed-equivalent probe must reach every name, or the \
+             denial below proves nothing; got {control:?}"
+        );
+        let contained = lookups(&containment_profile(), &names);
+        let (allowed, daemons): (Vec<_>, Vec<_>) = contained
+            .into_iter()
+            .partition(|(name, _)| allowlist.contains(name));
+        let reached = answered_otherwise(&daemons, REFUSED);
+        assert!(
+            reached.is_empty(),
+            "DENY FAILED: under the Containment profile a daemon that acts for its caller \
+             must be refused ({REFUSED}); answered otherwise: {reached:?}"
+        );
+        let refused = answered_otherwise(&allowed, "0");
+        assert!(
+            refused.is_empty(),
+            "OVER-BROAD: an allowlisted name must stay reachable under the Containment \
+             profile; answered otherwise: {refused:?}"
         );
     }
 
@@ -1461,6 +1576,379 @@ mod tests {
             "WRITE CONFINEMENT FAILED: under the Containment profile the sandbox allows \
              user-preference-write, so the preferences daemon writes ~/Library/Preferences \
              for the contained shell"
+        );
+    }
+
+    /// A hang detector for one contained tool, never a latency budget: each
+    /// answers in about a second, a `targo` build included.
+    #[cfg(target_os = "macos")]
+    const TOOL_HANG: std::time::Duration = std::time::Duration::from_secs(180);
+
+    /// `program`'s first line of output, run unsandboxed — the CONTROL a
+    /// contained run is compared with.
+    #[cfg(target_os = "macos")]
+    fn unsandboxed_line(program: &str, args: &[&str]) -> Option<String> {
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(program).args(args),
+            std::time::Instant::now() + TOOL_HANG,
+        )
+        .ok()?;
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .to_string();
+        (out.status.success() && !line.is_empty()).then_some(line)
+    }
+
+    /// The first directory on `path` holding an executable `name`.
+    #[cfg(target_os = "macos")]
+    fn on_path(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(path)
+            .map(|dir| dir.join(name))
+            .find(|p| {
+                std::fs::metadata(p)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    }
+
+    /// PROOF 11 (TOOL SET, FULL generated Containment profile) — what a
+    /// contained shell is for still works with every mach service but
+    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] refused: a `/bin/sh` pipeline, an
+    /// interactive and a login zsh reading copies of the user's rc files from a
+    /// scratch `$HOME`, bash, the user's and group's names (the allowlist's
+    /// reason: `whoami`, zsh's `$USERNAME`, python's `pwd`, `dsmemberutil`),
+    /// `ls -l`, `date`, `dscacheutil`, git (init, commit, log, diff, status and a
+    /// `file://` clone), python3 (`ssl`, `json`, `socket.getaddrinfo` of
+    /// localhost), make, xcrun, clang (compile and run), ad-hoc `codesign`
+    /// then `codesign -v` and exec, targo and trustc, and a `targo --unverified
+    /// build`. Each runs in a scratch directory under `$TMPDIR`, the one place a
+    /// contained build may write. A tool this machine lacks is SKIPPED by name
+    /// on stderr, never counted a pass.
+    ///
+    /// Not here, by decision (`docs/HARDCORE_BACKLOG.md` P1): `security`'s
+    /// keychain listing (the security daemon is refused), `curl` to a loopback
+    /// server (`(deny network*)`), `ps` (setuid, which the sandbox will not
+    /// exec on `origin/main` either), and `open`/`osascript` (PROOF 12).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_compat_tool_set_runs_under_containment() {
+        use crate::capability::FsCapability;
+        let Some(home) = scratch_home_outside_writable_roots("toolset") else {
+            return;
+        };
+        // The user's rc files, copied: the contained shells read them from the
+        // scratch home and can write nothing back.
+        if let Some(real) = std::env::var_os("HOME") {
+            for rc in [
+                ".zshenv",
+                ".zprofile",
+                ".zshrc",
+                ".zlogin",
+                ".bash_profile",
+                ".bashrc",
+                ".profile",
+            ] {
+                let _ = std::fs::copy(std::path::Path::new(&real).join(rc), home.join(rc));
+            }
+        }
+        let work = aterm_tempfile::tempdir().expect("a scratch directory under $TMPDIR");
+        let temp = std::env::temp_dir();
+        let profile =
+            crate::sbpl::profile_for_home(home.to_str(), Some(&temp), FsCapability::TmpOnly);
+        // CONTROL: the names an unsandboxed lookup gives, which a contained
+        // tool must print too (not `501`).
+        let user =
+            unsandboxed_line("/usr/bin/id", &["-un"]).expect("CONTROL: id -un names the user");
+        let group =
+            unsandboxed_line("/usr/bin/id", &["-gn"]).expect("CONTROL: id -gn names the group");
+        // The test's PATH, behind the directory of the `targo` running the
+        // tests (`$CARGO`), so the contained build uses the toolchain that
+        // built this binary.
+        let inherited =
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+        let toolchain = std::env::var_os("CARGO")
+            .map(std::path::PathBuf::from)
+            .and_then(|targo| targo.parent().map(std::path::Path::to_path_buf));
+        let path = std::env::join_paths(
+            toolchain
+                .into_iter()
+                .chain(std::env::split_paths(&inherited)),
+        )
+        .unwrap_or(inherited);
+        let run = |script: &str| {
+            let mut cmd = sandbox_wrap(&profile, "/bin/sh", &["-c", script]);
+            cmd.env_clear()
+                .env("PATH", &path)
+                .env("HOME", &home)
+                .env("TMPDIR", &temp)
+                .env("USER", &user)
+                .env("LOGNAME", &user)
+                .env("SHELL", "/bin/zsh")
+                .env("LANG", "en_US.UTF-8")
+                .env("TERM", "dumb")
+                .env("CARGO_HOME", work.path().join("cargo-home"))
+                .current_dir(work.path());
+            for kept in ["SDKROOT", "DEVELOPER_DIR"] {
+                if let Some(value) = std::env::var_os(kept) {
+                    cmd.env(kept, value);
+                }
+            }
+            aterm_uds::deadline::output_until(&mut cmd, std::time::Instant::now() + TOOL_HANG)
+        };
+
+        // What a skipped tool lacks, if anything.
+        let developer_tools = unsandboxed_line("/usr/bin/xcode-select", &["-p"])
+            .filter(|dir| std::path::Path::new(dir).is_dir())
+            .is_some();
+        let lacks = |needs: &[&str]| -> Option<String> {
+            needs.iter().find_map(|need| match *need {
+                "developer tools" => (!developer_tools)
+                    .then(|| "no developer tools (`xcode-select -p` names none)".to_string()),
+                tool if tool.starts_with('/') => (!std::path::Path::new(tool).exists())
+                    .then(|| format!("{tool} is not installed")),
+                tool => on_path(tool, &path)
+                    .is_none()
+                    .then(|| format!("`{tool}` is not on PATH")),
+            })
+        };
+        let dev = "developer tools";
+        let member_check = format!("dsmemberutil checkmembership -U '{user}' -G '{group}'");
+        let cases: [(&str, &[&str], &str, String); 16] = [
+            (
+                "a /bin/sh pipeline",
+                &[],
+                "echo hi | tr a-z A-Z | grep -c HI >/dev/null && cat /etc/hosts >/dev/null && echo SH-OK",
+                "SH-OK".into(),
+            ),
+            (
+                "an interactive zsh with the user's rc files",
+                &["/bin/zsh"],
+                "/bin/zsh -i -c 'print -r -- ZSH-I-OK:$USERNAME' </dev/null",
+                format!("ZSH-I-OK:{user}"),
+            ),
+            (
+                "a login zsh with the user's rc files",
+                &["/bin/zsh"],
+                "/bin/zsh -l -i -c 'print -r -- ZSH-L-OK' </dev/null",
+                "ZSH-L-OK".into(),
+            ),
+            (
+                "bash",
+                &["/bin/bash"],
+                "/bin/bash -l -c 'echo BASH-OK:$(whoami)' </dev/null",
+                format!("BASH-OK:{user}"),
+            ),
+            (
+                "the user's name",
+                &[],
+                "echo \"ID-OK:$(whoami):$(id -un):$(id -gn)\"",
+                format!("ID-OK:{user}:{user}:{group}"),
+            ),
+            (
+                "the user's group membership",
+                &["/usr/bin/dsmemberutil"],
+                &member_check,
+                "user is a member of the group".into(),
+            ),
+            (
+                "ls -l, date",
+                &[],
+                "ls -ld \"$HOME\" | awk '{print \"LS-OK:\" $3}' && date >/dev/null",
+                format!("LS-OK:{user}"),
+            ),
+            (
+                "dscacheutil",
+                &["/usr/bin/dscacheutil"],
+                "dscacheutil -q host -a name localhost",
+                "127.0.0.1".into(),
+            ),
+            (
+                "git",
+                &[dev],
+                "git init -q up && cd up && git config user.name r9 \
+                 && git config user.email r9@example.invalid && echo a > f && git add f \
+                 && git commit -qm init && echo b >> f && git diff --stat >/dev/null \
+                 && git status --short >/dev/null && git log --oneline >/dev/null && cd .. \
+                 && git clone -q \"file://$PWD/up\" clone \
+                 && git -C clone log -1 --format=GIT-OK:%an",
+                "GIT-OK:r9".into(),
+            ),
+            (
+                "python3",
+                &[dev],
+                "python3 -c 'import ssl, json, socket, pwd, os; \
+                 socket.getaddrinfo(\"localhost\", 0); \
+                 print(\"PY-OK:\" + pwd.getpwuid(os.getuid()).pw_name)'",
+                format!("PY-OK:{user}"),
+            ),
+            (
+                "make",
+                &[dev],
+                "printf 'all:\\n\\t@echo MAKE-OK\\n' > Makefile && make -s",
+                "MAKE-OK".into(),
+            ),
+            ("xcrun", &[dev], "xcrun --show-sdk-path", ".sdk".into()),
+            (
+                "clang",
+                &[dev],
+                "printf '#include <stdio.h>\\nint main(void){puts(\"C-OK\");return 0;}\\n' > hello.c \
+                 && clang -o hello hello.c && ./hello",
+                "C-OK".into(),
+            ),
+            (
+                "ad-hoc codesign, then codesign -v and exec",
+                &["/usr/bin/codesign"],
+                // A copy of an Apple binary off the system volume is signed
+                // ad hoc before it runs (AGENTS.md).
+                "cp /bin/ls ls-copy && codesign --force --sign - ls-copy 2>/dev/null \
+                 && codesign -v ls-copy && ./ls-copy -d . >/dev/null && echo CODESIGN-OK",
+                "CODESIGN-OK".into(),
+            ),
+            (
+                "targo and trustc",
+                &["targo", "trustc"],
+                "targo --version && trustc --version",
+                "trustc".into(),
+            ),
+            (
+                "a targo --unverified build",
+                &["targo", dev],
+                "mkdir -p crate/src && printf '[package]\\nname = \"probe\"\\nversion = \"0.1.0\"\\n\
+                 edition = \"2021\"\\n\\n[workspace]\\n' > crate/Cargo.toml \
+                 && printf 'fn main() { println!(\"TARGO-OK\"); }\\n' > crate/src/main.rs \
+                 && cd crate && targo --unverified build -q && ./target/debug/probe",
+                "TARGO-OK".into(),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        let mut ran = 0;
+        for (what, needs, script, expect) in &cases {
+            if let Some(reason) = lacks(needs) {
+                eprintln!("SKIPPED {what}: {reason}");
+                continue;
+            }
+            ran += 1;
+            match run(script) {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if !out.status.success() || !stdout.contains(expect.as_str()) {
+                        failures.push(format!(
+                            "{what}: rc={:?}, wanted {expect:?} in stdout={stdout:?} stderr={:?}",
+                            out.status.code(),
+                            String::from_utf8_lossy(&out.stderr)
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("{what}: {e:?}")),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        eprintln!("TOOLSET ran {ran} of {}", cases.len());
+        assert!(
+            failures.is_empty(),
+            "SHELL BROKEN: under the Containment profile:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// PROOF 12 (`open` AND `osascript`, FULL generated Containment profile) —
+    /// the two commands the launch brokers exist for stay refused when run for
+    /// real, not only looked up: `open -W` of a background-only scratch app
+    /// whose executable would leave a marker OUTSIDE the writable roots (where
+    /// only a process outside the sandbox could put it) fails and leaves none,
+    /// and `osascript` sending Finder an Apple Event gets no answer. The event is
+    /// written in raw codes (`«class pnam» of «class sdsk»`, the startup disk's
+    /// name) so it compiles without Finder's dictionary, which a contained
+    /// `osascript` cannot load: the failure is the send's, not a syntax error.
+    /// Both run only after PROOF 8's lookup finds every broker refused under
+    /// this profile, so a regressed profile fails here before anything could
+    /// act outside. No unsandboxed control: it would launch the scratch app and
+    /// register it with Launch Services; PROOF 8's control carries the
+    /// attribution.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_open_and_osascript_stay_refused() {
+        let profile = containment_profile();
+        let reached = answered_otherwise(&lookups(&profile, LAUNCH_BROKERS), REFUSED);
+        assert!(
+            reached.is_empty(),
+            "DENY FAILED: a launch broker is reachable under the Containment profile ({reached:?}); \
+             open and osascript were not run"
+        );
+        let Some(outside) = scratch_home_outside_writable_roots("open") else {
+            return;
+        };
+        let marker = outside.join("ran-outside");
+        let scratch = aterm_tempfile::tempdir().expect("a scratch directory");
+        let app = scratch.path().join("AtermContainmentProbe.app");
+        let macos = app.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("make the scratch app");
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>probe</string>\
+             <key>CFBundleIdentifier</key><string>com.example.aterm-containment-probe</string>\
+             <key>CFBundlePackageType</key><string>APPL</string>\
+             <key>LSBackgroundOnly</key><true/></dict></plist>\n",
+        )
+        .expect("write the scratch app's Info.plist");
+        let probe = macos.join("probe");
+        std::fs::write(
+            &probe,
+            format!("#!/bin/sh\necho ran > '{}'\n", marker.display()),
+        )
+        .expect("write the scratch app's executable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))
+                .expect("make the scratch app executable");
+        }
+        let deadline = || std::time::Instant::now() + TOOL_HANG;
+        let app_s = app.to_str().expect("utf8 scratch path");
+        let open = aterm_uds::deadline::output_until(
+            &mut sandbox_wrap(&profile, "/usr/bin/open", &["-W", "-g", "-j", app_s]),
+            deadline(),
+        )
+        .expect("run open under the Containment profile");
+        let osascript = aterm_uds::deadline::output_until(
+            &mut sandbox_wrap(
+                &profile,
+                "/usr/bin/osascript",
+                &[
+                    "-e",
+                    "tell application \"Finder\" to get «class pnam» of «class sdsk»",
+                ],
+            ),
+            deadline(),
+        )
+        .expect("run osascript under the Containment profile");
+        let ran_outside = marker.exists();
+        let _ = std::fs::remove_dir_all(&outside);
+
+        assert!(
+            !open.status.success() && !ran_outside,
+            "DENY FAILED: open launched an app outside the sandbox under the Containment \
+             profile: rc={:?} marker={ran_outside} stderr={:?}",
+            open.status.code(),
+            String::from_utf8_lossy(&open.stderr)
+        );
+        let osa_stdout = String::from_utf8_lossy(&osascript.stdout);
+        let osa_stderr = String::from_utf8_lossy(&osascript.stderr);
+        assert!(
+            !osa_stderr.contains("(-2740)"),
+            "the osascript probe did not compile, so it proves nothing: {osa_stderr:?}"
+        );
+        assert!(
+            !osascript.status.success() && osa_stdout.trim().is_empty(),
+            "DENY FAILED: Finder answered an Apple Event sent from the Containment profile: \
+             rc={:?} stdout={osa_stdout:?} stderr={osa_stderr:?}",
+            osascript.status.code()
         );
     }
 

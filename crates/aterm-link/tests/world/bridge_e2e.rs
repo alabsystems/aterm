@@ -369,6 +369,17 @@ fn no_bus_record_ever_reaches_a_pty() {
     let w = World::boot("pty", &["h-andrew", "s-1"]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
+    // The baseline is a SETTLED screen: the shell's first prompt is up. A shell that
+    // starts slowly would otherwise print it between the two reads and look like a
+    // record moving the terminal (seen 2026-10-10, in a gate: `before` blank, `after`
+    // holding the prompt, 9.9 s in).
+    until("the shell's first prompt", || {
+        w.verb(&format!("@{a} text"))
+            .rows()
+            .iter()
+            .any(|row| row.trim_end().ends_with(['$', '#']))
+            .then_some(())
+    });
     let before = w.verb(&format!("@{a} text")).rows().join("\n");
 
     let body = "v=1 t=1 re=1 gen=1:0000000000000000 \

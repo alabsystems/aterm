@@ -2062,7 +2062,7 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
 /// the main thread, so it is bounded well under a frame budget's worth of
 /// visible delay; a desktop whose `gsettings` is slower than this simply
 /// answers "not reduced" and config `motion` decides.
-#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 const GSETTINGS_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The GNOME motion preference, read the one dependency-free way: the
@@ -2140,11 +2140,14 @@ mod linux_reduce_motion_tests {
 
     #[test]
     fn the_bounded_read_returns_stdout_of_a_successful_child() {
+        // The bound is a hang detector here: `GSETTINGS_READ_BOUND` (200 ms) is the
+        // product's latency budget for a desktop's gsettings, and a child spawned on a
+        // loaded machine can take longer than that to print one word.
         assert_eq!(
             read_bounded_stdout(
                 "/bin/sh",
                 &["-c", "printf false"],
-                super::GSETTINGS_READ_BOUND
+                aterm_spec::wait::MUST_HAPPEN
             )
             .as_deref(),
             Some("false")
@@ -2153,7 +2156,7 @@ mod linux_reduce_motion_tests {
             read_bounded_stdout(
                 "/bin/sh",
                 &["-c", "printf false; exit 3"],
-                super::GSETTINGS_READ_BOUND
+                aterm_spec::wait::MUST_HAPPEN
             ),
             None,
             "a failing exit is not a preference"
@@ -2162,7 +2165,7 @@ mod linux_reduce_motion_tests {
             read_bounded_stdout(
                 "/nonexistent/wbgui-no-such-gsettings",
                 &[],
-                super::GSETTINGS_READ_BOUND
+                aterm_spec::wait::MUST_HAPPEN
             ),
             None,
             "a missing binary is not a preference"

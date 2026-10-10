@@ -273,6 +273,14 @@ impl CacheRoot {
     pub fn preflight(&self) -> PathBuf {
         self.root.join("preflight")
     }
+
+    /// Where the release's own handoff fixtures are staged before the claim and
+    /// landed from after the cut (`crate::fixtures`): one directory per reserved
+    /// identity, outside the clone, so writing them never dirties the cut tree.
+    #[must_use]
+    pub fn handoff_fixtures(&self) -> PathBuf {
+        self.root.join("handoff-fixtures")
+    }
 }
 
 /// The working tree of the clone `repo` belongs to: the parent of its common git

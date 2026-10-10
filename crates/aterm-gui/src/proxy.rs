@@ -1008,6 +1008,12 @@ fn deliver_then_relay(
     // Prove the child is serving before it is handed the verb, then send the
     // rewritten verb as the next request line.
     prove_child_serving(&child, &token, accept_within)?;
+    // The host's pid is read NOW, while the connection is surely up: Darwin answers
+    // `ENOTCONN` to `LOCAL_PEERPID` once the peer has closed, and the host this
+    // exists for (an update's Commit `_exit`s it) hangs up as soon as it has read
+    // the verb - read after the delivery, a relay that was descheduled between the
+    // two found no pid, and the client a bare EOF instead of `ERR gone`.
+    let pid = aterm_uds::fdpass::peer_pid(&child).ok();
     (&child).write_all(first_line.verb.as_bytes())?;
     (&child).write_all(b"\n")?;
     if !client_prebuffered.is_empty() {
@@ -1024,7 +1030,7 @@ fn deliver_then_relay(
     // ([`ForwardHost::gone_line`]).
     let host = ForwardHost {
         sock: child_sock.to_string(),
-        pid: aterm_uds::fdpass::peer_pid(&child).ok(),
+        pid,
         token,
         listener,
     };

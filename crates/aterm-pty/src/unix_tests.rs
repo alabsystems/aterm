@@ -1762,7 +1762,7 @@ fn a_spawned_child_can_read_real_pixel_geometry_from_the_kernel() {
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-    let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+    let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
     let spawn = |cell_px: Option<(u16, u16)>| {
         spawn_shell_with_pid_cell_px(
             41,
@@ -3286,7 +3286,7 @@ fn assert_the_child_never_holds_a_descriptor_parked_at(floor: libc::c_int) {
          s=closed; {{ : >&1; }} 2>/dev/null && s=open; \
          printf 'PROBE parked=%s stdout=%s\\n' \"$o\" \"$s\"; exec sleep 30"
     );
-    let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script];
+    let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
     let sh = spawn_shell_with_pid_cell_px(
         24,
         80,
@@ -3366,7 +3366,7 @@ fn spawned_child_stdio_is_an_inherited_tty_with_a_ctty_and_our_winsize() {
                   printf 'PROBE stdio=%s ctty=%s size=[%s] tty=[%s]\\n' \
                     \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\"; \
                   exec sleep 30";
-    let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+    let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
     let sh = spawn_shell_with_pid_cell_px(
         41,
         137,
@@ -3486,7 +3486,7 @@ fn master_reports_hangup_once_the_session_dies() {
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
     // Announce liveness, then park: the session stays up until we hang it up.
-    let exec: Vec<String> = vec![
+    let exec: Vec<std::ffi::OsString> = vec![
         "/bin/sh".into(),
         "-c".into(),
         "printf 'UP\\n'; exec sleep 30".into(),
@@ -3626,7 +3626,7 @@ fn spawn_on_pty(argv: &[&str]) -> i32 {
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-    let exec: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+    let exec: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
     let master = spawn_shell(
         24,
         80,
@@ -4571,7 +4571,9 @@ fn bogus_exec_command_takes_child_exec_failure_path() {
 
     // An absolute path that cannot exist => `resolve_program` returns it
     // verbatim => the child's `execve` fails => b'E' + _exit(127).
-    let bogus = vec![String::from("/nonexistent/aterm-pty-no-such-prog-xyz")];
+    let bogus = vec![std::ffi::OsString::from(
+        "/nonexistent/aterm-pty-no-such-prog-xyz",
+    )];
     let result = spawn_shell(
         24,
         80,
@@ -4788,15 +4790,15 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
 
     // Wrapped `-e nc` under (deny network*). The wrap is built by spawn_shell:
     // sandbox-exec -p <profile> /usr/bin/nc <args>. The connect is denied.
-    let nc = vec![
-        String::from("/usr/bin/nc"),
-        String::from("-G"),
-        String::from("1"),
-        String::from("-w"),
-        String::from("1"),
-        String::from("-z"),
-        String::from("127.0.0.1"),
-        port_s.clone(),
+    let nc: Vec<std::ffi::OsString> = vec![
+        "/usr/bin/nc".into(),
+        "-G".into(),
+        "1".into(),
+        "-w".into(),
+        "1".into(),
+        "-z".into(),
+        "127.0.0.1".into(),
+        port_s.clone().into(),
     ];
     let profile = aterm_containment::BASE_PROFILE;
     let master = spawn_shell(
@@ -4835,4 +4837,198 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
         !s.contains("succeeded"),
         "DENY FAILED: wrapped nc reported a successful connect under (deny network*): {s:?}",
     );
+}
+
+/// The probe a `-e` command's arguments are read back with: each positional
+/// argument's bytes in hex, one `[..]` line per argument, then `END`.
+const ARGV_HEX: &str = "for a; do printf '['; printf %s \"$a\" | od -An -tx1 | tr -d ' \\n'; \
+                        printf ']\\n'; done; echo END";
+
+/// Run `exec` as a `-e` command through the real spawn seam and return what the
+/// program saw of each positional argument, in hex ([`ARGV_HEX`]).
+fn argv_bytes_seen(exec: &[std::ffi::OsString]) -> Vec<String> {
+    // SAFETY: a test process; the trusted-launcher contract trivially holds.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let sh = spawn_shell_with_pid_cell_px(
+        24,
+        80,
+        &spawn_cap,
+        &sandbox_cap,
+        &[],
+        None, // shell_override
+        None, // shell_args
+        None, // argv_override
+        Some(exec),
+        None, // cwd
+        None, // sandbox_wrap
+        aterm_sandbox::Limits::inherit(),
+        None, // cell_px
+    )
+    .expect("the probe command must spawn");
+    set_nonblocking(sh.master, true).expect("nonblocking master");
+    let mut seen = Vec::new();
+    // A hang detector: the loop leaves the moment the probe's `END` is in.
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    while std::time::Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("END") {
+        let mut buf = [0u8; 256];
+        let n = read(sh.master, &mut buf);
+        if n > 0 {
+            seen.extend_from_slice(&buf[..n as usize]);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    hangup(sh.pid);
+    // SAFETY: closing the master this test owns.
+    unsafe { libc::close(sh.master) };
+    reap(sh.pid);
+    String::from_utf8_lossy(&seen)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('[')?.strip_suffix(']'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A `-e` argument reaches the program as the bytes it was given: a raw byte
+/// that is not UTF-8 (`aterm --window -e prog $'\xff'`) is not turned into
+/// U+FFFD on the way, and the argument after it is where it was.
+#[test]
+fn a_command_argument_reaches_the_program_byte_for_byte() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let raw = std::ffi::OsString::from_vec(vec![0xff, b'a', 0x80]);
+    let exec: Vec<std::ffi::OsString> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        ARGV_HEX.into(),
+        "sh".into(),
+        raw,
+        "c".into(),
+    ];
+    assert_eq!(argv_bytes_seen(&exec), ["ff6180", "63"]);
+}
+
+/// An argument holding a NUL byte cannot be handed to a program (`execve`
+/// takes C strings), and dropping it would shift every argument after it into
+/// its place. The spawn is refused instead, naming the argument, for each list
+/// a spawn takes its argv from: `-e`, the argv override and config `shell_args`.
+#[test]
+fn an_argument_holding_a_nul_refuses_the_spawn_instead_of_shifting_the_rest() {
+    // SAFETY: a test process; the trusted-launcher contract trivially holds.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    fn list<T: From<&'static str>>(v: &[&'static str]) -> Vec<T> {
+        v.iter().map(|s| T::from(*s)).collect()
+    }
+    let exec: Vec<std::ffi::OsString> = list(&["/bin/sh", "-c", ARGV_HEX, "sh", "a\0b", "c"]);
+    let args: Vec<String> = list(&["-c", ARGV_HEX, "sh", "a\0b", "c"]);
+    let over: Vec<String> = list(&["sh", "-c", ARGV_HEX, "sh", "a\0b", "c"]);
+    let spawn = |exec, shell_args, argv_override| {
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            Some("/bin/sh"),
+            shell_args,
+            argv_override,
+            exec,
+            None, // cwd
+            None, // sandbox_wrap
+            aterm_sandbox::Limits::inherit(),
+            None, // cell_px
+        )
+    };
+    // Each list's NUL element, by its index in that list.
+    for (what, index, got) in [
+        ("-e", 4, spawn(Some(&exec[..]), None, None)),
+        ("shell_args", 3, spawn(None, Some(&args[..]), None)),
+        ("argv_override", 4, spawn(None, None, Some(&over[..]))),
+    ] {
+        match got {
+            Ok(sh) => {
+                hangup(sh.pid);
+                // SAFETY: closing the master this test owns.
+                unsafe { libc::close(sh.master) };
+                reap(sh.pid);
+                panic!("{what}: an argument holding a NUL was dropped and the rest shifted");
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{what}: {e}");
+                let said = e.to_string();
+                assert!(
+                    said.contains("NUL") && said.contains(&format!("argument {index} ")),
+                    "{what}: the refusal names the argument: {said}"
+                );
+            }
+        }
+    }
+}
+
+/// A configured shell holding a NUL byte refuses the spawn instead of running
+/// another program. `execve` reads a path only up to its NUL, and this seam once
+/// swapped in `/bin/sh` for such a shell, so `shell = "/bin/zsh\u0000x"` with
+/// `shell_args = ["-c", "echo $0"]` printed `/bin/sh`. Each branch that runs
+/// the shell refuses (config `shell_args`, the argv override, the bare login
+/// shell); an `-e` command does not run the shell, so it is not refused for it.
+#[test]
+fn a_shell_holding_a_nul_refuses_the_spawn_instead_of_running_another() {
+    // SAFETY: a test process; the trusted-launcher contract trivially holds.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    fn list<T: From<&'static str>>(v: &[&'static str]) -> Vec<T> {
+        v.iter().map(|s| T::from(*s)).collect()
+    }
+    let args: Vec<String> = list(&["-c", "exit 0"]);
+    let over: Vec<String> = list(&["sh", "-c", "exit 0"]);
+    let spawn = |shell_args, argv_override, exec| {
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            Some("/bin/sh\0x"),
+            shell_args,
+            argv_override,
+            exec,
+            None, // cwd
+            None, // sandbox_wrap
+            aterm_sandbox::Limits::inherit(),
+            None, // cell_px
+        )
+    };
+    let end = |sh: SpawnedShell| {
+        hangup(sh.pid);
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        reap(sh.pid);
+    };
+    for (what, got) in [
+        ("shell_args", spawn(Some(&args[..]), None, None)),
+        ("argv_override", spawn(None, Some(&over[..]), None)),
+        ("login shell", spawn(None, None, None)),
+    ] {
+        match got {
+            Ok(sh) => {
+                end(sh);
+                panic!("{what}: a shell holding a NUL ran another program");
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{what}: {e}");
+                let said = e.to_string();
+                assert!(
+                    said.contains("NUL") && said.contains("the shell (set by --shell"),
+                    "{what}: the refusal names the shell and where it was set: {said}"
+                );
+            }
+        }
+    }
+    let exec = list(&["/bin/sh", "-c", "exit 0"]);
+    end(spawn(None, None, Some(&exec[..]))
+        .expect("an -e command does not run the shell, so it is not refused for it"));
 }

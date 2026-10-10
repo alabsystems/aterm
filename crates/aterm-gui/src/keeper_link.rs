@@ -1425,7 +1425,8 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()];
+        let exec: Vec<std::ffi::OsString> =
+            vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()];
         let sh = aterm_pty::spawn_shell_with_pid_cell_px(
             24,
             80,

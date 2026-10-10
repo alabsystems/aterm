@@ -12,9 +12,13 @@
 //! screens one after another, waits for ONE key after each — one byte, or an
 //! escape and the two bytes after it, so an arrow is one key — and appends it
 //! to a key log (`1`, `enter`, `up`, `down`: [`keys`]); a screen named
-//! `*.hold` is shown for a few seconds and reads nothing, and one named
-//! `*.late` is not drawn at all: the fake waits [`LATE_S`] first, an agent
-//! still starting; a screen named `*.type` is shown and then ONE bounded read
+//! `*.hold` is shown for a few seconds and reads nothing, one named `*.until`
+//! is shown and reads nothing until the test creates `<key log>.release` (a
+//! busy screen the host must be seen to read, held as long as the test needs
+//! and not for a count of seconds; at most [`UNTIL_MAX_TENTHS`], so it never
+//! waits on what waits on it), and one named `*.late` is not drawn at
+//! all: the fake waits [`LATE_S`] first, an agent still starting; a screen
+//! named `*.type` is shown and then ONE bounded read
 //! (`dd bs=4096 count=1`) takes whatever was written to it — a policy text,
 //! one `send`, arrives whole in that one read — logged as `text:<bytes>`. The
 //! key log is the ground truth of what the host typed.
@@ -124,6 +128,11 @@ use headless_boot::{ctl, ctl_ok, field, log_tail};
 /// How long a `*.hold` screen stays up: long enough for the supervisor to
 /// read it settled (its footer is what says bypass).
 const HOLD_S: u32 = 5;
+/// The most a `*.until` screen stays up when nothing releases it, in tenths of a
+/// second: long enough that the host reads it however late it looks, short enough
+/// that a host which tells its answer only at the worked edge (busy to idle) still
+/// gets one well inside a [`HANG`] - the screen must never wait on what waits on it.
+const UNTIL_MAX_TENTHS: u32 = 200;
 /// How long a `*.late` scene keeps the screen blank: longer than the
 /// supervisor's idle window (`aterm_agent::supervise`'s `IDLE_MS`, 2 s), so
 /// its first look settles on the blank screen as an idle point — as it does
@@ -709,6 +718,7 @@ fn write_world(tmp: &Path) {
          # A fake Claude Code: draws each screen file given, reads ONE key after\n\
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
          # as `od -c` spells it; a *.hold screen is shown and nothing read, a\n\
+         # *.until one the same until $log.release exists (or for a bound), a\n\
          # *.late one is a wait with nothing drawn, and after a *.type screen ONE\n\
          # bounded read takes what was written, logged text:.\n\
          log=$1; shift\n\
@@ -721,6 +731,7 @@ fn write_world(tmp: &Path) {
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 case \"$scene\" in\n\
          \x20 *.hold) sleep {HOLD_S}; continue ;;\n\
+         \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
          \x20 k=$(dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' ')\n\
@@ -845,6 +856,7 @@ fn write_world(tmp: &Path) {
         ),
         ("c2-person.type", screen(QUESTION_283_TYPED_PERSON)),
         ("worked.hold", screen(BUSY_283)),
+        ("worked.until", screen(BUSY_283)),
         ("done.hold", screen(AFTER_TURN_283)),
     ];
     for (name, rows) in screens_283 {
@@ -931,9 +943,11 @@ fn chose(inst: &Instance, within: Duration) -> String {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "no CHOSE within {within:?}; journal:\n{}\nharness log:\n{}",
+        "no CHOSE within {within:?}; journal:\n{}\nharness log:\n{}\n\
+         processes under the instance (pid ppid stat wchan etime command):\n{}",
         journal(inst),
-        harness_lines(inst)
+        harness_lines(inst),
+        headless_boot::process_tree(inst)
     );
 }
 
@@ -948,24 +962,39 @@ fn ledger_rows(inst: &Instance, rule: &str, decision: &str) -> Vec<String> {
         .collect()
 }
 
+/// The fake has read exactly `want`, in order. `within` is a HANG DETECTOR for
+/// the host, measured from the last key it read (or the start): a journey of
+/// several keys on a loaded machine is slow, and only a host that has stopped
+/// should fail it. The key log only grows, so a log that is not a prefix of
+/// `want` can never become it and fails at once, naming what was read.
 fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
     // The attention rides along in the record, so a timeout says why the
     // host handed the box over instead of answering it. It is read once, at
     // the timeout: read at every 20 ms look it was an `aterm ctl meta` spawn
     // each (6 ms of CPU, measured 2026-10-05) for a value only a failure
     // prints, 50 a second for every test waiting on a key.
-    let deadline = Instant::now() + within;
-    let mut last = Vec::new();
+    let mut deadline = Instant::now() + within;
+    let mut last: Vec<String> = Vec::new();
     while Instant::now() < deadline {
-        last = keys(inst, log);
-        if last == want {
+        let read = keys(inst, log);
+        if read == want {
             return;
         }
+        if read.len() > want.len() || read.iter().zip(want).any(|(got, want)| got != want) {
+            panic!(
+                "the fake read {read:?}, which is not a start of {want:?}\nharness log:\n{}",
+                harness_lines(inst)
+            );
+        }
+        if read.len() > last.len() {
+            deadline = Instant::now() + within;
+        }
+        last = read;
         std::thread::sleep(Duration::from_millis(20));
     }
     let last = format!("{last:?} attention={:?}", attention(inst));
     panic!(
-        "the fake read {want:?}: not within {within:?}; last: {last}\nharness log:\n{}",
+        "the fake read {want:?}: no key within {within:?} of the last; last: {last}\nharness log:\n{}",
         harness_lines(inst)
     );
 }
@@ -1236,12 +1265,20 @@ fn answer_questions_false_hands_every_question_over() {
 /// The owner's long-term word, in the one global key.
 const LONG_TERM_ON: &str = "question_priority = \"long-term\"\n";
 
+/// Let the fake whose key log is `log` go on past its `*.until` screen.
+fn release_fake(inst: &Instance, log: &str) {
+    std::fs::write(inst.tmp.join(format!("{log}.release")), b"").expect("release the fake");
+}
+
 /// The dialog is answered, told and gone: `CHOSE` names `rule` and `word`
 /// and the question `decided by the worker (<word>)`; the fake exits (every
 /// scene read); the ledger holds `approvals` approvals under `rule`, one of
 /// them the text typed; nothing is badged.
 fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, question: &str, approvals: usize) {
     let line = chose(inst, HANG);
+    // The fake held its busy screen ([`write_world`]'s `worked.until`) so the
+    // host read it busy however late it looked; now it may finish.
+    release_fake(inst, "k1");
     assert!(
         line.contains(&format!("rule={rule} policy={word} ")),
         "{line}"
@@ -1289,7 +1326,7 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
             "c1-opt2.txt",
             "c1-field.type",
             "c1-long.txt",
-            "worked.hold",
+            "worked.until",
             "done.hold",
         ],
     );
@@ -1326,7 +1363,7 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
             "c3-long.txt",
             "c3-long-button.txt",
             "c3-review.txt",
-            "worked.hold",
+            "worked.until",
             "done.hold",
         ],
     );
@@ -1376,7 +1413,7 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
             "c8-opt2.txt",
             "c8-field.type",
             "c8-short.txt",
-            "worked.hold",
+            "worked.until",
             "done.hold",
         ],
     );

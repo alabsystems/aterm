@@ -431,6 +431,100 @@ fn ay_installs_end_to_end_from_a_signed_release() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The env that turns [`probe_an_install_under_an_open_umask`] on: the scratch directory
+/// it installs under.
+#[cfg(unix)]
+const OPEN_UMASK_ENV: &str = "ATPKG_FLOW_OPEN_UMASK_DIR";
+/// That probe's name, as `--exact` wants it.
+#[cfg(unix)]
+const OPEN_UMASK_PROBE: &str = "flow::tests::probe_an_install_under_an_open_umask";
+
+/// Every entry under `dir` (never through a link) whose mode lets its group or anyone
+/// else write it, as `<path relative to base> <mode>`.
+#[cfg(unix)]
+fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode & 0o022 != 0 {
+            let rel = path.strip_prefix(base).unwrap().display().to_string();
+            out.push(format!("{rel} {mode:o}"));
+        }
+        if meta.is_dir() {
+            writable_by_others(base, &path, out);
+        }
+    }
+}
+
+/// The child half of [`an_install_under_an_open_umask_leaves_nothing_others_can_write`]:
+/// under umask `000`, the end-to-end install of
+/// [`ay_installs_end_to_end_from_a_signed_release`], a shim-environment sidecar and a
+/// stage-refusal memo leave no directory or file in the prefix that its group or anyone
+/// else could write. Outside that child (the env unset) it does nothing: the umask is
+/// the whole process's.
+#[cfg(unix)]
+#[test]
+fn probe_an_install_under_an_open_umask() {
+    let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
+        return;
+    };
+    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+    // process runs this one test (`--exact`), so no other create sees the mask.
+    unsafe { libc::umask(0) };
+    let dir = PathBuf::from(dir);
+    let fake = fixture(&dir);
+    let layout = layout(&dir);
+    let req = InstallRequest {
+        channel: "stable",
+        program: "ay",
+        triple: TRIPLE,
+        installed: None,
+    };
+    let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+    assert_eq!(report.build, 18);
+    // The two records a stage writes beside a build when there is cause, each the first
+    // writer of its program's directory: the environment a vendor row's shims export,
+    // and the memo of a refused stage.
+    let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+    crate::shim_env::write_sidecar(&layout.build_dir("claude", 2_026_091_301), &env).unwrap();
+    crate::store::record_stage_refusal(&layout.build_dir("nn", 3), "aa", "bb", "probe", 0).unwrap();
+    let mut loose = Vec::new();
+    writable_by_others(&layout.prefix, &layout.prefix, &mut loose);
+    assert!(loose.is_empty(), "laid writable by others: {loose:#?}");
+}
+
+/// AT3's review (2026-10-10): an install's store must not depend on the umask it runs
+/// under. A system prefix (`root`-owned, every user runs from it) staged by a `root`
+/// whose umask is `002` or `000` laid `store/`, `store/<program>/`, the build root
+/// itself, `staging/` and `staging/<program>/` at `0777 & ~umask`, and the records
+/// beside a build at `0666 & ~umask`: its group or every user could rename a build's
+/// `bin/` and put their own in its place, rename or rewrite the downloaded asset between
+/// its digest check and its extraction, or rewrite a record a later verb believes. The
+/// umask is process-wide, so the install runs in a child of this test binary that runs
+/// only [`probe_an_install_under_an_open_umask`].
+#[cfg(unix)]
+#[test]
+fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
+    let d = scratch("open-umask");
+    let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+        .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
+        .env(OPEN_UMASK_ENV, d.as_os_str())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the install under umask 000: {}\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Phase integration (R5): the SAME end-to-end install, run under a live
 /// `--progress-file` pass. The hooks in `install_inner` must carry the row
 /// through the honest phase sequence and record the pinned build; the terminal

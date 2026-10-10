@@ -402,8 +402,11 @@ Containment is a launch-time choice: `--containment <mode>` with modes `master`,
 last and wraps the shell in the macOS sandbox: no network, writes only under
 the temp directories (`$TMPDIR`, `/private/tmp`) and `/dev` plus the shell's
 history file, no reads or writes of credential stores or private data
-directories, and no debugger attach (no task port but a process's own),
-failing closed if the wrapper is missing. The working directory
+directories, no debugger attach (no task port but a process's own), and no
+mach service lookup but the user and group queries (so `open`, `osascript`,
+`pbcopy` and the keychain do nothing from inside; launchd, which needs no
+lookup, answers a contained caller by its own policy), failing closed if the
+wrapper is missing. The working directory
 and `$HOME` are read-only there, so a contained tool that builds a project
 builds a copy under `$TMPDIR`. Linux and Windows have no OS sandbox, so there `--sandbox`
 refuses to start and names the gap rather than run a shell unconfined. `safety`

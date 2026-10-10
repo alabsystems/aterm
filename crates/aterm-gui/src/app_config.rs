@@ -238,7 +238,9 @@ pub(crate) struct Config {
     /// Predictive local echo: `adaptive` (default: paint typed glyphs instantly
     /// once the shell has proven it echoes the current line, local or remote),
     /// `off`, or `always`. `adaptive` shows no guess in the alternate screen or
-    /// unechoed (password) input; the echo proof resets each submitted line.
+    /// unechoed (password) input; the echo proof ends at every key it did not
+    /// predict and whenever the screen's rows move. No mode predicts a key into a
+    /// tty that will not echo it (`sudo`, `read -s`, a passphrase).
     pub(crate) predictive_echo: Option<String>,
     /// Focus-linked shell priority (Windows): while a window is focused, its
     /// visible tab's shell processes and ConPTY hosts run above normal priority
@@ -3152,8 +3154,9 @@ impl Config {
 
     /// Predictive echo mode (`off` / `adaptive` / `always`). Default `adaptive`:
     /// on once echo is confirmed on the current line and RTT is high enough to
-    /// help; unechoed input is never shown. `always` is the aggressive variant,
-    /// unsafe at prompts.
+    /// help; unechoed input is never shown. `always` is the aggressive variant:
+    /// it can briefly show a key at a REMOTE prompt that does not echo; a local
+    /// one (a tty with echo off) is never predicted in any mode.
     pub(crate) fn predictive_echo_or_default(&self) -> &str {
         self.predictive_echo
             .as_deref()

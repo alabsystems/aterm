@@ -183,6 +183,12 @@ fn size_cap(artifact: &Artifact) -> u64 {
 /// real toolchain bundle.
 const MAX_ENTRIES: u64 = 4_000_000;
 
+/// The mode of the `<build>.incoming-<pid>` scratch while a stage fills and verifies it:
+/// its owner's alone, so nobody else can reach a member before it has its final mode or
+/// rename one between the verify and the swap. Opened to the build's `0755` just before
+/// the swap ([`verify_and_stage`], step 3b).
+const STAGING_SCRATCH_MODE: u32 = 0o700;
+
 /// Verify a downloaded `archive` against the signed `artifact` and stage it at
 /// `build_dir` (see the module docs). On success `build_dir` holds the verified,
 /// ready-to-activate tree. On any failure the partial tree is removed and the error
@@ -227,7 +233,18 @@ pub fn verify_and_stage(
             "build dir has no name",
         ))
     })?;
-    std::fs::create_dir_all(&incoming).map_err(|e| io_step("create the staging scratch", e))?;
+    //    THE SCRATCH IS PRIVATE WHILE IT FILLS, whatever the umask: born `0700`
+    //    ([`crate::platform::make_dir_born`], exclusively, so it is provably this stage's),
+    //    under a `store/<program>/` made at the store's directory mode. A
+    //    `create_dir_all` left it `0777 & ~umask`, and a stage under umask `000` or `002`
+    //    swapped a world- or group-writable root into place (AT3, 2026-10-10): its group
+    //    or every user of a system prefix could rename `bin/` or `Foo.app` and put their
+    //    own in its place, and a root `ditto` laid its members where anyone could reach
+    //    them before the walk sanitized them. It is opened to the build mode just before
+    //    the swap (step 3b).
+    crate::store::make_build_parent(build_dir)
+        .and_then(|()| crate::platform::make_dir_born(&incoming, STAGING_SCRATCH_MODE))
+        .map_err(|e| io_step("create the staging scratch", e))?;
     //    The stage hands back the `tree_root` of what it wrote, folded from the bytes
     //    as they went past (see `crate::extract::extract_tar_zst_tree`). This is
     //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
@@ -255,7 +272,8 @@ pub fn verify_and_stage(
     //      * a bundle whose laid-down layout, modes or contents differ in any way from the
     //        one the publisher signed — that is the whole point, and it is unchanged.
     //    WHAT IT GIVES UP is one thing: a mutation landing in the window BETWEEN the write
-    //    and the read, inside the `0700` staging scratch, while this process holds the
+    //    and the read, inside the `0700` staging scratch (`STAGING_SCRATCH_MODE`, made so
+    //    whatever the umask since 2026-10-10), while this process holds the
     //    store lock — not the threat the private prefix is hardened against, and closing
     //    it costs re-reading the entire payload (3.44 GB for the shipped `trust` member).
     //
@@ -326,6 +344,14 @@ pub fn verify_and_stage(
     //     state nothing repairs, because `decide` then answers `UpToDate` and the swap has
     //     already reclaimed the tree it superseded. So the CONTENTS go down first, and the
     //     names that vouch for them only afterwards.
+    //
+    //     First the verified root is opened from the scratch's `0700` to the mode every
+    //     directory in a build has ([`crate::extract::safe_mode`], `0755`): every user of
+    //     a system prefix runs from it, and by now every member has its final mode.
+    if let Err(e) = crate::platform::set_mode(&incoming, crate::extract::safe_mode(0, true)) {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return Err(io_step("give the staged tree the build's mode", e));
+    }
     if let Err(e) = crate::store::sync_tree(&incoming) {
         let _ = std::fs::remove_dir_all(&incoming);
         return Err(io_step("flush the staged tree", e));
@@ -564,9 +590,15 @@ fn check_developer_id(
 ///   in-root symlinks admitted ([`crate::extract::ExtractOptions`]), modes sanitized to
 ///   `0755`/`0644` exactly as for a release bundle;
 /// * `raw-binary` — the download IS the binary: it becomes `bin/<entry>`, mode `0755`;
-/// * `dmg` — the single `.app` at the image root, copied with `ditto` (mode bits
-///   PRESERVED, not sanitized: the bundle is the vendor's, signed and notarized as
-///   laid out), macOS only.
+/// * `dmg` — the single `.app` at the image root, copied with `ditto` and no ACL, then
+///   given the same modes as every other lane ([`crate::extract::safe_mode`]:
+///   [`vet_copied_tree`]), macOS only. Its links, contents and extended attributes are
+///   the vendor's as laid out; its permissions are the stage's (AT3, ruling
+///   2026-10-10, docs/AUDIT-atpkg-inputs-2026-10-04.md).
+///
+/// Every lane's directories are `0755` and its regular files `0755` (any `x` bit) or
+/// `0644`, so the mode slot of every `tree_root` line one of them folds is `755` or
+/// `644`: never a setuid, setgid or sticky bit, never group- or other-writable.
 ///
 /// Then, for every lane, the row's `links` are created as RELATIVE symlinks
 /// `bin/<name> -> ../<target>` ([`apply_links`]) so the shims resolve `bin/<tool>`. The
@@ -681,12 +713,12 @@ fn stage_raw_binary(
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
     let bin = dest.join("bin");
     refuse_symlinked_bin(&bin)?;
-    // Made through the fold, as every folding lane makes its directories, so the
-    // `links` laid after it find `bin` among the names this stage made.
+    // Made through the fold, as every folding lane makes its directories (at their one
+    // directory mode, `0755`), so the `links` laid after it find `bin` among the names
+    // this stage made.
     let mut tree = TreeAccumulator::new();
     crate::extract::make_dir_exact(dest, &bin, Path::new("bin"), &mut tree)
         .map_err(StageError::Extract)?;
-    crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
     let target = bin.join(tool.exe_file());
     let file = std::fs::File::open(archive).map_err(StageError::Io)?;
     let written =
@@ -791,15 +823,21 @@ fn apply_links(
         // The fold records the link as `bin/<name>`, so `bin` must be the name the stage
         // made, not one the filesystem folds onto it (an archive's `Bin/` on
         // case-insensitive APFS): the same exact-name rule as the archive's own members.
+        // Either way at the stage's one directory mode (`extract::safe_mode`):
+        // `make_dir_exact` gives it to a directory it makes, and an archive's own `bin`
+        // already has it.
         match tree.as_deref_mut() {
             Some(tree) => {
                 let raw = Path::new("bin").join(name);
                 crate::extract::make_dir_exact(dest, &bin, &raw, tree)
                     .map_err(StageError::Extract)?;
             }
-            None => std::fs::create_dir_all(&bin).map_err(StageError::Io)?,
+            None => {
+                std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
+                crate::platform::set_mode(&bin, crate::extract::safe_mode(0, true))
+                    .map_err(StageError::Io)?;
+            }
         }
-        crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
         if std::fs::symlink_metadata(&link).is_ok() {
             return Err(payload2(
                 "links name collides with a staged entry: bin/",
@@ -1189,10 +1227,39 @@ impl Drop for Mount {
 }
 
 /// The `dmg` lane: attach the image read-only, require exactly one `.app` at its
-/// root, `ditto` that bundle into `dest` (modes, symlinks and extended attributes
-/// preserved, as Finder would), refuse any link in it that leaves the stage root
-/// ([`vet_copied_tree`]), detach. Nothing else on the image is copied and nothing on
-/// it is executed.
+/// root, `ditto` that bundle into `dest` (symlinks, contents and extended attributes as
+/// the image carries them; no ACL), give it the archive lanes' modes and the stage's
+/// owner and group, clear any flag that would make a member immutable, and refuse any
+/// link in it that leaves the stage root ([`vet_copied_tree`]), detach. Nothing else on
+/// the image is copied and nothing on it is executed.
+///
+/// # The modes are the stage's, not the image's (AT3, ruling 2026-10-10)
+///
+/// Until 2026-10-10 this lane kept the image's mode bits, on the reasoning that the
+/// bundle is the vendor's, signed and notarized as laid out, while the archive lanes
+/// sanitized theirs ([`crate::extract::safe_mode`]). `ditto` copies a bundle's modes
+/// verbatim (measured that day: a group- or world-writable file or directory, an
+/// owner-only or read-only file and an ACL granting everyone write all survive an
+/// unprivileged `hdiutil create` and `ditto`; setuid, setgid and sticky survive `ditto`
+/// when it runs as root, ditto(1), which is how a root-owned system prefix stages), and
+/// the walk checked only link targets and entry kinds, so a signed image's bundle could
+/// land a setuid or world-writable member in a store that, under a system prefix, every
+/// user runs from. Fail closed: the lane gives every copied directory and regular file
+/// the same mode as every other lane does, through the same function, passes
+/// `--noacl`, clears the immutable and append-only flags `ditto` also copies, and gives
+/// every entry the stage root's owner and group, which `ditto` would otherwise keep from
+/// the image ([`give_owner`], added on the lane's review the same day), because no lane
+/// is the place a store tree gets a permission the others strip. A code
+/// signature seals contents, not permission bits (measured: an ad-hoc signed bundle
+/// verifies `--deep --strict` before and after its modes are changed).
+///
+/// The tree root contract could change at no cost: no published index row uses
+/// `kind = "app-bundle"`, `payload = "dmg"` (index 68 names exactly the 12 programs of
+/// tools/atpkg-programs.spec: ten release bundles, and codex and claude, https `binary`
+/// rows whose vendor-direct lane admits nothing else, `vendor_direct::resolve::admit`).
+/// So a `dmg` tree's `tree_root` now folds `755` or `644` in every file's mode slot,
+/// never the image's own bits, and a future `dmg` row is signed against that sanitized
+/// tree (the root [`stage_payload`] returns over the image).
 #[cfg(target_os = "macos")]
 fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     std::fs::create_dir_all(dest).map_err(StageError::Io)?;
@@ -1203,10 +1270,12 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
         .file_name()
         .ok_or_else(|| payload2("dmg bundle has no name: ", &app.to_string_lossy()))?;
     let out = dest.join(name);
-    run_tool("ditto", &[app.as_os_str(), out.as_os_str()])?;
-    // `ditto` laid the bundle VERBATIM, links included, with nothing of ours vetting
-    // them on the way — so vet them now, before the mount is released and long before
-    // the swap: the archive lanes' in-root rule, applied to the finished copy.
+    let no_acl = std::ffi::OsStr::new("--noacl");
+    run_tool("ditto", &[no_acl, app.as_os_str(), out.as_os_str()])?;
+    // `ditto` laid the bundle VERBATIM, links and modes included, with nothing of ours
+    // vetting them on the way — so vet and sanitize them now, before the mount is
+    // released and long before the swap: the archive lanes' rules, applied to the
+    // finished copy.
     if let Err(e) = vet_copied_tree(dest, &out) {
         let _ = mount.detach();
         return Err(e);
@@ -1214,17 +1283,41 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     mount.detach()
 }
 
-/// Every SYMLINK under `dir` (the copied `.app`) must resolve LEXICALLY inside the
-/// stage `root` — the rule the archive lanes enforce per entry
-/// ([`crate::extract::vet_symlink`]), applied after the fact because `ditto` preserves
-/// links as the image carries them. An image whose bundle holds
-/// `Contents/MacOS/x -> /usr/bin/x` or `-> ../../../..` would otherwise sit in a tree
-/// the digest describes only by target bytes, and a `links` target or a shim could then
-/// resolve through it to somewhere outside the store. Anything that is not a file, a
-/// directory or a symlink is refused as well (the walk would refuse it at the re-verify,
-/// but saying which entry is better than a bare mismatch).
+/// Make the copied `.app` at `dir` a tree the archive lanes could have laid, under the
+/// stage `root`. `dir` and every directory and regular file under it get the archive
+/// lanes' mode ([`crate::extract::safe_mode`]: `0755` for a directory or a file with
+/// any `x` bit, else `0644`; see [`stage_dmg`] for why) and lose any immutable or
+/// append-only flag (no archive lane lays one), each directory before it is read, so
+/// one its owner could not list is opened up first. Every entry, links included, gets
+/// the owner and group of the stage `root` ([`give_owner`]), which this stage made
+/// (exclusively, [`crate::platform::make_dir_born`]), so its owner is the stager.
+///
+/// Every SYMLINK under `dir` must resolve LEXICALLY inside the stage `root` — the rule
+/// the archive lanes enforce per entry ([`crate::extract::vet_symlink`]), applied after
+/// the fact because `ditto` preserves links as the image carries them. An image whose
+/// bundle holds `Contents/MacOS/x -> /usr/bin/x` or `-> ../../../..` would otherwise sit
+/// in a tree the digest describes only by target bytes, and a `links` target or a shim
+/// could then resolve through it to somewhere outside the store. A link's own mode is
+/// left alone (nothing reads it, and the tree root leaves it out). Anything that is not
+/// a file, a directory or a symlink is refused as well (the walk would refuse it at the
+/// re-verify, but saying which entry is better than a bare mismatch).
 #[cfg(target_os = "macos")]
 fn vet_copied_tree(root: &Path, dir: &Path) -> Result<(), StageError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let stage = std::fs::symlink_metadata(root).map_err(StageError::Io)?;
+    vet_copied_entries(root, dir, Owner(stage.uid(), stage.gid()))
+}
+
+/// The owner and group every entry of a copied bundle is given: the stage root's
+/// ([`vet_copied_tree`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct Owner(u32, u32);
+
+/// [`vet_copied_tree`]'s walk of `dir`, giving each entry `owner`.
+#[cfg(target_os = "macos")]
+fn vet_copied_entries(root: &Path, dir: &Path, owner: Owner) -> Result<(), StageError> {
+    give_safe_mode(dir, true, owner)?;
     for entry in std::fs::read_dir(dir).map_err(StageError::Io)? {
         let entry = entry.map_err(StageError::Io)?;
         let path = entry.path();
@@ -1240,14 +1333,72 @@ fn vet_copied_tree(root: &Path, dir: &Path) -> Result<(), StageError> {
             let target = std::fs::read_link(&path).map_err(StageError::Io)?;
             crate::extract::vet_symlink(root, rel, &target, 0)
                 .map_err(|r| StageError::Extract(ExtractError::Rejected(r, rel.to_path_buf())))?;
+            let meta = std::fs::symlink_metadata(&path).map_err(StageError::Io)?;
+            give_owner(&path, &meta, owner)?;
         } else if ft.is_dir() {
-            vet_copied_tree(root, &path)?;
-        } else if !ft.is_file() {
+            vet_copied_entries(root, &path, owner)?;
+        } else if ft.is_file() {
+            give_safe_mode(&path, false, owner)?;
+        } else {
             return Err(payload2(
                 "dmg bundle carries an entry that is not a file, directory or symlink: ",
                 &path.to_string_lossy(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Give the copied directory or regular file at `path` (never a link: the caller read
+/// its kind without following one) the stage's `owner` ([`give_owner`]) and its
+/// [`crate::extract::safe_mode`], when it has any other, after clearing any flag that
+/// stops its owner changing or removing it
+/// ([`crate::platform::OWNER_BINDING_FLAGS`]: `ditto` copies a `uchg` member immutable,
+/// measured 2026-10-10, and an immutable entry refuses the `chmod` and every later
+/// `remove_dir_all`, the store's reclaim of a superseded build among them).
+#[cfg(target_os = "macos")]
+fn give_safe_mode(path: &Path, is_dir: bool, owner: Owner) -> Result<(), StageError> {
+    use std::os::macos::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path).map_err(StageError::Io)?;
+    let flags = meta.st_flags();
+    if flags & crate::platform::OWNER_BINDING_FLAGS != 0 {
+        crate::platform::set_file_flags(path, flags & !crate::platform::OWNER_BINDING_FLAGS)
+            .map_err(StageError::Io)?;
+    }
+    give_owner(path, &meta, owner)?;
+    let mode = crate::platform::permission_mode(&meta) & 0o7777;
+    let safe = crate::extract::safe_mode(mode, is_dir);
+    if mode != safe {
+        crate::platform::set_mode(path, safe).map_err(StageError::Io)?;
+    }
+    Ok(())
+}
+
+/// Give the copied entry at `path` (never followed through a link), whose `lstat` is
+/// `meta`, the stage root's `owner` and group when it has any other: `lchown(2)`.
+///
+/// `ditto` keeps a member's owner and group: as root it keeps both as the image records
+/// them (ditto(1); hdiutil(1), PERMISSIONS VS. OWNERS: root "can see through" the
+/// `noowners` mapping), and unprivileged it keeps any group its user is a member of
+/// (measured 2026-10-10: a member of group `admin` copies as `admin`). An image built by
+/// `hdiutil create -srcfolder` records its builder's ids, so under a root-owned system
+/// prefix even an honest image would land its bundle owned by the uid that built it
+/// (often `501`, the first admin of a Mac) or by `_unknown` (`99`, which every user
+/// owns), and that owner could `chmod` a member back to writable and rewrite a program
+/// every user runs. An archive lane's entry is owned by the stager and, on macOS, takes
+/// its directory's group, which down the copied tree is the stage root's: the walk gives
+/// each entry exactly that (AT3 review, 2026-10-10). Unprivileged, only a group can
+/// differ, and the change is one the kernel allows its owner; a foreign owner can only
+/// have been laid by root, which may change it. A refusal fails the stage.
+#[cfg(target_os = "macos")]
+fn give_owner(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    Owner(uid, gid): Owner,
+) -> Result<(), StageError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if meta.uid() != uid || meta.gid() != gid {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid)).map_err(StageError::Io)?;
     }
     Ok(())
 }
@@ -2382,6 +2533,47 @@ mod tests {
         std::os::unix::fs::symlink(target, p).unwrap();
     }
 
+    /// `chmod +a <ace> <path>`: add an ACL entry, which std has no call for.
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &Path, ace: &str) {
+        let out = aterm_uds::spawnfd::command("/bin/chmod")
+            .arg("+a")
+            .arg(ace)
+            .arg(path)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "chmod +a {ace:?} {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    /// Whether `path` carries an ACL entry: `ls -led` lists each one on a line of its
+    /// own (`  0: group:everyone allow write`) after the entry's. (The `+` after the mode
+    /// is no witness: an entry with extended attributes shows `@` there instead.)
+    #[cfg(target_os = "macos")]
+    fn has_acl(path: &Path) -> bool {
+        let out = aterm_uds::spawnfd::command("/bin/ls")
+            .arg("-led")
+            .arg(path)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ls -led {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .skip(1)
+            .any(|line| line.trim_start().starts_with("0:"))
+    }
+
     /// The fixture's `hdiutil create` argv: a UDZO image of `src` at `dmg`. ONE
     /// spelling, which [`hdiutil_create`] runs and [`dmg_fixture_key`] files the result
     /// under, so a changed flag is never served an image the old flags made.
@@ -3289,12 +3481,21 @@ image-alias     : /tmp/stage/bar.dmg
     }
 
     /// The `dmg` lane, for real: a tiny image built with `hdiutil create` ([`dmg_fixture`])
-    /// around a `Foo.app` (an executable, a `0600` file, two internal symlinks, one of them a `..`
-    /// climb to the stage root and back) beside the usual
-    /// `Applications` link and a README; the stage copies ONLY the bundle, preserves its
-    /// modes and links, lays the row's `links`, detaches the image, and the root equals a
-    /// hand-laid replica's walk. Runs only where `hdiutil` exists (this Mac); skips
-    /// elsewhere.
+    /// around a `Foo.app` (an executable, two internal symlinks, one of them a `..` climb
+    /// to the stage root and back, and the modes and ACL AT3 is about) beside the usual
+    /// `Applications` link and a README; the stage copies ONLY the bundle, keeps its
+    /// links, lays the row's `links`, detaches the image, and the root equals the walk of
+    /// a replica laid at the archive lanes' modes. Runs only where `hdiutil` exists (this
+    /// Mac); skips elsewhere.
+    ///
+    /// AT3 (2026-10-10): the image carries what survives an unprivileged `hdiutil create`
+    /// and `ditto` (measured that day): an owner-only `0600` file, a read-only `0400` one,
+    /// a world-writable `0666` one, a group-writable executable, a world-writable `0777`
+    /// directory, a group-writable `0775` `Contents`, and a file whose ACL lets everyone
+    /// write it. Each lands at `0644`/`0755` with no ACL, and the root a row signs is the
+    /// root of that sanitised tree. (`hdiutil` and an unprivileged `ditto` drop
+    /// setuid, setgid and sticky themselves; ditto run as root keeps the first two, and
+    /// [`dmg_copy_walk_gives_the_bundle_the_archive_lanes_modes`] feeds the walk those.)
     ///
     /// THREE real images, one per way the lane releases its mount, each its own test
     /// (an `hdiutil create` + attach is seconds, so they run in parallel): this one is the
@@ -3317,19 +3518,57 @@ image-alias     : /tmp/stage/bar.dmg
         }
         /// Resources -> Contents -> Foo.app -> the stage root, then back down to the binary.
         const UP: &str = "../../../Foo.app/Contents/MacOS/foo";
+        /// The ACL entry the image's `acl` file carries, and that file's contents, so the
+        /// fixture key ([`dmg_fixture_key`], which reads no ACL) still names it.
+        const ACE: &str = "everyone allow write";
+        /// `(path, contents, mode on the image, mode staged)`.
+        const FILES: &[(&str, &[u8], u32, u32)] = &[
+            (
+                "Foo.app/Contents/MacOS/foo",
+                b"#!/bin/sh\necho foo\n",
+                0o755,
+                0o755,
+            ),
+            ("Foo.app/Contents/Info.plist", b"<plist/>", 0o644, 0o644),
+            ("Foo.app/Contents/Resources/secret", b"s", 0o600, 0o644),
+            ("Foo.app/Contents/Resources/sealed", b"r", 0o400, 0o644),
+            ("Foo.app/Contents/Resources/shared", b"w", 0o666, 0o644),
+            (
+                "Foo.app/Contents/Resources/acl",
+                ACE.as_bytes(),
+                0o644,
+                0o644,
+            ),
+            (
+                "Foo.app/Contents/Plugins/helper",
+                b"#!/bin/sh\n",
+                0o775,
+                0o755,
+            ),
+        ];
+        /// `(directory, mode on the image)`; every one is staged `0755`.
+        const DIRS: &[(&str, u32)] = &[
+            ("Foo.app/Contents/Plugins", 0o777),
+            ("Foo.app/Contents", 0o775),
+            ("Foo.app", 0o700),
+        ];
         let d = tmp("vendor-dmg");
         // Armed BEFORE the first image exists, dropped after the last assertion: an
         // assertion that fires half way through must not leave an image attached.
         let leaks = DetachAll::over(&d);
         let src = d.join("src");
-        lay(
-            &src,
-            "Foo.app/Contents/MacOS/foo",
-            b"#!/bin/sh\necho foo\n",
-            0o755,
+        for (rel, body, mode, _) in FILES {
+            lay(&src, rel, body, *mode);
+        }
+        for (rel, mode) in DIRS {
+            std::fs::set_permissions(src.join(rel), std::fs::Permissions::from_mode(*mode))
+                .unwrap();
+        }
+        add_acl(&src.join("Foo.app/Contents/Resources/acl"), ACE);
+        assert!(
+            has_acl(&src.join("Foo.app/Contents/Resources/acl")),
+            "the image's file carries the ACL under test"
         );
-        lay(&src, "Foo.app/Contents/Info.plist", b"<plist/>", 0o644);
-        lay(&src, "Foo.app/Contents/Resources/secret", b"s", 0o600);
         lay_link(&src, "Foo.app/Contents/current", "MacOS/foo");
         // A `..` climb to the stage root and back into the bundle (frameworks do that):
         // it must survive `hdiutil` + `ditto` byte for byte, pass the vet, and be swapped in.
@@ -3340,14 +3579,9 @@ image-alias     : /tmp/stage/bar.dmg
         dmg_fixture(&src, "FooTest", &dmg);
 
         let replica = d.join("replica");
-        lay(
-            &replica,
-            "Foo.app/Contents/MacOS/foo",
-            b"#!/bin/sh\necho foo\n",
-            0o755,
-        );
-        lay(&replica, "Foo.app/Contents/Info.plist", b"<plist/>", 0o644);
-        lay(&replica, "Foo.app/Contents/Resources/secret", b"s", 0o600);
+        for (rel, body, _, staged) in FILES {
+            lay(&replica, rel, body, *staged);
+        }
         lay_link(&replica, "Foo.app/Contents/current", "MacOS/foo");
         lay_link(&replica, "Foo.app/Contents/Resources/up", UP);
         lay_link(&replica, "bin/foo", "../Foo.app/Contents/MacOS/foo");
@@ -3357,7 +3591,8 @@ image-alias     : /tmp/stage/bar.dmg
         art.links
             .insert("foo".into(), "Foo.app/Contents/MacOS/foo".into());
         let build = d.join("store/foo/2026082601");
-        verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
+        let root = verify_and_stage(&art, &dmg, &build, &StageHooks::NONE).unwrap();
+        assert_eq!(root, expected, "the stage hands out the signed root");
         assert!(crate::store::build_is_complete(&build));
         assert_eq!(
             std::fs::read(build.join("bin/foo")).unwrap(),
@@ -3372,14 +3607,30 @@ image-alias     : /tmp/stage/bar.dmg
             Path::new(UP),
             "an in-root `..` climb is laid verbatim"
         );
-        assert_eq!(
-            std::fs::metadata(build.join("Foo.app/Contents/Resources/secret"))
+        let mode_of = |rel: &str| {
+            std::fs::symlink_metadata(build.join(rel))
                 .unwrap()
                 .permissions()
                 .mode()
-                & 0o7777,
-            0o600,
-            "dmg preserves mode bits"
+                & 0o7777
+        };
+        for (rel, _, image, staged) in FILES {
+            assert_eq!(
+                mode_of(rel),
+                *staged,
+                "{rel}: laid {image:o} on the image, staged at the archive lanes' mode"
+            );
+        }
+        for (rel, image) in DIRS {
+            assert_eq!(
+                mode_of(rel),
+                0o755,
+                "{rel}: a {image:o} directory on the image, staged 0755"
+            );
+        }
+        assert!(
+            !has_acl(&build.join("Foo.app/Contents/Resources/acl")),
+            "no ACL on the image reaches the store"
         );
         assert!(
             !build.join("README.txt").exists(),
@@ -3553,6 +3804,224 @@ image-alias     : /tmp/stage/bar.dmg
             }
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// AT3 (2026-10-10): the dmg lane's post-copy walk gives the copied bundle the
+    /// archive lanes' modes ([`crate::extract::safe_mode`]), over a plain directory laid
+    /// the way `ditto` lays an image's bundle when it runs as root (it keeps setuid and
+    /// setgid only then, ditto(1); an unprivileged run drops them, and sticky, itself):
+    /// a setuid executable, a sticky world-writable directory, a group-writable one, a
+    /// world-writable file and an owner-only read-only one, under an owner-only bundle
+    /// directory, and the flags `ditto` copies at any privilege: an immutable (`uchg`)
+    /// world-writable file, an append-only (`uappnd`) one and an immutable directory.
+    /// Every regular file comes out `0755` (any `x` bit) or `0644` and every directory
+    /// `0755`, the bundle's own included, with no immutable or append-only flag; a link
+    /// is left as it is; and the tree folds to the root of a replica laid at those modes.
+    /// The real-image half is [`dmg_app_payload_stages_the_single_app_and_its_links`].
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_copy_walk_gives_the_bundle_the_archive_lanes_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        /// `(path, contents, mode as copied, mode admitted)`.
+        const FILES: &[(&str, &[u8], u32, u32)] = &[
+            ("Foo.app/Contents/MacOS/foo", b"#!/bin/sh\n", 0o4755, 0o755),
+            ("Foo.app/Contents/Resources/shared", b"w", 0o666, 0o644),
+            ("Foo.app/Contents/Resources/sealed", b"r", 0o400, 0o644),
+            ("Foo.app/Contents/Resources/locked", b"l", 0o666, 0o644),
+            ("Foo.app/Contents/Resources/pinned", b"p", 0o644, 0o644),
+            (
+                "Foo.app/Contents/Plugins/helper",
+                b"#!/bin/sh\n",
+                0o771,
+                0o755,
+            ),
+        ];
+        /// `(directory, mode as copied)`; every one is admitted `0755`.
+        const DIRS: &[(&str, u32)] = &[
+            ("Foo.app/Contents/Plugins", 0o1777),
+            ("Foo.app/Contents", 0o775),
+            ("Foo.app", 0o700),
+        ];
+        /// `(entry, chflags(1) flag as copied)`; none is admitted.
+        const FLAGGED: &[(&str, &str)] = &[
+            ("Foo.app/Contents/Resources/locked", "uchg"),
+            ("Foo.app/Contents/Resources/pinned", "uappnd"),
+            ("Foo.app/Contents/Plugins", "uchg"),
+        ];
+        /// Clears every flag under the scratch dir however the test ends, so its removal
+        /// is never refused.
+        struct Unflag<'a>(&'a Path);
+        impl Drop for Unflag<'_> {
+            fn drop(&mut self) {
+                let _ = aterm_uds::spawnfd::command("/usr/bin/chflags")
+                    .arg("-R")
+                    .arg("nouchg,nouappnd")
+                    .arg(self.0)
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .output();
+            }
+        }
+        let d = tmp("dmg-modes");
+        let _unflag = Unflag(&d);
+        let root = d.join("stage");
+        for (rel, body, copied, _) in FILES {
+            lay(&root, rel, body, *copied);
+        }
+        lay_link(&root, "Foo.app/Contents/current", "MacOS/foo");
+        for (rel, copied) in DIRS {
+            std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(*copied))
+                .unwrap();
+        }
+        for (rel, flag) in FLAGGED {
+            let out = aterm_uds::spawnfd::command("/usr/bin/chflags")
+                .arg(flag)
+                .arg(root.join(rel))
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "chflags {flag} {rel}: {out:?}");
+        }
+        let mode_of = |rel: &str| {
+            std::fs::symlink_metadata(root.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let binding_flags_of = |rel: &str| {
+            use std::os::macos::fs::MetadataExt as _;
+            std::fs::symlink_metadata(root.join(rel))
+                .unwrap()
+                .st_flags()
+                & (libc::UF_IMMUTABLE | libc::UF_APPEND)
+        };
+        // The tree really carries the bits under test.
+        for (rel, _, copied, _) in FILES {
+            assert_eq!(mode_of(rel), *copied, "{rel}: laid as copied");
+        }
+        for (rel, copied) in DIRS {
+            assert_eq!(mode_of(rel), *copied, "{rel}: laid as copied");
+        }
+        for (rel, flag) in FLAGGED {
+            assert_ne!(binding_flags_of(rel), 0, "{rel}: laid {flag}");
+        }
+
+        vet_copied_tree(&root, &root.join("Foo.app")).unwrap();
+        for (rel, _, copied, admitted) in FILES {
+            assert_eq!(mode_of(rel), *admitted, "{rel}: copied {copied:o}");
+        }
+        for (rel, copied) in DIRS {
+            assert_eq!(mode_of(rel), 0o755, "{rel}: copied {copied:o}");
+        }
+        for (rel, flag) in FLAGGED {
+            assert_eq!(binding_flags_of(rel), 0, "{rel}: copied {flag}");
+        }
+        assert_eq!(
+            std::fs::read_link(root.join("Foo.app/Contents/current")).unwrap(),
+            Path::new("MacOS/foo")
+        );
+        let replica = d.join("replica");
+        for (rel, body, _, admitted) in FILES {
+            lay(&replica, rel, body, *admitted);
+        }
+        lay_link(&replica, "Foo.app/Contents/current", "MacOS/foo");
+        assert_eq!(tree_root(&root).unwrap(), tree_root(&replica).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// AT3's review (2026-10-10): `ditto` keeps a member's owner and group (all of them as
+    /// root, ditto(1); unprivileged, any group its user is a member of), so the dmg walk
+    /// gives every entry, links included, the stage root's owner and group: what an
+    /// archive lane's entry gets (its stager, and on macOS its directory's group). A test
+    /// cannot lay a foreign OWNER without root, so a file, a directory and a link are laid
+    /// in another group of this user's, the half `ditto` keeps at any privilege.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_copy_walk_gives_every_entry_the_stage_roots_owner_and_group() {
+        use std::os::unix::fs::MetadataExt as _;
+        const ENTRIES: [&str; 4] = [
+            "Foo.app/Contents/MacOS/foo",
+            "Foo.app/Contents/Resources",
+            "Foo.app/Contents/current",
+            "Foo.app",
+        ];
+        let d = tmp("dmg-owner");
+        let root = d.join("stage");
+        lay(&root, "Foo.app/Contents/MacOS/foo", b"#!/bin/sh\n", 0o755);
+        lay(&root, "Foo.app/Contents/Resources/r", b"r", 0o644);
+        lay_link(&root, "Foo.app/Contents/current", "MacOS/foo");
+        let stage = std::fs::symlink_metadata(&root).unwrap();
+        // Another group this user is in: the supplementary list, then `everyone` (12),
+        // which every macOS account belongs to, whichever the kernel admits first.
+        let mut groups = [0 as libc::gid_t; 64];
+        // SAFETY: `groups` is a writable buffer of exactly the 64 entries the call is told.
+        let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+        let candidates = groups[..usize::try_from(n).unwrap_or(0)]
+            .iter()
+            .copied()
+            .chain([12])
+            .filter(|g| *g != stage.gid());
+        let mut other = None;
+        for gid in candidates {
+            if std::os::unix::fs::lchown(root.join(ENTRIES[0]), None, Some(gid)).is_ok() {
+                other = Some(gid);
+                break;
+            }
+        }
+        let other = other.expect("a group of this user's other than the stage root's");
+        for rel in ENTRIES {
+            std::os::unix::fs::lchown(root.join(rel), None, Some(other)).unwrap();
+        }
+        let ids = |rel: &str| {
+            let m = std::fs::symlink_metadata(root.join(rel)).unwrap();
+            (m.uid(), m.gid())
+        };
+        // The tree really carries the group under test.
+        for rel in ENTRIES {
+            assert_eq!(ids(rel).1, other, "{rel}: laid in group {other}");
+        }
+
+        vet_copied_tree(&root, &root.join("Foo.app")).unwrap();
+        for rel in ENTRIES {
+            assert_eq!(
+                ids(rel),
+                (stage.uid(), stage.gid()),
+                "{rel}: copied in group {other}"
+            );
+        }
+    }
+
+    /// AT3's review (2026-10-10): the scratch a stage fills is its owner's alone until the
+    /// swap, and the build it becomes has the mode of every other directory in a build,
+    /// both whatever the umask. `create_dir_all` gave it `0777 & ~umask`: `0755` under
+    /// the usual `022`, so anyone could reach a member before the dmg walk had sanitized
+    /// it, and `0777` under `000`, so anyone could rename `bin/` out of the swapped-in
+    /// build (`an_install_under_an_open_umask_leaves_nothing_others_can_write`, in
+    /// `flow`, stages under that umask).
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_scratch_is_private_until_the_swap_and_the_build_is_0755() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode_of =
+            |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        let b = bundle("scratch-mode");
+        let build = b.build();
+        let seen = std::cell::Cell::new(None);
+        let pre_swap = |incoming: &Path| -> Result<(), StageError> {
+            seen.set(Some(mode_of(incoming)));
+            Ok(())
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&pre_swap),
+            sidecars: None,
+        };
+        verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert_eq!(
+            seen.get(),
+            Some(0o700),
+            "the scratch as the stage filled it"
+        );
+        assert_eq!(mode_of(&build), 0o755, "the build it was swapped in as");
     }
 
     /// A vendor record for the sidecar tests: the root it was handed, so the test can

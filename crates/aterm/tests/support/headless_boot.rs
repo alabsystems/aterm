@@ -87,6 +87,48 @@ impl Drop for Instance {
     }
 }
 
+/// The instance's descendants as `ps` shows them now (pid, parent, state, wait
+/// channel, age, command), for failure diagnostics: whether a session's shell is
+/// alive and parked reading its terminal, still starting, or gone says what a
+/// line typed into it met. Empty when `ps` cannot run.
+#[cfg(unix)]
+pub fn process_tree(inst: &Instance) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat=,wchan=,etime=,command="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<(u32, u32, &str)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            Some((pid, ppid, line.trim()))
+        })
+        .collect();
+    let mut under = std::collections::BTreeSet::from([inst.child.id()]);
+    loop {
+        let before = under.len();
+        for &(pid, ppid, _) in &rows {
+            if under.contains(&ppid) {
+                under.insert(pid);
+            }
+        }
+        if under.len() == before {
+            break;
+        }
+    }
+    rows.iter()
+        .filter(|(pid, _, _)| under.contains(pid))
+        .map(|(_, _, line)| (*line).chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The tail of the instance log, for failure diagnostics.
 pub fn log_tail(log: &Path) -> String {
     let body = std::fs::read_to_string(log).unwrap_or_default();
@@ -325,14 +367,33 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
 /// instance miss those 10 s once (`host_live_program`, 2026-10-05); a correctness
 /// test's wait for a listener that must answer is a hang detector, not a budget.
 pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
+    until_accepted(|| {
+        let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
+        child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    })
+}
+
+/// Whether `out` is the `aterm ctl` client's refusal to send anything: the
+/// instance's control socket did not ACCEPT its connection within the client's own
+/// 10 s (`aterm-ctl`'s `ACCEPT_DEADLINE`, which `--timeout` can only shorten), and
+/// the client says "so none was sent", exit 2. The instance is alive and not yet
+/// taking connections - a debug build on a machine under a build storm can be slow
+/// to start - and nothing reached it.
+pub fn was_never_accepted(out: &Output) -> bool {
+    out.status.code() == Some(2)
+        && String::from_utf8_lossy(&out.stderr).contains("so none was sent")
+}
+
+/// Run `attempt` (one `aterm ctl` call) again for as long as it comes back
+/// [`was_never_accepted`], up to the hang detector. Nothing was sent, so asking again
+/// is waiting for the instance to be ready, not retrying an effect; any other
+/// answer, success or failure, is returned at once.
+pub fn until_accepted(mut attempt: impl FnMut() -> Output) -> Output {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
-        let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
-        let out = child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
-            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"));
-        let not_accepted = out.status.code() == Some(2)
-            && String::from_utf8_lossy(&out.stderr).contains("so none was sent");
-        if !not_accepted || Instant::now() >= give_up {
+        let out = attempt();
+        if !was_never_accepted(&out) || Instant::now() >= give_up {
             return out;
         }
     }

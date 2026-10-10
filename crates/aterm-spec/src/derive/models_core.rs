@@ -1523,6 +1523,18 @@ pub fn recovery_redraw_model() -> Model {
 /// `confirmed=1` is the current-line echo proof. `pending` is predictor state,
 /// while `visible` and `erased` are the user-observable pixel events.
 ///
+/// `Submit` is EVERY epoch boundary, not only the Enter key: a line terminator
+/// in any spelling (`Predictor::note_line_submit`), any other press the host
+/// could not predict (`note_unmodelled_input`), a Backspace with nothing of the
+/// predictor's own to cancel, a declined glyph, the terminal moving rows under
+/// the cursor (the `coords` generation), and the program moving the cursor off
+/// the cell the last confirmed echo left it in (a prompt printed beside it).
+/// Each ends the proof; `aterm-predict`'s
+/// `every_epoch_boundary_is_the_models_submit` binds all six to this action.
+/// (`Submit` also drops the abstract `pending`; the implementation keeps a
+/// proven line's in-flight pixels across a terminator alone, until their echo
+/// or expiry, which the model's single-guess abstraction does not separate.)
+///
 /// Correct (`Buggy=0`): an app-owned composer does not even arm speculative
 /// state; fast Adaptive links may track a guess but never paint it, so expiry
 /// is invisible. A session switch starts with no inherited slow-link estimate

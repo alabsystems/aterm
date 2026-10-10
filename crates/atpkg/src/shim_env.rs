@@ -337,8 +337,8 @@ pub(crate) fn sidecar_path(build_dir: &Path) -> Option<PathBuf> {
 /// occupant of this build number left, so a reinstall never inherits a stale one.
 ///
 /// # Errors
-/// The sidecar could not be written (its parent — `store/<program>/` — does not exist,
-/// or the volume refuses).
+/// The sidecar could not be written (its parent — `store/<program>/` — could not be
+/// made, [`crate::store::make_build_parent`], or the volume refuses).
 pub(crate) fn write_sidecar(build_dir: &Path, env: &ShimEnv) -> io::Result<()> {
     let dest = sidecar_path(build_dir)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "build dir has no name"))?;
@@ -350,12 +350,11 @@ pub(crate) fn write_sidecar(build_dir: &Path, env: &ShimEnv) -> io::Result<()> {
         }
     }
     let parent = dest.parent().unwrap_or(build_dir);
-    std::fs::create_dir_all(parent)?;
+    crate::store::make_build_parent(build_dir)?;
     let mut tmp_name = String::from(".shim-env.tmp-");
     tmp_name.push_str(&std::process::id().to_string());
     let tmp = parent.join(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, env.to_lines().as_bytes())?;
+    crate::store::write_record_temp(&tmp, env.to_lines().as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);

@@ -34,7 +34,7 @@ account = "alabsystems"
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.102.0"
+version = "0.103.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"

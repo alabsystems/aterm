@@ -298,7 +298,7 @@ fn held_capture_deadline(
 /// producer failure with the pass published, so the next park follows it. `None`
 /// on the launched lane.
 #[cfg(unix)]
-fn capture_exceeds_policy(
+pub(crate) fn capture_exceeds_policy(
     parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
     adopted: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
 ) -> Option<String> {
@@ -4741,7 +4741,7 @@ fn run_handoff_decision(
 /// `MAX_HANDOFF_AGGREGATE_GRID_BYTES` (256 MiB), charged by `screen_digest_refs`
 /// and `write_outgoing` against the real serialized bytes.
 #[cfg(unix)]
-const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Acquires a parked session's engine within the freeze budget instead of failing
 /// on the first contention: after `park_all_readers` the scrollback-compression
@@ -5098,7 +5098,7 @@ pub(crate) enum DryRunCapture {
 /// session is refused only when the pool's visible-only total exceeds the ceiling,
 /// so early sessions' scrollback cannot starve a later visible screen.
 #[cfg(unix)]
-fn optional_carry_fits(
+pub(crate) fn optional_carry_fits(
     used: u64,
     own_mandatory: u64,
     optional: u64,

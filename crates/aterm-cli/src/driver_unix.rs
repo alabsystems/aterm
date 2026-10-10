@@ -372,10 +372,10 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let command = [
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "trap '' HUP; exec 0<&- 1>&- 2>&-; sleep 0.3; exit 3".to_string(),
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' HUP; exec 0<&- 1>&- 2>&-; sleep 0.3; exit 3".into(),
         ];
         let shell = aterm_pty::spawn_shell_with_pid(
             24,
@@ -440,10 +440,10 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let command = [
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "printf one; sleep 0.2; printf two; sleep 0.2; printf three".to_string(),
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf one; sleep 0.2; printf two; sleep 0.2; printf three".into(),
         ];
         let shell = aterm_pty::spawn_shell_with_pid(
             24,
@@ -556,10 +556,11 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let command = [
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("i=0; while [ $i -lt {LINES} ]; do echo out$i; i=$((i+1)); done; exit 5"),
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("i=0; while [ $i -lt {LINES} ]; do echo out$i; i=$((i+1)); done; exit 5")
+                .into(),
         ];
         let shell = aterm_pty::spawn_shell_with_pid(
             24,
@@ -653,13 +654,13 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let command = [
-            "/bin/sh".to_string(),
-            "-c".to_string(),
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
             "trap 'echo SIZE $(stty size); exit 0' WINCH; echo READY; i=0; \
              while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; \
              echo SIZE $(stty size) unchanged; exit 3"
-                .to_string(),
+                .into(),
         ];
         let (rows, cols) = host_winsize();
         assert_eq!((rows, cols), (30, 100), "the spawn reads the host's size");

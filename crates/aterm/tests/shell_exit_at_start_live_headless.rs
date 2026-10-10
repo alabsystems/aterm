@@ -65,22 +65,25 @@ fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// One `aterm ctl` call against `inst`, under the same scratch world.
+/// One `aterm ctl` call against `inst`, under the same scratch world; asked again
+/// while the instance has not yet accepted ([`headless_boot::until_accepted`]).
 fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, &inst.tmp);
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(&inst.sock)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = cmd.spawn().expect("spawn aterm ctl");
-    // Read until the client exits (`support/child_output.rs`: a sibling's
-    // spawn can hold its pipes open).
-    child_output::wait_and_read(child, Instant::now() + CEILING)
-        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    headless_boot::until_accepted(|| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        launch_isolation::apply(&mut cmd, &inst.tmp);
+        cmd.arg("ctl")
+            .arg("--sock")
+            .arg(&inst.sock)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn aterm ctl");
+        // Read until the client exits (`support/child_output.rs`: a sibling's
+        // spawn can hold its pipes open).
+        child_output::wait_and_read(child, Instant::now() + CEILING)
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    })
 }
 
 fn stdout(out: &Output) -> String {
@@ -100,15 +103,21 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
     ) else {
         return;
     };
-    let deadline = Instant::now() + CEILING;
+    let began = Instant::now();
+    let deadline = began + CEILING;
     let text = loop {
         let text = stdout(&ctl(&inst, &["text"]));
         if text.contains(line) {
             break text;
         }
+        // The exit status says how it ended (a signal, or its own exit code): the
+        // one gate failure of this (2026-10-09, load ~100) left only the log's
+        // first three lines and no cause.
+        let ended = inst.child.try_wait().expect("poll the instance");
         assert!(
-            inst.child.try_wait().expect("poll the instance").is_none(),
-            "the instance ended with its shell; log tail:\n{}",
+            ended.is_none(),
+            "the instance ended with its shell ({ended:?}, {:?} after boot); log tail:\n{}",
+            began.elapsed(),
             headless_boot::log_tail(&inst.log)
         );
         assert!(

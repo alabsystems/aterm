@@ -992,3 +992,125 @@ fn output_batch_pin_dance_is_not_a_reader_gesture() {
     );
     grid.assert_invariants();
 }
+
+/// The `aterm_log` records (level and message) written on THIS thread while
+/// `body` runs. The one logger this test binary installs keeps only the
+/// records of a thread that is capturing, so tests running beside it add none.
+fn logged_on_this_thread<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::cell::RefCell;
+    thread_local! {
+        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+    struct Capture;
+    impl aterm_log::Log for Capture {
+        fn enabled(&self, _: &aterm_log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &aterm_log::Record<'_>) {
+            LINES.with(|lines| {
+                if let Some(lines) = lines.borrow_mut().as_mut() {
+                    lines.push(format!("{} {}", record.level(), record.args()));
+                }
+            });
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE: Capture = Capture;
+    let _ = aterm_log::set_logger(&CAPTURE);
+    aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
+    LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    let out = body();
+    (
+        out,
+        LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default()),
+    )
+}
+
+/// THE LOG FLOOD: the detached-reflow window's staging cap is a fact about the
+/// WINDOW. Once a program streams past it, every further line it prints drops
+/// one staged line, on the PTY reader under the terminal lock; a WARN per drop
+/// let one width resize during a flood roll `aterm.log`'s 8 MiB pair over twice
+/// in under a second (measured on a release binary: `scrollback_lines =
+/// 1 000 000`, `yes | head` and eight `ctl resize`), audit lines and all. The
+/// window writes its first drop and, when it closes, its total: two lines per
+/// window, whether it re-attaches or aborts, and every drop is still counted.
+#[test]
+fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 64_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 64, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    // Past the window's 50 000-line staging cap (`Grid::DETACHED_LAZY_CAP`).
+    let streamed = 55_000;
+    let before = grid.truncated_lines();
+
+    // Window 1: a flood through it, then the re-attach.
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols / 2)
+        .expect("offload job");
+    let ((), lines) = logged_on_this_thread(|| {
+        for i in 0..streamed {
+            short_line(&mut grid, rows, &format!("W{i}"));
+        }
+        grid.reattach_reflowed_scrollback(pending.reflow());
+    });
+    let dropped = grid.truncated_lines() - before;
+    assert!(
+        dropped > 4_000,
+        "the flood went past the cap: {dropped} dropped"
+    );
+    let capped: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reflow window:"))
+        .collect();
+    assert_eq!(
+        capped.len(),
+        2,
+        "one window's cap: its first drop and its total, not a line per streamed \
+         line ({} lines): {:?}",
+        capped.len(),
+        capped.iter().take(3).collect::<Vec<_>>()
+    );
+    assert!(
+        capped[0].starts_with("WARN reflow window: lazy buffer exceeded 50000 lines"),
+        "{}",
+        capped[0]
+    );
+    assert_eq!(
+        *capped[1],
+        format!(
+            "WARN reflow window: closed after dropping {dropped} staged line(s) past its \
+             50000-line cap"
+        ),
+        "the close carries the window's whole count"
+    );
+    grid.assert_invariants();
+
+    // Window 2 opens at zero and ends by abort: its own two lines.
+    let before = grid.truncated_lines();
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols)
+        .expect("offload job");
+    let ((), lines) = logged_on_this_thread(|| {
+        for i in 0..streamed {
+            short_line(&mut grid, rows, &format!("X{i}"));
+        }
+        drop(pending);
+        grid.abort_reflow_offload();
+    });
+    let dropped = grid.truncated_lines() - before;
+    let capped: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reflow window:"))
+        .collect();
+    assert_eq!(capped.len(), 2, "{capped:?}");
+    assert!(capped[0].contains("lazy buffer exceeded"), "{}", capped[0]);
+    assert!(
+        capped[1].contains(&format!("closed after dropping {dropped} staged line(s)")),
+        "a fresh window counts from zero: {}",
+        capped[1]
+    );
+    grid.assert_invariants();
+}

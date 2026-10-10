@@ -48,6 +48,11 @@
 //! blind discovery dials), and a presented token with no active terminal
 //! context to check it against as an edge.
 //!
+//! THE NETWORK DRIVE'S REFUSALS ([`NET_REFUSALS`], `crate::net_listen`) keep
+//! the same rule in runs of their own: every remote peer's refusals are ONE run
+//! there ([`AuthDenials::record_network`]), since a remote dialer can change its
+//! address at will where a local one cannot change its user.
+//!
 //! DYNAMIC, NEVER A GATE: there is no fixed window or cap. The spacing grows
 //! with the run's measured count and restarts on the run's measured quiet.
 //! Nothing is blocked or delayed — the thinning only decides which refusals are
@@ -139,15 +144,17 @@ impl KindState {
     }
 }
 
-/// Why a refusal started a new run, for the line's own words.
-enum NewRun {
+/// Why a refusal's line is written: what it says of the run it is in.
+enum Written {
+    /// The kind's first refusal since launch.
     First,
     /// A program with no run: `first` when the kind never dropped one, so it
     /// is certainly the program's first refusal of the kind.
-    Peer {
-        first: bool,
-    },
+    Peer { first: bool },
+    /// A new run after this long a quiet.
     Quiet(Duration),
+    /// The run's `count`th refusal, a power of two, `span` after its first.
+    Nth { count: u64, span: Duration },
 }
 
 /// Refusal runs, one set per kind in [`KINDS`] plus a shared "other".
@@ -157,6 +164,11 @@ pub(crate) struct AuthDenials {
 
 /// This process's runs: the control server's handshake records through it.
 pub(crate) static AUTH_DENIALS: AuthDenials = AuthDenials::new();
+
+/// The network drive listener's refusals (`crate::net_listen`), counted apart
+/// from the local socket's: a remote peer's flood is never a local program's
+/// run, nor the other way round.
+pub(crate) static NET_REFUSALS: AuthDenials = AuthDenials::new();
 
 impl AuthDenials {
     pub(crate) const fn new() -> Self {
@@ -173,18 +185,73 @@ impl AuthDenials {
             .iter()
             .position(|k| *k == reason)
             .unwrap_or(KINDS.len());
+        let (written, total) = self.count(slot, peer.program.as_deref(), now)?;
+        let peer = peer.describe();
+        Some(match written {
+            Written::First => format!("{reason} ({peer})"),
+            Written::Peer { first: true } => {
+                format!("{reason} (first from this program; {total} since launch; {peer})")
+            }
+            // A program whose run was dropped, or one never seen: runs are
+            // kept for the most recent programs by count, not age.
+            Written::Peer { first: false } => format!(
+                "{reason} (not among the last {PROGRAMS_PER_KIND} programs refused; {total} since \
+                 launch; {peer})"
+            ),
+            Written::Quiet(quiet) => {
+                format!("{reason} (again after {quiet:.1?} quiet; {total} since launch; {peer})")
+            }
+            // The spacing rule is this module's doc, never the line's. Never
+            // "in a row": other programs' refusals, and quiet too short to
+            // restart it, fall inside a run.
+            Written::Nth { count, span } => format!(
+                "{reason} ({count} from this program in {span:.1?}, {total} since launch; {peer})"
+            ),
+        })
+    }
+
+    /// Count one refusal of the network drive's listener at `now` and return
+    /// its line — `line`, the refusal's own, which names the peer and why —
+    /// when THIS one is to be written, with the run's count past the first, or
+    /// `None` when it is only counted.
+    ///
+    /// Every peer's refusals are ONE run, thinned by the rule the local
+    /// socket's are: a run per program works where the programs are this
+    /// user's, but an address is no identity a remote dialer cannot change
+    /// (one IPv6 /64 holds 2^64), and a run per address would write every new
+    /// one at once. So a flood writes its 1st, 2nd, 4th … refusal, from
+    /// whatever addresses, and a refusal after a quiet longer than twice the
+    /// run's span is written at once and starts a new run.
+    pub(crate) fn record_network(&self, line: &str, now: Instant) -> Option<String> {
+        let (written, total) = self.count(KINDS.len(), None, now)?;
+        Some(match written {
+            // One run, never dropped: a peer of its own is the first refusal.
+            Written::First | Written::Peer { .. } => line.to_owned(),
+            Written::Quiet(quiet) => {
+                format!("{line} (again after {quiet:.1?} quiet; {total} since launch)")
+            }
+            Written::Nth { count, span } => {
+                format!("{line} ({count} refused in {span:.1?}, {total} since launch)")
+            }
+        })
+    }
+
+    /// THE RUN RULE (module doc): count one refusal in `slot` from the
+    /// dialer whose run is keyed `who` at `now`, and say why it is written —
+    /// with the slot's total since launch — or `None` when it is only counted.
+    fn count(&self, slot: usize, who: Option<&str>, now: Instant) -> Option<(Written, u64)> {
         let mut kinds = self.kinds.lock().unwrap_or_else(|p| p.into_inner());
         let k = &mut kinds[slot];
         k.total = k.total.saturating_add(1);
         let total = k.total;
         let fresh = |restart_gap| Run {
-            program: peer.program.clone(),
+            program: who.map(str::to_owned),
             count: 1,
             start: now,
             last: now,
             restart_gap,
         };
-        let why = match k.runs.iter().position(|r| r.program == peer.program) {
+        let why = match k.runs.iter().position(|r| r.program.as_deref() == who) {
             None => {
                 // Certain only while no program's run was ever dropped: this
                 // refusal's own drop is of another program.
@@ -197,9 +264,9 @@ impl AuthDenials {
                 }
                 k.runs.push(fresh(Duration::ZERO));
                 if total == 1 {
-                    NewRun::First
+                    Written::First
                 } else {
-                    NewRun::Peer { first }
+                    Written::Peer { first }
                 }
             }
             Some(i) => {
@@ -208,41 +275,21 @@ impl AuthDenials {
                 let span = r.last.saturating_duration_since(r.start);
                 if r.count >= 2 && quiet > span.max(r.restart_gap).saturating_mul(2) {
                     *r = fresh(quiet);
-                    NewRun::Quiet(quiet)
+                    Written::Quiet(quiet)
                 } else {
                     r.count = r.count.saturating_add(1);
                     r.last = now;
                     if !r.count.is_power_of_two() {
                         return None;
                     }
-                    // The spacing rule is this module's doc, never the line's.
-                    // Never "in a row": other programs' refusals, and quiet
-                    // too short to restart it, fall inside a run.
-                    return Some(format!(
-                        "{reason} ({} from this program in {:.1?}, {total} since launch; {})",
-                        r.count,
-                        now.saturating_duration_since(r.start),
-                        peer.describe()
-                    ));
+                    Written::Nth {
+                        count: r.count,
+                        span: now.saturating_duration_since(r.start),
+                    }
                 }
             }
         };
-        let peer = peer.describe();
-        Some(match why {
-            NewRun::First => format!("{reason} ({peer})"),
-            NewRun::Peer { first: true } => {
-                format!("{reason} (first from this program; {total} since launch; {peer})")
-            }
-            // A program whose run was dropped, or one never seen: runs are
-            // kept for the most recent programs by count, not age.
-            NewRun::Peer { first: false } => format!(
-                "{reason} (not among the last {PROGRAMS_PER_KIND} programs refused; {total} since \
-                 launch; {peer})"
-            ),
-            NewRun::Quiet(quiet) => {
-                format!("{reason} (again after {quiet:.1?} quiet; {total} since launch; {peer})")
-            }
-        })
+        Some((why, total))
     }
 
     /// Refusals of `reason`'s kind since this instance started.

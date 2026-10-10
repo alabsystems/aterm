@@ -1080,9 +1080,7 @@ pub(crate) fn land_artifact(
     // free space can't be queried (available_bytes None) — preflight is a safety net.
     let required = LandingBytes::of(artifact).need();
     disk_gate(required, crate::freespace::available_bytes(&dl))?;
-    if let Some(parent) = dl.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| FlowError::Download(e.to_string()))?;
-    }
+    make_staging_dir(&dl).map_err(|e| FlowError::Download(e.to_string()))?;
     // Clear any stale staging file BEFORE fetching — unless it is the verified archive
     // a previous attempt's failed stage RETAINED ([`carried_archive`]):
     // that one is the download, done, and is staged again without a fetch. A leftover
@@ -4030,9 +4028,8 @@ fn fetch_member(
             return None;
         }
     };
-    if let Some(parent) = dl.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = make_staging_dir(&dl) {
+        let parent = dl.parent().unwrap_or(&dl);
         *why = format!("cannot create {}: {e}", parent.display());
         return None;
     }
@@ -4250,6 +4247,24 @@ fn flip_member_with(
 /// an absolute asset (`Path::join` replaces the base) or a `..` climb would have a signed
 /// row delete files anywhere the user can write. Checked on the
 /// path itself, so no protocol lane can reach those deletions with one that escapes.
+/// Make the directory a download lands in (`staging/<program>/`, and `staging/` above
+/// it) when it is missing, each `0700` whatever the umask
+/// ([`crate::platform::make_dirs_born`]). The fetcher (curl) creates the asset at
+/// `0666 & ~umask`, and the stage hashes it and then opens it again to extract it: in a
+/// directory other users could traverse or write (`create_dir_all` under umask `000` or
+/// `002`), one of them could hold the asset open for writing, or rename another into
+/// its place, across that gap (AT3, 2026-10-10). Nothing but the store's owner reads
+/// `staging/` (the stage and gc), so it is its owner's alone in a system prefix too.
+/// One that exists is left as it is.
+fn make_staging_dir(dl: &Path) -> std::io::Result<()> {
+    match dl.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            crate::platform::make_dirs_born(parent, 0o700)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn staged_download_path(layout: &Layout, program: &str, asset: &str) -> Result<PathBuf, FlowError> {
     let mut comps = Path::new(asset).components();
     let one_name = matches!(

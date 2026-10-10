@@ -46,6 +46,9 @@ mod dmg;
 #[path = "../../src/durable.rs"]
 #[allow(dead_code)]
 mod durable;
+#[path = "../../src/fixtures.rs"]
+#[allow(dead_code)]
+mod fixtures;
 #[path = "../../src/gates.rs"]
 #[allow(dead_code)]
 mod gates;
@@ -109,6 +112,7 @@ mod packlane_order;
 mod plist_stamp;
 mod publisher_fence_liveness;
 mod publisher_fence_model;
+mod release_fixtures;
 mod release_flow;
 mod release_lease;
 mod resume;

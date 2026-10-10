@@ -126,6 +126,20 @@ impl ContentScrollState {
         self.bands.get(slot).copied().unwrap_or_default()
     }
 
+    /// One number that changes exactly when content rows moved under the active
+    /// screen's coordinates: any uniform scroll or any invalidating batch (band
+    /// moves included, since a band batch is always an epoch step). For a host
+    /// that only needs "did every cached row coordinate go stale" — the
+    /// predictive-echo generation — rather than the exact transform.
+    ///
+    /// Both counters only grow, so their sum moves whenever either does: it
+    /// would take a combined advance of 2^64 to come back to the same value.
+    #[must_use]
+    #[inline]
+    pub fn coordinate_generation(&self) -> u64 {
+        self.uniform_up_rows.wrapping_add(self.invalidation_epoch)
+    }
+
     /// The host decision between two snapshots (see [`ContentScrollDelta`]).
     ///
     /// With `d_u/d_e/d_bb/d_bs` the advances of `uniform_up_rows`,

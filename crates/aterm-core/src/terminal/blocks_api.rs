@@ -33,6 +33,27 @@ pub enum BlockText {
     NotAvailable,
 }
 
+/// Which rows of a block a read asked for: the eviction log keeps one
+/// newest-seen block per side (`ShellIntegrationState::eviction_seen`,
+/// indexed in this order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockSide {
+    /// The command rows (prompt end to output start).
+    Command = 0,
+    /// The output rows.
+    Output = 1,
+}
+
+impl BlockSide {
+    /// The word the log line names the side by.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Output => "output",
+        }
+    }
+}
+
 impl BlockText {
     /// True iff the block's content was evicted from scrollback.
     #[must_use]
@@ -217,13 +238,36 @@ impl Terminal {
         self.shell.eviction_reads.get()
     }
 
-    /// Record (log + bump the session counter) that a block read hit eviction.
-    fn record_block_eviction(&self, block_id: u64, what: &str, start: u64, end: u64) {
+    /// Record that a block read hit eviction: every read bumps the session
+    /// counter, the first read to find a newer block's `side` evicted is news,
+    /// and the 1st, 2nd, 4th … piece of news is logged.
+    ///
+    /// Not a line per read: an evicted block never comes back, and the status
+    /// observer re-reads the running block's command up to 4 times a second
+    /// where no OSC 633;E names it, so a long command's own output made a WARN
+    /// line per look, for as long as the command ran. Rows and block ids only
+    /// grow, so a block no newer than the newest one seen for `side` is evicted
+    /// on that side too: its read is counted, not news. Not a line per block
+    /// either: where no nonce guards OSC 133, a program can start a block a
+    /// look and scroll each one out, so news is thinned by doubling. Each line
+    /// carries both counts, so nothing the thinning skips is lost.
+    fn record_block_eviction(&self, block_id: u64, side: BlockSide, start: u64, end: u64) {
         let count = self.shell.eviction_reads.get().saturating_add(1);
         self.shell.eviction_reads.set(count);
+        let seen = &self.shell.eviction_seen[side as usize];
+        if seen.get().is_some_and(|newest| block_id <= newest) {
+            return;
+        }
+        seen.set(Some(block_id));
+        let news = self.shell.eviction_news.get().saturating_add(1);
+        self.shell.eviction_news.set(news);
+        if !news.is_power_of_two() {
+            return;
+        }
         aterm_log::warn!(
-            "block {block_id} {what} EVICTED: rows [{start}, {end}) are older than oldest \
-             retained row {}; session eviction reads = {count}",
+            "block {block_id} {} EVICTED: rows [{start}, {end}) are older than oldest \
+             retained row {}; session eviction reads = {count}, evicted blocks seen = {news}",
+            side.word(),
             self.grid.oldest_absolute_row(),
         );
     }
@@ -254,7 +298,7 @@ impl Terminal {
                 BlockText::Text(text)
             }
             BlockText::Evicted => {
-                self.record_block_eviction(block.id, "command", start, end);
+                self.record_block_eviction(block.id, BlockSide::Command, start, end);
                 BlockText::Evicted
             }
             BlockText::NotAvailable => BlockText::NotAvailable,
@@ -272,7 +316,7 @@ impl Terminal {
         };
         let result = self.text_range(start, end);
         if result.is_evicted() {
-            self.record_block_eviction(block.id, "output", start, end);
+            self.record_block_eviction(block.id, BlockSide::Output, start, end);
         }
         result
     }
@@ -401,6 +445,146 @@ mod eviction_tests {
             // it is reported as Evicted (never shifted text) — the core property.
             BlockText::Evicted => {}
             BlockText::NotAvailable => panic!("retained block unexpectedly NotAvailable"),
+        }
+    }
+
+    /// The `aterm_log` records written on THIS thread while `body` runs (level and
+    /// message). The one logger this test binary installs keeps only the records
+    /// of a thread that is capturing, so tests running beside it add nothing.
+    fn logged_on_this_thread(body: impl FnOnce()) -> Vec<String> {
+        use std::cell::RefCell;
+        thread_local! {
+            static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        }
+        struct Capture;
+        impl aterm_log::Log for Capture {
+            fn enabled(&self, _: &aterm_log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &aterm_log::Record<'_>) {
+                LINES.with(|lines| {
+                    if let Some(lines) = lines.borrow_mut().as_mut() {
+                        lines.push(format!("{} {}", record.level(), record.args()));
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture;
+        let _ = aterm_log::set_logger(&CAPTURE);
+        aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+        body();
+        LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// THE LOG FLOOD: a read that finds a block evicted is a fact about the block,
+    /// and the block stays evicted, so it is logged once, not once per read. The
+    /// status observer reads the RUNNING block's command up to 4 times a second
+    /// for a shell that sends no OSC 633;E (any shell aterm does not integrate, or
+    /// a program printing its own OSC 133), and a long command's output scrolls
+    /// that command out of the history: measured on a headless instance, 79 WARN
+    /// lines in 23 s, churning `aterm.log`'s two 4 MiB files in hours and the
+    /// audit lines with them. Every read is still counted.
+    #[test]
+    fn a_block_read_again_and_again_after_its_eviction_is_logged_once() {
+        let mut term = TerminalBuilder::new()
+            .size(4, 40)
+            .ring_buffer_size(6)
+            .build();
+        // A finished block, then a running one with no 633;E whose output
+        // scrolls its own command line out of the history.
+        run_block(&mut term, "first", &["out-a", "out-b"]);
+        term.process(b"\x1b]133;A\x07$ long-job\x1b]133;B\x07\r\n\x1b]133;C\x07");
+        for i in 0..40 {
+            term.process(format!("job-{i}\r\n").as_bytes());
+        }
+        let older = term.all_blocks().next().cloned().expect("the first block");
+        let running = term.current_block().cloned().expect("the running block");
+        assert!(running.id > older.id);
+
+        let lines = logged_on_this_thread(|| {
+            for _ in 0..50 {
+                // The observer's read of the running command.
+                assert_eq!(term.block_command_text(&running), BlockText::Evicted);
+                assert_eq!(term.block_command(&running), None);
+            }
+            // An older block's eviction is implied by the newer one's.
+            assert_eq!(term.block_command_text(&older), BlockText::Evicted);
+            // The other side of a block is its own fact: once, too.
+            for _ in 0..50 {
+                assert_eq!(term.block_output_text(&older), BlockText::Evicted);
+            }
+        });
+        let evicted: Vec<&String> = lines.iter().filter(|l| l.contains("EVICTED")).collect();
+        assert_eq!(
+            evicted.len(),
+            2,
+            "one line for the running block's command, one for the older block's \
+             output: {evicted:#?}"
+        );
+        assert!(evicted[0].starts_with("WARN block ") && evicted[0].contains(" command "));
+        assert!(evicted[1].contains(" output "));
+        assert_eq!(
+            term.block_eviction_read_count(),
+            151,
+            "every evicted read is still counted"
+        );
+    }
+
+    /// THE LOG FLOOD, minted: where no nonce guards OSC 133 (no 633;E), a
+    /// program can start a new block every look and scroll each one's command
+    /// out of the history. A line per block was then a line per look again
+    /// (measured on a headless instance: 73 lines in 20 s, a block every
+    /// 250 ms), so the news is thinned by doubling: 64 blocks write 7 lines,
+    /// and each line says how many reads and blocks it stands for.
+    #[test]
+    fn a_program_starting_block_after_block_logs_their_evictions_by_doubling() {
+        let mut term = TerminalBuilder::new()
+            .size(4, 40)
+            .ring_buffer_size(6)
+            .build();
+        let lines = logged_on_this_thread(|| {
+            for k in 0..64 {
+                term.process(
+                    format!("\x1b]133;A\x07$ job-{k}\x1b]133;B\x07\r\n\x1b]133;C\x07").as_bytes(),
+                );
+                for i in 0..20 {
+                    term.process(format!("out-{k}-{i}\r\n").as_bytes());
+                }
+                let running = term.current_block().cloned().expect("the running block");
+                for _ in 0..4 {
+                    // The status observer's looks at the running command.
+                    assert_eq!(term.block_command_text(&running), BlockText::Evicted);
+                }
+                term.process(b"\x1b]133;D;0\x07");
+            }
+        });
+        assert_eq!(
+            term.block_eviction_read_count(),
+            256,
+            "every read is counted"
+        );
+        let evicted: Vec<&String> = lines.iter().filter(|l| l.contains("EVICTED")).collect();
+        assert_eq!(
+            evicted.len(),
+            7,
+            "the 1st, 2nd, 4th … 64th evicted block, not one line per block or per read: \
+             {evicted:#?}"
+        );
+        assert!(
+            evicted
+                .iter()
+                .all(|l| l.starts_with("WARN block ") && l.contains(" command "))
+        );
+        for (line, news) in evicted.iter().zip([1u64, 2, 4, 8, 16, 32, 64]) {
+            let reads = 4 * (news - 1) + 1;
+            assert!(
+                line.ends_with(&format!(
+                    "session eviction reads = {reads}, evicted blocks seen = {news}"
+                )),
+                "each line carries the counts it stands for: {line}"
+            );
         }
     }
 

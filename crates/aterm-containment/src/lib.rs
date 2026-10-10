@@ -17,7 +17,7 @@
 //! | **Master** | Full | Nothing beyond the capability-gated spawn. |
 //! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | **Safety** | Reduced | Hardened resource limits; no OS sandbox. |
-//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own (no debugger attach), writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
+//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own (no debugger attach), no mach service lookup but the user and group queries (launchd answers by its own policy), writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
 //!
 //! Core axiom: all data is code. Any byte crossing a trust boundary is a
 //! potential instruction to an AI agent, so external data is untrusted by

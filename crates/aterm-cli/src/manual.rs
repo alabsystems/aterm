@@ -143,7 +143,10 @@ GOTCHAS
     a malformed mode fails CLOSED to `containment`. The OS sandbox exists on macOS only
     (no network; no debugger attach — no task port but a process's own; writes only to
     the temp dirs and to ~/.zsh_history or ~/.bash_history, a history file elsewhere
-    being read-only; no credential/private-data access);
+    being read-only; no credential/private-data access; no mach service lookup but the
+    user and group queries, so `open`, `osascript`, `pbcopy`/`pbpaste` and the keychain do
+    nothing from inside and a contained program's `os_log` is dropped; launchd, which
+    needs no lookup, answers a contained caller by its own policy);
     elsewhere `containment` REFUSES to start, naming the gap, rather than run a weaker
     shell. `safety` is hardened resource caps with no OS sandbox, on every platform.
   * macOS: `Operation not permitted` on a file macOS treats as private is privacy consent

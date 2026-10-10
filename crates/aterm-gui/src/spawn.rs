@@ -311,8 +311,8 @@ pub(crate) struct ShellStart {
 /// Whether a spawn records a [`ShellStart`]: a fresh interactive shell does; a
 /// `-e` command (its window closes when it exits, failure or not) and a shell
 /// adopted across an update (started long before this process) do not.
-fn records_shell_start(adopted: bool, exec_command: Option<&[String]>) -> bool {
-    !adopted && exec_command.is_none_or(<[String]>::is_empty)
+fn records_shell_start(adopted: bool, exec_command: Option<&[std::ffi::OsString]>) -> bool {
+    !adopted && exec_command.is_none_or(<[std::ffi::OsString]>::is_empty)
 }
 
 /// The name of the interactive shell a fresh spawn runs, resolved the way the
@@ -341,7 +341,7 @@ mod records_shell_start_tests {
     /// adopted shell close on exit exactly as before.
     #[test]
     fn only_a_fresh_interactive_shell_records_a_start() {
-        let false_cmd = vec!["false".to_string()];
+        let false_cmd = vec![std::ffi::OsString::from("false")];
         assert!(records_shell_start(false, None), "a fresh shell");
         assert!(
             records_shell_start(false, Some(&[])),
@@ -388,8 +388,9 @@ pub(crate) struct SessionFactory {
     /// shell-integration loader vars (which embed the per-tab nonce) are appended
     /// per session inside `spawn_session`, never here, so each tab's nonce is its own.
     pub(crate) env_add: Vec<(String, String)>,
-    /// `-e <cmd>`: run this instead of `$SHELL` (also disables shell integration).
-    pub(crate) exec_command: Option<Vec<String>>,
+    /// `-e <cmd>`: run this instead of `$SHELL` (also disables shell integration),
+    /// as the OS's argv gave it ([`crate::cli::Cli::exec_command`]).
+    pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     /// Config `shell` / `--shell`: the interactive shell every tab spawns
     /// (discovery-resolved — `"bash"` finds Git Bash off-PATH, absolute paths
     /// verbatim). `None` → the platform default. See `aterm_pty` shell selection.

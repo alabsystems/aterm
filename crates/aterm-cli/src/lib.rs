@@ -23,9 +23,9 @@
 //! applies at its own spawn — see `session_limits`; on Windows, where the same
 //! `Limits` go onto the child's Job Object, that means no job caps); Safety /
 //! Containment keep the hardened caps. `--sandbox` (`--containment containment`) opts
-//! into the macOS Seatbelt sandbox (no network, no debugger attach, writes only to
-//! the temp roots, no credential/private-data access) and is REFUSED where no OS
-//! sandbox exists; a
+//! into the macOS Seatbelt sandbox (no network, no debugger attach, no mach service
+//! lookup but the user and group queries, writes only to the temp roots, no
+//! credential/private-data access) and is REFUSED where no OS sandbox exists; a
 //! malformed value fails CLOSED to Containment.
 
 // The macOS consent tier (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.3):
@@ -121,8 +121,10 @@ const HELP_HEAD: &str = concat!(
     "        --sandbox             Shorthand for --containment containment (the macOS\n",
     "                              sandbox: no network; no debugger attach; writes\n",
     "                              only to temp dirs and shell history; no access to\n",
-    "                              credential stores or private data; refused where\n",
-    "                              no OS sandbox exists).\n",
+    "                              credential stores or private data; no mach\n",
+    "                              service lookup but user and group queries, so\n",
+    "                              open, osascript, pbcopy and the keychain do\n",
+    "                              nothing; refused where no OS sandbox exists).\n",
     "        --no-sandbox          Shorthand for --containment user (no OS sandbox;\n",
     "                              full network/credential access — the default).\n",
     "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
@@ -574,8 +576,10 @@ fn explain_config_report() -> String {
     out.push_str("Containment modes (least → most capability):\n");
     out.push_str(
         "  containment  No network; no debugger attach; writes only to temp dirs and shell\n\
-         \x20              history; no access to credential stores or private data (macOS;\n\
-         \x20              refused elsewhere).\n",
+         \x20              history; no access to credential stores or private data; no\n\
+         \x20              mach service lookup but user and group queries, so open,\n\
+         \x20              osascript, pbcopy and the keychain do nothing (macOS; refused\n\
+         \x20              elsewhere).\n",
     );
     out.push_str("  safety       Capped limits, no OS sandbox.\n");
     out.push_str("  user         No sandbox, no extra limits (the default).\n");
@@ -5366,7 +5370,7 @@ mod tests {
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "ulimit -n".into()];
+        let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), "ulimit -n".into()];
 
         let child_ulimit = |mode: Cm| -> String {
             let shell = aterm_pty::spawn_shell_with_pid(

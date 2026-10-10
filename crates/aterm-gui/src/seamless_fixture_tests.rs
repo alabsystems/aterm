@@ -12,7 +12,8 @@
 //! build's producer and the next build's rules stranded every shell on the old
 //! build for a day. So each release's producer bytes are checked in under
 //! `tests/fixtures/handoff/v<release>/<desk>/` — written by that release's own
-//! `write_outgoing`, in a worktree at its tag (the fixture README says how) —
+//! `write_outgoing`, by its generator (`seamless_fixture_generator_tests.rs`,
+//! which its release cut runs; the fixture README says how) —
 //! and this guard asserts, for every release and every desk, that the current
 //! consumer adopts EVERY session exactly (no repaint but the ones its producer
 //! flagged, no lost control carry, each meta's state reassembled, the layout
@@ -126,6 +127,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.101.0", "shell-integration"),
     ("v0.101.0", "stalled-sequence"),
     ("v0.101.0", "twelve-panes"),
+    ("v0.102.0", "claude-code-1049"),
+    ("v0.102.0", "colour-and-shell"),
+    ("v0.102.0", "held-pane"),
+    ("v0.102.0", "history"),
+    ("v0.102.0", "history-carry"),
+    ("v0.102.0", "incident-55x149"),
+    ("v0.102.0", "link-dense"),
+    ("v0.102.0", "link-dense-history"),
+    ("v0.102.0", "policy-repaint"),
+    ("v0.102.0", "policy-visible"),
+    ("v0.102.0", "shell-integration"),
+    ("v0.102.0", "stalled-sequence"),
+    ("v0.102.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -260,7 +274,7 @@ fn assert_held_panes_shown(desk: &Desk, incoming: &IncomingHandoff) {
 }
 
 /// What one desk's producer committed to (`parent.toml`, written beside the
-/// bytes by the generator in the release's worktree).
+/// bytes by the release's generator).
 #[derive(serde::Deserialize)]
 struct ParentRecord {
     producer_version: String,
@@ -2030,26 +2044,32 @@ fn a_repainted_session_is_counted_for_the_landing_row() {
 // `#[cfg(target_os = "macos")]` and the other unix cells compile none of it.
 
 /// Every release whose RENDEZVOUS TRANSPORT is pinned: `v<release>/rendezvous.toml`,
-/// written by that release's own claim, grant and proof code in a worktree at
-/// its tag (the fixture README says how). One literal `"vX.Y.0"` row per
-/// release, like [`PINNED_DESKS`], so a lost file is a red test rather than a
-/// guard that silently checks less.
+/// written by that release's own claim, grant and proof code (the fixture
+/// generator, `seamless_fixture_generator_tests.rs`, writes it beside the desks).
+/// Every release [`PINNED_DESKS`] pins, in its order: the same rows pin both,
+/// so a lost file is a red test rather than a guard that silently checks less,
+/// and a release adds its rows in one place (the release cut adds them).
 #[cfg(target_os = "macos")]
-const PINNED_RENDEZVOUS: &[&str] = &[
-    "v0.91.0", "v0.92.0", "v0.93.0", "v0.94.0", "v0.95.0", "v0.97.0", "v0.98.0", "v0.100.0",
-    "v0.101.0",
-];
+fn pinned_rendezvous() -> Vec<&'static str> {
+    let mut releases = PINNED_DESKS
+        .iter()
+        .map(|(release, _)| *release)
+        .collect::<Vec<_>>();
+    releases.dedup();
+    releases
+}
 
 /// The fixed inputs every rendezvous capture runs over, in every release and in
 /// this build: what a record holds is then the producer's SPELLING of them and
-/// nothing else. Kept byte-identical to the generator's copy
-/// (`tests/fixtures/handoff/generator.rs.txt`).
+/// nothing else. The generator
+/// (`seamless_fixture_generator_tests.rs`) records over these same constants.
 #[cfg(target_os = "macos")]
-const RZ_SECRET: &str = "3f9c2e71a0b84d56e1f7c3a92b0d4e68f5a1c7e39b2d0f86a4e1c5b7d93f0a2c";
+pub(super) const RZ_SECRET: &str =
+    "3f9c2e71a0b84d56e1f7c3a92b0d4e68f5a1c7e39b2d0f86a4e1c5b7d93f0a2c";
 #[cfg(target_os = "macos")]
-const RZ_NONCE: &str = "c0ffee00aa55aa55c0ffee00aa55aa55";
+pub(super) const RZ_NONCE: &str = "c0ffee00aa55aa55c0ffee00aa55aa55";
 #[cfg(target_os = "macos")]
-const RZ_SESSIONS: [(u64, i32); 3] = [(0, 4000), (1, 4001), (7, 4002)];
+pub(super) const RZ_SESSIONS: [(u64, i32); 3] = [(0, 4000), (1, 4001), (7, 4002)];
 
 /// What one release's rendezvous transport really does (`rendezvous.toml`).
 #[cfg(target_os = "macos")]
@@ -2098,18 +2118,18 @@ struct RendezvousRecord {
 
 /// What ONE build's rendezvous code does with the fixed inputs.
 #[cfg(target_os = "macos")]
-struct TransportCapture {
-    claim_frame: Vec<u8>,
-    grant_header: Vec<u8>,
-    grant_body: String,
-    descriptor_order: Vec<String>,
-    rendezvous_file_shape: String,
-    claim_hex_len: usize,
+pub(super) struct TransportCapture {
+    pub(super) claim_frame: Vec<u8>,
+    pub(super) grant_header: Vec<u8>,
+    pub(super) grant_body: String,
+    pub(super) descriptor_order: Vec<String>,
+    pub(super) rendezvous_file_shape: String,
+    pub(super) claim_hex_len: usize,
 }
 
 /// Lowercase hex of `bytes`.
 #[cfg(target_os = "macos")]
-fn hex_of(bytes: &[u8]) -> String {
+pub(super) fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -2136,7 +2156,7 @@ fn inode_of(fd: i32) -> (libc::dev_t, libc::ino_t) {
 
 /// A fresh PTY: `(master, slave)`, both close-on-exec from birth.
 #[cfg(target_os = "macos")]
-fn open_pty_pair() -> (i32, i32) {
+pub(super) fn open_pty_pair() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
@@ -2146,9 +2166,10 @@ fn open_pty_pair() -> (i32, i32) {
 /// a real claim — the header and every descriptor dequeued by one
 /// `recv_with_fds`, the body after it, and each descriptor identified by what
 /// it IS (a master by its `st_rdev`, a pipe end by its inode). The generator
-/// runs this same function in each release's worktree.
+/// (`seamless_fixture_generator_tests.rs`) records each release with this same
+/// function.
 #[cfg(target_os = "macos")]
-fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
+pub(super) fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
     use std::io::Read as _;
     use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 
@@ -2517,7 +2538,8 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
         .map(|(release, _)| release.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
-        releases, PINNED_RENDEZVOUS,
+        releases,
+        pinned_rendezvous(),
         "every pinned release's rendezvous.toml is checked in, and every checked-in one is pinned"
     );
     let scratch = std::env::temp_dir().join(format!("aterm-rz-fixture-{}", std::process::id()));

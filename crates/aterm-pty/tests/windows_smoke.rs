@@ -136,9 +136,9 @@ fn conpty_spawns_cmd_echo_and_reaps() {
             None, // shell_args
             None,
             Some(&[
-                "cmd.exe".to_string(),
-                "/c".to_string(),
-                "echo ATERM-WIN-MARKER".to_string(),
+                "cmd.exe".into(),
+                "/c".into(),
+                "echo ATERM-WIN-MARKER".into(),
             ]),
             None,
             None,
@@ -207,7 +207,7 @@ fn conpty_write_path_echoes_interactively() {
             None, // shell_override
             None, // shell_args
             None,
-            Some(&["cmd.exe".to_string()]),
+            Some(&["cmd.exe".into()]),
             None,
             None,
             aterm_sandbox::Limits::inherit(),
@@ -257,7 +257,7 @@ fn bogus_exec_command_fails_closed_no_session() {
             None, // shell_override
             None, // shell_args
             None,
-            Some(&["C:\\nonexistent\\aterm-no-such.exe".to_string()]),
+            Some(&["C:\\nonexistent\\aterm-no-such.exe".into()]),
             None,
             None,
             aterm_sandbox::Limits::inherit(),
@@ -299,7 +299,7 @@ fn bare_cmd_shim_resolves_via_pathext_and_launches() {
             None, // shell_override
             None, // shell_args
             None,
-            Some(&["winrm".to_string()]), // bare name: only PATHEXT can resolve it
+            Some(&["winrm".into()]), // bare name: only PATHEXT can resolve it
             None,
             None,
             aterm_sandbox::Limits::inherit(),
@@ -333,10 +333,10 @@ fn resize_is_thread_safe_against_parked_reader() {
             None, // shell_args
             None,
             Some(&[
-                "cmd.exe".to_string(),
-                "/c".to_string(),
+                "cmd.exe".into(),
+                "/c".into(),
                 // ping -n 2 ≈ a ~1 s child: long enough to resize while it runs.
-                "ping -n 2 127.0.0.1 > nul & echo ATERM-RESIZE-DONE".to_string(),
+                "ping -n 2 127.0.0.1 > nul & echo ATERM-RESIZE-DONE".into(),
             ]),
             None,
             None,
@@ -382,7 +382,7 @@ fn hangup_ends_an_interactive_shell_with_eof() {
             None, // shell_override
             None, // shell_args
             None,
-            Some(&["cmd.exe".to_string()]),
+            Some(&["cmd.exe".into()]),
             None,
             None,
             aterm_sandbox::Limits::inherit(),
@@ -481,7 +481,7 @@ fn focus_boost_actuates_shell_priority_and_restores() {
             None, // shell_override
             None, // shell_args
             None,
-            Some(&["cmd.exe".to_string()]), // hermetic interactive child
+            Some(&["cmd.exe".into()]), // hermetic interactive child
             None,
             None,
             aterm_sandbox::Limits::inherit(),

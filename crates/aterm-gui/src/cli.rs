@@ -16,7 +16,9 @@ use std::sync::RwLock;
 /// `--working-directory` to start it in (if any), whether to `--hold` the
 /// window open after the command exits, and whether `--headless` was passed.
 pub(crate) struct Cli {
-    pub(crate) exec_command: Option<Vec<String>>,
+    /// The `-e` payload as the OS gave it: a program's arguments are bytes, not
+    /// text, so they are never re-encoded on the way to the spawn.
+    pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
     /// `--headless`: no window is ever created — engine + PTY + control socket
@@ -699,9 +701,9 @@ const STARTER_CONFIG: &str = "\
 
 /// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
 /// missing. Used by the value-taking flags so they share one error shape.
-fn flag_value(flag: &str, args: &mut impl Iterator<Item = String>) -> String {
+fn flag_value(flag: &str, args: &mut impl Iterator<Item = std::ffi::OsString>) -> String {
     match args.next() {
-        Some(v) => v,
+        Some(v) => v.to_string_lossy().into_owned(),
         None => {
             eprintln!("aterm: {flag} requires a value (try --help)");
             std::process::exit(2);
@@ -819,16 +821,19 @@ fn unwaited_answer_line(argv: &[String]) -> String {
 /// [`Cli::launch`], the rest in [`LaunchFlags`]. Numeric flags are validated here
 /// for a clean early error; containment is validated by its own fail-closed funnel
 /// in `main`. Every print-and-exit flag answers through [`answer_and_exit`].
-pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
-    // Lossy conversion mirrors the binary era's `env::args()` UTF-8 boundary
-    // (a non-UTF8 flag was a panic there; here it degrades to a usage error).
-    // Kept whole as well as walked: an answer that may print after the prompt
-    // names the command line to type instead (`unwaited_answer_line`).
-    let argv: Vec<String> = argv
-        .into_iter()
+pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
+    // A flag and its value are read by their lossy spelling, the binary era's
+    // `env::args()` UTF-8 boundary (a non-UTF8 flag was a panic there; here it
+    // degrades to a usage error). Kept whole as well as walked: an answer that
+    // may print after the prompt names the command line to type instead
+    // (`unwaited_answer_line`). The walk itself is over the OS's strings: the
+    // `-e` payload is not text and is handed on as it came, so a program's
+    // arguments reach it byte for byte.
+    let argv: Vec<String> = os_argv
+        .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let mut args = argv.clone().into_iter();
+    let mut args = os_argv.into_iter();
     // An update's relaunch of a window that is already running (`ATERM_UPDATED_FROM`,
     // set by every update lane on the image it starts): see `start_dir_refusal`.
     let update_successor = std::env::var_os("ATERM_UPDATED_FROM").is_some();
@@ -836,10 +841,10 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     let mut hold = false;
     let mut headless = false;
     let mut lifeline_fd: Option<String> = None;
-    let mut exec_command: Option<Vec<String>> = None;
+    let mut exec_command: Option<Vec<std::ffi::OsString>> = None;
     let mut launch = crate::launch::Launch::default();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        match &*arg.to_string_lossy() {
             "-h" | "--help" => {
                 // Title, then the origin line (`by Andrew Yates · ALab ·
                 // alab.systems`), then the body.
@@ -930,7 +935,10 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 // Optional family argument; empty falls back to the effective
                 // font_family (--font > config). Exits non-zero if it does not resolve.
                 crate::launch::install(launch.clone());
-                let family = args.next().unwrap_or_default();
+                let family = args
+                    .next()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let (msg, ok) = crate::diagnostics::show_face(&family);
                 answer_and_exit(&argv, &msg, i32::from(!ok));
             }
@@ -1137,7 +1145,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 aterm_gpu::set_verbose(true);
             }
             "-e" | "--command" => {
-                let cmd: Vec<String> = args.by_ref().collect();
+                let cmd: Vec<std::ffi::OsString> = args.by_ref().collect();
                 if cmd.is_empty() {
                     eprintln!("aterm: -e/--command requires a command (try --help)");
                     std::process::exit(2);
@@ -1394,6 +1402,27 @@ mod tests {
         assert_eq!(cli.lifeline_fd, None);
     }
 
+    /// `-e`'s payload is handed on as the OS gave it: a raw byte that is not
+    /// UTF-8 (`aterm --window -e prog $'\xff'`) stays that byte, never U+FFFD,
+    /// and the arguments after it keep their places.
+    #[cfg(unix)]
+    #[test]
+    fn the_command_payload_keeps_the_bytes_it_was_given() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let raw = std::ffi::OsString::from_vec(vec![0xff, b'a', 0x80]);
+        let cli = super::parse_cli(vec!["-e".into(), "printf".into(), raw, "c".into()]);
+        let bytes: Vec<Vec<u8>> = cli
+            .exec_command
+            .expect("the -e payload")
+            .iter()
+            .map(|a| AsRef::<std::ffi::OsStr>::as_ref(a).as_bytes().to_vec())
+            .collect();
+        assert_eq!(
+            bytes,
+            [b"printf".to_vec(), vec![0xff, b'a', 0x80], b"c".to_vec()]
+        );
+    }
+
     /// `--lifeline-fd` arms only a headless launch, in either order, with a
     /// descriptor number; everything else is a usage error that names the fix —
     /// and the `-e` payload after it is still the payload.
@@ -1415,7 +1444,7 @@ mod tests {
             ] {
                 let cli = super::parse_cli(argv);
                 assert_eq!(cli.lifeline_fd, Some(0));
-                assert_eq!(cli.exec_command, Some(vec!["sh".to_string()]));
+                assert_eq!(cli.exec_command, Some(vec!["sh".into()]));
             }
         }
         for bad in ["-1", "x", ""] {

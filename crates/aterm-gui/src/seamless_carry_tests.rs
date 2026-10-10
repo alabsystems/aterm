@@ -1788,3 +1788,11 @@ fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
     );
     staged.teardown();
 }
+
+/// THE HANDOFF FIXTURE GENERATOR: what this release's producer writes for
+/// every required desk and its rendezvous transport, `#[ignore]`d, run by the
+/// release cut (`tests/fixtures/handoff/README.md`). A child of this module, so
+/// it reuses the carry tests' helpers as they are.
+#[cfg(test)]
+#[path = "seamless_fixture_generator_tests.rs"]
+mod fixture_generator;

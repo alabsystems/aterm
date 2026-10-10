@@ -51,11 +51,12 @@ pub enum ApplyStrategy {
     /// or swaps it. `app-bundle` over `github-release` ONLY.
     AppBundle,
     /// A VENDOR's `.app` (`app-bundle` over `https`, `payload = "dmg"`): the single
-    /// `.app` at the image root is copied into the store with its mode bits preserved and
-    /// exposed through the row's `links` — i.e. it activates like [`Shim`], through the
-    /// ordinary `bin/` flip. A DISTINCT variant so the self-update
-    /// [`AppBundle`](ApplyStrategy::AppBundle) gate is never taken for a vendor app, and
-    /// a vendor app is never mistaken for the aterm self-update.
+    /// `.app` at the image root is copied into the store at the modes every lane lays
+    /// (`extract::safe_mode`; AT3, 2026-10-10) and exposed through the row's `links` —
+    /// i.e. it activates like [`Shim`], through the ordinary `bin/` flip. A DISTINCT
+    /// variant so the self-update [`AppBundle`](ApplyStrategy::AppBundle) gate is never
+    /// taken for a vendor app, and a vendor app is never mistaken for the aterm
+    /// self-update.
     ///
     /// [`Shim`]: ApplyStrategy::Shim
     VendorApp,

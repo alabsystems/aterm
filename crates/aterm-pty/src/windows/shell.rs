@@ -299,12 +299,16 @@ pub(crate) fn resolve_spawn_target(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[OsString]>,
 ) -> (OsString, Vec<OsString>) {
     if let Some(cmd) = exec_command.filter(|c| !c.is_empty()) {
-        let program = resolve_program_windows(&cmd[0]);
-        let argv = cmd.iter().map(OsString::from).collect();
-        return (program, argv);
+        // The arguments pass as the OS gave them. A program name that is not
+        // Unicode (an unpaired surrogate) is not searched for: it is run as
+        // given, and `CreateProcessW` names it if it is not there.
+        let program = cmd[0]
+            .to_str()
+            .map_or_else(|| cmd[0].clone(), resolve_program_windows);
+        return (program, cmd.to_vec());
     }
     let shell = select_shell(shell_override.map(OsStr::new));
     if let Some(ov) = argv_override {
@@ -563,7 +567,7 @@ mod tests {
 
     #[test]
     fn exec_command_takes_precedence_and_argv_is_verbatim() {
-        let cmd = vec!["cmd".to_string(), "/c".to_string(), "echo hi".to_string()];
+        let cmd = ["cmd", "/c", "echo hi"].map(OsString::from).to_vec();
         let ov = vec!["ignored".to_string()];
         let (program, argv) = resolve_spawn_target(None, None, Some(&ov), Some(&cmd));
         assert!(

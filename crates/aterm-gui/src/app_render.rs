@@ -6849,8 +6849,8 @@ mod prediction_ghost_tests {
     fn predictor_overlay_is_borrowed_and_paints_byte_identically() {
         let now = Instant::now();
         let mut predictor = Predictor::new(PredictMode::Always);
-        assert!(predictor.predict_char('a', (0, 0), 5, now));
-        assert!(predictor.predict_char('b', (0, 0), 5, now));
+        assert!(predictor.predict_char('a', (0, 0), 0, 5, now));
+        assert!(predictor.predict_char('b', (0, 0), 0, 5, now));
 
         let mut actual = scratch(1);
         actual.cells[0] = vec![blank(); 5];
@@ -14926,8 +14926,15 @@ impl App {
                         // alongside `ws.predictor`, and put back after.
                         let mut scratch = std::mem::take(&mut ws.pred_row_scratch);
                         let mut cached: Option<u16> = None;
-                        ws.predictor
-                            .reconcile(Some((cur.row, cur.col)), no_echo, now, |r, c| {
+                        // Rows that moved under the guesses (output scrolled the
+                        // screen) end them and their epoch, under this same hold.
+                        let coords = g.content_scroll_state().coordinate_generation();
+                        ws.predictor.reconcile(
+                            Some((cur.row, cur.col)),
+                            coords,
+                            no_echo,
+                            now,
+                            |r, c| {
                                 if cached != Some(r) {
                                     scratch.clear();
                                     g.render_row_into(r as usize, &mut scratch);
@@ -14937,7 +14944,8 @@ impl App {
                                     .get(c as usize)
                                     .map(|cell| cell.ch)
                                     .filter(|ch| *ch != ' ')
-                            });
+                            },
+                        );
                         ws.pred_row_scratch = scratch;
                         (false, blank)
                     }
@@ -17883,6 +17891,9 @@ impl App {
         // single-pane law: active-grid coords over scrollback rows are lies).
         let mut focus_scrolled = false;
         let mut focus_no_echo = false;
+        // The focused pane's content-coordinate generation, from the same hold: the
+        // predictor's reconcile retires guesses (and their epoch) when rows moved.
+        let mut focus_coords = 0u64;
         // The focused pane's effective cursor colour (OSC 12, else OSC 10),
         // recolouring the wake/comet as single-pane `cursor_frame` does.
         let mut focus_cursor_rgb: Option<[u8; 3]> = None;
@@ -18105,6 +18116,7 @@ impl App {
                     focus_no_echo =
                         term.is_alternate_screen() || term.kitty_suppresses_predictive_echo();
                     let content_scroll_state = term.content_scroll_state();
+                    focus_coords = content_scroll_state.coordinate_generation();
                     let pane_alt = term.is_alternate_screen();
                     // Coordinate invalidation clears engine context, so apply
                     // it before re-stating this pane's exact alt/blink inputs.
@@ -19161,14 +19173,16 @@ impl App {
                         // but still run the expiry flush after this branch.
                         Some(false)
                     } else {
-                        // Cursor position and the no-echo gate (alt screen or an
-                        // app-owned Kitty composer) come from the pass-1 sample, so
+                        // Cursor position, the coordinate generation and the no-echo
+                        // gate (alt screen or an app-owned Kitty composer) come from
+                        // the pass-1 sample, so
                         // the reconcile matches the cells it compares against. The
                         // resolver indexes this pane's extracted snapshot: no
                         // per-guess row rebuild and no second terminal hold.
                         let input = &ws.pane_scratch;
                         ws.predictor.reconcile(
                             Some(focus_cur_pos),
+                            focus_coords,
                             focus_no_echo,
                             now,
                             |rr, cc| {

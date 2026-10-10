@@ -595,6 +595,28 @@ pub fn set_mode_on(f: &File, mode: u32) -> io::Result<()> {
     f.set_permissions(Permissions::from_mode(mode))
 }
 
+/// The BSD file flags that stop an entry's OWNER changing or removing it — user and
+/// system immutable and append-only (`chflags(1)`'s `uchg`, `uappnd`, `schg`, `sappnd`).
+/// No archive lane lays a flag; `ditto` copies a bundle's with it (the `dmg` lane,
+/// `install::vet_copied_tree`).
+#[cfg(target_os = "macos")]
+pub const OWNER_BINDING_FLAGS: u32 =
+    libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+
+/// Set `path`'s BSD file flags to exactly `flags` (`chflags(2)`, which follows a link).
+#[cfg(target_os = "macos")]
+pub fn set_file_flags(path: &Path, flags: u32) -> io::Result<()> {
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call, which reads it and
+    // nothing else.
+    if unsafe { libc::chflags(c.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Open `path` for a fresh (create+truncate) write with initial permission `mode`.
 pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
     OpenOptions::new()
@@ -619,7 +641,8 @@ pub fn open_create_new_write(path: &Path, mode: u32) -> io::Result<File> {
 
 /// Open `path` the way [`sync_file_contents`] needs it: read-only — `fsync(2)` takes any
 /// open descriptor, and a read-only open never fails on a file the store cannot write
-/// (the `dmg` lane's vendor bundle keeps its modes).
+/// (no lane lays one since AT3, 2026-10-10, when the `dmg` lane stopped keeping the
+/// image's modes and owners; the read-only open asks for nothing it does not need).
 pub fn open_for_sync(path: &Path) -> io::Result<File> {
     File::open(path)
 }

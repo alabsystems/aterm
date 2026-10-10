@@ -60,10 +60,11 @@ Examples of issues that should be reported privately include:
   roster, its deny-list, and the forward-only build rule are described in
   [README ▸ Security model](README.md#security-model));
 - escapes from the sandbox profile that `--sandbox` applies to session
-  processes on macOS (network, other processes' task ports, write confinement,
-  credential and private-data directories), a `containment` session starting on a platform with no OS
-  sandbox (it must refuse), or a containment gate on any platform failing to
-  enforce what it announces at startup;
+  processes on macOS (network, other processes' task ports, mach service
+  lookups, write confinement, credential and private-data directories), a
+  `containment` session starting on a platform with no OS sandbox (it must
+  refuse), or a containment gate on any platform failing to enforce what it
+  announces at startup;
 - capture-path escapes or unintended disclosure of terminal contents; and
 - committed or emitted credentials.
 

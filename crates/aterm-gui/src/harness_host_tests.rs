@@ -1306,10 +1306,26 @@ fn a_restart_the_successor_cannot_carry_in_time_is_said() {
     until("the first step", || steps.load(Ordering::SeqCst) > 0);
     // A park of the successor's own: nothing is stepped while it holds.
     host.suspend();
-    std::thread::sleep(Duration::from_millis(20));
-    let parked = steps.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(steps.load(Ordering::SeqCst), parked, "no step while parked");
+    // `suspend` only stops NEW steps: one the loop had already begun can still land
+    // after it returns (a loaded machine delays it by far more than a fixed sleep).
+    // Parked is when the count stops moving - a host that kept stepping through the
+    // suspension would never be steady, and the wait is a hang detector.
+    let parked = {
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut last = steps.load(Ordering::SeqCst);
+        loop {
+            std::thread::sleep(Duration::from_millis(150));
+            let now = steps.load(Ordering::SeqCst);
+            if now == last {
+                break now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop kept stepping through the suspension: {now} steps"
+            );
+            last = now;
+        }
+    };
     // The Commit failed: resumed, the carry goes on.
     host.resume();
     until("stepped again after the resume", || {

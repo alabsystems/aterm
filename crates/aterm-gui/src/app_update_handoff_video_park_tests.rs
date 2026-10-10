@@ -708,14 +708,12 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     });
 
     let (root, replies) = live_take(&mut app);
-    // The take's client reads its answer 50 ms after it is sent: the
-    // Commit's answers take real time, and its claim is held.
+    // The take's client reads its answer a while after the Commit is written: the
+    // Commit's answers take real time, and its claim is held. The wire is made here
+    // and its reader started right before the Commit (below), so its clock cannot run
+    // out while a starved main thread is still setting the park up.
     let (wire, release) = crate::control::ReplyWire::new();
     app.video_reply_wires.push(wire);
-    let reader = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drop(release);
-    });
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Immediate);
     let nonce = record.nonce.clone();
     app.update_handoff_prelaunch = Some(record);
@@ -751,6 +749,12 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
     drop(commit_rd);
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
+    // The claim counts as held when its answers took `HANDOFF_INPUT_DRAIN_YIELD`
+    // (2 ms); 250 ms leaves a loaded machine room to reach the wait first.
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        drop(release);
+    });
     app.finish_proven_handoff(crate::UpdateHandoffCompletion {
         attempt_id: 7,
         nonce: Some(nonce),

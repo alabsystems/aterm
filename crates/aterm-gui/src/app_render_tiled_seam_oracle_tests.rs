@@ -563,18 +563,21 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     //    compose path drops guesses parked anywhere else.
     {
         let focus = c.focus();
-        let caret = {
+        let (caret, coords) = {
             let term = c.app.pool.get(focus).expect("focused session").term.clone();
             let term = term_lock(&term);
             let cursor = term.cursor();
-            (cursor.row, cursor.col)
+            (
+                (cursor.row, cursor.col),
+                term.content_scroll_state().coordinate_generation(),
+            )
         };
         let now = c.now + FRAME;
         let ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.predictor.set_mode(crate::predict::PredictMode::Always);
         let cols = ws.cols;
         assert!(
-            ws.predictor.predict_char('?', caret, cols, now),
+            ws.predictor.predict_char('?', caret, coords, cols, now),
             "the prediction producer did not arm"
         );
     }

@@ -379,8 +379,11 @@ pub(crate) fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_c
             },
             &running,
             move |ev| {
-                let (line, refusal) = event_line(&ev);
-                note(&line, refusal);
+                listener_event(
+                    &ev,
+                    &crate::control::control_denials::NET_REFUSALS,
+                    std::time::Instant::now(),
+                );
             },
         );
     });
@@ -470,6 +473,36 @@ fn event_line(event: &NetEvent) -> (String, bool) {
             true,
         ),
     }
+}
+
+/// One listener event, said ([`note`]) — a refusal only when `refusals` says
+/// this one is written.
+///
+/// A refusal is a remote peer's to cause at will and before any token: a
+/// connection that opens and closes is one. Each wrote a WARN line here and on
+/// stderr, so a peer looping on connect wrote as fast as it could dial —
+/// measured on a headless instance, 2000 lines (293 KB) for 2000 connections
+/// in 0.1 s — and `aterm.log`'s two 4 MiB files, the containment audit trail
+/// and this listener's own record of who was admitted rolled away in seconds.
+/// The refusals are thinned as the local socket's handshake refusals are
+/// ([`crate::control::control_denials`]), in ONE run for every peer: an address is no
+/// identity a remote dialer cannot change (one IPv6 /64 holds 2^64). Every
+/// refusal is counted, each line written says how many, and the admitted and
+/// closed lines, which only a token holder causes, are written as they come.
+fn listener_event(
+    event: &NetEvent,
+    refusals: &crate::control::control_denials::AuthDenials,
+    now: std::time::Instant,
+) {
+    let (line, refusal) = event_line(event);
+    let line = match event {
+        NetEvent::Refused { .. } => match refusals.record_network(&line, now) {
+            Some(line) => line,
+            None => return,
+        },
+        NetEvent::Admitted { .. } | NetEvent::Closed { .. } | NetEvent::Stopped(_) => line,
+    };
+    note(&line, refusal);
 }
 
 /// A listener line to stderr AND aterm.log: a Dock-launched app's stderr goes
@@ -702,6 +735,92 @@ mod tests {
             "network drive token file /k/aterm-network-drive.token cannot be created; until \
              aterm can create it, clients use this launch's token and re-provision after each \
              restart"
+        );
+    }
+
+    /// THE AUDIT FLOOD: an unauthenticated peer that opens and closes a
+    /// connection a millisecond, from a new address each time, writes the 1st,
+    /// 2nd, 4th … of its refusals, each saying how many there were, not one line
+    /// per connection (`listener_event`). A refusal after a quiet longer than
+    /// the run is written at once, and an admitted peer is always written.
+    #[test]
+    fn a_flood_of_refused_connections_is_thinned_in_the_log() {
+        use std::time::{Duration, Instant};
+        crate::test_log::install();
+        // TEST-NET-2 addresses: no other test in this crate names them.
+        const NET: &str = "198.51.100.";
+        let refusals = crate::control::control_denials::AuthDenials::new();
+        let t0 = Instant::now();
+        for i in 0..1000_u64 {
+            let peer: SocketAddr = format!("{NET}{}:{}", 1 + i % 250, 10_000 + i)
+                .parse()
+                .unwrap();
+            listener_event(
+                &NetEvent::Refused {
+                    peer,
+                    reason: "received corrupt message of type InvalidContentType".into(),
+                },
+                &refusals,
+                t0 + Duration::from_millis(i),
+            );
+        }
+        let written = crate::test_log::containing(NET);
+        assert_eq!(
+            written.len(),
+            10,
+            "the 1st, 2nd, 4th … 512th of 1000 refusals: {:#?}",
+            written.iter().map(|r| &r.message).collect::<Vec<_>>()
+        );
+        assert!(
+            written
+                .iter()
+                .all(|r| r.level == aterm_log::Level::Warn && r.message.contains("not admitted"))
+        );
+        assert_eq!(
+            written[0].message,
+            "network drive: 198.51.100.1:10000 not admitted: received corrupt message of type \
+             InvalidContentType",
+            "the first refusal is written as it always was"
+        );
+        let last = &written[9].message;
+        assert!(
+            last.starts_with("network drive: 198.51.100.12:10511 not admitted: received corrupt")
+                && last.ends_with("(512 refused in 511.0ms, 512 since launch)"),
+            "{last}"
+        );
+
+        // Ten minutes of quiet: the next refusal starts a new run, written.
+        let later = t0 + Duration::from_secs(600);
+        let peer: SocketAddr = format!("{NET}251:4242").parse().unwrap();
+        listener_event(
+            &NetEvent::Refused {
+                peer,
+                reason: "wrong drive token".into(),
+            },
+            &refusals,
+            later,
+        );
+        let written = crate::test_log::containing(NET);
+        assert_eq!(written.len(), 11);
+        assert!(
+            written[10]
+                .message
+                .contains("not admitted: wrong drive token (again after "),
+            "{}",
+            written[10].message
+        );
+        assert!(written[10].message.ends_with("quiet; 1001 since launch)"));
+
+        // A token holder's connection is never thinned.
+        let peer: SocketAddr = format!("{NET}252:4243").parse().unwrap();
+        let granted = aterm_net::Granted {
+            src: "dial".into(),
+            op: "drive".into(),
+        };
+        listener_event(&NetEvent::Admitted { peer, granted }, &refusals, later);
+        assert!(
+            crate::test_log::containing(&format!("{NET}252:4243 connected")).len() == 1,
+            "an admitted peer is written"
         );
     }
 

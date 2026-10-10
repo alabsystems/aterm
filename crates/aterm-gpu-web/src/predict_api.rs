@@ -10,8 +10,11 @@
 //! 1. [`predict_char`](AtermGpuTerminal::predict_char) /
 //!    [`predict_backspace`](AtermGpuTerminal::predict_backspace) on the keydown
 //!    whose bytes go to the PTY, and
-//!    [`predict_line_submit`](AtermGpuTerminal::predict_line_submit) on Enter
-//!    (the password-prompt safety boundary),
+//!    [`predict_line_submit`](AtermGpuTerminal::predict_line_submit) on a key
+//!    that writes a line terminator (Enter in any spelling, Ctrl+J, Ctrl+M), and
+//!    [`predict_unmodelled_input`](AtermGpuTerminal::predict_unmodelled_input)
+//!    on every other key whose bytes go to the PTY and on a paste (the
+//!    password-prompt safety boundaries),
 //! 2. [`predict_reconcile`](AtermGpuTerminal::predict_reconcile) after `process()`
 //!    applies child output,
 //! 3. [`predict_overlay`](AtermGpuTerminal::predict_overlay) when composing a
@@ -63,12 +66,14 @@ impl AtermGpuTerminal {
         }
         let cur = self.term.cursor();
         let cols = self.term.grid().cols();
+        let coords = self.term.content_scroll_state().coordinate_generation();
         self.predict
-            .predict_char(ch, (cur.row, cur.col), cols, Instant::now())
+            .predict_char(ch, (cur.row, cur.col), coords, cols, Instant::now())
     }
 
     /// Register a Backspace: cancels only our own trailing guess (erasing real
-    /// content is left to the program's echo). Returns whether state changed.
+    /// content is left to the program's echo, and ends the confirmation epoch).
+    /// Returns whether a guess was cancelled.
     pub fn predict_backspace(&mut self) -> bool {
         if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
             self.predict.reset();
@@ -77,14 +82,27 @@ impl AtermGpuTerminal {
         self.predict.predict_backspace(Instant::now())
     }
 
-    /// Register a plain Enter (call when the line terminator goes to the PTY).
-    /// Ends the confirmation epoch, so the next line must re-confirm echo
-    /// before `adaptive` displays anything. Required for password safety: at
-    /// the bottom of the screen the cursor reuses one row across lines, and a
-    /// non-echoing prompt there must not inherit the last command's
-    /// confirmation. No-op when nothing is pending.
+    /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's
+    /// LF), Ctrl+J, Ctrl+M — not Alt+Enter, whose ESC prefix makes it any other
+    /// key. Ends the confirmation epoch, so nothing typed after it displays
+    /// (`adaptive`) until echo is confirmed again. Required for password safety:
+    /// a password typed ahead of the next prompt still sits on the proven row.
+    /// The line's own unechoed tail keeps painting until its echo. Cheap.
     pub fn predict_line_submit(&mut self) {
         self.predict.note_line_submit();
+    }
+
+    /// Register any OTHER key not handed to `predict_char` / `predict_backspace`
+    /// (Tab, an arrow, a control or Alt chord, an IME commit) or a paste, when
+    /// its bytes go to the PTY. Ends the confirmation epoch like
+    /// `predict_line_submit` and retires the guesses in flight: the key may erase
+    /// them (Ctrl+W, Ctrl+H), and a guess left over the erased cell is a ghost of
+    /// the erased text. Which keys submit a line is the program's call, so this
+    /// is the seam for every key that is not a terminator. Cheap.
+    pub fn predict_unmodelled_input(&mut self) {
+        // ICF barrier (see `predict_reset`): keep this export's body distinct.
+        std::hint::black_box(2u8);
+        self.predict.note_unmodelled_input();
     }
 
     /// Reconcile pending guesses against the grid; call after `process()`.
@@ -112,8 +130,10 @@ impl AtermGpuTerminal {
         // re-resolving the whole row each time.
         let mut scratch = std::mem::take(&mut self.pred_row_scratch);
         let mut cached: Option<u16> = None;
+        // Rows that moved under the guesses retire them and their epoch.
+        let coords = self.term.content_scroll_state().coordinate_generation();
         let (term, predict) = (&self.term, &mut self.predict);
-        predict.reconcile(Some((cur.row, cur.col)), no_echo, now, |r, c| {
+        predict.reconcile(Some((cur.row, cur.col)), coords, no_echo, now, |r, c| {
             if cached != Some(r) {
                 term.render_row_into(r as usize, &mut scratch);
                 cached = Some(r);
@@ -343,13 +363,37 @@ mod tests {
         t.predict_line_submit();
         assert!(
             t.predict_overlay().is_empty(),
-            "submit flushes pending guesses"
+            "a fast link paints nothing, before or after the submit"
         );
         assert!(t.predict_char('s'), "the password keystroke is tracked…");
         assert!(
             t.predict_overlay().is_empty(),
             "…but never displayed on the unconfirmed new line (no leak)"
         );
+    }
+
+    #[test]
+    fn only_a_line_terminator_carries_the_guesses_in_flight() {
+        // The two boundary exports differ in what they do to the pixels already
+        // painted: a terminator keeps the line's unechoed tail, any other key
+        // (Ctrl+W, Ctrl+H) may have erased it and retires it.
+        let Some(mut t) = terminal() else {
+            return;
+        };
+        t.set_predictive_echo("always");
+        assert!(t.predict_char('a'));
+        t.predict_line_submit();
+        assert_eq!(
+            t.predict_overlay(),
+            vec![0, 0, u32::from('a')],
+            "Enter keeps the tail on glass"
+        );
+        t.predict_unmodelled_input();
+        assert!(
+            t.predict_overlay().is_empty(),
+            "a key that may have erased the tail retires it"
+        );
+        assert!(t.predict_next_deadline_ms().is_none(), "nothing left armed");
     }
 
     #[test]

@@ -33,14 +33,19 @@
 //!  8 measure          tools/verify.sh --measure <that bundle>: the bytes that ship
 //!  9 preflight        the preflight and the provisioning again, with what changed
 //!                     while the long steps ran (the cut's disk, the version's tag, the
-//!                     cut's read-only pre-claim gates): READY, or nothing is staged
+//!                     cut's read-only pre-claim gates): READY, or nothing is staged;
+//!                     then the release's OWN handoff fixtures, written by the in-tree
+//!                     generator under the reserved identity into the release cache
+//!                     (`fixtures::stage`): a generator that refuses, refuses here
 //! 10 stage            pub stage aterm --commit R --repo-path <this clone>
 //! 11 publish          pub publish aterm --repo-path <this clone>
 //! 12 cut              ship cut: claim the reservation, then sign, notarize and
 //!                     package a byte copy of the MEASURED bundle (a claimed cut:
 //!                     --resume; the cut never builds)
 //! 13 after-cut        the published release's shape, from what GitHub serves, then
-//!                     alab.systems brought to it
+//!                     alab.systems brought to it, then the staged handoff fixtures
+//!                     landed on main with their PINNED_DESKS rows (`fixtures::land`,
+//!                     a compare-and-swap; nothing to do when main holds them)
 //! 14 check            the channel's `latest` is vX.Y.0
 //! ```
 //!
@@ -822,6 +827,9 @@ pub struct Facts {
     pub built: Answer,
     /// The MEASURE verdict for that bundle's executable.
     pub measured: Answer,
+    /// The release's own handoff fixtures on origin/main, as the next cut's gate judges
+    /// them (`fixtures::on_commit`): landed by step 13, or by hand.
+    pub fixtures: Answer,
 }
 
 /// The release commit and its version.
@@ -937,6 +945,23 @@ pub trait Backend {
     /// refusal there leaves nothing public.
     fn cut_gates(&mut self, c: &Candidate, creds: &Path) -> Vec<Refusal>;
     fn fixture_guard(&mut self, prover: &Prover) -> Result<String, Refusal>;
+    /// Write the release's own handoff fixtures for its reserved identity into the
+    /// release cache, with the in-tree generator in the cut tree, unless they are
+    /// staged already (`fixtures::stage`): what was done, or the refusal.
+    fn stage_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<String, Refusal>;
+    /// Land them on main (staging them first when the cache holds none), unless main
+    /// holds them already (`fixtures::land`).
+    fn land_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<String, Refusal>;
     fn audit(&mut self, machine_id: &str) -> Vec<Finding>;
     /// Raise the owner ask: `Ok(its reply)` only when the owner's aterm took it.
     fn ask(&mut self, words: &AskWords) -> Result<String, String>;
@@ -1243,16 +1268,34 @@ impl Run<'_> {
         }
 
         self.begin(Step::AfterCut)?;
-        if self.journal_has("after-cut") {
+        let shaped = self.journal_has("after-cut");
+        if shaped && self.facts.fixtures.yes {
             let v = self.version();
             let site = self.site_words();
-            self.skip(&format!("done for v{v} (this release's journal){site}"));
+            let landed = self.facts.fixtures.words.clone();
+            self.skip(&format!(
+                "done for v{v} (this release's journal){site}; {landed}"
+            ));
         } else if self.dry {
             let v = self.version();
-            self.finish(&format!(
-                "would check v{v}'s shape as GitHub serves it, then bring alab.systems to it \
-                 (publish/post-promote --latest)"
-            ));
+            let mut words = Vec::new();
+            if !shaped {
+                words.push(format!(
+                    "would check v{v}'s shape as GitHub serves it, then bring alab.systems to \
+                     it (publish/post-promote --latest)"
+                ));
+            }
+            words.push(if self.facts.fixtures.yes {
+                self.facts.fixtures.words.clone()
+            } else {
+                format!(
+                    "would land v{v}'s handoff fixtures, staged before the claim, on main: one \
+                     commit on its tip adding {}/v{v}/ and its PINNED_DESKS rows, pushed as a \
+                     compare-and-swap",
+                    crate::gates::HANDOFF_FIXTURE_ROOT
+                )
+            });
+            self.finish(&words.join("; then "));
         } else {
             self.after_cut()?;
         }
@@ -2392,7 +2435,7 @@ impl Run<'_> {
                 Step::Stage => self.skip_stage().is_some(),
                 Step::Publish => self.skip_publish().is_some(),
                 Step::Cut => matches!(self.cut_mode(), CutMode::Done(_)),
-                Step::AfterCut => self.journal_has("after-cut"),
+                Step::AfterCut => self.journal_has("after-cut") && self.facts.fixtures.yes,
                 _ => false,
             };
             if skipped {
@@ -2613,8 +2656,53 @@ impl Run<'_> {
                 Err(r) => self.refuse(r)?,
             }
         }
+        if strict {
+            words.push(self.stage_fixtures(&c, &p)?);
+        }
         self.finish(&words.join("; "));
         Ok(())
+    }
+
+    /// THE RELEASE'S OWN HANDOFF FIXTURES, before the claim: what its producer writes,
+    /// under the identity the shipped binary stamps (the reservation), staged in the
+    /// release cache for step 13 to land. A generator that refuses refuses the release
+    /// here, with nothing claimed or published.
+    fn stage_fixtures(&mut self, c: &Candidate, p: &Prover) -> Result<String, Halt> {
+        let v = &c.version;
+        if self.facts.fixtures.yes {
+            return Ok(self.facts.fixtures.words.clone());
+        }
+        let generator = format!(
+            "the in-tree generator (targo --unverified test -p aterm-gui --lib -- {})",
+            crate::fixtures::generator_args().join(" ")
+        );
+        if self.dry {
+            let identity = match self.reservation() {
+                Some(r) => format!("build {} ({})", r.build, short(&r.commit)),
+                None => "the build step 7 reserves".to_string(),
+            };
+            return Ok(format!(
+                "would write v{v}'s handoff fixtures for {identity} with {generator} into the \
+                 release cache, refusing here if it refuses; step 13 lands them on main"
+            ));
+        }
+        let Some(reserved) = self.reservation() else {
+            self.refuse(
+                Refusal::new(
+                    format!("no reservation of v{v} to write its handoff fixtures as"),
+                    format!("run {RELEASE_COMMAND} again: step 7 reserves it"),
+                )
+                .could_not_run(),
+            )?;
+            return Ok(String::new());
+        };
+        match self.b.stage_fixtures(c, &reserved, p) {
+            Ok(note) => Ok(note),
+            Err(r) => {
+                self.refuse(r)?;
+                Ok(String::new())
+            }
+        }
     }
 
     /// What the cut would refuse that can change while the long steps run — its disk
@@ -3351,20 +3439,27 @@ impl Run<'_> {
                 "read the engine's mappings.json",
             ));
         }
-        let tail = if ran.code == 0 {
-            String::new()
-        } else {
-            format!(
-                " (pub publish exited {} after recording it: {})",
-                ran.code,
-                ran.detail.last().cloned().unwrap_or_default()
-            )
-        };
+        // A PUBLISH THAT EXITED NONZERO IS NOT DONE, ledger or no ledger: what it
+        // did not finish (v0.102.0: sign-release, so no signed source manifest)
+        // would otherwise reach the cut, and the release would go out without it.
+        if ran.code != 0 {
+            return self.refuse(
+                Refusal::new(
+                    format!(
+                        "pub publish recorded {r} but exited {}: {}",
+                        ran.code,
+                        ran.detail.last().cloned().unwrap_or_default()
+                    ),
+                    format!(
+                        "finish what its last line names (e.g. pub sign-release aterm), then \
+                         {RELEASE_COMMAND}"
+                    ),
+                )
+                .detail(ran.detail),
+            );
+        }
         let rev = self.facts.engine.rev.clone().unwrap_or_default();
-        self.finish(&format!(
-            "published {r} -> alabsystems {}{tail}",
-            short(&rev)
-        ));
+        self.finish(&format!("published {r} -> alabsystems {}", short(&rev)));
         Ok(())
     }
 
@@ -3456,18 +3551,74 @@ impl Run<'_> {
     /// its check.
     fn after_cut(&mut self) -> Flow {
         let v = self.version();
-        match self.b.after_cut(&v) {
-            Ok(done) => {
-                if done.site_deferred {
-                    self.journal_add_all(&[SITE_DEFERRED, "after-cut"])?;
-                } else {
-                    self.journal_add("after-cut")?;
+        let mut notes = Vec::new();
+        if !self.journal_has("after-cut") {
+            match self.b.after_cut(&v) {
+                Ok(done) => {
+                    if done.site_deferred {
+                        self.journal_add_all(&[SITE_DEFERRED, "after-cut"])?;
+                    } else {
+                        self.journal_add("after-cut")?;
+                    }
+                    notes.push(format!("{}{}", done.note, self.site_words()));
                 }
-                let site = self.site_words();
-                self.finish(&format!("{}{site}", done.note));
-                Ok(())
+                Err(r) => return self.refuse(r),
             }
-            Err(r) => self.refuse(r),
+        }
+        if !self.facts.fixtures.yes {
+            notes.push(self.land_fixtures()?);
+        }
+        self.finish(&notes.join("; "));
+        Ok(())
+    }
+
+    /// THE RELEASE'S OWN HANDOFF FIXTURES, after the cut: the staging of the claimed
+    /// reservation landed on main, so the next cut's gate finds them. A re-run that
+    /// finds them on main does nothing; one that finds them staged and not landed
+    /// lands them; one whose cache lost them writes them again first.
+    fn land_fixtures(&mut self) -> Result<String, Halt> {
+        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
+            return Ok(String::new());
+        };
+        let claimed = self.facts.cut.as_ref().map(|cut| cut.build);
+        // The identity the shipped binary stamps: the journal's reservation of the
+        // claimed build, else (a claim resumed after `--forget`) the claimed build and
+        // the release commit its published tag names.
+        let mut reserved = self.reservation().filter(|r| Some(r.build) == claimed);
+        if reserved.is_none()
+            && let Some(build) = claimed
+            && let Ok(Some(commit)) = self.b.origin_tag_now(&format!("v{}", c.version))
+        {
+            reserved = Some(Reservation {
+                build,
+                commit,
+                line: format!("{build} {}", c.version),
+            });
+        }
+        let Some(reserved) = reserved else {
+            self.refuse(Refusal::new(
+                format!(
+                    "neither this release's journal nor a published tag names the release \
+                     commit of the claimed build {} to land v{}'s handoff fixtures as",
+                    claimed.map_or_else(|| "?".to_string(), |b| b.to_string()),
+                    c.version
+                ),
+                format!(
+                    "add them by hand ({}, \"By hand\")",
+                    crate::gates::HANDOFF_FIXTURE_README
+                ),
+            ))?;
+            return Ok(String::new());
+        };
+        match self.b.land_fixtures(&c, &reserved, &p) {
+            Ok(note) => {
+                self.refresh();
+                Ok(note)
+            }
+            Err(r) => {
+                self.refuse(r)?;
+                Ok(String::new())
+            }
         }
     }
 

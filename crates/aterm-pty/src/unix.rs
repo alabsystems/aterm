@@ -42,7 +42,7 @@ pub(crate) fn spawn_shell(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
 ) -> io::Result<i32> {
@@ -1491,6 +1491,17 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
 /// as given. It takes precedence over `argv_override` — there is no interactive
 /// shell to integrate with. An unresolved/again-failing `prog` ends
 /// the child with `_exit(127)`, closing the window, just like a failed shell exec.
+/// The command is `OsString`s because it comes from the OS's argv: each element
+/// reaches `execve` as the bytes it was given, so an argument that is not UTF-8
+/// (`aterm --window -e prog $'\xff'`) arrives as itself, never as U+FFFD.
+///
+/// No argv element is ever dropped: one that holds a NUL byte (which `execve`
+/// cannot pass) refuses the spawn with `InvalidInput`, naming its list and
+/// index, rather than leave it out and shift every argument after it into its
+/// place ([`argv_cstrings`]). That holds for `exec_command`, `argv_override` and
+/// `shell_args` alike. Nor is the shell ever swapped for another: a
+/// `shell_override` holding a NUL refuses the spawn the same way whenever the
+/// shell is what would run (an `-e` command does not run it, so is not refused).
 ///
 /// `cwd`, when `Some`, is the working directory the child `chdir`s into before
 /// exec (the `--working-directory` flag); it overrides the default
@@ -1534,7 +1545,8 @@ fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecSta
 /// `ioctl(TIOCGWINSZ)` gets real pixel geometry instead of zeros.
 ///
 /// # Errors
-/// Returns `PermissionDenied` if the capability's tier is too low, the OS error
+/// Returns `PermissionDenied` if the capability's tier is too low, `InvalidInput`
+/// if an argv element holds a NUL byte, the OS error
 /// if the PTY pair / `pipe` / `fork` fails, or `PermissionDenied`/`Other` if the child failed
 /// to confine itself (sandbox `apply` error) or to `execve` before exec. On any
 /// pre-exec child failure the master fd is closed and NO unconfined shell is
@@ -1549,7 +1561,7 @@ pub fn spawn_shell_with_pid(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
@@ -1707,7 +1719,7 @@ pub fn spawn_shell_with_pid_cell_px(
     // argv[0] and explicit `-l` would conflict). `None` → the default login argv.
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
     // The `rlimit` set applied in the child before exec. The caller chooses it by
@@ -1745,12 +1757,16 @@ pub fn spawn_shell_with_pid_cell_px(
                 None => ("/bin/sh".into(), ""),
             },
         };
-    // The fallback is a compile-time `c"..."` literal (interior-NUL-free by
-    // construction), not a runtime `CString::new(..).unwrap()`: same bytes, no
-    // panic path — behavior-identical while discharging the Trust unwrap
-    // panic-boundary obligations.
-    let cshell =
-        CString::new(shell.as_os_str().as_bytes()).unwrap_or_else(|_| c"/bin/sh".to_owned());
+    // The shell's path, and a name built from it, as C strings. Only the branches
+    // that run the shell build them, so a bad configured shell does not refuse an
+    // unrelated `-e`. A NUL in the shell refuses the spawn: `execve` would read the
+    // path only up to it, and a substitute (this seam once swapped in `/bin/sh`)
+    // runs a program the person did not name. `$SHELL` cannot hold a NUL, so
+    // only `--shell` / config `shell` reaches this.
+    let shell_cstring = |name: &std::ffi::OsStr| {
+        CString::new(name.as_bytes())
+            .map_err(|_| crate::program_nul_refusal(&format!("the shell{shell_from}")))
+    };
 
     // envp = the inherited environment with every deny-listed key removed, then
     // `env_add` applied on top (overriding or appending). Built by `build_child_env`
@@ -1779,37 +1795,40 @@ pub fn spawn_shell_with_pid_cell_px(
     // the C strings the child's `execve` reads.
     // `-e`'s program is named as typed, with no shell source beside it.
     let runs_program = exec_command.is_some_and(|c| !c.is_empty());
+    // Every list is converted whole or not at all (`argv_cstrings`): an element
+    // holding a NUL refuses the spawn, before the fork, instead of being dropped.
     let (exec_target, argv_store): (CString, Vec<CString>) =
         if let Some(cmd) = exec_command.filter(|c| !c.is_empty()) {
-            let argv: Vec<CString> = cmd
-                .iter()
-                .filter_map(|a| CString::new(a.as_bytes()).ok())
-                .collect();
+            let args: Vec<&std::ffi::OsStr> = cmd.iter().map(|a| a.as_os_str()).collect();
+            let argv = argv_cstrings("the -e command", &args)?;
             (resolve_program(&cmd[0]), argv)
         } else if let Some(ov) = argv_override {
-            let argv = ov
-                .iter()
-                .filter_map(|a| CString::new(a.as_bytes()).ok())
-                .collect();
-            (cshell.clone(), argv)
+            let args: Vec<&std::ffi::OsStr> = ov.iter().map(std::ffi::OsStr::new).collect();
+            (
+                shell_cstring(shell.as_os_str())?,
+                argv_cstrings("the shell's argv", &args)?,
+            )
         } else if let Some(args) = shell_args.filter(|a| !a.is_empty()) {
             // Config `shell_args`: a non-login interactive shell, argv[0] = the
             // shell basename (not the login "-" form — explicit args own the
             // login/interactive choice), then the user's args verbatim.
+            let cshell = shell_cstring(shell.as_os_str())?;
             let base = std::path::Path::new(&shell)
                 .file_name()
                 .unwrap_or(shell.as_os_str());
-            let mut argv = vec![CString::new(base.as_bytes()).unwrap_or_else(|_| cshell.clone())];
-            argv.extend(args.iter().filter_map(|a| CString::new(a.as_bytes()).ok()));
-            (cshell.clone(), argv)
+            // The basename is a part of the shell, which holds no NUL by now.
+            let mut argv = vec![shell_cstring(base)?];
+            let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+            argv.extend(argv_cstrings("config `shell_args`", &args)?);
+            (cshell, argv)
         } else {
+            let cshell = shell_cstring(shell.as_os_str())?;
             let base = std::path::Path::new(&shell)
                 .file_name()
                 .unwrap_or(shell.as_os_str());
             let mut argv0 = std::ffi::OsString::from("-");
             argv0.push(base);
-            let argv = vec![CString::new(argv0.as_bytes()).unwrap_or_else(|_| cshell.clone())];
-            (cshell.clone(), argv)
+            (cshell, vec![shell_cstring(argv0.as_os_str())?])
         };
 
     // OS-sandbox wrap (macOS Seatbelt, ATERM_DESIGN §5.6). When the caller demands
@@ -2870,6 +2889,23 @@ fn exec_failure(
     format!("`{path}` {why}{from}")
 }
 
+/// `args` as the C strings `execve` hands a program, every element in its place,
+/// or the refusal of the whole spawn when one holds a NUL byte. A C string ends
+/// at its first NUL, so such an element cannot be passed at all, and leaving it
+/// out would move every argument after it into its place: `rm -- "$a" "$b"` with
+/// a NUL in `$a` would run `rm -- "$b"`. `list` names where the arguments came
+/// from, for the error. Run in the PARENT, before the fork.
+fn argv_cstrings(list: &str, args: &[&std::ffi::OsStr]) -> io::Result<Vec<CString>> {
+    let mut out = Vec::with_capacity(args.len());
+    for (index, arg) in args.iter().enumerate() {
+        match CString::new(arg.as_bytes()) {
+            Ok(c) => out.push(c),
+            Err(_) => return Err(crate::argv_nul_refusal(list, index)),
+        }
+    }
+    Ok(out)
+}
+
 /// PATH-resolve a `-e` program name to an absolute path, IN THE PARENT (the child
 /// must stay async-signal-safe, so it cannot do its own `execvp` PATH search). A
 /// name containing `/` is used verbatim (an explicit path). Otherwise each `$PATH`
@@ -2883,13 +2919,13 @@ fn exec_failure(
 // a promoted seal: a totality entry for `CString::new` (total modulo
 // allocation); then drop this.
 #[cfg_attr(trust_verify, trust::skip)]
-fn resolve_program(name: &str) -> CString {
+fn resolve_program(name: &std::ffi::OsStr) -> CString {
     // The interior-NUL fallback is a compile-time `c"..."` literal (NUL-free by
     // construction), not a runtime `CString::new(..).unwrap()`: same bytes, no
     // panic path — behavior-identical while discharging the Trust unwrap
     // panic-boundary obligations.
     let verbatim = || CString::new(name.as_bytes()).unwrap_or_else(|_| c"/nonexistent".to_owned());
-    if name.is_empty() || name.contains('/') {
+    if name.is_empty() || name.as_bytes().contains(&b'/') {
         return verbatim();
     }
     if let Some(paths) = std::env::var_os("PATH") {

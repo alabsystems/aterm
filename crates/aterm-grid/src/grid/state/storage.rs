@@ -135,6 +135,12 @@ pub struct GridStorage {
     /// (`scroll_convert::FloodCut`). Ordinary retention eviction and
     /// user-requested limit shrinks are not counted.
     pub(crate) flood_truncated_lines: u64,
+    /// Staged lines the detached-reflow-window cap has dropped in the CURRENT
+    /// detach window (`Grid::bound_detached_lazy_buffer`), zeroed when a window
+    /// opens. The cap is a fact about the window, so its log line is written at
+    /// the window's first drop and its total when the window closes, not once
+    /// per streamed line (`Grid::close_reflow_window_cap_run`).
+    pub(crate) reflow_window_cap_dropped: u64,
     /// Ring-byte watermark budget: an approximate byte budget the host sets so
     /// ring-only "unlimited" retention still reports memory pressure
     /// ([`Grid::ring_watermark_level`]). `None` (default) = no watermark,

@@ -112,24 +112,27 @@ fn client(inst: &Instance, args: &[&str]) -> Command {
     cmd
 }
 
-/// One bounded `aterm ctl --sock <sock> <args…>`, `input` on its stdin.
+/// One bounded `aterm ctl --sock <sock> <args…>`, `input` on its stdin. Asked again
+/// while the instance has not yet accepted ([`headless_boot::until_accepted`]).
 fn ctl_in(inst: &Instance, args: &[&str], input: Option<&[u8]>) -> Output {
-    let mut cmd = client(inst, args);
-    if input.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    if let Some(input) = input {
-        // Written and closed in one statement: the client reads its stdin to the end.
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(input)
-            .expect("write stdin");
-    }
-    child_output::wait_and_read(child, Instant::now() + CLIENT_DEADLINE)
-        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    headless_boot::until_accepted(|| {
+        let mut cmd = client(inst, args);
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        if let Some(input) = input {
+            // Written and closed in one statement: the client reads its stdin to the end.
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(input)
+                .expect("write stdin");
+        }
+        child_output::wait_and_read(child, Instant::now() + CLIENT_DEADLINE)
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    })
 }
 
 fn ctl(inst: &Instance, args: &[&str]) -> Output {

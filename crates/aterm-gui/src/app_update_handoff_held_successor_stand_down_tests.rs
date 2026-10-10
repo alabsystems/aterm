@@ -170,11 +170,22 @@ fn reads_eof(stream: &aterm_uds::CtlStream) -> bool {
 /// back the trial launch.
 #[test]
 fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
-    let Some((held, child, stream)) = hold("sleep 0.2") else {
+    // The stand-in exits when its stdin closes, which the hook below does once the
+    // stand-down has revoked and found it still running: it is FORCED to exit
+    // inside the grace, with no count of milliseconds for the exit watch to beat
+    // (a `sleep 0.2` stand-in could be gone before `CandidateExitWatch::watch`
+    // attached to it on a loaded machine).
+    let Some((held, mut child, stream)) =
+        hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped())
+    else {
         return;
     };
+    let mut stdin = Some(child.stdin.take().expect("piped stdin"));
     let reaper = reap_in_background(child);
-    let stood = super::stand_down_held_successor(held, aterm_spec::wait::MUST_HAPPEN);
+    let stood =
+        super::stand_down_held_successor_between(held, aterm_spec::wait::MUST_HAPPEN, &mut || {
+            drop(stdin.take());
+        });
     assert!(!stood.signalled, "an EOF exit needs no kill");
     assert_eq!(stood.warrant, HandoffRollbackWarrant::Vanished);
     assert_eq!(

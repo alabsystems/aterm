@@ -30,25 +30,45 @@
 //!    O4). The one operation covers all four flavors — `task_for_pid`,
 //!    `task_read_for_pid`, `task_inspect_for_pid` and `task_name_for_pid` — and
 //!    a contained process's own children too (measured on macOS 26.6).
-//!    **`(deny mach-lookup …)`** over [`DENIED_LAUNCH_BROKERS`]: under
-//!    `(allow default)` every mach service is reachable, and Launch Services
-//!    (`open`), the Apple Events daemon and the `ServiceManagement` daemon
-//!    (`com.apple.xpc.smd`, behind `SMAppService`/`SMJobBless`) start, drive or
-//!    register code OUTSIDE the sandbox for whoever asks — a contained process
-//!    could hand itself to them (the `ServiceManagement` path registers a login
-//!    item or launch daemon, the broker route to the same plant the write
-//!    confinement blocks on `~/Library/LaunchAgents`). With these names denied
-//!    each lookup fails (`kr` 1100), measured with no UI on macOS 26.6, while
-//!    git, python3, targo, make, clang/xcrun, `security`, an interactive zsh
-//!    and ad-hoc `codesign` then exec behave exactly as before (the Launch
-//!    Services database and trust-cache names stay allowed: codesign uses
-//!    them). `launchctl submit` from inside the profile is already refused by
-//!    launchd (measured). This list is a denylist, so any other mach service
-//!    that works for its caller outside the sandbox stays reachable; the
-//!    root-cause fix, a deny-by-default `mach-lookup` with an allowlist measured
-//!    against the shell-compat proofs, is the open P1 follow-up in
-//!    `docs/HARDCORE_BACKLOG.md` (recorded 2026-10-09). Until it lands, a broker
-//!    found in the meantime is evidence for that allowlist, not a new row here.
+//!    **`(deny mach-lookup)`, then `(allow mach-lookup …)` for
+//!    [`MACH_LOOKUP_ALLOWLIST`] alone** — deny by default (since 2026-10-09). A
+//!    mach service is a daemon outside the sandbox that does work for whoever
+//!    looks it up, and the file and network rules cannot see that work: Launch
+//!    Services and the Apple Events daemon start or drive a process that does
+//!    not inherit the sandbox (`open`, `osascript`), the `ServiceManagement`
+//!    daemon registers a login item, the preferences daemon writes
+//!    `~/Library/Preferences`, the background-task agent edits login items, the
+//!    pasteboard hands data to every other app. Under `(allow default)` all of
+//!    them were reachable, and a denylist of the ones found left the rest open
+//!    by construction, so every lookup is refused (`kr` 1100), the XPC services
+//!    bundled in frameworks included, except the two directory queries a shell
+//!    needs to name its user and groups. Measured on macOS 26.6 with every
+//!    lookup refused (the per-tool table is the P1 entry in
+//!    `docs/HARDCORE_BACKLOG.md`): a `/bin/sh` pipeline, an interactive and a
+//!    login zsh with the user's rc files, bash, git (a `file://` clone too),
+//!    python3 (`ssl`, `socket.getaddrinfo("localhost")`), targo, trustc and a
+//!    `targo` build, make, xcrun and clang, ad-hoc `codesign` then exec, and
+//!    `dscacheutil` all still work; the only loss is the user and group names,
+//!    which the list restores. Refused on purpose, with what degrades: the
+//!    security daemon (`security` lists no keychain certificate; the system
+//!    roots stay readable as `/etc/ssl/cert.pem`), the pasteboard (`pbcopy` and
+//!    `pbpaste` fail), Spotlight (`mdfind` finds nothing), the preferences
+//!    daemon (`defaults read` still reads the plist files; nothing writes),
+//!    `notifyd`, `logd` and `diagnosticd` (a contained program's `os_log`
+//!    messages are dropped), `trustd`, `configd` and every GUI service. Each
+//!    refusal is reported in the unified log (`log stream --predicate 'sender ==
+//!    "Sandbox"'` prints `<program>(<pid>) deny(1) mach-lookup <name>`).
+//!    launchd itself is reached through the bootstrap port, not by a lookup, so
+//!    this rule does not cover it, and what a contained process may ask of it
+//!    is launchd's own policy; the posture therefore claims "no mach service
+//!    lookup", not "no system service". Measured on macOS 26.6: launchd refuses
+//!    `launchctl bootstrap` and `submit` from inside the profile, and refuses
+//!    the domain environment (`unsetenv`), the legacy `list`, `start` and
+//!    `stop` to any sandboxed caller, an `(allow default)` one included, while
+//!    it answers the reads (`print`, `print-disabled`, `blame`, `getenv`). The
+//!    verbs that act on a real user job (`kickstart`, `bootout`,
+//!    `enable`/`disable`, `setenv`) are unmeasured: the dated follow-up in the
+//!    P1 entry.
 //! 3. **WRITE confinement** (`TmpOnly` only) — [`PREFERENCE_WRITE_DENY`] (the
 //!    preferences daemon writes `~/Library/Preferences` for its caller and
 //!    consults that operation, not the file rules), then `(deny file-write*)`
@@ -105,43 +125,70 @@ use std::path::{Path, PathBuf};
 /// than silently resolved to something else.
 pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
-/// The base SBPL profile — rules 1 and 2, and the whole profile when `$HOME` is
-/// unset/empty.
-///
-/// `(allow default)` keeps the shell working; `(deny network*)` removes all
-/// network access; the task-port pair refuses every task port but the caller's
-/// own; the `mach-lookup` deny keeps the launch brokers ([`DENIED_LAUNCH_BROKERS`])
-/// from starting code outside the sandbox. None of it names a path, so it is
-/// emitted even with no resolvable home to scope secrets under (we emit NO file
-/// denies rather than deny bogus paths). The full Containment profile
-/// ([`profile_for_home`]) is this PLUS the write confinement and the
-/// secret/private-set file denies.
-pub const BASE_PROFILE: &str = "(version 1)(allow default)(deny network*)\
-(deny mach-priv-task-port)(allow mach-priv-task-port (target self))\
-(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\")\
-(global-name \"com.apple.lsd.open\")(global-name \"com.apple.lsd.openurl\")\
-(global-name \"com.apple.coreservices.appleevents\")\
-(global-name \"com.apple.xpc.smd\"))";
+/// Defines [`MACH_LOOKUP_ALLOWLIST`] and [`BASE_PROFILE`] from one list of
+/// global names, so the names the profile allows and the names its proofs read
+/// are the same list by construction.
+macro_rules! base_profile_allowing {
+    ($($name:literal,)+) => {
+        /// The only global mach service names a contained process may look up;
+        /// [`BASE_PROFILE`] refuses every other (`kr` 1100). Each is a read-only
+        /// directory QUERY answered by `opendirectoryd`: who a uid or gid is,
+        /// which groups a user is in. Neither changes anything for its caller —
+        /// no launch, no registration, no preference, keychain or file write (a
+        /// directory change goes through `com.apple.system.opendirectoryd.api`,
+        /// which stays refused) — and neither resolves a host name through DNS
+        /// for it (`dscacheutil -q host -a name example.com` resolves nothing
+        /// under the profile, measured 2026-10-09), so neither reopens the
+        /// network the profile denies.
+        ///
+        /// - `com.apple.system.opendirectoryd.libinfo` — `getpwuid`, `getpwnam`,
+        ///   `getgrgid`, `getgrouplist` for an account outside `/etc/passwd`, as
+        ///   every macOS user is. Without it `whoami` prints `501`, `id` and
+        ///   `ls -l` print numbers, zsh's `%n` is empty, python's `pwd` cannot
+        ///   find the user and `os.getgrouplist` returns one group.
+        /// - `com.apple.system.opendirectoryd.membership` — group membership and
+        ///   the uid/gid ↔ UUID map: `mbr_check_membership` (whether the user is
+        ///   in a group, such as `admin`), and the names in a file's ACL. Without
+        ///   it every such check errors (`dsmemberutil`: memberd is not
+        ///   reachable) and `ls -le` prints raw UUIDs. git, python3, make, xcrun
+        ///   and clang each look it up.
+        ///
+        /// A name joins only with a measurement that a normal shell or a
+        /// common tool fails without it, and a reason here that the daemon
+        /// behind it acts for nobody. The launch brokers are refused because
+        /// they are absent: `actuator`'s `enforcement_proof_launch_brokers_denied`
+        /// asks bootstrap for each, `enforcement_proof_mach_lookup_denied_by_default`
+        /// for a sample of other daemons that act for their caller and for
+        /// every name here, and `shell_compat_tool_set_runs_under_containment`
+        /// runs the tool set the list was measured on.
+        pub const MACH_LOOKUP_ALLOWLIST: &[&str] = &[$($name,)+];
 
-/// The launch brokers [`BASE_PROFILE`] denies a contained process a port to:
-/// The Launch Services daemon and its open/open-URL endpoints, the Apple Events
-/// daemon, and the `ServiceManagement` daemon (`com.apple.xpc.smd`) behind
-/// `SMAppService`/`SMJobBless` — the API an app hands a plist to register a
-/// login item or launch daemon, which runs OUTSIDE the caller's sandbox and
-/// survives it. That is the same plant the write confinement blocks on the
-/// filesystem (`~/Library/LaunchAgents`), reached through a broker instead, so
-/// the two must agree; `launchservicesd` et al. start or drive a process that
-/// likewise does not inherit the sandbox. The proof
-/// (`actuator::tests::enforcement_proof_launch_brokers_denied`) asks bootstrap
-/// for each of these under the real profile, so a name listed here but missing
-/// from the profile fails it.
-pub const DENIED_LAUNCH_BROKERS: &[&str] = &[
-    "com.apple.coreservices.launchservicesd",
-    "com.apple.lsd.open",
-    "com.apple.lsd.openurl",
-    "com.apple.coreservices.appleevents",
-    "com.apple.xpc.smd",
-];
+        /// The base SBPL profile — rules 1 and 2, and the whole profile when
+        /// `$HOME` is unset/empty.
+        ///
+        /// `(allow default)` keeps the shell working; `(deny network*)` removes
+        /// all network access; the task-port pair refuses every task port but
+        /// the caller's own; `(deny mach-lookup)` refuses every mach service but
+        /// [`MACH_LOOKUP_ALLOWLIST`], so no daemon outside the sandbox works for
+        /// the contained process. None of it names a path, so it is emitted
+        /// even with no resolvable home to scope secrets under (we emit NO file
+        /// denies rather than deny bogus paths). The full Containment profile
+        /// ([`profile_for_home`]) is this PLUS the write confinement and the
+        /// secret/private-set file denies.
+        pub const BASE_PROFILE: &str = concat!(
+            "(version 1)(allow default)(deny network*)",
+            "(deny mach-priv-task-port)(allow mach-priv-task-port (target self))",
+            "(deny mach-lookup)(allow mach-lookup",
+            $(" (global-name \"", $name, "\")",)+
+            ")",
+        );
+    };
+}
+
+base_profile_allowing!(
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+);
 
 /// The canonical roots a Containment ([`FsCapability::TmpOnly`]) shell may still
 /// WRITE under, as `subpath`s, whoever the user is. Canonical on purpose — `/tmp`

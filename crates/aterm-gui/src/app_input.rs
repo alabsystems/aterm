@@ -2490,6 +2490,13 @@ struct PressClass<'ev> {
     /// A keyed Enter for the armed celebration (`kitty_sing`): the Enter key, or raw
     /// controller bytes ending in a newline. Program output never reaches this path.
     keyed_enter: bool,
+    /// The press writes a line terminator and nothing that could erase or move the
+    /// text typed before it: Enter bare, ⇧ or ⌃ (CR or LF; ⌥ prefixes ESC, and a
+    /// Super chord is the window's), ⌃J / ⌃M, or controller bytes that are text
+    /// ending in one (`aterm_predict::is_line_submit`). The one boundary across
+    /// which the predictor keeps a proven line's in-flight guesses on glass
+    /// (`Predictor::note_line_submit`); every other press retires them.
+    line_terminator: bool,
     /// Any Tab press (joins the typed-hint disarm set).
     tab_key: bool,
     /// A bare Tab (no Shift, Control, Alt or Super): the completion the hand asked
@@ -2894,6 +2901,15 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
             ev,
             InputEvent::KeySequence(bytes) if bytes.last().is_some_and(|b| matches!(b, b'\r' | b'\n'))
         );
+    let line_terminator = matches!(
+        ev,
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Enter),
+            mods,
+            ..
+        } if !mods.intersects(TMods::ALT | TMods::SUPER)
+    ) || ctrl_chord(&['j', 'm'])
+        || matches!(ev, InputEvent::KeySequence(bytes) if aterm_predict::is_line_submit(bytes));
     let mut typed: Option<char> = None;
     let mut backspace = false;
     let mut brk = false;
@@ -3012,6 +3028,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         redraw_chord,
         enter_like,
         keyed_enter,
+        line_terminator,
         tab_key,
         insert_tab,
         paste_chord_key,
@@ -4775,6 +4792,7 @@ impl App {
                     redraw_chord,
                     enter_like,
                     keyed_enter,
+                    line_terminator,
                     tab_key,
                     insert_tab,
                     paste_chord_key,
@@ -4974,8 +4992,13 @@ impl App {
                             // encoder-feeding reader of the keyboard mode.
                             // `rows` lets the predictor continue a guess across the right
                             // margin at `(row + 1, 0)`; a wrap off the last row declines.
+                            //
+                            // The content-coordinate generation rides with the cursor:
+                            // rows that moved since the predictor last looked (a prompt
+                            // scrolled onto the proven bottom row) end its epoch.
                             (
                                 t.cursor(),
+                                t.content_scroll_state().coordinate_generation(),
                                 (t.cols(), t.rows()),
                                 t.is_alternate_screen() || kitty_owns_keyboard,
                             )
@@ -5440,20 +5463,31 @@ impl App {
                         }
                         if typed_enter {
                             ws.fx.companions_mut().cursor_cat.on_enter(input_now);
-                            // End the predictive-echo confirmation epoch at the submit
-                            // so the next line must re-confirm. The epoch is keyed to the
-                            // physical cursor row, reused across lines at the bottom, so a
-                            // no-echo password prompt on that row would otherwise inherit
-                            // the command's confirmation and flash the secret.
+                        }
+                        // End the predictive-echo confirmation epoch at every press the
+                        // predictor was not handed as a glyph: Enter, but equally
+                        // Shift+Enter (LF), Ctrl+Enter, Ctrl+J/M, Tab, an arrow, an IME
+                        // commit. Which of them submit a line is the program's call, and
+                        // a password typed ahead of the prompt that follows any of them
+                        // sits on the proven row until the remote answers, so it must
+                        // not inherit the proof. A bare modifier writes nothing.
+                        if predict_candidate.is_none() && !inert_modifier {
                             let was_displaying = ws.predictor.is_displaying(input_now);
-                            ws.predictor.note_line_submit();
-                            // `note_line_submit` ends the epoch without flushing, so the
-                            // submitted line's guesses keep painting until the real echo
-                            // (flushing would make the command's tail vanish at Enter).
-                            // Visibility can still change (new-epoch guesses go dark), so
-                            // the redraw request delivers that transition.
-                            if prediction_visibility_requires_redraw(was_displaying, false)
-                                && let Some(w) = ws.os_window.as_ref()
+                            // A line terminator keeps a proven line's guesses painting
+                            // until the real echo (flushing would make the command's
+                            // tail vanish at Enter). Any other press retires them: it
+                            // may erase them (Ctrl+H, Ctrl+W, a remapped kill), and a
+                            // guess over an erased cell is a ghost of the erased text.
+                            if line_terminator {
+                                ws.predictor.note_line_submit();
+                            } else {
+                                ws.predictor.note_unmodelled_input();
+                            }
+                            // The redraw request delivers any visibility change.
+                            if prediction_visibility_requires_redraw(
+                                was_displaying,
+                                ws.predictor.is_displaying(input_now),
+                            ) && let Some(w) = ws.os_window.as_ref()
                             {
                                 w.request_redraw();
                             }
@@ -5502,7 +5536,7 @@ impl App {
                             }
                         }
                     }
-                    if let Some(((ch, is_backspace), (cur, (cols, rows), no_echo))) =
+                    if let Some(((ch, is_backspace), (cur, coords, (cols, rows), no_echo))) =
                         act.zip(sample)
                     {
                         // Split panes predict too: the composed render path paints the
@@ -5515,7 +5549,14 @@ impl App {
                             // wrapping `predict_char`, Backspace): a painted ghost stays in
                             // the last frame until an explicit erase redraw.
                             let was_displaying = ws.predictor.is_displaying(now);
-                            if no_echo {
+                            // A press the tty will not echo (`tty_swallows`: canonical
+                            // mode with ECHO clear — `sudo`, `read -s`, a passphrase,
+                            // `getpass` — read off the pty at this key) is never a
+                            // guess, in ANY mode: the program will not draw it, so a
+                            // ghost would be the secret itself, on glass and in every
+                            // capture of it. Positive evidence only: a raw-mode program
+                            // echoes for itself and stays eligible.
+                            if no_echo || tty_swallows {
                                 // Stale-epoch hardening: a no-echo press registers
                                 // nothing, but a confirmed epoch from before entering the
                                 // app could let the first keystroke back on that row
@@ -5528,6 +5569,7 @@ impl App {
                                     Some(c) => ws.predictor.predict_char_in_grid(
                                         c,
                                         (cur.row, cur.col),
+                                        coords,
                                         (cols, rows),
                                         now,
                                     ),
@@ -6058,6 +6100,11 @@ impl App {
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
                     ws.last_key_at = Some(now);
+                    // A paste is input the predictor did not model (and may carry the
+                    // line terminator that submits it): what is typed after it must
+                    // re-prove its echo before a guess is painted, and the guesses in
+                    // flight are retired, since its text is not vetted for erases.
+                    ws.predictor.note_unmodelled_input();
                     // The kitty-command listener sees a paste as a break: the line now
                     // holds text it never watched being typed, so it is poisoned until a
                     // reset (`echo ` pasted then `sleep␣` typed must not nap the cat). A
@@ -12316,17 +12363,17 @@ mod predictive_echo_input_gate_tests {
         {
             let predictor = &mut app.windows.get_mut(&wid).expect("window").predictor;
             predictor.set_mode(PredictMode::Adaptive);
-            assert!(predictor.predict_char('a', (0, 0), 80, now));
+            assert!(predictor.predict_char('a', (0, 0), 0, 80, now));
             let first_confirmed = now + Duration::from_millis(60);
-            predictor.reconcile(Some((0, 1)), false, first_confirmed, |row, col| {
+            predictor.reconcile(Some((0, 1)), 0, false, first_confirmed, |row, col| {
                 ((row, col) == (0, 0)).then_some('a')
             });
-            assert!(predictor.predict_char('b', (0, 1), 80, first_confirmed));
+            assert!(predictor.predict_char('b', (0, 1), 0, 80, first_confirmed));
             let second_confirmed = first_confirmed + Duration::from_millis(60);
-            predictor.reconcile(Some((0, 2)), false, second_confirmed, |row, col| {
+            predictor.reconcile(Some((0, 2)), 0, false, second_confirmed, |row, col| {
                 ((row, col) == (0, 1)).then_some('b')
             });
-            assert!(predictor.predict_char('c', (0, 2), 80, second_confirmed));
+            assert!(predictor.predict_char('c', (0, 2), 0, 80, second_confirmed));
             assert!(predictor.is_displaying(second_confirmed));
         }
         assert!(model.fire("ConfirmSlow", &mut model_state));
@@ -12452,6 +12499,14 @@ mod vi_dispatch_tests;
 #[cfg(test)]
 #[path = "app_input_typed_kitty_summon_tests.rs"]
 mod typed_kitty_summon_tests;
+
+/// Predictive echo at prompts that do not echo, end to end through the press
+/// path and the composed present: no mode paints a keystroke the program will
+/// not echo (a canonical no-echo tty, a prompt scrolled onto an echo-proven
+/// row, a password typed ahead after any submit key).
+#[cfg(test)]
+#[path = "app_input_predict_privacy_tests.rs"]
+mod predict_privacy_tests;
 
 /// Kitty commands: host wiring of the typed-line listener
 /// (`aterm_effects::typed_tricks`). The listener's own laws (purity, the phrase

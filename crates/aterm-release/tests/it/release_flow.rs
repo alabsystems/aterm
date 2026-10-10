@@ -118,6 +118,14 @@ struct World {
     /// The real backend's spawn path and interrupt, for the trust step's child: that
     /// child is `/bin/sh -c <script> sh <dir>`, run as a step's child really is.
     real: Option<(Real, String, PathBuf)>,
+    /// The build whose handoff fixtures the release cache holds staged.
+    fixtures_staged: Option<u64>,
+    /// origin/main holds the release's handoff fixtures.
+    fixtures_on_main: bool,
+    /// The in-tree generator refuses.
+    generator_refuses: bool,
+    /// The landing's push fails (not a lost race).
+    landing_fails: bool,
 }
 
 impl World {
@@ -188,6 +196,10 @@ impl World {
             after_sleep: None,
             local_tags: BTreeSet::new(),
             real: None,
+            fixtures_staged: None,
+            fixtures_on_main: false,
+            generator_refuses: false,
+            landing_fails: false,
         }
     }
 
@@ -378,6 +390,12 @@ impl Backend for World {
     }
     fn origin_tag_now(&mut self, tag: &str) -> Result<Option<String>, String> {
         self.calls.push(format!("ls-remote {tag}"));
+        // a finished cut published its version's tag, on the release commit
+        if let Some(cut) = self.cut.as_ref().filter(|cut| cut.finished)
+            && tag == format!("v{}", cut.version)
+        {
+            return Ok(Some(format!("e{}", &BUMP[1..])));
+        }
         Ok(self.origin_tags.get(tag).cloned())
     }
     fn local_tag(&mut self, tag: &str) -> bool {
@@ -467,6 +485,11 @@ impl Backend for World {
             trusted: yes(&self.trusted, "VERIFIED", &c.commit),
             built,
             measured,
+            fixtures: if self.fixtures_on_main {
+                Answer::yes(format!("v{}'s handoff fixtures are on main", c.version))
+            } else {
+                Answer::no(format!("v{}'s handoff fixtures are not on main", c.version))
+            },
         }
     }
     fn disk(&mut self) -> (Option<u64>, bool) {
@@ -490,6 +513,55 @@ impl Backend for World {
     fn fixture_guard(&mut self, _p: &Prover) -> Result<String, Refusal> {
         self.calls.push("guard".into());
         Ok("the handoff fixture guard passes (3 test(s))".into())
+    }
+    fn stage_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        _p: &Prover,
+    ) -> Result<String, Refusal> {
+        if self.fixtures_staged == Some(reserved.build) {
+            return Ok(format!("v{}'s handoff fixtures staged already", c.version));
+        }
+        self.calls.push("stage-fixtures".into());
+        if self.generator_refuses {
+            return Err(Refusal::new(
+                "the release's handoff fixture generator refuses: 1 test(s) failed: \
+                 seamless::carry_tests::fixture_generator::generate_handoff_fixtures",
+                "fix it on main",
+            ));
+        }
+        self.fixtures_staged = Some(reserved.build);
+        Ok(format!(
+            "v{}'s handoff fixtures written by its own producer for build {}",
+            c.version, reserved.build
+        ))
+    }
+    fn land_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        p: &Prover,
+    ) -> Result<String, Refusal> {
+        self.calls.push("land-fixtures".into());
+        if self.fixtures_on_main {
+            return Ok(format!(
+                "v{}'s handoff fixtures are on main already",
+                c.version
+            ));
+        }
+        if self.fixtures_staged != Some(reserved.build) {
+            self.stage_fixtures(c, reserved, p)?;
+        }
+        if self.landing_fails {
+            return Err(Refusal::new(
+                "handoff fixtures: git push origin main failed (not a fast-forward rejection, \
+                 so retrying cannot help): remote: denied",
+                "run it again",
+            ));
+        }
+        self.fixtures_on_main = true;
+        Ok(format!("v{}'s handoff fixtures landed on main", c.version))
     }
     fn audit(&mut self, _id: &str) -> Vec<Finding> {
         self.calls.push("audit".into());
@@ -759,11 +831,13 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "build",
             "measure",
             "preflight-again",
+            "stage-fixtures",
             "stage",
             "publish",
             "sync",
             "cut --mac-only",
             "after-cut 0.6.0",
+            "land-fixtures",
         ]
     );
     for step in Step::ALL {
@@ -811,6 +885,120 @@ fn a_second_run_finds_everything_done_and_only_checks() {
         assert_eq!(w.count(never), 0, "{never}: {:?}", w.calls);
     }
     assert!(!w.calls.iter().any(|c| c.starts_with("cut")));
+}
+
+// (a') the release's own handoff fixtures ---------------------------------------------
+
+/// A generator that refuses refuses the release at the strict preflight: before the
+/// stage, the publish and the cut's claim, so nothing is public and no number burned.
+#[test]
+fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
+    let mut w = World::new();
+    w.generator_refuses = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{:#?}", w.out);
+    assert!(
+        last.starts_with(
+            "REFUSED at 9/14 preflight: the release's handoff fixture generator refuses"
+        ),
+        "{last}"
+    );
+    assert!(last.contains("nothing public"), "{last}");
+    for call in ["stage", "publish", "land-fixtures"] {
+        assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
+    }
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("cut ")),
+        "{:?}",
+        w.calls
+    );
+    assert!(w.cut.is_none(), "nothing claimed");
+
+    // fixed on main: the same reservation is staged and the release goes on
+    w.generator_refuses = false;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("stage-fixtures"), 1, "{:?}", w.calls);
+    assert_eq!(w.count("reserve"), 0, "{:?}", w.calls);
+    assert!(w.fixtures_on_main);
+}
+
+/// Fixtures staged and not landed (the landing's push failed after the cut) are landed
+/// by the next run, from the staging: the release's shape is not checked again and
+/// nothing is generated again.
+#[test]
+fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
+    let mut w = World::new();
+    w.landing_fails = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{:#?}", w.out);
+    assert!(
+        last.starts_with(
+            "REFUSED at 13/14 after-cut: handoff fixtures: git push origin main failed"
+        ),
+        "{last}"
+    );
+    assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
+    assert!(
+        w.journal().unwrap().has("after-cut"),
+        "the shape half is done"
+    );
+    assert!(!w.fixtures_on_main);
+
+    w.landing_fails = false;
+    w.calls.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(
+        (
+            w.count("land-fixtures"),
+            w.count("stage-fixtures"),
+            w.count("after-cut 0.6.0")
+        ),
+        (1, 0, 0),
+        "{:?}",
+        w.calls
+    );
+    assert!(w.fixtures_on_main);
+    assert!(
+        w.step_line(Step::AfterCut)
+            .contains("v0.6.0's handoff fixtures landed on main"),
+        "{:#?}",
+        w.out
+    );
+}
+
+/// Fixtures already on main (landed by an earlier run, or by hand) are left alone: no
+/// staging, no landing, and step 13 skips once its shape half is done too.
+#[test]
+fn fixtures_already_on_main_are_left_alone() {
+    let mut w = World::new();
+    w.fixtures_on_main = true;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        (w.count("stage-fixtures"), w.count("land-fixtures")),
+        (0, 0),
+        "{:?}",
+        w.calls
+    );
+    assert!(
+        w.step_line(Step::Preflight)
+            .contains("v0.6.0's handoff fixtures are on main"),
+        "{:#?}",
+        w.out
+    );
+    w.calls.clear();
+    let (code, _) = w.run(mac());
+    assert_eq!(code, 0);
+    assert!(
+        w.step_line(Step::AfterCut).contains(" skip "),
+        "{:#?}",
+        w.out
+    );
+    assert_eq!(w.count("land-fixtures"), 0, "{:?}", w.calls);
 }
 
 // (b) resume after a stop at each step --------------------------------------------
@@ -1032,7 +1220,16 @@ fn a_dry_run_plans_every_step_says_every_refusal_and_changes_nothing() {
     assert!(w.journal().is_none(), "a dry run writes no journal");
     assert!(!w.release_dir().join(RUNNING_FILE).exists());
     let mutating = [
-        "sync", "bump", "trust", "lock", "measure", "stage", "publish", "guard",
+        "sync",
+        "bump",
+        "trust",
+        "lock",
+        "measure",
+        "stage",
+        "publish",
+        "guard",
+        "stage-fixtures",
+        "land-fixtures",
     ];
     for call in mutating {
         assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
@@ -1048,6 +1245,20 @@ fn a_dry_run_plans_every_step_says_every_refusal_and_changes_nothing() {
     let (code, last) = w.run(dry);
     assert_eq!(code, 0, "{last}");
     assert!(last.contains("a real run would go ahead, about "), "{last}");
+    // and plans the release's own handoff fixtures: written before the claim, landed
+    // after the cut
+    assert!(
+        w.step_line(Step::Preflight)
+            .contains("would write v0.6.0's handoff fixtures for the build step 7 reserves"),
+        "{:#?}",
+        w.out
+    );
+    assert!(
+        w.step_line(Step::AfterCut)
+            .contains("would land v0.6.0's handoff fixtures, staged before the claim, on main"),
+        "{:#?}",
+        w.out
+    );
 }
 
 #[test]

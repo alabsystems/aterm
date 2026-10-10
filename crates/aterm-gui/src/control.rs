@@ -161,9 +161,10 @@ pub(crate) use control_media::{IdentitySpec, SpawnAim, resolve_spawn_identity};
 // `super::image_payload`, which now resolves to this sibling module's serializer.
 pub(crate) use control_media::image_payload;
 
-/// The handshake's `ERR auth` audit line, thinned per refusal kind.
+/// The handshake's `ERR auth` audit line, thinned per refusal kind; and the
+/// network drive's refusals (`crate::net_listen`), thinned by the same rule.
 #[path = "control_denials.rs"]
-mod control_denials;
+pub(crate) mod control_denials;
 /// Session-graph and capability verbs (`sessions`/`family`/`ready`/`cast`/
 /// `edges`/`grant`/`revoke`/`whoami`), dispatched as `control_session::cmd_*`
 /// from [`handle`]. The file is `src/control_session.rs`.

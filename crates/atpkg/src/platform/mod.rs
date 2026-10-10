@@ -62,6 +62,52 @@ pub(crate) fn create_private_new(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Create the ONE directory `dir`, exclusively (an existing entry of that name fails
+/// [`io::ErrorKind::AlreadyExists`], so the directory is provably this call's), born no
+/// wider than `mode` and then given exactly `mode`, whatever the umask.
+///
+/// `mkdir(2)` with `mode` is masked by the umask, which can only narrow it: the
+/// directory is never wider than `mode` at any instant, so nobody else can reach into it
+/// between its birth and the `chmod`. The `chmod` then gives back what a strict umask
+/// took (a `077` umask would leave a store directory `0700`, which every other user of a
+/// system prefix must traverse). A plain `create_dir_all` is born `0777 & ~umask`:
+/// world-writable under umask `000`, group-writable under `002` (AT3, 2026-10-10).
+/// Windows has no mode to ask for; the per-user profile ACL covers it.
+pub(crate) fn make_dir_born(dir: &Path, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), mode)
+            .create(dir)?;
+        set_mode(dir, mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir(dir)
+    }
+}
+
+/// [`make_dir_born`] for `dir` and every missing ancestor, top down: a component that is
+/// already a directory (followed through a link, as `create_dir_all` follows it) is left
+/// exactly as it is, mode and `st_ctime` included, and every component this call makes
+/// is born no wider than `mode` and ends at exactly `mode`. The store's own directories
+/// on the way to a build (`store/`, `store/<program>/`) and to a download
+/// (`staging/`, `staging/<program>/`) are made by this, never by the umask.
+pub(crate) fn make_dirs_born(dir: &Path, mode: u32) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        make_dirs_born(parent, mode)?;
+    }
+    match make_dir_born(dir, mode) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        made => made,
+    }
+}
+
 /// Make one open file or directory DURABLE: the barrier an atomic publish takes on its
 /// temp before the rename, and [`crate::store::sync_dir`] on the directory after it. The
 /// crate's one call of [`std::fs::File::sync_all`], which on Apple targets is

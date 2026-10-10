@@ -708,6 +708,7 @@ impl Grid {
 
         // Enter the reflow window after the resize, so the resize runs as the
         // plain path; until re-attach, scroll-off is staged to the lazy buffer.
+        self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         // Ruling 238: the window opens with no reader aim.
@@ -749,6 +750,7 @@ impl Grid {
         // The reflow window is over: stop staging scroll-off as "detached" — the
         // store (old or freshly attached below) is authoritative again.
         self.storage.scrollback_detached_for_reflow = false;
+        self.close_reflow_window_cap_run();
         // Where the reader asked to go while the history was away, and the row
         // counter the aim's growth is measured against, sampled before this
         // re-attach moves any line. Applied only on the normal branch (an erase
@@ -917,6 +919,7 @@ impl Grid {
         // This window's gesture baseline, sampled like the first detach's. The
         // clamp above does not advance the generation.
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
+        self.close_reflow_window_cap_run();
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         self.storage.detached_reader_aim = None;
@@ -1148,6 +1151,7 @@ impl Grid {
             return;
         }
         self.storage.scrollback_detached_for_reflow = false;
+        self.close_reflow_window_cap_run();
         // The job (and the history a deficit fill would have pulled) is lost:
         // drop the fill debt and the reader's aim with it.
         self.storage.pending_fill_target = None;

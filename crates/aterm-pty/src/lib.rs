@@ -99,6 +99,38 @@ fn build_child_env(
     env_pairs
 }
 
+/// The refusal of a spawn whose argument `index` of `list` holds a NUL byte
+/// (`index` counts from 0 in the list as the caller gave it, so in a whole
+/// command 0 is the program). A program's arguments are C strings on Unix and
+/// one NUL-terminated command line on Windows, so such an argument cannot reach
+/// the program whole; dropping or cutting it would hand the program a different
+/// command (every later argument shifted, or gone), so nothing is spawned.
+/// Shared by both platform spawns.
+pub(crate) fn argv_nul_refusal(list: &str, index: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "argument {index} of {list} holds a NUL byte, which no program can be handed: not \
+             started, since leaving it out would shift every argument after it"
+        ),
+    )
+}
+
+/// The refusal of a spawn whose program, `what` (the configured shell, with
+/// where it was set), holds a NUL byte. A file name cannot hold one, and the OS
+/// reads the name only up to it, so the spawn would run a different program:
+/// the part before the NUL, or a fallback shell. Nothing is spawned instead.
+/// Shared by both platform spawns.
+pub(crate) fn program_nul_refusal(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{what} holds a NUL byte, which no file name can hold: not started, since running \
+             it would start a different program"
+        ),
+    )
+}
+
 /// What the line discipline will do with the NEXT byte typed into a PTY —
 /// the two `c_lflag` bits that decide whether a keypress is the kernel's to
 /// echo, and the characters `ISIG` turns into signals ([`TtySignals`]), read

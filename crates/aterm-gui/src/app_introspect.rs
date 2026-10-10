@@ -11499,17 +11499,22 @@ mod terminal_split_capture_tests {
         let right_rect = rects.iter().find(|rect| rect.session == right).unwrap();
         let left_term = app.pool.get(0).unwrap().term.clone();
         let left_epoch = term_lock(&left_term).damage_epoch();
+        let left_coords = term_lock(&left_term)
+            .content_scroll_state()
+            .coordinate_generation();
         let predictor_now = Instant::now();
         let predictor_deadline = {
             let window = app.windows.get_mut(&wid).unwrap();
             window
                 .predictor
                 .set_mode(crate::predict::PredictMode::Always);
-            assert!(
-                window
-                    .predictor
-                    .predict_char('?', (0, 0), window.cols, predictor_now)
-            );
+            assert!(window.predictor.predict_char(
+                '?',
+                (0, 0),
+                left_coords,
+                window.cols,
+                predictor_now
+            ));
             window.predictor.next_deadline()
         };
 

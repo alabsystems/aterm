@@ -1031,11 +1031,15 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
         "{:?}",
         row.stall_words(later)
     );
-    // Negative control: the weekly row names its reset.
+    // Negative control: the weekly row names its reset. ONE clock reading names it
+    // in the row and in the check below: the first visit above can take seconds on
+    // a loaded machine (3 s seen, 2026-10-09), and a reset read from `now` at the
+    // top of the test would then differ from the row's by that long.
+    let reset = 1_791_046_800_u64.max(now_s() + 86_400);
     let weekly = format!(
         "{}\n{}\n",
         tasked_at(now),
-        limit_row(&ts(row_at), OWNERS_SESSION)
+        limit_row_until(&ts(row_at), OWNERS_SESSION, reset)
     );
     let visited = visit_at(
         "lim-weekly",
@@ -1047,7 +1051,6 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
         usize::MAX,
     );
     let saved = visited.saved.expect("saved");
-    let reset = 1_791_046_800_u64.max(now + 86_400);
     assert!(saved.limit_until.abs_diff(reset) <= 2, "{saved:?}");
     let row = view("lim-weekly-view", &saved);
     assert!(row.limit_passed(saved.limit_until + LIMIT_GRACE_S));

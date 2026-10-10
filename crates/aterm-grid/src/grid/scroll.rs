@@ -591,6 +591,11 @@ impl Grid {
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
     }
 
+    /// The staging cap of the detached-reflow window: past it the oldest
+    /// staged window output is dropped. Generous: normal windows finish in
+    /// well under a second; only heavy streaming through a long window hits it.
+    const DETACHED_LAZY_CAP: usize = 50_000;
+
     /// Bound the lazy buffer while the tiered store is detached for an
     /// off-thread reflow. Normally [`drain_lazy_buffer`](Self::drain_lazy_buffer)
     /// moves staged lines into the store, but during the reflow window the store
@@ -599,20 +604,44 @@ impl Grid {
     /// cap. With the store in the job, it cannot be known which of those lines
     /// the scrollback limit would have kept, so every one is counted and marked
     /// as a cut.
+    ///
+    /// Logged per WINDOW, not per drop: once at the cap, a stream drops one
+    /// line for every line it prints, on the PTY reader under the terminal
+    /// lock, so a line per drop let one resize during a flood roll
+    /// `aterm.log` over in under a second, audit lines and all. The window's
+    /// first drop is written here and its total when it closes
+    /// ([`close_reflow_window_cap_run`](Self::close_reflow_window_cap_run)).
     fn bound_detached_lazy_buffer(&mut self) {
-        // Generous cap for the transient reflow window: normal windows finish in
-        // well under a second; only heavy streaming through a long window hits it.
-        const DETACHED_LAZY_CAP: usize = 50_000;
         let len = self.storage.lazy_buffer.len();
-        if len > DETACHED_LAZY_CAP {
-            let drop_n = len - DETACHED_LAZY_CAP;
+        if len > Self::DETACHED_LAZY_CAP {
+            let drop_n = len - Self::DETACHED_LAZY_CAP;
             // Real retention loss: counted, and marked in place by the buffer's
             // flood cut; the re-attach flush drains the marker ahead of the
             // survivors, so the history shows the hole where it is.
             self.storage.flood_truncated_lines += self.storage.lazy_buffer.drop_oldest(drop_n);
+            let before = self.storage.reflow_window_cap_dropped;
+            self.storage.reflow_window_cap_dropped =
+                before.saturating_add(u64::try_from(drop_n).unwrap_or(u64::MAX));
+            if before == 0 {
+                aterm_log::warn!(
+                    "reflow window: lazy buffer exceeded {} lines; dropping the oldest \
+                     staged line(s) to bound memory until the window closes",
+                    Self::DETACHED_LAZY_CAP
+                );
+            }
+        }
+    }
+
+    /// Close the current detach window's cap run: write how many staged lines
+    /// the cap dropped in it, if any, and zero the count for the next window.
+    /// Called wherever a detach window ends (re-attach, abort) and opens.
+    pub(crate) fn close_reflow_window_cap_run(&mut self) {
+        let dropped = std::mem::take(&mut self.storage.reflow_window_cap_dropped);
+        if dropped > 0 {
             aterm_log::warn!(
-                "reflow window: lazy buffer exceeded {DETACHED_LAZY_CAP} lines; \
-                 dropped {drop_n} oldest staged line(s) to bound memory"
+                "reflow window: closed after dropping {dropped} staged line(s) past its \
+                 {}-line cap",
+                Self::DETACHED_LAZY_CAP
             );
         }
     }

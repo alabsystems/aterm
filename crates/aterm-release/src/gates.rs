@@ -2711,7 +2711,7 @@ pub fn handoff_fixture_gate_at(
 /// `clean_tree` has already proved equal to its HEAD, or a commit's objects
 /// (`ship check`, [`precheck`]). The handoff-fixture and changelog gates read
 /// through it, so the cut and the check judge the same bytes by one rule.
-enum GateTree<'a> {
+pub(crate) enum GateTree<'a> {
     Dir(&'a Path),
     Commit {
         git: &'a dyn GitRunner,
@@ -2721,7 +2721,7 @@ enum GateTree<'a> {
 
 impl GateTree<'_> {
     /// The text of the tracked file `path`.
-    fn text(&self, path: &str) -> Result<String> {
+    pub(crate) fn text(&self, path: &str) -> Result<String> {
         match self {
             GateTree::Dir(repo) => {
                 let full = repo.join(path);
@@ -2738,7 +2738,7 @@ impl GateTree<'_> {
 
     /// The directories directly under `dir` that hold a `parent.toml`, sorted;
     /// `None` when `dir` does not exist.
-    fn desks(&self, dir: &str) -> Result<Option<Vec<String>>> {
+    pub(crate) fn desks(&self, dir: &str) -> Result<Option<Vec<String>>> {
         match self {
             GateTree::Dir(repo) => {
                 let entries = match fs::read_dir(repo.join(dir)) {
@@ -2885,7 +2885,7 @@ pub fn predecessor_release(
 /// the two halves the guard needs — desks it can discover and run, and a pinned
 /// row, without which losing the directory again would leave the guard green
 /// while it checks less. `tree` is the cut tree on disk or a commit's objects.
-fn handoff_fixtures_of(tree: &GateTree<'_>, release: &str) -> Result<HandoffFixtures> {
+pub(crate) fn handoff_fixtures_of(tree: &GateTree<'_>, release: &str) -> Result<HandoffFixtures> {
     let rel_dir = format!("{HANDOFF_FIXTURE_ROOT}/v{release}");
     let Some(desks) = tree.desks(&rel_dir)? else {
         return Err(handoff_refusal(
@@ -2954,7 +2954,7 @@ fn handoff_fixtures_of(tree: &GateTree<'_>, release: &str) -> Result<HandoffFixt
 /// The `(release, desk)` rows of the guard's `PINNED_DESKS` table, read from
 /// its source. A table this gate cannot find or cannot pair up is an error
 /// rather than "no rows": a renamed constant must stop the cut, not pass it.
-fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
     let unreadable = |why: &str| {
         Error::new(format!(
             "handoff-fixture gate: cannot read the PINNED_DESKS table in \
@@ -2989,18 +2989,18 @@ fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
 /// One row of the guard's required desk set: `desk` is required of every
 /// release from `from` on.
 #[derive(Debug, PartialEq, Eq)]
-struct RequiredDesk {
+pub(crate) struct RequiredDesk {
     /// The first release held to it, as the ledger spells a version
     /// (`0.97.0`, the guard's `v` dropped).
-    from: String,
-    desk: String,
+    pub(crate) from: String,
+    pub(crate) desk: String,
 }
 
 /// The guard's `REQUIRED_DESKS` table — `("vX.Y.Z", "<desk>")` rows, each desk
 /// with its own floor — read from its source like [`pinned_desks`] and failing
 /// closed like it: a renamed constant, an unpaired row, an empty table, or a
 /// floor that is not a version, stops the cut.
-fn required_desks(guard: &str) -> Result<Vec<RequiredDesk>> {
+pub(crate) fn required_desks(guard: &str) -> Result<Vec<RequiredDesk>> {
     let unreadable = |why: &str| {
         Error::new(format!(
             "handoff-fixture gate: cannot read the required desk set in \
@@ -3062,7 +3062,7 @@ fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
 
 /// Whether `release` is `floor` or later. A release the ledger records that
 /// is not `X.Y.Z` stops the cut rather than slipping under the floor.
-fn release_at_least(release: &str, floor: &str) -> Result<bool> {
+pub(crate) fn release_at_least(release: &str, floor: &str) -> Result<bool> {
     match (version_triple(release), version_triple(floor)) {
         (Some(release), Some(floor)) => Ok(release >= floor),
         _ => Err(Error::new(format!(
@@ -3122,13 +3122,7 @@ pub(crate) fn handoff_fixture_guard_with(
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
 ) -> Result<usize> {
     let target = tree.join(HANDOFF_FIXTURE_GUARD_TARGET);
-    let clear = |target: &Path| match fs::symlink_metadata(target) {
-        Ok(meta) if meta.is_dir() => fs::remove_dir_all(target),
-        Ok(_) => fs::remove_file(target),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    };
-    clear(&target).map_err(|e| {
+    clear_path(&target).map_err(|e| {
         Error::new(format!(
             "handoff fixture guard: cannot clear its target directory {}: {e}",
             target.display()
@@ -3138,32 +3132,11 @@ pub(crate) fn handoff_fixture_guard_with(
         "==> handoff fixture guard: every shipped producer's desks through this build's \
          consumer (targo --unverified test -p aterm-gui --lib -- {HANDOFF_FIXTURE_GUARD_FILTER})"
     );
-    let mut command = Command::new(targo);
-    command
-        .args([
-            "--unverified",
-            "test",
-            "-p",
-            "aterm-gui",
-            "--lib",
-            "--target-dir",
-        ])
-        .arg(&target)
-        .args(["--", HANDOFF_FIXTURE_GUARD_FILTER])
-        .current_dir(tree)
-        .env_remove("RUSTFLAGS")
-        .env_remove("RUSTDOCFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("RUSTC")
-        .env_remove("RUSTC_BOOTSTRAP")
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET")
-        .stdin(std::process::Stdio::null());
+    let mut command = aterm_gui_lib_test(targo, tree, &target, &[HANDOFF_FIXTURE_GUARD_FILTER]);
     let outcome = run(&mut command);
     // Removed whatever the outcome; a failure to remove is said, never a refusal
     // of its own — the verdict is the guard's.
-    if let Err(error) = clear(&target) {
+    if let Err(error) = clear_path(&target) {
         println!(
             "==> handoff fixture guard: could not remove {} ({error}); remove it by hand",
             target.display()
@@ -3182,10 +3155,56 @@ pub(crate) fn handoff_fixture_guard_with(
     )
 }
 
-/// Read the guard's libtest output: how many tests passed, or the refusal —
-/// for a failed run (naming the failing tests, or the build's last error
-/// lines when it never ran a test) and for a run in which no test ran.
-fn fixture_guard_verdict(success: bool, stdout: &str, stderr: &str) -> Result<usize> {
+/// `targo --unverified test -p aterm-gui --lib --target-dir <target> -- <args>` in
+/// `tree`, with the build's steering variables (`RUSTFLAGS`, `RUSTC`, …) removed, as
+/// for the release build: an inherited `RUSTFLAGS` replaces the config's rustflags
+/// and would turn Trust verification on for every unit. The fixture guard runs it,
+/// and so does the release's own fixture generator (`crate::fixtures`).
+pub(crate) fn aterm_gui_lib_test(
+    targo: &Path,
+    tree: &Path,
+    target: &Path,
+    args: &[&str],
+) -> Command {
+    let mut command = Command::new(targo);
+    command
+        .args([
+            "--unverified",
+            "test",
+            "-p",
+            "aterm-gui",
+            "--lib",
+            "--target-dir",
+        ])
+        .arg(target)
+        .arg("--")
+        .args(args)
+        .current_dir(tree)
+        .env_remove("RUSTFLAGS")
+        .env_remove("RUSTDOCFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC")
+        .env_remove("RUSTC_BOOTSTRAP")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
+        .stdin(std::process::Stdio::null());
+    command
+}
+
+/// Remove `path` (a directory, a file or a link), and nothing when it is absent.
+pub(crate) fn clear_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// What libtest's output says: the tests that passed and failed over every
+/// `test result:` line, and the failing tests by name.
+pub(crate) fn libtest_tally(stdout: &str) -> (usize, usize, Vec<&str>) {
     let mut passed = 0_usize;
     let mut failed = 0_usize;
     for line in stdout.lines() {
@@ -3207,6 +3226,36 @@ fn fixture_guard_verdict(success: bool, stdout: &str, stderr: &str) -> Result<us
             }
         }
     }
+    let failing = stdout
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("test ")
+                .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        })
+        .collect();
+    (passed, failed, failing)
+}
+
+/// The first `error` lines of a build that stopped before its tests ran.
+pub(crate) fn build_error_lines(stderr: &str) -> String {
+    let tail: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("error"))
+        .take(5)
+        .collect();
+    if tail.is_empty() {
+        "(no error line)".to_string()
+    } else {
+        tail.join("\n")
+    }
+}
+
+/// Read the guard's libtest output: how many tests passed, or the refusal —
+/// for a failed run (naming the failing tests, or the build's last error
+/// lines when it never ran a test) and for a run in which no test ran.
+fn fixture_guard_verdict(success: bool, stdout: &str, stderr: &str) -> Result<usize> {
+    let (passed, failed, failing) = libtest_tally(stdout);
     let refuse = |why: String| {
         Error::new(format!(
             "handoff fixture guard: {why}\n\
@@ -3218,28 +3267,11 @@ fn fixture_guard_verdict(success: bool, stdout: &str, stderr: &str) -> Result<us
         ))
     };
     if !success || failed > 0 {
-        let failing: Vec<&str> = stdout
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix("test ")
-                    .and_then(|rest| rest.strip_suffix(" ... FAILED"))
-            })
-            .collect();
         let why = if failing.is_empty() {
-            let tail: Vec<&str> = stderr
-                .lines()
-                .filter(|line| line.starts_with("error"))
-                .take(5)
-                .collect();
             format!(
                 "the guard did not pass, and no test failed by name — the build or the run \
                  stopped first:\n{}",
-                if tail.is_empty() {
-                    "(no error line)".to_string()
-                } else {
-                    tail.join("\n")
-                }
+                build_error_lines(stderr)
             )
         } else {
             format!("{} test(s) failed: {}", failing.len(), failing.join(", "))
@@ -3261,8 +3293,10 @@ fn handoff_refusal(release: &str, missing: &str) -> Error {
     Error::new(format!(
         "the handoff fixtures of v{release}, the release this cut succeeds, are not checked in: \
          {missing}. Nothing was claimed.\n\
-         fix:  generate them in a worktree at tag v{release} and pin their rows in \
-         PINNED_DESKS ({HANDOFF_FIXTURE_README})"
+         fix:  v{release}'s own cut lands them after it publishes (run `targo \
+         --unverified ship release` again in the clone that cut it); a release an older \
+         cutter cut runs its generator at tag v{release} by hand ({HANDOFF_FIXTURE_README}, \
+         \"By hand\")"
     ))
 }
 
@@ -4611,7 +4645,8 @@ mod handoff_fixture_gate_tests {
         );
         assert!(msg.contains(HANDOFF_FIXTURE_README), "the steps: {msg}");
         assert!(
-            msg.contains(&format!("worktree at tag v{release}")),
+            msg.contains(&format!("v{release}'s own cut lands them"))
+                && msg.contains(&format!("its generator at tag v{release} by hand")),
             "{msg}"
         );
         assert!(msg.contains("Nothing was claimed"), "{msg}");

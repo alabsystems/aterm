@@ -120,17 +120,23 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 }
 
 /// Run one `aterm <args…>` client call against the instance, hermetically,
-/// asserting success and returning stdout as UTF-8.
+/// asserting success and returning stdout as UTF-8. The first call of this file is
+/// the anchor that needs the event loop running, and on a machine under a build
+/// storm the loop can take longer than the client's 10 s accept deadline to start
+/// taking connections ([`headless_boot::until_accepted`]; seen 2026-10-09, 3 times in
+/// sixteen gate-like rounds). Any other failure ends the test at once.
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    hermetic_env(&mut cmd, &inst.tmp);
-    let child = cmd.spawn().expect("spawn the aterm client");
-    let out = bounded_wait(child, &format!("aterm {args:?}"), CLIENT_EXIT_DEADLINE)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let out = headless_boot::until_accepted(|| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hermetic_env(&mut cmd, &inst.tmp);
+        let child = cmd.spawn().expect("spawn the aterm client");
+        bounded_wait(child, &format!("aterm {args:?}"), CLIENT_EXIT_DEADLINE)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
     assert!(
         out.status.success(),
         "aterm {args:?} failed: stdout={:?} stderr={:?}",

@@ -457,7 +457,7 @@ pub fn spawn_shell(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
 ) -> io::Result<i32> {
@@ -517,7 +517,7 @@ pub fn spawn_shell_with_pid(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
@@ -556,7 +556,7 @@ pub fn spawn_shell_with_pid_cell_px(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
     argv_override: Option<&[String]>,
-    exec_command: Option<&[String]>,
+    exec_command: Option<&[std::ffi::OsString]>,
     cwd: Option<&str>,
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
@@ -593,8 +593,32 @@ pub fn spawn_shell_with_pid_cell_px(
 
     // (4) Resolve program+argv (shell.rs), env block (shared `build_child_env`
     // → case-insensitive block builder), command line, cwd.
+    //
+    // A NUL cannot reach a Windows program whole: every wide string this seam
+    // hands Windows ends at its first NUL, so running what is left is running a
+    // different command, and the spawn is refused instead (the Unix seam's
+    // rule). The configured shell is checked as configured, BEFORE it is
+    // resolved, because the resolution reads only up to the NUL too:
+    // `SearchPathW` finds `cmd.exe` for `cmd.exe\0x`, and the program would hold
+    // no NUL by then. Only when the shell is what runs: an `-e` command does not
+    // run it. `$COMSPEC` and a PATH hit cannot hold a NUL.
+    let runs_program = exec_command.is_some_and(|c| !c.is_empty());
+    if !runs_program && shell_override.is_some_and(|s| s.contains('\0')) {
+        return Err(crate::program_nul_refusal(
+            "the shell (set by --shell or `shell` in aterm.toml)",
+        ));
+    }
     let (program, argv) =
         shell::resolve_spawn_target(shell_override, shell_args, argv_override, exec_command);
+    // An argument holding a NUL would end the command line `CreateProcessW`
+    // reads right there, dropping it and every argument after it. An `-e`
+    // program is argv[0], so this covers it as well.
+    if let Some(index) = argv.iter().position(|a| {
+        use std::os::windows::ffi::OsStrExt as _;
+        a.encode_wide().any(|u| u == 0)
+    }) {
+        return Err(crate::argv_nul_refusal("the command line", index));
+    }
     let program_w = wide_nul(&program);
     let mut cmdline_w = build_command_line(&argv);
     let mut env_pairs = crate::build_child_env(std::env::vars_os(), env_add);
@@ -1798,6 +1822,47 @@ mod tests {
         );
     }
 
+    // A configured shell holding a NUL refuses the spawn, before any process
+    // exists, instead of running the program the part before the NUL names.
+    // `cmd.exe\0x` is the sharp case: `SearchPathW` reads only `cmd.exe` and
+    // resolves it, so neither the program nor argv holds a NUL by the time a
+    // check after resolution could look. The Windows twin of
+    // `a_shell_holding_a_nul_refuses_the_spawn_instead_of_running_another`.
+    #[test]
+    fn a_shell_holding_a_nul_refuses_the_spawn() {
+        // SAFETY: single-threaded mint; trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let args = ["/c".to_string(), "exit".to_string()];
+        let over = ["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()];
+        for (what, shell_args, argv_override) in [
+            ("argv_override", None, Some(&over[..])),
+            ("shell_args", Some(&args[..]), None),
+            ("bare shell", None, None),
+        ] {
+            let err = spawn_shell(
+                24,
+                80,
+                &spawn_cap,
+                &sandbox_cap,
+                &[],
+                Some("cmd.exe\0x"),
+                shell_args,
+                argv_override,
+                None,
+                None,
+                None,
+            )
+            .expect_err("a shell holding a NUL must refuse, not run another program");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}: {err}");
+            assert!(
+                err.to_string().contains("the shell (set by --shell"),
+                "{what}: the refusal names the shell: {err}"
+            );
+        }
+    }
+
     // ---- Ctrl+C inheritance: the pre-spawn reset ----
 
     // `SetConsoleCtrlHandler(NULL, FALSE)` must be idempotent, since it runs
@@ -2000,11 +2065,11 @@ mod tests {
             None,
             None,
             Some(&[
-                "powershell.exe".to_string(),
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                script.to_string(),
+                "powershell.exe".into(),
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                script.into(),
             ]),
             None,
             None,

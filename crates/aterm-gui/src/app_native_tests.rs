@@ -245,39 +245,56 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
 #[test]
 fn machine_command_child_outliving_cleanup_is_still_reaped() {
     use std::time::Duration;
-    let fixture = machine_child_fixture("drain");
-    let pid_path = fixture.path().join("pid");
-    let (mut master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    let mut name_buf = [0 as libc::c_char; 128];
-    // SAFETY: `ttyname_r` writes a NUL-terminated name of at most
-    // `name_buf.len()` bytes into the buffer, for the slave this test
-    // just opened.
-    let named = unsafe { libc::ttyname_r(slave, name_buf.as_mut_ptr(), name_buf.len()) };
-    assert_eq!(named, 0, "ttyname_r");
-    // SAFETY: `ttyname_r` succeeded, so the buffer holds a NUL-terminated
-    // string.
-    let name = unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    // The child alone holds the slave, so its exit's last close waits on
-    // the drain of what it queued.
-    // SAFETY: closing the slave this test opened.
-    unsafe { libc::close(slave) };
-    let mut command = aterm_uds::spawnfd::command("/bin/sh");
-    command
-        .args([
-            "-c",
-            r#"printf '%s' "$$" > "$1"; exec 3<>"$2"; printf '%2000s' x >&3; exec /bin/sleep 120"#,
-            "--",
-        ])
-        .arg(&pid_path)
-        .arg(&name);
-    let result = machine_command_output(&mut command, "drain read", Duration::from_secs(2));
-    let pid = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
-        .filter(|&pid| pid > 0)
-        .expect("the fixture ran inside the budget");
+    // A take counts only if the fixture ran inside the budget (the shell wrote its pid
+    // file); a take whose spawn a starved machine delayed past it is repeated on a
+    // fresh terminal with a larger budget, as in the tests above and below.
+    const BUDGETS: [Duration; 3] = [
+        Duration::from_secs(2),
+        Duration::from_secs(8),
+        Duration::from_secs(30),
+    ];
+    let mut taken = None;
+    for budget in BUDGETS {
+        let fixture = machine_child_fixture("drain");
+        let pid_path = fixture.path().join("pid");
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        let mut name_buf = [0 as libc::c_char; 128];
+        // SAFETY: `ttyname_r` writes a NUL-terminated name of at most
+        // `name_buf.len()` bytes into the buffer, for the slave this test
+        // just opened.
+        let named = unsafe { libc::ttyname_r(slave, name_buf.as_mut_ptr(), name_buf.len()) };
+        assert_eq!(named, 0, "ttyname_r");
+        // SAFETY: `ttyname_r` succeeded, so the buffer holds a NUL-terminated
+        // string.
+        let name = unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // The child alone holds the slave, so its exit's last close waits on
+        // the drain of what it queued.
+        // SAFETY: closing the slave this test opened.
+        unsafe { libc::close(slave) };
+        let mut command = aterm_uds::spawnfd::command("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"printf '%s' "$$" > "$1"; exec 3<>"$2"; printf '%2000s' x >&3; exec /bin/sleep 120"#,
+                "--",
+            ])
+            .arg(&pid_path)
+            .arg(&name);
+        let result = machine_command_output(&mut command, "drain read", budget);
+        let pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            .filter(|&pid| pid > 0);
+        if let Some(pid) = pid {
+            taken = Some((master, pid, result));
+            break;
+        }
+        // SAFETY: closing the master this take opened; its child never ran.
+        unsafe { libc::close(master) };
+    }
+    let (mut master, pid, result) = taken.expect("the fixture ran inside even the largest budget");
     let error = result.expect_err("the read timed out");
     // A hang detector, not a budget: the drained exit finishes within a
     // second or so, and the reaper looks every 100 ms.

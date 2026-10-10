@@ -419,6 +419,12 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
         "the establishing frame presents"
     );
     let cols = focus_rect(&app, wid).cols;
+    let coords = {
+        let term = app.pool.get(focus).expect("pane session").term.clone();
+        term_lock(&term)
+            .content_scroll_state()
+            .coordinate_generation()
+    };
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.predictor.set_mode(crate::predict::PredictMode::Always);
@@ -426,6 +432,7 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
             ws.predictor.predict_char(
                 'Z',
                 (u16::try_from(CARET_ROW).expect("small"), 4),
+                coords,
                 cols,
                 now
             ),

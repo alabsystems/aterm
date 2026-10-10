@@ -12,13 +12,23 @@
 //!
 //! It is PURE and CLOCK-INJECTED (every entry point takes `now: Instant`), so it
 //! is testable without sleeping or a PTY. `Instant` is `std::time::Instant` on
-//! native and `aterm_time::Instant` on wasm32. The host wires four seams:
+//! native and `aterm_time::Instant` on wasm32. The host wires five seams:
 //!   1. [`Predictor::predict_char_in_grid`] (or the height-blind
 //!      [`Predictor::predict_char`]) / [`Predictor::predict_backspace`] on a keypress,
-//!   2. [`Predictor::reconcile`] after child output is applied to the grid,
-//!   3. [`Predictor::overlay`] when composing a frame (the glyphs to paint), and
-//!   4. [`Predictor::reset`] when the coordinate space changes (resize, pane swap,
-//!      scroll): every pending guess sits at an ABSOLUTE row/col.
+//!   2. [`Predictor::note_line_submit`] on a press that writes a line terminator
+//!      and nothing else (Enter, Ctrl+J, Ctrl+M; text ending in one, see
+//!      [`is_line_submit`]), and [`Predictor::note_unmodelled_input`] on EVERY
+//!      other byte-writing press (Tab, arrows, control chords, Alt chords, an IME
+//!      commit) and on a paste: input whose echo this crate does not model,
+//!   3. [`Predictor::reconcile`] after child output is applied to the grid,
+//!   4. [`Predictor::overlay`] when composing a frame (the glyphs to paint), and
+//!   5. [`Predictor::reset`] when the host changes the coordinate space itself
+//!      (resize, pane swap): every pending guess sits at an ABSOLUTE row/col.
+//!
+//! The terminal moving rows under those coordinates — output scrolling the
+//! screen, a region scroll, an inserted or deleted line — is not a seam the host
+//! can forget: `predict_char*` and `reconcile` take the host's content-coordinate
+//! generation (`coords`), and a change resets the predictor by itself.
 //!
 //! A host with tabs owns one more seam: the learned echo estimate is a property of the
 //! SESSION, not of the window, so it is SWAPPED across a front change
@@ -38,16 +48,38 @@
 //!   cursor and does not line-echo; [`Predictor::reconcile`] flushes and predicting
 //!   is refused.
 //! * **No unechoed flash (Adaptive).** Adaptive display requires a *confirmed* echo
-//!   in the CURRENT line's epoch, so a password prompt (a line that never echoes)
-//!   never displays a predicted character. The epoch is ended at the SUBMIT boundary
-//!   ([`Predictor::note_line_submit`], on Enter) — not merely on a physical-row change,
-//!   which the cursor does NOT undergo across logical lines on a terminal scrolled to
-//!   the bottom — so a prompt inheriting a prior command's confirmation on the same
-//!   bottom row cannot flash the secret. Guesses carry the epoch they were armed in, so
-//!   a pre-submit guess retiring AFTER the boundary cannot re-arm the new line's gate.
-//!   `Always` is the explicit power-user opt-in and does NOT carry this guarantee: it
-//!   can briefly show an unechoed glyph until the glitch-window expiry, so it is
-//!   unsuitable at a password prompt.
+//!   in the CURRENT epoch, so a password prompt (a line that never echoes) never
+//!   displays a predicted character. An epoch is the run of keystrokes since the last
+//!   thing this crate could not model, which is mosh's "become tentative" rule, and
+//!   it ends at each of them:
+//!   - any byte-writing press that is not a predicted glyph: a line terminator
+//!     ([`Predictor::note_line_submit`]: Enter, but equally Shift+Enter, Ctrl+J,
+//!     Ctrl+M) or anything else ([`Predictor::note_unmodelled_input`]: a paste, an
+//!     arrow, a kill chord) — a line submitted by any of them must not carry its
+//!     proof to the password typed ahead of the prompt that follows;
+//!   - a Backspace with nothing of ours to cancel, and a glyph we decline;
+//!   - the rows moving (the `coords` generation): on a terminal scrolled to the
+//!     bottom the next prompt reuses the cursor's physical row, so a row check alone
+//!     would hand it the proof of the line that just scrolled away, however that line
+//!     ended (a `read -n1` answer ends one with no keystroke at all);
+//!   - the cursor not standing where the last confirmed echo left it when a guess
+//!     starts from it (`proof_cell`): the program moved it — a new row, a redraw,
+//!     a prompt printed on the same line (`read -n1 -p 'Proceed? '; read -s -p
+//!     ' Password: '`, over ssh as well, where no tty verdict reaches the host).
+//!
+//!   Guesses carry the epoch they were armed in, so a guess retiring AFTER the
+//!   boundary cannot re-arm the new epoch's gate. `Always` is the explicit power-user
+//!   opt-in and does NOT carry this guarantee: it can briefly show an unechoed glyph
+//!   until the glitch-window expiry. A host that can read the PTY's line discipline
+//!   must therefore refuse to arm a guess for a press the tty will not echo
+//!   (canonical mode with ECHO clear: `sudo`, `read -s`, a passphrase) in EVERY
+//!   mode; only a remote prompt behind a raw-mode link is left to the epoch.
+//! * **No ghost of erased text.** Only a line terminator lets the guesses in
+//!   flight keep their pixels past the boundary, because it is the one input that
+//!   cannot erase or displace them. Every other unmodelled input retires them, in
+//!   every mode: a backward erase (Ctrl+H, Ctrl+W, a remapped kill, vi's `x`) that
+//!   lands on typed-ahead text leaves the real cursor on a guess over a blank
+//!   cell, which reconciliation cannot tell from "not echoed yet".
 //! * **Self-healing.** Any prediction unconfirmed for the glitch window
 //!   (RTT-relative — floor 250 ms, ceiling 2 s) expires,
 //!   and any divergence (the app drew a different glyph, or the cursor jumped) flushes
@@ -124,7 +156,7 @@ pub struct Prediction {
     /// The confirmation epoch (see `Predictor::epoch`) this guess was armed in. A
     /// guess armed BEFORE an Enter must never arm the NEXT line's display gate when
     /// its echo finally lands, or a password prompt inherits the submitted command's
-    /// confirmation — the exact leak `note_line_submit` exists to prevent.
+    /// confirmation — the exact leak ending the epoch exists to prevent.
     epoch: u64,
 }
 
@@ -181,6 +213,20 @@ const FAST_SAMPLES_TO_HIDE: u8 = 3;
 /// EWMA weight for a freshly-confirmed echo sample into the smoothed RTT.
 const SRTT_ALPHA: f32 = 0.3;
 
+/// Whether `bytes` written to the program are a line terminator and nothing that
+/// could erase or move what was typed before them: UTF-8 text that ends in CR or LF
+/// and holds no other control character (no BS, no ^U/^W, no ESC prefix, no DEL).
+/// The class [`Predictor::note_line_submit`] is for, for a host that has the bytes
+/// rather than the key (a remapped key sequence, controller input); any other
+/// byte-writing input is [`Predictor::note_unmodelled_input`].
+#[must_use]
+pub fn is_line_submit(bytes: &[u8]) -> bool {
+    let is_terminator = |c: char| matches!(c, '\r' | '\n');
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        text.ends_with(is_terminator) && text.chars().all(|c| is_terminator(c) || !c.is_control())
+    })
+}
+
 /// The speculative-echo state machine for one terminal pane. See the crate docs.
 #[derive(Default)]
 pub struct Predictor {
@@ -213,19 +259,25 @@ pub struct Predictor {
     /// flight — so returning from a remote foreground process to a local shell still
     /// closes it promptly, but ordinary jitter cannot blink a ghost off the glass.
     adaptive_slow: bool,
-    /// Have we confirmed ≥1 prediction on the CURRENT line (epoch)? Gates display so an
-    /// unechoed context never shows a guess. Reset when typing starts on a new row.
+    /// Have we confirmed ≥1 prediction in the CURRENT epoch, for the cursor the
+    /// next guess extends (`proof_cell`)? Gates display so an unechoed context never
+    /// shows a guess. Cleared whenever the epoch ends (see the crate docs for every
+    /// boundary) and whenever a guess starts from a cursor the proof does not cover.
     confirmed_epoch: bool,
-    /// The row the current confirmation epoch belongs to. Typing on a NEW row (e.g. a
-    /// password prompt after a command's Enter) starts a fresh epoch with
-    /// `confirmed_epoch = false`, so a no-echo line never inherits a prior line's
-    /// confirmation and displays an unechoed secret.
-    epoch_row: Option<u16>,
+    /// The cell right after the last echo this epoch CONFIRMED: where the real
+    /// cursor stands when nothing but our own keystrokes has moved it since. `Some`
+    /// exactly while `confirmed_epoch` holds. A guess anchored on a live cursor
+    /// anywhere else starts unproven, because the program moved the cursor without
+    /// us: a new row, a redraw, or a prompt printed on the same line —
+    /// `read -n1 -p 'Proceed? '; read -s -p ' Password: '`, over ssh too, where no
+    /// tty verdict reaches the host — so the proof never covers the secret typed
+    /// at the cursor that prompt left behind.
+    proof_cell: Option<(u16, u16)>,
     /// Monotonic id of the CURRENT confirmation epoch, bumped by
-    /// [`note_line_submit`](Self::note_line_submit). Guesses are tagged with it so the
-    /// submit boundary can end the epoch for FUTURE guesses without discarding the
-    /// pixels of in-flight ones: a stale guess still reconciles (and still feeds the
-    /// RTT estimate) but can neither anchor a new guess nor arm the new line's gate.
+    /// [`end_epoch`](Self::end_epoch). Guesses are tagged with it so a boundary can
+    /// end the epoch for FUTURE guesses without discarding the pixels of in-flight
+    /// ones: a stale guess still reconciles (and still feeds the RTT estimate) but
+    /// can neither anchor a new guess nor arm the new epoch's gate.
     epoch: u64,
     /// The most recent grid width seen by `predict_char*`. Only [`reconcile`](Self::reconcile)
     /// reads it, for the two margin questions: a guess that continues at column 0 of
@@ -248,11 +300,19 @@ pub struct Predictor {
     /// the declined glyph). So we stop extending until the set drains and the live
     /// cursor — which the real echo moves correctly — can re-anchor us.
     anchor_lost: bool,
-    /// The epoch whose still-pending guesses keep displaying after their line was
-    /// submitted. Set at [`note_line_submit`](Self::note_line_submit) only when that
-    /// epoch had CONFIRMED an echo, so the carried pixels are always characters the
-    /// user has already watched that line echo back — never a secret.
+    /// The epoch whose still-pending guesses keep displaying after it ended. Set when
+    /// an epoch that had CONFIRMED an echo ends at a line terminator
+    /// ([`note_line_submit`](Self::note_line_submit)), so the carried pixels are
+    /// always characters the user has already watched that line echo back — never
+    /// a secret — and nothing since could have erased them. An unconfirmed epoch
+    /// ending leaves it alone: its own guesses stay dark, and the confirmed epoch's
+    /// guesses ahead of them keep their pixels. Any other unmodelled input retires
+    /// the carried guesses with the rest.
     grandfathered_epoch: Option<u64>,
+    /// The host's content-coordinate generation at the last observation (`None`
+    /// until the first, and again after a [`reset`](Self::reset)). See
+    /// [`observe_coordinates`](Self::observe_coordinates).
+    coords: Option<u64>,
 }
 
 impl Predictor {
@@ -278,26 +338,37 @@ impl Predictor {
     /// [`predict_char_in_grid`](Self::predict_char_in_grid) with no wrap lane: a guess
     /// that would cross the right margin is declined. Prefer the grid-aware entry
     /// point: long command lines are where type-ahead matters most.
-    pub fn predict_char(&mut self, ch: char, cursor: (u16, u16), cols: u16, now: Instant) -> bool {
+    pub fn predict_char(
+        &mut self,
+        ch: char,
+        cursor: (u16, u16),
+        coords: u64,
+        cols: u16,
+        now: Instant,
+    ) -> bool {
         // `rows = 0` ⇒ no row is available to wrap INTO, so the margin declines.
-        self.predict_char_in_grid(ch, cursor, (cols, 0), now)
+        self.predict_char_in_grid(ch, cursor, coords, (cols, 0), now)
     }
 
     /// Register a printable character the user just typed. `cursor` is the live real
     /// cursor (the anchor when nothing is pending); while typing ahead, each new glyph
-    /// extends from the previous prediction. `grid` is `(cols, rows)`: at the right
-    /// margin the guess continues at column 0 of the next row, and only a guess that
-    /// would fall off the BOTTOM of the grid is declined. Returns `true` if a guess was
-    /// added.
+    /// extends from the previous prediction. `coords` is the host's content-coordinate
+    /// generation, read with the cursor (see [`reconcile`](Self::reconcile)). `grid`
+    /// is `(cols, rows)`: at the right margin the guess continues at column 0 of the
+    /// next row, and only a guess that would fall off the BOTTOM of the grid is
+    /// declined. Returns `true` if a guess was added.
     ///
-    /// A refusal never flushes: the guesses to the LEFT of an unmodellable character
-    /// are still exactly what the program will echo (flushing them would erase the
-    /// word typed so far, and the confirmation epoch with it). It does cost the
-    /// anchor for everything typed AFTER it (see `anchor_lost`).
+    /// Refusing a PRINTABLE glyph never flushes: the guesses to the LEFT of it are
+    /// still exactly what the program will echo (flushing them would erase the word
+    /// typed so far). It does end the epoch (the glyph is input we did not model) and
+    /// cost the anchor for everything typed AFTER it (see `anchor_lost`). A control
+    /// character is refused as [`note_unmodelled_input`](Self::note_unmodelled_input):
+    /// it may erase them.
     pub fn predict_char_in_grid(
         &mut self,
         ch: char,
         cursor: (u16, u16),
+        coords: u64,
         grid: (u16, u16),
         now: Instant,
     ) -> bool {
@@ -308,6 +379,7 @@ impl Predictor {
         if cols == 0 {
             return false; // degenerate geometry: no cell can hold a guess
         }
+        self.observe_coordinates(coords);
         self.grid_cols = cols;
         // A drained set re-anchors on the live cursor, which the real echo has moved
         // past whatever we declined, so the block on extending lifts here.
@@ -319,24 +391,22 @@ impl Predictor {
         // letter, while control (ESC sequences), zero-width (combining marks, which
         // modify the cell to their LEFT) and wide (CJK, emoji) glyphs have echo
         // geometry we cannot place. Refused glyphs are left to the real output.
-        if ch.is_control() || aterm_grapheme::char_width(ch) != 1 {
-            self.anchor_lost = true;
-            return false;
-        }
-        if self.anchor_lost {
-            return false;
+        if ch.is_control() || aterm_grapheme::char_width(ch) != 1 || self.anchor_lost {
+            return self.decline(ch);
         }
         // Anchor: extend the last pending guess OF THIS EPOCH, else the live cursor.
         // A pre-submit guess still in flight belongs to the previous logical line and
         // must not anchor the new one.
         let anchor = self.preds.iter().rev().find(|p| p.epoch == self.epoch);
-        // A new line is a fresh confirmation epoch: a guess only displays (Adaptive)
-        // after an echo is confirmed ON THIS LINE. So a no-echo prompt on a new row
-        // (a password prompt after a command) never inherits the prior line's
+        // A guess only displays (Adaptive) after an echo is confirmed for the cursor
+        // it extends. Anchored on the live cursor, that is the cell the last
+        // confirmed echo left it in (`proof_cell`); a cursor anywhere else was moved
+        // by the program — a new row, a prompt printed on the same line — and what
+        // is typed there has proven nothing, so a no-echo prompt never inherits the
         // confirmation and never shows an unechoed glyph.
-        if anchor.is_none() && self.epoch_row != Some(cursor.0) {
+        if anchor.is_none() && self.proof_cell != Some(cursor) {
             self.confirmed_epoch = false;
-            self.epoch_row = Some(cursor.0);
+            self.proof_cell = None;
         }
         let (row, col) = match anchor {
             Some(p) => (p.row, p.col.saturating_add(1)),
@@ -356,8 +426,7 @@ impl Predictor {
             // WITHOUT flushing: the guesses to the left are still correct.
             let next = row.saturating_add(1);
             if next >= rows {
-                self.anchor_lost = true;
-                return false;
+                return self.decline(ch);
             }
             (next, 0)
         } else {
@@ -373,9 +442,19 @@ impl Predictor {
         true
     }
 
-    /// Register a Backspace. We only cancel our OWN trailing prediction (the common
-    /// "type then immediately fix" case); erasing already-committed real content is
-    /// left to the program's echo (conservative). Returns `true` if state changed.
+    /// Register a Backspace. We cancel only our OWN trailing prediction of the current
+    /// epoch (the common "type then immediately fix" case). Returns `true` if a guess
+    /// was cancelled.
+    ///
+    /// With nothing of ours to cancel, the Backspace erases content the program
+    /// already echoed (or a guess carried across a line terminator, which we can no
+    /// longer tell apart from what the terminator wrote): input we did not model,
+    /// handled as [`note_unmodelled_input`](Self::note_unmodelled_input). The real
+    /// cursor will step LEFT once that erase echoes, so the live cursor is stale and
+    /// a glyph typed meanwhile is guessed one cell right of where it lands — and
+    /// after the echo the cursor sits exactly on that guess (erase -1, glyph +1), so
+    /// reconciliation cannot catch it. Ending the epoch keeps that guess dark until
+    /// an echo is confirmed again.
     pub fn predict_backspace(&mut self, _now: Instant) -> bool {
         if self.mode == PredictMode::Off {
             return false;
@@ -386,33 +465,111 @@ impl Predictor {
             self.preds.pop();
             return true;
         }
+        self.note_unmodelled_input();
         false
     }
 
-    /// The user SUBMITTED the line (a plain Enter). End the confirmation epoch: the
-    /// NEXT line must re-confirm an echo before any prediction is displayed.
+    /// A line terminator reached the program, and nothing else: Enter (CR, and
+    /// Shift+Enter's LF), Ctrl+J, Ctrl+M, or text ending in one ([`is_line_submit`]).
+    /// Ends the confirmation epoch, so nothing typed after it displays until an echo
+    /// is confirmed again — mosh's "become tentative".
     ///
-    /// LOAD-BEARING for the no-unechoed-flash guarantee. `confirmed_epoch` is
-    /// otherwise keyed to the physical cursor ROW (`epoch_row`), which is REUSED
-    /// across logical lines on a terminal scrolled to the bottom. Without a reset on
-    /// submit, a non-echoing password prompt on the same bottom row as a
-    /// just-confirmed command would INHERIT that confirmation and flash the secret.
+    /// LOAD-BEARING for the no-unechoed-flash guarantee: the proof is bound to the
+    /// cell the last echo left the cursor in (`proof_cell`), and a password typed
+    /// AHEAD of the prompt that follows a submit is typed at that very cell until the
+    /// remote answers. Which keys submit is the program's business (readline accepts
+    /// a line on CR, LF and Ctrl+O alike), so every other press we did not model ends
+    /// the epoch too ([`note_unmodelled_input`](Self::note_unmodelled_input)).
     ///
-    /// It ends the epoch for FUTURE guesses only; guesses in flight keep their pixels
-    /// (flushing them would blink out the tail of the command line at the moment of
-    /// commit). They retire through [`reconcile`](Self::reconcile) or expire at the
-    /// glitch window. A stale guess confirming later cannot arm the new epoch (see
-    /// `Prediction::epoch`).
+    /// The one boundary that keeps the guesses in flight on glass: a terminator
+    /// inserts nothing before them and erases none of them, so each still echoes
+    /// exactly where it is painted, and flushing them would blink out the tail of the
+    /// command line at the moment of commit. A proven epoch's guesses keep their
+    /// pixels until they retire through [`reconcile`](Self::reconcile) or expire at
+    /// the glitch window; a stale guess confirming later cannot arm the new epoch
+    /// (see `Prediction::epoch`).
     pub fn note_line_submit(&mut self) {
+        self.end_epoch();
+    }
+
+    /// Input this crate does not model reached the program, other than a line
+    /// terminator ([`note_line_submit`](Self::note_line_submit)): any byte-writing
+    /// press that is not a predicted glyph (Tab, an arrow, a control or Alt chord, a
+    /// remapped key sequence, an IME commit) or a paste. Ends the confirmation epoch
+    /// and retires every guess in flight, in every mode.
+    ///
+    /// Retired, not carried, because we cannot say where their echo lands any more:
+    /// the input may erase them. A backward erase (Ctrl+H, Ctrl+W, a `[key_sequences]`
+    /// kill, vi's `x`) that removes exactly the typed-ahead text leaves the real
+    /// cursor on one of its guesses over a blank cell, indistinguishable from "not
+    /// echoed yet", and a guess left there would stay on glass as a ghost of the
+    /// erased text for the whole glitch window. Failing closed costs one round trip
+    /// of a typed-ahead tail after a Tab or an arrow; the echo then draws it.
+    pub fn note_unmodelled_input(&mut self) {
+        // `flush` ends the epoch with the guesses: nothing is left to carry.
+        self.flush();
+    }
+
+    /// End the confirmation epoch at a line terminator (see
+    /// [`note_line_submit`](Self::note_line_submit)).
+    fn end_epoch(&mut self) {
         // Ending the epoch closes the Adaptive gate, which would blank the in-flight
         // guesses just as surely as flushing them. Guesses from an epoch that PROVED it
         // echoes keep their pixels until they retire or expire — the user has already
-        // watched that line echo, so nothing unechoed is exposed by carrying them.
-        self.grandfathered_epoch = self.confirmed_epoch.then_some(self.epoch);
+        // watched that line echo, so nothing unechoed is exposed by carrying them. An
+        // unproven epoch ending leaves an earlier proven epoch's carry in place: its
+        // guesses are the oldest, and its own stay dark behind them.
+        if self.confirmed_epoch {
+            self.grandfathered_epoch = Some(self.epoch);
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.confirmed_epoch = false;
-        self.epoch_row = None; // the next predict_char (re)starts a fresh epoch
-        self.anchor_lost = false; // the new line re-anchors on the live cursor
+        self.proof_cell = None;
+        self.anchor_lost = false; // the new epoch re-anchors on the live cursor
+    }
+
+    /// The program echoed `p`. A guess of the CURRENT epoch arms its display gate and
+    /// moves the proof to the cell after it — where the terminal leaves the cursor,
+    /// or the deferred-wrap slot it parks in at the right margin. A guess from an
+    /// earlier epoch measured the link but proves nothing about this one.
+    fn confirm(&mut self, p: Prediction) {
+        if p.epoch != self.epoch {
+            return;
+        }
+        self.confirmed_epoch = true;
+        let next = p.col.saturating_add(1);
+        let parked = self.grid_cols > 0 && next >= self.grid_cols;
+        self.proof_cell = Some((p.row, if parked { p.col } else { next }));
+    }
+
+    /// Refuse to place a typed glyph: it is input we did not model, and everything
+    /// typed after it would be placed relative to an echo we cannot predict. A
+    /// printable glyph (wide, zero-width) only inserts, so the guesses to its left
+    /// still echo where they are painted and keep their pixels, as across a line
+    /// terminator. A control character can erase them (BS, ^U, ^W reach a line
+    /// editor however the host labelled the key), so it retires them like any other
+    /// unmodelled input.
+    fn decline(&mut self, ch: char) -> bool {
+        if ch.is_control() {
+            self.note_unmodelled_input();
+            return false;
+        }
+        self.end_epoch();
+        self.anchor_lost = true;
+        false
+    }
+
+    /// Adopt the host's content-coordinate generation. A change means the terminal
+    /// moved rows (output scrolled the screen, a region scroll, an inserted or
+    /// deleted line, a reset): every pending guess now names a cell holding some
+    /// other line, where an identical glyph would confirm an echo that never happened,
+    /// and the line under the cursor is not the line whose echo was proven, even on
+    /// the same physical row. Both are retired, exactly as a host [`reset`](Self::reset).
+    fn observe_coordinates(&mut self, coords: u64) {
+        if self.coords.is_some_and(|seen| seen != coords) {
+            self.reset();
+        }
+        self.coords = Some(coords);
     }
 
     /// Reconcile pending predictions against fresh grid state after child output was
@@ -421,13 +578,21 @@ impl Predictor {
     /// `char`, or `None` if blank/space/unreadable). Confirms leading predictions the
     /// program echoed (feeding the RTT estimate and arming the epoch's display gate),
     /// and flushes on any divergence.
+    ///
+    /// `coords` is the host's content-coordinate generation, read under the same
+    /// terminal hold as the cursor and the cells: any value that changes exactly when
+    /// the terminal moves rows (aterm-core's `ContentScrollState::coordinate_generation`).
+    /// A change resets the predictor before anything is compared (see
+    /// `observe_coordinates`); every host hands one, so none can forget the scroll.
     pub fn reconcile(
         &mut self,
         real_cursor: Option<(u16, u16)>,
+        coords: u64,
         alt_screen: bool,
         now: Instant,
         mut observe: impl FnMut(u16, u16) -> Option<char>,
     ) {
+        self.observe_coordinates(coords);
         // The alternate screen owns the cursor and does not line-echo: never predict.
         if alt_screen {
             self.flush();
@@ -458,7 +623,7 @@ impl Predictor {
                     oldest_confirmed.get_or_insert(sample);
                     // A guess from BEFORE the last submit measures the link, but must
                     // not arm the new line's display gate (password safety).
-                    self.confirmed_epoch |= p.epoch == self.epoch;
+                    self.confirm(p);
                     self.preds.remove(0);
                 }
                 Some(_) => {
@@ -476,7 +641,7 @@ impl Predictor {
                         let sample = now.saturating_duration_since(p.born);
                         self.record_rtt(sample);
                         oldest_confirmed.get_or_insert(sample);
-                        self.confirmed_epoch |= p.epoch == self.epoch;
+                        self.confirm(p);
                         self.preds.remove(0);
                     } else {
                         break;
@@ -679,13 +844,16 @@ impl Predictor {
         self.preds.first().map(|p| p.born + window)
     }
 
-    /// Drop all in-flight predictions (coordinate space changed: resize, font zoom,
-    /// pane ⇄ split, or a scroll — a scrolled-in cell holding the same glyph would
-    /// otherwise confirm an echo that never happened). The RTT estimate is retained;
+    /// Drop all in-flight predictions (the host changed the coordinate space: resize,
+    /// font zoom, pane ⇄ split). The terminal moving rows itself reaches here through
+    /// the `coords` generation — a scrolled-in cell holding the same glyph would
+    /// otherwise confirm an echo that never happened. The RTT estimate is retained;
     /// the confirmation epoch is forgotten so the next line re-confirms first.
     pub fn reset(&mut self) {
         self.flush();
-        self.epoch_row = None;
+        // Re-adopt the generation at the next observation: a host reset is itself
+        // the coordinate change, and must not be counted twice.
+        self.coords = None;
         // The coordinate space changed, so the last cursor/cell reading describes a
         // screen that no longer exists — re-latch it from the next real reconcile.
         self.deferred_wrap = false;
@@ -755,6 +923,7 @@ impl Predictor {
     fn flush(&mut self) {
         self.preds.clear();
         self.confirmed_epoch = false;
+        self.proof_cell = None;
         self.anchor_lost = false; // nothing left to be anchored to
         self.grandfathered_epoch = None; // …and nothing left to carry pixels for
     }
@@ -816,6 +985,9 @@ impl Predictor {
 mod tests {
     use super::*;
 
+    /// The content-coordinate generation of a screen whose rows never move.
+    const G: u64 = 0;
+
     /// A tiny fake grid for `observe`: maps (row,col) → glyph.
     fn cell(map: &[((u16, u16), char)]) -> impl Fn(u16, u16) -> Option<char> + '_ {
         move |r, c| {
@@ -835,7 +1007,7 @@ mod tests {
         let now = t0();
         assert_eq!(predictor.pending_bounds(), None);
         for ch in ['a', 'b', 'c'] {
-            assert!(predictor.predict_char_in_grid(ch, (2, 9), (10, 10), now));
+            assert!(predictor.predict_char_in_grid(ch, (2, 9), G, (10, 10), now));
         }
         let deadline = predictor.next_deadline();
         assert_eq!(predictor.pending_bounds(), Some((2, 0, 4, 10)));
@@ -856,7 +1028,7 @@ mod tests {
         let mut p = Predictor::new(PredictMode::Always);
         let born = t0();
         assert!(!p.expire_due(born), "nothing pending, nothing due");
-        assert!(p.predict_char('a', (0, 0), 80, born));
+        assert!(p.predict_char('a', (0, 0), G, 80, born));
         let deadline = p.next_deadline().expect("a pending guess arms a deadline");
 
         let early = born + Duration::from_millis(1);
@@ -881,16 +1053,16 @@ mod tests {
     /// `rtt` later with the cursor advanced. Returns the confirmation instant. Only
     /// valid with an empty pending set (it anchors on the passed cursor).
     fn echo_turn(p: &mut Predictor, ch: char, col: u16, at: Instant, rtt: Duration) -> Instant {
-        assert!(p.predict_char(ch, (0, col), 80, at));
+        assert!(p.predict_char(ch, (0, col), G, 80, at));
         let done = at + rtt;
-        p.reconcile(Some((0, col + 1)), false, done, cell(&[((0, col), ch)]));
+        p.reconcile(Some((0, col + 1)), G, false, done, cell(&[((0, col), ch)]));
         done
     }
 
     #[test]
     fn off_mode_predicts_nothing() {
         let mut p = Predictor::new(PredictMode::Off);
-        assert!(!p.predict_char('a', (0, 0), 80, t0()));
+        assert!(!p.predict_char('a', (0, 0), G, 80, t0()));
         assert!(p.idle());
     }
 
@@ -898,20 +1070,20 @@ mod tests {
     fn sustained_slow_echo_retires_predictions_and_displays_next() {
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now)); // pred 'a' at (0,0)
+        assert!(p.predict_char('a', (0, 0), G, 80, now)); // pred 'a' at (0,0)
         assert!(!p.idle());
         // One 60 ms sample retires the prediction but does not trust a possibly
         // isolated scheduler tail enough to paint the next one.
         let first = now + Duration::from_millis(60);
-        p.reconcile(Some((0, 1)), false, first, cell(&[((0, 0), 'a')]));
+        p.reconcile(Some((0, 1)), G, false, first, cell(&[((0, 0), 'a')]));
         assert!(p.idle(), "confirmed prediction is retired");
-        assert!(p.predict_char('b', (0, 1), 80, first));
+        assert!(p.predict_char('b', (0, 1), G, 80, first));
         assert!(p.overlay(first).is_empty(), "one slow sample stays hidden");
 
         // A second consecutive slow echo establishes the remote-latency regime.
         let second = first + Duration::from_millis(60);
-        p.reconcile(Some((0, 2)), false, second, cell(&[((0, 1), 'b')]));
-        assert!(p.predict_char('c', (0, 2), 80, second));
+        p.reconcile(Some((0, 2)), G, false, second, cell(&[((0, 1), 'b')]));
+        assert!(p.predict_char('c', (0, 2), G, 80, second));
         let shown = p.overlay(second);
         assert_eq!(shown.len(), 1);
         assert_eq!((shown[0].row, shown[0].col, shown[0].ch), (0, 2, 'c'));
@@ -923,8 +1095,8 @@ mod tests {
         let now = t0();
         // Both typed before any echo: cursor is still (0,0) for the 2nd, but 'b'
         // must extend past 'a', not land on top of it.
-        p.predict_char('a', (0, 0), 80, now);
-        p.predict_char('b', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
+        p.predict_char('b', (0, 0), G, 80, now);
         let shown = p.overlay(now);
         assert_eq!(shown.len(), 2);
         assert_eq!((shown[0].col, shown[0].ch), (0, 'a'));
@@ -938,12 +1110,12 @@ mod tests {
         // a glyph and then erases it at GLITCH_MS.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         // Echo lands in 1 ms — local/instant — confirming the epoch but keeping the
         // Adaptive RTT gate closed.
         let fast = now + Duration::from_millis(1);
-        p.reconcile(Some((0, 1)), false, fast, cell(&[((0, 0), 'a')]));
-        p.predict_char('b', (0, 1), 80, fast);
+        p.reconcile(Some((0, 1)), G, false, fast, cell(&[((0, 0), 'a')]));
+        p.predict_char('b', (0, 1), G, 80, fast);
         assert!(
             p.overlay(fast).is_empty(),
             "fast echo ⇒ nothing displayed (no benefit, no flicker)"
@@ -956,20 +1128,21 @@ mod tests {
         let now = t0();
 
         // Establish the ordinary local regime, then inject one 60 ms callback tail.
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let fast = now + Duration::from_millis(1);
-        p.reconcile(Some((0, 1)), false, fast, cell(&[((0, 0), 'a')]));
-        assert!(p.predict_char('b', (0, 1), 80, fast));
-        assert!(p.predict_char('c', (0, 1), 80, fast));
+        p.reconcile(Some((0, 1)), G, false, fast, cell(&[((0, 0), 'a')]));
+        assert!(p.predict_char('b', (0, 1), G, 80, fast));
+        assert!(p.predict_char('c', (0, 1), G, 80, fast));
         let tail = fast + Duration::from_millis(60);
         p.reconcile(
             Some((0, 3)),
+            G,
             false,
             tail,
             cell(&[((0, 1), 'b'), ((0, 2), 'c')]),
         );
 
-        assert!(p.predict_char('d', (0, 3), 80, tail));
+        assert!(p.predict_char('d', (0, 3), G, 80, tail));
         assert!(
             p.overlay(tail).is_empty(),
             "one delayed scheduler turn must not manufacture speculative pixels, even when it retires a burst"
@@ -978,8 +1151,8 @@ mod tests {
         // The next fast confirmation clears the candidate streak as well as keeping
         // the display latch closed.
         let local_again = tail + Duration::from_millis(1);
-        p.reconcile(Some((0, 4)), false, local_again, cell(&[((0, 3), 'd')]));
-        assert!(p.predict_char('e', (0, 4), 80, local_again));
+        p.reconcile(Some((0, 4)), G, false, local_again, cell(&[((0, 3), 'd')]));
+        assert!(p.predict_char('e', (0, 4), G, 80, local_again));
         assert!(p.overlay(local_again).is_empty());
     }
 
@@ -996,9 +1169,9 @@ mod tests {
 
         let mut at = echo_turn(&mut p, 'a', 0, now, slow);
         at = echo_turn(&mut p, 'b', 1, at, slow);
-        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
         assert_eq!(p.overlay(at).len(), 1, "sustained remote latency opens");
-        p.reconcile(Some((0, 3)), false, at + fast, cell(&[((0, 2), 'c')]));
+        p.reconcile(Some((0, 3)), G, false, at + fast, cell(&[((0, 2), 'c')]));
         at += fast;
 
         // Two more fast turns: the raw streak is now long enough, but the SMOOTHED
@@ -1016,7 +1189,7 @@ mod tests {
             at = echo_turn(&mut p, 'x', col, at, fast);
         }
         assert!(!p.adaptive_slow, "a settled local link stops painting");
-        assert!(p.predict_char('z', (0, 14), 80, at));
+        assert!(p.predict_char('z', (0, 14), G, 80, at));
         assert!(p.overlay(at).is_empty());
     }
 
@@ -1035,7 +1208,7 @@ mod tests {
         at = echo_turn(&mut p, 'c', 2, at, Duration::from_millis(5)); // one jitter dip
         assert!(p.adaptive_slow, "one fast dip must not blank the overlay");
         at = echo_turn(&mut p, 'd', 3, at, slow);
-        assert!(p.predict_char('e', (0, 4), 80, at));
+        assert!(p.predict_char('e', (0, 4), G, 80, at));
         assert_eq!(
             p.overlay(at).len(),
             1,
@@ -1062,10 +1235,10 @@ mod tests {
         // pending set is never empty at classification time.
         let mut col = 2u16;
         for _ in 0..14 {
-            assert!(p.predict_char('x', (0, col), 80, at));
-            assert!(p.predict_char('y', (0, col + 1), 80, at));
+            assert!(p.predict_char('x', (0, col), G, 80, at));
+            assert!(p.predict_char('y', (0, col + 1), G, 80, at));
             at += fast;
-            p.reconcile(Some((0, col + 1)), false, at, cell(&[((0, col), 'x')]));
+            p.reconcile(Some((0, col + 1)), G, false, at, cell(&[((0, col), 'x')]));
             assert!(p.predict_backspace(at), "retire the type-ahead glyph");
             col += 1;
         }
@@ -1097,13 +1270,14 @@ mod tests {
                 assert!(p.predict_char(
                     'a',
                     (0, base + i),
+                    G,
                     80,
                     start + Duration::from_millis(u64::from(i) * 10)
                 ));
             }
             let echoed: Vec<((u16, u16), char)> = (0..5u16).map(|i| ((0, base + i), 'a')).collect();
             let done = start + Duration::from_millis(45);
-            p.reconcile(Some((0, base + 5)), false, done, cell(&echoed));
+            p.reconcile(Some((0, base + 5)), G, false, done, cell(&echoed));
             done
         };
 
@@ -1113,7 +1287,7 @@ mod tests {
             p.adaptive_slow,
             "two 45 ms turns are a slow link no matter how fast the user types"
         );
-        assert!(p.predict_char('z', (0, 10), 80, after));
+        assert!(p.predict_char('z', (0, 10), G, 80, after));
         assert_eq!(p.overlay(after).len(), 1);
     }
 
@@ -1123,10 +1297,10 @@ mod tests {
         // never pixels, so crossing the deadline is an invisible cleanup, not an erase.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         let fast = now + Duration::from_millis(1);
-        p.reconcile(Some((0, 1)), false, fast, cell(&[((0, 0), 'a')]));
-        assert!(p.predict_char('b', (0, 1), 80, fast));
+        p.reconcile(Some((0, 1)), G, false, fast, cell(&[((0, 0), 'a')]));
+        assert!(p.predict_char('b', (0, 1), G, 80, fast));
         assert!(!p.is_displaying(fast));
         assert!(
             p.overlay(fast).is_empty(),
@@ -1150,7 +1324,7 @@ mod tests {
     fn always_mode_shows_immediately_without_confirmation() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('x', (0, 0), 80, now);
+        p.predict_char('x', (0, 0), G, 80, now);
         assert_eq!(p.overlay(now).len(), 1, "Always shows the first keystroke");
     }
 
@@ -1158,9 +1332,9 @@ mod tests {
     fn divergence_flushes_all() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         // The program echoed a DIFFERENT glyph (e.g. a completion/masked char).
-        p.reconcile(Some((0, 1)), false, now, cell(&[((0, 0), '*')]));
+        p.reconcile(Some((0, 1)), G, false, now, cell(&[((0, 0), '*')]));
         assert!(p.idle(), "a wrong guess flushes the whole prediction set");
     }
 
@@ -1168,10 +1342,10 @@ mod tests {
     fn alt_screen_flushes_predictions() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         assert!(!p.idle());
         // Entering vim/less (alternate screen) drops predictions.
-        p.reconcile(Some((10, 4)), true, now, cell(&[]));
+        p.reconcile(Some((10, 4)), G, true, now, cell(&[]));
         assert!(p.idle());
     }
 
@@ -1179,7 +1353,7 @@ mod tests {
     fn unconfirmed_prediction_self_expires() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         assert_eq!(p.overlay(now).len(), 1);
         // No echo ever arrives; after the glitch window the guess is dropped.
         let late = now + Duration::from_millis(GLITCH_FLOOR_MS + 50);
@@ -1197,7 +1371,7 @@ mod tests {
         // AND next_deadline() must become None (the wake self-disarms).
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         assert!(
             p.next_deadline().is_some(),
             "a pending guess arms a deadline"
@@ -1215,8 +1389,8 @@ mod tests {
     fn backspace_cancels_pending_prediction() {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
-        p.predict_char('b', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
+        p.predict_char('b', (0, 0), G, 80, now);
         assert_eq!(p.overlay(now).len(), 2);
         assert!(p.predict_backspace(now));
         assert_eq!(p.overlay(now).len(), 1, "backspace removes the last guess");
@@ -1230,10 +1404,10 @@ mod tests {
         // the guesses to the LEFT of the margin are exactly what the program will echo.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char('a', (0, 78), 80, now)); // col 78 ok
-        assert!(p.predict_char('b', (0, 78), 80, now)); // extends to col 79 (last column)
+        assert!(p.predict_char('a', (0, 78), G, 80, now)); // col 78 ok
+        assert!(p.predict_char('b', (0, 78), G, 80, now)); // extends to col 79 (last column)
         assert!(
-            !p.predict_char('c', (0, 78), 80, now),
+            !p.predict_char('c', (0, 78), G, 80, now),
             "col 80 would wrap and no row height was supplied → declined"
         );
         assert_eq!(
@@ -1249,8 +1423,8 @@ mod tests {
         // guessing that is no more speculative than any other guess.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
-        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('a', (0, 79), G, (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), G, (80, 24), now));
         let shown = p.overlay(now);
         assert_eq!(shown.len(), 2);
         assert_eq!((shown[0].row, shown[0].col), (0, 79));
@@ -1269,10 +1443,10 @@ mod tests {
         // every wrapped guess one output burst after it was armed.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
-        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('a', (0, 79), G, (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), G, (80, 24), now));
         // The echo of 'a' lands; the cursor stays in the deferred-wrap slot (0,79).
-        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 79), 'a')]));
+        p.reconcile(Some((0, 79)), G, false, now, cell(&[((0, 79), 'a')]));
         let shown = p.overlay(now);
         assert_eq!(shown.len(), 1, "'a' retires, the wrapped 'b' survives");
         assert_eq!((shown[0].row, shown[0].col, shown[0].ch), (1, 0, 'b'));
@@ -1285,9 +1459,9 @@ mod tests {
         // above the wrap and unaffected.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (23, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('a', (23, 79), G, (80, 24), now));
         assert!(
-            !p.predict_char_in_grid('b', (23, 79), (80, 24), now),
+            !p.predict_char_in_grid('b', (23, 79), G, (80, 24), now),
             "there is no row 24 to wrap into"
         );
         assert_eq!(p.overlay(now).len(), 1, "the armed glyph keeps its pixels");
@@ -1301,17 +1475,17 @@ mod tests {
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
         assert!(
-            p.predict_char('é', (0, 0), 80, now),
+            p.predict_char('é', (0, 0), G, 80, now),
             "single-width accented Latin is ordinary self-echoing input"
         );
-        assert!(p.predict_char('ü', (0, 0), 80, now));
+        assert!(p.predict_char('ü', (0, 0), G, 80, now));
         assert_eq!(p.overlay(now).len(), 2);
         assert!(
-            !p.predict_char('日', (0, 0), 80, now),
+            !p.predict_char('日', (0, 0), G, 80, now),
             "wide/CJK glyphs are left to real echo"
         );
         assert!(
-            !p.predict_char('\u{0301}', (0, 0), 80, now),
+            !p.predict_char('\u{0301}', (0, 0), G, 80, now),
             "a combining mark modifies the cell to its LEFT — not a new cell"
         );
     }
@@ -1323,11 +1497,11 @@ mod tests {
         // drains and the live cursor (which the real echo moves) re-anchors us.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now));
-        assert!(!p.predict_char('日', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
+        assert!(!p.predict_char('日', (0, 0), G, 80, now));
         assert_eq!(p.overlay(now).len(), 1, "'a' keeps its pixels");
         assert!(
-            !p.predict_char('b', (0, 0), 80, now),
+            !p.predict_char('b', (0, 0), G, 80, now),
             "we cannot place a glyph past a wide echo we did not model"
         );
         assert_eq!(
@@ -1337,8 +1511,8 @@ mod tests {
         );
         // The real echo lands and drains the set: the live cursor is authoritative
         // again, so prediction resumes.
-        p.reconcile(Some((0, 3)), false, now, cell(&[((0, 0), 'a')]));
-        assert!(p.predict_char('c', (0, 3), 80, now));
+        p.reconcile(Some((0, 3)), G, false, now, cell(&[((0, 0), 'a')]));
+        assert!(p.predict_char('c', (0, 3), G, 80, now));
         assert_eq!(p.overlay(now)[0].col, 3);
     }
 
@@ -1357,17 +1531,17 @@ mod tests {
         // start a fresh epoch so the unechoed secret is never displayed.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
+        p.predict_char('a', (0, 0), G, 80, now);
         let t1 = now + Duration::from_millis(50);
-        p.reconcile(Some((0, 1)), false, t1, cell(&[((0, 0), 'a')]));
-        p.predict_char('b', (0, 1), 80, t1);
+        p.reconcile(Some((0, 1)), G, false, t1, cell(&[((0, 0), 'a')]));
+        p.predict_char('b', (0, 1), G, 80, t1);
         let t2 = t1 + Duration::from_millis(50);
-        p.reconcile(Some((0, 2)), false, t2, cell(&[((0, 1), 'b')]));
+        p.reconcile(Some((0, 2)), G, false, t2, cell(&[((0, 1), 'b')]));
         assert!(
             p.adaptive_slow,
             "control: sustained slow echo opened the latch"
         );
-        p.predict_char('s', (1, 9), 80, t2); // row 1 != epoch row 0 → fresh epoch
+        p.predict_char('s', (1, 9), G, 80, t2); // row 1 != epoch row 0 → fresh epoch
         assert!(
             p.overlay(t2).is_empty(),
             "an unechoed char on a new line must NOT display (no password leak)"
@@ -1385,13 +1559,13 @@ mod tests {
         let now = t0();
         let r = 23u16; // bottom physical row, reused across BOTH logical lines
         // Line 1: two slow echoes establish the link, then 'c' shows.
-        p.predict_char('a', (r, 0), 80, now);
+        p.predict_char('a', (r, 0), G, 80, now);
         let first = now + Duration::from_millis(60);
-        p.reconcile(Some((r, 1)), false, first, cell(&[((r, 0), 'a')]));
-        p.predict_char('b', (r, 1), 80, first);
+        p.reconcile(Some((r, 1)), G, false, first, cell(&[((r, 0), 'a')]));
+        p.predict_char('b', (r, 1), G, 80, first);
         let confirmed = first + Duration::from_millis(60);
-        p.reconcile(Some((r, 2)), false, confirmed, cell(&[((r, 1), 'b')]));
-        p.predict_char('c', (r, 2), 80, confirmed);
+        p.reconcile(Some((r, 2)), G, false, confirmed, cell(&[((r, 1), 'b')]));
+        p.predict_char('c', (r, 2), G, 80, confirmed);
         assert_eq!(
             p.overlay(confirmed).len(),
             1,
@@ -1408,7 +1582,7 @@ mod tests {
         );
         // Line 2 (password prompt) on the SAME physical row r: never echoes.
         let t1 = confirmed + Duration::from_millis(50);
-        assert!(p.predict_char('s', (r, 9), 80, t1)); // predicted (tracked)…
+        assert!(p.predict_char('s', (r, 9), G, 80, t1)); // predicted (tracked)…
         let shown = p.overlay(t1);
         assert!(
             shown.iter().all(|g| g.ch != 's'),
@@ -1422,8 +1596,8 @@ mod tests {
         // vanish at the instant of commit and reappear one RTT later.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char('l', (0, 0), 80, now));
-        assert!(p.predict_char('s', (0, 0), 80, now));
+        assert!(p.predict_char('l', (0, 0), G, 80, now));
+        assert!(p.predict_char('s', (0, 0), G, 80, now));
         assert_eq!(p.overlay(now).len(), 2);
         p.note_line_submit();
         assert_eq!(
@@ -1448,20 +1622,20 @@ mod tests {
         let r = 23u16; // bottom row, reused across both logical lines
         let slow = Duration::from_millis(60);
         // Establish a slow link on line 1 so the RTT latch is open.
-        assert!(p.predict_char('a', (r, 0), 80, now));
+        assert!(p.predict_char('a', (r, 0), G, 80, now));
         let t1 = now + slow;
-        p.reconcile(Some((r, 1)), false, t1, cell(&[((r, 0), 'a')]));
-        assert!(p.predict_char('b', (r, 1), 80, t1));
+        p.reconcile(Some((r, 1)), G, false, t1, cell(&[((r, 0), 'a')]));
+        assert!(p.predict_char('b', (r, 1), G, 80, t1));
         let t2 = t1 + slow;
-        p.reconcile(Some((r, 2)), false, t2, cell(&[((r, 1), 'b')]));
+        p.reconcile(Some((r, 2)), G, false, t2, cell(&[((r, 1), 'b')]));
         assert!(p.adaptive_slow, "control: the link is classified slow");
 
         // Type one more glyph, hit Enter while it is still unechoed, then let its echo
         // land AFTER the boundary.
-        assert!(p.predict_char('c', (r, 2), 80, t2));
+        assert!(p.predict_char('c', (r, 2), G, 80, t2));
         p.note_line_submit();
         let t3 = t2 + slow;
-        p.reconcile(Some((r, 3)), false, t3, cell(&[((r, 2), 'c')]));
+        p.reconcile(Some((r, 3)), G, false, t3, cell(&[((r, 2), 'c')]));
         assert!(p.idle(), "the stale guess retired normally");
         assert!(
             !p.confirmed_epoch,
@@ -1469,7 +1643,7 @@ mod tests {
         );
 
         // The password prompt lands on the SAME physical row and never echoes.
-        assert!(p.predict_char('s', (r, 9), 80, t3));
+        assert!(p.predict_char('s', (r, 9), G, 80, t3));
         assert!(
             p.overlay(t3).is_empty(),
             "an unechoed secret on the new line must never display"
@@ -1487,7 +1661,7 @@ mod tests {
 
         // First keystroke on a cold 400 ms link: nothing confirms it in the floor
         // window, so it expires — recording a LOWER BOUND on the link's latency.
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
         assert!(p.idle(), "the unconfirmed guess still self-heals");
         assert!(
@@ -1498,10 +1672,10 @@ mod tests {
         // Second keystroke: the widened window now outlasts the real 400 ms echo, so
         // the guess is still in flight when its echo lands and CONFIRMS.
         let armed = now + Duration::from_millis(500);
-        assert!(p.predict_char('b', (0, 0), 80, armed));
+        assert!(p.predict_char('b', (0, 0), G, 80, armed));
         let _ = p.overlay(armed + Duration::from_millis(300)); // a frame mid-flight
         assert!(!p.idle(), "the guess outlives the old fixed window");
-        p.reconcile(Some((0, 1)), false, armed + rtt, cell(&[((0, 0), 'b')]));
+        p.reconcile(Some((0, 1)), G, false, armed + rtt, cell(&[((0, 0), 'b')]));
         assert!(p.confirmed_epoch, "the echo finally reaches a live guess");
         assert!(
             !p.adaptive_slow,
@@ -1517,16 +1691,16 @@ mod tests {
 
         // A SECOND genuine slow confirmation is what opens the gate.
         let mut at = armed + rtt;
-        assert!(p.predict_char('c', (0, 1), 80, at));
+        assert!(p.predict_char('c', (0, 1), G, 80, at));
         at += rtt;
-        p.reconcile(Some((0, 2)), false, at, cell(&[((0, 1), 'c')]));
+        p.reconcile(Some((0, 2)), G, false, at, cell(&[((0, 1), 'c')]));
         assert!(
             p.adaptive_slow,
             "two real slow echoes classify the link — the honest evidence path"
         );
 
         // …and that is the whole point: the next keystroke is painted immediately.
-        assert!(p.predict_char('d', (0, 2), 80, at));
+        assert!(p.predict_char('d', (0, 2), G, 80, at));
         assert_eq!(p.overlay(at).len(), 1, "a 400 ms link finally predicts");
     }
 
@@ -1540,7 +1714,7 @@ mod tests {
         let mut p = Predictor::new(PredictMode::Adaptive);
         let mut now = t0();
         for _ in 0..12 {
-            assert!(p.predict_char('x', (0, 0), 80, now));
+            assert!(p.predict_char('x', (0, 0), G, 80, now));
             now += Duration::from_millis(GLITCH_CEILING_MS + 10);
             assert!(
                 p.overlay(now).is_empty(),
@@ -1562,9 +1736,9 @@ mod tests {
         // dropping the epoch would make this line re-prove an echo it already proved.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let later = now + Duration::from_millis(200);
-        assert!(p.predict_char('b', (0, 0), 80, later));
+        assert!(p.predict_char('b', (0, 0), G, 80, later));
         let shown = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 10));
         assert_eq!(shown.len(), 1, "only the expired head is retired");
         assert_eq!(shown[0].ch, 'b');
@@ -1576,14 +1750,14 @@ mod tests {
         let mut at = echo_turn(&mut p, 'a', 0, now, slow);
         at = echo_turn(&mut p, 'b', 1, at, slow);
         assert!(p.confirmed_epoch && p.adaptive_slow);
-        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
         let expired = at + Duration::from_millis(GLITCH_FLOOR_MS + 10);
         assert!(p.overlay(expired).is_empty(), "the stale guess expired");
         assert!(
             p.confirmed_epoch,
             "expiry must not make this line re-prove an echo it already proved"
         );
-        assert!(p.predict_char('d', (0, 2), 80, expired));
+        assert!(p.predict_char('d', (0, 2), G, 80, expired));
         assert_eq!(p.overlay(expired).len(), 1, "the next guess still paints");
     }
 
@@ -1594,20 +1768,20 @@ mod tests {
         // but it must not inherit the remote pane's display eligibility.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let slow1 = now + Duration::from_millis(60);
-        p.reconcile(Some((0, 1)), false, slow1, cell(&[((0, 0), 'a')]));
-        assert!(p.predict_char('b', (0, 1), 80, slow1));
+        p.reconcile(Some((0, 1)), G, false, slow1, cell(&[((0, 0), 'a')]));
+        assert!(p.predict_char('b', (0, 1), G, 80, slow1));
         let slow2 = slow1 + Duration::from_millis(60);
-        p.reconcile(Some((0, 2)), false, slow2, cell(&[((0, 1), 'b')]));
-        assert!(p.predict_char('c', (0, 2), 80, slow2));
+        p.reconcile(Some((0, 2)), G, false, slow2, cell(&[((0, 1), 'b')]));
+        assert!(p.predict_char('c', (0, 2), G, 80, slow2));
         assert_eq!(p.overlay(slow2).len(), 1, "control: slow link displays");
 
         p.reset_session();
         let local = slow2 + Duration::from_millis(1);
-        assert!(p.predict_char('x', (0, 0), 80, slow2));
-        p.reconcile(Some((0, 1)), false, local, cell(&[((0, 0), 'x')]));
-        assert!(p.predict_char('y', (0, 1), 80, local));
+        assert!(p.predict_char('x', (0, 0), G, 80, slow2));
+        p.reconcile(Some((0, 1)), G, false, local, cell(&[((0, 0), 'x')]));
+        assert!(p.predict_char('y', (0, 1), G, 80, local));
         assert!(
             p.overlay(local).is_empty(),
             "a new session learns its own fast RTT instead of inheriting the old slow link"
@@ -1624,11 +1798,11 @@ mod tests {
         // then flushed the whole set a burst later when the real cell diverged.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
-        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 79), 'a')]));
+        assert!(p.predict_char_in_grid('a', (0, 79), G, (80, 24), now));
+        p.reconcile(Some((0, 79)), G, false, now, cell(&[((0, 79), 'a')]));
         assert!(p.idle(), "control: the echo retired the guess");
 
-        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), G, (80, 24), now));
         let shown = p.overlay(now);
         assert_eq!(
             (shown[0].row, shown[0].col, shown[0].ch),
@@ -1645,10 +1819,10 @@ mod tests {
         // hole at the margin and shift the whole tail of the line one cell.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (0, 78), (80, 24), now));
-        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 78), 'a')]));
+        assert!(p.predict_char_in_grid('a', (0, 78), G, (80, 24), now));
+        p.reconcile(Some((0, 79)), G, false, now, cell(&[((0, 78), 'a')]));
         assert!(p.idle());
-        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), G, (80, 24), now));
         let shown = p.overlay(now);
         assert_eq!((shown[0].row, shown[0].col), (0, 79));
     }
@@ -1660,10 +1834,10 @@ mod tests {
         // anchor-extended twin of this edge is `bottom_row_declines_without_flushing`.)
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (23, 79), (80, 24), now));
-        p.reconcile(Some((23, 79)), false, now, cell(&[((23, 79), 'a')]));
+        assert!(p.predict_char_in_grid('a', (23, 79), G, (80, 24), now));
+        p.reconcile(Some((23, 79)), G, false, now, cell(&[((23, 79), 'a')]));
         assert!(
-            !p.predict_char_in_grid('b', (23, 79), (80, 24), now),
+            !p.predict_char_in_grid('b', (23, 79), G, (80, 24), now),
             "no row 24 to wrap into, and the slot holds the echoed 'a'"
         );
         assert!(p.idle(), "declining paints nothing and erases nothing");
@@ -1678,9 +1852,9 @@ mod tests {
         // replacement, and a wrapped guess must not depend on the parking to survive.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
-        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now)); // wraps to (1,0)
-        p.reconcile(Some((1, 0)), false, now, cell(&[((0, 79), 'a')]));
+        assert!(p.predict_char_in_grid('a', (0, 79), G, (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), G, (80, 24), now)); // wraps to (1,0)
+        p.reconcile(Some((1, 0)), G, false, now, cell(&[((0, 79), 'a')]));
         let shown = p.overlay(now);
         assert_eq!(
             shown.len(),
@@ -1699,14 +1873,14 @@ mod tests {
         // belongs to a different line.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(p.predict_char_in_grid('a', (5, 79), (80, 24), now));
-        assert!(p.predict_char_in_grid('b', (5, 79), (80, 24), now)); // wraps to (6,0)
-        p.reconcile(Some((5, 79)), false, now, cell(&[((5, 79), 'a')]));
+        assert!(p.predict_char_in_grid('a', (5, 79), G, (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (5, 79), G, (80, 24), now)); // wraps to (6,0)
+        p.reconcile(Some((5, 79)), G, false, now, cell(&[((5, 79), 'a')]));
         assert_eq!(p.overlay(now).len(), 1, "control: the park keeps 'b' alive");
 
         // One line of output scrolls the grid: the typed line — and the cursor parked
         // at its margin — are a row higher, and row 6 is still unwritten.
-        p.reconcile(Some((4, 79)), false, now, cell(&[((4, 79), 'a')]));
+        p.reconcile(Some((4, 79)), G, false, now, cell(&[((4, 79), 'a')]));
         assert!(p.idle(), "a stale absolute row is retired, not tolerated");
     }
 
@@ -1716,25 +1890,288 @@ mod tests {
         // cursor-consistency check, so a scroll that slides another line's identical
         // character under a pending guess confirms an echo that never happened: a bogus
         // RTT sample, and (Adaptive) a display gate armed by a line that never echoed.
-        // Only the host knows the grid scrolled; the guesses are not wrong, their
-        // COORDINATES are, and nothing in this crate can re-derive them.
+        // The guesses are not wrong, their COORDINATES are, and nothing in this crate
+        // can re-derive them — but the host's generation says they moved.
         let now = t0();
         let mut unaware = Predictor::new(PredictMode::Adaptive);
-        assert!(unaware.predict_char_in_grid('a', (5, 0), (80, 24), now));
-        unaware.reconcile(Some((5, 1)), false, now, cell(&[((5, 0), 'a')]));
+        assert!(unaware.predict_char_in_grid('a', (5, 0), G, (80, 24), now));
+        unaware.reconcile(Some((5, 1)), G, false, now, cell(&[((5, 0), 'a')]));
         assert!(
             unaware.confirmed_epoch,
             "control: a glyph-equal cell really does confirm"
         );
 
         let mut p = Predictor::new(PredictMode::Adaptive);
-        assert!(p.predict_char_in_grid('a', (5, 0), (80, 24), now));
-        p.reset();
+        assert!(p.predict_char_in_grid('a', (5, 0), G, (80, 24), now));
+        // One line of output scrolled the screen before the reconcile ran.
+        p.reconcile(Some((5, 1)), G + 1, false, now, cell(&[((5, 0), 'a')]));
         assert!(p.idle(), "a scrolled guess is retired, not re-aimed");
-        p.reconcile(Some((5, 1)), false, now, cell(&[((5, 0), 'a')]));
         assert!(
             !p.confirmed_epoch,
             "…so a moved cell can never arm the display gate"
+        );
+    }
+
+    /// The line the cursor is on after a scroll is a different line, even on the same
+    /// physical row (the bottom row of a terminal in use). However the previous line
+    /// ended — Enter, a key we never saw, or the program itself (`read -n1` takes its
+    /// answer without one) — the prompt that scrolled in must re-prove its echo.
+    #[test]
+    fn a_scroll_ends_the_epoch_on_the_same_physical_row() {
+        let slow = Duration::from_millis(60);
+        let r = 23u16;
+        let leak = |coords_after: u64| {
+            let mut p = Predictor::new(PredictMode::Adaptive);
+            let mut at = t0();
+            for (col, ch) in "yes".chars().enumerate() {
+                let col = col as u16;
+                assert!(p.predict_char_in_grid(ch, (r, col), G, (80, 24), at));
+                at += slow;
+                p.reconcile(Some((r, col + 1)), G, false, at, cell(&[((r, col), ch)]));
+            }
+            assert!(
+                p.adaptive_slow && p.confirmed_epoch,
+                "control: a proven slow line"
+            );
+            // The program ends the line itself and prints a password prompt; at the
+            // bottom of the screen that scrolls, and the prompt takes the same row.
+            // Three columns wide, it leaves the cursor in the very cell the last
+            // echo did, so only the generation can tell the lines apart.
+            p.reconcile(Some((r, 3)), coords_after, false, at, cell(&[]));
+            assert!(p.predict_char_in_grid('s', (r, 3), coords_after, (80, 24), at));
+            !p.overlay(at).is_empty()
+        };
+        assert!(
+            leak(G),
+            "control: without a scroll the row's proof still applies"
+        );
+        assert!(
+            !leak(G + 1),
+            "an unechoed glyph on a prompt that scrolled onto the proven row was painted"
+        );
+    }
+
+    /// Shift+Enter, Ctrl+J, Ctrl+M: a line terminator in any spelling
+    /// (`note_line_submit`). What is typed after it — a password typed ahead of the
+    /// prompt the submit produces — must not inherit the proof; what was typed before
+    /// it keeps its pixels, across any number of terminators.
+    #[test]
+    fn a_line_terminator_makes_what_follows_tentative() {
+        let slow = Duration::from_millis(60);
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let mut at = echo_turn(&mut p, 'a', 0, t0(), slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "control: the proven line paints");
+
+        p.note_line_submit(); // the submit
+        p.note_line_submit(); // and another terminator before the echo
+        assert!(p.predict_char('h', (0, 2), G, 80, at)); // typed ahead of the prompt
+        let shown: Vec<char> = p.overlay(at).iter().map(|g| g.ch).collect();
+        assert_eq!(
+            shown,
+            ['c'],
+            "the proven line's 'c' keeps its pixels; the glyph typed after the \
+             boundary stays dark"
+        );
+
+        // The echo of 'c' lands; the guess anchored on the stale cursor diverges.
+        at += slow;
+        p.reconcile(Some((0, 3)), G, false, at, cell(&[((0, 2), 'c')]));
+        assert!(p.idle());
+        // A confirmed echo in the new epoch is what re-arms the display.
+        at = echo_turn(&mut p, 'x', 3, at, slow);
+        assert!(p.predict_char('y', (0, 4), G, 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "a re-proven line paints again");
+    }
+
+    /// Tab, an arrow, a paste, an IME commit: input we did not model that is not a
+    /// line terminator (`note_unmodelled_input`). What follows is tentative, and
+    /// the guesses in flight stop painting in every mode, since the input may have
+    /// erased or displaced them; their echo draws them one round trip later.
+    #[test]
+    fn a_key_we_did_not_model_retires_the_guesses_in_flight() {
+        let slow = Duration::from_millis(60);
+        for mode in [PredictMode::Adaptive, PredictMode::Always] {
+            let mut p = Predictor::new(mode);
+            let mut at = echo_turn(&mut p, 'a', 0, t0(), slow);
+            at = echo_turn(&mut p, 'b', 1, at, slow);
+            assert!(p.predict_char('c', (0, 2), G, 80, at));
+            assert_eq!(p.overlay(at).len(), 1, "{mode:?}: control: 'c' paints");
+
+            p.note_unmodelled_input(); // Tab
+            assert!(
+                p.overlay(at).is_empty(),
+                "{mode:?}: 'c' stays on glass past a key that may have erased it"
+            );
+            if mode == PredictMode::Adaptive {
+                assert!(p.predict_char('h', (0, 2), G, 80, at));
+                assert!(
+                    p.overlay(at).is_empty(),
+                    "the glyph typed after the boundary stays dark"
+                );
+                // The echo of 'c' lands; the guess anchored on the stale cursor
+                // diverges.
+                at += slow;
+                p.reconcile(Some((0, 3)), G, false, at, cell(&[((0, 2), 'c')]));
+                assert!(p.idle());
+                at = echo_turn(&mut p, 'x', 3, at, slow);
+                assert!(p.predict_char('y', (0, 4), G, 80, at));
+                assert_eq!(p.overlay(at).len(), 1, "a re-proven line paints again");
+            }
+        }
+    }
+
+    /// An erase we did not model may land on a guess carried across a line
+    /// terminator the program did not take as a submit (a composer that inserts
+    /// the newline): the Backspace may be erasing the 'c' we are still painting,
+    /// so the carried pixels stop rather than become a stale ghost.
+    #[test]
+    fn an_erase_after_a_boundary_darkens_the_carried_guesses() {
+        let slow = Duration::from_millis(60);
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let mut at = echo_turn(&mut p, 'a', 0, t0(), slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
+        p.note_line_submit();
+        assert_eq!(p.overlay(at).len(), 1, "control: 'c' is carried");
+        assert!(
+            !p.predict_backspace(at),
+            "'c' is not this epoch's to cancel"
+        );
+        assert!(p.overlay(at).is_empty(), "the erase may be landing on it");
+    }
+
+    /// A backward erase that is not a Backspace of our own — Ctrl+W, Ctrl+H, a
+    /// remapped kill, a BS an embedder handed over as a glyph — landing on the
+    /// typed-ahead text. Once it echoes, the real cursor sits on one of the erased
+    /// guesses over a blank cell, which reconciliation cannot tell from "not echoed
+    /// yet": a guess left there is a ghost of the erased text for the whole glitch
+    /// window, in any mode.
+    #[test]
+    fn an_erase_landing_on_typed_ahead_text_leaves_no_ghost() {
+        type Erase = fn(&mut Predictor, Instant);
+        type Cells = &'static [((u16, u16), char)];
+        let killed: Cells = &[((0, 0), 'l'), ((0, 1), 's')];
+        let one_erased: Cells = &[((0, 0), 'l'), ((0, 1), 's'), ((0, 3), 'f'), ((0, 4), 'o')];
+        // (label, the erase, the cells its echo leaves, the cursor column after it)
+        let erases: [(&str, Erase, Cells, u16); 3] = [
+            (
+                "ctrl+w kills the word",
+                |p, _| p.note_unmodelled_input(),
+                killed,
+                3,
+            ),
+            (
+                "ctrl+h deletes its last glyph",
+                |p, _| p.note_unmodelled_input(),
+                one_erased,
+                5,
+            ),
+            (
+                "a BS handed over as a glyph",
+                |p, at| assert!(!p.predict_char('\u{8}', (0, 3), G, 80, at)),
+                one_erased,
+                5,
+            ),
+        ];
+        let slow = Duration::from_millis(60);
+        for mode in [PredictMode::Adaptive, PredictMode::Always] {
+            for (label, erase, left, cursor) in erases {
+                let mut p = Predictor::new(mode);
+                let mut at = echo_turn(&mut p, 'l', 0, t0(), slow);
+                at = echo_turn(&mut p, 's', 1, at, slow);
+                at = echo_turn(&mut p, ' ', 2, at, slow);
+                for ch in ['f', 'o', 'o'] {
+                    assert!(p.predict_char(ch, (0, 3), G, 80, at));
+                }
+                assert_eq!(
+                    p.overlay(at).len(),
+                    3,
+                    "{mode:?} {label}: control: the typed-ahead word paints"
+                );
+                erase(&mut p, at);
+                // The program echoes "foo", then the erase.
+                at += slow;
+                p.reconcile(Some((0, cursor)), G, false, at, cell(left));
+                let ghost: Vec<char> = p.overlay(at).iter().map(|g| g.ch).collect();
+                assert!(
+                    ghost.is_empty(),
+                    "{mode:?} {label}: the erased text is still on glass as {ghost:?}"
+                );
+            }
+        }
+    }
+
+    /// The byte rule for hosts that have the bytes rather than the key: a line
+    /// terminator ends the text, and nothing in it could erase or move what was
+    /// typed before.
+    #[test]
+    fn only_text_ending_in_a_terminator_is_a_line_submit() {
+        for yes in [
+            &b"\r"[..],
+            b"\n",
+            b"\r\n",
+            b"ls -l\r",
+            "caf\u{e9}\n".as_bytes(),
+        ] {
+            assert!(is_line_submit(yes), "{yes:?}");
+        }
+        for no in [
+            &b""[..],
+            b"ls",
+            b"\r ",
+            b"\x1b\r",
+            b"\x15clear\r",
+            b"\x08\r",
+            b"\x7f\n",
+            b"\t\r",
+            b"\xff\r",
+        ] {
+            assert!(!is_line_submit(no), "{no:?}");
+        }
+    }
+
+    /// The proof certifies the cell the last confirmed echo left the cursor in. A
+    /// prompt the program prints on the SAME row after it (`read -n1 -p 'Proceed? ';
+    /// read -s -p ' Password: '`) moves the cursor without us: no scroll, no key we
+    /// did not model, and over ssh no tty verdict — only the cell says so.
+    #[test]
+    fn a_prompt_printed_after_the_proof_on_the_same_row_voids_it() {
+        let slow = Duration::from_millis(60);
+        let leak = |cursor_after: u16| {
+            let mut p = Predictor::new(PredictMode::Adaptive);
+            let mut at = echo_turn(&mut p, 'o', 0, t0(), slow);
+            at = echo_turn(&mut p, 'k', 1, at, slow);
+            at = echo_turn(&mut p, 'y', 2, at, slow);
+            assert!(
+                p.adaptive_slow && p.confirmed_epoch,
+                "control: a proven slow line"
+            );
+            assert!(p.predict_char('s', (0, cursor_after), G, 80, at));
+            !p.overlay(at).is_empty()
+        };
+        assert!(leak(3), "control: typing on at the proven cell paints");
+        assert!(
+            !leak(14),
+            "a password glyph typed after ' Password: ' was printed on the proven row \
+             was painted"
+        );
+    }
+
+    /// The press seam observes the generation too: a host whose reconcile is idle
+    /// (nothing pending, nothing on glass) learns of the scroll at the next key.
+    #[test]
+    fn the_key_seam_sees_a_scroll_the_reconcile_never_did() {
+        let slow = Duration::from_millis(60);
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let mut at = echo_turn(&mut p, 'a', 0, t0(), slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.confirmed_epoch, "control: a proven line");
+        assert!(p.predict_char('s', (0, 2), G + 1, 80, at));
+        assert!(
+            p.overlay(at).is_empty(),
+            "the first key after a scroll must not inherit the proof"
         );
     }
 
@@ -1751,7 +2188,7 @@ mod tests {
         let fast = Duration::from_millis(1);
         let mut at = echo_turn(&mut p, 'a', 0, now, slow);
         at = echo_turn(&mut p, 'b', 1, at, slow);
-        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
         assert_eq!(p.overlay(at).len(), 1, "control: the slow link paints");
 
         // The ssh session goes to the background; its estimate leaves with it.
@@ -1762,7 +2199,7 @@ mod tests {
         );
         // The local pane in front now speculates on its OWN evidence only.
         at = echo_turn(&mut p, 'x', 0, at, fast);
-        assert!(p.predict_char('y', (0, 1), 80, at));
+        assert!(p.predict_char('y', (0, 1), G, 80, at));
         assert!(p.overlay(at).is_empty(), "a fast local link stays dark");
         let local = p.take_link_estimate();
 
@@ -1771,7 +2208,7 @@ mod tests {
         // itself (the no-unechoed-flash guarantee is per line, and still earned here).
         p.restore_link_estimate(ssh);
         at = echo_turn(&mut p, 'a', 0, at, slow);
-        assert!(p.predict_char('b', (0, 1), 80, at));
+        assert!(p.predict_char('b', (0, 1), G, 80, at));
         assert_eq!(
             p.overlay(at).len(),
             1,
@@ -1781,7 +2218,7 @@ mod tests {
         // …and the local session's own estimate comes back just as measured.
         p.restore_link_estimate(local);
         at = echo_turn(&mut p, 'x', 0, at, fast);
-        assert!(p.predict_char('y', (0, 1), 80, at));
+        assert!(p.predict_char('y', (0, 1), G, 80, at));
         assert!(
             p.overlay(at).is_empty(),
             "restoring a fast session's estimate must not paint either"
@@ -1801,7 +2238,7 @@ mod tests {
     fn restoring_an_estimate_clears_the_outgoing_panes_pixels() {
         let mut a = Predictor::new(PredictMode::Always);
         let now = t0();
-        assert!(a.predict_char('x', (3, 4), 80, now));
+        assert!(a.predict_char('x', (3, 4), G, 80, now));
         assert_eq!(a.overlay(now).len(), 1, "pane A has a ghost on glass");
         assert!(a.is_displaying(now));
 
@@ -1832,7 +2269,7 @@ mod tests {
         at = echo_turn(&mut p, 'b', 1, at, slow);
         let ssh = p.take_link_estimate();
         p.restore_link_estimate(ssh);
-        assert!(p.predict_char('s', (9, 0), 80, at));
+        assert!(p.predict_char('s', (9, 0), G, 80, at));
         assert!(
             p.overlay(at).is_empty(),
             "an unechoed keystroke on the restored pane's line must not display"
@@ -1853,14 +2290,14 @@ mod tests {
 
         p.restore_link_estimate(LinkEstimate::default());
         at = echo_turn(&mut p, 'a', 0, at, slow);
-        assert!(p.predict_char('b', (0, 1), 80, at));
+        assert!(p.predict_char('b', (0, 1), G, 80, at));
         assert!(
             p.overlay(at).is_empty(),
             "an unmeasured session re-earns the latch from its own samples"
         );
         at += slow;
-        p.reconcile(Some((0, 2)), false, at, cell(&[((0, 1), 'b')]));
-        assert!(p.predict_char('c', (0, 2), 80, at));
+        p.reconcile(Some((0, 2)), G, false, at, cell(&[((0, 1), 'b')]));
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
         assert_eq!(p.overlay(at).len(), 1, "…and opens it on the second sample");
     }
 
@@ -1873,7 +2310,7 @@ mod tests {
         // after every tab switch before it can confirm anything at all.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
         assert_eq!(
             p.expiry_backoff, 1,
@@ -1897,7 +2334,7 @@ mod tests {
         // timed out once.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
-        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(p.predict_char('a', (0, 0), G, 80, now));
         let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
         assert_eq!(
             p.expiry_backoff, 1,
@@ -1908,17 +2345,62 @@ mod tests {
         assert_eq!(p.glitch_window(), Duration::from_millis(GLITCH_FLOOR_MS));
     }
 
+    /// A Backspace with nothing of OURS to pop erases a glyph the program already
+    /// echoed: the real cursor will step LEFT, so the live cursor is stale until
+    /// that erase echoes. A glyph typed meanwhile was guessed one cell right of
+    /// where it lands, and after the echo the real cursor sits exactly on that
+    /// guess (erase -1, glyph +1), so the consistency check kept it: a duplicate
+    /// ghost on glass for the whole glitch window ("ac" + a dim "c").
+    #[test]
+    fn an_erase_we_did_not_model_leaves_no_ghost_where_nothing_echoes() {
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let slow = Duration::from_millis(60);
+        let mut at = echo_turn(&mut p, 'a', 0, t0(), slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(
+            p.adaptive_slow && p.confirmed_epoch,
+            "control: a slow, proven line"
+        );
+        assert!(
+            !p.predict_backspace(at),
+            "nothing of ours to pop: 'b' already echoed"
+        );
+        assert!(p.predict_char('c', (0, 2), G, 80, at));
+        let wrong_cell = |p: &mut Predictor, at| {
+            p.overlay(at)
+                .iter()
+                .any(|g| (g.row, g.col, g.ch) == (0, 2, 'c'))
+        };
+        assert!(
+            !wrong_cell(&mut p, at),
+            "'c' will echo at column 1, not 2: it must not be painted at 2"
+        );
+        // The program erases 'b' and echoes 'c' in its place.
+        at += slow;
+        p.reconcile(
+            Some((0, 2)),
+            G,
+            false,
+            at,
+            cell(&[((0, 0), 'a'), ((0, 1), 'c')]),
+        );
+        assert!(
+            !wrong_cell(&mut p, at),
+            "after the echo a ghost 'c' beside the real one is a stale duplicate"
+        );
+    }
+
     #[test]
     fn space_confirms_by_cursor_advance() {
         // A typed space echoes as a blank cell (observe → None), so it must confirm by
         // the cursor advancing past it, not wedge the queue + flush trailing type-ahead.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
-        p.predict_char('a', (0, 0), 80, now);
-        p.predict_char(' ', (0, 0), 80, now); // extends to (0,1)
-        p.predict_char('b', (0, 0), 80, now); // extends to (0,2)
+        p.predict_char('a', (0, 0), G, 80, now);
+        p.predict_char(' ', (0, 0), G, 80, now); // extends to (0,1)
+        p.predict_char('b', (0, 0), G, 80, now); // extends to (0,2)
         // Echo: 'a' at (0,0); the space is blank; the cursor advanced to (0,2).
-        p.reconcile(Some((0, 2)), false, now, cell(&[((0, 0), 'a')]));
+        p.reconcile(Some((0, 2)), G, false, now, cell(&[((0, 0), 'a')]));
         let shown = p.overlay(now);
         assert_eq!(shown.len(), 1, "'a' and the space retire; only 'b' remains");
         assert_eq!(shown[0].ch, 'b');
