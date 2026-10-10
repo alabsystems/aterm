@@ -12,11 +12,10 @@
 //! # The canonical suite
 //!
 //! The corpus here is hand-written, so it can only pin rules someone thought
-//! of — and a rule nobody thought of is exactly how the "a dotted key closes
-//! its table to sub-tables too" bug survived: the [`VALID`] entry copied from
-//! the specification's worked example stopped one line short of the line that
-//! disproved it. So the authority is `toml-test`, and this file is the subset
-//! of it that this tree's own history says is worth keeping close.
+//! of: the [`VALID`] entry copied from the specification's worked example once
+//! stopped one line short of the line that disproves "a dotted key closes its
+//! table to sub-tables too". So the authority is `toml-test`, and this file
+//! keeps the subset of it worth having close.
 //!
 //! MEASURED against `toml-test-data` 2.13.0 (777 documents) on 2026-08-27:
 //!
@@ -118,7 +117,7 @@ const VALID: &[&str] = &[
     "key = \"value\" # comment with \"quotes\" and 'apostrophes' and # hashes\n",
     "key = 1\r\nother = 2\r\n",
     // A `\r\n` INSIDE a multi-line string is normalized to `\n` in the VALUE,
-    // exactly as both retired crates do, while the raw bytes still round-trip.
+    // while the raw bytes still round-trip.
     // toml-test has no case for this; a config saved by a Windows editor does.
     "x = \"\"\"a\r\nb\"\"\"\n",
     "x = '''a\r\nb'''\n",
@@ -441,8 +440,7 @@ fn a_schema_error_renders_the_offending_line() {
 /// `native_config_language::parser_diagnostic_range` turns an empty span at or
 /// past the end of input into a caret on the last authored byte, so a caret the
 /// operator can see. A span covering the whole unterminated construct is not
-/// empty, misses that path, and underlines the opening bracket instead —
-/// measured, and the reason this test exists.
+/// empty, misses that path, and underlines the opening bracket instead.
 #[test]
 fn end_of_input_errors_point_at_the_last_authored_line() {
     for (source, position) in [

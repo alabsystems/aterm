@@ -976,6 +976,10 @@ impl Grid {
     /// request and reports success; re-attach applies it before staged output
     /// is drained. Ring-only grids have no byte-budgeted store, so this is a
     /// no-op there.
+    ///
+    /// The ring and staged rows' OSC 8 payload is held to a share of this
+    /// budget ([`history_link_budget`](Self::history_link_budget)), enforced
+    /// here too, so a temporary lower budget sheds it with the store.
     pub fn set_scrollback_memory_budget(
         &mut self,
         budget: usize,
@@ -991,6 +995,9 @@ impl Grid {
                 settings.memory_budget_changed = true;
             }
             if self.storage.scrollback.is_none() {
+                // The history link allowance follows the deferred budget now:
+                // the ring and staged rows are still here to shed.
+                self.enforce_history_link_budget();
                 return Ok(());
             }
         }
@@ -1015,6 +1022,10 @@ impl Grid {
                 }
             }
         }
+        // The uncompressed history's link allowance is a share of this budget
+        // (`history_link_budget`): a lowered budget (the pressure shed's) strips
+        // the oldest ring and staged rows' links to it.
+        self.enforce_history_link_budget();
         self.clamp_display_offset();
         if self.scrollback_lines() != before {
             self.storage.mark_content_full();
@@ -1153,8 +1164,8 @@ impl Grid {
         self.storage.mark_content_full();
     }
 
-    /// Check if the grid needs a full redraw (Kani proofs + FFI bridge tests).
-    #[cfg(any(test, kani))]
+    /// Check if the grid needs a full redraw (tests).
+    #[cfg(test)]
     #[must_use]
     pub fn needs_full_redraw(&self) -> bool {
         self.storage.damage.is_full()

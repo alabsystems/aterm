@@ -233,7 +233,7 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// `help_short_form_is_bounded_and_is_the_summary_catalog` measures the wire reply
 /// (rows plus the `OK` status and `#` framing lines); this crate's
 /// `summaries_fit_the_short_catalog_budget` sums rows only.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 11343;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 11449;
 
 /// THE ONE `subscribe` STREAM VOCABULARY: frame sources first, then the two
 /// modifiers. The catalog row, the `ERR usage` refusal, `Requested::parse`'s fold
@@ -952,7 +952,7 @@ pub const VERBS: &[VerbSpec] = &[
         "messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]: the message log, one row each",
         "Rows ascend by id: `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> \
          sev=<success|info|warn|error> origin=<host|wire|carried> \
-         state=<held|live|review|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded> \
+         state=<held|live|review|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded|quit> \
          glass=<row|-> rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
          [progress=<n>/100|level=<n>/100|busy=1] [load=<network|disk|cpu|memory>] \
          [since_ms=<ms>] [need=<now|working|notice|later>]`. level= is a measured level (the system.strain row only), never \
@@ -974,7 +974,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "notice <post|progress|done|dismiss|act> \u{2026}: record, show work in flight, end or press a message",
+        "notice <post|progress|done|ask|dismiss|act> \u{2026}: record, show work, ask, end or press a message",
         "Owner-only. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- \
          <detail>]`: sev=success or info (the default) is a RECORD in the message log, never a \
          row (`OK recorded message=<id>`); sev=warn or error is a row on the band (`OK \
@@ -987,7 +987,12 @@ pub const VERBS: &[VerbSpec] = &[
          s). `notice done <key> [ok|warn|withdraw] [<words>]` ends it with its finish (`OK \
          done=<id> how=<resolved-ok|resolved-warn|withdrawn>`, or `OK done=- how=gone`); warn is \
          a brief flash, and a failure that must stay is `notice post <tag> sev=error key=<key> \
-         <title>`, which takes the row's place. `notice dismiss <id>` takes a row down (`notice dismiss review` files every open exception into the log); `notice \
+         <title>`, which takes the row's place. `notice ask <key> [tag=<tag>] <title> -- \
+         <reason> -- <step>` is a standing ask: the owner is needed now for a reason only \
+         the owner can close (the reason says why, at most 90 characters, never that \
+         something is pending; the step is the one action, at most 90, never a snooze or \
+         two), shown until `notice done <key> ok` or read, then not raised again for a \
+         day (`OK message=<id>`). `notice dismiss <id>` takes a row down (`notice dismiss review` files every open exception into the log); `notice \
          act <id> <label|index|details>` presses its button as a person would (`OK \
          acted=<label> performed=<1|0>`). A band title is at most 6 words and 48 characters with \
          no clause; a key is 1-40 of a-z 0-9 . _ - and lives as wire.<key>; a tag is `script` \
@@ -1052,7 +1057,10 @@ pub const VERBS: &[VerbSpec] = &[
          message, so neither does this line. Off macOS there is no menu bar: the `menu \
          \"<title>\"` lines are the app's menu model, less the rows this platform cannot act \
          on (the two update rows where there is no updater); `controls menu` is the live \
-         palette, with each row's enabled state. On Windows a `strip-version shown=<yes|no> …` \
+         palette, with each row's enabled state. A macOS `--headless` instance has no menu \
+         bar either and prints `menu (none)`: reading the bar would create the application \
+         object a headless process never builds; `controls menu` still serves the menu \
+         model. On Windows a `strip-version shown=<yes|no> …` \
          line follows the tab-model line: the version label at the right end of the tab strip \
          (the macOS Version menu's title without its colour emoji, ` ↑` while an update is \
          staged), the strip `cols=` that `pointer move -1 <col>` takes and the `action=` a \
@@ -1452,13 +1460,17 @@ pub const VERBS: &[VerbSpec] = &[
          `stalled` or `stopped` session answers `ERR busy input-unread`, and one written \
          behind raw input a second old carries `warn=input-unread` on its OK (see `key`). While `stalled`/`stopped` aterm also raises the session's attention itself, \
          as owner `aterm` (`meta attention_owner=aterm`: `<program> is frozen: not reading \
-         input since <HH:MM> … — restart it: aterm ctl @<sid> signal term`), over any older \
-         badge, and clears it when the program reads again; nothing is armed while no input \
-         is unread. The queue `signal term` drops is not read: a program that lives through \
-         it stays `stalled` (`input_bytes=0`) until it ends or shows it is alive — it draws, \
-         reads a key sent since, or stops spinning with nothing left unread — and after 5 s \
-         the line reads `… is still running after its restart signal … — end it: aterm ctl \
-         @<sid> signal kill`. `supervisor=` is the live `meta set supervisor` \
+         input since <HH:MM> … — restart it: aterm ctl @<sid> signal term`, or, where the \
+         window's harness would carry the agent's restart, `… restart it: aterm ctl @<sid> \
+         restart pid=<leader> if-stalled; aterm relaunches it on its conversation` — a \
+         Codex's without that promise, its thread coming back only where it has a rollout), \
+         over any older badge, and clears it when the program reads again; nothing is armed \
+         while no input is unread. The queue `signal term` drops is not read: a program that \
+         lives through it stays `stalled` (`input_bytes=0`) until it ends or shows it is \
+         alive — it draws, reads a key sent since, or stops spinning with nothing left unread \
+         — and after 5 s the line reads `… is still running after its restart signal … — end \
+         it: aterm ctl @<sid> signal kill` (or the `restart` above, where it would be \
+         carried). `supervisor=` is the live `meta set supervisor` \
          claim — who is answering this session's prompts — `-` when none. \
          `human_ms=` is how long ago a PERSON last gave this session input — a key (an arrow, \
          a digit, Enter and Esc included), text, a paste, a click, a drag, a wheel notch or a \
@@ -1970,7 +1982,10 @@ pub const VERBS: &[VerbSpec] = &[
          the pointer is, through the functions `WindowEvent::MouseInput` calls (a band capsule, \
          a tab); `ERR` before any move. `click` is Owner-only, as `notice` is, and a click on \
          a band capsule spends one of `notice act`'s 10 presses a minute (`ERR busy notice: \
-         10 presses a minute retry_ms=<ms>` once they are spent). A cell outside the grid or the chrome rows is `ERR`, \
+         10 presses a minute retry_ms=<ms>` once they are spent); while a seamless update has \
+         parked the process it presses nothing and spends nothing, refused as `notice` is \
+         (`ERR busy notice: aterm is switching to its new version retry_ms=<ms>`). A cell \
+         outside the grid or the chrome rows is `ERR`, \
          never silently clamped onto a neighbour and reported as though it had been honoured. `OK at=-` \
          when the window holds no pointer position at all: after `pointer leave`, and before the \
          first move of any kind. `at=-` says only that — never a position that does not exist. \
@@ -2033,9 +2048,12 @@ pub const VERBS: &[VerbSpec] = &[
          same decision: `ERR busy person human_ms=<ms>` when a person gave the session \
          input within <s> seconds, `ERR busy input-unread bytes=<n>` while written input \
          sits unread (a prompt on its way) — nothing sent, nothing discarded. cont resumes a stopped job, the remedy `ERR busy input-unread … \
-         input=stopped` names; term is the restart for a program that has stopped reading \
-         its input, and int interrupts one whose tty is raw (where `key ctrl+c` is a byte \
-         queued behind the unread input). Never refused by the unread-input gate. term, \
+         input=stopped` names; term ends a program that has stopped reading its input, and \
+         int interrupts one whose tty is raw (where `key ctrl+c` is a byte queued behind the \
+         unread input). A signal is just a signal: the window's harness reads the exit it \
+         causes as the program's own (a graceful one is left at the shell). To restart an \
+         agent the harness supervises, use `restart` — its record is written before its \
+         signal, so the exit is relaunched on its conversation, and it ends a survivor itself. Never refused by the unread-input gate. term, \
          kill, hup and quit first DISCARD the input a raw-mode (or stopped) job left unread \
          — keys typed at a frozen program outlive it, and the shell that takes the tty back \
          would run them as commands — and say so: `OK signalled pgrp <n> discarded=<bytes>` \
@@ -2050,6 +2068,45 @@ pub const VERBS: &[VerbSpec] = &[
          kill`. The reply does not wait for the \
          program to end. POSIX only: Windows answers `ERR signal unsupported on this \
          platform`",
+    ),
+    v(
+        "restart",
+        Signal,
+        Status,
+        Session,
+        "restart [pid=<n>] [if-stalled] [quiet=<s>]: restart the tab's agent in place",
+        "- the agent the window's harness supervises in this tab (Claude Code, Codex) is ended and \
+         relaunched on its own conversation: the stall's remedy, and a person's restart. Its \
+         record comes FIRST: a stamp naming the process (pid and kernel start) is written before \
+         anything is sent, so whoever reads the exit — this window, or its successor after a \
+         seamless update — relaunches it, a keystroke before it not read as a person's /exit. \
+         `pid=<n>` acts only while <n> leads the foreground process group; `if-stalled` only while \
+         a stall is published for it (`status input=stalled`); `quiet=<s>` not while a person gave \
+         the session input within <s> seconds. Replies: `OK restarting pid <n> cause=<stall|asked>` \
+         (` discarded=<bytes>` when input it left unread was dropped first, as `signal term` \
+         drops it), answered at once — the program's end is not waited for; a request made while \
+         an earlier one's stamp still names the process joins it (one stamp, its cause kept, its \
+         time renewed once this request's SIGTERM is sent; one watch ends the program, on the \
+         earlier request's clocks); \
+         `OK restart gone pid <n>` (it stopped leading the tab before anything was sent: nothing \
+         sent, and a stamp this request wrote taken back — never one it joined); `ERR restart \
+         unavailable: <why>` — not-the-hosts-agent (no harness snapshot names \
+         that process), not-relaunchable, not-supervised (the harness's claim is not live here), \
+         driver-lease, driver-turn, halted, start-unread, no-state — nothing written, nothing sent: \
+         use `signal term` and resume it yourself; `ERR not-stalled`; `ERR busy person \
+         human_ms=<ms>`; `ERR pid <n> is not the foreground process group (<pgrp>)`; `ERR no \
+         foreground process group`; `ERR bad restart argument: <word>`; `ERR restart failed: \
+         <what>`. THE KILL IS ITS CONTRACT: the restart always ends the program it stamped — one \
+         still leading the tab 5 s after the SIGTERM with its stall still published and nothing \
+         read (deaf), or 30 s after it in any case, gets SIGKILL (the input left unread dropped \
+         first); one that stopped leading the tab by then (a job stopped from elsewhere) gets \
+         it once it leads again, while its stamp stands (5 min). A hold, another driver's lease \
+         or named turn, or another supervisor's claim that lands after the request pauses the \
+         SIGKILL until it is lifted, while the stamp stands; one that outlasts the stamp lets the \
+         program go. No SIGKILL is sent in the stamp's last 30 s, nor after it, when its exit \
+         would no longer be read as the restart's. `[harness] relaunch = false` does not refuse \
+         it. Refused under a hold like `signal`. POSIX only: Windows \
+         answers `ERR restart unsupported on this platform`",
     ),
     v(
         "reset",
@@ -3057,7 +3114,7 @@ pub const VERBS: &[VerbSpec] = &[
          either way, and a selector is rejected: the session is the argument. While on, every \
          PTY-reaching verb resolving to that session answers `ERR halted reason=<r> \
          origin=<local|fleet>` from ANY scope — `send key ctrl feed feed-bin paste paste-bin mouse \
-         pointer resize focus signal reset turn close invoke hwkey pane tab confirm \
+         pointer resize focus signal restart reset turn close invoke hwkey pane tab confirm \
          operator-propose-bin` — a \
          TRANSIENT class beside `ERR busy`, so existing back-off code already does the right \
          thing. That enumeration is NOT maintained by hand: it is pinned verb-for-verb against \

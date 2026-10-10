@@ -21,11 +21,12 @@
 //! via `#![allow(unsafe_code)]` at the file top; the rest of the crate
 //! denies unsafe.
 //!
-//! # Kani coverage
+//! # Coverage
 //!
-//! The harness `pty_wrap_ref_identity_slice` (the `kani_proofs` module below)
-//! asserts that for any `&[u8]` the wrapped reference has the same address,
-//! length, and byte contents as the input reference (bit-identical).
+//! The tests below (`wrap_slice_preserves_address_and_contents`,
+//! `wrap_scalar_reference_preserves_identity`, `wrap_str_preserves_bytes`)
+//! assert that the wrapped reference has the same address, length and bytes
+//! as the input reference (bit-identical).
 
 #![allow(
     unsafe_code,
@@ -95,33 +96,5 @@ mod tests {
         assert_eq!(wrapped.as_ref().as_ptr(), s.as_ptr());
         assert_eq!(wrapped.as_ref().len(), s.len());
         assert_eq!(wrapped.as_ref(), s);
-    }
-}
-
-// -- Kani layout-equivalence harness --------------------------------------
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::pty_wrap_ref;
-
-    /// `pty_wrap_ref` preserves the pointer address and slice length for any
-    /// `&[u8]`. With `#[repr(transparent)]`, the wrapped reference is
-    /// bit-identical to the input reference.
-    #[kani::proof]
-    fn pty_wrap_ref_identity_slice() {
-        // Bounded symbolic slice — Kani requires a concrete allocation.
-        let len: usize = kani::any();
-        kani::assume(len <= 4);
-        let data = [0u8; 4];
-        let slice: &[u8] = &data[..len];
-        let wrapped = pty_wrap_ref(slice);
-        kani::assert(
-            wrapped.as_ref().as_ptr() == slice.as_ptr(),
-            "wrapped ptr equals input ptr",
-        );
-        kani::assert(
-            wrapped.as_ref().len() == slice.len(),
-            "wrapped len equals input len",
-        );
     }
 }

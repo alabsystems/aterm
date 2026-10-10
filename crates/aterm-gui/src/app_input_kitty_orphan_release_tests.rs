@@ -128,6 +128,7 @@ fn fresh_press_closes_stale_forwarded_episode_before_replacement() {
         TKey::Character('a'),
         Modifiers::SHIFT,
         Some('a'),
+        None,
     );
 
     app.note_consumed_press_key(replacement_window, physical, false);
@@ -172,6 +173,7 @@ fn hidden_owned_repeat_does_not_arm_replacement_tab_effects() {
         TKey::Character('h'),
         Modifiers::empty(),
         Some('h'),
+        None,
     );
 
     let replacement = app.next_session_id;

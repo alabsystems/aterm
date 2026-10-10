@@ -19,7 +19,9 @@ use super::TerminalHandler;
 /// 3. CJK Unified Ideographs (U+4E00-U+9FFF) and Hangul Syllables
 ///    (U+AC00-U+D7A3): width 2. U+3000-U+4DFF is mixed-width and defers to the
 ///    table (honoring `cjk`).
-/// 4. Emoji bitmaps (U+1F300-U+1F6FF, U+2600-U+27BF) and CJK Extension B-H /
+/// 4. Emoji bitmaps (U+1F300-U+1F6FF, U+2600-U+27BF): width 2 on a bitmap
+///    hit, the table on a miss (in U+2600-U+27BF honoring `cjk`; U+1F300-
+///    U+1F6FF holds no ambiguous characters). CJK Extension B-H /
 ///    Compatibility Supplement (U+20000-U+2FA1F, U+30000-U+323AF): width 2.
 /// 5. Everything else: `aterm_grapheme::char_width` (`width_cjk()` when `cjk`).
 #[inline]
@@ -50,7 +52,7 @@ fn char_width(c: char, cjk: bool) -> usize {
         smp_emoji_width(cp)
     } else if (0x2600..0x27C0).contains(&cp) {
         // BMP Misc Symbols + Dingbats (✨ U+2728, ⚡ U+26A1, zodiac, etc.).
-        bmp_emoji_width(cp)
+        bmp_emoji_width(cp, cjk)
     } else if (0x20000..0x2FA20).contains(&cp) || (0x30000..0x323B0).contains(&cp) {
         // CJK Extension B through Compat Ideographs Supp (U+20000-U+2FA1F): all width 2.
         // CJK Extensions G (U+30000-U+3134F) and H (U+31350-U+323AF): all width 2.
@@ -100,15 +102,23 @@ static BMP_EMOJI_WIDTH2: [u8; 56] = [
 ];
 
 /// O(1) bitmap lookup for BMP emoji width (U+2600-U+27BF).
+///
+/// A bitmap miss defers to the table in the caller's ambiguous-width mode:
+/// the block holds 80 East Asian Ambiguous symbols (★ ♠ ♥ ♪ ☎ ❶ …) that
+/// take two cells when `cjk` is set, like every other EAW=A character.
 #[inline]
-fn bmp_emoji_width(cp: u32) -> usize {
+fn bmp_emoji_width(cp: u32, cjk: bool) -> usize {
     let idx = (cp - 0x2600) as usize;
     if BMP_EMOJI_WIDTH2[idx / 8] & (1 << (idx % 8)) != 0 {
         2
     } else {
-        // Fallback to char_width for bitmap misses, matching smp_emoji_width().
         // SAFETY: cp is guaranteed to be a valid Unicode codepoint (U+2600-U+27BF).
-        aterm_grapheme::char_width(unsafe { char::from_u32_unchecked(cp) }).max(1)
+        let c = unsafe { char::from_u32_unchecked(cp) };
+        if cjk {
+            aterm_grapheme::char_width_cjk(c).max(1)
+        } else {
+            aterm_grapheme::char_width(c).max(1)
+        }
     }
 }
 
@@ -973,6 +983,26 @@ impl TerminalHandler<'_> {
             return false;
         }
 
+        // The cell must be wide by emoji presentation (the default-width
+        // table, or a VS16 that widened it), not by `ambiguous_width = "wide"`
+        // alone: ⛹ (U+26F9) is East Asian Ambiguous, so wide mode gives it two
+        // cells while it stays text presentation, and `⛹🏽` is 2 + 2 cells as
+        // wcwidth counts it, like narrow mode's 1 + 2. The stored-text replay
+        // (`aterm-grid`'s `advance_grapheme_unit_scan`) decides the fold by
+        // this same rule, so the row keeps its layout through history,
+        // reflow and a checkpoint carry.
+        if aterm_grapheme::char_width(base_char) < 2
+            && !self.grid.cell_extra(row, col).is_some_and(|e| {
+                // A non-BMP base rebuilt from a stored line (a checkpoint
+                // carry, history) is a complex cell: its VS16 sits in the
+                // complex string, not in `combining()`.
+                e.combining().contains(&'\u{FE0F}')
+                    || e.complex_char().is_some_and(|s| s.contains('\u{FE0F}'))
+            })
+        {
+            return false;
+        }
+
         // Combine the skin tone modifier as a combining character on the base.
         self.add_combining_to_previous_cell(modifier);
         true
@@ -1256,13 +1286,34 @@ mod tests {
         }
     }
 
+    /// A syllable spelled in conjoining jamo is one two-cell cluster (UAX #29
+    /// GB6-GB8) whichever block its vowel and final come from: Hangul Jamo
+    /// Extended-B's V and T are zero-width like U+1160..U+11FF, as glibc and
+    /// unicode-width have them.
+    #[test]
+    fn extended_b_vowels_and_finals_join_the_syllable() {
+        for text in [
+            "\u{1100}\u{1161}\u{11A8}|", // modern L V T
+            "\u{A960}\u{D7B0}\u{D7CB}|", // Extended-A L, Extended-B V and T
+            "\u{1100}\u{D7C6}\u{D7FB}|", // the last V and T of Extended-B
+        ] {
+            for term in whole_and_fragmented(text) {
+                let grid = term.grid();
+                assert!(grid.cell(0, 0).is_some_and(|c| c.is_wide()), "{text:?}");
+                assert_eq!(grid.cell(0, 2).map(|c| c.char()), Some('|'), "{text:?}");
+                assert_eq!(term.cursor().col, 3, "{text:?}");
+            }
+        }
+    }
+
     /// Exhaustive parity guard for the Hangul blocks: the hardcoded
     /// `(0xAC00..0xD7A4) => 2` arm against the table.
     ///
     /// Catches the arm's width drifting from 2, and its upper bound widening
-    /// past U+D7A3 (U+D7A4..U+D7AF and Hangul Jamo Extended-B U+D7B0..U+D7FF are
-    /// narrow). Hangul Jamo (U+1100..U+11FF) is swept too: U+1100..115F are wide
-    /// and U+1160..11FF zero-width, both via the generic tail.
+    /// past U+D7A3 (U+D7A4..U+D7AF is narrow, and Hangul Jamo Extended-B's
+    /// vowels U+D7B0..U+D7C6 and finals U+D7CB..U+D7FB are zero-width).
+    /// Hangul Jamo (U+1100..U+11FF) is swept too: U+1100..115F are wide and
+    /// U+1160..11FF zero-width, both via the generic tail.
     ///
     /// Cannot catch narrowing the arm (the generic tail uses the same table),
     /// hence the absolute-width pins below. The `write_unicode_bulk` copies of
@@ -1344,6 +1395,128 @@ mod tests {
         assert_eq!(char_width('\u{3040}', false), 1); // unassigned -> narrow
         assert_eq!(char_width('\u{4E00}', false), 2); // CJK ideograph
         assert_eq!(char_width('\u{9FFF}', false), 2); // end of ideograph block
+    }
+
+    /// Exhaustive parity guard for the Miscellaneous Symbols and Dingbats arm
+    /// (U+2600..U+27BF, the `BMP_EMOJI_WIDTH2` bitmap) in both ambiguous-width
+    /// modes. The block holds 80 East Asian Ambiguous symbols (★ ☆ ♠ ♥ ♪ ☎
+    /// ❶ …) that a bitmap miss once measured narrow in wide mode too.
+    #[test]
+    fn fast_path_width_matches_table_misc_symbols_and_dingbats() {
+        for cp in 0x2600u32..0x27C0 {
+            let c = char::from_u32(cp).expect("U+2600..U+27BF are all BMP scalar values");
+            assert_eq!(
+                char_width(c, false),
+                aterm_grapheme::char_width(c),
+                "non-CJK (ambiguous=narrow) width mismatch at U+{cp:04X}"
+            );
+            assert_eq!(
+                char_width(c, true),
+                aterm_grapheme::char_width_cjk(c),
+                "CJK (ambiguous=wide) width mismatch at U+{cp:04X}"
+            );
+        }
+        // Parity alone holds if the table went narrow: pin ★ (EAW A) and ✨
+        // (EAW W, a bitmap hit) absolutely.
+        assert_eq!((char_width('★', false), char_width('★', true)), (1, 2));
+        assert_eq!((char_width('✨', false), char_width('✨', true)), (2, 2));
+    }
+
+    /// End to end with `ambiguous_width = "wide"`: an EAW=A symbol from U+2600..
+    /// U+27BF takes two cells on the per-char path and in a bulk run, like `°`.
+    #[test]
+    fn ambiguous_misc_symbols_take_two_cells_in_wide_mode() {
+        use crate::config::TerminalConfig;
+        let config = TerminalConfig {
+            ambiguous_width_double: true,
+            ..TerminalConfig::default()
+        };
+        // (text, the column the cursor ends in)
+        for (text, col) in [("★|", 3u16), ("°|", 3), ("♪♥❶|", 7), ("中★中★|", 9)] {
+            let mut term = Terminal::new(1, 20);
+            term.apply_config(&config);
+            term.process(text.as_bytes());
+            assert_eq!(term.cursor().col, col, "{text:?}");
+        }
+        // Narrow mode keeps them one cell.
+        let mut term = Terminal::new(1, 20);
+        term.process("★|".as_bytes());
+        assert_eq!(term.cursor().col, 2);
+    }
+
+    /// A skin tone folds only onto a base wide by emoji presentation, never
+    /// onto one `ambiguous_width = "wide"` widened: ⛹ (U+26F9, East Asian
+    /// Ambiguous, an emoji modifier base) + 🏽 is 2 + 2 cells in wide mode, as
+    /// 1 + 2 in narrow mode, and the row keeps that layout through a
+    /// checkpoint carry, whose stored-text replay decides the fold from the
+    /// default-width table and VS16. A VS16 base, and 👍 (wide in the table),
+    /// fold in both modes.
+    #[test]
+    fn skin_tone_folds_onto_an_emoji_presentation_base_in_both_width_modes() {
+        use crate::config::TerminalConfig;
+        let bar_col = |term: &Terminal| {
+            (0..20).find(|&c| term.grid().cell(0, c).is_some_and(|x| x.char() == '|'))
+        };
+        for wide in [false, true] {
+            let config = TerminalConfig {
+                ambiguous_width_double: wide,
+                ..TerminalConfig::default()
+            };
+            // (text, the column `|` lands in)
+            for (text, bar) in [
+                ("\u{26F9}\u{1F3FD}|", if wide { 4u16 } else { 3 }),
+                (
+                    "a\u{26F9}\u{1F3FD}\u{26F9}\u{1F3FD}|",
+                    if wide { 9 } else { 7 },
+                ),
+                ("\u{26F9}\u{FE0F}\u{1F3FD}|", 2),
+                ("\u{1F44D}\u{1F3FD}|", 2),
+            ] {
+                let mut live = Terminal::new(1, 20);
+                live.apply_config(&config);
+                live.process(text.as_bytes());
+                assert_eq!(bar_col(&live), Some(bar), "live {text:?} wide={wide}");
+                assert_eq!(live.cursor().col, bar + 1, "live {text:?} wide={wide}");
+
+                let cp = live.checkpoint_carry(0).expect("Ground");
+                let mut adopted = Terminal::new(1, 20);
+                adopted.apply_config(&config);
+                adopted.restore_checkpoint(&cp);
+                let fresh = Terminal::from_checkpoint(&cp);
+                for (at, restored) in [("restore", &adopted), ("from_checkpoint", &fresh)] {
+                    assert_eq!(bar_col(restored), Some(bar), "{at} {text:?} wide={wide}");
+                }
+
+                // Through history and a width change: scroll the row off a
+                // 1-row screen, rewrap at 19 columns, and grow the screen so
+                // the rebuilt row comes back.
+                let mut scrolled = Terminal::new(1, 20);
+                scrolled.apply_config(&config);
+                scrolled.process(text.as_bytes());
+                scrolled.process(b"\r\n");
+                scrolled.resize(4, 19);
+                let back = (0..4).find_map(|r| {
+                    (0..19).find(|&c| scrolled.grid().cell(r, c).is_some_and(|x| x.char() == '|'))
+                });
+                assert_eq!(back, Some(bar), "history {text:?} wide={wide}");
+            }
+            // A carry that lands BETWEEN a VS16-widened non-BMP base and its
+            // skin tone: the restored base is a complex cell holding the VS16,
+            // and the tone still folds (🖐️🏽 is 2 cells either side of the carry).
+            let mut live = Terminal::new(1, 20);
+            live.apply_config(&config);
+            live.process("\u{1F590}\u{FE0F}".as_bytes());
+            let cp = live.checkpoint_carry(0).expect("Ground");
+            let mut adopted = Terminal::new(1, 20);
+            adopted.apply_config(&config);
+            adopted.restore_checkpoint(&cp);
+            let mut fresh = Terminal::from_checkpoint(&cp);
+            fresh.apply_config(&config);
+            for (at, restored) in [("restore", &mut adopted), ("from_checkpoint", &mut fresh)] {
+                restored.process("\u{1F3FD}|".as_bytes());
+                assert_eq!(bar_col(restored), Some(2), "{at} split carry wide={wide}");
+            }
+        }
     }
 
     /// End-to-end pin for the wide-glyph wrap tail, driven as bytes so the SGR

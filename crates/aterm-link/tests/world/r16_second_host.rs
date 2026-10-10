@@ -223,8 +223,12 @@ fn free_port() -> u16 {
 /// Start the broker with EXACTLY the argv `on --service none` printed, and
 /// wait for its readiness line.
 fn spawn_printed_broker(argv_line: &str) -> Proc {
+    use aterm_uds::spawnfd::InheritNothing as _;
     let words: Vec<&str> = argv_line.split_whitespace().collect();
+    // std's, for `harness::first_line_within`, with the strip: the broker holds
+    // its stdio and nothing else of this process while it serves.
     let mut child = Command::new(words[0])
+        .inherit_nothing()
         .args(&words[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

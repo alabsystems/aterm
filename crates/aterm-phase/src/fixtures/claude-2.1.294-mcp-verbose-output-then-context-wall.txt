@@ -1,0 +1,21 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (the review of H6-HARNESS-1 pass 2), `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP tool (verbose output) whose one-block result opens with a login-wall phrase, then the follow-up request too long: the real context wall Claude Code draws as a SECOND column-2 `⎿` row under the MCP call, the same shape as an MCP result of two blocks
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ github - get_one (MCP)(n: 7)
+  ⎿  Not logged in · Please run /login
+     second row
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Churned for 3s · done 8:46 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents                                                                               21426 tokens

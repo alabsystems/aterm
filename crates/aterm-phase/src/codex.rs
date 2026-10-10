@@ -574,6 +574,7 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
         message,
         row: head,
         placement: Placement::Banner,
+        under_call: false,
     })
 }
 

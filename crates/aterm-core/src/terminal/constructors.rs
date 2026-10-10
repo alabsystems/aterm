@@ -78,6 +78,7 @@ impl Terminal {
             sixel: SixelState::new(),
             window_callback: None,
             text_selection: crate::selection::TextSelection::new(),
+            mouse_report_memo: None,
             parked_text_selection: crate::selection::TextSelection::new(),
             resize_undo_selection: None,
             last_custody: None,

@@ -25,9 +25,18 @@
 //! socketpair end mid-`pair()`) can reach the child; this process serves the near ends through its
 //! ordinary request loop with [`crate::control::Scope::Bridge`] PRE-RESOLVED, so
 //! no `AUTH` line is read and no token exists. **The authority is the
-//! descriptor.** A second process cannot present it, an agent inside a session
-//! cannot ask for it, and there is no file to steal — the only way to be the
-//! bridge is to be the process this function spawned.
+//! descriptor.** A second process cannot present it and there is no file to
+//! steal — the only way to be the bridge is to be the process this function
+//! spawned. WHICH process that is, is chosen by whoever ARMS the supervisor:
+//! the `[fabric] command` the instance was launched with, or, on a running
+//! instance, an `Owner`-scope `fabric attach [<argv>]` (`aterm fabric on`
+//! uses it), and a client in a session holds `Owner` too. So the guarantee
+//! is that `Owner` arms the bridge, ONCE per process (the latch), and never
+//! acts as it — not that no agent can arm one: on an instance with no
+//! supervisor armed, an agent in a session can (control_verbs' `fabric` row,
+//! Owner exactly because arming chooses the process that holds
+//! `Scope::Bridge`; ruling 2026-10-08, the review that found this line
+//! overstated it).
 //!
 //! The child gets NO token and NO socket path, and its environment is aterm's own
 //! with [`aterm_types::domain::is_ai_env_key`] applied — the SAME deny list the

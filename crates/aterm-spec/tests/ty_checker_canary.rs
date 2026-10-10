@@ -10,26 +10,21 @@
 //!
 //! ## Why this exists
 //!
-//! On 2026-08-06 `spec_xref_closure` went red with a dead-action tier
-//! disagreement. The root cause was a driver that had not armed reduction off —
-//! fixed — but underneath it was something the fix only routed around: the `ty`
-//! that `find_trust_bin` selected then had an **unsound partial-order
-//! reduction**. Given `RainbowJumpBurstLifecycle` at `Buggy = 1`, where
+//! A `ty` that `find_trust_bin` once selected had an **unsound partial-order
+//! reduction**: given `RainbowJumpBurstLifecycle` at `Buggy = 1`, where
 //! `NoLostFadePayload` is violated three steps from `Init`, it collapsed the
 //! 128-state space to one, printed `Model checking complete: No errors found
-//! (exhaustive).` under a `Soundness mode: Sound` banner, and exited 0.
-//!
-//! The atpkg store's `ty 0.13.0` finds the violation unarmed (a 3-state
-//! counterexample; measured 2026-09-25), so this canary passes silently today.
-//! It stays as the regression detector for the next `ty` that does not.
+//! (exhaustive).` under a `Soundness mode: Sound` banner, and exited 0. The
+//! atpkg store's `ty 0.13.0` finds the violation unarmed (a 3-state
+//! counterexample), so this canary passes silently; it stays as the detector
+//! for the next `ty` that does not.
 //!
 //! ## Why a NOTICE and not a failure
 //!
-//! The house idiom for a toolchain-state problem is the one AGENTS.md sets for
-//! the escalation tier: *"print a prominent notice and return early where the
-//! tool is absent — never a silent false `ok`, and never claimed as discharged."*
-//! A red suite would also make every unrelated change look broken, and the
-//! remedy here is one rebuild command on a toolchain this repo does not own.
+//! A toolchain-state problem prints a prominent notice and returns early —
+//! never a silent `ok`, never claimed as discharged. A red suite would make
+//! every unrelated change look broken, and the remedy is on a toolchain this
+//! repo does not own.
 //!
 //! The soundness of aterm's gates does NOT rest on this test: every `ty check`
 //! arms reduction off (`ty_drivers_are_armed` enforces that structurally), so a
@@ -43,12 +38,10 @@ use aterm_spec::{interp, verify};
 
 /// THE FIXTURE: the retired v1 rainbow jump-burst ring, `RainbowJumpBurstLifecycle`.
 ///
-/// It no longer describes any code — the burst ring it modelled was deleted with
-/// the v1 rainbow kitty (`48ea44608`), and the model left the registry with it —
-/// so it lives here and only here, as a CHECKER fixture: its shape (a stutter
-/// action, `SlowJump`, beside a violation three steps from `Init`) is the one
-/// that exposed the unsound reduction, and the incident histories in
-/// `aterm_spec::verify` name it by this module name.
+/// It describes no code and is in no registry; it lives here only as a CHECKER
+/// fixture: its shape (a stutter action, `SlowJump`, beside a violation three
+/// steps from `Init`) is the one that exposed the unsound reduction, and the
+/// incident histories in `aterm_spec::verify` name it by this module name.
 fn unsound_reduction_fixture() -> Model {
     aterm_spec::ty_model! {
         RainbowJumpBurstLifecycle {

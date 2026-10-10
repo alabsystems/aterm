@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// FIX 3, THE SAME BOX IS ONE POINT: the review key of a box (`box_key`,
-// through the loop's own reader) and the one ask a box gets however the
-// vendor redraws it — and the negative controls, two boxes that ARE two
-// requests asked twice. The incident: `CLEARED` then `ESCALATED` 7 s apart at
-// seq 94641/95788 of 2026-09-25 (journal s-37abc0e2b7ce6da3acbd), the same
-// box re-alerting. Included into `run.rs`'s test module (`mod engine`'s
+// FIX 3, THE SAME BOX IS ONE POINT: the review key of a box (`box_key`, through
+// the loop's own reader) and the one ask a box gets however the vendor
+// redraws it — and the negative controls, two boxes that ARE two requests
+// asked twice. The replayed incident: one box re-alerting, `CLEARED` then
+// `ESCALATED` 7 s apart. Included into `run.rs`'s test module (`mod engine`'s
 // `mod box_key`), where `Mock`, the engine's box helpers and its journal live.
 
 use aterm_phase::prompt::fixtures as f;
@@ -14,8 +13,7 @@ use aterm_phase::prompt::fixtures as f;
 /// The measured rm box (Claude Code 2.1.283, 80x24, 2026-09-25) as read
 /// before the supervisor's `1`, and the same box 5 ms after it was taken:
 /// its countdown and one blank row wiped, the transcript reflowed above it
-/// (`Listed 1 directory` scrolled into view), the box still drawn
-/// (d3d9ba9b1).
+/// (`Listed 1 directory` scrolled into view), the box still drawn.
 const BEFORE: &str = include_str!("policy/fixtures/cap-taken-box-1-before.txt");
 const REDRAWN: &str = include_str!("policy/fixtures/cap-taken-box-2-redrawn.txt");
 
@@ -114,7 +112,7 @@ fn ticking(left: &str) -> Vec<String> {
 }
 
 /// [`ticking`] in a grid narrower than the countdown: its tail wrapped onto
-/// a row of its own (the round-2 review's shape).
+/// a row of its own.
 fn ticking_wrapped(left: &str) -> Vec<String> {
     let mut r = ticking(left);
     let i = r
@@ -238,7 +236,7 @@ fn asked(tag: &str, script: Vec<Vec<String>>, opts: &SuperviseOpts) -> (Asked, M
 
 /// K1: THE BOX KEY HOLDS across every way the vendor redraws one box, each
 /// pair proven a real change of the rows first: (a) the MEASURED redraw
-/// (d3d9ba9b1: the countdown and a blank row wiped, the transcript reflowed
+/// (the countdown and a blank row wiped, the transcript reflowed
 /// above it); (b) the same box re-wrapped at another width (SYNTHESIZED,
 /// [`rewrapped`]: a command row broken mid-token and at a space, the note
 /// and countdown broken elsewhere, the transcript re-wrapped and a row
@@ -426,8 +424,8 @@ fn the_box_key_is_the_readers() {
 /// L1, THE INCIDENT'S SHAPE: a box handed over, then redrawn (measured) and
 /// re-wrapped (synthesized), each read twice, with no busy read between —
 /// one `EVENT prompt`, one badge, one ask, one `ESCALATED`, no `CLEARED`.
-/// Under the key before FIX 3 each new drawing was the box answered and a new
-/// one raised: three of each, and the incident's `CLEARED`/`ESCALATED` pair.
+/// The old layout key ([`layout_key`]) read each drawing as a new box: three
+/// of each, and the incident's `CLEARED`/`ESCALATED` pair.
 #[test]
 fn a_redrawn_box_is_asked_once() {
     let script = vec![
@@ -445,7 +443,7 @@ fn a_redrawn_box_is_asked_once() {
 /// L2, THE TICKING COUNTDOWN: the 2.1.281 rm box, its countdown ticking
 /// 1:59, 1:58, 1:57 and then wrapped onto two rows, handed over by the safe
 /// rules (`rm_breaker_ask`) and under `approve = "none"` alike — one ask.
-/// Under the key before FIX 3 every tick was a new box asked again.
+/// The old layout key read every tick as a new box.
 #[test]
 fn a_ticking_countdown_is_asked_once() {
     let script = vec![
@@ -467,8 +465,8 @@ fn a_ticking_countdown_is_asked_once() {
 /// own `await gone` (it latches whenever another screen is scripted), and
 /// with the server's judgement (`gone_on_next`): the box's first row — its
 /// path — never leaves the screen, so the wait on it runs out, and only the
-/// read after the step that ran out sees the second box (FIX 3's probe in
-/// `wait_for_next`; without it the second box was never looked at).
+/// read after the step that ran out sees the second box (the probe in
+/// `wait_for_next`; without it the second box is never looked at).
 #[test]
 fn two_edit_boxes_on_one_path_are_two_asks() {
     for servers in [false, true] {
@@ -559,8 +557,8 @@ fn a_box_redrawn_through_a_writing_frame_is_asked_once() {
 /// on a read made after the settle (an `await seq` before its badge), and
 /// its redraws after the ask are the same point — one ask. The box stands
 /// until its badge is up (`attention_gates`), so the settle runs out on it.
-/// Under the key before FIX 3 the redrawn box was a new point: its settle
-/// started over (`Step::Again`) and it was asked a second time.
+/// The old layout key read the redraw as a new point: its settle started
+/// over (`Step::Again`) and it was asked a second time.
 #[test]
 fn a_redrawn_box_under_the_settle_is_asked_once_after_the_settle() {
     let settle = Duration::from_millis(300);
@@ -760,18 +758,16 @@ fn edit_amended() -> Vec<String> {
     )
 }
 
-/// L9 (the review of 63f891a38, its blocker): a box someone is ANSWERING —
-/// a person, or the manager it was handed to — is asked ONCE, under the
-/// server's own `await gone` (`gone_on_next`): the box's first row stands, so
-/// every wait on it runs out. The measured multi-select ticked (the review's
-/// own probe, which asked twice), the measured free-text field typed into,
-/// the measured preview with its focus moved and its pane following it
+/// L9: a box someone is ANSWERING — a person, or the manager it was handed
+/// to — is asked ONCE, under the server's own `await gone` (`gone_on_next`):
+/// the box's first row stands, so every wait on it runs out. The measured
+/// multi-select ticked, the measured free-text field typed into, the
+/// measured preview with its focus moved and its pane following it
 /// (HAND-BUILT from the capture), the measured Edit box with its focus moved
 /// to option 3 and with text typed into option 1 (`Tab to amend`,
 /// HAND-BUILT), and the measured subagent box with the main thread printing
 /// a row over it (HAND-BUILT): one `EVENT prompt`, one badge, one ask, no
-/// `CLEARED` — where 63f891a38 asked twice in every case but the Edit box's
-/// focus move, its badge cleared and raised again. A question and
+/// `CLEARED` (never the badge cleared and raised again). A question and
 /// a command are read again only when their row leaves — no read at all
 /// while they stand; a file box is read once a step, and its request (title
 /// to question) holds while its options change.
@@ -873,14 +869,12 @@ fn suite_box(transcript: &[&str]) -> Vec<String> {
     r
 }
 
-/// L10 (the review of 63f891a38, its other blocker): the same long command
-/// asked AGAIN after it failed — its error and the worker's next words
-/// appended above the new echo, the busy spell between unseen (`await idle`
-/// passes over it, as in the reviewers' "a retried push") — is a new point,
-/// printed twice. The window of [`ABOVE_LETTERS`] right over the title is the
-/// echo alone, the same letters in both (shown first: the case the review
-/// measured, where 63f891a38 printed one), so the key counts the letters
-/// above the echo ([`before_the_echo`]).
+/// L10: the same long command asked AGAIN after it failed — its error and
+/// the worker's next words appended above the new echo, the busy spell
+/// between unseen (`await idle` passes over it, as in a retried push) — is a
+/// new point, printed twice. The window of [`ABOVE_LETTERS`] right over the
+/// title is the echo alone, the same letters in both (shown first), so the
+/// key counts the letters above the echo ([`before_the_echo`]).
 #[test]
 fn a_retried_long_command_is_asked_again() {
     let said = "⏺ The fix is in; running the integration suite on one thread.";
@@ -953,11 +947,12 @@ enum Seen {
     Box { req: i64, form: i64 },
 }
 
-/// THE KEY BEFORE FIX 3 — `review_key` of 541638f45, its arm for a prompt,
-/// rebuilt from the helpers it used (`event_summary`, still the same for a
-/// box; `status_row`; `prompt_box_span`; the last [`KEY_ROWS`] rows' words,
-/// `push_words_above`): the box's rows VERBATIM, its focus marker and
-/// countdown with them, and the words of the rows above it one by one.
+/// THE OLD LAYOUT KEY (the spec's "key before FIX 3") — the former
+/// `review_key`'s arm for a prompt, rebuilt from the helpers it used
+/// (`event_summary`, still the same for a box; `status_row`;
+/// `prompt_box_span`; the last [`KEY_ROWS`] rows' words, `push_words_above`):
+/// the box's rows VERBATIM, its focus marker and countdown with them, and
+/// the words of the rows above it one by one.
 /// Kept for the Tier-1 negative control alone: walked over the same reads,
 /// it must be refused.
 fn layout_key(rows: &[String]) -> String {
@@ -1132,7 +1127,7 @@ fn walk_reads(
 /// One script of the Tier-1 bind: its screens, each as the model sees it;
 /// whether `await idle` never latches (a screen being written never holds
 /// still); whether `await gone` is the server's (`gone_on_next`: a box's
-/// first row that stands runs the wait out); whether the key before FIX 3
+/// first row that stands runs the wait out); whether the old layout key
 /// must be refused walking its reads (the historical bug replayed); and the
 /// dial that must break an invariant walking them.
 struct Walked {
@@ -1159,7 +1154,7 @@ struct Walked {
 /// looked at.
 ///
 /// NEGATIVE CONTROLS. THE HISTORICAL BUG REPLAYED: S1 and S2 walked with the
-/// key before FIX 3 ([`layout_key`]) are refused on the key — the redraw and
+/// old layout key ([`layout_key`]) are refused on the key — the redraw and
 /// the tick it read as another box. And the model alone (non-vacuity): the
 /// key of the drawing (`Drawing = 1`, S1), the key of the head alone
 /// (`Coarse = 1`, S3) and a writing read taken for work (`WritingWorks = 1`,
@@ -1328,8 +1323,8 @@ fn tier1_the_box_is_asked_once_per_request() {
         if layout_refused {
             let layout: KeyOf<'_> = &layout_key;
             match walk_reads(&model, &screens, &m, Some(layout)) {
-                Err(e) => assert!(e.starts_with("key: "), "{tag}, the key before FIX 3: {e}"),
-                Ok(n) => panic!("{tag}: the key before FIX 3 is not refused ({n} asks)"),
+                Err(e) => assert!(e.starts_with("key: "), "{tag}, the old layout key: {e}"),
+                Ok(n) => panic!("{tag}: the old layout key is not refused ({n} asks)"),
             }
         }
         if let Some((dial, invariant)) = caught {

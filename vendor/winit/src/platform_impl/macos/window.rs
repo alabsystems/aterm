@@ -69,9 +69,16 @@ impl Window {
         // file needed `objc2_foundation` because a struct field in
         // `event_loop.rs` had that type, not because of anything written here.
         let mtm = window_target.mtm;
+        // LOCAL PATCH (aterm), 2026-09-26: a display-free loop (`headless.rs`)
+        // has no application, so no window: an error, never an `NSWindow`.
+        let Some(app_delegate) = window_target.app_delegate() else {
+            return Err(os_error!(super::OsError::CreationError(
+                "cannot create a window on a headless event loop: it has no display"
+            )));
+        };
         let delegate = autoreleasepool(|_| {
             // LOCAL PATCH (aterm), W9: `WindowDelegate::new` takes a witness now.
-            WindowDelegate::new(window_target.app_delegate(), attributes, mtm)
+            WindowDelegate::new(app_delegate, attributes, mtm)
         })?;
         Ok(Window {
             window: MainThreadBound::new(delegate.window().retained(), mtm),

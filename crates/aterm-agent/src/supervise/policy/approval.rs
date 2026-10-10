@@ -88,8 +88,7 @@
 //!   credits`) is no consent: Claude Code draws it exactly when the account
 //!   holder switched the credits off, so its yes is spend the account's own
 //!   configuration took away — read as a purchase ([`buys`]), and the box
-//!   answered with the option that waits (the hazards review of
-//!   2026-09-25; *"configuration limits power"*);
+//!   answered with the option that waits (*"configuration limits power"*);
 //! * and never a PURCHASE ([`buys`]: an option whose label OPENS with buy,
 //!   purchase, add funds, upgrade, subscribe, usage credits, or a spend limit
 //!   raised — `Yes, buy usage credits`, `Add funds to continue with …`,
@@ -105,8 +104,6 @@
 //! A box none of that answers — its only yes a standing grant or a purchase,
 //! and nothing that waits — is DECLINED: its `No` ([`RULE_DECLINE`]), and the
 //! worker's turn ends on the refusal, which the turn-end policy continues.
-//! What is left for a person is what no reader can answer: a box whose
-//! options carry no roles (one parsed with unsound options).
 //!
 //! **Program-neutral.** Full power reads the box by its options' ROLES, which
 //! each program's reader assigns ([`aterm_phase::read`]): Codex's exec and
@@ -230,10 +227,9 @@
 //!   each joined with spaces — a soft wrap — and, in a box with `│` bars,
 //!   with newlines — a statement break). A newline ends a segment and a
 //!   space does not, so `git status⏎touch x` shown as two rows is one read
-//!   under the space reading and a write under the other (audit APR-5); a
-//!   row the parser shows as the description may be the command's tail
-//!   (lane B's review: a barred `Rm -rf …` row read as prose was never
-//!   judged). Never narrowed for this rule: only the rm breaker's box,
+//!   under the space reading and a write under the other; a row the parser
+//!   shows as the description may be the command's tail (a barred `Rm -rf …`
+//!   row read as prose). Never narrowed for this rule: only the rm breaker's box,
 //!   whose geometry was measured, drops a row the box proves is no wrap
 //!   of the command ([`command_readings`]). Never on a box that
 //!   carries a vendor note row, and never in a bypass session: there every
@@ -252,13 +248,11 @@
 //!   assign — or is a directory the line's own `mktemp -d` made, `"$D"` or
 //!   a path under it — ([`super::rm_breaker`]; `$TMPDIR` is a root a
 //!   literal path may sit in, never a value) AND the rest of the line is a
-//!   read
-//!   ([`classify_except_rm`]), on a box that runs on this machine (a
-//!   `(runs on <m>)` box's targets resolve there, not here). The rest was
-//!   once left unjudged ("in bypass it
-//!   runs unasked anyway"), but the bypass it knows of was read off a footer
-//!   the box has since replaced, and a shift-tab out of bypass inside that
-//!   window left the whole line approved (lane B's review) — so it is judged.
+//!   read ([`classify_except_rm`]), on a box that runs on this machine (a
+//!   `(runs on <m>)` box's targets resolve there, not here). The rest is
+//!   judged, not left to bypass: the bypass the breaker knows of was read
+//!   off a footer the box has since replaced, so a shift-tab out of bypass
+//!   in that window would approve the whole line.
 //!   The breaker is recognised as a family ([`PromptV2::rm_breaker`]): the
 //!   resolver runs for the `rm` possibly-empty-variable form only (both of
 //!   its [`RmBreakerKind::EmptyVariable`] spellings), the one it was written
@@ -274,7 +268,7 @@
 //!   `/private/tmp/claude-<uid>`) and outside the [`SecretRule`] list — the
 //!   path as written AND as its symlinks resolve ([`real_components`]), so
 //!   a committed `docs/k -> ~/.ssh/id_rsa` under an allowed root is judged
-//!   where it leads (lane B2's review). A link the worker makes after the
+//!   where it leads. A link the worker makes after the
 //!   read is not seen: the check is the read's, not the Read's.
 //! * [`RULE_TRUST_DIALOG`] — Claude Code's folder-trust dialog, when the
 //!   folder it asks about is the session's own working directory (`meta
@@ -284,11 +278,10 @@
 //!   then Enter, the Enter only once a fresh read shows the focus on
 //!   `Yes, I trust this folder` (the loop's part).
 //!
-//! **Which option** (the safe rules). Only the plain one-shot allow ([`Role::Once`] — `Yes`,
-//! `Yes, proceed`, `Yes, run it`, Chrome's `Allow`) — by its digit, or on
-//! an unnumbered box by moving the focus to it — or the trust dialog's
-//! [`Role::Trust`];
-//! never a [`Role::Session`], [`Role::Persist`] or [`Role::ModeSwitch`]
+//! **Which option** (the safe rules). Only the plain one-shot allow
+//! ([`Role::Once`] — `Yes`, `Yes, proceed`, `Yes, run it`, Chrome's `Allow`)
+//! — by its digit, or on an unnumbered box by moving the focus to it — or
+//! the trust dialog's [`Role::Trust`]; never a [`Role::Session`], [`Role::Persist`] or [`Role::ModeSwitch`]
 //! grant, which would turn one verdict into a standing wildcard, and never
 //! [`Role::Other`] — what aterm-phase gives every option of a box whose
 //! options are not sound, and every option of every Codex box.
@@ -296,8 +289,8 @@
 //! **Which program.** The box is read by the reader for the session's
 //! PROGRAM ([`aterm_phase::read`]), and only on a reading whose phase is the
 //! reader's evidence ([`Reading::phase_authoritative`]): a shell showing a
-//! captured box, a pager — no agent's box, never pressed. The four safe rules were measured
-//! on Claude Code's boxes and judge only those: under `"safe"` another
+//! captured box, a pager — no agent's box, never pressed. The four safe rules
+//! were measured on Claude Code's boxes and judge only those: under `"safe"` another
 //! agent's box is escalated.
 //!
 //! **The press.** An approval carries the guard to press it under
@@ -353,7 +346,6 @@
 //! same `No` (`allowEmptySubmitToCancel`, 189912662). A box with no plain
 //! `No` or no `Tab to amend` offers no way to give the worker a reason, and
 //! is escalated instead ([`decline`]).
-//!
 //!
 //! **A BOX TALLER THAN THE SCREEN, DECLINED** ([`RULE_TALL_BOX`],
 //! [`tall_box`]). Measured 2026-09-25 (Claude Code 2.1.282/2.1.283, a live
@@ -861,8 +853,14 @@ pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRo
 }
 
 /// The defaults for `trust_roots` when no config names any
-/// (`SupervisorConfig::default`'s).
-const DEFAULT_TRUST_ROOTS: &[&str] = &["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"];
+/// (`SupervisorConfig::default`'s): the owner's projects under the developer root
+/// (`atpkg::devroot`, `~/Developer`), and Claude Code's own scratch folder.
+const DEFAULT_TRUST_ROOTS: &[&str] = &[
+    "~/Developer/aterm*",
+    "~/Developer/ay*",
+    "~/Developer/trust*",
+    "/private/tmp/claude-*",
+];
 
 /// Everything [`decide`] knows besides the box.
 #[derive(Debug, Clone)]
@@ -969,7 +967,8 @@ impl ApprovalCtx {
     /// Scratch roots: `/private/tmp/claude-<uid>/`, `tmpdir` (a root for literal
     /// paths, when at least two levels deep and holding neither `cwd` nor
     /// `home`), any `/tmp/<x>/` and `/private/tmp/<x>/`, and `<cwd>/target*`.
-    /// Trust roots `~/aterm*`, `~/ay*`, `$HOME/trust*`, `/private/tmp/claude-*`
+    /// Trust roots `~/Developer/aterm*`, `~/Developer/ay*`, `~/Developer/trust*`,
+    /// `/private/tmp/claude-*`
     /// ([`Self::set_trust_roots`] replaces them). Read roots: trust roots plus
     /// `/usr`, `/etc`, `/private/etc`, `/opt/homebrew`,
     /// `/private/tmp/claude-<uid>`. [`default_secrets`], cwd known, not bypass,
@@ -2715,10 +2714,9 @@ fn opens_with(label: &str, words: &[&str]) -> bool {
 /// been captured on a screen.
 ///
 /// A reset is a counted allowance with a deadline, and the weekly one claims
-/// with no confirmation at all. Before 2026-10-02 a confirmation whose title
-/// row was off the screen fell to [`allow_once`], whose first plain yes is
-/// `Yes, use my reset`: full power would have spent a reset nobody asked it
-/// to. Now such a box is pressed by no rule (it is not read whole,
+/// with no confirmation at all. A confirmation whose title row is off the
+/// screen would fall to [`allow_once`], whose first plain yes is `Yes, use my
+/// reset`; so such a box is pressed by no rule (it is not read whole,
 /// [`head_unread`]), a box that offers one gets the option that waits (`No,
 /// keep it`, [`RULE_NO_SPEND`]), and the grant row is chosen by
 /// [`RULE_LIMIT_RESET`] alone.

@@ -93,7 +93,7 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     );
     assert!(model.fire("ReAsk", &mut at_break));
 
-    // CLAUDE'S OWN STATUS LAGS AN IDLE SCREEN (the review of 2026-09-27):
+    // CLAUDE'S OWN STATUS LAGS AN IDLE SCREEN:
     // `busy` or `shell` over a screen read idle, nothing under the agent the
     // kernel can see. Work in the agent's own process may still run, and the
     // status is the one word that says so: the agent is never ended on it.

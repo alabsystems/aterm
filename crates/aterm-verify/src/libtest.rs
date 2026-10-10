@@ -153,34 +153,60 @@ pub fn ran_no_test(log: &str) -> bool {
     log.lines().any(|l| header(l).is_some()) && !log.lines().any(|l| l.starts_with("test result: "))
 }
 
-/// The line a test binary prints, once, when macOS's `trustd` did not answer
-/// and its code-signing and TLS tests returned without asserting anything
-/// (`aterm_uds::deadline::SKIPPED`). Included from aterm-uds's own file, not
-/// copied and not a dependency: this crate takes none (its Cargo.toml).
-pub(crate) mod trustd {
+/// The lines a test binary prints, once each, when a macOS service it needs
+/// did not answer and its tests of it returned without asserting anything
+/// (`aterm_uds::deadline::{SKIPPED, DISK_IMAGE_SKIPPED}`). Included from
+/// aterm-uds's own file, not copied and not a dependency: this crate takes
+/// none (its Cargo.toml).
+pub(crate) mod skipped {
     include!("../../aterm-uds/src/deadline/skipped.rs");
 }
 
-/// The head of the test stage's skip row for binaries that skipped because
-/// `trustd` did not answer ([`trustd_skip`]).
-pub const TRUSTD_SKIPPED: &str = "tests: trustd did not answer — ";
+/// A macOS service whose silence a test binary names with one line: the line,
+/// the head of the test stage's skip row for it, what its tests check, and
+/// what clears it.
+struct Wedged {
+    line: &'static str,
+    head: &'static str,
+    checks: &'static str,
+    remedy: &'static str,
+}
 
-/// The binaries of a `targo test` log that printed aterm-uds's `SKIPPED`
-/// line: each by its crate and target, in log order, once. Matched anywhere
-/// in a line: on one test thread libtest has already written `test x ... `
-/// when the notice lands, and on many another thread's line can follow it
-/// before its newline.
+/// Every service a test skips for: each gets its own row ([`host_skips`]).
+const WEDGED: [Wedged; 2] = [
+    Wedged {
+        line: skipped::SKIPPED,
+        head: "tests: trustd did not answer — ",
+        checks: "code-signing and TLS checks",
+        remedy: "rebooting the Mac clears a wedged trustd",
+    },
+    Wedged {
+        line: skipped::DISK_IMAGE_SKIPPED,
+        head: "tests: hdiutil did not answer — ",
+        checks: "disk-image checks",
+        remedy: "rebooting the Mac clears a wedged disk-image service",
+    },
+];
+
+/// `true` for a skip row of [`host_skips`]: it names what clears it (a
+/// reboot), so no re-run here lifts it.
 #[must_use]
-pub fn trustd_skipped(log: &str) -> Vec<String> {
-    if log.contains('\x1b') {
-        return trustd_skipped(&strip_ansi(log));
-    }
+pub fn is_host_skip(row: &str) -> bool {
+    WEDGED.iter().any(|w| row.starts_with(w.head))
+}
+
+/// The binaries of a `targo test` log that printed `line`: each by its crate
+/// and target, in log order, once. Matched anywhere in a line: on one test
+/// thread libtest has already written `test x ... ` when the notice lands, and
+/// on many another thread's line can follow it before its newline.
+#[must_use]
+fn printed(log: &str, line: &str) -> Vec<String> {
     let mut at: Option<String> = None;
     let mut found: Vec<String> = Vec::new();
-    for line in log.lines() {
-        if let Some(h) = header(line) {
+    for l in log.lines() {
+        if let Some(h) = header(l) {
             at = Some(short_binary(&h));
-        } else if line.contains(trustd::SKIPPED) {
+        } else if l.contains(line) {
             let name = at.clone().unwrap_or_else(|| "a test binary".to_string());
             if !found.contains(&name) {
                 found.push(name);
@@ -190,22 +216,32 @@ pub fn trustd_skipped(log: &str) -> Vec<String> {
     found
 }
 
-/// The test stage's ONE skip row when any binary skipped because `trustd` did
-/// not answer ([`trustd_skipped`]): what ran stays decided, and this names
-/// what did not and what clears it. `None` when none did.
+/// The test stage's skip rows, ONE per service whose silence any binary named
+/// ([`WEDGED`]): what ran stays decided, and each row names what did not and
+/// what clears it. Empty when none did.
 #[must_use]
-pub fn trustd_skip(log: &str) -> Option<String> {
-    let bins = trustd_skipped(log);
-    let n = bins.len();
-    (n > 0).then(|| {
-        format!(
-            "{TRUSTD_SKIPPED}{n} test binar{} skipped {} code-signing and TLS checks ({}); \
-             rebooting the Mac clears a wedged trustd",
-            if n == 1 { "y" } else { "ies" },
-            if n == 1 { "its" } else { "their" },
-            bins.join(", ")
-        )
-    })
+pub fn host_skips(log: &str) -> Vec<String> {
+    if log.contains('\x1b') {
+        return host_skips(&strip_ansi(log));
+    }
+    WEDGED
+        .iter()
+        .filter_map(|w| {
+            let bins = printed(log, w.line);
+            let n = bins.len();
+            (n > 0).then(|| {
+                format!(
+                    "{}{n} test binar{} skipped {} {} ({}); {}",
+                    w.head,
+                    if n == 1 { "y" } else { "ies" },
+                    if n == 1 { "its" } else { "their" },
+                    w.checks,
+                    bins.join(", "),
+                    w.remedy
+                )
+            })
+        })
+        .collect()
 }
 
 /// `running N test(s)` — the count.
@@ -933,28 +969,47 @@ mod tests {
              {s}\ntest result: ok. 4 passed\n\
              \x20    Running tests/signs.rs (target/debug/deps/signs-5c)\n\
              running 1 test\ntest t::signs ... {s}\nok\ntest result: ok. 1 passed\n",
-            s = trustd::SKIPPED
+            s = skipped::SKIPPED
         );
         assert_eq!(
-            trustd_skipped(&log),
+            host_skips(&log),
             [
-                "aterm_uds unittests src/lib.rs",
-                "contract tests/contract.rs",
-                "signs tests/signs.rs"
-            ]
-        );
-        assert_eq!(
-            trustd_skip(&log).as_deref(),
-            Some(
                 "tests: trustd did not answer — 3 test binaries skipped their code-signing and \
                  TLS checks (aterm_uds unittests src/lib.rs, contract tests/contract.rs, signs \
                  tests/signs.rs); rebooting the Mac clears a wedged trustd"
-            )
+            ]
         );
+        assert!(is_host_skip(&host_skips(&log)[0]));
         let clean = "     Running unittests src/lib.rs (target/debug/deps/x-abc)\n\
                      test result: ok. 1 passed\n";
-        assert!(trustd_skipped(clean).is_empty());
-        assert_eq!(trustd_skip(clean), None);
+        assert!(host_skips(clean).is_empty());
+    }
+
+    /// A wedged disk-image service (2026-10-08: `hdiutil create` timed out
+    /// after 121 s and failed the merge gate on a host fault) is its own row,
+    /// beside trustd's, each naming only the binaries that printed its line.
+    #[test]
+    fn a_silent_disk_image_service_is_its_own_row() {
+        let log = format!(
+            "     Running unittests src/lib.rs (target/debug/deps/aterm_uds-1f2e)\n\
+             running 2 tests\ntest p::dead ... {d}\nok\n{t}\ntest result: ok. 2 passed\n\
+             \x20    Running tests/signs.rs (target/debug/deps/signs-5c)\n\
+             {t}\ntest result: ok. 1 passed\n",
+            d = skipped::DISK_IMAGE_SKIPPED,
+            t = skipped::SKIPPED
+        );
+        assert_eq!(
+            host_skips(&log),
+            [
+                "tests: trustd did not answer — 2 test binaries skipped their code-signing and \
+                 TLS checks (aterm_uds unittests src/lib.rs, signs tests/signs.rs); rebooting \
+                 the Mac clears a wedged trustd",
+                "tests: hdiutil did not answer — 1 test binary skipped its disk-image checks \
+                 (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged disk-image \
+                 service"
+            ]
+        );
+        assert!(host_skips(&log).iter().all(|r| is_host_skip(r)));
     }
 
     /// THE `--report-time` SUFFIX (2026-09-28): a verdict still reads as a
@@ -1210,7 +1265,7 @@ mod tests {
                    \n\
                    running 2 tests\n\
                    test two::fine ... ok\n\
-                   \x20    Running `target/debug/xtask harness-manifest`\n\
+                   \x20    Running `target/debug/xtask gate forge`\n\
                    test two::stuck has been running for over 60 seconds\n";
         let u = scan(log).expect("a test binary's section");
         assert_eq!(

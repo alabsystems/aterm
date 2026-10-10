@@ -23,6 +23,9 @@ pub trait EventLoopBuilderExtHeadless {
     /// SSH session, or under `env -i` — none of which have `DISPLAY` or `WAYLAND_DISPLAY`
     /// set, and all of which would otherwise fail to build an event loop at all.
     ///
+    /// On macOS it keeps a windowless process from being a WindowServer client: the loop
+    /// runs the main `CFRunLoop` and never creates an `NSApplication`.
+    ///
     /// [`EventLoopProxy`]: crate::event_loop::EventLoopProxy
     /// [`ControlFlow`]: crate::event_loop::ControlFlow
     fn with_headless(&mut self) -> &mut Self;
@@ -31,7 +34,15 @@ pub trait EventLoopBuilderExtHeadless {
 impl<T> EventLoopBuilderExtHeadless for EventLoopBuilder<T> {
     #[inline]
     fn with_headless(&mut self) -> &mut Self {
-        self.platform_specific.forced_backend = Some(crate::platform_impl::Backend::Headless);
+        #[cfg(free_unix)]
+        {
+            self.platform_specific.forced_backend = Some(crate::platform_impl::Backend::Headless);
+        }
+        // macOS: the run-loop twin, `platform_impl/macos/headless.rs`.
+        #[cfg(macos_platform)]
+        {
+            self.platform_specific.headless = true;
+        }
         self
     }
 }

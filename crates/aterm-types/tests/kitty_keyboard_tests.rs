@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Integration tests for `KittyKeyboardFlags` and `KittyKeyboardState` push/pop stack semantics.
-//!
-//! Part of #3139: closes keyboard state test coverage gap after extraction to aterm-types.
-//! Tests verify protocol-correct behavior through the public API.
 
 use aterm_types::{
     KittyKeyboardFlags, KittyKeyboardState, KittyKeyboardStateSnapshot, ScreenBuffer,
@@ -136,7 +133,7 @@ fn test_push_set_flags_pop_restores_pre_push_state() {
     state.set_flags(0b1_1111, 1); // flags = 0b11111
     assert_eq!(state.flags().bits(), 0b1_1111);
 
-    // Fixed #5679: Restores the pre-push value (0b11) from stack[0].
+    // Regression #5679: restores the pre-push value (0b11) from stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0b0_0011);
 }
@@ -280,7 +277,7 @@ fn test_screen_buffer_isolation() {
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 
-    // Fixed #5679: Restores pre-push value (1) from alt stack[0].
+    // Regression #5679: restores pre-push value (1) from alt stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 1);
 }
@@ -299,11 +296,11 @@ fn test_screen_buffer_stacks_independent() {
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 
-    // Fixed #5679: Restores pre-push value (flags=3) from alt stack[0].
+    // Regression #5679: restores pre-push value (flags=3) from alt stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 3);
 
-    // Fixed #5679: Restores pre-first-push value (flags=0) from main stack[0].
+    // Regression #5679: restores pre-first-push value (flags=0) from main stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }

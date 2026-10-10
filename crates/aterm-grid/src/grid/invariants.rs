@@ -22,6 +22,10 @@ impl Grid {
             self.assert_scroll_region_valid();
             self.assert_ring_buffer_valid();
             self.assert_keys_cover_retained_rows();
+            // The history byte sums the link budget and `memory_used` read
+            // are running sums: each equals a fresh walk of its rows.
+            self.storage.ring_extras.assert_running_sums();
+            self.storage.lazy_buffer.assert_running_sums();
         }
     }
 

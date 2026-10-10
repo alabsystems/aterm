@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NativeUpdateLaunchedDialWait` (2026-09-29): the outgoing
+//! Tier-0 for `NativeUpdateLaunchedDialWait`: the outgoing
 //! process's wait for its launched successor's dial ends on LaunchServices'
 //! "terminated before it checked in", and on the kernel's word that a pid
 //! LaunchServices named is gone — promptly, without the dial budget — and

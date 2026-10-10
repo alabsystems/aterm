@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Grid construction. The Kani build uses a constructor without symbolic loop
-//! bounds to avoid CBMC state explosion.
+//! Grid construction.
 
 use aterm_scrollback::ScrollbackStorage;
 
@@ -17,7 +16,6 @@ use crate::GenerationTracker;
 use crate::Row;
 use crate::StyleTable;
 use crate::{MAX_GRID_COLS, MAX_GRID_ROWS};
-use std::collections::VecDeque;
 
 impl Grid {
     /// Create a new grid with the given dimensions.
@@ -26,17 +24,8 @@ impl Grid {
         Self::with_scrollback(rows, cols, 10_000)
     }
 
-    /// Create a grid with a custom ring scrollback limit (Kani variant without
-    /// initialization loops).
-    #[cfg(kani)]
-    #[must_use]
-    pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
-        Self::kani_stub_with_scrollback(rows, cols, max_scrollback)
-    }
-
     /// Create a grid with a custom ring scrollback limit. For tiered storage,
     /// use [`Grid::with_tiered_scrollback`].
-    #[cfg(not(kani))]
     #[must_use]
     pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
         // Ingress clamp (§5.8): bound the allocation a hostile caller can request.
@@ -83,7 +72,7 @@ impl Grid {
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
-                ring_extras: VecDeque::new(),
+                ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows),
@@ -184,7 +173,7 @@ impl Grid {
                 scrollback_clear_gen: 0,
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
-                ring_extras: VecDeque::new(),
+                ring_extras: super::ring_extras::RingExtras::new(),
                 resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),

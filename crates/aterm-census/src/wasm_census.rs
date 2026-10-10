@@ -36,7 +36,7 @@
 //!   stale entry red until removed); every detected hazard is registered.
 //! * OB-12 single-threaded tripwire: the shipped closure contains no
 //!   thread-spawn vocabulary (`thread::spawn(`, `thread::Builder`,
-//!   `Worker::new(`) outside test/kani/native-only items. Shipping wasm
+//!   `Worker::new(`) outside test and native-only items. Shipping wasm
 //!   threads fails the build until lock order is extended to this process.
 //!
 //! Consumers: `tools/freeze-safety-gate/build.rs` and the `aterm-census` bin
@@ -58,11 +58,10 @@ use crate::{
 pub const WASM_ROOT_CRATES: &[&str] = &["crates/aterm-gpu-web", "crates/aterm-wasm"];
 
 /// Item gates whose code never compiles into the shipped wasm32 module
-/// (test/kani and native-only items), masked before the walk and the OB-12
+/// (test and native-only items), masked before the walk and the OB-12
 /// sweep. Exact-match: an unrecognized cfg spelling is not masked.
 const WASM_UNSHIPPED_GATES: &[&str] = &[
     "#[cfg(test)]",
-    "#[cfg(kani)]",
     "#[test]",
     "#[cfg(not(target_arch = \"wasm32\"))]",
 ];
@@ -106,7 +105,7 @@ pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         standing findings would no longer be re-detected), forcing a re-audit
         rather than rotting silently.
       - SCOPE: the call graph covers the root crates' non-test src ONLY (masked
-        to the shipped wasm32 surface: #[cfg(test)]/#[cfg(kani)]/#[test]/
+        to the shipped wasm32 surface: #[cfg(test)]/#[test]/
         #[cfg(not(target_arch = \"wasm32\"))] items blanked); deeper reaches are
         pinned by the shared `// COST: UNBOUNDED(<dim>)` markers swept over the
         DERIVED wasm-process closure. The OB-12 spawn sweep covers the whole

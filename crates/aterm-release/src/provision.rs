@@ -506,8 +506,9 @@ pub fn run_provision(
         open: checks
             .iter()
             .filter_map(|(l, c)| match c {
-                Check::Fail { .. } => Some(format!("{l} (gap)")),
+                Check::Fail { .. } | Check::Owner { .. } => Some(format!("{l} (gap)")),
                 Check::Todo { .. } => Some(format!("{l} (waiting)")),
+                Check::CouldNotRun(_) => Some(format!("{l} (could not run)")),
                 _ => None,
             })
             .collect(),
@@ -640,14 +641,14 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
 /// `targo`; targo refuses an implicit lane, so it names its explicit `--unverified` one.
 pub(crate) const SHIP: &str = crate::publish::SHIP_COMMAND;
 
-/// The one line an operator copies off a READY TO CUT transcript. It RUNS as printed:
-/// the profile path is the real one the audit resolved, never a `<profile>` placeholder,
-/// and it goes through the launcher, because a dry run meets the same provenance gate
-/// and paint smoke a real cut does.
+/// The one line an operator copies off a READY TO CUT transcript: the release's own
+/// dry run (the plan, the ETA and every refusal a real run would meet). It RUNS as
+/// printed: the profile path is the real one the audit resolved, never a `<profile>`
+/// placeholder.
 fn cut_dry_run_next(profile_path: &Path) -> String {
     format!(
-        "{} --dry-run --release-credentials {}",
-        crate::publish::CUT_COMMAND,
+        "{} --dry-run --bump --mac-only --release-credentials {}",
+        crate::release::RELEASE_COMMAND,
         profile_path.display()
     )
 }
@@ -722,7 +723,7 @@ fn close(c: Closing<'_>) -> Result<()> {
     }
     let profile_path = Path::new(c.home).join(".aterm/release-credentials.toml");
     // `c.fails + c.waiting == 0` is the whole point: an operator copies the last runnable
-    // command on the screen, so a `NOT DONE` run must not offer `… ship cut --dry-run …`.
+    // command on the screen, so a `NOT DONE` run must not offer `… ship release --dry-run …`.
     if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
         // The command as printed RUNS: it names the real profile path.
         next.push(cut_dry_run_next(&profile_path));
@@ -1343,6 +1344,18 @@ enum Check {
         what: String,
         next: String,
     },
+    /// A gap only the OWNER can close — an account act no command on this machine
+    /// takes (Apple's developer agreement, accepted by the team's Account Holder). It
+    /// blocks exactly as a [`Check::Fail`] does; `ship release` raises it once as an
+    /// ask and keeps running every step that does not need it ([`audit`]).
+    Owner {
+        what: String,
+        fix: String,
+    },
+    /// The check could not be asked (Apple's service did not answer at all): no
+    /// verdict either way. It blocks a mint like a gap, and a release stops at the
+    /// first step that needs the answer, resumable by running it again.
+    CouldNotRun(String),
     Skip(String),
 }
 
@@ -1368,6 +1381,14 @@ fn print_check(label: &str, c: &Check) {
         Check::Todo { what, next } => {
             step(label, &format!("WAITING — {what}"));
             step("", &format!("next: {next}"));
+        }
+        Check::Owner { what, fix } => {
+            step(label, &format!("GAP — {what} (owner)"));
+            step("", &format!("fix: {fix}"));
+        }
+        Check::CouldNotRun(what) => {
+            step(label, &format!("COULD NOT RUN — {what}"));
+            step("", "next: run it again once it answers");
         }
     }
 }
@@ -1432,10 +1453,12 @@ fn verifiers_check(bin: &Path) -> Check {
             // The config key had no FILE and named a tool that is not in the missing
             // list, so neither half of this remedy could be acted on. Name the file and
             // the command.
-            fix: "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
-                  or, from source: set `tools` in $HOME/trust/bootstrap.toml to include every \
-                  driver above, then `python3 x.py build --stage 2` in $HOME/trust"
-                .into(),
+            fix: format!(
+                "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
+                 or, from source: set `tools` in $HOME/trust/bootstrap.toml to include every \
+                 driver above, then rebuild {}",
+                gates::TRUST_FROM_SOURCE
+            ),
         }
     }
 }
@@ -1503,10 +1526,11 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
         // linking it would only relocate the death.
         return Check::Fail {
             what: format!("{} exists but is not executable", target.display()),
-            fix: "an incomplete stage2 — reinstall it (`aterm pkg install trust`, then \
-                  `aterm pkg doctor`) or, from source, rebuild it (`python3 x.py build \
-                  --stage 2` in $HOME/trust)"
-                .into(),
+            fix: format!(
+                "an incomplete stage2 — reinstall it (`aterm pkg install trust`, then \
+                 `aterm pkg doctor`) or, from source, rebuild it ({})",
+                gates::TRUST_FROM_SOURCE
+            ),
         };
     }
     // `-sf` so the remedy is runnable over the dangling link this check
@@ -1660,9 +1684,9 @@ fn front_door_verdict(
 ) -> Check {
     let fix = format!(
         "aterm pkg install trust   (then `aterm pkg which targo` names the store's targo, \
-         `aterm pkg doctor` the prefix)\n  or, from source: python3 x.py build --stage 2, \
-         in $HOME/trust\n  or point TRUST_STAGE2_BIN at a stage2 bin dir carrying both — this \
-         audit resolved {}",
+         `aterm pkg doctor` the prefix)\n  or, from source: {}\n  or point TRUST_STAGE2_BIN \
+         at a stage2 bin dir carrying both — this audit resolved {}",
+        gates::TRUST_FROM_SOURCE,
         bin.display()
     );
     let mut targo_version = String::new();
@@ -1717,9 +1741,7 @@ fn x86_slice_check() -> Check {
                 what: "Rosetta does not run x86_64 programs here — a universal cut runs its \
                        x86_64 slice under it before it ships"
                     .into(),
-                fix: "softwareupdate --install-rosetta --agree-to-license\n\
-                      or:   cut with --arm64-only — an explicit, thinner artifact"
-                    .into(),
+                fix: "softwareupdate --install-rosetta --agree-to-license".into(),
             },
         },
         // The WHOLE fault, untruncated, and the shared remedy text: the explanation (a
@@ -1829,7 +1851,12 @@ fn blockers(checks: &[(&'static str, Check)]) -> usize {
 fn tally(checks: &[(&'static str, Check)]) -> (usize, usize) {
     let count = |f: fn(&Check) -> bool| checks.iter().filter(|(_, c)| f(c)).count();
     (
-        count(|c| matches!(c, Check::Fail { .. })),
+        count(|c| {
+            matches!(
+                c,
+                Check::Fail { .. } | Check::Owner { .. } | Check::CouldNotRun(_)
+            )
+        }),
         count(|c| matches!(c, Check::Todo { .. })),
     )
 }
@@ -1846,6 +1873,246 @@ fn gaps(fails: usize, waiting: usize) -> String {
         parts.push(format!("{waiting} waiting"));
     }
     parts.join(", ")
+}
+
+/// `crate::apple::APPLE_LABEL`, spelled where the release reads it on every host
+/// (apple.rs is unix-only; a test holds the two equal).
+const APPLE_LABEL: &str = "apple id";
+
+/// One provisioning finding, as `ship release` reads it ([`audit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Audited {
+    /// Proven.
+    Pass,
+    /// Missing, with its fix. `owner` when only the owner closes it — an account act,
+    /// a browser errand, a credential only he types (the check itself says so,
+    /// [`Check::Owner`], by the gap's cause) — and the release then asks once and keeps
+    /// running every step that does not need it; otherwise it is this machine's to fix
+    /// (a file mode, a missing tool), and the release refuses before its long steps.
+    Gap {
+        what: String,
+        fix: String,
+        owner: bool,
+    },
+    /// The check could not be asked: nothing is known either way.
+    CouldNotRun(String),
+}
+
+/// One labelled line of [`audit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// The line's label, as `provision --check` prints it (`notary`, `x86 slice`…).
+    pub label: &'static str,
+    pub state: Audited,
+}
+
+/// THE MACHINE AUDIT `ship release` RUNS CONTINUOUSLY: what `provision --check --id
+/// <id>` asks of this machine, the same checks in the same check-only mode (nothing
+/// minted, installed, imported, tightened or written; the Apple and notary steps
+/// observe and acquire nothing), printed by no one — plus the cut's own roster
+/// admission (`machines::authorize_cut` of this machine's key under the roster pair
+/// the cut would read). Each finding says who closes its gap ([`Audited`]).
+#[cfg(unix)]
+#[must_use]
+pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
+    let mut found: Vec<(&'static str, Check)> = Vec::new();
+    let Ok(home) = std::env::var("HOME") else {
+        return vec![Finding {
+            label: "roster",
+            state: Audited::CouldNotRun("HOME is not set".into()),
+        }];
+    };
+    if id.is_empty() {
+        found.push((
+            "roster",
+            Check::Owner {
+                what: "this machine names no roster id (no ~/.aterm/machine.toml, no machine_id \
+                       in its credentials profile) — the cut signs only as a rostered machine"
+                    .into(),
+                fix: format!("{SHIP} provision --id <its roster id> (docs/RELEASE-KEYS.md)"),
+            },
+        ));
+    }
+    let (stack, stage2_bin) = toolchain_check(repo);
+    found.push(("toolchain", stack));
+    if let Some(bin) = &stage2_bin {
+        found.push(("verifiers", verifiers_check(bin)));
+        found.push(("front door", front_door_check(bin)));
+    }
+    found.push(("doc tool", doc_tool_check(&home, true)));
+    found.push(("x86 slice", x86_slice_check()));
+    found.push(("apple sdk", apple_clt_check()));
+    let (apple, apple_sha1) = apple_identity_check(id, false, None);
+    found.push((crate::apple::APPLE_LABEL, apple));
+    found.push(("notary", notary_check()));
+    found.push(("github", gh_check()));
+    let slug = std::fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
+        .and_then(|manifest| channel::update_channel_slug(&manifest))
+        .and_then(|slug| slug.ok_or_else(|| Error::new("no update channel is committed")));
+    match &slug {
+        Ok(slug) => found.push(("channel", channel_token_check(slug, false))),
+        Err(e) => found.push(("channel", Check::CouldNotRun(e.to_string()))),
+    }
+    let derived = sign::ReleaseCredentials::resolve(None, repo)
+        .ok()
+        .flatten()
+        .map(|c| c.pubkey().to_string());
+    found.push((
+        "profile",
+        profile_check(&home, id, apple_sha1.as_deref(), derived.as_deref()),
+    ));
+    let roster = slug.and_then(|slug| {
+        let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
+        atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(&roster_path)?)
+            .map_err(Error::new)?;
+        let local = match read_local_candidate(&roster_path)? {
+            Some(local) => Some(local),
+            None => read_local_candidate(&kept_roster_path(&home))?,
+        };
+        let fetched = fetch_channel_candidate(&slug);
+        let (chosen, _, _) = choose_candidate(&roster_path, &slug, local, fetched)?;
+        let pubkey = derived.clone().ok_or_else(|| {
+            Error::new("this machine holds no release key (~/.aterm/machine.key)")
+        })?;
+        authorize(chosen.bytes, &chosen.sig, &pubkey)
+    });
+    // The roster admits a key only through the paper master's phrase: the owner's.
+    found.push((
+        "roster",
+        match roster {
+            Ok(a) => Check::Pass(format!(
+                "authorize_cut passes: '{}' signs under roster seq {}",
+                a.machine_id, a.roster_seq
+            )),
+            Err(e) => Check::Owner {
+                what: e.to_string(),
+                fix: format!("{SHIP} provision --id {id}"),
+            },
+        },
+    ));
+    found
+        .into_iter()
+        .map(|(label, check)| Finding {
+            label,
+            state: audited(check),
+        })
+        .collect()
+}
+
+/// [`audit`] off unix: there is no provisioning engine to ask.
+#[cfg(not(unix))]
+#[must_use]
+pub fn audit(_repo: &std::path::Path, _id: &str) -> Vec<Finding> {
+    vec![Finding {
+        label: "toolchain",
+        state: Audited::Gap {
+            what: "a release runs on macOS".into(),
+            fix: "release from a provisioned Mac".into(),
+            owner: false,
+        },
+    }]
+}
+
+/// One [`Check`] as the release reads it, by its CAUSE, never its label: an owner
+/// gap ([`Check::Owner`]) or a person's errand at Apple ([`Check::Todo`]) is the
+/// owner's; a fault this machine's operator repairs ([`Check::Fail`]: a file mode, a
+/// missing tool, a keychain) is the machine's; a check that got no answer is
+/// [`Audited::CouldNotRun`].
+#[cfg(unix)]
+fn audited(check: Check) -> Audited {
+    match check {
+        Check::Pass(_) => Audited::Pass,
+        Check::Fail { what, fix } => Audited::Gap {
+            what,
+            fix,
+            owner: false,
+        },
+        Check::Owner { what, fix } => Audited::Gap {
+            what,
+            fix,
+            owner: true,
+        },
+        Check::Todo { what, next } => Audited::Gap {
+            what,
+            fix: next,
+            owner: true,
+        },
+        Check::Skip(why) => Audited::Gap {
+            what: format!("impossible here — {why}"),
+            fix: "release from a provisioned Mac".into(),
+            owner: false,
+        },
+        Check::CouldNotRun(what) => Audited::CouldNotRun(what),
+    }
+}
+
+/// The words an owner gap is asked with (`aterm ctl notice ask`): the row's key, its
+/// glass title (at most six words, no clause), the reason a person and not the
+/// machine is needed (at most `need::REASON_CAP` characters, no word for waiting)
+/// and the ONE step that closes it (at most `need::STEP_CAP`, one action).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskWords {
+    pub key: String,
+    pub title: String,
+    pub reason: String,
+    pub step: String,
+}
+
+/// Where the release channel's token lives, as a person types it
+/// (`publish::channel_token_path`: `$HOME/.secrets/gh_access_token_alabsystems`).
+pub const CHANNEL_TOKEN_HOME: &str = "~/.secrets/gh_access_token_alabsystems";
+
+/// [`AskWords`] for the gap labelled `label` whose words are `what`.
+#[must_use]
+pub fn ask_words(label: &str, what: &str) -> AskWords {
+    let team = aterm_update_core::pins::APPLE_TEAM_ID;
+    let (key, title, reason, step) = match label {
+        "notary" if what.contains("agreement") => (
+            "notary",
+            "Apple agreement blocks the release".to_string(),
+            format!(
+                "Apple's developer agreement for team {team} lapsed, so notarization answers 403"
+            ),
+            "Accept the current agreements at developer.apple.com/account".to_string(),
+        ),
+        "notary" => (
+            "notary",
+            "Notary login blocks the release".to_string(),
+            "Apple refuses the notary credential this Mac stores".to_string(),
+            "Store a new app-specific password with xcrun notarytool store-credentials".to_string(),
+        ),
+        APPLE_LABEL => (
+            "apple-id",
+            "Signing certificate blocks the release".to_string(),
+            "this Mac holds no Developer ID certificate that signs".to_string(),
+            "Finish the certificate errand ship provision starts on this Mac".to_string(),
+        ),
+        "github" => (
+            "github",
+            "GitHub login blocks the release".to_string(),
+            "gh is not signed in on this Mac".to_string(),
+            "Sign in with gh auth login".to_string(),
+        ),
+        "channel" => (
+            "channel",
+            "Channel token blocks the release".to_string(),
+            "only the owner mints the release channel's token, and this Mac holds none".to_string(),
+            format!("Save a new fine-grained channel token to {CHANNEL_TOKEN_HOME}"),
+        ),
+        _ => (
+            "key",
+            "Release key blocks the release".to_string(),
+            "this Mac's release key is not authorized to sign a release".to_string(),
+            "Run targo --unverified ship provision on this Mac".to_string(),
+        ),
+    };
+    AskWords {
+        key: format!("release.{key}"),
+        title,
+        reason,
+        step,
+    }
 }
 
 /// The cut's own admission gate. One spelling, so the pre-Apple check and the post-mint
@@ -1884,7 +2151,11 @@ fn phase(n: usize, name: &str, what: &str) {
 #[cfg(unix)]
 fn notary_acquire(may_change: bool) -> Check {
     match notary_check() {
-        live @ (Check::Pass(_) | Check::Skip(_)) => live,
+        // An agreement only the Account Holder accepts, or a service that did not
+        // answer, is no missing credential: storing one again changes nothing.
+        live @ (Check::Pass(_) | Check::Skip(_) | Check::Owner { .. } | Check::CouldNotRun(_)) => {
+            live
+        }
         // `--check` keeps the LIVE verdict. Routing it into `ensure_notary` returned a
         // blind "no notarytool credential in the keychain" — a statement that is FALSE
         // about the machine when a credential exists and Apple refused it — and threw
@@ -1921,27 +2192,91 @@ fn notary_check() -> Check {
         .args(["notarytool", "history", "--keychain-profile", profile])
         .output()
     {
-        Ok(out) if out.status.success() => Check::Pass(format!(
-            "notarytool profile '{profile}' answers (live-checked)"
-        )),
-        Ok(out) => Check::Fail {
-            what: format!(
-                "notarytool profile '{profile}' did not authenticate: {}",
-                String::from_utf8_lossy(&out.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or("(no error line)")
-            ),
-            fix: format!(
-                "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-                 --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
-                pins::APPLE_TEAM_ID
-            ),
-        },
+        Ok(out) => notary_verdict(
+            profile,
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
         Err(e) => Check::Fail {
             what: format!("could not run xcrun notarytool: {e}"),
             fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
         },
+    }
+}
+
+/// What `notarytool history` answered, as a verdict — EVERY line of its output read,
+/// never the first one alone (pure, so each answer Apple gives is a test).
+///
+/// * An HTTP 403 naming an agreement is Apple's developer agreement, missing or
+///   expired (MEASURED 2026-10-01: `Error: HTTP status code: 403. A required agreement
+///   is missing or has expired. This request requires an in-effect agreement that has
+///   not been signed or has expired.`). No credential fixes it: the team's Account
+///   Holder accepts the agreement on developer.apple.com — a [`Check::Owner`] gap.
+/// * Any other HTTP status (a 401, an invalid password), or a profile the keychain
+///   does not hold: the stored credential is wrong, and `store-credentials` is the fix.
+/// * No HTTP status and a transport error (offline, a timeout): Apple did not answer,
+///   so nothing is known — [`Check::CouldNotRun`].
+#[cfg(unix)]
+fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> Check {
+    if success {
+        return Check::Pass(format!(
+            "notarytool profile '{profile}' answers (live-checked)"
+        ));
+    }
+    let lines: Vec<&str> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
+    let said = |needle: &str| lower.iter().position(|l| l.contains(needle));
+    let first = lines.first().copied().unwrap_or("(no error line)");
+    if let Some(at) = said("status code: 403").or_else(|| said("http 403"))
+        && lower.iter().any(|l| l.contains("agreement"))
+    {
+        return Check::Owner {
+            what: format!(
+                "Apple's developer agreement for team {} is missing or expired — notarytool \
+                 answers: {}",
+                pins::APPLE_TEAM_ID,
+                lines[at]
+            ),
+            fix: format!(
+                "the team's Account Holder accepts the current agreements at \
+                 https://developer.apple.com/account (no credential fixes this: \
+                 store-credentials leaves the 403 as it is), then `{SHIP} release` goes on"
+            ),
+        };
+    }
+    let transport = [
+        "offline",
+        "timed out",
+        "timeout",
+        "could not connect",
+        "network connection",
+        "nsurlerrordomain",
+        "could not be found",
+    ];
+    if said("status code").is_none()
+        && lower
+            .iter()
+            .any(|l| transport.iter().any(|t| l.contains(t)))
+    {
+        return Check::CouldNotRun(format!(
+            "Apple's notary service did not answer notarytool profile '{profile}': {first}"
+        ));
+    }
+    // The credential is an app-specific password minted from the owner's Apple ID:
+    // only he types it.
+    Check::Owner {
+        what: format!("notarytool profile '{profile}' did not authenticate: {first}"),
+        fix: format!(
+            "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
+             --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
+            pins::APPLE_TEAM_ID
+        ),
     }
 }
 
@@ -2092,16 +2427,74 @@ fn profile_check(
 
 #[cfg(unix)]
 fn gh_check() -> Check {
-    match Command::new("gh").args(["auth", "status"]).output() {
-        Ok(out) if out.status.success() => Check::Pass("gh is authenticated".into()),
-        Ok(_) => Check::Fail {
-            what: "gh is not authenticated".into(),
-            fix: "gh auth login".into(),
-        },
-        Err(e) => Check::Fail {
-            what: format!("could not run gh: {e}"),
-            fix: "install the GitHub CLI (`brew install gh`), then `gh auth login`".into(),
-        },
+    let ran = Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .map(|out| {
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        })
+        .map_err(|e| e.to_string());
+    gh_verdict(ran)
+}
+
+/// What `gh auth status` answered, by its CAUSE (pure, so each answer is a test): a
+/// login that is missing or refused is the owner's browser login ([`Check::Owner`]);
+/// a `GITHUB_TOKEN`/`GH_TOKEN` in this shell, which gh prefers over its keyring, and a
+/// missing `gh` are this machine's; a network that did not answer is
+/// [`Check::CouldNotRun`].
+#[cfg(unix)]
+fn gh_verdict(ran: std::result::Result<(bool, String), String>) -> Check {
+    let (ok, text) = match ran {
+        Ok(answer) => answer,
+        Err(e) => {
+            return Check::Fail {
+                what: format!("could not run gh: {e}"),
+                fix: "install the GitHub CLI (`brew install gh`), then `gh auth login`".into(),
+            };
+        }
+    };
+    if ok {
+        return Check::Pass("gh is authenticated".into());
+    }
+    let lower = text.to_ascii_lowercase();
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no answer)");
+    let transport = [
+        "timeout",
+        "timed out",
+        "could not connect",
+        "connection refused",
+        "no such host",
+        "dial tcp",
+        "network is unreachable",
+        "error connecting",
+    ];
+    if transport.iter().any(|t| lower.contains(t)) {
+        return Check::CouldNotRun(format!("GitHub did not answer gh auth status: {first}"));
+    }
+    // gh names the source of the token it tried: `(GITHUB_TOKEN)`/`(GH_TOKEN)` for one
+    // this shell exported, `(keyring)` for the login. The env itself is never read here.
+    if lower.contains("(github_token)") || lower.contains("(gh_token)") {
+        return Check::Fail {
+            what: "gh cannot authenticate with the GITHUB_TOKEN/GH_TOKEN this shell exports — gh \
+                   prefers it over the keyring"
+                .into(),
+            fix: "unset GITHUB_TOKEN GH_TOKEN (or export a valid one), then gh auth status".into(),
+        };
+    }
+    Check::Owner {
+        what: format!("gh is not signed in: {first}"),
+        fix: "gh auth login".into(),
     }
 }
 
@@ -2117,59 +2510,70 @@ fn gh_check() -> Check {
 /// `--check` it is still only reported: that flag's whole promise is that nothing changes.
 #[cfg(unix)]
 fn channel_token_check(slug: &str, may_change: bool) -> Check {
+    use std::os::unix::fs::PermissionsExt as _;
     let where_it_lives = publish::channel_token_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.secrets/gh_access_token_alabsystems".into());
+    let present = publish::channel_token().is_some();
+    let path = publish::channel_token_path();
+    let open = path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| m.permissions().mode() & 0o077 != 0);
+    let tightened = present
+        && open
+        && may_change
+        && path.is_some_and(|p| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).is_ok()
+        });
+    channel_token_verdict(
+        &where_it_lives,
+        slug,
+        present,
+        open && !tightened,
+        tightened,
+    )
+}
+
+/// The channel token's verdict, by its CAUSE (pure, so each case is a test): none at
+/// all is the owner's to mint ([`Check::Owner`]); one whose file is open to the group
+/// or others is this machine's to `chmod` ([`Check::Fail`]).
+#[cfg(unix)]
+fn channel_token_verdict(
+    where_it_lives: &str,
+    slug: &str,
+    present: bool,
+    open: bool,
+    tightened: bool,
+) -> Check {
     // "mint", not "copy": a per-machine token revokes per-machine, the same reason the
-    // signing key never travels. That is the design's reason, not the operator's next
-    // action, so it is a comment here and not a second sentence on the remedy line.
-    // The URL matters more here than anywhere else in the crate: the CLASSIC-token page
-    // is the easy wrong turn from a bare "mint a PAT", and it produces the wrong scopes
-    // for a fine-grained-only org — a token that exists, reads as done, and fails at the
-    // upload step of a real cut. Every other credential remedy in this file gives a full
-    // click path; this one gave none.
-    let fix = format!(
-        "1. https://github.com/settings/personal-access-tokens/new  (FINE-GRAINED, not \
-         the classic-token page)\n\
-         2. Contents: read/write on {slug}, short expiry\n\
-         3. (umask 077; cat > {where_it_lives})   (then paste it and press ^D)"
-    );
-    match publish::channel_token() {
-        None => Check::Fail {
+    // signing key never travels. The URL matters more here than anywhere else in the
+    // crate: the CLASSIC-token page is the easy wrong turn from a bare "mint a PAT", and
+    // it produces the wrong scopes for a fine-grained-only org — a token that exists,
+    // reads as done, and fails at the upload step of a real cut.
+    if !present {
+        return Check::Owner {
             what: format!("no channel token at {where_it_lives}"),
-            fix,
-        },
-        Some(_) => {
-            // The token resolved; now hold its file to the same owner-only standard
-            // as every other credential.
-            use std::os::unix::fs::PermissionsExt as _;
-            let path = publish::channel_token_path();
-            let open = path
-                .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.permissions().mode() & 0o077 != 0)
-                .unwrap_or(false);
-            if !open {
-                // Names the FILE. "channel token present" spent its first two words
-                // restating the label and never said WHERE, so an operator with a stale
-                // token in one location and a fresh one in another could not tell which
-                // the cut would use without reading `publish::channel_token_path`.
-                return Check::Pass(format!("{where_it_lives}  0600, owner-only"));
-            }
-            let tightened = may_change
-                && path.is_some_and(|p| {
-                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).is_ok()
-                });
-            if tightened {
-                Check::Pass(format!("{where_it_lives}  tightened to 0600"))
-            } else {
-                Check::Fail {
-                    what: format!("{where_it_lives} is group/other-accessible"),
-                    fix: format!("chmod 600 {where_it_lives}"),
-                }
-            }
-        }
+            fix: format!(
+                "1. https://github.com/settings/personal-access-tokens/new  (FINE-GRAINED, not \
+                 the classic-token page)\n\
+                 2. Contents: read/write on {slug}, short expiry\n\
+                 3. (umask 077; cat > {where_it_lives})   (then paste it and press ^D)"
+            ),
+        };
     }
+    if tightened {
+        return Check::Pass(format!("{where_it_lives}  tightened to 0600"));
+    }
+    if open {
+        return Check::Fail {
+            what: format!("{where_it_lives} is group/other-accessible"),
+            fix: format!("chmod 600 {where_it_lives}"),
+        };
+    }
+    // Names the FILE, so an operator with a stale token in one location and a fresh
+    // one in another can tell which the cut would use.
+    Check::Pass(format!("{where_it_lives}  0600, owner-only"))
 }
 
 /// The Developer ID Application identities for `team_id` in a `security find-identity
@@ -2208,6 +2612,220 @@ fn now_unix() -> Result<u64> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// notarytool's answers, every line read: Apple's agreement (MEASURED text,
+    /// 2026-10-01) is the owner's — never `store-credentials`; a refused credential or
+    /// a missing keychain item is `store-credentials`; no answer at all is COULD NOT
+    /// RUN.
+    #[test]
+    fn notary_answers_are_classified_by_every_line_they_carry() {
+        let agreement = "Error: HTTP status code: 403. A required agreement is missing or has \
+                         expired. This request requires an in-effect agreement that has not been \
+                         signed or has expired.";
+        match notary_verdict(
+            "aterm-notary",
+            false,
+            "",
+            &format!("Fetching history\n{agreement}\n"),
+        ) {
+            Check::Owner { what, fix } => {
+                assert!(what.contains(agreement), "{what}");
+                assert!(fix.contains("https://developer.apple.com/account"), "{fix}");
+                assert!(
+                    fix.contains("Account Holder") && !fix.starts_with("xcrun"),
+                    "{fix}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        for credential in [
+            "Error: HTTP status code: 401. Invalid credentials. Username or password is incorrect.",
+            "Error: No Keychain password item found for profile: aterm-notary",
+        ] {
+            match notary_verdict("aterm-notary", false, "", credential) {
+                Check::Owner { fix, .. } => assert!(fix.contains("store-credentials"), "{fix}"),
+                other => panic!("{credential}: {other:?}"),
+            }
+        }
+        match notary_verdict(
+            "aterm-notary",
+            false,
+            "",
+            "Error: The Internet connection appears to be offline.",
+        ) {
+            Check::CouldNotRun(what) => assert!(what.contains("did not answer"), "{what}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            notary_verdict("aterm-notary", true, "No submission history.", ""),
+            Check::Pass(_)
+        ));
+        // the owner's by the check's cause, never its label
+        assert_eq!(
+            audited(Check::Owner {
+                what: "w".into(),
+                fix: "f".into()
+            }),
+            Audited::Gap {
+                what: "w".into(),
+                fix: "f".into(),
+                owner: true
+            }
+        );
+        assert_eq!(
+            audited(Check::Fail {
+                what: "w".into(),
+                fix: "f".into()
+            }),
+            Audited::Gap {
+                what: "w".into(),
+                fix: "f".into(),
+                owner: false
+            }
+        );
+    }
+
+    /// A gap is the owner's by its CAUSE: a token he must mint, his browser login, his
+    /// Apple agreement or password — never a file mode this machine fixes, nor a
+    /// network that did not answer.
+    #[test]
+    fn a_gap_is_the_owners_by_its_cause_not_its_label() {
+        let at = "~/.secrets/gh_access_token_alabsystems";
+        assert!(matches!(
+            channel_token_verdict(at, "alabsystems/aterm", false, false, false),
+            Check::Owner { .. }
+        ));
+        match channel_token_verdict(at, "alabsystems/aterm", true, true, false) {
+            Check::Fail { fix, .. } => assert_eq!(fix, format!("chmod 600 {at}")),
+            other => panic!("a file mode is this machine's: {other:?}"),
+        }
+        assert!(matches!(
+            channel_token_verdict(at, "alabsystems/aterm", true, false, true),
+            Check::Pass(_)
+        ));
+        let not_signed_in = "github.com\n  X Failed to log in to github.com account someone \
+                             (keyring)\n  - The token in keyring is invalid.\n";
+        assert!(matches!(
+            gh_verdict(Ok((false, not_signed_in.into()))),
+            Check::Owner { .. }
+        ));
+        assert!(matches!(
+            gh_verdict(Ok((
+                false,
+                "error connecting to api.github.com\ncheck your internet connection".into()
+            ))),
+            Check::CouldNotRun(_)
+        ));
+        assert!(matches!(
+            gh_verdict(Ok((
+                false,
+                "github.com\n  X Failed to log in to github.com using token (GITHUB_TOKEN)\n"
+                    .into()
+            ))),
+            Check::Fail { .. }
+        ));
+        assert!(matches!(
+            gh_verdict(Err("No such file or directory".into())),
+            Check::Fail { .. }
+        ));
+    }
+
+    /// EVERY OWNER ASK'S ONE STEP IS THE ACT THAT CLOSES ITS CHECK: the step names the
+    /// check's own remedy, and the check answers Pass once that act is done. An ask
+    /// whose step closes nothing would leave the release waiting for ever.
+    #[test]
+    fn every_owner_asks_step_is_the_act_that_closes_its_check() {
+        let at = "~/.secrets/gh_access_token_alabsystems";
+        let agreement = "Error: HTTP status code: 403. A required agreement is missing or has \
+                         expired.";
+        let refused = "Error: HTTP status code: 401. Invalid credentials.";
+        let cases: [(&str, Check, &str, Check); 4] = [
+            (
+                "channel",
+                channel_token_verdict(at, "alabsystems/aterm", false, false, false),
+                CHANNEL_TOKEN_HOME,
+                channel_token_verdict(at, "alabsystems/aterm", true, false, false),
+            ),
+            (
+                "github",
+                gh_verdict(Ok((
+                    false,
+                    "You are not logged into any GitHub hosts.".into(),
+                ))),
+                "gh auth login",
+                gh_verdict(Ok((true, String::new()))),
+            ),
+            (
+                "notary",
+                notary_verdict("aterm-notary", false, "", agreement),
+                "developer.apple.com/account",
+                notary_verdict("aterm-notary", true, "No submission history.", ""),
+            ),
+            (
+                "notary",
+                notary_verdict("aterm-notary", false, "", refused),
+                "store-credentials",
+                notary_verdict("aterm-notary", true, "No submission history.", ""),
+            ),
+        ];
+        for (label, gap, act, done) in cases {
+            let Check::Owner { what, fix } = gap else {
+                panic!("{label}: not the owner's: {gap:?}");
+            };
+            let words = ask_words(label, &what);
+            assert!(words.step.contains(act), "{label}: {}", words.step);
+            assert!(
+                fix.contains(act),
+                "{label}: the step is the check's own remedy: {fix}"
+            );
+            assert!(matches!(done, Check::Pass(_)), "{label}: {done:?}");
+        }
+    }
+
+    /// Every ask the release can raise is one the wire stands: a glass title, a reason
+    /// and a step within their caps, no word for waiting, one action — parsed by the
+    /// wire itself, so none is refused at the owner's door.
+    #[test]
+    fn every_owner_ask_is_one_the_wire_stands() {
+        assert_eq!(APPLE_LABEL, crate::apple::APPLE_LABEL);
+        for (label, what) in [
+            (
+                "notary",
+                "Apple's developer agreement for team X is missing or expired",
+            ),
+            (
+                "notary",
+                "notarytool profile 'aterm-notary' did not authenticate",
+            ),
+            (APPLE_LABEL, "no Developer ID Application identity"),
+            ("github", "gh is not authenticated"),
+            ("channel", "no channel token"),
+            ("profile", "no credentials profile"),
+            ("roster", "the roster does not authorize this key"),
+        ] {
+            let w = ask_words(label, what);
+            assert!(w.key.starts_with("release."), "{w:?}");
+            assert!(
+                w.reason.chars().count() <= aterm_messages::need::REASON_CAP,
+                "{w:?}"
+            );
+            assert!(
+                w.step.chars().count() <= aterm_messages::need::STEP_CAP,
+                "{w:?}"
+            );
+            let line = format!(
+                "ask {} tag=release {} -- {} -- {}",
+                w.key, w.title, w.reason, w.step
+            );
+            if let Err(e) = aterm_messages::wire::NoticeRequest::parse(&line) {
+                panic!("{line}: {e}");
+            }
+        }
+        assert_eq!(
+            ask_words("notary", "the agreement lapsed").step,
+            "Accept the current agreements at developer.apple.com/account"
+        );
+    }
     use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
 
     /// A synthetic paper phrase, built at runtime so no phrase-shaped literal exists in
@@ -2619,7 +3237,8 @@ mod tests {
         let next = cut_dry_run_next(Path::new("/tmp/x/release.toml"));
         assert_eq!(
             next,
-            "tools/cut-launch.sh --dry-run --release-credentials /tmp/x/release.toml"
+            "targo --unverified ship release --dry-run --bump --mac-only --release-credentials \
+             /tmp/x/release.toml"
         );
         assert!(!next.starts_with("cargo "), "{next}");
         assert!(!SHIP.contains("cargo"), "{SHIP}");
@@ -2676,6 +3295,10 @@ mod tests {
                     !fix.contains("rustup"),
                     "rustup is not a remedy here: {fix}"
                 );
+                // The source build is the seed-first one, sealed (gates.rs
+                // `trust_from_source!`) — never a bare x.py over a stock stage0.
+                assert!(fix.contains(gates::TRUST_FROM_SOURCE), "{fix}");
+                assert!(!fix.contains("x.py"), "{fix}");
             }
             other => panic!("a mute compiler is a GAP: {other:?}"),
         }

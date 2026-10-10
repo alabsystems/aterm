@@ -194,6 +194,12 @@ struct PasteWatch {
     completed_sent: u64,
     completed_total: u64,
     completed_failed: bool,
+    /// A paste of the burst ended Stopped short of its size (ruling 441
+    /// (v)). Inside a watch only a discard (`signal term|kill|hup|quit`,
+    /// `reset flush`) or a sever does that, since `Stop paste` removes the
+    /// watch before it stops the meters, and the rest of that paste was
+    /// dropped, not delivered.
+    completed_short: bool,
     started: Instant,
     wait: SessionWait,
     row: Option<MessageId>,
@@ -221,6 +227,7 @@ impl PasteWatch {
             self.completed_sent = self.completed_sent.saturating_add(sent);
             self.completed_total = self.completed_total.saturating_add(size);
             self.completed_failed |= p.state == BulkState::Failed;
+            self.completed_short |= p.state == BulkState::Stopped && sent < size;
             false
         });
     }
@@ -290,6 +297,7 @@ impl App {
                     completed_sent: 0,
                     completed_total: 0,
                     completed_failed: false,
+                    completed_short: false,
                     started: now,
                     wait: SessionWait::paste(session, series),
                     row: None,
@@ -320,16 +328,23 @@ impl App {
             asked: true,
             end: Some(WaitEnd::Stopped),
         });
+        self.record_paste_stopped(watch.row.take(), sent, total);
+        true
+    }
+
+    /// A paste that stopped short (`Stop paste`, or a discard that dropped
+    /// its rest, ruling 441 (v)) says how much went (ruling 231). One entry
+    /// per paste: the row on the band becomes the `Paste stopped` record (it
+    /// fades, as a stop claims nothing), never a withdrawn `Pasting 4.2 MB`
+    /// beside a second record. A paste stopped before its row was posted is
+    /// written down alone.
+    fn record_paste_stopped(&mut self, row: Option<MessageId>, sent: u64, total: u64) {
         let detail = [format!(
             "{} of {} sent; the rest was not",
             waits::size_words(sent),
             waits::size_words(total)
         )];
-        // One entry per paste: the row on the band becomes the `Paste stopped`
-        // record (it fades, as a stop claims nothing), never a withdrawn
-        // `Pasting 4.2 MB` beside a second record. A paste stopped before its
-        // row was posted is written down alone.
-        match watch.row.take() {
+        match row {
             Some(id)
                 if self
                     .messages
@@ -345,7 +360,6 @@ impl App {
                 );
             }
         }
-        true
     }
 
     /// The person scrolled back into `session`'s history or searched it: if
@@ -434,10 +448,19 @@ impl App {
             let sink = watch.sink.upgrade();
             let settled = watch.meters.is_empty();
             let failed = watch.completed_failed;
+            // Delivered only when every byte went (ruling 441 (v)): a paste
+            // whose rest a discard dropped ended Stopped short, and its record
+            // says how much went, never `Pasted N MB` under ✓.
             let end = match sink {
                 None => Some(WaitEnd::Gone),
                 _ if !alive || failed => Some(WaitEnd::Gone),
-                Some(sink) if settled && sink.ordered_egress_count() == 0 => Some(WaitEnd::Done),
+                Some(sink) if settled && sink.ordered_egress_count() == 0 => {
+                    Some(if watch.completed_short {
+                        WaitEnd::Stopped
+                    } else {
+                        WaitEnd::Done
+                    })
+                }
                 Some(_) => None,
             };
             let step = watch.wait.step(&WaitSample {
@@ -447,7 +470,11 @@ impl App {
                 asked: on_screen,
                 end,
             });
-            self.perform_wait_step(&mut watch.row, step);
+            if end == Some(WaitEnd::Stopped) {
+                self.record_paste_stopped(watch.row.take(), done, total);
+            } else {
+                self.perform_wait_step(&mut watch.row, step);
+            }
             if end.is_none() {
                 self.session_waits.pastes.insert(session, watch);
             }
@@ -1169,6 +1196,47 @@ mod tests {
         assert!(!app.session_waits.pastes.contains_key(&0));
         assert_eq!(Arc::strong_count(&outstanding), 1);
         assert_eq!(Arc::strong_count(&later), 1);
+    }
+
+    /// `WaitEnd::Done` is delivery: every byte went (ruling 441 (v)). A paste
+    /// whose rest a discard dropped (`signal term`, `reset flush`: its meter
+    /// ends `Stopped` short of its size, as `BulkMeter::abandon` leaves it)
+    /// ends no Complete echo and no `Pasted 1.0 MB` under ✓; its record says
+    /// how much went (ruling 231).
+    #[test]
+    fn a_paste_whose_rest_a_discard_dropped_claims_no_delivery() {
+        use aterm_session::sink::BulkMeter;
+
+        let (mut app, sink, _reader) = app_with_reader();
+        let t0 = Instant::now();
+        let meter = Arc::new(BulkMeter::new());
+        app.watch_paste(0, &sink, meter.clone(), 1 << 20, t0);
+        let late = t0 + PROGRESS_GRACE * 2;
+        app.sample_session_waits(late);
+        app.settle_messages(late);
+        assert_eq!(app.message_band_rows, 1, "premise: the row is up");
+        meter.abandon();
+        app.sample_session_waits(late + WAIT_SAMPLE);
+        assert!(app.session_waits.pastes.is_empty(), "the watch ended");
+        let completes: Vec<String> = app
+            .messages
+            .echoes()
+            .iter()
+            .filter(|e| e.kind == EchoKind::Complete)
+            .map(|e| e.msg.finished_title())
+            .collect();
+        assert!(
+            completes.is_empty(),
+            "a paste 0 of 1 MB sent ended in a Complete echo: {completes:?}"
+        );
+        let state = app.messages_state();
+        let entry = &state.entries[0];
+        assert_eq!(entry.title, super::PASTE_STOPPED, "{entry:?}");
+        assert_ne!(entry.severity, "success", "{entry:?}");
+        assert!(
+            entry.detail[0].ends_with(" of 1.0 MB sent; the rest was not"),
+            "{entry:?}"
+        );
     }
 
     /// Session 0 given a tiered history of `n` short lines, detached for a

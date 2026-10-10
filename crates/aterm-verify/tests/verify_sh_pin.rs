@@ -4,11 +4,10 @@
 //! `tools/verify.sh`'s toolchain pin, driven as the shell script it is.
 //!
 //! A checkout with NO `rust-toolchain.toml` is refused (exit 3, COULD NOT RUN)
-//! before any toolchain is adopted — decided 2026-09-25. Until then it printed
-//! "NO TOOLCHAIN PIN … UNAUTHENTICATED" and ran anyway: with no pin the
-//! candidate check answers "may be used" for every directory holding a
-//! `targo`, so the gate was built and run by whichever one it met first and its
-//! verdict was attributed to a pin nobody read.
+//! before any toolchain is adopted: with no pin the candidate check answers
+//! "may be used" for every directory holding a `targo`, so the gate would run
+//! on whichever one it met first and attribute its verdict to a pin nobody
+//! read.
 //!
 //! Each fixture is a scratch root holding a copy of the real script and a
 //! recording `targo` on `PATH`. The script's discovery also probes the rustup

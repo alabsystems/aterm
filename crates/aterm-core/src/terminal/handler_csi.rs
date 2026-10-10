@@ -145,21 +145,13 @@ impl TerminalHandler<'_> {
             }
             CsiHandler::CursorForward => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_state().cursor_forward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_forward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_forward_margin(n, self.modes.left_right_margin_mode);
             }
             CsiHandler::CursorBackward => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_state().cursor_backward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_backward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_backward_margin(n, self.modes.left_right_margin_mode);
             }
             CsiHandler::CursorPosition | CsiHandler::CursorPositionAlt => {
                 // CUP - inline to avoid cursor_state() for this high-frequency op.
@@ -561,8 +553,10 @@ impl TerminalHandler<'_> {
                 // XTVERSION: CSI > Ps q — Query terminal version.
                 let ps = params.first().copied().unwrap_or(0);
                 if ps == 0 {
-                    let response =
-                        format!("\x1bP>|aterm({})\x1b\\", aterm_types::version::APP_VERSION);
+                    let response = format!(
+                        "\x1bP>|aterm({})\x1b\\",
+                        aterm_types::version::app_version()
+                    );
                     self.send_response(cap, response.as_bytes());
                 }
             }

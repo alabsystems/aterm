@@ -6,10 +6,10 @@
 //!
 //! # Why this exists
 //!
-//! Measured 2026-09-30/10-01 on a 460 GB volume that kept falling to 3-6 GB
-//! free: the hogs were build directories the watch never looked at. It
-//! looked only at `target*` directly under each supervised session's working
-//! directory, and the space was elsewhere — a checkout's `crates/target ->
+//! Measured on a 460 GB volume that kept falling to 3-6 GB free: the hogs
+//! were build directories a watch of only `target*` directly under each
+//! supervised session's working directory never sees; the space was
+//! elsewhere — a checkout's `crates/target ->
 //! target.noindex` (49 GB), x.py's bootstrap trees under `build/<host>/`
 //! (77 GB), an agent worktree's build directory beside it rather than in it
 //! (19 GB), the scratch builds of Claude Code sessions that had ended (45 GB
@@ -23,8 +23,10 @@
 //! * each supervised agent's `CARGO_TARGET_DIR`, where its environment could
 //!   be read ([`Origin::AgentTargetDir`]);
 //! * each supervised session's working directory and the git worktree root
-//!   above it, and each direct child of `$HOME` and every git worktree of
-//!   one (`.git/worktrees/*/gitdir`, read — no `git` is run): a bounded walk
+//!   above it, and each direct child of `$HOME` — and of the developer root
+//!   `~/Developer` (`atpkg::devroot`), a folder of checkouts like `$HOME`
+//!   itself — and every git worktree of one (`.git/worktrees/*/gitdir`, read —
+//!   no `git` is run): a bounded walk
 //!   two levels down ([`CHECKOUT_DEPTH`]) for directories carrying a build
 //!   tool's marker ([`Origin::Checkout`]) — which finds `crates/target`
 //!   behind a checkout and `wt/m1-target` beside a worktree;
@@ -188,8 +190,9 @@ impl Budget {
 pub struct Roots {
     /// The working directories of the supervised sessions (the verb's own).
     pub cwds: Vec<PathBuf>,
-    /// `$HOME`: its direct children and their worktrees are walked, and its
-    /// guarded folders are never looked into ([`HOME_SKIP`]).
+    /// `$HOME`: its direct children — and those of `~/Developer`, the
+    /// developer root — and their worktrees are walked, and its guarded folders
+    /// are never looked into ([`HOME_SKIP`]).
     pub home: Option<PathBuf>,
     /// The Claude Code directories whose registries and transcripts say
     /// whether a session ended ([`claude_dirs`]): `~/.claude`, each running
@@ -899,7 +902,7 @@ pub struct Discovered {
 ///
 /// The roots whose build directories have NO owner that can end are walked
 /// FIRST — the agents' `CARGO_TARGET_DIR`, their working directories,
-/// `$HOME`'s checkouts — and Claude Code's temp root and the cells cache
+/// `$HOME`'s and `~/Developer`'s checkouts — and Claude Code's temp root and the cells cache
 /// after: a build directory any of those names is theirs ([`Origin::merge`]),
 /// and a walk cut short before they are done reaches no owner's at all (each
 /// later walk reads nothing once the budget is spent), so an owner's build
@@ -954,6 +957,14 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
         .and_then(|h| std::fs::canonicalize(h).ok())
         && w.on_device(&home)
     {
+        // The developer root (`atpkg::devroot`, `~/Developer`, a real folder: a link is
+        // never followed) is a folder OF checkouts, as `$HOME` is: each of its children is
+        // a checkout root, never the root itself — whose x.py checkouts' `build/` and
+        // `crates/target` would otherwise sit one level past the walk.
+        let devroot = match atpkg::devroot::root_at(&home) {
+            (root, atpkg::devroot::RootIs::Folder) => Some(root),
+            _ => None,
+        };
         for (name, child, ty) in w.children(&home) {
             let n = name.to_string_lossy();
             if !ty.is_dir() || n.starts_with('.') || HOME_SKIP.contains(&n.as_ref()) {
@@ -962,10 +973,18 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
             if !w.same_device(&child) {
                 continue;
             }
-            w.checkout(&child);
-            for wt in worktrees(&child) {
-                w.checkout(&wt);
+            if devroot.as_deref() == Some(child.as_path()) {
+                for (name, inner, ty) in w.children(&child) {
+                    if ty.is_dir()
+                        && !name.to_string_lossy().starts_with('.')
+                        && w.same_device(&inner)
+                    {
+                        w.checkout_and_worktrees(&inner);
+                    }
+                }
+                continue;
             }
+            w.checkout_and_worktrees(&child);
         }
     }
     if let Some(tmp) = &roots.claude_tmp {
@@ -1249,6 +1268,14 @@ impl Walk {
                 self.seen.insert(id, self.found.len());
                 self.found.push(Found { path, origin });
             }
+        }
+    }
+
+    /// A checkout root and every git worktree of it ([`worktrees`]).
+    fn checkout_and_worktrees(&mut self, root: &Path) {
+        self.checkout(root);
+        for wt in worktrees(root) {
+            self.checkout(&wt);
         }
     }
 

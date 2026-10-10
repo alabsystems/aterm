@@ -68,7 +68,7 @@ impl Scratch {
         self.path("b.sock")
     }
 
-    /// The bridge command, in the spelling `tools/fabric-enable.sh` writes
+    /// The bridge command, in the spelling `aterm fabric on` writes
     /// (`aterm link serve`) or the argv0 alias's (`aterm-link serve`).
     fn command(&self, sock: &str, alias: bool) -> String {
         let program = if alias {
@@ -125,19 +125,21 @@ fn json(text: &str) -> aterm_json::Value {
     aterm_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
 }
 
-/// A broker process, killed on drop.
+/// A broker process, killed on drop. Started by `spawnfd`: it holds its stdio
+/// and nothing else of this process, not another test thread's pipe for as long
+/// as it serves.
 struct Broker {
-    child: Child,
+    child: aterm_uds::spawnfd::Child,
 }
 
 impl Broker {
     /// `aterm-link broker <sock> <log>`, returned once it prints `listening`.
     fn spawn(s: &Scratch) -> Self {
-        let mut child = Command::new(harness::link_to_launch())
+        let mut child = aterm_uds::spawnfd::command(harness::link_to_launch())
             .args(["broker", &s.sock(), &s.path("b.log")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn the broker");
         let lines = line_reader(child.stdout.take().expect("stdout"));
@@ -185,11 +187,11 @@ fn a_broker_whose_stdout_reader_left_keeps_serving() {
     let s = Scratch::new("epipe");
     let (gone, stdout) = std::io::pipe().expect("a pipe");
     drop(gone);
-    let mut child = Command::new(harness::link_to_launch())
+    let mut child = aterm_uds::spawnfd::command(harness::link_to_launch())
         .args(["broker", &s.sock(), &s.path("b.log")])
-        .stdin(Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(stdout)
-        .stderr(Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("spawn the broker");
     let err = child.stderr.take().expect("stderr");
@@ -448,7 +450,7 @@ fn with_no_command_the_fabric_is_off_says_where_it_looked_and_exits_2() {
 /// A SOCKET FILE IS NOT A BROKER. A socket that was bound and abandoned — the
 /// leftover of a broker that died — refuses the connect: `reachable NO`, a
 /// warning naming the socket, exit 1. The config is read in the spelling
-/// `tools/fabric-enable.sh` writes.
+/// `aterm fabric on` writes.
 #[test]
 fn a_dead_socket_file_is_unreachable_and_a_warning() {
     let s = Scratch::new("dead");
@@ -740,7 +742,12 @@ struct Tail {
 
 impl Tail {
     fn spawn(s: &Scratch, args: &[&str]) -> Self {
+        use aterm_uds::spawnfd::InheritNothing as _;
+        // `fabric_cmd`'s std `Command` (it feeds `harness::output_within` too),
+        // with the strip: the tail holds its stdio and nothing else of this
+        // process for as long as it follows.
         let mut child = fabric_cmd(s, Some(&s.command(&s.sock(), false)), args)
+            .inherit_nothing()
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

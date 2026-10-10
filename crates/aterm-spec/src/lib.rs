@@ -12,8 +12,8 @@
 
 //! TLA+ specification coverage tracking for aterm formal verification.
 //!
-//! Provides tools to cross-reference Rust Kani proofs against TLA+ specifications,
-//! tracking which TLA+ actions have corresponding Rust refinements.
+//! Cross-references Rust code against TLA+ specifications, tracking which TLA+
+//! actions have corresponding Rust refinements.
 //!
 //! # Derived, drift-free TLA+ ([`derive`] + [`ty_model`])
 //!
@@ -22,23 +22,8 @@
 //! `ty`-checkable spec AND the executable interpreter are generated from that one
 //! source, so they cannot drift from each other. The model itself is authored, so
 //! it can drift from the code; Tier-1 conformance is what binds the two. See the
-//! [`derive`] module docs and the `AGENTS.md` at the repo root for the workflow
-//! (Tier-0 `ty check` of the derived spec; Tier-1 conformance binding the model to
-//! the real code). Existing models: [`derive::ring_model`],
-//! [`derive::kernel_model`], [`derive::subscribe_model`], [`derive::snapshot_model`],
-//! [`derive::transact_model`], [`derive::cursor_model`],
-//! [`derive::read_image_seq_model`] (the A-3 read_image snapshot-seq protocol),
-//! and the native tab-app contracts [`derive::native_control_routing_model`],
-//! [`derive::native_tab_identity_model`],
-//! [`derive::native_settings_singleton_model`],
-//! [`derive::native_settings_draft_close_model`],
-//! [`derive::manual_config_handoff_model`],
-//! [`derive::native_packages_worker_model`],
-//! [`derive::native_config_transaction_model`],
-//! [`derive::native_config_observation_handoff_model`],
-//! [`derive::native_document_publication_model`],
-//! [`derive::native_close_plan_model`], [`derive::native_async_delivery_model`],
-//! and [`derive::native_updater_model`].
+//! [`derive`] module docs and the `AGENTS.md` at the repo root for the workflow;
+//! [`xref::model_registry`] lists every model.
 
 // The `ty_model!` proc-macro emits absolute `::aterm_spec::derive::*` paths so it
 // works from any downstream crate. This self-alias lets aterm-spec ALSO invoke its
@@ -56,7 +41,6 @@ pub use inventory;
 
 mod compiled;
 pub mod derive;
-pub mod harness_manifest;
 pub mod interp;
 pub mod ir;
 pub mod rng;
@@ -66,42 +50,6 @@ pub mod verify;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod wait;
 pub mod xref;
-
-/// Bind a `#[kani::proof]` harness to a model `(machine, action)` — the kani half of
-/// the unified verifier ledger (TRUST_NATIVE_TLA §4, Phase 4).
-///
-/// ```ignore
-/// aterm_spec::proof_anchor!(machine = "Ring", action = "Push", proof = "ring_push_bounded");
-/// ```
-///
-/// Expands to an `inventory::submit!` of a [`xref::ProofAnchor`] so the
-/// `spec_xref_closure` gate collects it (cross-crate) into ONE per-action ledger spanning
-/// `ty` (temporal) and `kani` (bounded-local). The named `(machine, action)` is held to
-/// the SAME Ob.1/Ob.4 obligations as a `#[refines]` anchor — a bogus action fails the gate.
-///
-/// # The decoupling that makes this work (the §4 subtlety)
-///
-/// kani harnesses are `#[cfg(kani)]`-gated — DORMANT under stock `cargo`. A
-/// `#[proof_anchors]` ATTRIBUTE on such a fn would be stripped (never registering) in
-/// normal/test builds. So this is a MODULE-LEVEL declarative-macro INVOCATION, placed
-/// OUTSIDE any `#[cfg(kani)]` block and decoupled from the harness (which it names by
-/// string). Gate the invocation with `#[cfg(any(test, feature = "spec-anchors"))]` —
-/// exactly like `#[cfg_attr(…, refines(…))]` — so it is collected in the gate's test build
-/// but byte-absent from production. Do NOT place it inside the `#[cfg(kani)]` harness module.
-#[macro_export]
-macro_rules! proof_anchor {
-    (machine = $machine:literal, action = $action:literal, proof = $proof:literal $(,)?) => {
-        $crate::inventory::submit! {
-            $crate::xref::ProofAnchor {
-                machine: $machine,
-                action: $action,
-                proof_name: $proof,
-                kind: $crate::xref::ProofKind::Kani,
-                location: concat!(file!(), ":", line!()),
-            }
-        }
-    };
-}
 
 /// Refinement mapping trait.
 ///

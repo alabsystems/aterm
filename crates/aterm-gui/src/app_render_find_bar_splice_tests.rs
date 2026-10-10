@@ -535,6 +535,105 @@ fn a_hit_that_straddles_a_soft_wrap_is_tinted_on_both_rows_it_occupies() {
     );
 }
 
+/// On a BiDi row the hit's logical columns are painted elsewhere: in
+/// `abc שלום עולם def` the search finds עולם at logical 9..=12, which the frame
+/// paints reversed at 4..=7, while 9..=12 paint שלום. The tint follows the
+/// frame's visual→logical map onto the cells that show the match, and the
+/// current match's selection lights the same cells.
+#[test]
+fn highlight_all_tints_the_cells_that_paint_an_rtl_match() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term).process(
+        "\r\n\r\n\r\n\r\nabc \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD} def\r\n"
+            .as_bytes(),
+    );
+    app.search_enter();
+    seed_query(&mut app, wid, "\u{05E2}\u{05D5}\u{05DC}\u{05DD}");
+    app.search_recompute();
+    assert_eq!(
+        app.windows[&wid].search.as_ref().unwrap().matches,
+        vec![(4, 9, 12)],
+        "the search reports logical columns"
+    );
+    fill_scratch(&mut app, wid);
+    app.splice_find_bar(wid);
+    let hi = highlight_bg();
+    let scratch = &app.windows[&wid].input_scratch;
+    let tinted: Vec<usize> = scratch.cells[4]
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.bg == hi)
+        .map(|(col, _)| col)
+        .collect();
+    assert_eq!(tinted, vec![4, 5, 6, 7], "the cells that paint עולם");
+    let painted: String = scratch.cells[4][4..=7].iter().map(|c| c.ch).collect();
+    assert_eq!(painted, "\u{05DD}\u{05DC}\u{05D5}\u{05E2}");
+    let lit: Vec<usize> = (0..scratch.cells[4].len())
+        .filter(|&col| scratch.selection_contains_cell(4, col, false, false))
+        .collect();
+    assert_eq!(lit, tinted, "the current match's selection lights them too");
+}
+
+/// A band painted over a BiDi row is host content in logical order, so the
+/// row's visual→logical map goes with the cells it replaced: the find panel's
+/// band and a generic band splice (`splice_band_rows_at`) both drop it, and a
+/// selection on that row can no longer be steered onto the band's cells by
+/// the terminal row's permutation.
+#[test]
+fn a_band_painted_over_a_bidi_row_drops_its_map() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let cols = app.windows[&wid].cols as usize;
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    term_lock(&term)
+        .process("\u{05D0}\u{05D1}\u{05D2} x\r\n\r\n\r\n\r\nab \u{05D3}\u{05D4} cd".as_bytes());
+    app.search_enter();
+    seed_query(&mut app, wid, "cd");
+    app.search_recompute();
+    fill_scratch(&mut app, wid);
+    assert!(
+        !app.windows[&wid]
+            .input_scratch
+            .visual_to_logical_row(0)
+            .is_empty()
+    );
+    app.splice_find_bar(wid);
+    let band = app.windows[&wid]
+        .find_bar_hit
+        .as_ref()
+        .expect("panel")
+        .band
+        .clone();
+    assert!(band.contains(&0), "the panel covers row 0");
+    assert!(
+        app.windows[&wid]
+            .input_scratch
+            .visual_to_logical_row(0)
+            .is_empty(),
+        "the find panel's row carries no map"
+    );
+
+    fill_scratch(&mut app, wid);
+    assert!(
+        !app.windows[&wid]
+            .input_scratch
+            .visual_to_logical_row(4)
+            .is_empty()
+    );
+    let cell_h = app.win_cell_size(wid).1;
+    let blank = crate::message_band::blank_band_row(cols, app.chrome_palette_theme());
+    app.splice_band_rows_at(wid, 4, vec![blank], cols, cell_h);
+    assert!(
+        app.windows[&wid]
+            .input_scratch
+            .visual_to_logical_row(4)
+            .is_empty(),
+        "a spliced band row carries no map"
+    );
+}
+
 /// Highlight-all maps a scrollback match through `display_offset`
 /// (`screen = sel_row + display_offset`): the current match lands on screen
 /// row 1, just below the top-anchored bar, highlighted.

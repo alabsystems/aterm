@@ -5,8 +5,7 @@
 //! as [`Class::Animal`], carries a species id that resolves to its sprite key,
 //! and rides `ambiguous = true` (the live-caret deferral + fold-collision-gate
 //! exemption the group's design depends on). Existing classes keep their
-//! homograph wins: `cat`/`kitty` stay feline. `orca` is no class's word: the
-//! orca class was deleted (2026-09-27) and the animal roster did not take it.
+//! homograph wins: `cat`/`kitty` stay feline. `orca` is no class's word.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -33,7 +32,7 @@ fn animal_surfaces_scan_with_their_species() {
         ("fox", "fox"), // 3 folded chars: the short-word guards are feline/emphasis-only
         ("owl", "owl"),
         ("bee", "bee"),
-        // The two words the owner typed that were silent (2026-08-10).
+        // Regression: these once matched nothing.
         ("turkey", "turkey"),
         ("turkeys", "turkey"),
         ("Turkey", "turkey"), // the country folds into the bird — deliberate, see the entry's notes
@@ -57,8 +56,8 @@ fn animal_surfaces_scan_with_their_species() {
 #[test]
 fn animal_class_never_steals_existing_families() {
     let lex = Lexicon::builtin();
-    // The generic whale is the animal sprite; `orca` (the deleted orca class's
-    // word) decorates nothing rather than falling through to it.
+    // The generic whale is the animal sprite; `orca` decorates nothing rather
+    // than falling through to it.
     assert!(lex.scan("orca", &ScanOptions::default()).is_empty());
     assert_eq!(scan_one(lex, "whale").class, Class::Animal);
     // kitty stays feline (rank), and bare `cat` stays the short-feline opt-in.

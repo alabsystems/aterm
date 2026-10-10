@@ -5130,6 +5130,7 @@ fn the_developer_tools_button_opens_only_its_pane() {
                 crate::menu::PrivacyPane::FullDiskAccess => 1,
                 crate::menu::PrivacyPane::FilesAndFolders => 2,
                 crate::menu::PrivacyPane::DeveloperTools => 3,
+                crate::menu::PrivacyPane::SpotlightSearchPrivacy => 4,
             },
             Ordering::Release,
         );
@@ -8487,20 +8488,13 @@ fn live_packages_state_with_machine_reads(
 
 fn machine_state_fixture(
     uc: atpkg::machine::UcPosture,
-    would_migrate: usize,
     home: atpkg::machine::HomePosture,
 ) -> atpkg::machine::MachineState {
     atpkg::machine::MachineState {
         universal_control: uc,
         policy: atpkg::config::UniversalControlPolicy::Off,
-        spotlight_noindex: true,
-        exposed: would_migrate + 1,
-        hidden: 8,
-        would_migrate,
-        scan_complete: true,
         home,
         config_unreadable: false,
-        open: None,
     }
 }
 
@@ -10537,7 +10531,6 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Account
             )),
         ),
@@ -10572,7 +10565,6 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Disabled,
-                0,
                 HomePosture::Account
             )),
         ),
@@ -10609,7 +10601,6 @@ fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Account
             )),
         ),
@@ -10645,12 +10636,11 @@ fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
         // row at all, which is exactly the shape that made the old limit too short.
         seen.extend(rows);
     }
-    for key in ["machine.universal_control", "machine.spotlight_noindex"] {
-        assert!(
-            seen.iter().any(|row| row.contains(key)),
-            "paging never reached {key}: {seen:?}"
-        );
-    }
+    assert!(
+        seen.iter()
+            .any(|row| row.contains("machine.universal_control")),
+        "paging never reached machine.universal_control: {seen:?}"
+    );
 }
 
 #[test]
@@ -10681,7 +10671,6 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Account
             )),
         ),
@@ -10710,12 +10699,8 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
         "Universal Control: at the OS default — the cursor roams to other Macs and iPads"
     );
     assert_eq!(
-        text("settings/machine/spotlight"),
-        "Build output: 8 target dirs hidden, 3 open to Spotlight — 2 a pass would hide"
-    );
-    assert_eq!(
         text("settings/machine/next"),
-        "Apply now would set: Universal Control off for this host; 2 target dir(s) hidden from Spotlight"
+        "Apply now would set: Universal Control off for this host"
     );
     assert_eq!(
         text("settings/machine/last-applied"),
@@ -10745,7 +10730,6 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Disabled,
-                0,
                 HomePosture::Account
             )),
         ),
@@ -10765,7 +10749,7 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             .semantic(&UiKey::new("settings/machine/next"))
             .unwrap()
             .label
-            .starts_with("Nothing an apply can do")
+            .starts_with("Nothing to apply")
     );
     assert!(
         compiled
@@ -10782,7 +10766,6 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Mismatch
             )),
         ),
@@ -10816,7 +10799,6 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             vec![
                 Ok(machine_state_fixture(
                     UcPosture::Default,
-                    2,
                     HomePosture::Account
                 )),
                 Err("atpkg machine printed no state".to_string()),
@@ -10867,7 +10849,7 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
-        state.search = "spotlight".to_string();
+        state.search = "universal".to_string();
     }
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     assert!(
@@ -10998,7 +10980,6 @@ fn machine_apply_gates_dispatch_and_finish() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Disabled,
-                0,
                 HomePosture::Account
             )),
         ),
@@ -11018,7 +10999,6 @@ fn machine_apply_gates_dispatch_and_finish() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Mismatch
             )),
         ),
@@ -11038,7 +11018,6 @@ fn machine_apply_gates_dispatch_and_finish() {
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Account
             )),
         ),
@@ -11085,7 +11064,6 @@ fn machine_apply_gates_dispatch_and_finish() {
             Some(crate::packages_screen::PackagesBusy::MachineApply),
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                2,
                 HomePosture::Account
             )),
         ),
@@ -11127,7 +11105,6 @@ fn machine_apply_dispatches_with_the_manager_off() {
                 collection_error,
                 vec![Ok(machine_state_fixture(
                     UcPosture::Default,
-                    2,
                     HomePosture::Account
                 ))],
             ),
@@ -22103,7 +22080,7 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
         // The Security page's second box: the [machine] host settings the
         // "This Mac" card confirms.
-        group_witnesses.push(("This Mac", prefs::EDIT_MACHINE_SPOTLIGHT_NOINDEX));
+        group_witnesses.push(("This Mac", prefs::EDIT_MACHINE_UNIVERSAL_CONTROL));
     }
     group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
     // The Security page's "Notifications" box (`desktop_alerts`): a row only
@@ -27856,7 +27833,7 @@ fn open_log_folder_asks_the_host_and_never_names_a_path() {
     let effects = messages_action(&mut runtime, instance, view, MESSAGES_OPEN_FOLDER);
     let asked = effects
         .iter()
-        .any(|effect| matches!(effect, AppEffect::OpenLogFolder));
+        .any(|effect| matches!(effect, AppEffect::OpenLogFolder { .. }));
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!();
     };
@@ -27888,7 +27865,7 @@ fn open_log_folder_asks_the_host_and_never_names_a_path() {
     assert!(
         !effects
             .iter()
-            .any(|e| matches!(e, AppEffect::OpenLogFolder))
+            .any(|e| matches!(e, AppEffect::OpenLogFolder { .. }))
     );
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!();
@@ -29122,11 +29099,9 @@ fn realistic_messages() -> MessagesState {
             "config font_family_bold: \"Nope\" is not an admissible font (not found); ignored",
         ),
     ));
-    for (k, msg) in toolchain_words::machine_settings(
-        "spotlight-noindex 73 dir(s) migrated; universal-control disabled",
-    )
-    .into_iter()
-    .enumerate()
+    for (k, msg) in toolchain_words::machine_settings("universal-control disabled")
+        .into_iter()
+        .enumerate()
     {
         posts.push((404 - k as u64, msg));
     }
@@ -29557,4 +29532,865 @@ fn settings_messages_visual_capture() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings ▸ Messages: the keyboard, the scroll and the status line after an
+// action, a publication or a scroll (ruling 441 (k)–(t)).
+// ---------------------------------------------------------------------------
+
+/// The Settings view's focused key, compiled at `cx`, and whether the page
+/// shows it.
+fn focus_on_page(
+    runtime: &NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+) -> (Option<UiKey>, bool) {
+    let compiled = compile_settings_view(runtime, instance, view, cx);
+    let focus = messages_view_state(runtime, view).common.last_focus.clone();
+    let shown = focus
+        .as_ref()
+        .is_some_and(|key| compiled.semantic(key).is_some());
+    (focus, shown)
+}
+
+/// Put the keyboard on `key`, as a click or Tab does.
+fn focus_key(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    key: &str,
+) {
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new(key.to_string()))),
+        )
+        .unwrap();
+}
+
+/// The Messages view's status line.
+fn feedback_line(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> Option<String> {
+    messages_view_state(runtime, view).feedback.clone()
+}
+
+/// A publication of [`sample_messages`] at `now`, as the host's does.
+fn publish_messages(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    now: u64,
+    revision: u64,
+) {
+    let mut state = sample_messages();
+    state.now_unix_ms = now;
+    state.revision = revision;
+    assert!(runtime.replace_settings_messages(state, revision));
+    runtime
+        .dispatch(instance, view, AppEvent::MessagesChanged { revision })
+        .unwrap();
+}
+
+/// [`sample_messages`] with forty one-entry tags on top, so a compact page's
+/// Tag pop-up holds more chip rows than the page has room for.
+fn forty_tag_messages() -> MessagesState {
+    script_tag_messages(40)
+}
+
+/// [`sample_messages`] with `n` one-entry tags on top (`script00`, …), as a
+/// script that names its own tags posts them (ruling 267).
+fn script_tag_messages(n: u64) -> MessagesState {
+    let mut state = sample_messages();
+    for k in 0..n {
+        let tag = format!("script{k:02}");
+        let mut entry = state.entries[3].clone();
+        entry.id = 100 + k;
+        entry.tag = tag.clone();
+        state.entries.insert(0, entry);
+        state.tags.push((tag, 1));
+    }
+    state
+}
+
+/// Ruling 441 (k), ruling 267 (the keyboard never leaves the page with no
+/// focused node) and the choice picker's own close: a tag chosen from the
+/// Tag pop-up with the keyboard puts focus back on the control that opened
+/// it, never on a chip the closed pop-up took out of the tree.
+#[test]
+fn a_tag_chosen_from_the_pop_up_leaves_focus_on_its_button() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let cx = view_cx_at(474.0, 572.0);
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/row/40/title",
+    );
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    focus_key(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    let chip = "settings/messages/filter/tag/crash";
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled.semantic(&UiKey::new(chip)).is_some(),
+        "premise: the pop-up shows the crash chip"
+    );
+    focus_key(&mut runtime, instance, view, chip);
+    messages_action(&mut runtime, instance, view, chip);
+    assert!(
+        !messages_view_state(&runtime, view).messages_tag_menu,
+        "premise: the choice closed the pop-up"
+    );
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "the keyboard is on {focus:?}, which the page no longer shows"
+    );
+    assert_eq!(
+        focus.as_ref().map(UiKey::as_str),
+        Some(MESSAGES_TAG_MENU),
+        "back on the control that opened the pop-up"
+    );
+}
+
+/// Ruling 441 (l), ruling 264: on Messages `page_scroll` counts list stops,
+/// bounded by the plan the Messages render records; a config publication
+/// leaves the log where the reader is, never clamped to the Settings field
+/// count.
+#[test]
+fn a_config_publication_leaves_a_deep_messages_scroll_where_it_is() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    assert!(runtime.replace_settings_messages(full_ring_messages(), 8));
+    let cx = view_cx();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(250))
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let deep = messages_view_state(&runtime, view).page_scroll;
+    let fields = messages_view_state(&runtime, view).legacy.fields.len();
+    assert!(
+        deep > fields,
+        "premise: scrolled past the field count ({deep} vs {fields})"
+    );
+    let rows = message_rows(&compiled);
+    let mut service = VersionedConfigService::new(String::new()).unwrap();
+    let snapshot = match service.patch(ConfigPatchRequest {
+        base_revision: 1,
+        edits: vec![ConfigKeyEdit {
+            key: prefs::EDIT_THEME.to_string(),
+            expected: ExpectedValue::Exact(None),
+            value: Some("\"Nord\"".to_string()),
+        }],
+    }) {
+        ConfigPatchResult::Applied { snapshot, .. } => snapshot,
+        other => panic!("theme fixture patch failed: {other:?}"),
+    };
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
+        .unwrap();
+    assert_eq!(
+        messages_view_state(&runtime, view).page_scroll,
+        deep,
+        "an aterm.toml change moved the log"
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(message_rows(&compiled), rows, "the same entries shown");
+}
+
+/// Ruling 441 (m), ruling 264: the scroll moves on from the stop the reader
+/// saw. A page action (an entry's Copy) handled before the next render must
+/// not leave a following wheel event clamped to a limit of 0.
+#[test]
+fn a_scroll_after_a_page_action_moves_on_from_the_stop_shown() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let cx = view_cx_at(774.0, 612.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(3))
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let s = messages_view_state(&runtime, view).page_scroll;
+    assert!(s > 0, "premise: the list scrolled");
+    let seated = message_rows(&compiled)[0];
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/messages/row/{seated}/copy"),
+    );
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(1))
+        .unwrap();
+    assert_eq!(
+        messages_view_state(&runtime, view).page_scroll,
+        s + 1,
+        "the wheel after a Copy snapped the list"
+    );
+}
+
+/// Ruling 441 (n), ruling 267 and `keep_message_focus_seated`'s doc: a
+/// control the scroll unseats hands the keyboard to the first entry the
+/// view shows (or, with none, the first header item still seated) — never
+/// to an entry the view does not show. A compact page whose Tag pop-up
+/// holds forty tags: past the switch, the header's chip rows leave no room
+/// for a card, so the view seats no entry at all.
+#[test]
+fn focus_never_moves_to_an_unseated_entry_under_a_tall_header() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    assert!(runtime.replace_settings_messages(forty_tag_messages(), 8));
+    let cx = view_cx_at(474.0, 348.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    let switch = format!("settings/control/{}", prefs::EDIT_EXPLAIN_HEAVY_LOAD);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    focus_key(&mut runtime, instance, view, &switch);
+    let (_, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(shown, "premise: the switch is on the page");
+    for step in 0..12 {
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+        assert!(
+            shown,
+            "step {step}: the keyboard is on {focus:?}, which the view does not show"
+        );
+    }
+}
+
+/// Ruling 441 (o), rulings 264 and 267: FOCUS NEVER SCROLLS AWAY. A focused
+/// footer button of the open entry that the scroll unseats hands the
+/// keyboard to what the view still shows, on the wide page and the compact
+/// one.
+#[test]
+fn a_focused_footer_button_never_scrolls_away_with_its_entry() {
+    for (w, h) in [(1_200.0, 820.0), (474.0, 572.0)] {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx_at(w, h);
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/row/40/title",
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let copy = "settings/messages/row/40/copy";
+        focus_key(&mut runtime, instance, view, copy);
+        let (_, shown) = focus_on_page(&runtime, instance, view, &cx);
+        assert!(
+            shown,
+            "{w} pt premise: the open entry's Copy is on the page"
+        );
+        let mut scrolled_away = false;
+        for step in 0..6 {
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(1))
+                .unwrap();
+            let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+            scrolled_away |= messages_view_state(&runtime, view).page_scroll > 0;
+            assert!(
+                shown,
+                "{w} pt step {step}: the keyboard is on {focus:?}, which the view does not show"
+            );
+        }
+        assert!(scrolled_away, "{w} pt premise: the list scrolled");
+    }
+}
+
+/// Ruling 441 (p): Escape closes the Tag pop-up, as `cancel_transient`
+/// closes Settings' other pop-up (the choice picker), with focus back on
+/// the control that opened it; it never throws the reader off the log.
+#[test]
+fn escape_closes_the_tag_pop_up_and_stays_on_the_log() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let cx = view_cx_at(474.0, 572.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/filter/warn",
+    );
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/row/40/title",
+    );
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    focus_key(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    assert!(
+        messages_view_state(&runtime, view).messages_tag_menu,
+        "premise: open"
+    );
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    let state = messages_view_state(&runtime, view);
+    assert_eq!(
+        state.route,
+        SettingsRoute::Messages,
+        "Escape on the pop-up left the log"
+    );
+    assert!(!state.messages_tag_menu, "the pop-up closed");
+    assert!(state.messages_filter.warn_only, "the filter stands");
+    assert_eq!(state.messages_selected, Some(40), "the entry stays open");
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(MESSAGES_TAG_MENU)
+    );
+}
+
+/// Ruling 441 (p), its review: Escape closes the Tag pop-up with the
+/// keyboard back on its button — a button the page SHOWS. On a compact page
+/// the header scrolls with the log, and a pop-up whose chips scroll its own
+/// button away left Escape's focus on a control the page no longer seats:
+/// no ring, and the next Return fell through to the page's default action
+/// (the failure (k) fixes for a chip's choice, which scrolls the list to
+/// its top).
+#[test]
+fn escape_from_a_scrolled_tag_pop_up_seats_its_button() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    assert!(runtime.replace_settings_messages(forty_tag_messages(), 8));
+    let cx = view_cx_at(474.0, 348.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    focus_key(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+    let tag_menu = UiKey::new(MESSAGES_TAG_MENU);
+    let mut away = false;
+    for _ in 0..12 {
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        if compiled.semantic(&tag_menu).is_none() {
+            away = true;
+            break;
+        }
+    }
+    assert!(away, "premise: the pop-up's chips scrolled its button away");
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    assert!(
+        !messages_view_state(&runtime, view).messages_tag_menu,
+        "premise: Escape closed the pop-up"
+    );
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert_eq!(
+        focus.as_ref().map(UiKey::as_str),
+        Some(MESSAGES_TAG_MENU),
+        "back on the button"
+    );
+    assert!(
+        shown,
+        "the keyboard is on {focus:?}, which the page does not show"
+    );
+}
+
+/// Ruling 441 (p), its second review: the Tag pop-up takes Escape only
+/// where the page draws it. Search Results and the compact category list
+/// replace the page, and a pop-up left open under either took the first
+/// Escape for a button the tree no longer held: the search stood, the list
+/// stayed open, and the keyboard had no ring. Both close the pop-up as they
+/// close the choice picker, and Escape does what it does there.
+#[test]
+fn a_tag_pop_up_under_search_or_the_category_list_takes_no_escape() {
+    let cx = view_cx_at(474.0, 572.0);
+    let open_pop_up = || {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        focus_key(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+        messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+        assert!(
+            messages_view_state(&runtime, view).messages_tag_menu,
+            "premise: open"
+        );
+        (runtime, instance, view)
+    };
+    let escape = |runtime: &mut NativeRuntime,
+                  instance: crate::native_app::AppInstanceId,
+                  view: crate::native_app::ViewId| {
+        runtime
+            .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+            .unwrap();
+    };
+    // Search Results over the page, reached as a person reaches them: the
+    // search field, then typing.
+    let (mut runtime, instance, view) = open_pop_up();
+    focus_key(&mut runtime, instance, view, "settings/search");
+    runtime
+        .dispatch(instance, view, AppEvent::InsertText("font".to_string()))
+        .unwrap();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(
+        messages_view_state(&runtime, view).search,
+        "font",
+        "premise: Search Results replace the page"
+    );
+    escape(&mut runtime, instance, view);
+    let state = messages_view_state(&runtime, view);
+    assert!(
+        state.search.is_empty(),
+        "Escape left the search standing: the pop-up it hid took it"
+    );
+    assert!(!state.messages_tag_menu, "the search closed the pop-up");
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "search: the keyboard is on {focus:?}, which the page does not show"
+    );
+    // The compact category list over the page.
+    let (mut runtime, instance, view) = open_pop_up();
+    messages_action(&mut runtime, instance, view, "settings/compact-navigation");
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    escape(&mut runtime, instance, view);
+    let state = messages_view_state(&runtime, view);
+    assert!(
+        !state.compact_navigation,
+        "Escape left the category list open: the pop-up it hid took it"
+    );
+    assert!(
+        !state.messages_tag_menu,
+        "the category list closed the pop-up"
+    );
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "category list: the keyboard is on {focus:?}, which the page does not show"
+    );
+}
+
+/// Ruling 441 (k) and (p), their second review: the pop-up's button is
+/// the keyboard's place only where the page draws it. A compact page
+/// widened under an open pop-up lays its tags out as chips, the pop-up
+/// still open in the state and drawn nowhere: a chip chosen there keeps
+/// the keyboard (it went to the absent button, and the next Return fell
+/// through to the open entry's Primary), and Escape is not the hidden
+/// pop-up's.
+#[test]
+fn a_pop_up_the_wider_page_does_not_draw_never_takes_the_keyboard() {
+    let compact = view_cx_at(474.0, 572.0);
+    let wide = view_cx_at(1_200.0, 820.0);
+    let chip = "settings/messages/filter/tag/crash";
+    let widened = || {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let _ = compile_settings_view(&runtime, instance, view, &compact);
+        focus_key(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+        messages_action(&mut runtime, instance, view, MESSAGES_TAG_MENU);
+        let compiled = compile_settings_view(&runtime, instance, view, &wide);
+        assert!(
+            compiled.semantic(&UiKey::new(chip)).is_some()
+                && compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_none()
+                && messages_view_state(&runtime, view).messages_tag_menu,
+            "premise: the wide page lays its tags out as chips under an open pop-up"
+        );
+        focus_key(&mut runtime, instance, view, chip);
+        (runtime, instance, view)
+    };
+    let (mut runtime, instance, view) = widened();
+    messages_action(&mut runtime, instance, view, chip);
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &wide);
+    assert_eq!(
+        focus.as_ref().map(UiKey::as_str),
+        Some(chip),
+        "the chip chosen keeps the keyboard"
+    );
+    assert!(shown, "premise: the page shows the chip");
+    let (mut runtime, instance, view) = widened();
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    let state = messages_view_state(&runtime, view);
+    assert_ne!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(MESSAGES_TAG_MENU),
+        "Escape put the keyboard on the button the page does not draw"
+    );
+    assert_eq!(
+        state.route,
+        SettingsRoute::Home,
+        "Escape does what it does on a page with nothing open"
+    );
+}
+
+/// Ruling 441 (q), rulings 267/268: only the line a Messages action set is
+/// transient. A config patch's result that replaced it stands, as on every
+/// other page.
+#[test]
+fn the_messages_clock_clears_only_the_line_it_set() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let effects = messages_action(&mut runtime, instance, view, "settings/messages/copy-all");
+    let operation = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::Clipboard { reply, .. } => Some(reply.operation),
+            _ => None,
+        })
+        .expect("one clipboard effect");
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ClipboardFinished {
+                operation,
+                outcome: ClipboardOutcome::Copied,
+            },
+        )
+        .unwrap();
+    let base = sample_messages().now_unix_ms;
+    publish_messages(&mut runtime, instance, view, base, 8);
+    assert_eq!(feedback_line(&runtime, view).as_deref(), Some("Copied"));
+    let effects = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_EXPLAIN_HEAVY_LOAD)),
+                value: None,
+            }),
+        )
+        .unwrap()
+        .effects;
+    let operation = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::ConfigPatch { reply, .. } => Some(reply.operation),
+            _ => None,
+        })
+        .expect("the switch's config patch");
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Rejected {
+                    message: "x".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        feedback_line(&runtime, view).as_deref(),
+        Some("Couldn\u{2019}t apply: x"),
+        "premise"
+    );
+    publish_messages(&mut runtime, instance, view, base + 6_000, 9);
+    assert_eq!(
+        feedback_line(&runtime, view).as_deref(),
+        Some("Couldn\u{2019}t apply: x"),
+        "the Copy's clock cleared the config patch's result"
+    );
+}
+
+/// Ruling 441 (r), ruling 264: an entry opened low in the view is read
+/// whole. A new record posted at the head of the list (the next publish)
+/// must not push the entry just opened out of the view.
+#[test]
+fn a_new_record_never_pushes_the_open_entry_out_of_view() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let cx = view_cx_at(774.0, 612.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(2))
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let last = *message_rows(&compiled).last().unwrap();
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/messages/row/{last}/title"),
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        message_rows(&compiled).contains(&last),
+        "premise: the opened entry is shown"
+    );
+    post_newest(&mut runtime, instance, view, false);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        message_rows(&compiled).contains(&last),
+        "entry {last}, just opened, left the view when a record was posted: {:?}",
+        message_rows(&compiled)
+    );
+}
+
+/// The host's next publication of [`sample_messages`]: a config warning,
+/// #41, posted at the head, and with `evict`, #1 — the oldest — gone from
+/// the ring to make room for it.
+fn post_newest(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    evict: bool,
+) {
+    let mut state = sample_messages();
+    let mut newest = state.entries[3].clone();
+    newest.id = 41;
+    newest.title = "config warning 41".to_string();
+    state.entries.insert(0, newest);
+    if evict {
+        state.entries.retain(|entry| entry.id != 1);
+    } else {
+        for (tag, count) in &mut state.tags {
+            if tag == "config" {
+                *count += 1;
+            }
+        }
+    }
+    state.revision = 8;
+    assert!(runtime.replace_settings_messages(state, 8));
+    runtime
+        .dispatch(instance, view, AppEvent::MessagesChanged { revision: 8 })
+        .unwrap();
+}
+
+/// Ruling 441 (o) and (r), their second review: FOCUS NEVER MOVES AWAY
+/// (ruling 267) under a publication either. A list at its newest entry
+/// takes a new record at its top ((r) keeps no anchor there), so an entry
+/// opened low in that view leaves it whole, its footer button with it; and
+/// an entry the ring evicts leaves the list. Each left the keyboard on a
+/// control the page no longer showed.
+#[test]
+fn a_publication_never_leaves_the_keyboard_on_an_entry_it_moved_away() {
+    let cx = view_cx_at(774.0, 612.0);
+    let shown_at_top = {
+        let (runtime, instance, view) = setup_with_messages();
+        message_rows(&compile_settings_view(&runtime, instance, view, &cx))
+    };
+    // Each entry the unscrolled view shows, opened where it stands and its
+    // Copy focused; then a record is posted.
+    let mut pushed = false;
+    for id in shown_at_top {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            &format!("settings/messages/row/{id}/title"),
+        );
+        let copy = format!("settings/messages/row/{id}/copy");
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        if messages_view_state(&runtime, view).page_scroll != 0
+            || compiled.semantic(&UiKey::new(copy.clone())).is_none()
+        {
+            // Opened by a scroll: (r)'s case, a test of its own.
+            continue;
+        }
+        focus_key(&mut runtime, instance, view, &copy);
+        post_newest(&mut runtime, instance, view, false);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        pushed |= !message_rows(&compiled).contains(&id);
+        let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+        assert!(
+            shown,
+            "entry {id}: the keyboard is on {focus:?}, which the view does not show"
+        );
+    }
+    assert!(
+        pushed,
+        "premise: a record posted pushed an entry opened low in the view out of it"
+    );
+    // The oldest entry, open at the end of the list with its Copy focused,
+    // evicted by the next record.
+    let (mut runtime, instance, view) = setup_with_messages();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(250))
+        .unwrap();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/row/1/title",
+    );
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let copy = "settings/messages/row/1/copy";
+    focus_key(&mut runtime, instance, view, copy);
+    let (_, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(shown, "premise: the oldest entry's Copy is on the page");
+    post_newest(&mut runtime, instance, view, true);
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "eviction: the keyboard is on {focus:?}, which the view does not show"
+    );
+}
+
+/// Ruling 441 (k) and (o), ruling 262's two lines: a publication never
+/// leaves the keyboard on a Tag control it took off a wider page. New tags
+/// a script names fold the chips into the `Tag: …` pop-up, so a focused
+/// chip goes to the pop-up's button, as a choice in the pop-up puts it; a
+/// ring that lets those tags go lets the chips out again and takes the
+/// button away. A publication that keeps the chips keeps the chip focused.
+#[test]
+fn a_publication_that_folds_the_tag_chips_moves_the_keyboard_with_them() {
+    let cx = view_cx_at(760.0, 820.0);
+    let chip = "settings/messages/filter/tag/crash";
+    let (mut runtime, instance, view) = setup_with_messages();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    focus_key(&mut runtime, instance, view, chip);
+    messages_action(&mut runtime, instance, view, chip);
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown && focus.as_ref().map(UiKey::as_str) == Some(chip),
+        "premise: the wide page shows the focused crash chip, focus {focus:?}"
+    );
+    // The control: a record posted under a tag the log has keeps the chips.
+    post_newest(&mut runtime, instance, view, false);
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown && focus.as_ref().map(UiKey::as_str) == Some(chip),
+        "a publication that kept the chips moved the keyboard to {focus:?}"
+    );
+    let publish = |runtime: &mut NativeRuntime, mut state: MessagesState, revision: u64| {
+        state.revision = revision;
+        assert!(runtime.replace_settings_messages(state, revision));
+        runtime
+            .dispatch(instance, view, AppEvent::MessagesChanged { revision })
+            .unwrap();
+        compile_settings_view(runtime, instance, view, &cx)
+    };
+    let compiled = publish(&mut runtime, script_tag_messages(2), 9);
+    assert!(
+        compiled.semantic(&UiKey::new(chip)).is_none()
+            && compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_some(),
+        "premise: two new tags fold the chips into the Tag pop-up"
+    );
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "folded: the keyboard is on {focus:?}, which the page no longer shows"
+    );
+    assert_eq!(
+        focus.as_ref().map(UiKey::as_str),
+        Some(MESSAGES_TAG_MENU),
+        "folded: the chip's keyboard goes to the pop-up's button"
+    );
+    let compiled = publish(&mut runtime, sample_messages(), 10);
+    assert!(
+        compiled.semantic(&UiKey::new(chip)).is_some()
+            && compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_none(),
+        "premise: without the new tags the chips are back"
+    );
+    let (focus, shown) = focus_on_page(&runtime, instance, view, &cx);
+    assert!(
+        shown,
+        "unfolded: the keyboard is on {focus:?}, which the page no longer shows"
+    );
+}
+
+/// Ruling 441 (s), ruling 267: "The status line an action on the Messages
+/// page sets is transient: the next action on the page clears it". A
+/// refused entry press's line is such a line.
+#[test]
+fn a_refused_entry_press_line_is_transient_too() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/row/9999/copy",
+    );
+    assert_eq!(
+        feedback_line(&runtime, view).as_deref(),
+        Some("That message is no longer in the log"),
+        "premise"
+    );
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/filter/warn",
+    );
+    assert_eq!(
+        feedback_line(&runtime, view),
+        None,
+        "the next action on the page did not clear it"
+    );
+}
+
+/// Ruling 441 (t): the page says what happened, as its other outcomes do (a
+/// refused `Open log` is `Could not open the log`): Open Log Folder's
+/// `Opening the log folder…` is answered by the open's outcome, so a
+/// failure can correct it, and the answer is transient like the page's
+/// other lines.
+#[cfg(target_os = "macos")]
+#[test]
+fn open_log_folder_waits_for_its_outcome() {
+    let (mut runtime, instance, view) = setup_with_messages();
+    let open = |runtime: &mut NativeRuntime| {
+        let effects = messages_action(runtime, instance, view, MESSAGES_OPEN_FOLDER);
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::OpenLogFolder { reply } => Some(reply.operation),
+                _ => None,
+            })
+            .expect("premise: the host is asked to open the folder")
+    };
+    let answer = |runtime: &mut NativeRuntime, operation, outcome| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::ExternalOpenFinished { operation, outcome },
+            )
+            .unwrap();
+    };
+    let operation = open(&mut runtime);
+    let state = messages_view_state(&runtime, view);
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some("Opening the log folder\u{2026}"),
+        "premise"
+    );
+    assert!(
+        !state.pending.is_empty(),
+        "nothing waits for the open's outcome: a failure can never replace \
+         `Opening the log folder\u{2026}`"
+    );
+    answer(
+        &mut runtime,
+        operation,
+        ExternalOpenOutcome::Denied {
+            message: "the log folder did not open".to_string(),
+        },
+    );
+    let state = messages_view_state(&runtime, view);
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some("Couldn\u{2019}t open the log folder"),
+        "a refused open is said"
+    );
+    assert_eq!(
+        state.messages_feedback_clock(),
+        Some(false),
+        "the answer is transient: the next publish starts its clock"
+    );
+    let operation = open(&mut runtime);
+    answer(&mut runtime, operation, ExternalOpenOutcome::Opened);
+    assert_eq!(
+        feedback_line(&runtime, view).as_deref(),
+        Some("Opened the log folder")
+    );
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/filter/warn",
+    );
+    assert_eq!(
+        feedback_line(&runtime, view),
+        None,
+        "the next action on the page clears it"
+    );
 }

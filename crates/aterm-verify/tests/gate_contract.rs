@@ -1428,7 +1428,7 @@ fn the_default_names_the_measure_tier_it_leaves_out_and_measure_runs_it_alone() 
     let repo = FakeRepo::new();
     repo.with_stage2_body("echo \"argv: $*\"\nexit 0");
     let titles = plan::tier_titles(&Scope::workspace(), Tier::Measure);
-    assert_eq!(titles.len(), 3, "{titles:?}");
+    assert_eq!(titles.len(), 2, "{titles:?}");
 
     let (fast, _) = repo.run(Mode::Fast, Scope::workspace());
     for title in &titles {
@@ -1468,12 +1468,17 @@ fn the_default_names_the_measure_tier_it_leaves_out_and_measure_runs_it_alone() 
     let mut want = titles.clone();
     want.push("verdict".to_string());
     assert_eq!(headers(&measure), want, "{measure}");
-    for argv in [
-        "argv: --unverified build --locked --release -p aterm",
-        "argv: --unverified test --workspace --no-fail-fast --test paint --test spin -- measuring::",
-    ] {
-        assert!(measure.contains(argv), "missing {argv:?}:\n{measure}");
-    }
+    assert!(
+        measure.contains(
+            "argv: --unverified test --workspace --no-fail-fast --test paint --test spin -- \
+             measuring::"
+        ),
+        "the measuring tests ran:\n{measure}"
+    );
+    assert!(
+        !measure.contains("--release"),
+        "the MEASURE tier is handed its bundle and builds no release artifact:\n{measure}"
+    );
     assert!(
         !measure.contains("argv: --unverified test --workspace --no-fail-fast --no-run"),
         "no test compile of the merge contract: {measure}"

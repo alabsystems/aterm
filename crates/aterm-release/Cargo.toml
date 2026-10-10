@@ -75,6 +75,11 @@ aterm-codec = { workspace = true }
 # This edge unifies ring's default features (RNG) into THIS binary's graph —
 # deliberate: the cutter is owner-only; shipped clients keep their own graphs.
 atpkg-keys = { workspace = true }
+# The merge gate's library, for the three things `ship release` must judge exactly as
+# the gate does: the ONE clean-tree judge (`identity::dirty_against`, the Trust lane's
+# rule), the build-env scrub (`differential::build_env_records`) and this machine's
+# gate lock (`snapshot::hold_machine`). Dependency-free by charter.
+aterm-verify = { workspace = true }
 
 [dev-dependencies]
 # The one trustd probe and skip line, and the bounded child runner the tests' own
@@ -87,6 +92,9 @@ aterm-spec = { workspace = true }
 # directories, `buildplan::PrivateSliceDir` and `publish::PrivateTempDir`, keep
 # their own code: library code this crate's Trust lane verifies.)
 aterm-tempfile = { workspace = true }
+# The wire `ship release` asks the owner through (`notice ask`): its tests hold every
+# ask the release can raise to the wire's own parse, so none is refused at the door.
+aterm-messages = { workspace = true }
 
 [lints]
 workspace = true

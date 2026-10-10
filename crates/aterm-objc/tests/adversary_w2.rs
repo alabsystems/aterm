@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W2 second-pass adversarial arming: attacks on the W2 FIXES themselves.
+//! Adversarial tests against the `declare_class!`/`msg` contracts.
 
 #![cfg(target_os = "macos")]
 
@@ -68,7 +68,7 @@ impl Drop for Ivars {
 }
 
 declare_class! {
-    /// Arities 4, 5 and 6 — past everything W1 or W2 exercised — plus the two
+    /// Arities 4, 5 and 6, plus the two
     /// struct sizes that straddle the `_stret` boundary.
     struct Adv: NSObject {
         const NAME: &str = "ATermObjcAdvW2";

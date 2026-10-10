@@ -865,6 +865,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
                         key,
                         mods,
                         base_layout: None,
+                        layout_text: None,
                         event_type,
                     },
                     Source::Human,

@@ -4,6 +4,7 @@
 use super::{RootAnswer, leaf_program};
 use crate::quit_safety::SessionRoot;
 use crate::{App, WindowId, pane, restore};
+use aterm_uds::spawnfd::InheritNothing as _;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
@@ -96,8 +97,11 @@ fn spawn_leader_inheriting(
     // SAFETY: `slave` is an open fd the caller handed over; owned here.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     // std's Command on purpose: the leader needs `pre_exec` (setsid + TIOCSCTTY) and may inherit `inherit`.
+    // The strip first: the leader holds its terminal, `inherit` (made inheritable by the hook
+    // below, after the strip) and nothing else of this process.
     let mut cmd = std::process::Command::new(argv[0]);
-    cmd.args(&argv[1..])
+    cmd.inherit_nothing()
+        .args(&argv[1..])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("PS1", "$ ")
@@ -404,6 +408,8 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
         session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
         cwd: "/".into(),
         version: None,
+        home: None,
+        login: None,
         codex: None,
     };
     manifest.fill_agents(&|id| (id == 2).then(|| hosted.clone()));
@@ -573,6 +579,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
         codex: None,
         dialect: None,
         login: None,
+        home: None,
     };
     crate::harness_host::publish_snapshot_for_test(&sid, Some(&agent));
     let hosted = app.capture_restore_manifest();

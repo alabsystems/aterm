@@ -533,6 +533,25 @@ fn scroll_up_n_exceeds_capacity() {
     }
 }
 
+/// A full-screen scroll of more than a screenful (`CSI 65535 S`) archives
+/// exactly one screenful — the screen's content, in order — and leaves the
+/// screen blank, as xterm and Alacritty clamp it. Unclamped it archived one
+/// row per count (here 100 of them, mostly blank), each costing the lock.
+#[test]
+fn a_full_screen_scroll_past_the_screen_archives_one_screenful() {
+    let mut grid = Grid::with_scrollback(3, 5, 1000);
+    for row in 0..3u16 {
+        grid.set_cursor(row, 0);
+        grid.write_char((b'X' + row as u8) as char);
+    }
+    grid.scroll_region_up(65535);
+    assert_eq!(grid.scrollback_lines(), 3, "one screenful archived");
+    for row in 0..3u16 {
+        assert!(grid.row(row).unwrap().is_empty(), "row {row} blank");
+    }
+    grid.assert_invariants();
+}
+
 /// Extras (hyperlinks, RGB colours) on visible rows survive being pushed to
 /// scrollback by a height decrease: they are extracted by their real row index.
 #[test]

@@ -79,10 +79,9 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     assert!(buggy.fire("Limited", &mut q));
     assert!(!buggy.check_invariant("NeverSilent", &q));
 
-    // The harness's OWN restart ended the agent (S0 of the in-flight review,
-    // 2026-09-27): due whoever is at the tab, and never left — no person
-    // coming back, no limit and no "end of the launch" takes it off. It
-    // lands, is tried again, or is said.
+    // The harness's OWN restart ended the agent: due whoever is at the tab,
+    // and never left — no person coming back, no limit and no "end of the
+    // launch" takes it off. It lands, is tried again, or is said.
     let mut own = model.init_state();
     assert!(model.fire("Restarted", &mut own));
     assert_eq!(
@@ -108,7 +107,7 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     }
 }
 
-/// D2 of the 2026-09-26 live test: whether an exit left Claude Code's own
+/// Whether an exit left Claude Code's own
 /// record is read as the exit is seen and KEPT, so another Claude Code that
 /// removes the dead agent's record during the relaunch's back-off cannot turn
 /// a crash into a graceful exit — and the look waits out a graceful exit's
@@ -176,15 +175,14 @@ fn a_crash_is_read_at_its_exit_and_kept_through_the_back_off() {
     assert!(!model.action_enabled("LookAtInstant", &instant));
 }
 
-/// A CODEX EXIT IS READ ON ITS SHELL'S WORD ALONE (the review of 2026-09-27):
+/// A CODEX EXIT IS READ ON ITS SHELL'S WORD ALONE:
 /// someone's signal is never relaunched and a crash is left only when its
 /// word could not be read at the attempt either — proven; the first cut's
 /// look at the thread lock (which SIGTERM leaves behind as SIGKILL does)
 /// relaunches a person's `kill`, Claude Code's rule inherited (silence a
 /// graceful exit) leaves a crash, an attempt that decides on the look alone
-/// leaves a crash whose word came late (round three of the joint audit of
-/// 2026-10-01), and one that reads the newest block whatever ran it
-/// relaunches a person's `kill` on another command's failure — each caught
+/// leaves a crash whose word came late, and one that reads the newest block
+/// whatever ran it relaunches a person's `kill` on another command's failure — each caught
 /// on a path of its own.
 #[test]
 fn a_codex_exit_is_decided_on_its_shells_word_alone() {

@@ -2191,7 +2191,7 @@ pub(crate) enum VersionRung {
 /// build itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct VersionFacts<'a> {
-    /// A release lane produced the binary ([`crate::build_info::IS_RELEASE_BUILD`]).
+    /// A release lane produced the binary ([`crate::build_info::is_release_build`]).
     pub(crate) release: bool,
     /// The display version, `MAJOR.MINOR.0` ([`crate::build_info::version_display`]).
     pub(crate) version: &'a str,
@@ -2207,7 +2207,7 @@ impl VersionFacts<'static> {
     #[must_use]
     pub(crate) fn this_build() -> Self {
         Self {
-            release: crate::build_info::IS_RELEASE_BUILD,
+            release: crate::build_info::is_release_build(),
             version: crate::build_info::version_display(),
             dev_commits: crate::build_info::dev_commits(),
             commit: crate::build_info::git_commit(),
@@ -2567,15 +2567,17 @@ pub(crate) use macos::{
 ///
 /// A process-wide fact rather than an `App` field because the helpers that
 /// read it are free functions every subsystem calls, and because the fact it
-/// guards is process-wide too: a headless launch is `Prohibited`
-/// (`launch_posture` in `lib.rs`), so AppKit will not present a window for it
-/// at all. A modal it tried to run (`choose_local_file`, `confirm`, `notify`)
-/// would park the main thread in a nested run loop nothing can see or dismiss,
-/// and an `NSWorkspace` open (`open_in_workspace`: Open Log, Help, a Privacy
-/// pane) would bring ANOTHER app to the front — the focus theft the posture
-/// exists to stop, through a different door. Guarding here covers every caller,
-/// including ones written later; the per-caller guards (the palette's picker
-/// rows, the document-open path) stay as the honest "disabled" answer.
+/// guards is process-wide too: a headless process has no application object
+/// to present anything from (on macOS its display-free loop never builds an
+/// `NSApplication`, and creating one would open the WindowServer connection a
+/// headless process must not; AGENTS.md rule 5). A modal it tried to run
+/// (`choose_local_file`, `confirm`, `notify`) would park the main thread in a
+/// nested run loop nothing can see or dismiss, and an `NSWorkspace` open
+/// (`open_in_workspace`: Open Log, Help, a Privacy pane) would bring ANOTHER app
+/// to the front — focus theft by a process with no glass. Guarding here covers
+/// every caller, including ones written later; the per-caller guards (the
+/// palette's picker rows, the document-open path) stay as the honest "disabled"
+/// answer.
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record that this process is headless. Called once, by `main_entry`.
@@ -2764,15 +2766,25 @@ pub(crate) enum PrivacyPane {
     /// macOS 26 the same page also holds the Processor Trace switch, a
     /// different setting.
     DeveloperTools,
+    /// Spotlight's Search Privacy list (System Settings ▸ Spotlight), the one
+    /// mechanism Apple documents for keeping a folder out of the index: the
+    /// owner adds `~/Developer` there (`atpkg::devroot`), which no API can do.
+    /// Read off this Mac's Settings extension (macOS 27.0, 26A428):
+    /// `SpotlightPreferenceExtension.appex` is `com.apple.Spotlight-Settings.extension`,
+    /// declares `allowsXAppleSystemPreferencesURLScheme`, names the legacy id
+    /// `com.apple.preference.spotlight`, and registers the anchor `privacy`
+    /// ("Block search of private files") in its `SpotlightSearchTerms`.
+    SpotlightSearchPrivacy,
 }
 
 impl PrivacyPane {
     /// Every pane, for the tests that hold each to the same rules.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::FullDiskAccess,
         Self::FilesAndFolders,
         Self::DeveloperTools,
+        Self::SpotlightSearchPrivacy,
     ];
 }
 
@@ -2813,6 +2825,24 @@ pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str =
 const SETTINGS_DEVELOPER_TOOLS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools";
 
+/// Spotlight's Search Privacy section, through the modern Settings extension and
+/// its registered `privacy` anchor ([`PrivacyPane::SpotlightSearchPrivacy`]).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SETTINGS_SPOTLIGHT_PRIVACY: &str =
+    "x-apple.systempreferences:com.apple.Spotlight-Settings.extension?privacy";
+
+/// Spotlight's Search Privacy section, through the legacy pane id the extension
+/// declares for itself.
+#[cfg(any(target_os = "macos", test))]
+const SETTINGS_SPOTLIGHT_PRIVACY_LEGACY: &str =
+    "x-apple.systempreferences:com.apple.preference.spotlight?privacy";
+
+/// The Spotlight page with NO anchor: its own degradation target (Search Privacy
+/// is a button on it, not a section of Privacy & Security).
+#[cfg(any(target_os = "macos", test))]
+const SETTINGS_SPOTLIGHT_ROOT: &str =
+    "x-apple.systempreferences:com.apple.Spotlight-Settings.extension";
+
 /// The Privacy & Security page with NO anchor — the degradation target. It
 /// carries no `?`, which is the invariant
 /// `the_last_candidate_is_the_unanchored_pane_root` pins: the last entry of
@@ -2847,6 +2877,11 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
             SETTINGS_DEVELOPER_TOOLS_LEGACY,
             SETTINGS_PRIVACY_ROOT,
         ],
+        PrivacyPane::SpotlightSearchPrivacy => [
+            SETTINGS_SPOTLIGHT_PRIVACY,
+            SETTINGS_SPOTLIGHT_PRIVACY_LEGACY,
+            SETTINGS_SPOTLIGHT_ROOT,
+        ],
     }
 }
 
@@ -2869,6 +2904,7 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
         PrivacyPane::DeveloperTools => {
             "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools"
         }
+        PrivacyPane::SpotlightSearchPrivacy => atpkg::devroot::SEARCH_PRIVACY,
     }
 }
 
@@ -5238,21 +5274,17 @@ mod tests {
     /// number and the hash"): a binary the release cutter did not produce —
     /// this test binary — must wear the dev counter in the third slot, the
     /// short commit hash, and the DEV marker. A release build
-    /// (`ATERM_RELEASE_BUILD` present) keeps its clean `v<version>`; that arm
-    /// is proven by the discriminator being exactly the release marker's
-    /// presence, whose name `aterm-release`'s buildplan pins to the one it
-    /// sets.
+    /// (`ATERM_RELEASE_BUILD` present for the binary's compile) keeps its clean
+    /// `v<version>`; that arm is proven by the discriminator being exactly the
+    /// release marker's presence, whose name `aterm-release`'s buildplan pins to
+    /// the one it sets.
     #[test]
     fn a_dev_build_wears_its_signature_in_the_bar_title() {
-        // A test binary is never a release build — and as a const block this
-        // fails the COMPILE of any test build that sets the release env,
-        // which is the actual invariant.
-        const {
-            assert!(
-                !crate::build_info::IS_RELEASE_BUILD,
-                "a test binary is never a release build"
-            )
-        };
+        // A test binary is never a release build: it reads the test stamp.
+        assert!(
+            !crate::build_info::is_release_build(),
+            "a test binary is never a release build"
+        );
         let t = super::version_menu_bar_title(false);
         assert!(t.starts_with('\u{1F6E0}'), "the wrench leads: {t}");
         assert!(t.ends_with(" \u{00B7} DEV"), "the marker trails: {t}");
@@ -5325,7 +5357,7 @@ mod tests {
     fn the_bar_title_is_the_strip_label_plus_its_colour_glyphs() {
         use super::{VersionRung, strip_version_label, version_menu_bar_title};
         let plain = strip_version_label(VersionRung::Full, false).expect("a full rung");
-        let wrench = if crate::build_info::IS_RELEASE_BUILD {
+        let wrench = if crate::build_info::is_release_build() {
             ""
         } else {
             "\u{1F6E0}\u{FE0F} "
@@ -5355,7 +5387,7 @@ mod tests {
             for attention in [false, true] {
                 let Some(label) = strip_version_label(rung, attention) else {
                     assert!(
-                        crate::build_info::IS_RELEASE_BUILD && rung == VersionRung::Short,
+                        crate::build_info::is_release_build() && rung == VersionRung::Short,
                         "only a release's short rung is absent"
                     );
                     continue;
@@ -5367,7 +5399,7 @@ mod tests {
                         "{c:?} is a colour glyph in {label:?}"
                     );
                 }
-                if !crate::build_info::IS_RELEASE_BUILD {
+                if !crate::build_info::is_release_build() {
                     assert!(label.contains(" \u{00B7} DEV"), "{label:?}");
                 }
             }
@@ -5670,21 +5702,37 @@ mod tests {
             super::SETTINGS_DEVELOPER_TOOLS.ends_with("?Privacy_DevTools"),
             "the Developer Tools list is anchored at Privacy_DevTools"
         );
+        assert!(
+            super::SETTINGS_SPOTLIGHT_PRIVACY.ends_with("?privacy"),
+            "Spotlight's Search Privacy is anchored at its registered `privacy`"
+        );
     }
 
     /// NEVER A DEAD END. None of these URLs is Apple-documented, so the last
     /// candidate must be a page with NO anchor at all: if both anchors stop
     /// resolving, Privacy & Security still opens and the caller falls back to
     /// the route in words. Every pane must degrade to the SAME root — the
-    /// sections live on the one page — and only the three registered anchors
-    /// may ever appear, never a per-folder pseudo-anchor
-    /// (`Privacy_DocumentsFolder` and its siblings are not anchors; Appendix
-    /// A.2).
+    /// sections live on the one page (Search Privacy degrades to the Spotlight
+    /// page it is a button on) — and only the registered anchors may ever
+    /// appear, never a per-folder pseudo-anchor (`Privacy_DocumentsFolder` and
+    /// its siblings are not anchors; Appendix A.2).
     #[test]
     fn the_last_candidate_is_the_unanchored_pane_root() {
         let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
-        for urls in super::PrivacyPane::ALL.map(super::privacy_settings_urls) {
-            assert_eq!(urls[2], fda[2], "every pane degrades to the same page");
+        for pane in super::PrivacyPane::ALL {
+            let urls = super::privacy_settings_urls(pane);
+            if pane == super::PrivacyPane::SpotlightSearchPrivacy {
+                assert_eq!(
+                    urls[2],
+                    super::SETTINGS_SPOTLIGHT_ROOT,
+                    "Search Privacy degrades to the Spotlight page it is a button on"
+                );
+            } else {
+                assert_eq!(
+                    urls[2], fda[2],
+                    "every Privacy & Security pane degrades to the same page"
+                );
+            }
             let (root, anchored) = urls.split_last().expect("three candidates");
             assert!(
                 !root.contains('?'),
@@ -5706,7 +5754,10 @@ mod tests {
                 matches!(
                     anchor,
                     None | Some(
-                        "Privacy_AllFiles" | "Privacy_FilesAndFolders" | "Privacy_DevTools"
+                        "Privacy_AllFiles"
+                            | "Privacy_FilesAndFolders"
+                            | "Privacy_DevTools"
+                            | "privacy"
                     )
                 ),
                 "only a REGISTERED anchor may ship: {url:?}"

@@ -1439,8 +1439,8 @@ fn bold_italic_gpu_match_cpu() {
 /// A SUBSCRIPT cell (`Script::Sub`, chrome-only: the Claude footer's facts)
 /// draws its glyph smaller and lower — no glyph's ink, a parenthesis taller
 /// than the letters included, above `SUB_CEILING` — the rule glyph beside it
-/// full size; and the GPU, which takes the CPU's raster and placement,
-/// matches it.
+/// full size; a nudged one draws the same glyph moved sideways by its nudge;
+/// and the GPU, which takes the CPU's raster and placement, matches it.
 #[test]
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;
@@ -1448,13 +1448,16 @@ fn sub_script_gpu_matches_cpu() {
     let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
         return;
     };
-    let (rows, cols) = (2usize, 4usize);
+    let (rows, cols) = (3usize, 4usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process("H\u{2500}(H\r\nH\u{2500}(H".as_bytes());
+    term.process("H\u{2500}(H\r\nH\u{2500}(H\r\n H".as_bytes());
     let mut input = term.cell_frame(rows, cols);
     for cell in &mut input.cells[0] {
-        cell.script = Script::Sub;
+        cell.script = Script::Sub { nudge: 0 };
     }
+    // Row 2: the same sub H one cell right, nudged half a cell back left.
+    let half = Script::NUDGES_PER_CELL / 2;
+    input.cells[2][1].script = Script::Sub { nudge: -half };
     let mut win = aterm_gpu::WindowGpu::new();
     let (cf, gf) = (
         cpu.render_input(&input),
@@ -1479,6 +1482,15 @@ fn sub_script_gpu_matches_cpu() {
             px.iter().filter(|p| inked(p)).count(),
         )
     };
+    // The leftmost inked frame column of `row` within its first `span` cells.
+    let ink_left = |f: &Frame, row: usize, span: usize| {
+        let ground = f.pixels[row * ch * f.width];
+        (0..span * cw)
+            .find(|&x| {
+                (row * ch..row * ch + ch).any(|y| dist(f.pixels[y * f.width + x], ground) > 24)
+            })
+            .expect("the row has ink")
+    };
     for f in [&cf, &gf] {
         let (sub_top, _, sub_ink) = ink_rows(f, 0, 0);
         let (top, _, ink) = ink_rows(f, 1, 0);
@@ -1499,6 +1511,12 @@ fn sub_script_gpu_matches_cpu() {
                 "col {col}: ink from row {top}, ceiling {ceiling}"
             );
         }
+        let moved = (cw as f32 / 2.0).round() as usize;
+        assert_eq!(
+            ink_left(f, 2, 2),
+            ink_left(f, 0, 1) + cw - moved,
+            "the nudged sub H stands half a cell left of its cell"
+        );
     }
 }
 

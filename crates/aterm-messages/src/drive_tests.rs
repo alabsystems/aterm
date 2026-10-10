@@ -4,8 +4,7 @@
 //! THE ONE BAND DRIVER, tested where it lives (design ruling 338): the step's
 //! order and its freeze, the afford arithmetic, the idle law, the memo's key
 //! and cost law, the past guard, the look-change due, and the paint key —
-//! including the High Contrast toggle the macOS host's old theme-only key
-//! missed (ruling 337, F1).
+//! including the High Contrast toggle a theme-only key misses (ruling 337).
 
 use crate::drive::{self, Commit, Lay, LookIn, View};
 use crate::ink::{self, BandInks, BarBase, ForcedPalette, ThemeInks};
@@ -417,10 +416,10 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
             .is_some(),
         "inks"
     );
-    // THE HIGH CONTRAST TOGGLE (ruling 337, F1): the palette the host derives
-    // from the SAME theme becomes the OS's, and the rows must follow. The old
-    // macOS key hashed the theme — equal across the toggle — so it kept the
-    // stale rows; this key hashes what the rows are painted with.
+    // THE HIGH CONTRAST TOGGLE (ruling 337): the palette the host derives
+    // from the SAME theme becomes the OS's, and the rows must follow. A key
+    // that hashed the theme — equal across the toggle — would keep the stale
+    // rows; this key hashes what the rows are painted with.
     let before = view
         .paint(&center, 80, None, g, false, &|| dark)
         .expect("painted");
@@ -438,9 +437,9 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         &hc,
     );
     assert_eq!(after, fresh, "the drive paints what a fresh paint draws");
-    // NEGATIVE CONTROL: the old key — the theme's bg/fg/cursor in place of
-    // the inks — is the same number on both sides of the toggle, so a cache
-    // on it would have presented `before`, which is not `fresh`.
+    // NEGATIVE CONTROL: a theme key — bg/fg/cursor in place of the inks —
+    // is the same number on both sides of the toggle, so a cache on it would
+    // present `before`, which is not `fresh`.
     let theme_key = |t: ThemeInks| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -523,14 +522,14 @@ fn step_floored(
     c
 }
 
-/// THE WINDOWS' CHROME REGROW FLOOR (ruling 414): the band's QUIET
-/// shrink also waits the floor the host hands in, and its state deadline
-/// names the later of the two, so the host's timer never wakes for a shrink
-/// the commit declines. Measured 2026-09-29 on main `8b24e99a4`: a presence
-/// row born 4–6 ms before this shrink made a net-zero pair that shifted a
-/// busy alternate screen. NEGATIVE CONTROL: with no floor the shrink lands at
-/// its quiet's end — that measured pair. The WINDOW's shrink (the afford fell
-/// below the count) is not floored, and a rise is never delayed.
+/// THE WINDOWS' CHROME REGROW FLOOR (ruling 414): the band's QUIET shrink also
+/// waits the floor the host hands in, and its state deadline names the later of
+/// the two, so the host's timer never wakes for a shrink the commit declines.
+/// Measured: a presence row born 4–6 ms before this shrink made a net-zero pair
+/// that shifted a busy alternate screen. NEGATIVE CONTROL: with no floor the
+/// shrink lands at its quiet's end — that measured pair. The WINDOW's shrink
+/// (the afford fell below the count) is not floored, and a rise is never
+/// delayed.
 #[test]
 fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
     use crate::chrome::CHROME_REGROW_SETTLE;

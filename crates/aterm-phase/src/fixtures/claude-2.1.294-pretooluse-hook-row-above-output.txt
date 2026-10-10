@@ -1,0 +1,21 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a PreToolUse hook on Bash printing `{"systemMessage": "remember to run the tests"}`, then a Bash call (`sleep 3; cat notes.txt`, the file's first line `Not logged in · Please run /login`), the reply after it EMPTY (a custom stub mode streaming no text): Claude Code draws the hook's row ABOVE the output, both at column 2, so the output is the SECOND column-2 `⎿` row under the call
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Bash(sleep 3; cat notes.txt)
+  ⎿  PreToolUse:Bash says: remember to run the tests
+  ⎿  Not logged in · Please run /login
+     second line of notes
+
+✻ Crunched for 3s · done 7:48 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

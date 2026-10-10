@@ -3,142 +3,69 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
 #[test]
 fn grid_insert_lines_with_scroll_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    // Row 0: A, Row 1: B, Row 2: C, Row 3: D, Row 4: E, Row 5: F, Row 6: G, Row 7: H
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Cursor at row 3 (within region)
     grid.set_cursor(3, 0);
     grid.insert_lines(2);
 
-    // Expected rows: A B C _ _ D G H (_ = inserted blank; E, F pushed off).
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'D');
-    assert_eq!(grid.cell(6, 0).unwrap().char(), 'G');
-    assert_eq!(grid.cell(7, 0).unwrap().char(), 'H');
+    // Two blanks inserted at row 3; E, F pushed off the region bottom.
+    assert_eq!(col0(&grid), "ABC  DGH");
 }
 
 #[test]
 fn grid_insert_lines_cursor_outside_scroll_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Cursor at row 1 (above region) - IL should have no effect
+    // Cursor above the region: IL is a no-op.
     grid.set_cursor(1, 0);
     grid.insert_lines(2);
 
-    // All rows unchanged
-    for row in 0..8 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "Row {row} should be unchanged"
-        );
-    }
+    assert_eq!(col0(&grid), "ABCDEFGH");
 }
 
 #[test]
 fn grid_delete_lines_with_scroll_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    // Row 0: A, Row 1: B, Row 2: C, Row 3: D, Row 4: E, Row 5: F, Row 6: G, Row 7: H
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Cursor at row 3 (within region)
     grid.set_cursor(3, 0);
     grid.delete_lines(2);
 
-    // Expected rows: A B C F _ _ G H (_ = blank inserted at region bottom).
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'F');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(5, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(6, 0).unwrap().char(), 'G');
-    assert_eq!(grid.cell(7, 0).unwrap().char(), 'H');
+    // D, E deleted; blanks fill the region bottom.
+    assert_eq!(col0(&grid), "ABCF  GH");
 }
 
 #[test]
 fn grid_delete_lines_cursor_outside_scroll_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Cursor at row 7 (below region) - DL should have no effect
+    // Cursor below the region: DL is a no-op.
     grid.set_cursor(7, 0);
     grid.delete_lines(2);
 
-    // All rows unchanged
-    for row in 0..8 {
-        assert_eq!(
-            grid.cell(row, 0).unwrap().char(),
-            (b'A' + row as u8) as char,
-            "Row {row} should be unchanged"
-        );
-    }
+    assert_eq!(col0(&grid), "ABCDEFGH");
 }
 
 #[test]
 fn grid_scroll_region_up_within_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    // Row 0: A, Row 1: B, Row 2: C, Row 3: D, Row 4: E, Row 5: F, Row 6: G, Row 7: H
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Scroll region up by 2 lines
     grid.scroll_region_up(2);
 
-    // Expected rows: A B E F _ _ G H (_ = blank inserted at region bottom).
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'E');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), 'F');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(5, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(6, 0).unwrap().char(), 'G');
-    assert_eq!(grid.cell(7, 0).unwrap().char(), 'H');
+    // C, D scrolled out; blanks fill the region bottom.
+    assert_eq!(col0(&grid), "ABEF  GH");
     assert_eq!(
         grid.scrollback_lines(),
         0,
@@ -151,11 +78,7 @@ fn grid_scroll_region_up_within_region() {
 /// Content displaced through row zero must enter primary-screen history.
 #[test]
 fn grid_top_anchored_partial_scroll_archives_history_and_preserves_footer() {
-    let mut grid = Grid::with_scrollback(5, 10, 10);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 10, 10));
 
     grid.set_scroll_region(0, 2);
     grid.clear_damage();
@@ -197,13 +120,7 @@ fn grid_top_anchored_partial_scroll_archives_history_and_preserves_footer() {
             .trim_end(),
         "A"
     );
-    for (row, expected) in ['B', 'C', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(
-            grid.cell(row as u16, 0).unwrap().char(),
-            expected,
-            "visible row {row}"
-        );
-    }
+    assert_eq!(col0(&grid), "BC DE");
 
     grid.scroll_display(1);
     assert_eq!(grid.display_offset(), 1, "new history is user-scrollable");
@@ -212,11 +129,7 @@ fn grid_top_anchored_partial_scroll_archives_history_and_preserves_footer() {
 
 #[test]
 fn grid_top_anchored_partial_batch_scroll_archives_each_displaced_row() {
-    let mut grid = Grid::with_scrollback(5, 10, 10);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 10, 10));
 
     grid.set_scroll_region(0, 2);
     grid.scroll_region_up(2);
@@ -231,9 +144,7 @@ fn grid_top_anchored_partial_batch_scroll_archives_each_displaced_row() {
             expected
         );
     }
-    for (row, expected) in ['C', ' ', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(grid.cell(row as u16, 0).unwrap().char(), expected);
-    }
+    assert_eq!(col0(&grid), "C  DE");
     grid.assert_invariants();
 }
 
@@ -405,23 +316,17 @@ fn grid_fresh_session_mixed_batch_scroll_drops_only_leading_blank_prefix() {
         Some(crate::AbsoluteRowUpdate::Splice { at: 3, inserted: 1 }),
         "the footer splice covers only the archived suffix"
     );
-    for (row, expected) in [' ', ' ', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(
-            grid.cell(row as u16, 0).unwrap().char(),
-            expected,
-            "visible row {row} must match a single scroll of the full amount"
-        );
-    }
+    assert_eq!(
+        col0(&grid),
+        "   DE",
+        "the screen must match a single scroll of the full amount"
+    );
     grid.assert_invariants();
 }
 
 #[test]
 fn grid_top_anchored_partial_scroll_keeps_history_order_at_ring_capacity() {
-    let mut grid = Grid::with_scrollback(5, 10, 2);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 10, 2));
     grid.scroll_up(2);
     assert_eq!(grid.scrollback_lines(), 2);
 
@@ -442,19 +347,13 @@ fn grid_top_anchored_partial_scroll_keeps_history_order_at_ring_capacity() {
             expected
         );
     }
-    for (row, expected) in ['L', 'M', ' ', 'N', 'O'].into_iter().enumerate() {
-        assert_eq!(grid.cell(row as u16, 0).unwrap().char(), expected);
-    }
+    assert_eq!(col0(&grid), "LM NO");
     grid.assert_invariants();
 }
 
 #[test]
 fn grid_top_anchored_partial_scroll_clamps_to_region_size() {
-    let mut grid = Grid::with_scrollback(5, 10, 10);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 10, 10));
 
     grid.set_scroll_region(0, 2);
     grid.scroll_region_up(usize::MAX);
@@ -469,39 +368,27 @@ fn grid_top_anchored_partial_scroll_clamps_to_region_size() {
             expected
         );
     }
-    for (row, expected) in [' ', ' ', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(grid.cell(row as u16, 0).unwrap().char(), expected);
-    }
+    assert_eq!(col0(&grid), "   DE");
     grid.assert_invariants();
 }
 
 #[test]
 fn grid_history_free_top_region_remains_ephemeral() {
-    let mut grid = Grid::with_scrollback(5, 10, 0);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 10, 0));
 
     grid.set_scroll_region(0, 2);
     grid.scroll_region_up(1);
 
     assert_eq!(grid.scrollback_lines(), 0);
     assert_eq!(grid.take_absolute_row_update(), None);
-    for (row, expected) in ['B', 'C', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(grid.cell(row as u16, 0).unwrap().char(), expected);
-    }
+    assert_eq!(col0(&grid), "BC DE");
     grid.assert_invariants();
 }
 
 #[test]
 fn grid_zero_ring_tiered_history_archives_top_anchored_partial_scroll() {
     let scrollback = aterm_scrollback::Scrollback::new(4, 32, 100_000);
-    let mut grid = Grid::with_tiered_scrollback(5, 10, 0, scrollback);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_tiered_scrollback(5, 10, 0, scrollback));
 
     grid.set_scroll_region(0, 2);
     grid.scroll_region_up(1);
@@ -514,19 +401,13 @@ fn grid_zero_ring_tiered_history_archives_top_anchored_partial_scroll() {
             .trim_end(),
         "A"
     );
-    for (row, expected) in ['B', 'C', ' ', 'D', 'E'].into_iter().enumerate() {
-        assert_eq!(grid.cell(row as u16, 0).unwrap().char(), expected);
-    }
+    assert_eq!(col0(&grid), "BC DE");
     grid.assert_invariants();
 }
 
 #[test]
 fn grid_top_anchored_partial_scroll_preserves_dense_extras_and_bce() {
-    let mut grid = Grid::with_scrollback(5, 4, 10);
-    for row in 0..5 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(5, 4, 10));
 
     let history_fg = [201, 31, 41];
     grid.row_mut(0).unwrap().set(
@@ -607,59 +488,34 @@ fn grid_top_anchored_partial_scroll_preserves_dense_extras_and_bce() {
 
 #[test]
 fn grid_scroll_region_down_within_region() {
-    let mut grid = Grid::new(8, 10);
-    // Write content to each row
-    for row in 0..8 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    // Row 0: A, Row 1: B, Row 2: C, Row 3: D, Row 4: E, Row 5: F, Row 6: G, Row 7: H
+    let mut grid = lettered(Grid::new(8, 10));
 
-    // Set scroll region: rows 2-5
     grid.set_scroll_region(2, 5);
 
-    // Scroll region down by 2 lines
     grid.scroll_region_down(2);
 
-    // Expected rows: A B _ _ C D G H (_ = blank inserted at top; E, F pushed off).
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'B');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(3, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(4, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(5, 0).unwrap().char(), 'D');
-    assert_eq!(grid.cell(6, 0).unwrap().char(), 'G');
-    assert_eq!(grid.cell(7, 0).unwrap().char(), 'H');
+    // Blanks inserted at the region top; E, F pushed off.
+    assert_eq!(col0(&grid), "AB  CDGH");
 }
 
 /// scroll_region_up with a nonzero display_offset snaps to the live view.
 #[test]
 fn grid_scroll_region_up_resets_nonzero_display_offset() {
-    let mut grid = Grid::with_scrollback(8, 10, 20);
-    for row in 0..8u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
     grid.scroll_up(4);
     grid.set_scroll_region(2, 5);
     grid.scroll_display(2);
     assert_eq!(grid.display_offset(), 2);
 
-    // Should not panic — resets display_offset and operates on live rows
     grid.scroll_region_up(1);
     assert_eq!(grid.display_offset(), 0);
     grid.assert_invariants();
 }
 
-/// Verify that scroll_region_down resets display_offset to 0.
+/// scroll_region_down resets display_offset to 0.
 #[test]
 fn grid_scroll_region_down_resets_nonzero_display_offset() {
-    let mut grid = Grid::with_scrollback(8, 10, 20);
-    for row in 0..8u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
     grid.scroll_up(4);
     grid.set_scroll_region(2, 5);
     grid.scroll_display(2);
@@ -670,14 +526,10 @@ fn grid_scroll_region_down_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-/// Verify that insert_lines resets display_offset to 0.
+/// insert_lines resets display_offset to 0.
 #[test]
 fn grid_insert_lines_resets_nonzero_display_offset() {
-    let mut grid = Grid::with_scrollback(8, 10, 20);
-    for row in 0..8u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
     grid.scroll_up(4);
     grid.set_scroll_region(2, 5);
     grid.set_cursor(3, 0);
@@ -689,14 +541,10 @@ fn grid_insert_lines_resets_nonzero_display_offset() {
     grid.assert_invariants();
 }
 
-/// Verify that delete_lines resets display_offset to 0.
+/// delete_lines resets display_offset to 0.
 #[test]
 fn grid_delete_lines_resets_nonzero_display_offset() {
-    let mut grid = Grid::with_scrollback(8, 10, 20);
-    for row in 0..8u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::with_scrollback(8, 10, 20));
     grid.scroll_up(4);
     grid.set_scroll_region(2, 5);
     grid.set_cursor(3, 0);
@@ -710,171 +558,92 @@ fn grid_delete_lines_resets_nonzero_display_offset() {
 
 // Margined IL/DL tests (DECLRMM)
 
-/// IL with DECLRMM shifts a rectangle: 6x10 grid, region rows 1-4, margins
-/// cols 2-5, cursor row 2. Cols 2-5 of rows 2-4 move down one; cols 0-1 and
-/// 6-9 are untouched.
-#[test]
-fn grid_insert_lines_margined_rectangular_shift() {
-    let mut grid = Grid::new(6, 10);
-    // Fill each row with a distinguishable letter at every column.
-    for row in 0..6u16 {
-        for col in 0..10u16 {
+/// A grid whose every cell in row `r` holds the letter `A + r`.
+fn filled(rows: u16, cols: u16) -> Grid {
+    let mut grid = Grid::new(rows, cols);
+    for row in 0..rows {
+        for col in 0..cols {
             grid.set_cursor(row, col);
             grid.write_char((b'A' + row as u8) as char);
         }
     }
-    // Row 0: AAAAAAAAAA, Row 1: BBBBBBBBBB, ..., Row 5: FFFFFFFF
+    grid
+}
 
+/// Every visible row as its full-width cell characters.
+fn screen(grid: &Grid) -> Vec<String> {
+    (0..grid.rows())
+        .map(|row| {
+            (0..grid.cols())
+                .map(|col| grid.cell(row, col).unwrap().char())
+                .collect()
+        })
+        .collect()
+}
+
+/// IL with DECLRMM shifts a rectangle: region rows 1-4, margins cols 2-5,
+/// cursor row 2. Cols 2-5 of rows 2-4 move down one; the rest is untouched.
+#[test]
+fn grid_insert_lines_margined_rectangular_shift() {
+    let mut grid = filled(6, 10);
     grid.set_scroll_region(1, 4);
     grid.set_horizontal_margins(2, 5);
 
-    grid.set_cursor(2, 3); // within region and margins
+    grid.set_cursor(2, 3);
     grid.insert_lines_margined(1, true);
 
-    // Cursor should move to left margin (col 2)
-    assert_eq!(grid.cursor().col, 2);
-
-    // Row 0: unchanged (outside scroll region)
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(0, col).unwrap().char(), 'A', "row 0, col {col}");
-    }
-
-    // Row 1: unchanged (above cursor within region)
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(1, col).unwrap().char(), 'B', "row 1, col {col}");
-    }
-
-    // Row 2: cols 0-1 unchanged ('C'), cols 2-5 blank (inserted), cols 6-9 unchanged ('C')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'C', "row 2, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), ' ', "row 2, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'C', "row 2, col {col}");
-    }
-
-    // Row 3: cols 0-1 unchanged ('D'), cols 2-5 shifted from row 2 ('C'), cols 6-9 unchanged ('D')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'D', "row 3, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'C', "row 3, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'D', "row 3, col {col}");
-    }
-
-    // Row 4: cols 0-1 unchanged ('E'), cols 2-5 shifted from row 3 ('D'), cols 6-9 unchanged ('E')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'E', "row 4, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'D', "row 4, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'E', "row 4, col {col}");
-    }
-
-    // Row 5: unchanged (outside scroll region)
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(5, col).unwrap().char(), 'F', "row 5, col {col}");
-    }
-
+    assert_eq!(grid.cursor().col, 2, "cursor moves to the left margin");
+    assert_eq!(
+        screen(&grid),
+        [
+            "AAAAAAAAAA",
+            "BBBBBBBBBB",
+            "CC    CCCC",
+            "DDCCCCDDDD",
+            "EEDDDDEEEE",
+            "FFFFFFFFFF",
+        ]
+    );
     grid.assert_invariants();
 }
 
-/// DL with DECLRMM shifts a rectangle: 6x10 grid, region rows 1-4, margins
-/// cols 2-5, cursor row 2. Cols 2-5 of rows 2-4 move up one; cols 0-1 and
-/// 6-9 are untouched.
+/// DL with DECLRMM shifts a rectangle: region rows 1-4, margins cols 2-5,
+/// cursor row 2. Cols 2-5 of rows 2-4 move up one; the rest is untouched.
 #[test]
 fn grid_delete_lines_margined_rectangular_shift() {
-    let mut grid = Grid::new(6, 10);
-    for row in 0..6u16 {
-        for col in 0..10u16 {
-            grid.set_cursor(row, col);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-    }
-
+    let mut grid = filled(6, 10);
     grid.set_scroll_region(1, 4);
     grid.set_horizontal_margins(2, 5);
 
     grid.set_cursor(2, 3);
     grid.delete_lines_margined(1, true);
 
-    // Cursor should move to left margin (col 2)
-    assert_eq!(grid.cursor().col, 2);
-
-    // Row 0: unchanged
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(0, col).unwrap().char(), 'A', "row 0, col {col}");
-    }
-
-    // Row 1: unchanged (above cursor)
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(1, col).unwrap().char(), 'B', "row 1, col {col}");
-    }
-
-    // Row 2: cols 0-1 unchanged ('C'), cols 2-5 shifted from row 3 ('D'), cols 6-9 unchanged ('C')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'C', "row 2, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'D', "row 2, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'C', "row 2, col {col}");
-    }
-
-    // Row 3: cols 0-1 unchanged ('D'), cols 2-5 shifted from row 4 ('E'), cols 6-9 unchanged ('D')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'D', "row 3, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'E', "row 3, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'D', "row 3, col {col}");
-    }
-
-    // Row 4: cols 0-1 unchanged ('E'), cols 2-5 blank (vacated), cols 6-9 unchanged ('E')
-    for col in 0..2u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'E', "row 4, col {col}");
-    }
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), ' ', "row 4, col {col}");
-    }
-    for col in 6..10u16 {
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'E', "row 4, col {col}");
-    }
-
-    // Row 5: unchanged
-    for col in 0..10u16 {
-        assert_eq!(grid.cell(5, col).unwrap().char(), 'F', "row 5, col {col}");
-    }
-
+    assert_eq!(grid.cursor().col, 2, "cursor moves to the left margin");
+    assert_eq!(
+        screen(&grid),
+        [
+            "AAAAAAAAAA",
+            "BBBBBBBBBB",
+            "CCDDDDCCCC",
+            "DDEEEEDDDD",
+            "EE    EEEE",
+            "FFFFFFFFFF",
+        ]
+    );
     grid.assert_invariants();
 }
 
 /// IL margined with lrmm=false falls back to full-width insert_lines.
 #[test]
 fn grid_insert_lines_margined_lrmm_off_falls_back() {
-    let mut grid = Grid::new(6, 10);
-    for row in 0..6u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::new(6, 10));
 
     grid.set_scroll_region(1, 4);
     grid.set_horizontal_margins(2, 5);
     grid.set_cursor(2, 0);
 
-    // lrmm=false: should do full-width IL regardless of horizontal margins
     grid.insert_lines_margined(1, false);
 
-    // Full-width shift: row 2 should be blank, row 3 should have old row 2 content
     assert_eq!(grid.cell(2, 0).unwrap().char(), ' ');
     assert_eq!(grid.cell(3, 0).unwrap().char(), 'C');
     grid.assert_invariants();
@@ -883,89 +652,54 @@ fn grid_insert_lines_margined_lrmm_off_falls_back() {
 /// DL margined with full-width margins falls back to full-width delete_lines.
 #[test]
 fn grid_delete_lines_margined_full_width_falls_back() {
-    let mut grid = Grid::new(6, 10);
-    for row in 0..6u16 {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
+    let mut grid = lettered(Grid::new(6, 10));
 
     grid.set_scroll_region(1, 4);
-    // Full-width margins (0 to cols-1)
     grid.set_horizontal_margins(0, 9);
     grid.set_cursor(2, 0);
 
-    // Even with lrmm=true, full-width margins should fall back to full-width DL
     grid.delete_lines_margined(1, true);
 
-    // Full-width shift: row 2 should have old row 3 content
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'D');
     assert_eq!(grid.cell(4, 0).unwrap().char(), ' ');
     grid.assert_invariants();
 }
 
-/// IL margined cursor outside scroll region is noop.
+/// IL margined with the cursor above the scroll region is a no-op.
 #[test]
 fn grid_insert_lines_margined_cursor_outside_noop() {
-    let mut grid = Grid::new(6, 10);
-    for row in 0..6u16 {
-        for col in 0..10u16 {
-            grid.set_cursor(row, col);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-    }
+    let mut grid = filled(6, 10);
+    let before = screen(&grid);
     grid.set_scroll_region(2, 4);
     grid.set_horizontal_margins(2, 5);
 
-    // Cursor above scroll region
     grid.set_cursor(1, 3);
     grid.insert_lines_margined(1, true);
 
-    // Nothing should change within the scroll region
-    for col in 2..6u16 {
-        assert_eq!(grid.cell(2, col).unwrap().char(), 'C', "row 2, col {col}");
-        assert_eq!(grid.cell(3, col).unwrap().char(), 'D', "row 3, col {col}");
-        assert_eq!(grid.cell(4, col).unwrap().char(), 'E', "row 4, col {col}");
-    }
+    assert_eq!(screen(&grid), before);
     grid.assert_invariants();
 }
 
-/// IL/DL margined with count exceeding region size clamps correctly.
+/// Margined IL with a count beyond the region clamps to the region.
 #[test]
 fn grid_insert_lines_margined_count_exceeds_region() {
-    let mut grid = Grid::new(6, 10);
-    for row in 0..6u16 {
-        for col in 0..10u16 {
-            grid.set_cursor(row, col);
-            grid.write_char((b'A' + row as u8) as char);
-        }
-    }
+    let mut grid = filled(6, 10);
     grid.set_scroll_region(1, 4);
     grid.set_horizontal_margins(2, 5);
     grid.set_cursor(2, 3);
 
-    // Insert 100 lines (exceeds region size 3) — should clamp to 3
     grid.insert_lines_margined(100, true);
 
-    // All cells within margins and region should be blank
-    for row in 2..5u16 {
-        for col in 2..6u16 {
-            assert_eq!(
-                grid.cell(row, col).unwrap().char(),
-                ' ',
-                "row {row}, col {col}"
-            );
-        }
-    }
-    // Cells outside margins should be unchanged
-    for row in 2..5u16 {
-        for col in 0..2u16 {
-            let expected = (b'C' + (row - 2) as u8) as char;
-            assert_eq!(
-                grid.cell(row, col).unwrap().char(),
-                expected,
-                "row {row}, col {col}"
-            );
-        }
-    }
+    assert_eq!(
+        screen(&grid),
+        [
+            "AAAAAAAAAA",
+            "BBBBBBBBBB",
+            "CC    CCCC",
+            "DD    DDDD",
+            "EE    EEEE",
+            "FFFFFFFFFF",
+        ]
+    );
     grid.assert_invariants();
 }

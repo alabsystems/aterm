@@ -10,7 +10,7 @@ use super::page::PageId;
 pub type Generation = u64;
 
 /// A stable reference to a position in the terminal buffer.
-#[cfg(any(test, feature = "testing", kani))]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pin {
     /// Page containing the pinned content.
@@ -23,7 +23,7 @@ pub struct Pin {
     generation: Generation,
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl Pin {
     /// Create a new pin at the given position.
     #[must_use]
@@ -128,14 +128,14 @@ impl GenerationTracker {
     }
 
     /// Get the current global generation.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn current_generation(&self) -> Generation {
         self.global_generation
     }
 
     /// Get the generation for a specific page.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn page_generation(&self, page_id: PageId) -> Generation {
         self.generations.get(page_id).copied().unwrap_or(0)
@@ -156,7 +156,7 @@ impl GenerationTracker {
     }
 
     /// Mark multiple pages as evicted starting from `first_page`.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn evict_pages_from(&mut self, first_page: PageId) {
         for page_id in first_page..self.generations.len() {
             self.generations[page_id] += 1;
@@ -174,7 +174,7 @@ impl GenerationTracker {
     }
 
     /// Check if a pin is potentially valid.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_potentially_valid(&self, pin: &Pin) -> bool {
         if pin.generation < self.min_valid_generation {
@@ -186,7 +186,7 @@ impl GenerationTracker {
     }
 
     /// Check if a pin matches the current generation of its page.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_valid(&self, pin: &Pin) -> bool {
         if pin.generation < self.min_valid_generation {
@@ -199,7 +199,7 @@ impl GenerationTracker {
 }
 
 /// A pinned range (start and end pins).
-#[cfg(any(test, feature = "testing", kani))]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedRange {
     /// Start of the range (inclusive).
@@ -208,7 +208,7 @@ pub struct PinnedRange {
     pub end: Pin,
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl PinnedRange {
     /// Create a new pinned range.
     #[must_use]

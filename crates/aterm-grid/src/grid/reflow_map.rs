@@ -85,6 +85,15 @@ pub(super) fn source_coords_for_row(row: u16, len: usize) -> Vec<CellCoord> {
         .collect()
 }
 
+/// The source coordinate of the copied cell at `src_index`, for extras lookups.
+fn source_coord(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> Option<CellCoord> {
+    match extras_ctx.source {
+        ExtrasSource::None => None,
+        ExtrasSource::Row(r) => Some(CellCoord::new(r, row_u16(src_index))),
+        ExtrasSource::Coords(coords) => coords.get(src_index).copied(),
+    }
+}
+
 fn remap_copied_extra(
     extras_ctx: &mut ExtrasCopyCtx<'_>,
     src_index: usize,
@@ -95,13 +104,8 @@ fn remap_copied_extra(
         return;
     };
     // Single-row copies compute the coord; the merge path indexes its table.
-    let coord = match extras_ctx.source {
-        ExtrasSource::None => return,
-        ExtrasSource::Row(r) => CellCoord::new(r, row_u16(src_index)),
-        ExtrasSource::Coords(coords) => match coords.get(src_index) {
-            Some(&c) => c,
-            None => return,
-        },
+    let Some(coord) = source_coord(extras_ctx, src_index) else {
+        return;
     };
 
     // Structured extras and rings can both contribute to one cell (an emoji's
@@ -137,12 +141,36 @@ fn remap_copied_extra(
     }
 }
 
+/// Is the blank source cell at `src_index` an inline-image tile? An image cell
+/// carries no glyph; its row's length is pinned only so the rewrap copies it
+/// (`Terminal::pin_image_rows_for_width_change`), so it is not text content.
+fn is_image_blank(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> bool {
+    let Some(old_extras) = extras_ctx.old_extras else {
+        return false;
+    };
+    source_coord(extras_ctx, src_index)
+        .and_then(|coord| old_extras.get(coord))
+        .is_some_and(|extra| extra.image().is_some())
+}
+
 /// Copy cells into a row, replacing wide chars that can't fit in narrow terminals.
+///
+/// `content_len` is where the source's content ends (an index into `cells`):
+/// every copied cell before it is content, a printed blank included, and the
+/// row's length covers it, as the write path counts a printed space. `Row::set`
+/// alone advances the length only for non-empty cells, so a printed space at a
+/// chunk end would stop being content: tiered history (staged at the row's
+/// length) would join the words around it, and a cursor after it would be
+/// clamped onto it. Cells past `content_len` (an autowrap row's trailing pad,
+/// the ConPTY cursor row's blanks through the cursor) and blank image tiles
+/// are copied but not counted.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn copy_cells_to_row(
     new_row: &mut Row,
     cells: &[crate::Cell],
     cell_offset: usize,
     actual_end: usize,
+    content_len: usize,
     new_cols: u16,
     dest_row: u16,
     extras_ctx: &mut ExtrasCopyCtx<'_>,
@@ -151,6 +179,7 @@ pub(super) fn copy_cells_to_row(
     count_reflow_cell_ops(actual_end.saturating_sub(cell_offset));
 
     let mut j = 0u16;
+    let mut content_end = 0u16;
     let mut skip_next_spacer = false;
     for (src_index, cell) in cells[cell_offset..actual_end].iter().enumerate() {
         if cell.flags().contains(CellFlags::WIDE) && new_cols < 2 {
@@ -171,25 +200,39 @@ pub(super) fn copy_cells_to_row(
             skip_next_spacer = true;
         } else if j < new_cols {
             let dest_col = j;
+            let src = cell_offset + src_index;
             new_row.set(dest_col, *cell);
-            remap_copied_extra(extras_ctx, cell_offset + src_index, dest_row, dest_col);
+            remap_copied_extra(extras_ctx, src, dest_row, dest_col);
             j += 1;
+            if src < content_len && !(cell.is_empty() && is_image_blank(extras_ctx, src)) {
+                content_end = j;
+            }
             skip_next_spacer = false;
         } else {
             skip_next_spacer = false;
         }
     }
+    new_row.update_len(content_end);
 }
 
 /// Chunk non-empty cells into new-width rows with cursor tracking. Rows after
 /// the first are marked wrapped; the caller sets the first row's flag.
+///
+/// `content_len` is where the content of `cells` ends ([`copy_cells_to_row`]).
+/// `points` are the cursors carried through the rewrap (the live one and the
+/// saved one), each a logical offset into `cells` mapped to its new cell.
+///
+/// A chunk the boundary backs off a wide glyph ends one cell short: that cell
+/// is an early-wrap hole, recorded on the row (`RowFlags::EARLY_WRAP_HOLE`) so
+/// the next rewrap drops it and nothing else.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn chunk_cells_to_rows(
     cells: &[crate::Cell],
+    content_len: usize,
     new_cols: u16,
     new_pages: &mut PageStore,
     new_rows: &mut Vec<Row>,
-    cursor_offset: Option<usize>,
-    cursor_state: &mut (usize, u16),
+    points: &mut [TrackedPoint],
     extras_ctx: &mut ExtrasCopyCtx<'_>,
 ) {
     let mut cell_offset = 0;
@@ -205,6 +248,7 @@ pub(super) fn chunk_cells_to_rows(
             cells,
             cell_offset,
             actual_end,
+            content_len,
             new_cols,
             row_u16(new_rows.len()),
             extras_ctx,
@@ -212,16 +256,48 @@ pub(super) fn chunk_cells_to_rows(
         if !first {
             row.set_wrapped(true);
         }
-        if let Some(offset) = cursor_offset
-            && let Some((r, c)) =
-                cursor_in_chunk(offset, cells.len(), cell_offset, actual_end, new_rows.len())
-        {
-            *cursor_state = (r, c);
+        // `adjust_chunk_boundary` ends a chunk before `chunk_end` only to move
+        // a wide head that would straddle the edge onto the next row.
+        if actual_end < chunk_end {
+            row.set_early_wrap_hole(true);
+        }
+        for point in points.iter_mut() {
+            if let Some(offset) = point.offset
+                && let Some((row, col)) =
+                    cursor_in_chunk(offset, cells.len(), cell_offset, actual_end, new_rows.len())
+            {
+                // Past the line's content, a gap-keeping point keeps its
+                // distance from the last chunk's start (finalize clamps it to
+                // the new width), where the live cursor is pulled back.
+                let col = if point.keeps_gap && offset > cells.len() {
+                    row_u16(offset.saturating_sub(cell_offset))
+                } else {
+                    col
+                };
+                point.at = Some((row, col));
+            }
         }
         new_rows.push(row);
         cell_offset = actual_end;
         first = false;
     }
+}
+
+/// A cursor the rewrap carries: its logical offset in the line being chunked
+/// (`None` when it is on another line), and the `(row, col)` it lands on in
+/// the new rows once its line is chunked (`None` until then).
+///
+/// An offset past the line's content lands on the line's last row. The live
+/// cursor is pulled back to the content's end there (the Native rule this
+/// module has always applied to it); a `keeps_gap` point (the saved cursor)
+/// keeps its offset, so a column a program saved past its output survives a
+/// widening, and a narrowing clamps it only to the new width, as xterm, which
+/// never moves the slot, would restore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TrackedPoint {
+    pub(super) offset: Option<usize>,
+    pub(super) at: Option<(usize, u16)>,
+    pub(super) keeps_gap: bool,
 }
 
 #[cfg(test)]
@@ -476,7 +552,16 @@ mod tests {
             new_extras: &mut new_extras,
         };
 
-        copy_cells_to_row(&mut new_row, &cells, 0, 3, 5, 0, &mut extras_ctx);
+        copy_cells_to_row(
+            &mut new_row,
+            &cells,
+            0,
+            3,
+            cells.len(),
+            5,
+            0,
+            &mut extras_ctx,
+        );
 
         assert_eq!(new_row.get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_row.get(1).unwrap().char_data(), 'B' as u16);
@@ -501,7 +586,16 @@ mod tests {
         };
 
         // Copy cells[2..4] = ['C', 'D']
-        copy_cells_to_row(&mut new_row, &cells, 2, 4, 5, 0, &mut extras_ctx);
+        copy_cells_to_row(
+            &mut new_row,
+            &cells,
+            2,
+            4,
+            cells.len(),
+            5,
+            0,
+            &mut extras_ctx,
+        );
 
         assert_eq!(new_row.get(0).unwrap().char_data(), 'C' as u16);
         assert_eq!(new_row.get(1).unwrap().char_data(), 'D' as u16);
@@ -533,7 +627,16 @@ mod tests {
             new_extras: &mut new_extras,
         };
 
-        copy_cells_to_row(&mut new_row, &cells, 0, 2, 1, 0, &mut extras_ctx);
+        copy_cells_to_row(
+            &mut new_row,
+            &cells,
+            0,
+            2,
+            cells.len(),
+            1,
+            0,
+            &mut extras_ctx,
+        );
 
         // Wide char replaced with space, spacer skipped.
         let cell = new_row.get(0).unwrap();
@@ -554,35 +657,74 @@ mod tests {
         };
 
         // cell_offset == actual_end: no cells to copy.
-        copy_cells_to_row(&mut new_row, &cells, 0, 0, 5, 0, &mut extras_ctx);
+        copy_cells_to_row(
+            &mut new_row,
+            &cells,
+            0,
+            0,
+            cells.len(),
+            5,
+            0,
+            &mut extras_ctx,
+        );
         assert!(new_row.is_empty());
     }
 
     // chunk_cells_to_rows — requires PageStore/Row allocation
 
-    #[test]
-    fn chunk_cells_to_rows_single_chunk() {
+    /// The pages (first, so a caller's binding drops them after the rows),
+    /// the chunked rows and where each tracked cursor landed.
+    type Chunked = (PageStore, Vec<Row>, [Option<(usize, u16)>; 2]);
+
+    /// Chunk `cells` (all content) at `new_cols`, tracking two cursors.
+    fn chunk(cells: &[Cell], new_cols: u16, offsets: [Option<usize>; 2]) -> Chunked {
         let mut new_pages = PageStore::new();
         let mut new_rows: Vec<Row> = Vec::new();
-        let cells = [Cell::new('A'), Cell::new('B'), Cell::new('C')];
-        let mut cursor_state = (0usize, 0u16);
         let mut new_extras = CellExtras::new();
         let mut extras_ctx = ExtrasCopyCtx {
             source: ExtrasSource::None,
             old_extras: None,
             new_extras: &mut new_extras,
         };
-
+        let mut points = offsets.map(|offset| TrackedPoint {
+            offset,
+            at: None,
+            keeps_gap: false,
+        });
         chunk_cells_to_rows(
-            &cells,
-            5, // new_cols=5, fits all 3 cells in one row
+            cells,
+            cells.len(),
+            new_cols,
             &mut new_pages,
             &mut new_rows,
-            None,
-            &mut cursor_state,
+            &mut points,
             &mut extras_ctx,
         );
+        (new_pages, new_rows, points.map(|p| p.at))
+    }
 
+    fn wide(c: char) -> [Cell; 2] {
+        [
+            Cell::with_style(
+                c,
+                crate::PackedColor::default(),
+                crate::PackedColor::default(),
+                CellFlags::WIDE,
+            ),
+            Cell::with_style(
+                ' ',
+                crate::PackedColor::default(),
+                crate::PackedColor::default(),
+                CellFlags::WIDE_CONTINUATION,
+            ),
+        ]
+    }
+
+    #[test]
+    fn chunk_cells_to_rows_single_chunk() {
+        let cells = [Cell::new('A'), Cell::new('B'), Cell::new('C')];
+        // new_cols=5 fits all 3 cells in one row.
+        let (_pages, new_rows, _) = chunk(&cells, 5, [None, None]);
         assert_eq!(new_rows.len(), 1);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
@@ -593,32 +735,14 @@ mod tests {
 
     #[test]
     fn chunk_cells_to_rows_multi_chunk() {
-        let mut new_pages = PageStore::new();
-        let mut new_rows: Vec<Row> = Vec::new();
         let cells = [
             Cell::new('A'),
             Cell::new('B'),
             Cell::new('C'),
             Cell::new('D'),
         ];
-        let mut cursor_state = (0usize, 0u16);
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        chunk_cells_to_rows(
-            &cells,
-            2, // new_cols=2: [AB] and [CD]
-            &mut new_pages,
-            &mut new_rows,
-            None,
-            &mut cursor_state,
-            &mut extras_ctx,
-        );
-
+        // new_cols=2: [AB] and [CD].
+        let (_pages, new_rows, _) = chunk(&cells, 2, [None, None]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
@@ -630,9 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_cells_to_rows_cursor_tracking() {
-        let mut new_pages = PageStore::new();
-        let mut new_rows: Vec<Row> = Vec::new();
+    fn chunk_cells_to_rows_tracks_two_cursors() {
         let cells = [
             Cell::new('A'),
             Cell::new('B'),
@@ -641,53 +763,18 @@ mod tests {
             Cell::new('E'),
             Cell::new('F'),
         ];
-        let mut cursor_state = (0usize, 0u16);
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        // Cursor at offset 4 ('E'). With new_cols=3: [ABC][DEF].
-        // 'E' is at logical offset 4, chunk [3..6), col = 4-3 = 1.
-        chunk_cells_to_rows(
-            &cells,
-            3,
-            &mut new_pages,
-            &mut new_rows,
-            Some(4), // cursor at 'E'
-            &mut cursor_state,
-            &mut extras_ctx,
-        );
-
+        // With new_cols=3: [ABC][DEF]. 'E' (offset 4) lands at row 1, col 1;
+        // 'B' (offset 1) at row 0, col 1.
+        let (_pages, new_rows, at) = chunk(&cells, 3, [Some(4), Some(1)]);
         assert_eq!(new_rows.len(), 2);
-        assert_eq!(cursor_state, (1, 1)); // row=1, col=1
+        assert_eq!(at, [Some((1, 1)), Some((0, 1))]);
     }
 
     #[test]
     fn chunk_cells_to_rows_single_column() {
-        let mut new_pages = PageStore::new();
-        let mut new_rows: Vec<Row> = Vec::new();
         let cells = [Cell::new('A'), Cell::new('B')];
-        let mut cursor_state = (0usize, 0u16);
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        chunk_cells_to_rows(
-            &cells,
-            1, // new_cols=1: each cell gets its own row
-            &mut new_pages,
-            &mut new_rows,
-            None,
-            &mut cursor_state,
-            &mut extras_ctx,
-        );
-
+        // new_cols=1: each cell gets its own row.
+        let (_pages, new_rows, _) = chunk(&cells, 1, [None, None]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[1].get(0).unwrap().char_data(), 'B' as u16);
@@ -697,34 +784,49 @@ mod tests {
 
     #[test]
     fn chunk_cells_to_rows_cursor_on_last_chunk_boundary() {
-        let mut new_pages = PageStore::new();
-        let mut new_rows: Vec<Row> = Vec::new();
         let cells = [
             Cell::new('A'),
             Cell::new('B'),
             Cell::new('C'),
             Cell::new('D'),
         ];
-        let mut cursor_state = (0usize, 0u16);
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
         // Cursor at 4 (past end) is in the last chunk [2..4): row 1, col 2.
-        chunk_cells_to_rows(
-            &cells,
-            2,
-            &mut new_pages,
-            &mut new_rows,
-            Some(4),
-            &mut cursor_state,
-            &mut extras_ctx,
-        );
-
+        let (_pages, new_rows, at) = chunk(&cells, 2, [Some(4), None]);
         assert_eq!(new_rows.len(), 2);
-        assert_eq!(cursor_state, (1, 2));
+        assert_eq!(at, [Some((1, 2)), None]);
+    }
+
+    /// A printed space at a chunk end is content: the row's length covers it,
+    /// as the write path counts a printed space.
+    #[test]
+    fn a_printed_space_at_a_chunk_end_stays_inside_the_rows_length() {
+        let cells = [
+            Cell::new('a'),
+            Cell::new('b'),
+            Cell::new(' '),
+            Cell::new('c'),
+        ];
+        let (_pages, new_rows, _) = chunk(&cells, 3, [None, None]);
+        assert_eq!(new_rows[0].len(), 3, "`ab ` keeps its space");
+        assert_eq!(new_rows[1].len(), 1);
+    }
+
+    /// A chunk backed off a wide glyph ends in an early-wrap hole, recorded on
+    /// its row; a chunk filled to the edge records none.
+    #[test]
+    fn a_chunk_backed_off_a_wide_glyph_records_its_hole() {
+        let [head, tail] = wide('中');
+        let cells = [Cell::new('a'), Cell::new('b'), head, tail, Cell::new('c')];
+        let (_pages, new_rows, _) = chunk(&cells, 3, [None, None]);
+        assert_eq!(new_rows.len(), 2);
+        assert!(new_rows[0].has_early_wrap_hole(), "`ab` + hole");
+        assert!(!new_rows[1].has_early_wrap_hole(), "`中c` fills its row");
+
+        let cells = [Cell::new('a'), Cell::new('b'), Cell::new(' '), head, tail];
+        let (_pages, new_rows, _) = chunk(&cells, 3, [None, None]);
+        assert!(
+            !new_rows[0].has_early_wrap_hole(),
+            "`ab ` is full: its last cell is a printed space, not a hole"
+        );
     }
 }

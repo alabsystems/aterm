@@ -52,6 +52,8 @@ impl Terminal {
         if cols_changed {
             self.pin_image_rows_for_width_change(cols);
         }
+        // Each saved cursor rides the resize of the grid it belongs to.
+        self.lend_saved_cursors();
         if self.modes.alternate_screen {
             // Alt screen active: don't reflow current grid (app-managed content).
             // Saved primary grid should reflow normally.
@@ -67,7 +69,48 @@ impl Terminal {
                 alt.resize_no_reflow_with_policy(rows, cols, policy);
             }
         }
+        self.take_back_saved_cursors();
         self.finalize_resize(cols_changed, rows_before, origin);
+    }
+
+    /// Lend each grid the DECSC slot that belongs to it (xterm `sc[0]` to the
+    /// primary-content grid, `sc[1]` to the alternate one) for a resize or an
+    /// offloaded re-attach, so the slot follows its text as the grid's own
+    /// cursor does ([`Grid::lend_saved_cursor`](crate::grid::Grid::lend_saved_cursor)).
+    /// The 1049 exit and DECRC then land on the cell after the saved output, not
+    /// on whatever the resize moved under the old coordinates.
+    fn lend_saved_cursors(&mut self) {
+        let (active, inactive) = if self.modes.alternate_screen {
+            (self.cursor_save.alt, self.cursor_save.main)
+        } else {
+            (self.cursor_save.main, self.cursor_save.alt)
+        };
+        self.grid
+            .lend_saved_cursor(active.map(|saved| saved.cursor));
+        if let Some(other) = self.alt_grid.as_mut() {
+            other.lend_saved_cursor(inactive.map(|saved| saved.cursor));
+        }
+    }
+
+    /// Take the lent slots back where the grids carried them
+    /// ([`Self::lend_saved_cursors`]). The rest of each slot (style, modes,
+    /// charset, pending wrap) is the host's and stays as saved.
+    fn take_back_saved_cursors(&mut self) {
+        let active = self.grid.take_lent_saved_cursor();
+        let inactive = self
+            .alt_grid
+            .as_mut()
+            .and_then(crate::grid::Grid::take_lent_saved_cursor);
+        let (active_slot, inactive_slot) = if self.modes.alternate_screen {
+            (&mut self.cursor_save.alt, &mut self.cursor_save.main)
+        } else {
+            (&mut self.cursor_save.main, &mut self.cursor_save.alt)
+        };
+        for (slot, carried) in [(active_slot, active), (inactive_slot, inactive)] {
+            if let (Some(saved), Some(cursor)) = (slot.as_mut(), carried) {
+                saved.cursor = cursor;
+            }
+        }
     }
 
     /// Resize with the width-change rewrap of off-screen scrollback moved off
@@ -108,6 +151,9 @@ impl Terminal {
         if cols_changed {
             self.pin_image_rows_for_width_change(cols);
         }
+        // As in `resize_with_policy`; the re-attach lends them again for the
+        // deficit fill it runs.
+        self.lend_saved_cursors();
         let pending = if self.modes.alternate_screen {
             // Alt active: the alt grid is app-managed; the saved primary holds
             // the scrollback that reflows.
@@ -125,6 +171,7 @@ impl Terminal {
             }
             pending
         };
+        self.take_back_saved_cursors();
         self.finalize_resize(cols_changed, rows_before, origin);
         pending
     }
@@ -144,12 +191,19 @@ impl Terminal {
         &mut self,
         reflowed: aterm_grid::ReflowedScrollback,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
+        // The re-attach's deficit fill moves the screen down by the lines it
+        // pulls back; the saved cursors move with it.
+        self.lend_saved_cursors();
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
         } else {
             Some(&mut self.grid)
         };
-        target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed))
+        let next = target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed));
+        self.take_back_saved_cursors();
+        // The history is back: the vi cursor is clamped against it now.
+        self.vi_shift(0);
+        next
     }
 
     /// Abort an offloaded resize whose reflow will never re-attach (the worker
@@ -165,6 +219,7 @@ impl Terminal {
         if let Some(grid) = target {
             grid.abort_reflow_offload();
         }
+        self.vi_shift(0);
     }
 
     /// Attach or detach the off-thread compression worker on the
@@ -244,6 +299,10 @@ impl Terminal {
         // rows-only resize keeps row identity, so it re-runs the existing range
         // check with delta 0, the new live-bottom row count and the scrollback
         // floor.
+        //
+        // The vi cursor gets the same relabel as the selection, resize undo
+        // included, and is clamped onto the new grid. A rewrap maps nothing, so
+        // a width change only clamps it.
         if cols_changed {
             // A width change never keeps a grid resize undo, so none is open.
             self.resize_undo_selection = None;
@@ -253,6 +312,7 @@ impl Terminal {
             // `abort_resize_offload` later mutate that grid's scrollback with no
             // selection call; sound only while the offload path is width-only.
             self.parked_text_selection.clear();
+            self.vi_shift(0);
         } else {
             // A rows grow that revealed retained history moves every pre-resize
             // row `revealed` rows down, as `Grid::resize_with_reflow_mode` does for
@@ -266,6 +326,7 @@ impl Terminal {
             // stay, so scrollback anchors gain `demoted` lines above them.
             // `adjust_for_rows_shrink` is that piecewise map (see its doc).
             let selection_before = self.text_selection.clone();
+            let vi_before = self.vi_is_active().then(|| self.vi.cursor_point().line);
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
@@ -276,16 +337,18 @@ impl Terminal {
                 // nothing.
                 self.text_selection
                     .adjust_for_rows_shrink(max_rows, revealed, floor);
+                self.vi_shift(revealed.saturating_neg());
             } else {
                 self.text_selection
                     .adjust_for_scroll(-revealed, max_rows, floor);
+                self.vi_shift(revealed);
             }
             // Resize undo: the transform above clamps an anchor on a row the alt
             // grid demoted, so the grow would land it a row low even though every
             // cell came back. Keep the selection the first shrink found and put it
             // back when the grid hands its undo back whole. Active screen only; the
             // parked (main) selection's grid keeps history and opens no undo.
-            self.follow_resize_undo_selection(selection_before, undone);
+            self.follow_resize_undo_selection(selection_before, vi_before, undone);
             // The parked selection gets the same treatment against the other grid,
             // with that grid's floor (the active alt grid's `scrollback_lines()` is 0
             // and would evict every scrollback anchor). `max_rows` and `demoted` are

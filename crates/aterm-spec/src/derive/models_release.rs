@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Release / updater channel state-machine models — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! Release / updater channel state-machine models. Every constructor keeps its
+//! `crate::derive` path via the `pub use` re-exports in `derive.rs`.
 
 use super::*;
 
@@ -618,9 +616,8 @@ pub fn roster_pair_redo_model() -> Model {
 /// (`publish`'s last act — the client's own election, the evergreen pointer, the
 /// anonymous downloads); only the final journaled unlock releases it. This models the
 /// whole scan → freeze/crash/resume → lease → revalidate → publish → prove head →
-/// unlock lifecycle rather than testing the arithmetic decisions in isolation. (Until
-/// 2026-09-26 the post-publish suffix was the private origin's archive and verify;
-/// the one publication proves its own head.)
+/// unlock lifecycle rather than testing the arithmetic decisions in isolation. The
+/// cut publishes once, and that one publication proves its own head.
 ///
 /// `Buggy=1` enables independent non-vacuity controls:
 /// `ResolveOperatorOnly` drops the observed channel input (the retired
@@ -1893,7 +1890,7 @@ pub fn release_published_identity_model() -> Model {
 /// and finish the convergent release delete. Only after the tag is gone may the
 /// release disappear, and clean completion atomically releases both session refs.
 ///
-/// Since the cut publishes once (2026-09-26), "the release disappears" is a DEMOTION
+/// Since the cut publishes once, "the release disappears" is a DEMOTION
 /// of the bad channel release to a prerelease (`verify::run_yank`): to every client
 /// and every scan it has left the published set exactly as a deleted release has, and
 /// it keeps its signed source attestation and stays reversible. The tag is the origin
@@ -2271,19 +2268,25 @@ pub fn release_yank_successor_first_model() -> Model {
 }
 
 /// The release CLAIM, where it LANDS, and the reader that classifies the NEXT cut
-/// (2026-09-23, owner ruling R2) — the writer/reader contract of `ledger::claim` +
-/// `changelog::claim_changelogs` (writers) and `publish::real_cut_version` over
-/// `verify::derive_cut_mode` (reader), in crates/aterm-release.
+/// (owner ruling R2) — the writer/reader contract of `ledger::reserve` +
+/// `ledger::claim` + `changelog::claim_changelogs` (writers) and
+/// `publish::real_cut_version` over `verify::derive_cut_mode` (reader), in
+/// crates/aterm-release.
 ///
-/// A real cut builds the published commit P. The claim writes ONE release commit
-/// R = P + one ledger line + P's changelog rolled — P's code and nothing else — and
-/// main takes it as a fast-forward when its tip is P, else as a merge onto the tip
-/// whose tree is the TIP's plus the same line and the shipped notes. The push is the
-/// compare-and-swap on main's tip: a lost race re-reads the winner's tip and ledger
-/// and claims again — unless main now carries this version's section and the cut is
-/// not a recut, which is the "cut elsewhere" abort. The NEXT cut reads MAIN's
-/// changelog section and the published state: section and unpublished is a recut of
-/// a claim whose cut died, section and published refuses, anything else is fresh.
+/// A real release builds the published commit P. The RESERVATION (`ClaimRead`) fixes
+/// the build number n from the tail it reads and writes ONE release commit
+/// R = P + one ledger line + P's changelog rolled — P's code and nothing else — which
+/// the release then builds and measures (build once: the bytes carry n). The claim
+/// lands it: main takes R as a fast-forward when its tip is P, else as a merge onto
+/// the tip whose tree is the TIP's plus the same line and the shipped notes. The push
+/// is the compare-and-swap on main's tip: a lost race re-reads the winner's tip and
+/// ledger and lands again with the SAME n while n is still above the tail
+/// (`ClaimRetry`), refuses with nothing claimed once the tail has reached n
+/// (`ClaimStale`: the bytes carry n, so the release reserves anew and rebuilds), and
+/// aborts as "cut elsewhere" when main now carries this version's section and the cut
+/// is not a recut. The NEXT cut reads MAIN's changelog section and the published
+/// state: section and unpublished is a recut of a claim whose cut died, section and
+/// published refuses, anything else is fresh.
 ///
 /// Environment: peers push code (`PeerPush`), other versions' claims land ledger
 /// lines (`RivalClaim`), and another machine may claim THIS version while our claim
@@ -2293,7 +2296,8 @@ pub fn release_yank_successor_first_model() -> Model {
 /// `Buggy = 1` turns on the defects this contract rules out, each caught by its own
 /// invariant: the release built from main's tip (the pre-R2 cut); the landing tree
 /// built from R (peers' code and other claims' ledger lines dropped from main); a
-/// retry that keeps its stale build number; and the reader taking the recut signal
+/// retry that lands its reserved number after the tail reached it; and the reader
+/// taking the recut signal
 /// from the published commit's changelog — which never carries the section — so a
 /// claimed-unpublished version is classified fresh, then aborted as "cut elsewhere"
 /// on its own claim, and a published one is claimed again.
@@ -2398,10 +2402,17 @@ pub fn release_claim_landing_model() -> Model {
                 elsewhere = 1;
             }
             action ClaimRetry when (
-                phase == 2 && seq > read_seq && (section == 0 || allow == 1)
+                phase == 2 && seq > read_seq && (section == 0 || allow == 1) &&
+                (n > tail || Buggy == 1)
             ) {
                 read_seq = seq;
-                n = if Buggy == 1 { n } else { tail + 1 };
+            }
+            // The reservation is stale: the tail reached n while the release built and
+            // measured. Nothing was claimed; the release reserves again.
+            action ClaimStale when (
+                phase == 2 && seq > read_seq && (section == 0 || allow == 1) && n <= tail
+            ) {
+                phase = 1;
             }
             action ClaimLand when (phase == 2 && seq == read_seq && MaxSeq > seq) {
                 phase = 3;

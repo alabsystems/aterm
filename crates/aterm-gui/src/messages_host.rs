@@ -83,7 +83,9 @@ use aterm_messages::{
     PROGRESS_GRACE, Restatement, Severity, WallStamp, drive, wire,
 };
 
-use crate::message_reporters::{PANE_FULL_DISK_ACCESS, log_did_not_open};
+use crate::message_reporters::{
+    PANE_FULL_DISK_ACCESS, PANE_SPOTLIGHT_SEARCH_PRIVACY, log_did_not_open,
+};
 use crate::native_app::MessageActOutcome;
 use crate::native_settings::SettingsRoute;
 use crate::toolchain_words::{self, HookDialect, SnapshotWords};
@@ -338,6 +340,7 @@ fn route_words(opened: bool, route: &str) -> Restatement {
 fn privacy_pane(pane: &str) -> Option<crate::menu::PrivacyPane> {
     match pane {
         PANE_FULL_DISK_ACCESS => Some(crate::menu::PrivacyPane::FullDiskAccess),
+        PANE_SPOTLIGHT_SEARCH_PRIVACY => Some(crate::menu::PrivacyPane::SpotlightSearchPrivacy),
         _ => None,
     }
 }
@@ -807,6 +810,10 @@ impl App {
     /// afford and the rows its geometry reserves, re-grids between the two
     /// halves, and hands the drained lines to its writer.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
+        // A strain row about to go stale is its episode's end, not a silence
+        // of its own (ruling 441 (u)): the episode folds first, and its row
+        // becomes the record.
+        self.strain_end_before_stale(now);
         // The digest's own clock (an entry a reporter stopped naming ends, an
         // aged one files itself): read here, on the loop's own sweep, so an
         // entry cannot outlive its cause because no second look came.
@@ -887,6 +894,20 @@ impl App {
             );
         }
         landed
+    }
+
+    /// THE SEAMLESS PARENT'S ROWS THAT DID NOT CROSS (ruling 441 (d)): at
+    /// Commit, before its last [`Self::flush_messages_log_within`], every live
+    /// row the park's carry did not take (an unrevealed row, the strain level,
+    /// a row posted since the park) retires as ended with this process
+    /// ([`aterm_messages::MessageCenter::close_uncarried`]). Left open, the
+    /// successor replayed each from the file as cut off by a crash (`still
+    /// open when aterm stopped`, ruling 267), beside its reporter's re-post
+    /// there. The count closed.
+    #[cfg(unix)]
+    pub(crate) fn close_uncarried_messages(&mut self) -> usize {
+        self.messages
+            .close_uncarried(&self.handoff_carried_messages, Instant::now())
     }
 
     /// THE GRACEFUL EXIT'S LAST WORD (design ruling 267): every row still
@@ -1242,7 +1263,10 @@ impl App {
                     .opened();
                 let route = crate::menu::privacy_settings_path_words(pane);
                 self.restate_message(id, route_words(opened, route));
-                self.note_macos_access_settings_opened(now);
+                // The access card's marker is Full Disk Access's alone.
+                if pane == crate::menu::PrivacyPane::FullDiskAccess {
+                    self.note_macos_access_settings_opened(now);
+                }
                 opened
             }
             Intent::ApplyUpdate { build } => {
@@ -1596,18 +1620,24 @@ impl App {
     /// R32 — `managed-current:`, from the pass's marker or `appnotice`: the
     /// record for `text` with the count of frozen tabs and this window's hook
     /// dialect — never a row (the silent lane, upstream dbf97ecff), and
-    /// RECORDED ONLY WHEN ITS WORDS CHANGE (2026-09-23; design ruling 58):
-    /// atpkg prints the marker at the end of every pass, four and more times
-    /// a day, and the log ring (`LOG_CAP`) and Settings ▸ Messages are for
-    /// news. That memory (`managed_current_recorded`) is a log-noise rule,
-    /// not the retired glass rule of ruling 34 — a new version, or a frozen
-    /// tab counted or adopted, is new words and is recorded. `true` when a
-    /// record was written; the caller logs INFO then, DEBUG otherwise.
+    /// RECORDED ONLY WHEN ITS SET OF VERSIONS CHANGES (2026-09-23, design
+    /// ruling 58; audit 2026-10-09): atpkg prints the marker at the end of
+    /// every pass, four and more times a day, and the log ring (`LOG_CAP`) and
+    /// Settings ▸ Messages are for news. A new version, or a program the pass
+    /// could not check (each program's standing is part of the set), is a new
+    /// record; the same set with the tabs counted differently — a frozen tab
+    /// adopted, the sessions the upgrade moves — RE-WORDS the record already
+    /// written, in place ([`Self::reword_record`]): measured that day, one
+    /// install was recorded three times in five seconds (12:48:46/49/51) as its
+    /// rows retargeted, 28 records for 11 updates. That memory
+    /// (`managed_current_recorded`) is a log-noise rule, not the retired glass
+    /// rule of ruling 34. `true` when a record was written or re-worded; the
+    /// caller logs INFO then, DEBUG otherwise.
     ///
     /// THE TABS ARE COUNTED BY WHAT THEY RUN (gap audit 2026-09-24,
     /// [`Self::tabs_behind`]): a frozen tab whose foreground is an agent is
-    /// never handed the hook to type, the Claude sessions the live upgrade is
-    /// moving turn the title to "installed", and a change in those counts
+    /// never handed the hook to type, the Claude sessions behind the managed
+    /// build turn the title to "installed", and a change in those counts
     /// re-derives the words from the text remembered here.
     pub(crate) fn post_managed_current(&mut self, text: &str) -> bool {
         self.upgrade_view.note_managed_text(text);
@@ -1618,12 +1648,23 @@ impl App {
         else {
             return false;
         };
-        let said = (msg.title.clone(), msg.detail.clone());
-        if self.managed_current_recorded.as_ref() == Some(&said) {
-            return false;
+        let versions = toolchain_words::managed_items(text);
+        // The record re-worded must still be one: past the ring's cap, or
+        // retired otherwise, the counts it would carry are a new record's —
+        // never silence until the versions move (review of 2026-10-09).
+        if let Some((said, id)) = &self.managed_current_recorded
+            && *said == versions
+            && self
+                .messages
+                .log()
+                .get(*id)
+                .is_some_and(|rec| rec.retired() == Some(&aterm_messages::Retired::Recorded))
+        {
+            let id = *id;
+            return self.reword_record(id, &msg);
         }
-        self.managed_current_recorded = Some(said);
-        self.record_message(msg);
+        let id = self.record_message(msg);
+        self.managed_current_recorded = Some((versions, id));
         true
     }
 
@@ -1648,6 +1689,27 @@ impl App {
     pub(crate) fn post_machine_settings(&mut self, text: &str) {
         for msg in toolchain_words::machine_settings(text) {
             self.record_message(msg);
+        }
+    }
+
+    /// `foreign:` — what one of a pass's looks found that aterm LEAVES ALONE, with
+    /// atpkg's fix ([`toolchain_words::foreign_report`]; audit 2026-10-09: a foreign
+    /// rustup `trust` link and a managed tool shadowed on PATH were prose 30-odd passes
+    /// printed, logged and shown to no one). Each look — the rustup seam, the PATH
+    /// shadow reconcile — reports every time it runs, so each has ONE exceptions entry
+    /// of its own ([`toolchain_words::foreign_tools_entry`]): raised, or re-worded in
+    /// place, while its report names something, and ended by its first report that
+    /// names nothing. A body this build cannot read changes nothing.
+    pub(crate) fn note_foreign_tools(&mut self, body: &str) {
+        let Some((scope, items)) = toolchain_words::foreign_report(body) else {
+            aterm_log::info!("atpkg foreign: a report this build cannot read: {body}");
+            return;
+        };
+        let entry = toolchain_words::foreign_tools_entry(scope, &items);
+        if items.is_empty() {
+            self.except_clear(&entry.key());
+        } else {
+            self.except(&entry);
         }
     }
 
@@ -3049,7 +3111,19 @@ impl App {
         finishing: Option<&str>,
     ) {
         let now = Instant::now();
-        let carried: Carry = carry.message_carry();
+        let mut carried: Carry = carry.message_carry();
+        // AN INTENT ONLY THE OLD PROCESS COULD PERFORM DOES NOT CROSS (ruling
+        // 265 / 417 (j), 441 (w)): `End sessions` hangs up the shells THIS
+        // launch reattached from the keeper (`keeper_recovered`), and an update
+        // successor reattached none, so the press would end nothing and the
+        // page would say the running sessions "had already ended". The
+        // recovery row keeps its words: they are the crashed launch's history.
+        if self.keeper_recovered.is_empty() {
+            let end = Intent::EndRecovered.encode();
+            for message in &mut carried.live {
+                message.actions.retain(|action| *action != end);
+            }
+        }
         // THE PARENT'S NEXT ID crosses even when no row does (round-seven
         // update audit, finding 18): the automatic lane parks with nothing on
         // the band, and the parent recorded past what this process loaded at

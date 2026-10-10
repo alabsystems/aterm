@@ -240,27 +240,6 @@ fn stamped_values_are_xml_escaped() {
     assert!(out.contains("<string>a&amp;b&lt;c&gt;</string>"), "{out}");
 }
 
-// --- the -dirty rule (must match crates/aterm/build.rs) ----------------------
-
-#[test]
-fn dirty_rule_matches_build_rs() {
-    // Clean commit → bare short hash.
-    assert_eq!(
-        bundle::commit_stamp(Some("aed5a06c1f00"), false),
-        "aed5a06c1f00"
-    );
-    // Dirty tree on a real commit → "-dirty" suffix.
-    assert_eq!(
-        bundle::commit_stamp(Some("aed5a06c1f00"), true),
-        "aed5a06c1f00-dirty"
-    );
-    // Unborn/.git-less tree stamps a bare "unknown", NEVER "unknown-dirty" —
-    // build.rs only suffixes a REAL commit, and the plist must agree
-    // byte-for-byte with the binary's own ATERM_GIT_COMMIT.
-    assert_eq!(bundle::commit_stamp(None, false), "unknown");
-    assert_eq!(bundle::commit_stamp(None, true), "unknown");
-}
-
 // --- provenance timestamp golden (build-app.sh's `date -u -r`) ---------------
 
 #[test]

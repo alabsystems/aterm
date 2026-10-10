@@ -213,6 +213,9 @@ struct Mock {
     /// Scripted replies to `send` requests, in order (missing = the
     /// model): a partial write, a lost answer.
     send_replies: VecDeque<CtlReply>,
+    /// Scripted replies to `restart` requests, in order (missing: `OK
+    /// restarting …`, the act made).
+    restart_replies: VecDeque<CtlReply>,
     /// `status`'s `hold=` and `fabric=`.
     hold: &'static str,
     fabric: &'static str,
@@ -1017,6 +1020,7 @@ impl Mock {
             help: "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string(),
             help_send: None,
             send_replies: VecDeque::new(),
+            restart_replies: VecDeque::new(),
             hold: "0",
             fabric: "connected",
             hold_lifts_after: None,
@@ -2391,6 +2395,12 @@ impl Mock {
             // judged as `key`'s (the person first, then the screen) —
             // then `OK seq=<n>`. A `send` releases a screen held for a
             // key, as a key does: a scripted step.
+            // The explicit restart: its fences answer as scripted, else the
+            // act is made.
+            "restart" => Ok(self
+                .restart_replies
+                .pop_front()
+                .unwrap_or_else(|| ok("OK restarting pid 4242 cause=stall\n"))),
             "send" if self.gen_fence && self.modern => {
                 self.keyed = true;
                 // The text after `--`, as the panel's world takes it.
@@ -3835,8 +3845,7 @@ fn supervise_hands_a_limit_notice_over_like_idle() {
         "{out}"
     );
     assert!(m.presses().is_empty());
-    // The manager is right there: no escalation, no probe (round 17 is
-    // `watch`'s).
+    // The manager is right there: no escalation, no probe.
     assert!(
         !m.requests
             .iter()
@@ -4278,8 +4287,8 @@ fn a_new_point_that_looks_like_the_last_one_is_still_reported() {
                 ..SuperviseOpts::default()
             },
         );
-        // The limit case's budget extension (`EXTEND …`, round 17) has
-        // tests of its own; here only the review points count.
+        // The limit case's budget extension (`EXTEND …`) has tests of
+        // its own; here only the review points count.
         let got: Vec<String> = decisions(&lines)
             .into_iter()
             .filter(|l| !l.starts_with("EXTEND "))
@@ -5025,12 +5034,11 @@ impl IdleHost for LooksAt {
     }
 }
 
-/// A LOOK THE HOST SCHEDULED ENDS THE IDLE WAIT'S STEP (the live re-check
-/// of 2026-10-01: the upgrade's unread looks, 5 s and 15 s apart, were
-/// taken 21 s apart, each at the wait's next [`WAIT_STEP`] wake). The
-/// longest step the loop waits at the idle point is the time to the look,
-/// not the step's 20 s. NEGATIVE CONTROL: a host that knows no look keeps
-/// the ordinary step.
+/// A LOOK THE HOST SCHEDULED ENDS THE IDLE WAIT'S STEP (measured: looks
+/// 5 s and 15 s apart were otherwise taken 21 s apart, each at the wait's
+/// next [`WAIT_STEP`] wake). The longest step the loop waits at the idle
+/// point is the time to the look, not the step's 20 s. NEGATIVE CONTROL: a
+/// host that knows no look keeps the ordinary step.
 #[test]
 fn a_look_the_host_scheduled_ends_the_idle_wait_step_at_its_instant() {
     let longest = |at: Option<Instant>| {
@@ -5292,9 +5300,8 @@ fn every_survey_kind_is_dismissed_with_a_guard_on_its_own_question_row() {
     }
 }
 
-/// D1 of the survey audit: a card parked over a worker that READS BUSY (a live
-/// spinner, a dynamic workflow it waits on for an hour) used to be seen and
-/// never pressed — the loop's survey step ran only at a turn's end. It is
+/// A card parked over a worker that READS BUSY (a live spinner, a dynamic
+/// workflow it waits on for an hour) is not left for the turn's end: it is
 /// dismissed at the first busy read that shows it, and the `DISMISSED` line
 /// comes with the read that shows it gone, still busy; the worker is not
 /// disturbed (no key but the `0`, nothing typed).
@@ -5591,14 +5598,12 @@ fn the_drafts_card_is_never_pressed_or_called_a_survey() {
 }
 
 // ---- the 0 in flight, the refused backspace, the card nobody presses, the
-// workflow wait (review of 2026-09-28, finals) --------------------------------
+// workflow wait ---------------------------------------------------------------
 
 /// A worker that is busy by its STATUS ROW alone — a dynamic workflow it waits on: no
-/// `esc to interrupt` footer, so nothing but the status row says it is busy. This is the
-/// owner's case (both tabs sat in it when the last survey drew), and the only screen on
-/// which the reader's stepping over a parked card is what keeps a busy worker busy:
-/// under [`busy_screen`]'s footer a card the reader misses changes nothing, which is why
-/// the first D4 tests of this stream could not tell.
+/// `esc to interrupt` footer, so nothing but the status row says it is busy. The only
+/// screen on which the reader's stepping over a parked card is what keeps a busy worker
+/// busy: under [`busy_screen`]'s footer a card the reader misses changes nothing.
 fn workflow_screen() -> Vec<String> {
     let mut r = rows(&[
         "⏺ Second-pass reviewers are out and the build is running.",
@@ -5634,10 +5639,8 @@ const WEB_SETUP_ROWS: [&str; 2] = [
 
 /// D4 where it can be told: over a worker that is busy by its status row alone, no
 /// card of ANY kind — the five rating cards, the drafts card, the transcript ask and
-/// the web-setup offer — turns it idle. No `EVENT idle`, no key, nothing typed. (Over
-/// [`busy_screen`] the footer keeps the phase busy whatever the reader makes of a card,
-/// so the loop tests written first passed with the card walkers switched off; these do
-/// not: neutralising `parked_span` turns every row of this table red.)
+/// the web-setup offer — turns it idle. No `EVENT idle`, no key, nothing typed.
+/// Neutralising `parked_span` turns every row of this table red.
 #[test]
 fn no_card_turns_a_workflow_wait_idle_in_the_loop() {
     for card in [
@@ -5710,14 +5713,12 @@ fn every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read() {
     }
 }
 
-/// ISSUE 2 of the review: Claude Code takes a lone digit 400 ms after it appeared in the
-/// composer, and ANY change to the composer in that time cancels the take. The loop
-/// used to settle 500 ms after its `0`, see the `0` still standing under the open card
-/// and backspace it — on a timer only 100 ms late it deleted its own pending dismissal,
-/// try after try. Now a `0` of ours younger than [`SURVEY_LAND`] under an open card is
-/// neither judged nor removed: the loop waits for the card to leave (`await gone` on
-/// its question row), and reads the card gone. NEGATIVE CONTROL: with no landing time
-/// the same script is backspaced at its first read.
+/// Claude Code takes a lone digit 400 ms after it appeared in the composer, and ANY
+/// change to the composer in that time cancels the take, so a backspace on a late
+/// timer deletes our own pending dismissal. A `0` of ours younger than [`SURVEY_LAND`]
+/// under an open card is neither judged nor removed: the loop waits for the card to
+/// leave (`await gone` on its question row), and reads the card gone. NEGATIVE
+/// CONTROL: with no landing time the same script is backspaced at its first read.
 #[test]
 fn a_0_the_card_has_not_taken_yet_is_not_backspaced_inside_its_debounce() {
     for busy in [false, true] {
@@ -5899,14 +5900,12 @@ fn a_busy_read_presses_a_card_once_and_leaves_the_ladder_to_the_idle_look() {
     );
 }
 
-/// ISSUE 3 of the review: a backspace the server REFUSED (`ERR halted`, `ERR busy`,
-/// `ERR rate`) was taken for done — only a lost connection was looked for — so the
-/// machine forgot the `0`, the composer's `0` made every later look wait for a "draft",
-/// and the person's next message began with it (or, the card gone, the bare `0` was
-/// SUBMITTED to the worker). Now the `0` stays owed: the loop parks or backs off like
-/// after any refused press, and removes it once the server takes the key. Each refusal
-/// is a row; the script is one card, its dropped `0`, and the same `0` still standing
-/// when the hold lifts.
+/// A backspace the server REFUSED (`ERR halted`, `ERR busy`, `ERR rate`) is not done:
+/// a forgotten `0` would make every later look wait for a "draft" and begin the
+/// person's next message (or, the card gone, be SUBMITTED to the worker). The `0`
+/// stays owed: the loop parks or backs off like after any refused press, and removes
+/// it once the server takes the key. Each refusal is a row; the script is one card,
+/// its dropped `0`, and the same `0` still standing when the hold lifts.
 #[test]
 fn a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it() {
     for (refusal, hold) in [
@@ -6011,7 +6010,7 @@ fn a_refused_backspace_of_a_stray_1_is_tried_again() {
 /// A `0` pressed on a survey that is still open at the next look did not
 /// dismiss it: no DISMISSED line — the `EVENT survey` line and a note —
 /// and it is tried again after its back-off (here the session ends
-/// first). (Round-8 review, finding 2: `DISMISSED` came at the press.)
+/// first).
 #[test]
 fn a_survey_still_open_after_its_0_is_handed_over_not_dismissed() {
     let (dir, notes) = notes_file("survey-stays");
@@ -6038,11 +6037,10 @@ fn a_survey_still_open_after_its_0_is_handed_over_not_dismissed() {
     );
 }
 
-/// THE PHILOSOPHY REVIEW OF 2026-09-25 (major): a survey whose `0` did
-/// not take was handed over for good — never pressed again, no badge,
-/// and the turn-end policy acts at no point while a survey is open, so
-/// the session silently stopped being continued. Now it is TRIED AGAIN on
-/// a growing back-off, and dismissed when a later `0` takes, with the
+/// A survey whose `0` did not take is TRIED AGAIN on a growing back-off
+/// (the turn-end policy acts at no point while a survey is open, so
+/// handing it over for good would silently stop the session being
+/// continued), and dismissed when a later `0` takes, with the
 /// host told from the second failure while the tries go on (no tab is marked).
 /// NEGATIVE CONTROL: `dismiss_surveys = false` never presses it.
 #[test]
@@ -6905,12 +6903,10 @@ fn a_request_not_served_is_told_from_a_server_answer() {
     assert!(!s.unserved(&err("halted")));
 }
 
-/// What `aterm-ctl` (since its redial) prints and exits with when an update's
-/// Commit cuts a request it does not ask again — `await seq <n>`, `await
-/// inbox since=`, a bare `await seq`, `turn`, `post` — and when no
-/// successor answered at all: exit 75 ([`aterm_ctl::EXIT_REPLACED`]) and
-/// a note, never the old `server closed the connection without
-/// responding`.
+/// What `aterm-ctl` prints and exits with when an update's Commit cuts a
+/// request it does not ask again — `await seq <n>`, `await inbox since=`,
+/// a bare `await seq`, `turn`, `post` — and when no successor answered at
+/// all: exit 75 ([`aterm_ctl::EXIT_REPLACED`]) and a note.
 fn replaced(note: &str) -> CtlReply {
     failed(i32::from(aterm_ctl::EXIT_REPLACED), note)
 }
@@ -6924,12 +6920,10 @@ const REPLACED_ANCHOR: &str = "aterm was replaced (pid 10 -> 11) before it \
 const REPLACED_GONE: &str = "aterm (pid 10) went away and nothing replaced it within 30.0 s; \
                              the exchange cannot be resumed (exit 75)";
 
-/// ROUND EIGHT, FINDING 13: exit 75 is `aterm-ctl`'s typed "the server
-/// went away before it answered" — the request was not served, whatever
-/// the note says (an anchor named in the old process, a `turn` that may
-/// have typed, nothing replacing the server at all). Read as a hard
-/// failure, `aterm drive await-turn --reconnect-s` and the `--mail` lane
-/// died at the first update instead of riding it out.
+/// Exit 75 is `aterm-ctl`'s typed "the server went away before it
+/// answered" — the request was not served, whatever the note says (an
+/// anchor named in the old process, a `turn` that may have typed, nothing
+/// replacing the server at all), so it is ridden out, not a hard failure.
 #[test]
 fn exit_75_is_a_request_not_served() {
     for note in [
@@ -7196,7 +7190,7 @@ fn a_count_that_started_over_with_no_request_failing_is_seen_moved() {
 
 /// A session that never comes back: every read fails until the window
 /// lapses, and the last line names the last failure — the connection
-/// closed under it, or (round eight, finding 13) `aterm-ctl`'s exit 75
+/// closed under it, or `aterm-ctl`'s exit 75
 /// for an update nothing replaced: ridden out, never for longer than the
 /// window.
 #[test]
@@ -9366,6 +9360,12 @@ struct ProbeHost {
     /// hand as they stood then ([`PanelShared`]).
     samples: Mutex<Vec<(crate::harness::accounts::Sample, i64, bool)>>,
     shared: Arc<PanelShared>,
+    /// Its agent's transcript tail ([`IdleHost::transcript_tail`]; `None`:
+    /// none to read), how many times the loop asked for it, and how many
+    /// it had asked by each claim ([`IdleHost::account_probe`]).
+    tail: Mutex<Option<String>>,
+    tail_asks: std::sync::atomic::AtomicUsize,
+    asks_at_claims: Mutex<Vec<usize>>,
 }
 
 impl ProbeHost {
@@ -9436,7 +9436,15 @@ impl IdleHost for ProbeHost {
         }
         last.clone()
     }
+    fn transcript_tail(&self) -> Option<String> {
+        self.tail_asks.fetch_add(1, Ordering::SeqCst);
+        self.tail.lock().unwrap().clone()
+    }
     fn account_probe(&self) -> Result<(), &'static str> {
+        self.asks_at_claims
+            .lock()
+            .unwrap()
+            .push(self.tail_asks.load(Ordering::SeqCst));
         let mut last = self.claimed.lock().unwrap();
         if let Some(next) = self.claims.lock().unwrap().pop_front() {
             *last = next;
@@ -10727,7 +10735,7 @@ fn a_reset_further_off_than_a_week_extends_nothing() {
     );
 }
 
-// ---- the auto-continue notice (round 20) ------------------------------
+// ---- the auto-continue notice -----------------------------------------
 
 /// An auto-continue notice's text; the rows around it are reconstructed.
 const AUTO_TEXT: &str =
@@ -11055,6 +11063,13 @@ mod engine {
 mod turn_end {
     use super::*;
     include!("turn_end_loop_tests.rs");
+}
+
+/// The wall confirmed by the transcript before it is acted on
+/// (`wall_confirm_loop_tests.rs`, H6-HARNESS-1).
+mod wall_confirm_loop {
+    use super::*;
+    include!("wall_confirm_loop_tests.rs");
 }
 
 /// The limit reset's step in the loop (`reset_loop_tests.rs`).

@@ -610,7 +610,7 @@ fn bloom_glow_rides_the_scissor_path_byte_identical() {
     assert_eq!(gpu.full_repaints(), 1, "first frame must be a full repaint");
 
     // Frame B: one keystroke + the comet moves down a row — the default typing
-    // tick. PRE-FIX this forced a FULL repaint whenever bloom was enabled.
+    // tick, which must not force a full repaint with bloom on.
     term.process(b"x");
     let mut in_b = term.cell_frame(ROWS, COLS);
     in_b.cursor_glow_add = comet(5, 4..10);
@@ -691,7 +691,7 @@ fn input_hot_presents_the_same_halo_as_settle() {
     let mut win_s = aterm_gpu::WindowGpu::new();
     let px_settle = gpu.present_input_readback(&mut win_s, &settle).pixels;
 
-    // Hot frame (input_hot = true): identical content — and now an IDENTICAL frame.
+    // Hot frame (input_hot = true): identical content, so an identical frame.
     let mut hot = base.clone();
     hot.input_hot = true;
     let mut win_h = aterm_gpu::WindowGpu::new();

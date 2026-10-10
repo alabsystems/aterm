@@ -29,8 +29,6 @@
 //! - Hyperlinks: OSC 8 sequences set hyperlinks on cells
 //! - Combining characters: Unicode combining marks (U+0300-U+036F, etc.)
 //! - Underline colors: SGR 58/59 for colored underlines
-//!
-//! Kani proofs are in `extra_kani_proofs.rs`.
 
 use aterm_alloc::SmallVec;
 use std::sync::Arc;
@@ -565,7 +563,8 @@ impl CellExtra {
         }
     }
 
-    /// Calculate memory used by this extra.
+    /// Calculate memory used by this extra. Saturating throughout, as in
+    /// `Grid::memory_used`: exact whenever the sum fits, `usize::MAX` otherwise.
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
@@ -574,33 +573,38 @@ impl CellExtra {
         // Over-reporting is the safe direction for a memory budget.
         let hyperlink_mem = self.hyperlink.as_ref().map_or(0, |data| {
             std::mem::size_of::<HyperlinkData>()
-                + data.url.len()
-                + data
-                    .id
-                    .as_ref()
-                    .map_or(0, |s| std::mem::size_of::<Arc<str>>() + s.len())
+                .saturating_add(data.url.len())
+                .saturating_add(data.id.as_ref().map_or(0, |s| {
+                    std::mem::size_of::<Arc<str>>().saturating_add(s.len())
+                }))
         });
         let complex_char_mem = self.complex_char.as_ref().map_or(0, |s| {
             // Boxed Arc<str>: the box holds the 16-byte fat pointer, plus the
             // backing string bytes shared via the Arc.
-            std::mem::size_of::<Arc<str>>() + s.len()
+            std::mem::size_of::<Arc<str>>().saturating_add(s.len())
         });
         let combining_mem = if self.combining.spilled() {
-            self.combining.capacity() * std::mem::size_of::<char>()
+            self.combining
+                .capacity()
+                .saturating_mul(std::mem::size_of::<char>())
         } else {
             0 // Inline storage, already counted in base
         };
         // The image payload is shared via Arc (counted once at the source, not
         // per covered cell); each cell pays only its boxed layer refs.
         let image_mem = self.image.as_ref().map_or(0, |layers| {
-            std::mem::size_of::<SmallVec<ImageRef, 1>>()
-                + if layers.spilled() {
-                    layers.capacity() * std::mem::size_of::<ImageRef>()
-                } else {
-                    0
-                }
+            std::mem::size_of::<SmallVec<ImageRef, 1>>().saturating_add(if layers.spilled() {
+                layers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ImageRef>())
+            } else {
+                0
+            })
         });
-        base + hyperlink_mem + complex_char_mem + combining_mem + image_mem
+        base.saturating_add(hyperlink_mem)
+            .saturating_add(complex_char_mem)
+            .saturating_add(combining_mem)
+            .saturating_add(image_mem)
     }
 }
 
@@ -632,7 +636,7 @@ pub struct UniformExtras<'a> {
 /// - Combining Diacritical Marks Supplement (U+1DC0-U+1DFF)
 /// - Combining Diacritical Marks for Symbols (U+20D0-U+20FF)
 /// - Combining Half Marks (U+FE20-U+FE2F)
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 #[inline]
 pub fn is_combining_mark(c: char) -> bool {
@@ -648,7 +652,3 @@ pub fn is_combining_mark(c: char) -> bool {
 #[cfg(test)]
 #[path = "extra_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "extra_kani_proofs.rs"]
-mod proofs;

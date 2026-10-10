@@ -4603,7 +4603,7 @@ mod tests {
     }
 
     /// BOTH SPELLINGS OF THE BRIDGE: `aterm link serve` (what `aterm fabric on`
-    /// writes; tools/fabric-enable.sh is a shim onto it) and `aterm-link serve`
+    /// writes) and `aterm-link serve`
     /// (the argv0 alias every harness writes) — with any program path in front.
     #[test]
     fn both_spellings_of_the_bridge_command_parse_with_the_bridges_own_parser() {

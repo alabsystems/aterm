@@ -38,8 +38,9 @@
 //!
 //! ## Verification
 //!
-//! - Kani proofs: `cell_kani_proofs.rs` (`cell_bmp_codepoint_roundtrip`,
-//!   `cell_flags_roundtrip`, `packed_colors_indexed_roundtrip`, ...)
+//! - Exhaustive tests: `cell_tests.rs`
+//!   (`cell_packing_is_lossless_over_every_input`: every char, every visual
+//!   flag set, every indexed colour pair, every overflow index and StyleId).
 //! - Compile-time assert: `size_of::<Cell>() == 8`
 
 pub use super::cell_colors::{PackedColor, PackedColors};
@@ -183,7 +184,7 @@ impl Cell {
     /// For complex cells, use the overflow table with `char_data()` as key.
     #[must_use]
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn codepoint(&self) -> u32 {
         // Copy from packed struct to avoid unaligned access
         let flags = self.flags;
@@ -263,7 +264,7 @@ impl Cell {
     }
 
     /// Get the StyleId if this cell uses style interning, otherwise None.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     #[inline]
     pub const fn style_id_opt(&self) -> Option<StyleId> {
@@ -286,8 +287,8 @@ impl Cell {
     /// The non-BMP `debug_assert!` is a deliberate caller-misuse check, so
     /// Trust's L0 gate reports it as an accepted refutation at `cp = 0x10000`.
     /// Discharging it would need a `requires` precondition or removing the
-    /// assert, so it stays documented. The Kani proofs (`cell_kani_proofs.rs`)
-    /// cover the BMP contract only.
+    /// assert, so it stays documented. `cell_packing_is_lossless_over_every_input`
+    /// covers the BMP contract over every BMP char.
     ///
     /// The masked cast `(cp & 0xFFFF) as u16` is lossless; the interval engine
     /// reports UNKNOWN here because of a toolchain transport gap, not a logic
@@ -471,7 +472,3 @@ mod color_accessors;
 #[cfg(test)]
 #[path = "cell_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "cell_kani_proofs.rs"]
-mod proofs;

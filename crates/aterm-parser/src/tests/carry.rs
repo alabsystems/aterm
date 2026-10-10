@@ -34,6 +34,7 @@ fn a_carry_continues_every_split_exactly() {
         successor
             .restore_carry(&carry)
             .unwrap_or_else(|refusal| panic!("split {split}: {carry:?} refused: {refusal}"));
+        assert_restored_state_is_safe(&successor, &format!("split {split}"));
         assert_eq!(
             successor.carry().as_ref(),
             Some(&carry),
@@ -117,19 +118,17 @@ fn parser_c1(c1: bool) -> Parser {
     }
 }
 
-/// `carry_unhooking` carries a hooked DCS string as one to IGNORE (round eight
-/// of the update audit, finding 57): the successor swallows the rest of its
-/// payload to the terminator — never printing it, never hooking a handler it
-/// did not start — and then reads what follows exactly as the live parser
-/// does. That includes a tmux passthrough wrapper's doubled ESC, which breaks
-/// out of the string into the inner sequence in both, UTF-8 in the payload (a
-/// tmux control-mode line, a kitty command's JSON) and an 8-bit ST, in either
-/// C1 mode. Everywhere else it is `carry` itself.
+/// `carry_unhooking` carries a hooked DCS string as one to IGNORE: the
+/// successor swallows the rest of its payload to the terminator — never
+/// printing it, never hooking a handler it did not start — and then reads
+/// what follows exactly as the live parser does. That includes a tmux
+/// passthrough wrapper's doubled ESC, which breaks out of the string into the
+/// inner sequence in both, UTF-8 in the payload (a tmux control-mode line, a
+/// kitty command's JSON) and an 8-bit ST, in either C1 mode. Everywhere else it is `carry` itself.
 ///
 /// RED with the first carried form, `DcsIgnore`: the tmux control-mode tail
 /// printed `\u{fffd} \u{276f} ls` and `%end` before `after`, the kitty tail
-/// `\u{fffd}llo"}`, and the sixel ended by `0x9C` swallowed `after` (the review
-/// of round eight's fix).
+/// `\u{fffd}llo"}`, and the sixel ended by `0x9C` swallowed `after`.
 #[test]
 fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
     let cases: [(&[u8], &[u8]); 6] = [
@@ -212,15 +211,14 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
 }
 
 /// THE HOOKED STRING'S CARRY READS EVERY BYTE AS THE HOOKED STRING DOES
-/// ([`HOOKED_STRING_CARRY`]; round eight of the update audit, finding 57). The
-/// table, entry by entry: for every byte the carried state stays in itself
-/// exactly where `DcsPassthrough` stays in itself, and where either leaves,
-/// both go to the same state by the same action. Then the parsers: a hooked
-/// live parser and a successor restored from its `carry_unhooking`, fed every
-/// one- and two-byte tail (65,792 of them), with C1 controls off and on,
-/// through both the byte path and the fast path, agree on everything outside
-/// the hook and end in corresponding states — and, once out of the string,
-/// in the same one.
+/// ([`HOOKED_STRING_CARRY`]). The table, entry by entry: for every byte the
+/// carried state stays in itself exactly where `DcsPassthrough` stays in
+/// itself, and where either leaves, both go to the same state by the same
+/// action. Then the parsers: a hooked live parser and a successor restored
+/// from its `carry_unhooking`, fed every one- and two-byte tail (65,792 of
+/// them), with C1 controls off and on, through both the byte path and the
+/// fast path, agree on everything outside the hook and end in corresponding
+/// states — and, once out of the string, in the same one.
 #[test]
 fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
     for byte in 0..=u8::MAX {
@@ -662,16 +660,33 @@ fn restore_carry_refuses_every_invalid_carry() {
             },
             CarryRefusal::Utf8Tail,
         ),
+        (
+            "a string head outside a string",
+            ParserCarry {
+                string_utf8_tail: vec![0xE6],
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
+            "an invalid string head",
+            ParserCarry {
+                state: State::SosPmApcString,
+                string_utf8_tail: vec![0xE6, b'a'],
+                ..ParserCarry::default()
+            },
+            CarryRefusal::Utf8Tail,
+        ),
     ];
     for (label, carry, refusal) in cases {
         let mut parser = Parser::new();
         parser.advance_fast(b"\x1b[1", &mut RecordingSink::default());
-        let before = parser.carry();
+        let before = format!("{parser:?}");
         assert_eq!(parser.restore_carry(&carry), Err(refusal), "{label}");
         assert_eq!(
-            parser.carry(),
+            format!("{parser:?}"),
             before,
-            "{label}: a refusal leaves the parser"
+            "{label}: a refusal installs nothing"
         );
         assert!(!refusal.to_string().is_empty());
     }
@@ -746,14 +761,264 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
             state: State::CsiIgnore,
             ..ParserCarry::default()
         },
+        ParserCarry {
+            state: State::SosPmApcString,
+            string_utf8_tail: vec![0xE6, 0x9C],
+            ..ParserCarry::default()
+        },
+        ParserCarry {
+            state: State::DcsIgnore,
+            string_utf8_tail: vec![0xF4, 0x8F, 0xBF],
+            ..ParserCarry::default()
+        },
     ];
-    for carry in accepted {
-        let mut parser = Parser::new();
-        parser
-            .restore_carry(&carry)
-            .unwrap_or_else(|refusal| panic!("{carry:?}: {refusal}"));
-        assert_eq!(parser.carry(), Some(carry), "a restored carry reads back");
-        parser.assert_invariants();
+    for c1 in [false, true] {
+        for carry in &accepted {
+            let mut parser = parser_c1(c1);
+            parser
+                .restore_carry(carry)
+                .unwrap_or_else(|refusal| panic!("{carry:?}: {refusal}"));
+            assert_eq!(
+                parser.carry().as_ref(),
+                Some(carry),
+                "a restored carry reads back"
+            );
+            assert_restored_state_is_safe(&parser, &format!("c1={c1} {carry:?}"));
+        }
+    }
+}
+
+/// UTF-8 tails to put in a carry. The pending prefixes: every Table 3-7 row's
+/// lead alone, then (three- and four-byte rows) with the lowest second byte
+/// the row allows, then (four-byte rows) with a third byte. Beside them,
+/// tails no stream ends in: a second byte just outside each range-checked
+/// row's range (`E0`, `ED`, `F0`, `F4`), an ASCII byte, continuation bytes
+/// and the leads that begin no sequence as heads, and a complete character of
+/// each length.
+fn utf8_tails() -> Vec<Vec<u8>> {
+    let mut tails = vec![vec![]];
+    for lead in [
+        0xC2u8, 0xDF, 0xE0, 0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4,
+    ] {
+        tails.push(vec![lead]);
+        let low = match lead {
+            0xE0 => 0xA0,
+            0xF0 => 0x90,
+            _ => 0x80,
+        };
+        match lead {
+            0xC2..=0xDF => tails.push(vec![lead, low]),
+            0xE0..=0xEF => tails.extend([vec![lead, low], vec![lead, low, 0x80]]),
+            _ => tails.extend([
+                vec![lead, low],
+                vec![lead, low, 0x80],
+                vec![lead, low, 0x80, 0x80],
+            ]),
+        }
+    }
+    tails.extend([
+        vec![0xE0, 0x9F],
+        vec![0xED, 0xA0],
+        vec![0xF0, 0x8F],
+        vec![0xF4, 0x90],
+    ]);
+    for head in [b'a', 0x80, 0xBF, 0xC0, 0xC1, 0xF5, 0xF7, 0xF8] {
+        tails.push(vec![head]);
+    }
+    tails
+}
+
+/// THE HOSTILE CARRIES: `restore_carry` either installs a carry that reads
+/// back exactly and leaves a safe parser ([`assert_restored_state_is_safe`],
+/// in both C1 modes), or refuses it and installs nothing — over carries no
+/// parser wrote, at, inside and just past every bound. Two products, each
+/// over all 14 states:
+///
+/// * the sequence fields, with both UTF-8 tails empty: 0, 1, 2, `MAX_PARAMS`
+///   and `MAX_PARAMS + 1` parameters (`u16::MAX` and 0 alternating) × a
+///   subparameter mask of 0, 1, 2, the bit at the parameter count, or every
+///   bit × `current_param` 0, 1 or `u32::MAX` × both `param_started` and both
+///   `last_was_colon` × intermediates of every length to
+///   `MAX_INTERMEDIATES + 1` in `0x20`, `0x2F`, `0x30`, `0x3C`, `0x3F` and
+///   `0x40`, and two mixed × no OSC payload or one byte × both
+///   `osc_overflowed`;
+/// * the UTF-8 fields, with the sequence fields empty: every
+///   [`utf8_tails`] tail × `utf8_expected` 0..=5 × every [`utf8_tails`] tail
+///   as `string_utf8_tail`.
+///
+/// No acceptance check reads a field of both groups, and a state that takes
+/// either group's fields refuses the other's, so a carry that mixes them is
+/// refused by a check one of the two products already reaches. Every state
+/// a carry may name is accepted at least once and every refusal is met, so
+/// neither product is vacuous.
+#[test]
+fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
+    let mut start = Parser::new();
+    start.advance_fast(b"\x1b[1", &mut RecordingSink::default());
+    let before = format!("{start:?}");
+    let mut accepted: Vec<State> = Vec::new();
+    let mut refused: Vec<CarryRefusal> = Vec::new();
+    let mut judge = |carry: &ParserCarry| {
+        let mut parser = start.clone();
+        match parser.restore_carry(carry) {
+            Ok(()) => {
+                if !accepted.contains(&carry.state) {
+                    accepted.push(carry.state);
+                }
+                assert_eq!(parser.carry().as_ref(), Some(carry), "reads back");
+                assert_restored_state_is_safe(&parser, &format!("{carry:?}"));
+                let mut c1 = parser_c1(true);
+                assert_eq!(c1.restore_carry(carry), Ok(()), "{carry:?} with C1 on");
+                assert_restored_state_is_safe(&c1, &format!("c1 {carry:?}"));
+            }
+            Err(refusal) => {
+                assert_eq!(
+                    format!("{parser:?}"),
+                    before,
+                    "{carry:?} refused ({refusal}) installed something"
+                );
+                if !refused.contains(&refusal) {
+                    refused.push(refusal);
+                }
+            }
+        }
+    };
+
+    let mut intermediates = vec![vec![], vec![0x3F, 0x20], vec![0x20, 0x40]];
+    for byte in [0x20, 0x2F, 0x30, 0x3C, 0x3F, 0x40] {
+        for len in 1..=MAX_INTERMEDIATES + 1 {
+            intermediates.push(vec![byte; len]);
+        }
+    }
+    let tails = utf8_tails();
+    for state in State::ALL {
+        for len in [0, 1, 2, MAX_PARAMS, MAX_PARAMS + 1] {
+            let params: Vec<u16> = (0..len)
+                .map(|i| if i % 2 == 0 { u16::MAX } else { 0 })
+                .collect();
+            for subparam_mask in [0, 1, 2, 1 << len, u32::MAX] {
+                for current_param in [0, 1, u32::MAX] {
+                    for (param_started, last_was_colon) in
+                        [(false, false), (false, true), (true, false), (true, true)]
+                    {
+                        for intermediates in &intermediates {
+                            for osc in [&[][..], b"x"] {
+                                for osc_overflowed in [false, true] {
+                                    judge(&ParserCarry {
+                                        state,
+                                        params: params.clone(),
+                                        subparam_mask,
+                                        current_param,
+                                        param_started,
+                                        last_was_colon,
+                                        intermediates: intermediates.clone(),
+                                        osc: osc.to_vec(),
+                                        osc_overflowed,
+                                        ..ParserCarry::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for utf8_tail in &tails {
+            for utf8_expected in 0..=5 {
+                for string_utf8_tail in &tails {
+                    judge(&ParserCarry {
+                        state,
+                        utf8_tail: utf8_tail.clone(),
+                        utf8_expected,
+                        string_utf8_tail: string_utf8_tail.clone(),
+                        ..ParserCarry::default()
+                    });
+                }
+            }
+        }
+    }
+
+    let carried = [
+        State::Ground,
+        State::Escape,
+        State::EscapeIntermediate,
+        State::CsiEntry,
+        State::CsiParam,
+        State::CsiIntermediate,
+        State::CsiIgnore,
+        State::DcsIgnore,
+        State::OscString,
+        State::SosPmApcString,
+    ];
+    assert_eq!(accepted, carried, "the states a carry restores");
+    for refusal in [
+        CarryRefusal::State(State::DcsEntry),
+        CarryRefusal::State(State::DcsParam),
+        CarryRefusal::State(State::DcsIntermediate),
+        CarryRefusal::State(State::DcsPassthrough),
+        CarryRefusal::Params,
+        CarryRefusal::SubparamMask,
+        CarryRefusal::CurrentParam,
+        CarryRefusal::Intermediates,
+        CarryRefusal::Osc,
+        CarryRefusal::Utf8Tail,
+        CarryRefusal::FieldOutsideState,
+    ] {
+        assert!(refused.contains(&refusal), "no carry met {refusal:?}");
+    }
+}
+
+/// What a restored carry may install, whoever wrote it: a state inside the
+/// invariant that names no hookable DCS state, arms no DCS or APC consumer,
+/// keeps subparameter bits below the parameters, holds a UTF-8 tail only at
+/// `Ground` and still incomplete, and a string's UTF-8 head only in a
+/// string — and the invariant still holds after every possible next byte.
+/// The next byte goes through the fast path, the successor's, and through the
+/// byte path too unless a UTF-8 tail is pending: the byte path collects no
+/// UTF-8, so only the fast path could have written or can finish one.
+fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
+    parser.assert_invariants();
+    assert!(
+        !matches!(
+            parser.state(),
+            State::DcsEntry | State::DcsParam | State::DcsIntermediate | State::DcsPassthrough
+        ),
+        "{at}: a hookable DCS state"
+    );
+    assert!(
+        !parser.dcs_active && !parser.apc_active,
+        "{at}: a consumer is armed"
+    );
+    assert_eq!(
+        parser.subparam_mask >> parser.params.len(),
+        0,
+        "{at}: subparameter bits past the parameters"
+    );
+    assert!(
+        parser.utf8_len == 0
+            || (parser.state() == State::Ground && parser.utf8_len < parser.utf8_expected),
+        "{at}: a UTF-8 tail outside Ground, or a complete one"
+    );
+    assert!(
+        parser.string_utf8 == crate::utf8::Utf8Prefix::NONE
+            || matches!(parser.state(), State::DcsIgnore | State::SosPmApcString),
+        "{at}: a string's UTF-8 head outside a string"
+    );
+    for byte in 0..=u8::MAX {
+        let mut next = vec![parser.clone()];
+        next[0].advance_fast(&[byte], &mut NullSink);
+        if parser.utf8_len == 0 {
+            let mut slow = parser.clone();
+            slow.advance(&[byte], &mut NullSink);
+            next.push(slow);
+        }
+        for next in &next {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| next.assert_invariants()))
+                .is_err()
+            {
+                panic!("{at}: the invariant broke at the next byte {byte:#04x}");
+            }
+        }
     }
 }
 
@@ -766,7 +1031,7 @@ fn state_names_round_trip() {
     assert_eq!(State::from_name("Nowhere"), None);
 }
 
-/// THE CARRIES THAT ONLY SWALLOW (round six of the update audit, finding 30):
+/// THE CARRIES THAT ONLY SWALLOW:
 /// an OSC over the carry's cap, an unhooked DCS header and an APC string with
 /// its consumer started are carried as sequences to ignore to their
 /// terminator, where this parser would have delivered them —
@@ -784,8 +1049,7 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
     big_osc.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
     let mut big_image = b"\x1b]1337;File=inline=1:".to_vec();
     big_image.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
-    // (bytes, swallowed, a picture the next frame replaces — round eight of
-    // the update audit, finding 57)
+    // (bytes, swallowed, a picture the next frame replaces)
     for (bytes, swallowed, picture) in [
         (&big_osc[..], true, false),
         (&big_image[..], true, true),

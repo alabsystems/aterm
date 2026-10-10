@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THIS SESSION'S USAGE (owner function 2, 2026-09-25): what the Claude Code
+//! THIS SESSION'S USAGE: what the Claude Code
 //! footer's `Σ` segment (one merged total, shown unless `[claude_footer] usage
 //! = false`) and its limit wall show ([`super::footer`]) and what `aterm
 //! harness usage` prints, per model ([`super::cli`]) — ONE implementation for
@@ -55,7 +55,7 @@
 //!   screen but older than a served response).
 //!
 //! Nothing here writes anything and nothing is installed into the agent:
-//! decision "B" (2026-09-22) stands — no hook, no statusLine, no plugin, no
+//! decision "B" stands — no hook, no statusLine, no plugin, no
 //! `--settings`. The files are the vendor's own, read from outside.
 //!
 //! STATUS (docs/README.md honesty ratchet): unit-tested against temp-file
@@ -1086,8 +1086,8 @@ pub enum UsageGrain {
     /// out of the totals: `aterm harness usage`'s `Σ` line ([`usage_text`]).
     PerModel,
     /// Runtime and every model's tokens merged into one pair, no names; what
-    /// was left out still said: the footer's `Σ` segment (owner, 2026-09-30:
-    /// "I just can't have so many different model stats").
+    /// was left out still said: the footer's `Σ` segment, one total rather
+    /// than a stat per model.
     Total,
     /// Runtime alone: the footer's `Σ` where the rule is too narrow for the
     /// total.

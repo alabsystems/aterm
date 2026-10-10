@@ -66,7 +66,7 @@ pub struct ManifestInputs<'a> {
     /// binding of the manifest to its tag and container. `<slug>` must be this
     /// public channel or the client's own repointed source. The cut asserts the
     /// exact equality against `aterm_update_core::cdn::release_download_url`
-    /// (publish.rs, the pointer gate) and `tools/check-release-shape.sh` checks
+    /// (publish.rs, the pointer gate) and `ship release`'s after-cut step checks
     /// it against what GitHub serves, so a mis-set `update_channel` fails the
     /// cut rather than the fleet. `install.sh` reads
     /// `version`/`dmg`/`sha256`/`team_id`/`min_os` and fetches by asset id; it

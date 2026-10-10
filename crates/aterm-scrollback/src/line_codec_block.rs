@@ -474,8 +474,8 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
 
     // Drop any spare capacity left by an over-estimated `count` so a page that is
     // retained in the DiskColdTier page cache pins exactly its real content — this
-    // is what keeps cache_byte_limit (and its Kani model, which measures page bytes
-    // from len) honest. A no-op for well-formed pages where capacity == len.
+    // is what keeps cache_byte_limit (which measures page bytes from len)
+    // honest. A no-op for well-formed pages where capacity == len.
     lines.shrink_to_fit();
     lines
 }

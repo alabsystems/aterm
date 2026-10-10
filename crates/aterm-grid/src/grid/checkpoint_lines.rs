@@ -95,7 +95,17 @@ impl Grid {
                 continue;
             };
             let row_extras = Self::extract_row_extras(row, extras, r, styles);
-            lines.push(Self::row_to_line_with_stored_extras(row, &row_extras));
+            // Read as history reads a row: a continued row at its full width
+            // less a recorded early-wrap hole, so the restored row re-derives
+            // the hole exactly and rewraps as the live one does. At its length,
+            // a hole after skipped cells (a tab, CUF, CHA) came back unmarked,
+            // and a row DCH left one short of the margin came back with one.
+            let len = super::scrollback_reflow::history_row_len(row, self.row_at_screen(r + 1));
+            lines.push(Self::row_to_line_with_stored_extras_at_len(
+                row,
+                &row_extras,
+                len,
+            ));
         }
 
         lines

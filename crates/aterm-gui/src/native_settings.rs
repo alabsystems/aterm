@@ -201,6 +201,8 @@ enum PendingAction {
     Message,
     /// A Settings ▸ Messages entry's Copy, on its way to the clipboard.
     MessageCopy,
+    /// Settings ▸ Messages' Open Log Folder, being opened by the host.
+    LogFolder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -618,6 +620,12 @@ pub(crate) struct SettingsViewState {
     /// and the reducer adopts the stop it drew ([`Self::messages_drawn`])
     /// before it moves the list again.
     messages_reveal: bool,
+    /// The entry the last Messages render drew at the top of its list while
+    /// the list was scrolled into the log (ruling 441 (r)): a record posted
+    /// at the head moves every entry one stop down, and the next projection
+    /// keeps the reader's view on this entry
+    /// ([`SettingsApp::keep_messages_anchor`]).
+    messages_anchor: RefCell<Option<MessagesAnchor>>,
     /// How many list stops the last render showed at once — the page Page Up
     /// and Page Down move by (design ruling 267): the compact category list's
     /// rows, a field page's settings, one slice on every page that pages by
@@ -631,6 +639,11 @@ pub(crate) struct SettingsViewState {
     /// published at `t` has seen it; it clears on the first projection five
     /// seconds after that, at the next action on the page, or on leaving it.
     messages_feedback_since: Option<Option<u64>>,
+    /// The line that clock is timing, and the only one it may clear (ruling
+    /// 441 (q)): a config patch's result or its Undo offer that replaced it
+    /// stands, as on every other page (rulings 267 and 268), the way
+    /// [`Self::macos_access_feedback`] owns its own line.
+    messages_feedback_text: Option<String>,
 }
 
 /// `config.prepare_sparkle_runtime().consumer_capabilities()` for
@@ -767,8 +780,10 @@ impl SettingsViewState {
             messages_drawn: Cell::new(None),
             messages_page_geometry: Cell::new(None),
             messages_reveal: false,
+            messages_anchor: RefCell::new(None),
             page_window: Cell::new(None),
             messages_feedback_since: None,
+            messages_feedback_text: None,
         }
     }
 
@@ -863,6 +878,13 @@ impl SettingsViewState {
         self.config_reconciliation_required = false;
         self.unverified_patch = None;
         self.invalidate_result_page_limit();
+        // Messages' scroll counts the LOG's stops, bounded by the plan its
+        // render records (ruling 264), never by the settings' field count:
+        // an aterm.toml change clamped a scroll deeper than that count back
+        // to it (ruling 441 (l)). The render clamps it to the plan it draws.
+        if self.route == SettingsRoute::Messages && self.search.trim().is_empty() {
+            return Ok(());
+        }
         let limit = if self.route == SettingsRoute::Modified || !self.search.trim().is_empty() {
             settings_field_result_count(self).saturating_sub(1)
         } else {
@@ -905,10 +927,14 @@ impl SettingsViewState {
     /// yet seen by a projection (the next publish starts its clock),
     /// `Some(true)` seen and waiting out [`MESSAGES_FEEDBACK_MS`] (the
     /// publish after that clears it), `None` nothing transient. Only a view
-    /// on the Messages route clears it.
+    /// on the Messages route clears it, and only while the line it timed
+    /// still stands ([`Self::messages_feedback_text`]).
     pub(crate) fn messages_feedback_clock(&self) -> Option<bool> {
         self.messages_feedback_since
-            .filter(|_| self.route == SettingsRoute::Messages)
+            .filter(|_| {
+                self.route == SettingsRoute::Messages
+                    && self.feedback == self.messages_feedback_text
+            })
             .map(|since| since.is_some())
     }
 
@@ -933,6 +959,29 @@ impl SettingsViewState {
     fn mark_messages_feedback(&mut self) {
         if self.route == SettingsRoute::Messages && self.feedback.is_some() {
             self.messages_feedback_since = Some(None);
+            self.messages_feedback_text.clone_from(&self.feedback);
+        }
+    }
+
+    /// Put `line` on the Messages page's status line from an action on the
+    /// page: transient from here, like a completion's
+    /// ([`Self::mark_messages_feedback`]), a refused entry press's line too
+    /// (ruling 441 (s): it stood until the person left the page).
+    fn show_messages_line(&mut self, line: String) {
+        self.messages_feedback_since = Some(None);
+        self.messages_feedback_text = Some(line.clone());
+        self.feedback = Some(line);
+    }
+
+    /// The transient Messages line's clock ran out, or the next action on
+    /// the page began: the line it timed goes, and only that line (ruling
+    /// 441 (q)), never one something else put there since.
+    fn clear_messages_line(&mut self) {
+        self.messages_feedback_since = None;
+        if let Some(line) = self.messages_feedback_text.take()
+            && self.feedback.as_deref() == Some(line.as_str())
+        {
+            self.feedback = None;
         }
     }
 
@@ -1469,6 +1518,7 @@ impl SettingsViewState {
         self.messages_tag_menu = false;
         self.messages_reveal = false;
         self.messages_feedback_since = None;
+        self.messages_feedback_text = None;
         self.common.last_focus = self.presented_route_focus(route).or_else(|| {
             if from_compact_navigation {
                 Some(UiKey::new("settings/compact-navigation"))
@@ -1507,12 +1557,13 @@ impl SettingsViewState {
     }
 
     /// Search replaces the page's transient authoring surface. Closing these
-    /// states at focus time (before the first character) keeps the picker and
-    /// destructive confirmation from becoming invisible Escape consumers
-    /// behind Search Results.
+    /// states at focus time (before the first character) keeps the picker,
+    /// Settings ▸ Messages' Tag pop-up and destructive confirmation from
+    /// becoming invisible Escape consumers behind Search Results.
     fn begin_search_interaction(&mut self) {
         self.clear_field_edit();
         self.choice_picker = None;
+        self.messages_tag_menu = false;
         if self.reset_all_confirmation {
             self.reset_all_confirmation = false;
             self.feedback = None;
@@ -1642,6 +1693,19 @@ impl SettingsViewState {
         }
         if let Some(picker) = self.choice_picker.take() {
             self.common.last_focus = Some(UiKey::new(format!("settings/control/{}", picker.key)));
+            return;
+        }
+        // Settings ▸ Messages' Tag pop-up is the page's other pop-up: Escape
+        // closes it, the keyboard back on the control that opened it, and
+        // the reader stays on the log (ruling 441 (p): it fell through to
+        // Home, dropping the filter, the open entry and the scroll). Only a
+        // pop-up the page draws reaches here: Search and the category list
+        // close it, and the `Cancel` handler closes one a widened page lays
+        // out as chips (`SettingsApp::messages_tag_menu_drawn`).
+        if self.route == SettingsRoute::Messages && self.messages_tag_menu {
+            self.messages_tag_menu = false;
+            self.common.last_focus = Some(UiKey::new(MESSAGES_TAG_MENU));
+            self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
             return;
         }
         if self.editing_field.is_some() {
@@ -2069,6 +2133,9 @@ impl SettingsApp {
         if action == "settings/compact-navigation" {
             view.clear_field_edit();
             let _ = view.clear_search();
+            // The category list replaces the page: an open Tag pop-up would
+            // take the Escape that closes the list (ruling 441 (p)).
+            view.messages_tag_menu = false;
             view.compact_navigation = true;
             view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
             view.common.last_focus = Some(UiKey::new("settings/compact-navigation-close"));
@@ -2230,22 +2297,14 @@ impl SettingsApp {
 
         if action == "settings/page-up" {
             view.settle_messages_scroll();
-            let limit = settings_page_scroll_limit(
-                view,
-                &self.update.projection(),
-                &self.packages.projection(),
-            );
+            let limit = self.page_scroll_limit(view);
             view.reduce_page_scroll(limit, SettingsPageScrollCommand::Previous);
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
         }
         if action == "settings/page-down" {
             view.settle_messages_scroll();
-            let limit = settings_page_scroll_limit(
-                view,
-                &self.update.projection(),
-                &self.packages.projection(),
-            );
+            let limit = self.page_scroll_limit(view);
             view.reduce_page_scroll(limit, SettingsPageScrollCommand::Next);
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
@@ -2253,11 +2312,7 @@ impl SettingsApp {
         if action == "settings/page-scroll" {
             view.settle_messages_scroll();
             if let Some(SemanticInput::Number(offset)) = invocation.value {
-                let limit = settings_page_scroll_limit(
-                    view,
-                    &self.update.projection(),
-                    &self.packages.projection(),
-                );
+                let limit = self.page_scroll_limit(view);
                 view.reduce_page_scroll(
                     limit,
                     SettingsPageScrollCommand::Absolute(offset.max(0.0) as usize),
@@ -3394,8 +3449,7 @@ impl SettingsApp {
             // Observed and idle, yet nothing for an apply to do — or a reason in the
             // way (a home that is not the account's, an unreadable state). Say which.
             view.feedback = Some(packages.machine.reason.clone().unwrap_or_else(|| {
-                "Nothing to apply — Universal Control and Spotlight are where [machine] wants them."
-                    .to_string()
+                "Nothing to apply — Universal Control is where [machine] wants it.".to_string()
             }));
         } else if !machine_apply && !packages.manager_enabled {
             // The projection's detail line names the inert cause (an unpinned build —
@@ -3521,7 +3575,8 @@ impl SettingsApp {
                     | PendingAction::Packages
                     | PendingAction::Clipboard
                     | PendingAction::Message
-                    | PendingAction::MessageCopy => None,
+                    | PendingAction::MessageCopy
+                    | PendingAction::LogFolder => None,
                 };
                 // A prior undo token cannot safely target bytes whose final
                 // publication is unknown. Keep the attempted edit above, but
@@ -3544,16 +3599,27 @@ impl SettingsApp {
         operation: OperationId,
         outcome: ExternalOpenOutcome,
     ) {
-        if !matches!(
-            view.pending.remove(&operation),
-            Some(PendingAction::External)
-        ) {
-            return;
+        match view.pending.remove(&operation) {
+            Some(PendingAction::External) => {
+                view.feedback = Some(match outcome {
+                    ExternalOpenOutcome::Opened => "Project site opened".to_string(),
+                    ExternalOpenOutcome::Denied { message } => format!("Open denied: {message}"),
+                });
+            }
+            // Open Log Folder's outcome (ruling 441 (t)): the page says what
+            // happened, transient as its other lines, as a refused `Open log`
+            // says `Could not open the log`.
+            Some(PendingAction::LogFolder) => {
+                view.feedback = Some(match outcome {
+                    ExternalOpenOutcome::Opened => "Opened the log folder".to_string(),
+                    ExternalOpenOutcome::Denied { .. } => {
+                        "Couldn\u{2019}t open the log folder".to_string()
+                    }
+                });
+                view.mark_messages_feedback();
+            }
+            _ => {}
         }
-        view.feedback = Some(match outcome {
-            ExternalOpenOutcome::Opened => "Project site opened".to_string(),
-            ExternalOpenOutcome::Denied { message } => format!("Open denied: {message}"),
-        });
     }
 
     fn finish_config_editor(
@@ -3704,9 +3770,10 @@ impl SettingsApp {
             view.settle_messages_scroll();
         }
         // The page's last confirmation was about the LAST action: the next
-        // one says its own or nothing (ruling 267).
-        if view.messages_feedback_since.take().is_some() {
-            view.feedback = None;
+        // one says its own or nothing (ruling 267), clearing the line it set
+        // and never one a config patch put there since (ruling 441 (q)).
+        if view.messages_feedback_since.is_some() {
+            view.clear_messages_line();
         }
         match rest {
             // The severity and the tag COMBINE (ruling 262): each press sets its
@@ -3721,7 +3788,7 @@ impl SettingsApp {
             }
             "filter/tags-all" => {
                 view.messages_filter.tag = None;
-                view.messages_tag_menu = false;
+                self.close_messages_tag_menu(view);
                 view.page_scroll = 0;
             }
             "tag-menu" => {
@@ -3753,8 +3820,7 @@ impl SettingsApp {
                 // Its completion says `Copied` — never the About page's
                 // `Build information copied` (ruling 267).
                 view.pending.insert(operation, PendingAction::MessageCopy);
-                view.messages_feedback_since = Some(None);
-                view.feedback = Some(format!(
+                view.show_messages_line(format!(
                     "Copying {} message{}\u{2026}",
                     shown.len(),
                     if shown.len() == 1 { "" } else { "s" }
@@ -3763,17 +3829,19 @@ impl SettingsApp {
             }
             // The folder the logs live in, opened by the host through NSWorkspace
             // (never a shell, never a path from the view); named where there is
-            // no NSWorkspace.
+            // no NSWorkspace. The open ANSWERS (ruling 441 (t)): its outcome
+            // replaces `Opening the log folder…`, so a failure is said.
             "open-folder" => {
-                view.feedback = Some(match self.messages.log_folder.as_deref() {
+                let line = match self.messages.log_folder.as_deref() {
                     Some(_) if cfg!(target_os = "macos") => {
-                        cx.open_log_folder();
+                        let operation = cx.open_log_folder();
+                        view.pending.insert(operation, PendingAction::LogFolder);
                         "Opening the log folder\u{2026}".to_string()
                     }
                     Some(folder) => format!("The log folder is {folder}"),
                     None => "The log folder is not available.".to_string(),
-                });
-                view.messages_feedback_since = Some(None);
+                };
+                view.show_messages_line(line);
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
@@ -3801,7 +3869,7 @@ impl SettingsApp {
                     view.page_scroll = 0;
                 } else if let Some(tag) = rest.strip_prefix("filter/tag/") {
                     view.messages_filter.tag = Some(tag.to_string());
-                    view.messages_tag_menu = false;
+                    self.close_messages_tag_menu(view);
                     view.page_scroll = 0;
                 } else if let Some(row) = rest.strip_prefix("row/") {
                     let Some((id, verb)) = row.split_once('/') else {
@@ -3857,7 +3925,7 @@ impl SettingsApp {
             }
             "copy" => {
                 let Some(entry) = self.messages.entry(id) else {
-                    view.feedback = Some("That message is no longer in the log".to_string());
+                    view.show_messages_line("That message is no longer in the log".to_string());
                     return true;
                 };
                 let operation = cx.clipboard(ClipboardRequest::CopyText {
@@ -3887,10 +3955,10 @@ impl SettingsApp {
                         view.pending.insert(operation, PendingAction::Message);
                     }
                     Some(false) => {
-                        view.feedback = Some("That can no longer be done from here".to_string());
+                        view.show_messages_line("That can no longer be done from here".to_string());
                     }
                     None => {
-                        view.feedback = Some("That message no longer offers this".to_string());
+                        view.show_messages_line("That message no longer offers this".to_string());
                     }
                 }
                 true
@@ -3953,23 +4021,239 @@ impl SettingsApp {
         view.page_window.get().unwrap_or(8).max(1)
     }
 
+    /// The bound the page-scroll reducer holds `page_scroll` to. On Settings
+    /// ▸ Messages it is the list's own [`MessagesPlan::limit`], measured as
+    /// the renderer seats the list in the geometry it last laid out in — the
+    /// one function the renderer and the reducer share (ruling 264), as
+    /// [`Self::step_message_focus`] and [`Self::shown_page`] measure: a page
+    /// action invalidates the limit the render recorded, and a wheel event
+    /// handled before the next render read that as 0 and snapped the list to
+    /// its top (ruling 441 (m)). Everywhere else, and before any Messages
+    /// render, [`settings_page_scroll_limit`].
+    fn page_scroll_limit(&self, view: &SettingsViewState) -> usize {
+        if view.route == SettingsRoute::Messages
+            && !view.compact_navigation
+            && view.search.trim().is_empty()
+            && let Some((width, viewport)) = view.messages_page_geometry.get()
+        {
+            let visible = messages_visible(&self.messages, &view.messages_filter);
+            return messages_plan(view, &self.messages, &visible, width, viewport).limit();
+        }
+        settings_page_scroll_limit(view, &self.update.projection(), &self.packages.projection())
+    }
+
+    /// A RECORD POSTED AT THE HEAD NEVER MOVES THE LOG UNDER ITS READER
+    /// (ruling 441 (r)). `page_scroll` is an index into the newest-first
+    /// list, so every record posted since the last render moved each entry
+    /// one stop down under a scrolled list: the view showed a newer entry at
+    /// its top and dropped its bottom one, and an entry just opened low in
+    /// the view (read whole, ruling 264) with it. A new projection keeps the
+    /// entry the last render drew at the top of a list scrolled into the log
+    /// where it was (and any scroll made since, on top of it). A list at its
+    /// newest entry takes the new record at its top, as before; so does one
+    /// whose filter changed, or that scrolled back above that entry since.
+    fn keep_messages_anchor(&self, view: &mut SettingsViewState) {
+        if view.route != SettingsRoute::Messages
+            || view.compact_navigation
+            || !view.search.trim().is_empty()
+            || view.messages_reveal
+        {
+            return;
+        }
+        let Some(anchor) = view.messages_anchor.borrow().clone() else {
+            return;
+        };
+        if anchor.filter != view.messages_filter || view.page_scroll < anchor.stop {
+            return;
+        }
+        let Some((width, viewport)) = view.messages_page_geometry.get() else {
+            return;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        let Some(index) = visible.iter().position(|entry| entry.id == anchor.id) else {
+            return;
+        };
+        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+        let stop = plan.lead_stops() + index;
+        let moved = view.page_scroll - anchor.stop;
+        view.page_scroll = (stop + moved).min(plan.limit());
+        view.messages_anchor
+            .replace(Some(MessagesAnchor { stop, ..anchor }));
+    }
+
     /// FOCUS NEVER SCROLLS AWAY (ruling 267). A compact Messages page scrolls
     /// its header — the switch, the filters, the report buttons — away with
     /// the log, and a control that is no longer seated is no longer in the
     /// tree: the keyboard went with it (round 16: Down on a filter chip left
-    /// no focused node and no ring). When the scroll just unseated the
-    /// focused control, the keyboard moves to the first entry the view shows
-    /// (or, with none, the first header item still seated).
+    /// no focused node and no ring). An entry's own controls — its title, and
+    /// the open entry's footer buttons — leave with their entry on every
+    /// page, since an entry is seated whole or not at all (ruling 441 (o): a
+    /// focused `Copy` scrolled away and a Return then fell through to the
+    /// page's Primary). A publication moves the list too: a record posted at
+    /// the head of a list at its newest entry pushes the entries down, and
+    /// the ring evicts its oldest. A publication can change the header's
+    /// form too: tags past its two lines fold the wider page's chips into
+    /// the `Tag: …` pop-up, and an eviction lets them out again. When a
+    /// scroll or a publication just unseated the focused control, or took
+    /// its entry or its Tag control from the page, the keyboard moves — a
+    /// chip to the pop-up's button where the page seats it, else to the
+    /// first entry the view shows (or, with none, the first header item
+    /// still seated that holds a control — never an entry the view does not
+    /// show, ruling 441 (n)).
     fn keep_message_focus_seated(&self, view: &mut SettingsViewState) {
-        if view.route != SettingsRoute::Messages || view.compact_navigation {
+        if view.route != SettingsRoute::Messages
+            || view.compact_navigation
+            || !view.search.trim().is_empty()
+        {
             return;
         }
         let Some(focus) = view.common.last_focus.clone() else {
             return;
         };
-        if focus.as_str().starts_with("settings/messages/row/") {
+        let Some((width, viewport)) = view.messages_page_geometry.get() else {
+            return;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+        let shown = plan.view(view.page_scroll.min(plan.limit()));
+        if let Some(id) = messages_row_of(focus.as_str()) {
+            if visible
+                .iter()
+                .position(|entry| entry.id == id)
+                .is_some_and(|k| shown.rows.contains(&k))
+            {
+                return;
+            }
+        } else {
+            // Whether the header holds `key`, and then whether the page seats
+            // it: the wider pages' header stays, only the compact one scrolls.
+            let seated = |key: &str| {
+                plan.header
+                    .iter()
+                    .position(|(node, _)| ui_node_holds(node, key))
+                    .map(|item| !plan.compact || shown.header.contains(&item))
+            };
+            match seated(focus.as_str()) {
+                Some(true) => return,
+                Some(false) => {}
+                None => {
+                    // Not in the header. The sidebar and the footer are not
+                    // the header's to seat; a Tag control is: a publication
+                    // changes the header's FORM (ruling 262's two lines) —
+                    // new tags fold the chips into the `Tag: …` pop-up, an
+                    // eviction lets them out again, and a chip's tag can
+                    // leave the log — and takes the focused one out of the
+                    // tree. A chip goes to the pop-up's button where the
+                    // page seats it, as `close_messages_tag_menu` puts it.
+                    let chip = focus.as_str().starts_with(MESSAGES_TAG_CHIPS);
+                    if !chip && focus.as_str() != MESSAGES_TAG_MENU {
+                        return;
+                    }
+                    if chip && seated(MESSAGES_TAG_MENU) == Some(true) {
+                        view.common.last_focus = Some(UiKey::new(MESSAGES_TAG_MENU));
+                        return;
+                    }
+                }
+            }
+        }
+        let seated_header = if plan.compact {
+            shown.header.clone()
+        } else {
+            0..plan.header.len()
+        };
+        view.common.last_focus = shown
+            .rows
+            .clone()
+            .next()
+            .and_then(|k| visible.get(k))
+            .map(|entry| UiKey::new(format!("settings/messages/row/{}/title", entry.id)))
+            .or_else(|| {
+                seated_header
+                    .filter_map(|k| plan.header.get(k))
+                    .find_map(|(node, _)| first_focusable_key(node))
+            });
+    }
+
+    /// The Messages page's header items, laid out in the geometry its last
+    /// render had — on a compact page those the list has scrolled past too;
+    /// `None` before any Messages render.
+    fn messages_header(&self, view: &SettingsViewState) -> Option<Vec<(UiNode, f32)>> {
+        let (width, viewport) = view.messages_page_geometry.get()?;
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        Some(messages_plan(view, &self.messages, &visible, width, viewport).header)
+    }
+
+    /// Whether Settings ▸ Messages DRAWS its Tag pop-up open, so that Escape
+    /// is the pop-up's (ruling 441 (p)): the state says open, the page is on
+    /// the glass — no Search Results over it, no compact category list —
+    /// and its tags take the pop-up form. A page widened under an open
+    /// pop-up lays its tags out as chips and draws no pop-up at all.
+    fn messages_tag_menu_drawn(&self, view: &SettingsViewState) -> bool {
+        if !view.messages_tag_menu
+            || view.route != SettingsRoute::Messages
+            || !view.search.trim().is_empty()
+        {
+            return false;
+        }
+        match view.messages_page_geometry.get() {
+            Some((SettingsWidth::Compact, _)) if view.compact_navigation => false,
+            Some(_) => self.messages_header(view).is_some_and(|header| {
+                header
+                    .iter()
+                    .any(|(node, _)| ui_node_holds(node, MESSAGES_TAG_MENU))
+            }),
+            None => !view.compact_navigation,
+        }
+    }
+
+    /// Close Settings ▸ Messages' Tag pop-up after a choice in it: its chips
+    /// leave the tree with it, so a keyboard on one goes back to the control
+    /// that opened it ([`MESSAGES_TAG_MENU`]), as the choice picker's close
+    /// puts it back on its control (ruling 441 (k): it stayed on a chip that
+    /// was gone, and the next Return fell through to the page's Primary).
+    /// Only where the page draws that control and not the chip: a page that
+    /// lays its tags out as chips (a wider one, widened under the open
+    /// pop-up) keeps the keyboard on the chip chosen.
+    fn close_messages_tag_menu(&self, view: &mut SettingsViewState) {
+        let was_open = std::mem::replace(&mut view.messages_tag_menu, false);
+        let Some(chip) = view
+            .common
+            .last_focus
+            .clone()
+            .filter(|focus| focus.as_str().starts_with(MESSAGES_TAG_CHIPS))
+        else {
+            return;
+        };
+        let to_button = match self.messages_header(view) {
+            Some(header) => {
+                let holds = |key: &str| header.iter().any(|(node, _)| ui_node_holds(node, key));
+                !holds(chip.as_str()) && holds(MESSAGES_TAG_MENU)
+            }
+            // No render has laid the page out: as the pop-up was.
+            None => was_open,
+        };
+        if to_button {
+            view.common.last_focus = Some(UiKey::new(MESSAGES_TAG_MENU));
+        }
+    }
+
+    /// Scroll a compact Messages page back to the header control the keyboard
+    /// was just put on, when its header item is scrolled away: that item goes
+    /// to the top of the list. Escape closing the Tag pop-up puts the keyboard
+    /// on the pop-up's button (ruling 441 (p)), and the pop-up's chips may have
+    /// scrolled it away — a focus the page did not show, with no ring, and a
+    /// Return that fell through to the page's default action. Nothing on the
+    /// wider pages, whose header stays, nor for a control already seated.
+    fn seat_message_header_focus(&self, view: &mut SettingsViewState) {
+        if view.route != SettingsRoute::Messages
+            || view.compact_navigation
+            || !view.search.trim().is_empty()
+        {
             return;
         }
+        let Some(focus) = view.common.last_focus.clone() else {
+            return;
+        };
         let Some((width, viewport)) = view.messages_page_geometry.get() else {
             return;
         };
@@ -3985,20 +4269,13 @@ impl SettingsApp {
         else {
             return;
         };
-        let shown = plan.view(view.page_scroll.min(plan.limit()));
-        if shown.header.contains(&item) {
-            return;
+        if !plan
+            .view(view.page_scroll.min(plan.limit()))
+            .header
+            .contains(&item)
+        {
+            view.page_scroll = item;
         }
-        view.common.last_focus = if let Some(entry) = visible.get(shown.rows.start) {
-            Some(UiKey::new(format!(
-                "settings/messages/row/{}/title",
-                entry.id
-            )))
-        } else {
-            plan.header
-                .get(shown.header.start)
-                .and_then(|(node, _)| first_focusable_key(node))
-        };
     }
 
     /// THE DEEP LINK (design §4.5; ruling 264): expand `id`, drop a chip that
@@ -4882,10 +5159,10 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_DESKTOP_ALERTS => {
             crate::notify::delivery_available().then_some(Effect::DesktopNotifier)
         }
-        // The [machine] host settings actuate only on macOS (`defaults`, Spotlight):
-        // ordinary Security rows there, Modified/Manual-only elsewhere — the
-        // FONT_THICKEN pattern.
-        prefs::EDIT_MACHINE_UNIVERSAL_CONTROL | prefs::EDIT_MACHINE_SPOTLIGHT_NOINDEX => {
+        // The [machine] host setting actuates only on macOS (`defaults`): an ordinary
+        // Security row there, Modified/Manual-only elsewhere — the FONT_THICKEN
+        // pattern.
+        prefs::EDIT_MACHINE_UNIVERSAL_CONTROL => {
             cfg!(target_os = "macos").then_some(Effect::PackageRuntime)
         }
         _ => None,
@@ -5036,7 +5313,20 @@ impl NativeAppModel for SettingsApp {
                 true
             }
             AppEvent::TextInput(TextInputEvent::Cancel) => {
+                // A Tag pop-up the page does not draw (a page widened under
+                // it lays its tags out as chips) closes without taking the
+                // Escape, which goes on to what the glass shows (ruling 441
+                // (p)): never the keyboard on a button the tree lacks.
+                if view.messages_tag_menu && !self.messages_tag_menu_drawn(view) {
+                    view.messages_tag_menu = false;
+                }
+                let tag_menu_open = view.messages_tag_menu;
                 view.cancel_transient();
+                // The Tag pop-up closed with the keyboard back on its button:
+                // the page shows that button (ruling 441 (p)).
+                if tag_menu_open && !view.messages_tag_menu {
+                    self.seat_message_header_focus(view);
+                }
                 true
             }
             // THE SEVERITY SEGMENTS ARE ONE CONTROL (ruling 267): Left and
@@ -5068,11 +5358,7 @@ impl NativeAppModel for SettingsApp {
                 // keyboard to the list (ruling 267).
                 view.settle_messages_scroll();
                 if !self.step_message_focus(view, lines) {
-                    let limit = settings_page_scroll_limit(
-                        view,
-                        &self.update.projection(),
-                        &self.packages.projection(),
-                    );
+                    let limit = self.page_scroll_limit(view);
                     view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
                     self.keep_message_focus_seated(view);
                 }
@@ -5086,11 +5372,7 @@ impl NativeAppModel for SettingsApp {
                 let page = self.shown_page(view);
                 let lines = direction.saturating_mul(i32::try_from(page).unwrap_or(i32::MAX));
                 if !self.step_message_focus(view, lines) {
-                    let limit = settings_page_scroll_limit(
-                        view,
-                        &self.update.projection(),
-                        &self.packages.projection(),
-                    );
+                    let limit = self.page_scroll_limit(view);
                     view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
                     self.keep_message_focus_seated(view);
                 }
@@ -5179,13 +5461,21 @@ impl NativeAppModel for SettingsApp {
                 match view.messages_feedback_since {
                     Some(None) => view.messages_feedback_since = Some(Some(now)),
                     Some(Some(since)) if now.saturating_sub(since) >= MESSAGES_FEEDBACK_MS => {
-                        view.messages_feedback_since = None;
                         if view.route == SettingsRoute::Messages {
-                            view.feedback = None;
+                            view.clear_messages_line();
+                        } else {
+                            view.messages_feedback_since = None;
+                            view.messages_feedback_text = None;
                         }
                     }
                     _ => {}
                 }
+                self.keep_messages_anchor(view);
+                // A list at its newest entry takes the record at its top and
+                // pushes an entry opened low in it out whole; the ring can
+                // evict the focused entry. Either took its focused control
+                // out of the tree (ruling 441 (o), as a scroll does).
+                self.keep_message_focus_seated(view);
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 true
@@ -17609,20 +17899,12 @@ fn machine_card_lines(
     } else {
         StyleRef::Primary
     };
-    let mut lines = vec![
-        (
-            "settings/machine/universal-control".to_string(),
-            machine.universal_control.clone(),
-            SemanticRole::Status,
-            settled,
-        ),
-        (
-            "settings/machine/spotlight".to_string(),
-            machine.spotlight.clone(),
-            SemanticRole::Status,
-            settled,
-        ),
-    ];
+    let mut lines = vec![(
+        "settings/machine/universal-control".to_string(),
+        machine.universal_control.clone(),
+        SemanticRole::Status,
+        settled,
+    )];
     if let Some(reason) = machine.reason.clone() {
         lines.push((
             "settings/machine/home".to_string(),
@@ -17696,8 +17978,8 @@ fn machine_card_height(machine: &MachineProjection, compact: bool, debugger_row:
     heading_height + lines as f32 * line_height + scaled_control_height() + 12.0 + 24.0
 }
 
-/// The "This Mac" card: what the co-located atpkg MEASURED about the two
-/// `[machine]` checks (Universal Control, Spotlight), what this launch changed,
+/// The "This Mac" card: what the co-located atpkg MEASURED about the `[machine]`
+/// check (Universal Control), what this launch changed,
 /// and Apply now. Every word comes from the packages projection so pixels,
 /// accessibility and introspection agree.
 fn machine_card(packages: &PackagesProjection, compact: bool, debugger_row: bool) -> UiNode {
@@ -21908,6 +22190,16 @@ fn ui_node_holds(node: &UiNode, key: &str) -> bool {
     node.key.as_str() == key || node.children.iter().any(|child| ui_node_holds(child, key))
 }
 
+/// The entry a Settings ▸ Messages key belongs to: its title or one of its
+/// own buttons (`settings/messages/row/<id>/…`).
+fn messages_row_of(key: &str) -> Option<u64> {
+    key.strip_prefix("settings/messages/row/")?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// The first control under `node` a person can focus, in authoring order.
 fn first_focusable_key(node: &UiNode) -> Option<UiKey> {
     let focusable = matches!(
@@ -21972,6 +22264,9 @@ const MESSAGES_OPEN_FOLDER: &str = "settings/messages/open-folder";
 const MESSAGES_TAG_MENU: &str = "settings/messages/tag-menu";
 /// The tag list's first chip: every tag.
 const MESSAGES_TAGS_ALL: &str = "settings/messages/filter/tags-all";
+/// What every chip of the tag list begins with: `…/filter/tags-all` and each
+/// `…/filter/tag/<tag>`.
+const MESSAGES_TAG_CHIPS: &str = "settings/messages/filter/tag";
 
 /// The caption under the "Explain heavy load" switch (design ruling 262).
 const MESSAGES_EXPLAIN_LOAD_CAPTION: &str =
@@ -23626,6 +23921,16 @@ struct MessagesView {
     rows: std::ops::Range<usize>,
 }
 
+/// Where a scrolled Messages list stood when it was last drawn: the stop at
+/// its top, the entry there, and the filter it was drawn under
+/// ([`SettingsViewState::messages_anchor`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessagesAnchor {
+    stop: usize,
+    id: u64,
+    filter: MessagesFilter,
+}
+
 impl MessagesPlan {
     /// The stops before the entries: the compact page's header items, which
     /// scroll with the list.
@@ -23929,6 +24234,15 @@ fn messages_page(
     };
     state.messages_drawn.set(Some(top));
     let view = plan.view(top);
+    state
+        .messages_anchor
+        .replace(
+            (view.rows.start > 0 && !view.rows.is_empty()).then(|| MessagesAnchor {
+                stop: top,
+                id: visible[view.rows.start].id,
+                filter: state.messages_filter.clone(),
+            }),
+        );
     let shown: Vec<&MessageView> = visible[view.rows.clone()].to_vec();
     let list = (!shown.is_empty()).then(|| {
         let (card, height) = messages_list_node(&shown, view.rows.start, &plan, selected);

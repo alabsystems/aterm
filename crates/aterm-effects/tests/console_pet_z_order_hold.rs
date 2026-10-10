@@ -5,9 +5,9 @@
 //!
 //! `PetFrame::under_ink` decides whether the renderer draws the resident
 //! beneath the glyphs (with the ribbon light, the caret halo and the
-//! sparkles over it) or above all of them. It used to be `!clear(body)`
-//! every frame, and `clear` counts the caret's 3x3 keep-off ring as
-//! occupied — so the typing escort, seated at caret+1, flipped between the
+//! sparkles over it) or above all of them. Recomputed as `!clear(body)`
+//! every frame it strobes: `clear` counts the caret's 3x3 keep-off ring as
+//! occupied, so the typing escort, seated at caret+1, flipped between the
 //! two layers at the keystroke rate with no glyph under it at all: 50 flips
 //! over one 80 ms/key pangram. Measured here against a real `Terminal` —
 //! typed text, and Claude Code's own recorded bytes — with an independent

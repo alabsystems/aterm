@@ -17,6 +17,9 @@
 //!   passes. It writes to the process's stderr directly, once per line per
 //!   binary.
 //!
+//! * [`disk_image_service_silent`] judges an `hdiutil` run the test already
+//!   made: only a failure with `Operation timed out` is the service not answering.
+//!
 //! The skip is ONLY for the service not answering: any other failure of the
 //! probe (an error status, a missing file) is an answer, and the tests run.
 
@@ -26,7 +29,7 @@ use std::time::Duration;
 
 use super::{Refused, TRUST};
 
-// `SKIPPED`: its own file, which aterm-verify includes too.
+// `SKIPPED` and `DISK_IMAGE_SKIPPED`: their own file, which aterm-verify includes too.
 include!("skipped.rs");
 
 /// How long the probe waits for `trustd`: about a hundred times its honest
@@ -38,11 +41,20 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// though the skipped tests pass.
 pub fn notice_once(line: &'static str) {
     static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    #[cfg(test)]
+    ASKED.with(|n| n.set(n.get() + 1));
     let mut said = SAID.lock().unwrap_or_else(PoisonError::into_inner);
     if !said.contains(&line) {
         said.push(line);
         let _ = writeln!(std::io::stderr(), "{line}");
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many notices THIS thread asked [`notice_once`] for, printed or not:
+    /// what a test of a judgment reads to show it asked for none.
+    static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `true`, after [`notice_once`] of [`SKIPPED`], when macOS's `trustd` does
@@ -59,6 +71,30 @@ pub fn trust_service_silent() -> bool {
         notice_once(SKIPPED);
     }
     silent
+}
+
+/// `true`, after [`notice_once`] of [`DISK_IMAGE_SKIPPED`], when `out` is an
+/// `hdiutil` run that failed because macOS's disk-image service did not answer
+/// (MEASURED 2026-10-08: a wedged service fails `hdiutil create` after about
+/// 121 s with `Operation timed out`); the caller then returns without
+/// asserting anything. Any other failure is an answer, and `false`.
+#[must_use]
+pub fn disk_image_service_silent(out: &std::process::Output) -> bool {
+    let silent = timed_out(out);
+    if silent {
+        notice_once(DISK_IMAGE_SKIPPED);
+    }
+    silent
+}
+
+/// [`disk_image_service_silent`]'s judgment WITHOUT its notice: a failed run
+/// whose stderr says `Operation timed out`. A test of the judgment asks here,
+/// never the function above: the notice is the line the merge gate counts as a
+/// host skip (aterm-verify `libtest::host_skips`), and printed for a made-up
+/// run it makes a whole-tree run read "1 skipped", and withhold the merge
+/// contract, on a host whose service answers.
+fn timed_out(out: &std::process::Output) -> bool {
+    !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Operation timed out")
 }
 
 /// How long a test's own `codesign` may run: a hang detector, never a budget.
@@ -139,3 +175,43 @@ fn probe() {
 
 #[cfg(not(target_vendor = "apple"))]
 fn probe() {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{ExitStatus, Output};
+
+    fn run(code: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Only a FAILED run that timed out is the service's silence: any other
+    /// failure is an answer, and the test asserts on it.
+    #[test]
+    fn only_a_timed_out_failure_is_a_silent_disk_image_service() {
+        // The judgment alone: `disk_image_service_silent` would print the skip
+        // line the gate reads, and no `hdiutil` ran here.
+        use super::timed_out as silent;
+        let asked = super::ASKED.with(std::cell::Cell::get);
+        assert!(silent(&run(
+            1,
+            "hdiutil: create failed - Operation timed out\n"
+        )));
+        assert!(!silent(&run(
+            1,
+            "hdiutil: create failed - No space left on device\n"
+        )));
+        assert!(!silent(&run(1, "")));
+        assert!(!silent(&run(0, "Operation timed out\n")));
+        assert_eq!(
+            super::ASKED.with(std::cell::Cell::get),
+            asked,
+            "the judgment asked for the skip line: the gate would count a made-up run as a \
+             host check this binary skipped"
+        );
+    }
+}

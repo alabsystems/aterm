@@ -4,7 +4,7 @@
 
 //! Cell constructor methods.
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use super::super::style::StyleId;
 use super::{Cell, CellFlags, PackedColor, PackedColors};
 
@@ -150,7 +150,7 @@ impl Cell {
 
     /// Create a cell with an overflow index for a complex character; the string
     /// lives in CellExtras.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     #[inline]
     pub const fn with_overflow_index(index: u16) -> Self {
@@ -171,14 +171,13 @@ impl Cell {
     /// - `colors.0` low 16 bits: StyleId value
     /// - `colors.0` high 16 bits: reserved (for RGB overflow index)
     /// - `flags`: USES_STYLE_ID plus cell-specific flags
-    #[cfg(any(test, kani, feature = "testing"))]
+    #[cfg(test)]
     #[must_use]
     #[inline]
     #[allow(
         clippy::cast_possible_truncation,
         reason = "cp verified <= 0xFFFF before cast"
     )]
-    #[cfg(any(test, kani))]
     pub const fn with_style_id(c: char, style_id: StyleId, cell_flags: CellFlags) -> Self {
         let cp = c as u32;
         let char_data = if cp <= Self::MAX_DIRECT_CODEPOINT {
@@ -204,7 +203,7 @@ impl Cell {
     ///
     /// # Preconditions (caller must verify)
     /// - `byte` is printable ASCII (0x20..=0x7E)
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     #[inline]
     pub const fn from_ascii_with_style_id(

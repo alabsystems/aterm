@@ -22,6 +22,9 @@
 #[path = "../../src/apple.rs"]
 #[allow(dead_code)]
 mod apple;
+#[path = "../../src/artifact.rs"]
+#[allow(dead_code)]
+mod artifact;
 #[path = "../../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
@@ -61,9 +64,18 @@ mod provision;
 #[path = "../../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../../src/release.rs"]
+#[allow(dead_code)]
+mod release;
+#[path = "../../src/release_steps.rs"]
+#[allow(dead_code)]
+mod release_steps;
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
+#[path = "../../src/snapshot.rs"]
+#[allow(dead_code)]
+mod snapshot;
 #[path = "../../src/trust_closure.rs"]
 #[allow(dead_code)]
 mod trust_closure;
@@ -81,11 +93,10 @@ mod trust_oblig;
 mod verify;
 
 mod apple_tier;
+mod build_once;
 mod channel_floor_model;
 mod channel_latest;
 mod claim_landing_model;
-mod cut_handoff;
-mod cut_launcher;
 mod d27_refute;
 mod durable_post_intent_model;
 mod handoff_policy_bundle;
@@ -95,12 +106,13 @@ mod linux_release_arch;
 mod machine_roster;
 mod pack_arch_gate;
 mod packlane_order;
-mod paint_smoke;
 mod plist_stamp;
 mod publisher_fence_liveness;
 mod publisher_fence_model;
+mod release_flow;
 mod release_lease;
 mod resume;
 mod signconf;
+mod snapshot_take;
 mod transcript_grid;
 mod trust_facts_model;

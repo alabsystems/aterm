@@ -13,25 +13,11 @@ use std::process::Command;
 
 /// A `const` declaration's body, whatever VISIBILITY it is spelled with.
 ///
-/// # This function is the fourteenth pass's finding
-///
-/// It was `line.trim().strip_prefix("pub(crate) const ")`, and all 42 rows in
-/// the seam happen to be spelled that way. **That armed the guard at one
-/// SPELLING of its rule rather than at the rule.** `pub const` inside the
-/// seam's private `consts` module is the same declaration with the same
-/// visibility in practice — arguably the more idiomatic spelling, since the
-/// module is already `pub(crate)` — and a `pub const` carrying a WRONG value
-/// was planted here and passed all three tests in the seam's file, including
-/// the coverage test whose entire job is to say that every seam constant has a
-/// row.
-///
-/// That is F1's shape, recurring inside the fix for the constant-recipe gap:
-/// the previous pass found a `load_borrowed` rebuilt with its lifetime behind a
-/// `PhantomData` wrapper slipping through a guard armed at `&`. The question to
-/// ask of any new guard is what the same defect looks like spelled differently,
-/// so this parser is written against the GRAMMAR — `pub`, `pub(crate)`,
-/// `pub(super)`, `pub(in path)` or nothing — and
-/// [`the_parser_reads_every_visibility_spelling`] proves it reads all of them.
+/// Written against the GRAMMAR — `pub`, `pub(crate)`, `pub(super)`,
+/// `pub(in path)` or nothing — not one spelling: a parser that matched only
+/// `pub(crate) const ` let a `pub const` with a WRONG value pass every census
+/// test, coverage included. [`the_parser_reads_every_visibility_spelling`]
+/// proves it reads all of them.
 fn strip_const_decl(line: &str) -> Option<&str> {
     let mut s = line.trim();
     if let Some(rest) = s.strip_prefix("pub") {

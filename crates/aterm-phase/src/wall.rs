@@ -16,22 +16,84 @@
 //! ONE table, [`PHRASES`].
 //!
 //! **Placement decides what is the vendor's; the table decides what kind.**
-//! A `⎿` block that opens the last thing said is read as a vendor row
-//! unless one of two recognised forms says it is output: the `⏺` row it
-//! hangs from is a tool call written `⏺ Name(…)` (`⏺ Bash(…)`, `⏺
-//! Update(notes.txt)`), or the block opens with the command's own echo
-//! (`⎿  $ touch x`, how 2.1.280 draws a running Bash call under `⏺
-//! <description>`). Under those the gutter carries the tool's OUTPUT, which
-//! quotes anything — a log that says `API Error: 529`, a peer's screen. Any
-//! other owner is read as the vendor's: the worker's message, a completion
-//! notice (`⏺ Dynamic workflow … completed`, `⏺ Background command …
-//! completed`, both measured with a limit notice under them) — and a
-//! `⏺ Monitor event: …` row, whose block is its event's payload. A limit
-//! notice under a Monitor event is the same shape as under a completion
-//! notice (a monitor event opens a turn with no user row), so it is read
-//! as a wall; a payload that OPENS with a wall phrase — a peer's screen
-//! whose first row is its limit notice — reads as this worker's wall too.
-//! A finished Bash call's `⎿` block once its echo is gone is not measured.
+//! A `⎿` block that opens the last thing said is read as a vendor row by the
+//! OWNER WALK (`phase::block_is_vendors`), measured on Claude Code 2.1.294 in
+//! `tools/real-claude-lab`:
+//! * Claude Code draws its OWN `⎿` rows at column 2 (`  ⎿  …`); a tool's
+//!   output continues at column 5, so a `⎿` the output prints — after a blank
+//!   row of it or not, behind carriage returns, tabs and cursor moves — is at
+//!   column 5 or deeper, and never a vendor row.
+//! * The walk goes up from the block over the rows of the blocks above it —
+//!   and over a blank row whose next row below stands past column 2 or is a
+//!   column-2 `⎿` row, a blank line of a call's output or of its command —
+//!   to the first row in column 0. A CALL there (`phase::is_tool_call`: `⏺
+//!   Bash(…)`, `⏺ Web Search(…)`, an MCP tool drawn `⏺ <server> - <title>
+//!   (MCP)(…)` or `⏺ mcp__srv__tool (MCP)`, an integration's `⏺ Claude in
+//!   Chrome[…](…)`, a shell-mode `! cmd`) owns the block, and its FIRST
+//!   column-2 row is the call's output — the first line of what it printed,
+//!   which quotes anything (a log that says `API Error: 529`, an issue body,
+//!   a peer's screen) — and never a wall. A LATER column-2 row under a call
+//!   is read: it is where Claude Code draws the wall when the request after
+//!   a tool fails (`⏺ Bash(…)` / `⎿  stamped` / `⎿  Context limit reached ·
+//!   …`, a PostToolUse hook's row between them or not; measured).
+//! * Every other owner's column-2 rows are read as Claude Code's: the
+//!   person's `❯` turn (a full context, a failed `/compact`), a hook summary
+//!   (`⏺ Ran 1 stop hook (ctrl+o to expand)`), a completion notice (`⏺
+//!   Dynamic workflow … completed`, `⏺ Background command … completed`, `⏺
+//!   Goal check-in: …`), the worker's message, and a `⏺ Monitor event: …`
+//!   row, whose block is its event's payload. So is a block whose owner the
+//!   walk does not reach because a blank row (under it a column-2 row that is
+//!   no `⎿` row) or the top of the screen comes first: Claude Code's walls
+//!   stand so under a prompt's second paragraph, under a collapsed tool group
+//!   (`  Read 1 file (ctrl+o to expand)`, its hint wrapped onto a second row
+//!   in a narrow pane or not) and under a long output whose call row has
+//!   scrolled off (all measured). Not a block that opens with the command's
+//!   own echo (`⎿  $ touch x`, how 2.1.280 draws a running Bash call under `⏺
+//!   <description>`).
+//!
+//! **The screen reads for recall; the transcript decides.** The walk reads
+//! some of a tool's output as Claude Code's, and no rule of the screen's can
+//! tell them apart (measured on 2.1.294): an MCP result of several content
+//! blocks is drawn one column-2 row per block, where an MCP result and then a
+//! wall look the same; a PreToolUse hook's row is drawn ABOVE the output,
+//! which is then the second column-2 row; a long output's call row scrolls
+//! off, and so does the first row of an MCP result's first block; a tool
+//! whose row this reader does not take for a call (a bare `⏺ <Name>`, a tool
+//! drawn with no row at all) has its output read as the vendor's; and the
+//! worker's own words can hold a `⎿` row. So the supervisor ACTS on a wall
+//! read here — types `/login`, `/compact` or a retry, waits for a reset,
+//! moves the session to another account, raises the login-gone alarm — only
+//! where the session's Claude Code transcript confirms it: its newest
+//! main-chain entry is Claude Code's own notice row of the same kind
+//! (aterm-agent, `supervise/wall_confirm.rs`). A wall the transcript does not
+//! confirm is journaled and the turn is an ordinary turn end. Where no
+//! transcript can be read, a wall read UNDER A CALL ([`Wall::under_call`]: a
+//! later column-2 row under any call this walk recognises, an MCP call's, a
+//! shell-mode command's and one a hook's row opens included) is not acted on,
+//! and any other is acted on as the screen reads it. Main read walls under
+//! MCP and `!` calls (it did not know them as calls) and acted on them, so
+//! where no transcript can be read this gives up the real walls drawn there —
+//! a knowing loss, ruled 2026-10-08 to refuse the MCP and hook spoofs
+//! (`supervise/wall_confirm.rs`), the MCP spoofs whose first block holds or
+//! ends on a blank line among them (the walk goes on over a blank row inside
+//! the output), at the price of the real wall under an output that holds a
+//! blank row, read under its call too. An output whose call row scrolled off
+//! is read with no owner, and acted on there, as main read it. A heredoc
+//! command's output (main read it with no owner, behind the command's blank
+//! row) is the first row under its call: no wall.
+//!
+//! H6-HARNESS-1 (2026-10-08) is why: the rule had been "the vendor's unless
+//! the owner is `⏺ Name(…)`", and Claude Code 2.1.294 draws an MCP call `⏺
+//! github - get_issue (MCP)(…)` (verbose output) and a shell-mode command `!
+//! cat notes.txt`. Measured in `tools/real-claude-lab` with nothing said
+//! after either, the first row of the tool's output was read as the wall
+//! (`agent=wall:overloaded`, `agent=wall:auth`) and the harness typed
+//! `/login` into the session; its API-error act typed the output back as a
+//! user turn. Two screen-only fixes were tried and never landed: an
+//! allowlist of owners missed the real walls under a collapsed group and a
+//! hook summary, and a column rule that failed closed under MCP calls, hook
+//! rows and blank rows missed the real walls under a prompt's second
+//! paragraph, after an MCP call and under a long output (each measured).
 //!
 //! **Claude Code 2.1.283 draws an API error as a message of its own** — the
 //! `⏺` in column 0, the text from column 2 (its `lu()`), never under `⎿` —
@@ -208,6 +270,24 @@ pub struct Wall {
     /// The row the notice opens on — for a guard bound to it.
     pub row: usize,
     pub placement: Placement,
+    /// READ UNDER A TOOL'S CALL: a [`Placement::Gutter`] row the owner walk
+    /// (`phase::block_is_vendors`) found below the first column-2 row under a
+    /// call (`⏺ Bash(…)`, an MCP tool's row, a shell-mode `! cmd`), a hook's
+    /// row above the output or not, blank rows of the output between or not —
+    /// where Claude Code draws a wall after a tool's output, and where an MCP
+    /// result's second block and the output under a PreToolUse hook's row
+    /// stand too. Main read no wall under a `⏺ Name(…)` call (but behind a
+    /// blank row of its output), but read every row under an MCP call, a `!
+    /// cmd` and a `Name[tool](…)` call (its walk did not know them as calls),
+    /// so a real wall there was acted on. A supervisor that has no transcript
+    /// to confirm a wall by does not act on one read here, those included (a
+    /// loss of recall ruled 2026-10-08: aterm-agent,
+    /// `supervise/wall_confirm.rs`), and reads the WHOLE screen for it, not
+    /// the tail it decides from.
+    /// `false` everywhere else: a wall under the person's turn, a notice, the
+    /// worker's message, a collapsed group, or no owner the walk reaches, and
+    /// every other placement.
+    pub under_call: bool,
 }
 
 /// What one table row names.
@@ -771,6 +851,7 @@ pub fn memory_wall(rows: &[String]) -> Option<Wall> {
                 reset: None,
                 row: i,
                 placement: Placement::Banner,
+                under_call: false,
             })
     })
 }
@@ -1325,18 +1406,493 @@ mod tests {
             FOOTER,
         );
         let prose = framed(&[&format!("⏺ The last run died on {API_529}"), ""], FOOTER);
-        for (name, r) in [("tool call", under_call), ("echo", echo), ("prose", prose)] {
+        let mcp = framed(
+            &[
+                "⏺ github - get_issue (MCP)(owner: \"acme\", repo: \"app\", issue_number: 7)",
+                &format!("  ⎿  {API_529}"),
+                "",
+                "✻ Cooked for 3m 2s · done 4:24 PM",
+                "",
+            ],
+            FOOTER,
+        );
+        for (name, r) in [
+            ("tool call", under_call),
+            ("echo", echo),
+            ("prose", prose),
+            ("mcp", mcp),
+        ] {
             assert_eq!(wall(&r), None, "{name}");
             assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
         }
         assert!(crate::phase::is_tool_call("⏺ Bash(tail -1 build.log)"));
         assert!(crate::phase::is_tool_call("⏺ Update(notes.txt)"));
+        assert!(crate::phase::is_tool_call(
+            "⏺ github - get_issue (MCP)(owner: \"acme\")"
+        ));
+        assert!(crate::phase::is_tool_call("⏺ github - ping (MCP)"));
+        assert!(crate::phase::is_tool_call("! cat notes.txt"));
         assert!(!crate::phase::is_tool_call(
             "⏺ Dynamic workflow \"Second review pass\" completed · 5s"
         ));
         assert!(!crate::phase::is_tool_call(
             "⏺ Suites are running (all three)."
         ));
+        assert!(!crate::phase::is_tool_call(
+            "⏺ Wired the github server in (MCP), and it answers."
+        ));
+        assert!(crate::phase::is_tool_call(
+            "⏺ Claude in Chrome[get_page_text](tabId: 1)"
+        ));
+        assert!(!crate::phase::is_tool_call(
+            "⏺ Fixed rows[i] so the parser keeps the last one (it dropped it)."
+        ));
+    }
+
+    /// THE SCREEN'S HALF OF H6-HARNESS-1 (2026-10-08), on hand-built screens.
+    /// NEVER A WALL: a wall's words in a call's FIRST column-2 `⎿` row — the
+    /// first line of its output — under every row Claude Code draws for a
+    /// call or a command (the MCP forms: no arguments, spaces in the server
+    /// or the title, the unknown-tool stub; the shell mode's two; a name of
+    /// several words; an integration's `Name[tool](…)`), and a `⎿` at any
+    /// column but 2, which is what an output prints (after a blank row of it
+    /// or not), and the first row under a call whose own row wraps (the
+    /// wrapped row is no `⎿` row) or whose command holds a blank row (a
+    /// heredoc's, its rows at column 6). Main read the MCP, shell-mode,
+    /// column-5 and heredoc ones as walls, and its harness typed `/login`
+    /// (measured on 2.1.294).
+    /// READ, for recall: a LATER column-2 row under every call — Claude
+    /// Code's wall after a tool's output, which main missed — an MCP call's
+    /// and one a hook's row opens included, where the screen cannot tell the
+    /// wall from the output's own row and the transcript decides: each says
+    /// it was read UNDER A CALL ([`Wall::under_call`]), which a supervisor
+    /// with no transcript does not act on — behind a blank row of the output
+    /// too, and behind blank rows that end a block of it (the walk goes on
+    /// over a blank row whose next row is at column 5 or a column-2 `⎿`
+    /// row); and a column-2 row whose owner the walk does not reach (a blank
+    /// row over a column-2 row that opens an item, or the top of the screen,
+    /// comes first),
+    /// where pass 2 of the fix read nothing and so missed the real
+    /// walls measured there (a prompt's second paragraph, a wrapped group
+    /// row, a long output whose call scrolled off). CONTROLS: every owner
+    /// that is no call reads its wall, and none of those is under a call.
+    #[test]
+    fn the_owner_walk_reads_a_wall_but_never_in_a_calls_first_row() {
+        const WALLS: [(&str, WallKind); 4] = [
+            (API_529, WallKind::Overloaded),
+            ("Not logged in · Please run /login", WallKind::Auth),
+            (
+                "Context limit reached · /compact or /clear to continue",
+                WallKind::Context,
+            ),
+            (
+                "You've hit your weekly limit · resets Oct 30 at 7pm (America/Los_Angeles)",
+                WallKind::UsageWeekly,
+            ),
+        ];
+        let screen_of = |body: &[&str]| {
+            let mut rows: Vec<&str> = body.to_vec();
+            rows.extend(["", "✻ Worked for 4s · done 5:47 AM", ""]);
+            framed(&rows, FOOTER)
+        };
+        let read = |r: &Vec<String>| {
+            let reading = crate::reader::read(Some("claude"), r, None);
+            super::wall(r)
+                .or(reading.wall)
+                .map(|w| (w.kind, w.placement, w.under_call))
+        };
+        let calls = [
+            "⏺ Bash(tail -1 build.log)",
+            "⏺ Web Search(\"aterm release notes\")",
+            "⏺ Update(notes.txt)",
+            "! cat notes.txt",
+            "❯ !cat notes.txt",
+            "⏺ github - get_issue (MCP)(owner: \"acme\", issue_number: 7)",
+            "⏺ github - ping (MCP)",
+            "⏺ ticket desk - get_issue (MCP)(owner: \"acme\", issue_number: 8)",
+            "⏺ github - Fetch Page (MCP)(url: \"http://example.invalid/x\")",
+            "⏺ claude.ai Gmail - search_threads (MCP)(query: \"from:billing\")",
+            "⏺ mcp__github__get_issue (MCP)(issue_number: 7)",
+            "⏺ mcp__github__get_issue(issue_number: 7)",
+            "⏺ Claude in Chrome[get_page_text](tabId: 1)",
+            "⏺ Claude in Chrome[tabs_context_mcp]",
+        ];
+        let mut wrong = Vec::new();
+        for (wall, kind) in WALLS {
+            let gutter = format!("  ⎿  {wall}");
+            // Read under a call's later row, or anywhere else.
+            let under = Some((kind, Placement::Gutter, true));
+            let want = Some((kind, Placement::Gutter, false));
+            for owner in calls {
+                assert!(crate::phase::is_tool_call(owner), "{owner}");
+                // The output's first row: never a wall.
+                let first = screen_of(&[owner, &gutter, "     the second row of the output"]);
+                if let Some(w) = read(&first) {
+                    wrong.push(format!("first row under {owner}: {w:?}"));
+                }
+                // A later row: read, whatever the call.
+                let later = screen_of(&[owner, "  ⎿  stamped", "     a second row", &gutter]);
+                if read(&later) != under {
+                    wrong.push(format!("later row under {owner}: {:?}", read(&later)));
+                }
+                // Under a hook's row above the output: read too.
+                let hooked = screen_of(&[
+                    owner,
+                    "  ⎿  PreToolUse:Bash says: remember to run the tests",
+                    &gutter,
+                ]);
+                if read(&hooked) != under {
+                    wrong.push(format!("hooked under {owner}: {:?}", read(&hooked)));
+                }
+                // Behind a blank row of the output (its next row at column
+                // 5): the walk goes on over it to the call, and reads the
+                // row under the call too.
+                let blank = screen_of(&[
+                    owner,
+                    "  ⎿  Issue 7: the parser drops a row",
+                    "",
+                    "     Steps to reproduce: run it",
+                    &gutter,
+                ]);
+                if read(&blank) != under {
+                    wrong.push(format!(
+                        "behind a blank row under {owner}: {:?}",
+                        read(&blank)
+                    ));
+                }
+                // Behind blank rows that END a block of the output (the row
+                // under them a column-2 `⎿` row): read under the call too.
+                let ended = screen_of(&[
+                    owner,
+                    "  ⎿  Issue 7: the parser drops a row",
+                    "",
+                    "",
+                    &gutter,
+                ]);
+                if read(&ended) != under {
+                    wrong.push(format!(
+                        "behind blank rows ending a block under {owner}: {:?}",
+                        read(&ended)
+                    ));
+                }
+            }
+            // A CALL'S OWN WRAPPED ROW is no `⎿` row, at column 2 or not: the
+            // output's first row under it is still its first (hand-built: a
+            // call row whose arguments run onto a row of their own).
+            for wrapped in [
+                screen_of(&[
+                    "⏺ Bash(cargo test --workspace --no-fail-fast -- --nocapture",
+                    "  2>&1 | tail -40)",
+                    &gutter,
+                ]),
+                screen_of(&[
+                    "⏺ github - get_issue (MCP)(owner: \"acme\", repo: \"app\",",
+                    "  issue_number: 7)",
+                    &gutter,
+                ]),
+                // A heredoc command, its blank line a blank row of the call's
+                // own (its rows at column 6): the walk goes on over it.
+                screen_of(&[
+                    "⏺ Bash(python3 - <<'EOF'",
+                    "      print('first line')",
+                    "",
+                    "      print('third line')",
+                    "      EOF)",
+                    &gutter,
+                ]),
+            ] {
+                if let Some(w) = read(&wrapped) {
+                    wrong.push(format!("first row under a wrapped call: {w:?}"));
+                }
+            }
+            // A `⎿` the output printed: at column 5 (after a blank row of the
+            // output or not), at any column but 2.
+            for (name, r) in [
+                (
+                    "column 5, after a blank row",
+                    screen_of(&[
+                        "⏺ Bash(cat issue.txt)",
+                        "  ⎿  Issue 7: the parser drops a row",
+                        "",
+                        &format!("     ⎿  {wall}"),
+                    ]),
+                ),
+                (
+                    "column 5",
+                    screen_of(&[
+                        "⏺ Bash(cat issue.txt)",
+                        "  ⎿  Issue 7: the parser drops a row",
+                        &format!("     ⎿  {wall}"),
+                    ]),
+                ),
+                (
+                    "column 3, under no call",
+                    screen_of(&["⏺ The runs are queued.", &format!("   ⎿  {wall}")]),
+                ),
+            ] {
+                if let Some(w) = read(&r) {
+                    wrong.push(format!("{name}: {w:?}"));
+                }
+            }
+            // No owner the walk reaches: read.
+            for (name, r) in [
+                (
+                    "scrolled off",
+                    framed(&[&gutter, "     more output", ""], FOOTER),
+                ),
+                (
+                    "under a long output whose call scrolled off",
+                    screen_of(&["     78", "     79", "     80", &gutter]),
+                ),
+                (
+                    "under a prompt's second paragraph",
+                    screen_of(&[
+                        "❯ Please fix the parser.",
+                        "",
+                        "  The second paragraph says what done looks like.",
+                        &gutter,
+                    ]),
+                ),
+                (
+                    "under a wrapped group row",
+                    screen_of(&[
+                        "❯ toolstart",
+                        "",
+                        "  Searched for 2 patterns, read 1 file (ctrl+o",
+                        "  to expand)",
+                        &gutter,
+                    ]),
+                ),
+                // A blank row ends the walk where the row under it opens a new
+                // item, so a call's block above it does not own the wall.
+                (
+                    "under a group row behind a call's block",
+                    screen_of(&[
+                        "⏺ Bash(ls)",
+                        "  ⎿  out",
+                        "",
+                        "  Read 1 file (ctrl+o to expand)",
+                        &gutter,
+                    ]),
+                ),
+            ] {
+                if read(&r) != want {
+                    wrong.push(format!("{name}: {:?}", read(&r)));
+                }
+            }
+            // CONTROLS: every other owner's column-2 rows are Claude Code's.
+            for owner in [
+                &["❯ fourth turn: the stub says the prompt is too long"][..],
+                &["⏺ Suites are running; I'll report the number when it lands."],
+                &["⏺ Here is the plan:"],
+                &["⏺ Done:", "  - parser fixed", "  - tests added"],
+                &["⏺ Dynamic workflow \"Second review pass\" completed · 5s"],
+                &["⏺ Background command \"Run the cache tests\" completed (exit code 0)"],
+                &["⏺ Goal check-in: background work still running"],
+                &["⏺ The runs are queued.", ""],
+                &["⏺ Monitor event: worker s-1 screen changed"],
+                &["❯ toolstart", "", "  Read 1 file (ctrl+o to expand)"],
+                &[
+                    "❯ toolstart",
+                    "",
+                    "  Called github 2 times (ctrl+o to expand)",
+                ],
+                &[
+                    "⏺ Ran 1 stop hook (ctrl+o to expand)",
+                    "  ⎿  Stop hook error: check the tests",
+                ],
+            ] {
+                let mut body = owner.to_vec();
+                body.push(&gutter);
+                if read(&screen_of(&body)) != want {
+                    wrong.push(format!("control {owner:?}: {:?}", read(&screen_of(&body))));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The owner walk on the screens it was measured on (Claude Code 2.1.294,
+    /// `tools/real-claude-lab`, 2026-10-08). WALLS, each a real context wall
+    /// read from the gutter: under a collapsed tool group, under a Stop
+    /// hook's summary, under a Bash call's output (plain, holding a blank
+    /// row, a PostToolUse hook's row between), under a prompt's second
+    /// paragraph, under an MCP call's one-block output, under a long output
+    /// whose call scrolled off, and — hand-built from two measured screens —
+    /// under a group row wrapped in a narrow pane. Pass 1 of the fix read
+    /// neither of the first two, pass 2 none of the last four, and main none
+    /// under a call. OUTPUTS the screen tells from a wall, each the last
+    /// thing said, `idle` and no wall: an MCP result's first row, a
+    /// shell-mode command's output, a file's own `⎿` at column 5, and a
+    /// heredoc command's output (the first row under its call, the walk gone
+    /// on over the command's own blank row). OUTPUTS it cannot tell from
+    /// one, READ as walls here and refused by the session's transcript
+    /// (aterm-agent, `supervise/wall_confirm.rs`): an MCP result of three
+    /// blocks (its last a login phrase), two of two whose first block holds
+    /// or ends on a blank line, one whose long first block scrolled its call
+    /// off, and a
+    /// Bash output under a PreToolUse hook's row and under its error rows.
+    /// Pass 2 read none of those, at the price of the walls above. Each wall
+    /// says whether it was read under a call ([`Wall::under_call`]); of the
+    /// outputs, all but the scrolled-off MCP block are (main read the MCP
+    /// ones as walls: its walk did not know the MCP call); of the walls, the
+    /// ones after a Bash, a PostToolUse hook's and an MCP output, a blank row
+    /// in the output or not (since the walk goes on over a blank row inside
+    /// an output, ruled 2026-10-08).
+    #[test]
+    fn the_owner_walk_on_its_measured_screens() {
+        use crate::prompt::fixtures::{
+            BASH_BLANK_ROW_THEN_CONTEXT_WALL_MEASURED, BASH_OUTPUT_THEN_CONTEXT_WALL_MEASURED,
+            COLLAPSED_GROUP_CONTEXT_WALL_MEASURED, GUTTER_PHRASE_IN_OUTPUT_MEASURED,
+            LONG_OUTPUT_CONTEXT_WALL_MEASURED,
+            MCP_BLANK_ROW_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED,
+            MCP_LONG_BLOCK_THEN_WALL_PHRASE_MEASURED, MCP_MULTI_BLOCK_OUTPUT_MEASURED,
+            MCP_OUTPUT_ENDS_TURN_MEASURED, MCP_OUTPUT_THEN_CONTEXT_WALL_MEASURED,
+            MCP_TRAILING_BLANK_ROWS_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED,
+            MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED, MULTILINE_COMMAND_OUTPUT_MEASURED,
+            POST_HOOK_THEN_CONTEXT_WALL_MEASURED, PRE_HOOK_ABOVE_OUTPUT_MEASURED,
+            PRE_HOOK_ERROR_ABOVE_OUTPUT_MEASURED, SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED,
+            STOP_HOOK_CONTEXT_WALL_MEASURED, WRAPPED_GROUP_ROW_CONTEXT_WALL,
+        };
+        let read = |capture: &str| {
+            let r = screen(capture);
+            let reading = crate::reader::read(Some("claude"), &r, None);
+            assert_eq!(
+                wall(&r).map(|w| w.kind),
+                reading.wall.as_ref().map(|w| w.kind),
+                "the reader and `wall` agree"
+            );
+            (wall(&r), reading)
+        };
+        const CONTEXT: &str = "Context limit reached · /compact or /clear to continue";
+        // Each with whether it was read UNDER A CALL (a later column-2 row
+        // under it): the walls a supervisor with no transcript leaves alone.
+        for (name, capture, under_call) in [
+            (
+                "collapsed group",
+                COLLAPSED_GROUP_CONTEXT_WALL_MEASURED,
+                false,
+            ),
+            ("stop hook", STOP_HOOK_CONTEXT_WALL_MEASURED, false),
+            ("bash output", BASH_OUTPUT_THEN_CONTEXT_WALL_MEASURED, true),
+            // Under the call since the walk goes on over the output's
+            // blank row (pass 5 read it under no owner).
+            (
+                "bash output, a blank row",
+                BASH_BLANK_ROW_THEN_CONTEXT_WALL_MEASURED,
+                true,
+            ),
+            ("post hook", POST_HOOK_THEN_CONTEXT_WALL_MEASURED, true),
+            (
+                "a prompt's second paragraph",
+                MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED,
+                false,
+            ),
+            ("mcp output", MCP_OUTPUT_THEN_CONTEXT_WALL_MEASURED, true),
+            ("long output", LONG_OUTPUT_CONTEXT_WALL_MEASURED, false),
+        ] {
+            let (w, reading) = read(capture);
+            let w = w.unwrap_or_else(|| panic!("{name}: the wall"));
+            assert_eq!(
+                (w.kind, w.placement, w.message.as_str(), w.under_call),
+                (WallKind::Context, Placement::Gutter, CONTEXT, under_call),
+                "{name}"
+            );
+            assert_eq!(
+                reading.wall.map(|w| w.under_call),
+                Some(under_call),
+                "{name}"
+            );
+        }
+        let (w, _) = read(WRAPPED_GROUP_ROW_CONTEXT_WALL);
+        assert_eq!(
+            w.map(|w| (w.kind, w.placement, w.under_call)),
+            Some((WallKind::Context, Placement::Gutter, false)),
+            "a wrapped group row"
+        );
+        for (name, capture) in [
+            ("mcp", MCP_OUTPUT_ENDS_TURN_MEASURED),
+            ("shell mode", SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED),
+            ("column 5", GUTTER_PHRASE_IN_OUTPUT_MEASURED),
+            // The first row under its call, the walk gone on over the
+            // command's own blank row (pass 5 read it under no owner).
+            ("heredoc", MULTILINE_COMMAND_OUTPUT_MEASURED),
+        ] {
+            let (w, reading) = read(capture);
+            assert_eq!(w, None, "{name}");
+            assert_eq!(reading.phase, Phase::Idle, "{name}");
+            assert!(reading.phase_authoritative, "{name}");
+        }
+        // Under a call: the MCP ones, which main read as walls (it did not
+        // know the MCP call), the two whose first block holds or ends on a
+        // blank line among them (pass 5 read them under no owner: its walk
+        // stopped at the blank row), and the two hook ones, which main never
+        // read (it knew `⏺ Bash(…)`); not under one: the one main read as a
+        // wall too (its walk reached the top of the screen as this one does).
+        for (name, capture, under_call) in [
+            ("mcp, three blocks", MCP_MULTI_BLOCK_OUTPUT_MEASURED, true),
+            (
+                "mcp, a blank row in the first block",
+                MCP_BLANK_ROW_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED,
+                true,
+            ),
+            (
+                "mcp, the first block ending on a blank line",
+                MCP_TRAILING_BLANK_ROWS_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED,
+                true,
+            ),
+            (
+                "mcp, a long block then another",
+                MCP_LONG_BLOCK_THEN_WALL_PHRASE_MEASURED,
+                false,
+            ),
+            ("pre hook", PRE_HOOK_ABOVE_OUTPUT_MEASURED, true),
+            ("pre hook error", PRE_HOOK_ERROR_ABOVE_OUTPUT_MEASURED, true),
+        ] {
+            let (w, _) = read(capture);
+            assert_eq!(
+                w.map(|w| (w.kind, w.placement, w.under_call)),
+                Some((WallKind::Auth, Placement::Gutter, under_call)),
+                "{name}: read, for the transcript to refuse"
+            );
+        }
+    }
+
+    /// THE WALK NEEDS EVERY ROW THE SCREEN SHOWS (the review of pass 4,
+    /// measured): an MCP result's second block, a weekly limit's words, on a
+    /// 50-row pane whose call row is row 9 and whose last 31 rows are blank.
+    /// The whole screen reads the limit UNDER THE CALL; the pane's last 40
+    /// rows — the tail a supervisor reads — hold the limit and not the call,
+    /// and the walk, reaching their top, reads it under no owner. So whoever
+    /// acts on [`Wall::under_call`] reads the whole screen for it
+    /// (aterm-agent, `supervise/wall_confirm.rs`).
+    #[test]
+    fn a_wall_is_under_its_call_on_the_whole_screen_and_not_on_a_tail_that_cut_the_call() {
+        use crate::prompt::fixtures::MCP_LIMIT_PHRASE_CALL_ROW_ABOVE_TAIL_MEASURED;
+        let whole = screen(MCP_LIMIT_PHRASE_CALL_ROW_ABOVE_TAIL_MEASURED);
+        assert_eq!(whole.len(), 50);
+        assert_eq!(whole[9], "⏺ github - get_limit (MCP)(n: 7)");
+        let tail = &whole[whole.len() - 40..];
+        assert!(
+            tail[0].starts_with("  ⎿") && tail[0].ends_with("Issue 7: the parser drops a row"),
+            "the tail opens on the result's first block: {:?}",
+            tail[0]
+        );
+        let read = |rows: &[String]| {
+            crate::reader::read(Some("claude"), rows, None)
+                .wall
+                .map(|w| (w.kind, w.placement, w.under_call))
+        };
+        assert_eq!(
+            read(&whole),
+            Some((WallKind::UsageWeekly, Placement::Gutter, true)),
+            "the whole screen"
+        );
+        assert_eq!(
+            read(tail),
+            Some((WallKind::UsageWeekly, Placement::Gutter, false)),
+            "the tail"
+        );
     }
 
     /// THE LOGIN WALL OF 2026-09-27 (tab `s-b5cf2faabac5ce5127bd`): Claude

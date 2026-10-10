@@ -1392,7 +1392,7 @@ fn chosen_by_hand(
         || default_model.is_some_and(|d| family_of(d) == family)
 }
 
-/// THE RIDE'S GUARD (2026-10-01): whether `carried` — the model a notice of
+/// THE RIDE'S GUARD: whether `carried` — the model a notice of
 /// the upgrade carried, which a restart of its round still asks for (an
 /// announced round's, or a gave-up one's on a late READY) — may still ride
 /// that restart, judged over the SETTLED record of this read and what the
@@ -1579,17 +1579,15 @@ impl ModelRecord {
         }
     }
 
-    /// A LINE NEVER TYPED ASKED NOTHING (2026-10-01): the ask `asked`
+    /// A LINE NEVER TYPED ASKED NOTHING: the ask `asked`
     /// recorded right before a relaunch line is typed is TAKEN BACK when that
     /// line is not typed (a wait, a refusal), and the ask it replaced stands
     /// again. Kept, it settled [`MODEL_SETTLE_S`] later as FAILED though no
     /// relaunch ever asked it: the model barred from the conversation for good
     /// ([`spent`]), and, since the ride's guard ([`ride_bar`]), from the very
-    /// round whose READY a refused signal left standing. (Until 2026-10-02 the
-    /// ask was written before the restart's signal, and a restart in place
-    /// whose signal was refused, or any restart whose line never came, kept
-    /// it.) Only while the record still holds that ask: one a later write
-    /// replaced is not this one's to undo.
+    /// round whose READY a refused signal left standing. Only while the
+    /// record still holds that ask: one a later write replaced is not this
+    /// one's to undo.
     pub fn take_back(&mut self, asked: Asked) {
         if self.set == asked.model && self.set_at == asked.at {
             self.set = asked.before;
@@ -1677,7 +1675,7 @@ pub struct ModelReadStep {
 ///   answer came for [`CACHE_COLD_S`] ([`last_answer_at`]); and THE DUE CLOCK
 ///   ([`ModelRecord::due_clock`]) is stepped by the verdict.
 ///
-/// A carried model reads the transcript even on an empty offer (2026-10-01):
+/// A carried model reads the transcript even on an empty offer:
 /// what a person typed since the notice must be seen (and remembered) before
 /// a restart asks for it.
 ///
@@ -1744,7 +1742,7 @@ pub fn model_read_step<S: AsRef<str>>(
 ///   says now: the READY answer warms the cache again, and a decision
 ///   re-taken then would drop the model half-way. Only while the rule's laws
 ///   still hold for it: a read that bars it ([`ride_bar`]) drops it from the
-///   upgrade's state first, so it is never handed here (2026-10-01);
+///   upgrade's state first, so it is never handed here;
 /// * else a DUE move ([`model_due`]) when THE MODEL LADDER
 ///   ([`model_moves_now`]) takes it now — `build_restart` when the restart
 ///   happens regardless (a newer build is due, or it is a restart made for
@@ -1771,7 +1769,7 @@ pub fn model_to(
     }
 }
 
-/// THE LAUNCH'S `--model` A RELAUNCH KEEPS (2026-10-01): `launch`, the
+/// THE LAUNCH'S `--model` A RELAUNCH KEEPS: `launch`, the
 /// `--model` the process runs with (`upgrade::launch_model`), unless the
 /// record marks it FAILED ([`ModelRecord::failed`]): this harness's own
 /// earlier ask, a relaunch's `--model` that did not become what runs, which no
@@ -2809,7 +2807,7 @@ mod tests {
         assert!(never.set.is_empty() && never.failed == ["claude-opus-5-5"]);
     }
 
-    /// A SIGNAL NEVER SENT ASKED NOTHING (review of 2026-10-01): an ask taken
+    /// A SIGNAL NEVER SENT ASKED NOTHING: an ask taken
     /// back restores the one it replaced, time and all, and never settles as
     /// FAILED — no relaunch ran to ask it. One a later write replaced is not
     /// undone. NEGATIVE CONTROL: the same ask kept settles as FAILED once
@@ -2854,7 +2852,7 @@ mod tests {
         assert_eq!(settled.failed.as_deref(), Some("claude-opus-5-5"));
     }
 
-    /// THE RIDE'S GUARD (2026-10-01): a notice's model rides its round's
+    /// THE RIDE'S GUARD: a notice's model rides its round's
     /// restart only while the rule's three move laws still hold for it — the
     /// gaps the skeptic review of `HarnessModelSwitch` found (2026-09-27) are
     /// each barred, by the rule's own word, and what the ride exists to hold
@@ -2995,7 +2993,7 @@ mod tests {
         );
     }
 
-    /// The read RE-JUDGES A CARRIED MODEL even on an empty offer (2026-10-01):
+    /// The read RE-JUDGES A CARRIED MODEL even on an empty offer:
     /// without one the transcript is not read; with one it is, so a person's
     /// `/model` typed since the notice is remembered and bars the ride.
     #[test]

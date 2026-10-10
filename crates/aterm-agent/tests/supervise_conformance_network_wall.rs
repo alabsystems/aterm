@@ -197,14 +197,14 @@ fn expected(m: &Model, st: &State) -> Verdict {
 }
 
 /// What the real decider says at `st`, with the act's words checked: the
-/// vendor's line quoted, under the rule's own sentence.
+/// wall's kind named, under the rule's own sentence.
 fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
     match a {
         TurnEndAction::Type { text, rule_id } => {
             let r = reading(st, None, now);
             assert_eq!(
                 *text,
-                wall_retry_text(rule_id, cause_of(st), &r.wall_message, r.program),
+                wall_retry_text(rule_id, r.wall.expect("a shown wall"), r.program),
                 "the words at {st:?}"
             );
             Verdict::Act(rule_id)

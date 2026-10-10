@@ -2566,16 +2566,30 @@ impl App {
     /// moving heals with the move (its relaunch line sources the hook) — plus
     /// the shells still waiting to be adopted; the unmarked tabs whose PATH
     /// was measured, two jobs in a row, to put a foreign copy first; and the
-    /// Claude sessions behind THE VERSION THE RECORD NAMES (its wire text,
-    /// remembered by `post_managed_current`), split into those the upgrade
-    /// moves on its own and those it will not move —
+    /// Claude sessions RUNNING A BUILD OLDER THAN THE VERSION THE RECORD NAMES
+    /// (its wire text, remembered by `post_managed_current`), split into those
+    /// the upgrade moves on its own and those it will not move —
     /// stalled, or held by the owner's word (review of 2026-09-25: an overdue
     /// session was said to move at its next turn end while the band showed it
-    /// stalled, and a row moving to ANY version was counted). The version,
-    /// not the copy: a session moving onto the native install of that version
-    /// lags it just the same — measured 2026-09-25, one of the owner's two
-    /// lagging sessions was the native 2.1.281 moving to native 2.1.282, the
-    /// session the gap audit's false "up to date" was said over.
+    /// stalled). The build a session RUNS, whatever its row's target (audit
+    /// 2026-10-09: at the install the rows still targeted the previous build
+    /// for the two seconds before their retarget, so counting only rows onto
+    /// the new one recorded "are current" nine times in a week while two tabs
+    /// ran days-old builds). The version, not the copy: a session on the native
+    /// install of an older version lags it just the same — measured
+    /// 2026-09-25, one of the owner's two lagging sessions was the native
+    /// 2.1.281, the session the gap audit's false "up to date" was said over.
+    ///
+    /// KNOWN LIMITS (review of 2026-10-09): a session is counted only while
+    /// the live upgrade hands the window a row for it. A finished move whose
+    /// model is still unconfirmed leaves the rows once its confirm-by and
+    /// `DONE_SHOWN_S` pass (`upgrade_status::View::refresh_with`) while the
+    /// harness starts no next round for it, so such a session goes uncounted
+    /// whatever build it runs; and at an install, a session that was current
+    /// on the previous build has no row until the harness mints the new
+    /// round, two or three seconds later, so the first record can still say
+    /// "current" — re-worded in place once those rows land
+    /// (`post_managed_current`), though the message log keeps the first line.
     pub(crate) fn tabs_behind(&self) -> TabsBehind {
         let now = now_s();
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2622,19 +2636,40 @@ impl App {
             .iter()
             .filter(|r| r.agent == aterm_agent::harness::upgrade::Agent::Claude)
         {
-            if !managed.as_deref().is_some_and(|v| same_build(v, &row.to)) {
+            if !managed.as_deref().is_some_and(|v| runs_older(row, v)) {
                 continue;
             }
-            if row.moving(now) && row.stall(now).is_none() {
+            // A finished move onto an older build is behind too, and the
+            // upgrade takes it on from there on its own.
+            // Every other session behind will not move on its own: stalled
+            // (a restart stuck in flight among them), or held by the owner.
+            if row.phase == Phase::Done || (row.moving(now) && row.stall(now).is_none()) {
                 tabs.agents_behind += 1;
-            } else if matches!(
-                row.phase,
-                Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
-            ) {
+            } else {
                 tabs.agents_held += 1;
             }
         }
         tabs
+    }
+}
+
+/// Whether the session `row` moves RUNS a build older than `managed`: the
+/// build it is moving from, or — once relaunched, its relaunch line having
+/// typed the target, or its move done — the one it moved onto, whatever its
+/// row targets next. A relaunch still waiting for the idle point that carries
+/// its conversation on (stuck there, even) runs the target already (review
+/// of 2026-10-09). Where either does not parse as a version, any build but
+/// `managed` itself is counted: an unreadable build is never called current.
+fn runs_older(row: &Row, managed: &str) -> bool {
+    use aterm_agent::harness::upgrade::Version;
+    let runs = if matches!(row.phase, Phase::Done | Phase::Relaunched { .. }) {
+        &row.to
+    } else {
+        &row.from
+    };
+    match (Version::parse(runs), Version::parse(managed)) {
+        (Some(runs), Some(managed)) => runs < managed,
+        _ => !same_build(runs, managed),
     }
 }
 
@@ -3366,18 +3401,18 @@ mod tests {
         );
     }
 
-    /// ONLY A SESSION THAT WILL MOVE ON ITS OWN, ONTO THE VERSION THE RECORD
-    /// NAMES, IS SAID TO MOVE AT ITS NEXT TURN END (review of 2026-09-25: an
-    /// overdue session was counted so while the band showed it stalled, and
-    /// the count took rows moving to any version). An overdue, gave-up or
-    /// skipped session is counted as staying behind — the title still says
-    /// "installed" — and a row moving to ANOTHER version is not this record's
-    /// at all; one moving onto the NATIVE copy of the named version lags it
-    /// just the same and is counted (the measured 2.1.281 session was native).
+    /// ONLY A SESSION THAT WILL MOVE ON ITS OWN IS SAID TO MOVE (review of
+    /// 2026-09-25: an overdue session was counted so while the band showed it
+    /// stalled). An overdue, gave-up or skipped session is counted as staying
+    /// behind — the title still says "installed". Every session RUNNING a
+    /// build older than the record's is counted, whatever its row targets: one
+    /// moving to another version lags it just the same, and so does one moving
+    /// onto the NATIVE copy (the measured 2.1.281 session was native). One
+    /// already on the record's build is not behind, wherever it moves next.
     /// NEGATIVE CONTROL: a healthy pending row onto the named version is
     /// counted as moving.
     #[test]
-    fn only_a_session_moving_on_its_own_onto_the_named_build_is_said_to_move() {
+    fn only_a_session_running_an_older_build_that_moves_on_its_own_is_said_to_move() {
         let mut app = App::headless_for_test();
         let text = "claude 2.1.282 (Anthropic latest)";
         app.upgrade_view.note_managed_text(text);
@@ -3388,6 +3423,11 @@ mod tests {
         let other_build = Row {
             to: "2.1.283".to_string(),
             ..row("s-other", 60)
+        };
+        let on_it = Row {
+            from: "2.1.282".to_string(),
+            to: "2.1.283".to_string(),
+            ..row("s-on-it", 60)
         };
         let gave_up = Row {
             phase: Phase::Failed("unanswered".to_string()),
@@ -3404,15 +3444,17 @@ mod tests {
             skipped,
             native,
             other_build,
+            on_it,
         ]);
         assert_eq!(
             app.tabs_behind(),
             TabsBehind {
-                agents_behind: 2,
+                agents_behind: 3,
                 agents_held: 3,
                 ..TabsBehind::default()
             },
-            "healthy + native move; overdue, gave-up, skipped stay; 2.1.283 is not this record's"
+            "healthy, native and 2.1.283-bound move; overdue, gave-up, skipped stay; one \
+             already on 2.1.282 is not behind"
         );
         assert!(!app.post_managed_current(text), "re-derived by the rows");
         let (title, detail) = app
@@ -3424,7 +3466,7 @@ mod tests {
             .expect("the record");
         assert_eq!(title, "Claude Code 2.1.282 installed");
         assert!(
-            detail.contains("2 running Claude Code sessions move onto it on their own"),
+            detail.contains("3 running Claude Code sessions move onto it on their own"),
             "{detail}"
         );
         assert!(
@@ -3435,6 +3477,199 @@ mod tests {
         let mut fresh = App::headless_for_test();
         fresh.apply_agent_upgrades(vec![row("s-healthy", 60)]);
         assert_eq!(fresh.tabs_behind(), TabsBehind::default());
+    }
+
+    /// "ARE CURRENT" IS NEVER SAID WHILE A SESSION RUNS AN OLDER BUILD (audit
+    /// 2026-10-09: nine `… are current · ready in every aterm tab` records in
+    /// a week while two tabs ran days-old builds). At the install the marker
+    /// lands while the rows still target the PREVIOUS build — their retarget
+    /// comes two seconds later — so a count of rows onto the new build alone
+    /// was zero and the record said "current". The sessions are counted by the
+    /// build they run, a finished move onto an older build among them, and a
+    /// relaunch onto an older build.
+    /// NEGATIVE CONTROL: sessions that run the installed build leave the
+    /// record "current" — one moving past it, one whose move onto it is done,
+    /// and one RELAUNCHED onto it, fresh or stuck past `STALE_S` waiting for
+    /// the idle point that carries its conversation on (review of
+    /// 2026-10-09: the relaunch line typed the managed copy, so such a
+    /// session runs it; read by the build it moves from, a stuck one was
+    /// recorded "still on the old build" while the band's own stuck row said
+    /// the new one had started).
+    #[test]
+    fn the_install_is_not_current_while_a_session_runs_an_older_build() {
+        let title = |rows: Vec<Row>| {
+            let mut app = App::headless_for_test();
+            app.apply_agent_upgrades(rows);
+            assert!(app.post_managed_current("claude 2.1.287 (Anthropic latest)"));
+            app.messages
+                .log()
+                .records()
+                .rfind(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| r.title.clone())
+                .expect("the record")
+        };
+        let to_previous = Row {
+            from: "2.1.285".to_string(),
+            to: "2.1.286".to_string(),
+            ..row("s-a", 60)
+        };
+        let done_onto_previous = Row {
+            phase: Phase::Done,
+            done_at: now_s() - 5,
+            from: "2.1.285".to_string(),
+            to: "2.1.286".to_string(),
+            ..row("s-b", 600)
+        };
+        assert_eq!(
+            title(vec![to_previous]),
+            "Claude Code 2.1.287 installed",
+            "a row onto the previous build still runs an older one"
+        );
+        assert_eq!(
+            title(vec![done_onto_previous]),
+            "Claude Code 2.1.287 installed",
+            "a finished move onto the previous build runs it"
+        );
+        let relaunched = |tab: &str, to: &str, ago: u64| Row {
+            phase: Phase::Relaunched {
+                at_s: now_s() - ago,
+            },
+            from: "2.1.285".to_string(),
+            to: to.to_string(),
+            ..row(tab, ago + 600)
+        };
+        assert_eq!(
+            title(vec![relaunched("s-e", "2.1.286", 30)]),
+            "Claude Code 2.1.287 installed",
+            "relaunched onto the previous build, it runs that one"
+        );
+        let stuck_onto_it = relaunched("s-f", "2.1.287", 7 * 86_400);
+        assert_eq!(
+            stuck_onto_it.stall(now_s()).as_deref(),
+            Some("stuck:relaunched"),
+            "the reviewer's row: stuck past STALE_S"
+        );
+        assert_eq!(
+            title(vec![relaunched("s-g", "2.1.287", 30), stuck_onto_it]),
+            "Claude Code 2.1.287 is current",
+            "relaunched onto the installed build, fresh or stuck, it runs it"
+        );
+        let past_it = Row {
+            from: "2.1.287".to_string(),
+            to: "2.1.288".to_string(),
+            ..row("s-c", 60)
+        };
+        let done_onto_it = Row {
+            phase: Phase::Done,
+            done_at: now_s() - 5,
+            from: "2.1.286".to_string(),
+            to: "2.1.287".to_string(),
+            ..row("s-d", 600)
+        };
+        assert_eq!(
+            title(vec![past_it, done_onto_it]),
+            "Claude Code 2.1.287 is current"
+        );
+    }
+
+    /// ONE INSTALL IS ONE RECORD (audit 2026-10-09: 28 `toolchain.managed`
+    /// records for 11 updates, one install recorded at 12:48:46, :49 and :51
+    /// as its rows retargeted and moved): the record is written when the SET
+    /// OF VERSIONS changes, and the tab counts that move after it re-word that
+    /// record in place — its words follow the sessions, the log keeps one
+    /// entry. A new version is a new record. NEGATIVE CONTROL: the record's
+    /// words did move, from "installed" to "current".
+    #[test]
+    fn one_install_is_one_record_whose_counts_move_in_place() {
+        let mut app = App::headless_for_test();
+        let managed = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| r.title.clone())
+                .collect::<Vec<_>>()
+        };
+        let moving = |to: &str| Row {
+            from: "2.1.286".to_string(),
+            to: to.to_string(),
+            ..row("s-a", 60)
+        };
+        app.apply_agent_upgrades(vec![moving("2.1.286")]);
+        let text = "claude 2.1.287 (Anthropic latest)";
+        assert!(app.post_managed_current(text));
+        // The retarget, two seconds later: the same counts, nothing said.
+        app.apply_agent_upgrades(vec![moving("2.1.287")]);
+        assert!(!app.post_managed_current(text), "the same words");
+        // The move lands: the counts move, and the one record says so.
+        app.apply_agent_upgrades(vec![Row {
+            phase: Phase::Done,
+            done_at: now_s() - 5,
+            ..moving("2.1.287")
+        }]);
+        assert_eq!(
+            managed(&app),
+            vec!["Claude Code 2.1.287 is current".to_string()],
+            "one record, re-worded in place"
+        );
+        assert!(app.post_managed_current("claude 2.1.288 (Anthropic latest)"));
+        assert_eq!(managed(&app).len(), 2, "a new version is a new record");
+    }
+
+    /// A RECORD GONE FROM THE RING IS WRITTEN AGAIN when its words move
+    /// (review of 2026-10-09): the in-place re-word needs the record still
+    /// there, and once the shared ring (`LOG_CAP`) has evicted it the new
+    /// counts are a new record — never silence until the versions move.
+    /// NEGATIVE CONTROL: that new record is the one re-worded after it, and
+    /// the same words again write nothing.
+    #[test]
+    fn a_managed_record_gone_from_the_ring_is_written_again() {
+        let mut app = App::headless_for_test();
+        let managed = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.key.as_deref() == Some(crate::toolchain_words::KEY_MANAGED))
+                .map(|r| r.title.clone())
+                .collect::<Vec<_>>()
+        };
+        let moving = Row {
+            from: "2.1.286".to_string(),
+            to: "2.1.287".to_string(),
+            ..row("s-a", 60)
+        };
+        app.apply_agent_upgrades(vec![moving.clone()]);
+        let text = "claude 2.1.287 (Anthropic latest)";
+        assert!(app.post_managed_current(text));
+        for n in 0..aterm_messages::LOG_CAP {
+            app.record_message(
+                aterm_messages::Message::new(
+                    aterm_messages::tags::CONFIG,
+                    aterm_messages::Severity::Info,
+                    format!("other news {n}"),
+                )
+                .record(),
+            );
+        }
+        assert_eq!(managed(&app), Vec::<String>::new(), "evicted by the ring");
+        // The move lands: the words move, with no record left to re-word.
+        app.apply_agent_upgrades(vec![Row {
+            phase: Phase::Done,
+            done_at: now_s() - 5,
+            ..moving.clone()
+        }]);
+        assert_eq!(
+            managed(&app),
+            vec!["Claude Code 2.1.287 is current".to_string()],
+            "a new record"
+        );
+        assert!(!app.post_managed_current(text), "the same words: nothing");
+        app.apply_agent_upgrades(vec![moving]);
+        assert_eq!(
+            managed(&app),
+            vec!["Claude Code 2.1.287 installed".to_string()],
+            "the new record is the one re-worded"
+        );
     }
 
     /// A TAB MEASURED TO PUT A FOREIGN COPY FIRST, two jobs in a row, with no
@@ -3492,6 +3727,91 @@ mod tests {
             )]
         );
         assert_eq!(app.messages.live_rows().count(), 0, "a record, never a row");
+    }
+
+    /// A MOVE THAT FINISHED DAYS AFTER IT HAPPENED SAYS WHEN IT HAPPENED (audit
+    /// 2026-10-09: `Claude Code moved onto 2.1.287` was recorded seven days
+    /// after the move, at the session's next idle turn end, dated as if it
+    /// had just happened). The relaunch's instant rides the row
+    /// (`Row::moved_at`) to the finished move's record, which names it on the
+    /// reader's clock against the day the record is written. NEGATIVE CONTROL:
+    /// a move finished minutes after its relaunch says nothing more — its
+    /// record's own instant is the move's.
+    #[test]
+    fn a_move_finished_days_later_names_when_it_happened() {
+        use crate::message_reporters::moved_line;
+        // Tuesday 2026-09-22 14:04 UTC, read on a UTC clock.
+        let at = 1_758_549_840_u64 + 365 * 86_400;
+        assert_eq!(
+            moved_line(at, at + 3 * 3_600, Some(0)).as_deref(),
+            Some("moved at 2:04 PM")
+        );
+        assert_eq!(
+            moved_line(at, at + 86_400, Some(0)).as_deref(),
+            Some("moved yesterday 2:04 PM")
+        );
+        let week = moved_line(at, at + 7 * 86_400, Some(0)).expect("a week later");
+        assert!(
+            week.starts_with("moved ") && week.ends_with("2:04 PM"),
+            "{week}"
+        );
+        assert!(!week.starts_with("moved at"), "with its day: {week}");
+        assert_eq!(
+            moved_line(at, at + 5 * 60, Some(0)),
+            None,
+            "minutes: the record's own"
+        );
+        assert_eq!(
+            moved_line(0, at, Some(0)),
+            None,
+            "an older record: no instant"
+        );
+        assert_eq!(
+            moved_line(at, at + 7 * 86_400, None),
+            None,
+            "no clock, no time"
+        );
+        // Through the window's door: the finished move's record carries it.
+        let mut app = App::headless_for_test();
+        let now = now_s();
+        let done = Row {
+            phase: Phase::Done,
+            done_at: now - 5,
+            moved_at: now - 7 * 86_400,
+            outcome: "claude restarted on 2.1.287 \u{b7} model claude-opus-5-5".to_string(),
+            to: "2.1.287".to_string(),
+            ..row("s-a", 8 * 86_400)
+        };
+        app.apply_agent_upgrades(vec![done]);
+        let records = records_titled(&app, "moved onto");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let detail = &records[0].1;
+        match crate::presence::local_offset_s() {
+            Some(_) => assert!(detail[1].starts_with("moved "), "{detail:?}"),
+            None => assert_eq!(detail.len(), 2, "{detail:?}"),
+        }
+        assert_eq!(
+            detail.last().map(String::as_str),
+            Some("model claude-opus-5-5")
+        );
+        // NEGATIVE CONTROL: moved two minutes before it finished.
+        let mut app = App::headless_for_test();
+        let prompt = Row {
+            phase: Phase::Done,
+            done_at: now - 5,
+            moved_at: now - 125,
+            outcome: "claude restarted on 2.1.287 \u{b7} model claude-opus-5-5".to_string(),
+            to: "2.1.287".to_string(),
+            ..row("s-a", 600)
+        };
+        app.apply_agent_upgrades(vec![prompt]);
+        assert_eq!(
+            records_titled(&app, "moved onto")[0].1,
+            vec![
+                "in its tab".to_string(),
+                "model claude-opus-5-5".to_string()
+            ]
+        );
     }
 
     // ------------------------------------------------ the owner's word (gap #21)

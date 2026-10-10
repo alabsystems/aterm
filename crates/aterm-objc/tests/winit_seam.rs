@@ -164,8 +164,8 @@ const ROWS: &[Row] = &[
     Row { site: "app_state.rs:148",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
     Row { site: "app_state.rs:153",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
     // ---- WinitWindow : NSWindow
-    Row { site: "window.rs:214",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
-    Row { site: "window.rs:220",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:221",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:227",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
     // ---- WinitApplication : NSApplication
     // ---- WindowDelegate : NSObject <NSWindowDelegate, NSDraggingDestination>
     Row { site: "window_delegate.rs:231", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },

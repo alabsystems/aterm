@@ -236,7 +236,7 @@ impl Iterator for SearchMatchIterator<'_> {
                 let col_map = match self.index.column_maps.get(&line_num) {
                     Some(map) => map,
                     None => {
-                        fallback = ColumnMap::new(text);
+                        fallback = ColumnMap::new(text, self.index.ambiguous_width);
                         &fallback
                     }
                 };
@@ -314,7 +314,7 @@ impl Iterator for SearchMatchReverseIterator<'_> {
                     let col_map = match self.index.column_maps.get(&line_num) {
                         Some(map) => map,
                         None => {
-                            fallback = ColumnMap::new(text);
+                            fallback = ColumnMap::new(text, self.index.ambiguous_width);
                             &fallback
                         }
                     };

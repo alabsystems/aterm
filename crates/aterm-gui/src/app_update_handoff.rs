@@ -6253,7 +6253,7 @@ impl App {
         let fds = crate::session_store::HandoffFds {
             entries: adoption.clone(),
         };
-        let window = self.handoff_window_carry(target_build);
+        let window = self.park_window_carry(target_build);
         // The fork lane's proof term is the descriptor number: `execve` copies
         // the table verbatim, so the number itself is what both sides compute.
         let proof_identities = adoption.clone();
@@ -6621,6 +6621,22 @@ impl App {
                 messages_captured_unix_ms: carried.captured_unix_ms,
             }
         })
+    }
+
+    /// [`Self::handoff_window_carry`] at a park, noting which messages crossed:
+    /// at that attempt's Commit every live row the carry did not take ends with
+    /// this process ([`Self::close_uncarried_messages`], ruling 441 (d)).
+    #[cfg(unix)]
+    fn park_window_carry(
+        &mut self,
+        target_build: u64,
+    ) -> Option<crate::session_store::WindowCarry> {
+        let window = self.handoff_window_carry(target_build);
+        self.handoff_carried_messages = window
+            .as_ref()
+            .map(|window| window.messages.iter().map(|message| message.id).collect())
+            .unwrap_or_default();
+        window
     }
 
     /// The advisory warm hint a launched successor starts with
@@ -8209,7 +8225,7 @@ impl App {
         let fds = crate::session_store::HandoffFds {
             entries: adoption.clone(),
         };
-        let window = self.handoff_window_carry(target_build);
+        let window = self.park_window_carry(target_build);
         // The proof term is the PTY device on this lane (`SCM_RIGHTS` installs the
         // receiver's own numbers); a launched attempt that must fork keeps that
         // term, and the worker names it in the successor's environment.
@@ -8590,9 +8606,27 @@ impl App {
         {
             return false;
         }
+        // With no writer behind it the flush waits on nothing: its hold is
+        // none, whatever the scheduler did meanwhile (a descheduled main
+        // thread here is no different from one anywhere else in the loop).
+        let writer = self.messages_log.is_some();
         let started = std::time::Instant::now();
         let landed = self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
-        let refence = started.elapsed() >= HANDOFF_INPUT_DRAIN_YIELD;
+        let held = if writer {
+            started.elapsed()
+        } else {
+            std::time::Duration::ZERO
+        };
+        self.settle_commit_flush(landed, held)
+    }
+
+    /// What the Commit's flush leaves on the attempt, given whether the writer
+    /// answered (`landed`) and how long waiting on it `held` the main thread:
+    /// the writer's answer is kept, and a hold of a fence grain or more
+    /// ([`HANDOFF_INPUT_DRAIN_YIELD`]) restarts the fence's clock.
+    #[cfg(unix)]
+    fn settle_commit_flush(&mut self, landed: bool, held: std::time::Duration) -> bool {
+        let refence = held >= HANDOFF_INPUT_DRAIN_YIELD;
         if let Some(pending) = self.pending_update_handoff.as_mut() {
             pending.commit_flush = Some(landed);
             if refence {
@@ -9172,13 +9206,25 @@ impl App {
             && admitted
             && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof)
         {
+            // THE ROWS THE CARRY DID NOT TAKE END WITH THIS PROCESS (ruling
+            // 441 (d)): an unrevealed row, the strain level, a row posted or
+            // revealed since the park (a held claim's fence among it), recorded
+            // as ended here and flushed below, never replayed open in the
+            // successor as cut off by a crash. Here, after the admission's LAST
+            // reading, never at the claim: a held claim reads it again after its
+            // fence, and a refusal there keeps this process running with its
+            // rows, which their reporters still restate and end by id. Only the
+            // operator's permit and the write itself can still return (an
+            // EPIPE); the rejection's caller syncs the band after either.
+            let closed = self.close_uncarried_messages();
             // A HELD CLAIM'S RECORD LANDS TOO (round-seven update audit, finding
-            // 53): what the fence's turns of the loop recorded is flushed, waited
-            // for one grain of the fence at most (`HANDOFF_INPUT_DRAIN_YIELD`),
-            // which an idle writer answers well within: a longer wait would be
-            // one more interval for keys to queue in and die (#18). A writer
-            // that did not answer before is not waited for again.
-            if claimed
+            // 53), and so do the endings just closed: what the fence's turns of
+            // the loop recorded is flushed, waited for one grain of the fence at
+            // most (`HANDOFF_INPUT_DRAIN_YIELD`), which an idle writer answers
+            // well within: a longer wait would be one more interval for keys to
+            // queue in and die (#18). A writer that did not answer before is
+            // not waited for again.
+            if (claimed || closed > 0)
                 && !matches!(
                     self.pending_update_handoff
                         .as_ref()
@@ -9465,6 +9511,10 @@ impl App {
                 video.unwritten
             );
         }
+        // The rows the park's carry did not take are NOT closed here (ruling
+        // 441 (d)): these answers can hold the claim through one more fence,
+        // and the admission read after it may still refuse, with this process
+        // running on. They close at the write, after its last reading.
         // THE PARENT'S RECORD LANDS BEFORE ITS `_exit` (round-seven
         // update audit, finding 53): the writer thread's queue dies
         // with the process, and the successor reads the file again
@@ -11694,7 +11744,7 @@ impl App {
             ),
             &live,
         );
-        let window = self.handoff_window_carry(target_build);
+        let window = self.park_window_carry(target_build);
         let budget = std::time::Duration::from_secs(30);
         let ParkedScreens {
             screens,
@@ -13204,6 +13254,11 @@ mod ownership_conformance;
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_font_zoom_carry_tests.rs"]
 mod font_zoom_carry_tests;
+
+/// The rows the park's carry did not take end with the parent at Commit.
+#[cfg(all(test, unix))]
+#[path = "app_update_handoff_uncarried_messages_tests.rs"]
+mod uncarried_messages_tests;
 
 /// The presence row crosses the handoff inside its window.
 #[cfg(all(test, unix))]

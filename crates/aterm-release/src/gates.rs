@@ -9,8 +9,7 @@
 //! floor on), the handoff policy the bundle seals, `gh auth
 //! status`, Trust rustc
 //! probe (always on — the repo compiles with Trust, there is no opt-out
-//! lane), x86_64 rustup target probe with printed remediation (`--arm64-only`
-//! opt-out), disk space, and last the cross-version handoff guard run in the
+//! lane), disk space, and last the cross-version handoff guard run in the
 //! cut tree (the one gate that takes minutes). All fail closed BEFORE anything
 //! is committed or pushed — a failed gate costs seconds (or those minutes),
 //! not a burned ledger number.
@@ -29,11 +28,11 @@ use crate::changelog;
 use crate::channel;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 
-/// Free-disk floor for a cut. A universal release build carries two full
-/// `--release` target trees (Trust arm64 + rustup x86_64, both with
-/// `CARGO_PROFILE_RELEASE_DEBUG=1` for the dSYM) plus the .app/DMG staging in
-/// `dist/` — 10 GiB is a conservative floor that fails BEFORE a 4-minute
-/// build dies at 99% on ENOSPC.
+/// Free-disk floor for the release's build and its cut. The build carries two full
+/// `--release` target trees in the release cache (Trust arm64 + rustup x86_64, both
+/// with `CARGO_PROFILE_RELEASE_DEBUG=1` for the dSYM) and keeps its bundle there; the
+/// cut stages a copy of it, the DMG and the zip in `dist/` — 10 GiB is a conservative
+/// floor that fails BEFORE a build dies at 99% on ENOSPC.
 pub const MIN_FREE_DISK_GIB: u64 = 10;
 
 /// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …), in the
@@ -63,12 +62,41 @@ pub fn trust_stage2_bin() -> Result<PathBuf> {
     // identity to protect in that case, and a sticky "no toolchain" would
     // outlive an install the operator performs on the advice of this very
     // error.
-    static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let pinned = pin_first_success(&PINNED, resolve_trust_stage2_bin)?;
     if LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
         hold_toolchain_lease(&pinned);
     }
     Ok(pinned)
+}
+
+/// The one toolchain this process pinned ([`trust_stage2_bin`]).
+static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Pin `dir` as this process's Trust toolchain before anything resolves one: `ship
+/// release` holds ONE prover for its whole life — the one its journal names on a
+/// resume, which the store's current build may no longer be — so every in-process
+/// judge that asks [`trust_stage2_bin`] (the provisioning audit's toolchain,
+/// verifier and front-door lines among them) judges that prover, never the store's
+/// newer build.
+///
+/// # Errors
+/// This process already pinned another toolchain.
+pub fn pin_trust_stage2_bin(dir: &Path) -> Result<()> {
+    pin_into(&PINNED, dir)
+}
+
+/// [`pin_trust_stage2_bin`] over `cell` (a test's own cell, the process's in production).
+fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
+    let pinned = cell.get_or_init(|| dir.to_path_buf());
+    if pinned == dir {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "this process already pinned the toolchain {}, not {}",
+            pinned.display(),
+            dir.display()
+        )))
+    }
 }
 
 /// Whether this process is a CUT ([`arm_toolchain_lease`]): only a cut leases the
@@ -80,6 +108,12 @@ static LEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// answers with. Called once, at the top of a cut (`publish::run_cut`).
 pub fn arm_toolchain_lease() {
     LEASE_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`hold_toolchain_lease`] on `dir`, for `ship release`: its one prover, held from the
+/// first step to the last (the cut it runs takes its own).
+pub fn lease_toolchain(dir: &Path) {
+    hold_toolchain_lease(dir);
 }
 
 /// THE CUT'S LEASE on the toolchain it pinned ([`atpkg::lease`]), taken once, at the
@@ -134,8 +168,8 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
 ///
 /// Split out so the pinning is a test rather than a promise: a second call with
 /// a DIFFERENT resolver must still answer the first one's path, which is the
-/// whole property — a mid-run seal cannot change what a running cut compiles
-/// with.
+/// whole property — a mid-run seal cannot change what a running release compiles
+/// or judges with.
 fn pin_first_success(
     cell: &std::sync::OnceLock<PathBuf>,
     resolve: impl FnOnce() -> Result<PathBuf>,
@@ -174,12 +208,33 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
     }))
 }
 
-/// The two ways past a missing x86_64 slice, for a caller to append VERBATIM.
+/// The way past a missing x86_64 slice, for a caller to append VERBATIM.
 ///
 /// One remedy text, laid out by whichever grid prints it, so the probe's own error never
 /// repeats it under a second `fix:` marker.
-pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-darwin\n\
-     or:   cut with --arm64-only — an explicit, thinner artifact";
+pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-darwin";
+
+/// How to build Trust from source, for every remedy here that offers it: from the
+/// pinned Trust seed, then SEALED. A macro so [`TRUST_TOOLCHAIN_REMEDIES`] can
+/// `concat!` it; everything else names [`TRUST_FROM_SOURCE`].
+///
+/// Never a bare `python3 x.py build --stage 2`: that runs whatever stage0 the
+/// checkout's gitignored `bootstrap.toml` names, and until 2026-09-29 `$HOME/trust`'s named
+/// a "genesis" stage0 of shell scripts running stock rustup Rust under Trust names. The
+/// recreator's `--require-seed --fresh-seed` takes the checksum-pinned Trust seed that
+/// trust's `src/stage0` names and refuses rather than wrap a stock compiler (owner,
+/// 2026-09-29: no stock Rust in the toolchain for Trust); `--no-register` leaves rustup
+/// alone until `promote-toolchain.sh` points it at the seal.
+macro_rules! trust_from_source {
+    () => {
+        "in $HOME/trust, python3 scripts/recreate_bootstrap.py --stage 2 --require-seed \
+         --fresh-seed --no-register (stage0 = the pinned Trust seed; it refuses rather than \
+         wrap a stock rustc), then seal it with scripts/promote-toolchain.sh"
+    };
+}
+
+/// The from-source build, for a remedy to name after "from source" (`trust_from_source!`).
+pub const TRUST_FROM_SOURCE: &str = trust_from_source!();
 
 /// The three ways to get a Trust toolchain, for a caller to append VERBATIM.
 ///
@@ -187,9 +242,13 @@ pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-dar
 /// spelling. The package manager leads: it is the ordinary source of the pinned
 /// toolchain, and `aterm pkg doctor` names the store it filled. Building from source is
 /// the developer alternative.
-pub const TRUST_TOOLCHAIN_REMEDIES: &str = "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
-     or, from source: python3 x.py build --stage 2 in $HOME/trust, then seal it with $HOME/trust/scripts/promote-toolchain.sh\n\
-     or point TRUST_STAGE2_BIN at an existing stage2 bin dir";
+pub const TRUST_TOOLCHAIN_REMEDIES: &str = concat!(
+    "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
+     or, from source: ",
+    trust_from_source!(),
+    "\n\
+     or point TRUST_STAGE2_BIN at an existing stage2 bin dir"
+);
 
 /// The ordered places a Trust toolchain may live, and whether the first is an explicit
 /// override (then it is the ONLY one).
@@ -317,8 +376,6 @@ pub fn resolve_targo() -> Result<PathBuf> {
 pub struct GateOpts {
     /// Release version being cut, e.g. "0.2.0" — drives the tag gates.
     pub version: String,
-    /// `--arm64-only`: single-arch build; skips the x86_64 target probe.
-    pub arm64_only: bool,
     /// The notes are already rolled: the checkout's changelog carries the
     /// version's `## [version]` section, so the changelog gate judges THAT section
     /// — the `[Unreleased]` scaffold above it is legitimately empty. False on every
@@ -337,61 +394,10 @@ pub struct GateOpts {
     /// A rehearsal mutates its scratch repository, so it must use the tree's
     /// own binary just like a production cut.
     pub allow_stale_cutter: bool,
-    /// Will the self-check's paint smoke run? `--no-paint-smoke` means it will
-    /// not, and then the scheduler tier this cut was spawned at cannot starve it
-    /// ([`launchd_qos_gate`]).
-    pub paint_smoke: bool,
     /// A real cut's published commit, already placed in the cut tree
     /// ([`place_published`]); `None` for a dry run or rehearsal, which build the
     /// checkout as it stands.
     pub published: Option<PublishedCheckout>,
-    /// How a refusal here names running THIS run again ([`Rerun`]).
-    pub rerun: Rerun,
-}
-
-/// How a refusal before the build names running THIS run again: the launcher command
-/// that repeats it, and whether this process already is that launcher's job.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rerun {
-    /// [`crate::publish::CUT_COMMAND`] with this run's own flags: a dry run's remedy
-    /// must not start a real cut, and a resume's must not start a fresh one (the
-    /// journal refuses it).
-    pub command: String,
-    /// `ATERM_CUT_LAUNCH` is set — the launcher's plist sets it — so this cut already
-    /// runs as the launcher's job, and the launcher alone changes nothing.
-    pub under_launcher: bool,
-}
-
-impl Rerun {
-    /// A fresh run of `kind`; `rehearse` is a `--rehearse` run's scratch channel.
-    #[must_use]
-    pub fn of(kind: crate::publish::CutKind, rehearse: Option<&str>) -> Self {
-        use crate::publish::{CUT_COMMAND, CutKind};
-        let flags = match kind {
-            CutKind::Real => String::new(),
-            CutKind::DryRun => " --dry-run".to_string(),
-            CutKind::Rehearse => format!(" --rehearse {}", rehearse.unwrap_or("<owner/repo>")),
-        };
-        Self {
-            command: format!("{CUT_COMMAND}{flags} --release-credentials <path>"),
-            under_launcher: under_cut_launcher(),
-        }
-    }
-
-    /// A `--resume` of the journaled cut.
-    #[must_use]
-    pub fn resume() -> Self {
-        Self {
-            command: format!("{} --resume", crate::publish::CUT_COMMAND),
-            under_launcher: under_cut_launcher(),
-        }
-    }
-}
-
-/// Is this process the cut `tools/cut-launch.sh` bootstrapped? Its plist sets
-/// `ATERM_CUT_LAUNCH=1` in the job's environment.
-fn under_cut_launcher() -> bool {
-    env::var_os("ATERM_CUT_LAUNCH").is_some_and(|value| !value.is_empty())
 }
 
 /// What the gates learned — everything the cut transcript's `gates` lines
@@ -407,8 +413,6 @@ pub struct GateReport {
     /// The probed trustc path (the Trust stage2 compiler the native build lane
     /// resolves via targo). Always probed — there is no opt-out lane.
     pub trustc: PathBuf,
-    /// false under `--arm64-only`.
-    pub universal: bool,
     /// Free disk in GiB at gate time.
     pub free_disk_gib: u64,
     /// `Some(version)` when the public update channel's source tree was read and
@@ -418,7 +422,7 @@ pub struct GateReport {
     /// How many running processes the staging-liveness gate read — the evidence
     /// behind "nothing runs out of a cut staging bundle".
     pub processes_checked: usize,
-    /// The published commit this cut builds — `None` for a dry run or rehearsal.
+    /// The published commit this cut releases — `None` for a dry run or rehearsal.
     pub published: Option<PublishedCheckout>,
     /// How far HEAD is past the newest gate receipt. Stated, never required.
     pub receipts: ReceiptReport,
@@ -436,11 +440,9 @@ pub struct GateReport {
 }
 
 /// Run every gate, in the transcript's order, first failure wins. Cheap and
-/// side-effect-free by construction (the one network touch is a fetch) with one
-/// exception, a repair: [`provenance_gate`] clears `com.apple.provenance` from the
-/// toolchain before it judges it.
+/// side-effect-free by construction (the one network touch is a fetch).
 ///
-/// `git` and `tree` are the tree the cut builds — the cut tree for a real cut, the
+/// `git` and `tree` are the tree the cut releases — the cut tree for a real cut, the
 /// checkout as it stands for a dry run or rehearsal; `state` is the operator's
 /// checkout, whose `dist/` and gate receipts the cut reads and writes.
 pub fn run_all(
@@ -454,7 +456,7 @@ pub fn run_all(
     // `git pull` "uncommitted changes": the right fix names the submodule.
     submodules_at_gitlinks(git)?;
     clean_tree(git)?;
-    // A real cut builds the published commit: `place_published` put the cut tree
+    // A real cut releases the published commit: `place_published` put the cut tree
     // there BEFORE this whole function, ahead of every file read. What is left
     // here is the ASSERTION that it worked. A dry run and a rehearsal build the
     // checkout as it stands.
@@ -470,7 +472,7 @@ pub fn run_all(
         )));
     }
     // The tree is proven; now prove the binary proving it.
-    cutter_identity_gate(git, &head, opts.allow_stale_cutter)?;
+    own_cutter_gate(git, &head, opts.allow_stale_cutter)?;
     tag_free(git, &opts.version)?;
     let cl = changelog_gate(
         tree,
@@ -495,18 +497,10 @@ pub fn run_all(
     let gh_account = gh_auth()?;
     locked_metadata_gate(tree)?;
     let trustc = trustc_probe(tree)?;
-    // The compiler runs; now prove it will not tag everything it writes.
-    provenance_gate(&trustc, &opts.rerun)?;
-    // ...and that the scheduler will not starve the one proof that runs after the
-    // claim.
-    launchd_qos_gate(opts.paint_smoke, &opts.rerun)?;
-    let universal = universal_gate(opts.arm64_only, x86_target_probe, || {
-        rosetta_runs(&mut |command| command.output())
-    })?;
     let free_disk_gib = disk_gate(tree)?;
     let processes_checked =
         staged_bundle_liveness_gate(&state.join("dist"), &crate::bundle::running_processes)?;
-    // How far the commit this cut builds is past the newest gate receipt — stated,
+    // How far the commit this cut releases is past the newest gate receipt — stated,
     // never required. Local git, so before the channel's network read. The store is
     // the git common dir's, which the cut tree shares with every other worktree,
     // and a tree receipt also counts from a checkout `aterm-release.receiptsFrom`
@@ -525,7 +519,6 @@ pub fn run_all(
         changelog_entries: cl.entries,
         gh_account,
         trustc,
-        universal,
         free_disk_gib,
         channel_version,
         handoff_fixtures,
@@ -846,8 +839,8 @@ fn shipped_commit(git: &dyn GitRunner, release: &str) -> Result<String> {
 /// pids and the path; and when the process list cannot be read at all. Returns how
 /// many processes it read.
 ///
-/// WHY. The cut deletes and rebuilds staging bundles: `bundle::assemble` removes its
-/// own directory on a rebuilding resume and prunes older ones. A bundle deleted under
+/// WHY. The cut deletes and replaces staging bundles: `bundle::prepare_staging`
+/// removes its own directory on a resume that signs again and prunes older ones. A bundle deleted under
 /// a live process re-attributes that process to a path that no longer resolves, and
 /// macOS answers a code identity it cannot build by REPLACING the stored requirement
 /// — resetting the TCC grants of every copy of aterm on the Mac.
@@ -855,8 +848,8 @@ fn shipped_commit(git: &dyn GitRunner, release: &str) -> Result<String> {
 /// `lister` is injected so the three answers are tests: `Some([])` passes, a live
 /// process refuses, and `None` — "could not look" — refuses too, because it is the
 /// one answer that can never license a delete, and pre-claim is where refusing is
-/// free. `bundle::assemble` and `bundle::prune_staging_dirs` ask again at the moment
-/// of deleting; this is the early refusal, not the only guard.
+/// free. `bundle::prepare_staging` and `bundle::prune_staging_dirs` ask again at the
+/// moment of deleting; this is the early refusal, not the only guard.
 pub fn staged_bundle_liveness_gate(
     dist: &Path,
     lister: &dyn Fn() -> Option<Vec<crate::bundle::RunningProcess>>,
@@ -895,18 +888,20 @@ pub fn staged_bundle_liveness_gate(
 // ---------------------------------------------------------------------------
 
 /// Where the publication engine keeps its ledger: `$PUBLICATION_ENGINE/mappings.json`,
-/// default `~/publication/mappings.json` — the same location knob (a LOCATION, not a
-/// skip switch) `tools/release-preflight.sh` reads. `pub publish` writes a row there
+/// default `~/Developer/publication/mappings.json` (the engine checkout under the
+/// developer root, `atpkg::devroot`) — the same location knob (a LOCATION, not a
+/// skip switch) `ship release` reads. `pub publish` writes a row there
 /// for every source publication: the dev commit it exported, keyed by its full sha.
-/// A real cut builds the newest aterm row's commit ([`published_source`]).
-/// `tools/cut-launch.sh` forwards `PUBLICATION_ENGINE` across its launchd hop, so the
-/// knob means the same thing under the documented launcher as in a shell.
+/// A real cut releases the newest aterm row's commit ([`published_source`]).
 #[must_use]
 pub fn publication_mappings_path() -> PathBuf {
     env::var_os("PUBLICATION_ENGINE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join("publication")))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(|home| atpkg::devroot::publication_engine(std::path::Path::new(&home)))
+        })
         .unwrap_or_else(|| PathBuf::from("publication"))
         .join("mappings.json")
 }
@@ -946,26 +941,27 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
         .ok_or_else(|| Error::new("the publication ledger has no aterm row with a commit key"))
 }
 
-/// The commit a real cut builds: the newest aterm row of the engine's ledger
+/// The commit a real cut releases: the newest aterm row of the engine's ledger
 /// ([`publication_mappings_path`], [`newest_published_source`]).
 ///
 /// # Errors
-/// An unreadable or rowless ledger is a refusal: a real cut builds the commit
+/// An unreadable or rowless ledger is a refusal: a real cut releases the commit
 /// `pub publish` recorded, and that ledger is the only record of it.
 pub fn published_source() -> Result<PublishedSource> {
     let ledger = publication_mappings_path();
     let text = fs::read_to_string(&ledger).map_err(|e| {
         Error::new(format!(
-            "cannot read the publication ledger {} ({e}) — a real cut builds the commit \
-             `pub publish` recorded there. Pull the engine (`git -C ~/publication pull \
+            "cannot read the publication ledger {} ({e}) — a real cut releases the commit \
+             `pub publish` recorded there. Pull the engine (`git -C {} pull \
              --ff-only`) or point PUBLICATION_ENGINE at its checkout. Nothing was claimed.",
-            ledger.display()
+            ledger.display(),
+            ledger.parent().unwrap_or(&ledger).display()
         ))
     })?;
     newest_published_source(&text).map_err(|e| Error::new(format!("{}: {e}", ledger.display())))
 }
 
-/// Where [`place_published`] put the commit a real cut builds.
+/// Where [`place_published`] put the commit a real cut releases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCheckout {
     /// The published commit, now the cut tree's `HEAD` (detached).
@@ -1155,14 +1151,35 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
         }
     }
     let tree = crate::ledger::GitCli::new(&path);
-    let status = git_ok(&tree, &["status", "--porcelain"])?.stdout_utf8();
-    if !status.trim().is_empty() {
+    // THE ONE CLEAN-TREE JUDGE ([`dirty_paths`]'s, which `clean_tree` asks of this tree
+    // right after): never `git status --porcelain`, which also reads
+    // `.git/info/exclude` and `core.excludesFile` and so passed what that judge then
+    // refused. A submodule not populated is the alignment's to fix (below), not work.
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let changes: Vec<String> =
+        aterm_verify::identity::dirty_against(&path, &path_env, Some("HEAD"))
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "git could not list the state of the cut tree {}. Nothing was claimed.",
+                    path.display()
+                ))
+            })?
+            .into_iter()
+            .filter(|(_, state)| *state != aterm_verify::identity::PathState::Unpopulated)
+            .map(|(p, _)| p)
+            .collect();
+    if !changes.is_empty() {
         return Err(Error::new(format!(
             "the cut tree {} has changes — it belongs to the cutter, which never discards \
              work it did not make:\n  {}\nRemove it (`git worktree remove --force {}`), then \
              cut again; the next cut recreates it. Nothing was claimed.",
             path.display(),
-            status.lines().take(5).collect::<Vec<_>>().join("\n  "),
+            changes
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n  "),
             path.display()
         )));
     }
@@ -1289,10 +1306,10 @@ pub const RECEIPTS_FROM_KEY: &str = "aterm-release.receiptsFrom";
 ///
 /// READ-ONLY, AND TREE-KEYED ONLY. Another store is only ever read — no file
 /// written, no lock taken, nothing pruned — and only under keys that name the
-/// bytes (`tree-<tree>`, `measure-tree-<tree>`, a Trust facts key over the tree
-/// and prover), so what counts there is exactly what would count here: every
-/// rule a receipt is judged by (the tree, the compiler, `build-env`,
-/// `build-config`) is applied unchanged. Among the receipts under one key that
+/// bytes (`tree-<tree>`, a Trust facts key over the tree and prover), so what
+/// counts there is exactly what would count here: every rule a receipt is judged
+/// by is applied unchanged. (A MEASURE receipt is keyed by the executable the
+/// release built in THIS clone, and read here alone: [`measured`].) Among the receipts under one key that
 /// meet them, the newest run decides ([`Stores::newest_tree_keyed`]), and a
 /// receipt from another store says which store it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1403,13 +1420,6 @@ impl Stores {
             .map(|(_, text, from)| (text, from))
             .collect()
     }
-}
-
-/// How a receipt read from another clone's store is named in the transcript.
-fn from_store(store: Option<&Path>) -> String {
-    store.map_or_else(String::new, |s| {
-        format!(" (from the receipt store {})", s.display())
-    })
 }
 
 /// A full pass: a receipt (the gate writes one only for a clean tree) that
@@ -1677,17 +1687,14 @@ fn short(sha: &str) -> &str {
     sha.get(..9).unwrap_or(sha)
 }
 
-/// The file-name prefix of a MEASURE receipt: `<store>/measure-<commit>` and
-/// `<store>/measure-tree-<tree>` (`crates/aterm-verify/src/receipt.rs`
-/// `MEASURE_KEY_PREFIX`, which this mirrors — no dependency edge on the gate).
-const RECEIPT_MEASURE_PREFIX: &str = "measure-";
-
-/// THE COMPILER A CUT BUILDS WITH, spelled as the gate's receipts spell the
-/// one a run used (`crates/aterm-verify/src/lib.rs` `write_receipt`'s
-/// `toolchain` line): `<stage2 bin dir> trustc <commit-hash>` — the pinned
-/// stage2 ([`trust_stage2_bin`], canonical, as the gate's own resolution is)
-/// and the `commit-hash:` its `trustc -vV` answers, `unknown` when it names
-/// none (as the gate writes it).
+/// THE PROVER A CUT JUDGES WITH — this process's pinned Trust toolchain — spelled as
+/// the gate's receipts spell the one a run used (`crates/aterm-verify/src/lib.rs`
+/// `write_receipt`'s `toolchain` line): `<stage2 bin dir> trustc <commit-hash>` — the
+/// pinned stage2 ([`trust_stage2_bin`], canonical, as the gate's own resolution is)
+/// and the `commit-hash:` its `trustc -vV` answers, `unknown` when it names none (as
+/// the gate writes it). The cut's TRUST gate judges with it, and the cut signs only
+/// bytes its `trustc` compiled (`publish::measured_release_bundle`): one compiler,
+/// named by the bytes.
 ///
 /// # Errors
 /// No toolchain, or a trustc that does not answer `-vV`.
@@ -1695,9 +1702,18 @@ pub fn cut_toolchain() -> Result<String> {
     toolchain_at(&trust_stage2_bin()?)
 }
 
+/// The `trustc` commit-hash a [`cut_toolchain`] identity names (`unknown` when it
+/// names none): what a bundle's build record (`artifact::Complete::trustc`) is
+/// compared with.
+#[must_use]
+pub fn toolchain_trustc(toolchain: &str) -> &str {
+    toolchain
+        .rsplit_once(" trustc ")
+        .map_or("unknown", |(_, commit)| commit)
+}
+
 /// [`cut_toolchain`]'s spelling for the toolchain whose `bin/` is `stage2`
-/// (canonical, as the gate records it): what `ship measure verdict --prover`
-/// judges with.
+/// (canonical, as the gate records it).
 ///
 /// # Errors
 /// No such directory, or a trustc there that does not answer `-vV`.
@@ -1724,397 +1740,169 @@ pub fn toolchain_at(stage2: &Path) -> Result<String> {
         .find_map(|l| l.trim().strip_prefix("commit-hash:"))
         .map(str::trim)
         .filter(|h| !h.is_empty())
-        .unwrap_or(UNKNOWN_COMMIT);
+        .unwrap_or("unknown");
     Ok(format!("{} trustc {commit}", stage2.display()))
 }
 
-/// What a toolchain identity says when trustc named no commit.
-const UNKNOWN_COMMIT: &str = "unknown";
-
-/// Whether the tree a cut builds was MEASURED ([`measure_report`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MeasureReport {
-    /// A MEASURE receipt for HEAD or HEAD's tree says `measured yes`: the key it
-    /// stands under and the commit its run was on (short) — another commit
-    /// with the same bytes when it answered by the tree.
-    /// `from` is the other clone's store it was read from ([`Stores`]),
-    /// `None` for this clone's.
-    Measured {
-        key: String,
-        run: String,
-        from: Option<PathBuf>,
-    },
-    /// Nothing measured it: what the store holds instead, in a few words.
-    Unmeasured { why: String },
-}
-
-/// Did a gate run MEASURE the tree this cut builds, with the compiler this cut
-/// builds it with? Reads the MEASURE receipts `tools/verify.sh --measure` and
-/// `--full` file under `measure-<commit>`, then
-/// `measure-tree-<commit^{tree}>` — `rev` is the commit judged: HEAD for the
-/// cut, any commit for `ship check` ([`precheck`]) — and answers
-/// [`MeasureReport::Measured`] only
-/// for a receipt that is about that commit (or that tree), whole-tree, that
-/// names `toolchain` — the cut's, [`cut_toolchain`] — as the compiler its run
-/// used, and says `measured yes` — the gate writes that only when every stage
-/// of its MEASURE tier (the release artifact's paint and spin matrices and the
-/// build they judge, the typing-pacing smoke, the startup scheduler's timing
-/// cases) ran green with nothing skipped. An unreadable or foreign file is no
-/// measurement, never permission.
+/// WERE THESE BYTES MEASURED, BY THE RELEASE'S OWN SUITE? (build once, 2026-10-09)
+/// The one MEASURE judge — the release's measure step, the cut's sign step and `ship
+/// check` all ask it: the receipt `tools/verify.sh --measure <app>` files under the
+/// digest of the executable it judged (`aterm_verify::receipt::measure_key`), in
+/// `store` (this clone's, `<git common dir>/aterm-verify/receipts`), says `measured
+/// yes` about exactly `macho_sha256`, from a whole-tree run ON `judge` — the release's
+/// R, the clean checkout whose measuring suites and thresholds (aterm-conformance's
+/// paint and spin rows, `tools/paint-conformance/scan.py`) did the judging. The KEY
+/// is the bytes, so no compiler, build environment or config line has to stand in for
+/// them; the JUDGE is R's suite, so another worktree or commit of the clone — weaker
+/// rows, older ones — cannot vouch for the bytes R ships.
 ///
-/// THE SAME COMPILER. The key is the tree, and a tree is not a binary: a tree
-/// measured under another trustc measured a binary this cut does not ship. A
-/// receipt with no `toolchain` line, another one, or one whose trustc named no
-/// commit (nothing to tell two builds apart by) is refused, named. So is one whose
-/// run took a build environment from its caller (its `build-env` line other than
-/// `none`, or none at all) — the cut's own builds clear theirs. And so is one whose
-/// builds read any cargo config file but the tree's own (its `build-config` line
-/// other than [`tree_build_config`], or none at all) — the cut's builds read the
-/// tree's config in a fresh, empty Cargo home.
-///
-/// ACROSS CLONES. The tree's key is read in each of `stores` ([`Stores`]) — this
-/// clone's, and the ones `aterm-release.receiptsFrom` names, read-only — under
-/// every rule above, unchanged; the commit's key in this clone's alone. Of the tree
-/// receipts that meet every rule, the NEWEST run's decides, `measured yes` or not;
-/// one that meets no rule takes no part. A receipt from another store names it.
+/// `(true, the transcript line)`, or `(false, what the store holds instead)`. An
+/// unreadable or foreign file is no measurement, never permission.
 ///
 /// # Errors
-/// A git failure naming `rev` or its tree.
-pub fn measure_report(
-    git: &dyn GitRunner,
-    stores: &Stores,
-    toolchain: &str,
-    rev: &str,
-) -> Result<MeasureReport> {
-    let head = rev_parse(git, rev)?;
-    let tree = rev_parse(git, &format!("{head}^{{tree}}"))?;
-    let own_config = tree_build_config(git, &head)?;
-    let mut seen = Vec::new();
-    // What keeps a receipt from being about THIS cut's bytes, compiler and
-    // build, in words; `None` when it is about them. Whether it then PASSED is
-    // asked after: a receipt that matches and did not pass is a verdict about
-    // these bytes, not a reason to look elsewhere.
-    let mismatch = |text: &str, field: &str, expect: &str, shown: &str| -> Option<String> {
-        if receipt_field(text, "head").is_none() {
-            return Some(format!("{shown} is not a receipt this cutter reads"));
-        }
-        if receipt_field(text, field).as_deref() != Some(expect) {
-            return Some(format!("{shown} is about another {field}"));
-        }
-        if receipt_field(text, "scope").as_deref() != Some("workspace") {
-            return Some(format!("{shown} is a narrowed run's"));
-        }
-        match receipt_field(text, "toolchain") {
-            None => {
-                return Some(format!(
-                    "{shown} names no compiler, and this cut builds with `{toolchain}`"
-                ));
-            }
-            Some(used) if used != toolchain => {
-                return Some(format!(
-                    "{shown} was measured with `{used}`, and this cut builds with `{toolchain}`"
-                ));
-            }
-            Some(_) if toolchain.ends_with(&format!(" trustc {UNKNOWN_COMMIT}")) => {
-                return Some(format!(
-                    "{shown} and this cut's trustc name no commit (`{toolchain}`), so the \
-                     compiler it measured with cannot be told from this one"
-                ));
-            }
-            Some(_) => {}
-        }
-        // THE SAME BUILD: the gate's release build
-        // takes its caller's environment — `RUSTFLAGS`, a wrapper, a profile
-        // override — and this cut's builds clear theirs (`buildplan`), so a
-        // tree measured under any of it measured a binary this cut does not
-        // build. Only `build-env none` measured this cut's.
-        match receipt_field(text, "build-env").as_deref() {
-            Some("none") => {}
-            None => {
-                return Some(format!(
-                    "{shown} does not say what build environment its release build took, and \
-                     this cut builds with none"
-                ));
-            }
-            Some(env) => {
-                return Some(format!(
-                    "{shown} measured a release build under `{env}`, and this cut builds with \
-                     none (its environment cleared)"
-                ));
-            }
-        }
-        // THE SAME CONFIG FILES: cargo reads `.cargo/config.toml`
-        // from the directory it runs in, every ancestor and `$CARGO_HOME`, and
-        // a `rustflags` or a profile there builds other code exactly as the
-        // variable does. This cut's builds read the tree's own config in a
-        // fresh, empty Cargo home, so only a run that read the tree's own
-        // config and nothing else measured this cut's binary.
-        match receipt_field(text, "build-config") {
-            Some(read) if read == own_config => {}
-            None => {
-                return Some(format!(
-                    "{shown} does not say what cargo config files its release build read, and \
-                     this cut reads only the tree's own (`{own_config}`)"
-                ));
-            }
-            Some(read) => {
-                return Some(format!(
-                    "{shown} measured a release build reading the cargo config files \
-                     `{read}`, and this cut reads only the tree's own (`{own_config}`)"
-                ));
-            }
-        }
-        None
-    };
-    let not_yes = |text: &str, shown: &str| {
-        format!(
-            "{shown} says `measured {}` (verdict {})",
-            receipt_field(text, "measured").unwrap_or_else(|| "<absent>".to_string()),
-            receipt_field(text, "verdict").unwrap_or_else(|| "<absent>".to_string())
-        )
-    };
-    let measured = |text: &str| receipt_field(text, "measured").as_deref() == Some("yes");
-    let run_of = |text: &str| short(&receipt_field(text, "head").unwrap_or_default()).to_string();
-    // The commit's key, in this clone's store alone.
-    let by_head = format!("{RECEIPT_MEASURE_PREFIX}{head}");
-    if let Ok(text) = fs::read_to_string(stores.own.join(&by_head)) {
-        let name = by_head.replace(head.as_str(), short(&head));
-        let shown = format!("`{name}`");
-        match mismatch(&text, "head", &head, &shown) {
-            Some(why) => seen.push(why),
-            None if measured(&text) => {
-                return Ok(MeasureReport::Measured {
-                    key: name,
-                    from: None,
-                    run: run_of(&text),
-                });
-            }
-            None => seen.push(not_yes(&text, &shown)),
-        }
-    }
-    // The tree's key, in every store: of the receipts about these bytes, this
-    // compiler and this build, the NEWEST decides ([`Stores::newest_tree_keyed`]),
-    // as it would had every run filed in one store.
-    let by_tree = format!("{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{tree}");
-    let name = by_tree.replace(tree.as_str(), short(&tree));
-    let shown = |from: Option<&Path>| format!("`{name}`{}", from_store(from));
-    let matching = stores.newest_tree_keyed(&by_tree, |text, from| {
-        match mismatch(text, "tree", &tree, &shown(from)) {
-            Some(why) => {
-                seen.push(why);
-                false
-            }
-            None => true,
-        }
-    });
-    if let Some((text, from)) = matching.first() {
-        if measured(text) {
-            return Ok(MeasureReport::Measured {
-                key: name,
-                from: from.map(Path::to_path_buf),
-                run: run_of(text),
-            });
-        }
-        seen.push(format!(
-            "{}, the newest run on these bytes with this compiler and build",
-            not_yes(text, &shown(*from))
-        ));
-        for (older, from) in matching.iter().skip(1).filter(|(text, _)| measured(text)) {
-            seen.push(format!(
-                "{} said `measured yes` in an older run (on {}), which that newer one replaces",
-                shown(*from),
-                run_of(older)
+/// The store cannot be read at all: no answer either way.
+pub fn measured(store: &Path, macho_sha256: &str, judge: &str) -> Result<(bool, String)> {
+    let key = aterm_verify::receipt::measure_key(macho_sha256);
+    let shown = format!("`{}`", key.replace(macho_sha256, short(macho_sha256)));
+    let text = match fs::read_to_string(store.join(&key)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                false,
+                format!(
+                    "no MEASURE receipt for the executable {} ({shown} is not in {})",
+                    short(macho_sha256),
+                    store.display()
+                ),
             ));
         }
+        Err(e) => {
+            return Err(Error::new(format!(
+                "read {}: {e}",
+                store.join(&key).display()
+            )));
+        }
+    };
+    let Some(receipt) = aterm_verify::receipt::Receipt::parse(&text) else {
+        return Ok((false, format!("{shown} is not a receipt this cutter reads")));
+    };
+    if receipt.artifact.as_deref() != Some(macho_sha256) {
+        return Ok((false, format!("{shown} is about other bytes")));
     }
-    if seen.is_empty() {
-        seen.push(format!(
-            "no MEASURE receipt for {} or its tree {}",
-            short(&head),
-            short(&tree)
+    if receipt.head != judge {
+        return Ok((
+            false,
+            format!(
+                "{shown} was judged by the measuring suite of {}, not of the release's {}",
+                short(&receipt.head),
+                short(judge)
+            ),
         ));
     }
-    seen.extend(stores.unresolved.iter().cloned());
-    Ok(MeasureReport::Unmeasured {
-        why: seen.join("; "),
-    })
+    if receipt.scope != "workspace" {
+        return Ok((false, format!("{shown} is a narrowed run's")));
+    }
+    if receipt.measured != Some(true) {
+        return Ok((
+            false,
+            format!(
+                "{shown} says `measured {}` (verdict {})",
+                match receipt.measured {
+                    Some(false) => "no",
+                    _ => "<absent>",
+                },
+                receipt.verdict
+            ),
+        ));
+    }
+    Ok((
+        true,
+        format!(
+            "MEASURE tier: the executable {} MEASURED — `measured yes` in {shown}, judged by \
+             {}'s suite",
+            short(macho_sha256),
+            short(&receipt.head)
+        ),
+    ))
 }
 
-/// The `build-config` line a run of `rev`'s tree records when its builds read
-/// the tree's own cargo config and no other (`aterm_verify::build_config`):
-/// `repo/.cargo/<name>=<blob id>` for each of `.cargo/config` and
-/// `.cargo/config.toml` the tree holds, in that order, or `none`. The blob
-/// id is git's, which is why the gate records git's: the cutter reads it from
-/// the tree, never from a disk a run could have edited.
+/// `ship check`'s MEASURE line for `commit`: this clone's release journal's bundle
+/// of it ([`crate::release::Journal::artifact`] — the journal lives in the git
+/// common dir, so `publish/pre-promote`'s throwaway worktree reads it too) and the
+/// answer [`measured`] gives for its executable. No bundle of `commit` built here
+/// refuses: the source is never published ahead of a binary that cannot follow.
 ///
 /// # Errors
-/// A git failure listing `rev`'s `.cargo`.
-pub fn tree_build_config(git: &dyn GitRunner, rev: &str) -> Result<String> {
-    const NAMES: [&str; 2] = ["config", "config.toml"];
-    let listed = git_ok(
+/// Not measured, or not built yet, with the remedy; and a store or journal that
+/// cannot be read.
+pub fn measure_gate_at(git: &dyn GitRunner, commit: &str) -> Result<String> {
+    let common = git_ok(
         git,
-        &[
-            "ls-tree",
-            rev,
-            "--",
-            &format!(".cargo/{}", NAMES[0]),
-            &format!(".cargo/{}", NAMES[1]),
-        ],
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?
     .stdout_utf8();
-    let mut entries = Vec::new();
-    for name in NAMES {
-        let path = format!(".cargo/{name}");
-        let blob = listed.lines().find_map(|l| {
-            let (meta, p) = l.split_once('\t')?;
-            let mut f = meta.split_whitespace();
-            let (_mode, kind, id) = (f.next()?, f.next()?, f.next()?);
-            (p == path && kind == "blob").then(|| id.to_string())
-        });
-        if let Some(id) = blob {
-            entries.push(format!("repo/{path}={id}"));
-        }
-    }
-    Ok(if entries.is_empty() {
-        "none".to_string()
-    } else {
-        entries.join(" ")
-    })
-}
-
-/// NOTHING SHIPS UNMEASURED. The merge contract does not run the MEASURE tier
-/// (the fat-LTO release build, the paint and spin matrices that judge it, the
-/// pacing smoke), so the cut is where it is required: before the ledger claim, where a
-/// refusal burns no build number, the tree this cut builds must carry a
-/// MEASURE receipt saying `measured yes` ([`measure_report`]). `cut --gate`
-/// runs `tools/verify.sh --full` first, which files one when it measures.
-///
-/// `refuse` is a real cut's: without a measurement it refuses, naming what the
-/// store holds and the command that measures the tree. A dry run or rehearsal
-/// claims nothing, so it states the same answer as a line — including that a
-/// real cut would refuse here — and goes on. Returns the transcript line.
-/// Measured means with the compiler this cut builds with ([`cut_toolchain`]).
-///
-/// # Errors
-/// A real cut of an unmeasured tree; a git failure; no compiler to name.
-pub fn measure_gate(git: &dyn GitRunner, refuse: bool) -> Result<String> {
-    let toolchain = cut_toolchain().map_err(|e| {
-        Error::new(format!(
-            "the MEASURE gate cannot name the compiler this cut builds with: {e}"
-        ))
-    })?;
-    measure_gate_with(git, refuse, &toolchain, "HEAD")
-}
-
-/// [`measure_gate`] for the cut compiler `toolchain`, judging `rev` — HEAD for
-/// the cut, the commit named for `ship check` ([`precheck`]).
-fn measure_gate_with(
-    git: &dyn GitRunner,
-    refuse: bool,
-    toolchain: &str,
-    rev: &str,
-) -> Result<String> {
-    let head = rev_parse(git, rev)?;
-    match measure_report(git, &Stores::of(git)?, toolchain, &head)? {
-        MeasureReport::Measured { key, run, from } => {
-            Ok(measured_line(&head, toolchain, &key, &run, from.as_deref()))
-        }
-        MeasureReport::Unmeasured { why } if refuse => Err(Error::new(format!(
-            "the tree this cut builds ({head}) is not MEASURED ({why}). Measure it: \
-             `git worktree add --detach <dir> {head}`, then `tools/verify.sh --measure` there \
-             (if a separate clone measured it: `git config --add {RECEIPTS_FROM_KEY} <dir>`). \
-             Nothing was claimed."
-        ))),
-        MeasureReport::Unmeasured { why } => Ok(format!(
-            "MEASURE tier: {} NOT measured ({why}) — a real cut would refuse here; \
-             `tools/verify.sh --measure` on it measures it",
-            short(&head)
-        )),
-    }
-}
-
-/// The transcript line for a tree [`measure_report`] found MEASURED: the cut's,
-/// and `ship measure verdict`'s.
-fn measured_line(head: &str, toolchain: &str, key: &str, run: &str, from: Option<&Path>) -> String {
-    format!(
-        "MEASURE tier: {} MEASURED — `measured yes` in `{key}`{}, run on {run}, with `{toolchain}`",
-        short(head),
-        from_store(from)
+    let common = Path::new(common.trim());
+    let journal = crate::release::Journal::load(
+        &common
+            .join(crate::release::RELEASE_DIR)
+            .join(crate::release::JOURNAL_FILE),
     )
-}
-
-/// `targo --unverified ship measure verdict [--commit REV] [--prover BIN-DIR]`:
-/// THE ONE MEASURE JUDGE for the release scripts (tools/release.sh and
-/// tools/release-preflight.sh call it rather than copy the rule).
-/// [`measure_report`] over [`Stores::of`],
-/// for REV with the compiler whose `bin/` is BIN-DIR ([`toolchain_at`]) —
-/// default, the one the cut builds with ([`cut_toolchain`]). Prints one line —
-/// [`measured_line`], or what the stores hold instead — and answers 0
-/// MEASURED, 1 not, 2 could not answer.
-pub fn run_measure_verdict(repo: &Path, commit: &str, prover: Option<&Path>) -> i32 {
-    let git = crate::ledger::GitCli::new(repo);
-    let answer = match prover {
-        Some(bin) => toolchain_at(bin),
-        None => cut_toolchain(),
-    }
-    .and_then(|toolchain| {
-        let head = rev_parse(&git, &format!("{commit}^{{commit}}"))?;
-        let report = measure_report(&git, &Stores::of(&git)?, &toolchain, &head)?;
-        Ok((report, head, toolchain))
-    });
-    match answer {
-        Ok((MeasureReport::Measured { key, run, from }, head, toolchain)) => {
-            println!(
-                "{}",
-                measured_line(&head, &toolchain, &key, &run, from.as_deref())
-            );
-            0
-        }
-        Ok((MeasureReport::Unmeasured { why }, _, _)) => {
-            println!("{why}");
-            1
-        }
-        Err(e) => {
-            eprintln!("aterm-release measure verdict: {e}");
-            2
-        }
+    .map_err(Error::new)?;
+    let Some(artifact) = journal
+        .filter(|j| j.commit == commit)
+        .and_then(|j| j.artifact)
+    else {
+        return Err(Error::new(format!(
+            "no bundle of {} is built in this clone yet (its release journal names none) — \
+             `{}` builds it once and MEASURE judges those bytes; nothing is signed unmeasured",
+            short(commit),
+            crate::release::RELEASE_COMMAND
+        )));
+    };
+    match measured(&receipt_store(git)?, &artifact.macho_sha256, commit)? {
+        (true, line) => Ok(line),
+        (false, why) => Err(Error::new(format!(
+            "the bundle of {} (build {}) is not MEASURED ({why}) — `{}` measures it: \
+             `tools/verify.sh --measure {}`",
+            short(commit),
+            artifact.build,
+            crate::release::RELEASE_COMMAND,
+            artifact.app.display()
+        ))),
     }
 }
 
 /// NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE (owner ruling: the merge
 /// contract verifies only the libraries a change touched, the release the whole
 /// tree). Before the ledger claim, where a refusal burns no
-/// build number, the tree this cut builds must be VERIFIED by the lane's facts
+/// build number, the tree this cut releases must be VERIFIED by the lane's facts
 /// ([`crate::trust_facts::trust_report`]): a whole-tree run's measurements of
 /// this tree — every byte but its floors, `tools/trust-gate-ratchet.tsv` and
-/// `tools/trust-gate-memory.tsv` — with the prover it builds with, judged NOW
+/// `tools/trust-gate-memory.tsv` — with the prover `toolchain` names (the
+/// [`cut_toolchain`] identity, whose `trustc` compiled the bytes the cut signs:
+/// `publish::measured_release_bundle` refuses any other), judged NOW
 /// against this commit's own floors (FACTS, NOT VERDICTS: a commit that changes
 /// only the floors reuses the run before it, and its floors are
-/// held to the merge contract's up-only rule against the run's). `cut --gate`
-/// runs the whole-tree lane first, which files them.
+/// held to the merge contract's up-only rule against the run's). `ship release`
+/// runs the whole-tree lane first (its step 5), which files them.
 ///
 /// `refuse` is a real cut's; a dry run or rehearsal states the same answer as a
 /// line — including that a real cut would refuse here — and goes on. Returns
 /// the transcript line.
 ///
 /// # Errors
-/// A real cut of a tree the lane did not verify; a git failure; no compiler.
-pub fn trust_receipt_gate(git: &dyn GitRunner, refuse: bool) -> Result<String> {
-    let toolchain = cut_toolchain().map_err(|e| {
-        Error::new(format!(
-            "the trust gate cannot name the prover this cut builds with: {e}"
-        ))
-    })?;
+/// A real cut of a tree the lane did not verify; a git failure.
+pub fn trust_receipt_gate(git: &dyn GitRunner, refuse: bool, toolchain: &str) -> Result<String> {
     trust_receipt_gate_with(
         git,
         refuse,
-        &crate::trust_facts::Prover::of_toolchain(&toolchain),
+        &crate::trust_facts::Prover::of_toolchain(toolchain),
         "HEAD",
     )
 }
 
-/// [`trust_receipt_gate`] for the cut prover `prover`, judging `rev` — HEAD
-/// for the cut, the commit named for `ship check` ([`precheck`]).
+/// [`trust_receipt_gate`] for the prover `prover`, judging `rev` — HEAD for the cut,
+/// the commit named for `ship check` ([`precheck`]).
 fn trust_receipt_gate_with(
     git: &dyn GitRunner,
     refuse: bool,
@@ -2126,7 +1914,7 @@ fn trust_receipt_gate_with(
     match trust_report(git, &Stores::of(git)?, prover, &head)? {
         report @ TrustReport::Verified { .. } => Ok(verified_line(&head, prover, &report)),
         // A NARROWED verdict's `why` names its one action; rerunning the lane
-        // here, or `cut --gate`, only narrows again on the machine that ran it.
+        // here only narrows again on the machine that ran it.
         TrustReport::Unverified { why, narrowed } if refuse => {
             Err(Error::new(refusal(&head, &why, narrowed)))
         }
@@ -2207,9 +1995,8 @@ impl Precheck {
 /// read only the commit and this repository's receipt store, in the cut's
 /// order:
 ///
-/// * the cutter identity ([`cutter_identity_gate`]'s rule) FIRST — this binary
-///   is the commit's own cutter: built from it, or from a commit whose cutter
-///   source closure is byte-identical. When it is not, the check REFUSES TO
+/// * the cutter identity ([`own_cutter`]'s rule) FIRST — this binary is the
+///   commit's own cutter: built from it. When it is not, the check REFUSES TO
 ///   ANSWER (an error, before any other gate): every answer after it would be
 ///   another tree's rules, which is how a check could say READY for a commit
 ///   whose own cutter then refuses;
@@ -2220,8 +2007,8 @@ impl Precheck {
 ///   and pinned ([`handoff_fixture_gate_at`]);
 /// * [`handoff_policy_gate`] — the handoff policy a cut of it seals into its
 ///   bundle, read strictly ([`handoff_policy_gate_at`]);
-/// * [`measure_gate`] — a MEASURE receipt for it, taken with the compiler this
-///   machine's cut builds with ([`cut_toolchain`]);
+/// * [`measure_gate_at`] — this clone's bundle of it (its release journal) measured
+///   ([`measured`]): the bytes a cut of it would sign;
 /// * [`trust_receipt_gate`] — the whole-tree Trust lane's facts for its tree
 ///   (the floors aside), from that compiler's prover, passing its own floors.
 ///
@@ -2244,7 +2031,7 @@ impl Precheck {
 pub fn precheck(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
     let toolchain = cut_toolchain().map_err(|e| {
         format!(
-            "cannot name the compiler this machine's cut builds with ({e}) — `aterm pkg \
+            "cannot name the prover this machine's cut judges with ({e}) — `aterm pkg \
              doctor` says why; TRUST_STAGE2_BIN pins one"
         )
     });
@@ -2260,16 +2047,8 @@ fn precheck_with(
     toolchain: std::result::Result<String, String>,
 ) -> Result<Precheck> {
     let commit = rev_parse(git, &format!("{rev}^{{commit}}"))?;
-    let identity = match cutter_identity_finding(
-        stamp,
-        &commit,
-        &cutter_source_closure(git, stamp, &commit),
-    ) {
-        Ok(Some(note)) => note,
-        Ok(None) => format!(
-            "cutter identity: this check was built from {} itself",
-            short(&commit)
-        ),
+    let identity = match own_cutter_with(git, stamp, &commit) {
+        Ok(note) => note,
         Err(what) => {
             return Err(Error::new(format!(
                 "ship check will not answer for {commit}: {what}. Its gates would be another \
@@ -2315,9 +2094,7 @@ fn precheck_with(
         },
         PrecheckGate {
             name: "MEASURE tier",
-            outcome: toolchain
-                .clone()
-                .and_then(|tc| answer(measure_gate_with(git, true, &tc, &commit))),
+            outcome: answer(measure_gate_at(git, &commit)),
         },
         PrecheckGate {
             name: "TRUST lane",
@@ -2545,14 +2322,22 @@ pub fn host_gate() -> Result<()> {
 /// Clean tree: the release commit must be EXACTLY the changelog-roll + ledger
 /// changes, and a rejected-push retry does `reset --hard` — stray local edits
 /// would be destroyed, so refuse them up front.
+///
+/// THE ONE CLEAN-TREE JUDGE: [`aterm_verify::identity::dirty_against`] against `HEAD`,
+/// the Trust lane's own rule (the tracked `.gitignore` files, never
+/// `.git/info/exclude` or `core.excludesFile`), which `ship release` judges its clone
+/// with too — so no step of a release can call a tree clean that another calls dirty.
 pub fn clean_tree(git: &dyn GitRunner) -> Result<()> {
-    let out = git_ok(git, &["status", "--porcelain"])?;
-    let dirty = out.stdout_utf8();
-    if dirty.trim().is_empty() {
+    let root = git_ok(git, &["rev-parse", "--show-toplevel"])?
+        .stdout_utf8()
+        .trim()
+        .to_string();
+    let dirty = dirty_paths(Path::new(&root))?;
+    if dirty.is_empty() {
         return Ok(());
     }
-    let mut lines: Vec<&str> = dirty.lines().take(5).collect();
-    if dirty.lines().count() > 5 {
+    let mut lines: Vec<&str> = dirty.iter().take(5).map(String::as_str).collect();
+    if dirty.len() > 5 {
         lines.push("…");
     }
     Err(Error::new(format!(
@@ -2560,6 +2345,23 @@ pub fn clean_tree(git: &dyn GitRunner) -> Result<()> {
          worktree:\n  {}",
         lines.join("\n  ")
     )))
+}
+
+/// The paths [`aterm_verify::identity::dirty_against`] finds dirty in the checkout at
+/// `root` against its `HEAD` — the one judge [`clean_tree`] and `ship release` share.
+///
+/// # Errors
+/// git could not list the checkout's state.
+pub fn dirty_paths(root: &Path) -> Result<Vec<String>> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    aterm_verify::identity::dirty_against(root, &path, Some("HEAD"))
+        .map(|dirty| dirty.into_keys().collect())
+        .ok_or_else(|| {
+            Error::new(format!(
+                "git could not list the state of {}",
+                root.display()
+            ))
+        })
 }
 
 /// Every submodule initialised and checked out at exactly the commit `HEAD`
@@ -2605,9 +2407,10 @@ pub fn submodules_off_gitlink(status: &str) -> Vec<&str> {
 /// --detach` moves the gitlink and never the checkout — so without this the published
 /// commit would be built against no astream at all, or against the astream of the
 /// tree's previous commit. The release operator reads aterm's private remote, so
-/// reading astream's is the same credential. (A lost claim race needs no such step:
-/// `ledger::claim` resets to the published commit, whose gitlinks this already
-/// placed.) Fails loudly, and leaves nothing half-done that the refusal does not name.
+/// reading astream's is the same credential. (A claim needs no such step:
+/// `ledger::claim` leaves the cut tree at the published commit until it lands, then
+/// moves it to the release commit, whose gitlinks are the published commit's.) Fails
+/// loudly, and leaves nothing half-done that the refusal does not name.
 pub fn align_submodules(git: &dyn GitRunner) -> Result<()> {
     let out = git.git(&["submodule", "update", "--init", "--recursive", "--checkout"])?;
     if !out.success() {
@@ -2623,98 +2426,6 @@ pub fn align_submodules(git: &dyn GitRunner) -> Result<()> {
     submodules_at_gitlinks(git)
 }
 
-/// The repository-owned inputs that can change the `aterm-release` binary —
-/// the SAME list `crates/aterm-release/build.rs` watches and judges dirty, kept
-/// here so the identity gate can ask what changed between the stamp and `HEAD`.
-///
-/// Duplicated rather than shared because a build script cannot be imported by
-/// the crate it builds; `the_source_closure_matches_the_one_build_rs_judges`
-/// (below) parses `build.rs` and refuses any drift between the two lists, so the
-/// duplication is checked, not trusted.
-pub const SOURCE_INPUTS: &[&str] = &[
-    "crates",
-    "vendor",
-    ".cargo",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-];
-
-/// What the cutter's own source closure did between the commit it was built
-/// from and the commit it is about to cut.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SourceClosure {
-    /// Not one byte of [`SOURCE_INPUTS`] differs: a rebuild at `HEAD` would
-    /// produce the same binary, so this one IS the tree's cutter.
-    Identical,
-    /// Something the binary is compiled from moved. The paths are named so the
-    /// refusal can say what.
-    Changed(Vec<String>),
-    /// Could not be established — an absent stamp commit, a git that would not
-    /// answer, a stamp that is not this line of history. "Cannot tell" is the
-    /// refusing answer here for the same reason it is in
-    /// [`cutter_identity_verdict`].
-    Unresolvable(String),
-}
-
-/// Ask git what changed, under [`SOURCE_INPUTS`], between `stamp` and `head`.
-///
-/// The two must also be ONE LINE of history — either an ancestor of the other: a
-/// binary built from a foreign branch that happens to share these paths is not this
-/// tree's cutter, and the whole point of the stamp is provenance, not coincidence.
-/// Either direction, because a real cut builds the published commit, which is
-/// usually OLDER than the tip the cutter was compiled at: a cutter
-/// built at a descendant whose own sources did not move since is that commit's
-/// cutter.
-pub fn cutter_source_closure(git: &dyn GitRunner, stamp: &str, head: &str) -> SourceClosure {
-    if !canonical_commit(stamp) {
-        return SourceClosure::Unresolvable(format!("{stamp} is not a commit id"));
-    }
-    match git.git(&["cat-file", "-e", &format!("{stamp}^{{commit}}")]) {
-        Ok(out) if out.success() => {}
-        Ok(_) => {
-            return SourceClosure::Unresolvable(format!(
-                "{stamp} is not in this checkout (fetch it, or rebuild the cutter)"
-            ));
-        }
-        Err(e) => return SourceClosure::Unresolvable(e.to_string()),
-    }
-    let ancestor = |a: &str, b: &str| {
-        git.git(&["merge-base", "--is-ancestor", a, b])
-            .map(|out| out.success())
-    };
-    match ancestor(stamp, head).and_then(|up| Ok(up || ancestor(head, stamp)?)) {
-        Ok(true) => {}
-        Ok(false) => {
-            return SourceClosure::Unresolvable(format!(
-                "{stamp} and {head} are not one line of history (neither is an ancestor of \
-                 the other) — the cutter was built off this line of history"
-            ));
-        }
-        Err(e) => return SourceClosure::Unresolvable(e.to_string()),
-    }
-    let mut args = vec!["diff", "--name-only", stamp, head, "--"];
-    args.extend_from_slice(SOURCE_INPUTS);
-    match git.git(&args) {
-        Ok(out) if out.success() => {
-            let changed: Vec<String> = out
-                .stdout_utf8()
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect();
-            if changed.is_empty() {
-                SourceClosure::Identical
-            } else {
-                SourceClosure::Changed(changed)
-            }
-        }
-        Ok(out) => SourceClosure::Unresolvable(out.stderr_utf8().trim().to_string()),
-        Err(e) => SourceClosure::Unresolvable(e.to_string()),
-    }
-}
-
 /// A real 40-hex commit id — not `"unknown"`, not git's reserved all-zero null
 /// object id that `build.rs` stamps on a dirty source closure.
 pub fn canonical_commit(value: &str) -> bool {
@@ -2727,125 +2438,133 @@ pub fn canonical_commit(value: &str) -> bool {
 pub const BUILD_COMMIT: &str = env!("ATERM_RELEASE_BUILD_COMMIT");
 const DIRTY_BUILD_COMMIT: &str = "0000000000000000000000000000000000000000";
 
-/// Prove the cutter is the tree's own — the binary-side twin of the tree gates.
+/// What a claim commit changes on top of the commit it claims: its ledger line and
+/// its changelog roll (`ledger::reserve` makes it, `ledger::claim` lands it), and
+/// nothing else.
+pub const CLAIM_FILES: [&str; 2] = [crate::changelog::CHANGELOG_FILE, crate::ledger::LEDGER_FILE];
+
+/// THE CUTTER IS ITS COMMIT'S OWN. Every other pre-claim gate proves something about
+/// the TREE and nothing about the binary doing the proving: a cutter built from an
+/// older tree validates its output against its OWN older rules, and passes on a clean
+/// tree (v0.63.0 shipped a seeded image that way). So the binary carries the commit
+/// it was built from ([`BUILD_COMMIT`]), and it acts for `commit` only when it IS that
+/// commit — or `commit` is the claim commit made on top of it: its first parent the
+/// stamp, and nothing but [`CLAIM_FILES`] differing, the one shape `ledger::reserve`
+/// makes. No source closure is reasoned about: `targo --unverified ship release`
+/// re-runs itself as the release commit's own cutter before it judges anything
+/// (`release.rs`), and the cut it runs is that same binary.
 ///
-/// Every other pre-claim gate proves something about the TREE and nothing about
-/// the binary doing the proving: a cutter built from an older tree validates its
-/// output against its OWN older rules, and passes on a clean tree.
+/// # Errors
+/// This binary is not `commit`'s cutter, and why.
+pub fn own_cutter(git: &dyn GitRunner, commit: &str) -> std::result::Result<String, String> {
+    own_cutter_with(git, BUILD_COMMIT, commit)
+}
+
+/// [`own_cutter`] for a cutter stamped `stamp` — pure over the stamp, so every case is
+/// a test rather than a rebuild.
 ///
-/// Every remote-mutating cut must match. Only `--dry-run` may proceed with a
-/// mismatch, because it stops before any upload; the mismatch is still
-/// reported so its local result is not mistaken for evidence about the tree.
-/// A rehearsal publishes to a scratch repository and therefore gets no
-/// exemption.
-pub fn cutter_identity_gate(git: &dyn GitRunner, head: &str, allow_stale: bool) -> Result<()> {
-    let closure = cutter_source_closure(git, BUILD_COMMIT, head);
-    match cutter_identity_verdict(BUILD_COMMIT, head, &closure, allow_stale) {
-        Ok(Some(note)) => {
-            println!("==> {note}");
+/// # Errors
+/// As [`own_cutter`].
+pub fn own_cutter_with(
+    git: &dyn GitRunner,
+    stamp: &str,
+    commit: &str,
+) -> std::result::Result<String, String> {
+    if stamp == "unknown" || stamp.is_empty() {
+        return Err(
+            "this aterm-release binary carries no build commit (built without git, or from \
+             an export)"
+                .to_string(),
+        );
+    }
+    if stamp == DIRTY_BUILD_COMMIT {
+        return Err(
+            "this aterm-release binary was built from a dirty repository source closure"
+                .to_string(),
+        );
+    }
+    if !canonical_commit(stamp) {
+        return Err(format!(
+            "this aterm-release binary's build commit {stamp:?} is not a commit id"
+        ));
+    }
+    if stamp == commit {
+        return Ok(format!(
+            "cutter identity: built from {} itself",
+            short(commit)
+        ));
+    }
+    let parent = git
+        .git(&["rev-parse", "--verify", "-q", &format!("{commit}^1")])
+        .ok()
+        .filter(crate::ledger::RunOut::success)
+        .map(|out| out.stdout_utf8().trim().to_string());
+    if parent.as_deref() == Some(stamp)
+        && let Ok(out) = git.git(&["diff", "--name-only", "--no-renames", stamp, commit])
+        && out.success()
+    {
+        let text = out.stdout_utf8();
+        let changed: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !changed.is_empty() && changed.iter().all(|p| CLAIM_FILES.contains(p)) {
+            return Ok(format!(
+                "cutter identity: built from {}, whose claim commit {} adds only its ledger \
+                 line and changelog roll",
+                short(stamp),
+                short(commit)
+            ));
+        }
+    }
+    Err(format!(
+        "this aterm-release binary was built from {stamp}, not {commit}"
+    ))
+}
+
+/// [`own_cutter`] as a gate, with its remedy. Only a true `--dry-run` (`allow_stale`),
+/// which publishes nowhere, proceeds with another commit's cutter — and says so,
+/// because its results came from other code than the tree's. A rehearsal mutates its
+/// scratch repository, so it gets no exemption.
+///
+/// # Errors
+/// This binary is not `commit`'s cutter, with the remedy.
+pub fn own_cutter_gate(git: &dyn GitRunner, commit: &str, allow_stale: bool) -> Result<()> {
+    match own_cutter(git, commit) {
+        Ok(_) => Ok(()),
+        Err(what) if allow_stale => {
+            println!(
+                "==> cutter identity: {what} — allowed because this dry-run publishes nowhere, \
+                 but it is running OTHER code than the tree"
+            );
             Ok(())
         }
-        Ok(None) => Ok(()),
-        Err(e) => Err(e),
+        Err(what) => Err(Error::new(own_cutter_refusal(&what, commit))),
     }
 }
 
-/// Pure core of [`cutter_identity_gate`] (the stamp is an input, so every case
-/// is a unit test rather than a rebuild). `Ok(Some(note))` is a dry-run that
-/// should say something; `Ok(None)` is silence.
-pub fn cutter_identity_verdict(
-    stamp: &str,
-    head: &str,
-    closure: &SourceClosure,
-    allow_stale: bool,
-) -> Result<Option<String>> {
-    let what = match cutter_identity_finding(stamp, head, closure) {
-        Ok(found) => return Ok(found),
-        Err(what) => what,
-    };
-    if allow_stale {
-        return Ok(Some(format!(
-            "cutter identity: {what} — allowed because this dry-run publishes nowhere, \
-             but it is running OTHER code than the tree"
-        )));
-    }
-    Err(Error::new(format!(
+/// The refusal [`own_cutter_gate`] says: what is wrong, then the one way to run as the
+/// commit's own cutter.
+fn own_cutter_refusal(what: &str, commit: &str) -> String {
+    format!(
         "{what}.\n\
-         fix:  re-run the cut (it rebuilds the cutter from this tree), or force it: \
-         `targo clean --release -p aterm-release` (`--release` required: the `ship` alias \
-         is `run --release`; `clean` takes no lane flag)"
-    )))
+         fix:  run it as `{}` from the release's clone (it re-runs itself as the release \
+         commit's own cutter), or rebuild this cutter at {commit}: `targo clean --release -p \
+         aterm-release` (`--release` required: the `ship` alias is `run --release`; `clean` \
+         takes no lane flag)",
+        crate::release::RELEASE_COMMAND
+    )
 }
 
-/// The cutter-identity RULE, shared by the cut ([`cutter_identity_verdict`])
-/// and `ship check` ([`precheck`]): `Ok(None)` — the binary was built from
-/// `head` itself; `Ok(Some(note))` — built from another commit, with not one
-/// byte of the cutter's own source closure moved between them, so it is
-/// `head`'s cutter all the same; `Err(what)` — its rules are not `head`'s, and
-/// why. Each caller adds its own remedy.
-fn cutter_identity_finding(
-    stamp: &str,
-    head: &str,
-    closure: &SourceClosure,
-) -> std::result::Result<Option<String>, String> {
-    if stamp == head {
-        return Ok(None);
-    }
-    // THE STAMP IS A PROXY; THE CLOSURE IS THE PREDICATE. What this gate owes is
-    // "the rules this binary enforces are the rules this tree declares". A peer's
-    // push to a doc moves HEAD without moving one byte the cutter was built from;
-    // if nothing under SOURCE_INPUTS differs between the stamp and HEAD, a rebuild
-    // here would emit this same binary, so its rules ARE this tree's.
-    if let SourceClosure::Identical = closure
-        && canonical_commit(stamp)
-    {
-        return Ok(Some(format!(
-            "cutter identity: built from {stamp}, tree is at {head} — nothing under the \
-             cutter's own source closure moved between them, so this binary is what this \
-             tree builds"
-        )));
-    }
-    // An unknown stamp is NOT a pass. "Cannot tell" is how the stale cutter got
-    // through, so it is the refusing answer here, exactly as an unreachable
-    // channel is for `channel_version_gate`.
-    Err(if stamp == "unknown" {
-        "this aterm-release binary carries no build commit (built without git, or from an export)"
-            .to_string()
-    } else if stamp == DIRTY_BUILD_COMMIT {
-        "this aterm-release binary was built from a dirty repository source closure".to_string()
-    } else {
-        let detail = match closure {
-            SourceClosure::Changed(paths) => {
-                let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
-                format!(
-                    " — {} of the cutter's own source files moved between them ({}{})",
-                    paths.len(),
-                    shown.join(", "),
-                    if paths.len() > shown.len() {
-                        ", …"
-                    } else {
-                        ""
-                    }
-                )
-            }
-            SourceClosure::Unresolvable(why) => {
-                format!(" — and what moved between them cannot be established: {why}")
-            }
-            SourceClosure::Identical => String::new(),
-        };
-        format!(
-            "this aterm-release binary was built from {stamp}, but the tree is at \
-             {head}{detail}"
-        )
-    })
-}
-
-/// Apply the real-mutation cutter check to the checkout the caller is about
-/// to act from. Resume, recovery, abandon and yank do not enter
-/// [`run_all`], so each of those paths uses this shared boundary before its
-/// first remote mutation.
-pub fn current_cutter_identity_gate(git: &dyn GitRunner) -> Result<()> {
-    cutter_identity_gate(git, &rev_parse(git, "HEAD")?, false)
+/// [`own_cutter_gate`] for the checkout the caller is about to act from (its `HEAD`).
+/// Resume, recovery, abandon and yank do not enter [`run_all`], so each of those paths
+/// uses this shared boundary before its first remote mutation.
+///
+/// # Errors
+/// As [`own_cutter_gate`].
+pub fn current_own_cutter_gate(git: &dyn GitRunner) -> Result<()> {
+    own_cutter_gate(git, &rev_parse(git, "HEAD")?, false)
 }
 
 /// Tag vX.Y.Z must be absent BOTH locally and on origin: the publish step mints
@@ -3395,9 +3114,9 @@ pub fn handoff_fixture_guard_gate(
     handoff_fixture_guard_with(&resolve_targo()?, tree, run)
 }
 
-/// [`handoff_fixture_guard_gate`] with the `targo` it runs named, so a test
-/// needs no toolchain.
-fn handoff_fixture_guard_with(
+/// [`handoff_fixture_guard_gate`] with the `targo` it runs named: a test needs no
+/// toolchain, and `ship release` runs it with its one prover's.
+pub(crate) fn handoff_fixture_guard_with(
     targo: &Path,
     tree: &Path,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
@@ -3758,7 +3477,7 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
             return Err(Error::new(format!(
                 "trustc not runnable at {} ({e}) — the repo compiles with Trust always. \
                  Reinstall the toolchain (`aterm pkg install trust`, then `aterm pkg doctor`), \
-                 or from source rebuild the stage2 (`python3 x.py build --stage 2` in $HOME/trust), \
+                 or from source rebuild the stage2 ({TRUST_FROM_SOURCE}), \
                  or point TRUST_STAGE2_BIN at a stage2 bin dir that carries trustc",
                 trustc.display()
             )));
@@ -3821,9 +3540,9 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         Ok(o) => Err(Error::new(format!(
             "trustc at {} runs but `{} --unverified check` cannot COMPILE the probe under \
              the native-lane rustflags {flags:?} (stage2 library missing/stale — reinstall \
-             with `aterm pkg install trust`, or from source rebuild with `python3 x.py build \
-             --stage 2` in $HOME/trust — or a flag spelling does not match this trustc; \
-             `trustc -Z help | grep trust-verify` decides): {}",
+             with `aterm pkg install trust`, or from source rebuild {TRUST_FROM_SOURCE} — or \
+             a flag spelling does not match this trustc; `trustc -Z help | grep trust-verify` \
+             decides): {}",
             trustc.display(),
             targo.display(),
             String::from_utf8_lossy(&o.stderr)
@@ -3837,393 +3556,12 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     result
 }
 
-/// The scheduling tier a launchd job was spawned at, as `launchctl print` names
-/// it. `None` is "this launchd does not say", which is not a refusal.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SpawnTier {
-    /// Not a launchd job at all — an interactive shell, which is the tier the
-    /// paint smoke was calibrated in.
-    Shell,
-    /// `spawn type = interactive (4)`: the tier a `ProcessType=Interactive`
-    /// LaunchAgent gets, and the only launchd tier the smoke survives.
-    Interactive,
-    /// Any other named tier — `launchctl submit` produces this one.
-    Other(String),
-    /// A launchd job whose tier could not be read.
-    Unknown,
-}
-
-/// Refuse, BEFORE the claim, a cut whose PAINT SMOKE is going to fail for the
-/// scheduler's reasons rather than the renderer's.
-///
-/// Measured and recorded in docs/RELEASING.md: a job started with
-/// `launchctl submit` runs at `QOS_CLASS_UTILITY`, its 50 ms sampling timer
-/// fires 75 ms late on the first tick and 25-35 ms late at the median, and the
-/// aterm instance the smoke launches INHERITS the tier. Thirty takes of the
-/// cutter's exact smoke under `launchctl submit` went red eleven times; eight
-/// from a shell went red none. The smoke runs at the self-check step — AFTER the
-/// ledger claim — so that coin flip costs a burned build number each time it
-/// lands tails, and `--resume` re-enters at the same starved step.
-///
-/// The tier is knowable before any of it: a launchd job's own label is in
-/// `XPC_SERVICE_NAME`, and `launchctl print` names its `spawn type`. A cut from a
-/// shell is the calibrated case and asks launchd nothing.
-///
-/// "Cannot tell" is a NOTE here, not a refusal — deliberately the opposite of
-/// [`cutter_identity_gate`]. A wrong answer there ships a bad artifact; a wrong
-/// answer here costs a flake on a resumable step, so an unreadable `launchctl
-/// print` (an older macOS, a renamed field) must not be able to block a release.
-pub fn launchd_qos_gate(paint_smoke_will_run: bool, rerun: &Rerun) -> Result<()> {
-    let tier = match env::var("XPC_SERVICE_NAME").ok().filter(|l| l != "0") {
-        None => SpawnTier::Shell,
-        Some(label) => read_spawn_tier(&label),
-    };
-    match launchd_qos_verdict(&tier, paint_smoke_will_run, rerun)? {
-        Some(note) => {
-            println!("==> {note}");
-            Ok(())
-        }
-        None => Ok(()),
-    }
-}
-
-/// Ask launchd what tier it spawned this job at. Never fails: every unreadable
-/// answer is [`SpawnTier::Unknown`].
-fn read_spawn_tier(label: &str) -> SpawnTier {
-    let uid = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-    let Some(uid) = uid else {
-        return SpawnTier::Unknown;
-    };
-    let out = Command::new("launchctl")
-        .arg("print")
-        .arg(format!("gui/{uid}/{label}"))
-        .output();
-    let Ok(out) = out else {
-        return SpawnTier::Unknown;
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("spawn type = ") {
-            // "interactive (4)" — the tier name is the first word.
-            let name = rest.split_whitespace().next().unwrap_or("").to_string();
-            return if name == "interactive" {
-                SpawnTier::Interactive
-            } else if name.is_empty() {
-                SpawnTier::Unknown
-            } else {
-                SpawnTier::Other(name)
-            };
-        }
-    }
-    SpawnTier::Unknown
-}
-
-/// The decision, without the environment. `Ok(None)` is silence, `Ok(Some(note))`
-/// is something the transcript should say, `Err` is the refusal, whose fix is
-/// `rerun`'s launcher command.
-pub fn launchd_qos_verdict(
-    tier: &SpawnTier,
-    paint_smoke_will_run: bool,
-    rerun: &Rerun,
-) -> Result<Option<String>> {
-    if !paint_smoke_will_run {
-        // No smoke, no starvation to worry about: --no-paint-smoke already
-        // carries its own (much louder) refusal on a notarized real cut.
-        return Ok(None);
-    }
-    match tier {
-        SpawnTier::Shell | SpawnTier::Interactive => Ok(None),
-        SpawnTier::Unknown => Ok(Some(
-            "scheduler tier: this cut is a launchd job whose spawn type launchd would not \
-             name — if its plist does not say ProcessType=Interactive, the paint smoke will \
-             be sampled at UTILITY and can fail for the scheduler's reasons (docs/RELEASING.md)"
-                .to_string(),
-        )),
-        // The launcher bootstraps the ProcessType=Interactive agent itself. At a lower
-        // tier the paint smoke's 50 ms timer fires 25-75 ms late and goes red after the
-        // claim (docs/RELEASING.md).
-        SpawnTier::Other(name) => Err(Error::new(format!(
-            "this cut runs at launchd tier {name:?}, which starves the paint smoke; nothing \
-             was claimed\n\
-             fix:  {}",
-            rerun.command
-        ))),
-    }
-}
-
-/// The provenance gate: refuse, BEFORE the claim, a cut whose files would all carry
-/// `com.apple.provenance`.
-///
-/// macOS stamps that attribute on every file a provenance-TRACKED process writes, and a
-/// process is tracked when its executable carries the tag or its parent is tracked
-/// (`atpkg::provenance` has the table). These can bring it into a cut, and this gate
-/// checks each:
-///
-/// * the `trustc` the native slice will run — [`trustc_probe`] proved it compiles; its
-///   attribute decides whether every object file, the proof snapshot and the release
-///   artifacts inherit the tag (tools/proof_snapshot.py then refuses the snapshot AFTER
-///   the ledger claim — a burned build number);
-/// * the `targo` beside it, which drives that trustc and writes on its own;
-/// * the dynamic libraries under the bundle's `lib/` that trustc loads — a tagged one
-///   tracks the process that loads it, so they carry the tag into
-///   a cut exactly as a tagged `trustc` does;
-/// * the cutter's own binary — AND, separately, whether this PROCESS is tracked, which
-///   the binary's attribute cannot tell (a clean cutter under a tracked parent — a shell
-///   inside aterm.app, an agent started from a tagged `claude` — is tracked too). That is
-///   MEASURED by writing a probe file and reading the attribute back; nothing this gate
-///   could do would untrack a running process, and it says what does.
-///
-/// THE TOOLCHAIN IS HEALED FIRST ([`heal_toolchain`]): a tagged trustc, targo, dylib or
-/// cutter binary is cleared in place by the same launchd job `aterm pkg` uses
-/// (`atpkg::provenance::heal`, the one cure), and only what is STILL tagged afterwards is
-/// refused — before the claim, so a refusal burns no build number. The heal cannot untrack
-/// a running process: a cutter whose own binary was tagged is tracked until it is run again,
-/// and the probe below says so.
-///
-/// A path this gate cannot inspect is a refusal, not a pass: the tag's whole failure mode
-/// is being invisible until after the claim.
-pub fn provenance_gate(trustc: &Path, rerun: &Rerun) -> Result<()> {
-    provenance_gate_with(trustc, atpkg::provenance::heal, rerun)
-}
-
-/// [`provenance_gate`] with the toolchain heal explicit ([`atpkg::provenance::Healer`]).
-/// A cut passes `atpkg::provenance::heal`; a test that runs the gate over this machine's
-/// INSTALLED toolchain passes one that changes nothing, so a test run never rewrites the
-/// store (the heal itself is tested on a scratch toolchain).
-pub fn provenance_gate_with(
-    trustc: &Path,
-    heal: atpkg::provenance::Healer,
-    rerun: &Rerun,
-) -> Result<()> {
-    let stage2 = trust_stage2_bin()?;
-    let cutter = env::current_exe().and_then(fs::canonicalize).map_err(|e| {
-        Error::new(format!(
-            "provenance gate: cannot resolve the cutter's own binary: {e}"
-        ))
-    })?;
-    let healed = heal_toolchain(trustc, &stage2, &cutter, heal);
-    let carriers = toolchain_carriers(
-        trustc,
-        &stage2,
-        &cutter,
-        atpkg::provenance::PROVENANCE_XATTR,
-    )?;
-    let scratch = env::temp_dir();
-    let tracked = atpkg::provenance::measure_tracked(&scratch).ok_or_else(|| {
-        Error::new(format!(
-            "provenance gate: could not write a probe file under {} to measure whether this \
-             cutter process is provenance-tracked",
-            scratch.display()
-        ))
-    })?;
-    provenance_verdict(&carriers, tracked, healed.why(), rerun)
-}
-
-/// The `(label, path)` pairs of the cut's toolchain that carry `attr` (production:
-/// `com.apple.provenance`): `trustc`, the `targo` in `stage2`, the cutter's own binary, and
-/// the dylibs under the bundle's `lib/` that trustc loads — a process that `dlopen`s a
-/// tagged library becomes tracked, so a clean `trustc` over a tagged
-/// `lib/` writes tagged files all the same. The first three dylibs are named, the count
-/// says the rest. A file that cannot be inspected is an `Err`, never clean.
-fn toolchain_carriers(
-    trustc: &Path,
-    stage2: &Path,
-    cutter: &Path,
-    attr: &str,
-) -> Result<Vec<(&'static str, PathBuf)>> {
-    let mut carriers: Vec<(&'static str, PathBuf)> = Vec::new();
-    for (label, path) in [
-        ("trustc", trustc.to_path_buf()),
-        ("targo", stage2.join("targo")),
-        ("the cutter's own binary", cutter.to_path_buf()),
-    ] {
-        match atpkg::provenance::xattr_names(&path) {
-            Ok(names) if names.iter().any(|n| n == attr) => carriers.push((label, path)),
-            Ok(_) => {}
-            Err(e) => {
-                return Err(Error::new(format!(
-                    "provenance gate: cannot inspect {label} at {} for {attr}: {e}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    if let Some(lib) = trustc
-        .parent()
-        .and_then(Path::parent)
-        .map(|b| b.join("lib"))
-        && lib.is_dir()
-    {
-        let dylibs: Vec<PathBuf> = atpkg::provenance::tagged_files_under(&lib, attr)
-            .carriers
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "dylib"))
-            .collect();
-        for path in dylibs.iter().take(3) {
-            carriers.push(("a library trustc loads", path.clone()));
-        }
-        if dylibs.len() > 3 {
-            carriers.push((
-                "…and more libraries under the bundle's lib/ (count in the message)",
-                lib.join(format!("({} tagged dylibs in all)", dylibs.len())),
-            ));
-        }
-    }
-    Ok(carriers)
-}
-
-/// What [`heal_toolchain`] clears: the real `bin/` that holds `trustc`, the bundle's `lib/`
-/// beside it (the dylibs trustc loads), the real directory holding `targo` when it is a
-/// different one, and the cutter's own binary — a FILE, never the directory it sits in (a
-/// cargo `target/`). Every path is resolved first: the store reaches the bundle through its
-/// `current` link, and the heal never follows a link.
-fn toolchain_heal_roots(trustc: &Path, stage2: &Path, cutter: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut add = |path: PathBuf| {
-        if path.exists() && !roots.contains(&path) {
-            roots.push(path);
-        }
-    };
-    if let Some(bin) = fs::canonicalize(trustc)
-        .ok()
-        .and_then(|real| real.parent().map(Path::to_path_buf))
-    {
-        if let Some(bundle) = bin.parent() {
-            add(bundle.join("lib"));
-        }
-        add(bin);
-    }
-    if let Some(targo_dir) = fs::canonicalize(stage2.join("targo"))
-        .ok()
-        .and_then(|real| real.parent().map(Path::to_path_buf))
-    {
-        add(targo_dir);
-    }
-    if let Ok(cutter) = fs::canonicalize(cutter) {
-        add(cutter);
-    }
-    roots.sort();
-    roots
-}
-
-/// Clear `com.apple.provenance` from the toolchain this cut is about to run and from the
-/// cutter's own binary ([`toolchain_heal_roots`]) before [`provenance_gate`] reads them,
-/// and say so on the transcript when it cleared something. `heal` is
-/// `atpkg::provenance::heal` in a cut: one launchd job made only of platform binaries,
-/// untracked whatever this process is, that removes that ONE attribute and re-measures. It
-/// runs without the store lock — it changes no byte of any file, and the gate's own read
-/// afterwards is the verdict, so a pass that moves the store underneath can only make it
-/// refuse, never pass wrongly.
-fn heal_toolchain(
-    trustc: &Path,
-    stage2: &Path,
-    cutter: &Path,
-    heal: atpkg::provenance::Healer,
-) -> atpkg::provenance::HealOutcome {
-    let outcome = heal(
-        &toolchain_heal_roots(trustc, stage2, cutter),
-        &env::temp_dir(),
-    );
-    if let atpkg::provenance::HealOutcome::Healed { cleared } = outcome {
-        println!(
-            "==> provenance gate: cleared com.apple.provenance from {} in the toolchain",
-            atpkg::provenance::count_of(cleared, "file")
-        );
-    }
-    outcome
-}
-
-/// The decision behind [`provenance_gate`], without the filesystem: `carriers` are the
-/// `(label, path)` pairs found tagged, `cutter_tracked` is the probe-write measurement,
-/// and `heal_left` is why the toolchain heal left files tagged, when it did. Clean on
-/// both counts passes silently; anything else is the one refusal, naming every carrier,
-/// what the tag does, and the ways out — the launcher spelled as `rerun` repeats this
-/// run, and never offered to a cut that already runs under it.
-pub fn provenance_verdict(
-    carriers: &[(&str, PathBuf)],
-    cutter_tracked: bool,
-    heal_left: Option<&str>,
-    rerun: &Rerun,
-) -> Result<()> {
-    if carriers.is_empty() && !cutter_tracked {
-        return Ok(());
-    }
-    let mut msg = String::from(
-        "com.apple.provenance would reach every file this cut writes — refusing BEFORE the \
-         claim (after it, a build number is burned):\n",
-    );
-    for (label, path) in carriers {
-        msg.push_str(&format!(
-            "  {label}: {} carries com.apple.provenance\n",
-            path.display()
-        ));
-    }
-    if !carriers.is_empty()
-        && let Some(why) = heal_left
-    {
-        msg.push_str(&format!(
-            "  the gate cleared the toolchain and the cutter through a launchd job first, and \
-             the tag stayed: {why}\n"
-        ));
-    }
-    if cutter_tracked {
-        msg.push_str(
-            "  this cutter PROCESS is provenance-tracked: a probe file it wrote came back \
-             tagged — its own binary carried the tag when it was started (cleared above, so a \
-             fresh start can run clean), or it runs under a tracked parent (a shell inside a \
-             tracked aterm.app, or an agent started from a tagged binary such as a natively \
-             installed `claude`); a running process stays tracked, so even an untagged \
-             toolchain would write tagged files from here\n",
-        );
-    }
-    msg.push_str(atpkg::provenance::WHAT_IT_BREAKS);
-    if carriers.is_empty() {
-        // Only the PROCESS is tracked, and nothing clears a running process. Outside the
-        // launcher, the launcher is the fix. Under it, the job is /bin/zsh exec'ing the
-        // targo shim on PATH, which this gate neither reads nor clears: a tagged shim
-        // tracks the job, and `aterm pkg repair` clears the store's bin/ shims.
-        if rerun.under_launcher {
-            msg.push_str(&format!(
-                "\nfix:  aterm pkg repair   (it clears a tagged targo shim, which the job \
-                 execs), then {}",
-                rerun.command
-            ));
-        } else {
-            msg.push_str(&format!(
-                "\nfix:  {}   (runs the cut as a launchd job, untracked)",
-                rerun.command
-            ));
-        }
-        return Err(Error::new(msg));
-    }
-    msg.push_str("\nfix:  ");
-    msg.push_str(atpkg::provenance::REMEDY);
-    if rerun.under_launcher {
-        return Err(Error::new(msg));
-    }
-    msg.push_str(&format!(
-        // A runnable launcher command, never `launchctl submit`: submit's tier starves
-        // the post-claim paint smoke (docs/RELEASING.md); `tools/cut-launch.sh`
-        // bootstraps the ProcessType=Interactive agent itself.
-        "\nor:   with the toolchain clean, run this cut as a launchd job: `{}` (not \
-         `launchctl submit`, which runs at QOS_CLASS_UTILITY and starves the paint smoke)",
-        rerun.command
-    ));
-    Err(Error::new(msg))
-}
-
 /// The x86_64 compat slice builds on upstream stable (buildplan.rs pins
 /// `RUSTUP_TOOLCHAIN=stable`), so probe STABLE's installed targets — a bare
 /// `rustup target list` would resolve the repo's `trust` toolchain via
 /// rust-toolchain.toml, and custom toolchains never carry rustup-managed
-/// targets. When the target is absent, print the exact remediation and
-/// require the explicit `--arm64-only` to proceed single-arch (spec decision
-/// 18) — never silently ship a thinner artifact.
+/// targets. When the target is absent, print the exact remediation — the release
+/// is universal, and never silently ships a thinner artifact.
 /// STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std: `targo --unverified
 /// check --target x86_64-apple-darwin -p aterm` fails E0463).
 pub fn x86_target_probe() -> Result<()> {
@@ -4233,12 +3571,10 @@ pub fn x86_target_probe() -> Result<()> {
         .output()
         .map_err(|e| {
             // rustup is wanted for one thing: upstream stable's x86_64-apple-darwin
-            // std, which Trust lacks. On a Trust-only machine that is a choice about
-            // what to ship, so the escape hatch is named.
+            // std, which Trust lacks.
             Error::new(format!(
                 "failed to run rustup ({e}); the x86_64 slice needs upstream stable's std.\n\
-                 fix:  install rustup, then `rustup +stable target add x86_64-apple-darwin`\n\
-                 or:   cut with --arm64-only"
+                 fix:  install rustup, then `rustup +stable target add x86_64-apple-darwin`"
             ))
         })?;
     if !out.status.success() {
@@ -4261,23 +3597,18 @@ pub fn x86_target_probe() -> Result<()> {
     ))
 }
 
-/// Whether this cut ships a universal binary, and — when it does — the proof, BEFORE the
-/// claim, that this builder can both BUILD the x86_64 slice (`target`, the stable
-/// `x86_64-apple-darwin` std) and RUN it (`rosetta`). The build lane runs the slice under
-/// Rosetta after it is linked (buildplan.rs, docs/DESIGN-intel-just-works-2026-09-14.md
-/// §3.1) — past `ledger::claim`, which has already pushed the release commit and taken a
-/// build number, so this refuses pre-claim, where a refused cut consumes nothing.
-/// `--arm64-only` asks neither probe. Both probes are injected so every arm is testable
-/// on a machine that has Rosetta.
+/// The proof, BEFORE the release's one build (`artifact::build`), that this builder can
+/// both BUILD the x86_64 slice (`target`, the stable `x86_64-apple-darwin` std) and RUN
+/// it (`rosetta`): the release is universal, and the build runs the slice under Rosetta
+/// after it is linked (buildplan.rs, docs/DESIGN-intel-just-works-2026-09-14.md §3.1),
+/// so a builder that cannot is refused before minutes of compile. The cut builds
+/// nothing, so it asks neither. Both probes are injected so every arm is testable on a
+/// machine that has Rosetta.
 pub(crate) fn universal_gate(
-    arm64_only: bool,
     target: impl FnOnce() -> Result<()>,
     rosetta: impl FnOnce() -> std::result::Result<(), String>,
-) -> Result<bool> {
-    if arm64_only {
-        return Ok(false);
-    }
-    // The cut appends the remedies itself: the probe returns a fault, and this is the only
+) -> Result<()> {
+    // The build appends the remedies itself: the probe returns a fault, and this is the only
     // caller that must STOP, so it is the only one that has to say what to do about it.
     target().map_err(|e| {
         Error::new(format!(
@@ -4286,18 +3617,17 @@ pub(crate) fn universal_gate(
         ))
     })?;
     rosetta().map_err(Error::new)?;
-    Ok(true)
+    Ok(())
 }
 
-/// The refusal a universal cut gets on a builder that cannot RUN its x86_64 slice.
-pub(crate) const ROSETTA_REFUSAL: &str = "the universal cut RUNS its x86_64 slice under Rosetta before it \
+/// The refusal a release build gets on a builder that cannot RUN its x86_64 slice.
+pub(crate) const ROSETTA_REFUSAL: &str = "the universal build RUNS its x86_64 slice under Rosetta before it \
      ships (an unexecuted slice is how every Intel-only fault reached a release), and Rosetta \
-     does not run here — softwareupdate --install-rosetta --agree-to-license, or pass \
-     --arm64-only to ship an Apple-Silicon-only build deliberately";
+     does not run here — softwareupdate --install-rosetta --agree-to-license";
 
 /// Whether Rosetta runs a trivial x86_64 program here (`/usr/bin/arch -x86_64
 /// /usr/bin/true`). `run` spawns, injected so the refusal is testable on a machine that
-/// has Rosetta. The ONE Rosetta probe: the pre-claim [`universal_gate`], the provision
+/// has Rosetta. The ONE Rosetta probe: the pre-build [`universal_gate`], the provision
 /// audit, and the post-build slice run all ask it.
 pub(crate) fn rosetta_runs(
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
@@ -4337,8 +3667,8 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
     let free_gib = avail_kib / (1024 * 1024);
     if free_gib < MIN_FREE_DISK_GIB {
         return Err(Error::new(format!(
-            "only {free_gib} GiB free — a universal release build needs at least \
-             {MIN_FREE_DISK_GIB} GiB (two release target trees + dist/ staging)"
+            "only {free_gib} GiB free — a release needs at least {MIN_FREE_DISK_GIB} GiB \
+             (its build's two release target trees, the cut's dist/ staging)"
         )));
     }
     Ok(free_gib)
@@ -4346,7 +3676,6 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod universal_gate_tests {
-    use std::cell::Cell;
     use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
@@ -4359,40 +3688,24 @@ mod universal_gate_tests {
         }
     }
 
-    /// A builder without Rosetta is refused by the PRE-CLAIM gate, naming the remedy and
-    /// the escape.
+    /// A builder without Rosetta is refused before the build, naming the remedy.
     #[test]
-    fn no_rosetta_is_refused_before_the_claim() {
-        let err = universal_gate(false, || Ok(()), || Err(ROSETTA_REFUSAL.to_string()))
-            .expect_err("no Rosetta must refuse a universal cut");
+    fn no_rosetta_is_refused_before_the_build() {
+        let err = universal_gate(|| Ok(()), || Err(ROSETTA_REFUSAL.to_string()))
+            .expect_err("no Rosetta must refuse a universal build");
         assert_eq!(err.to_string(), ROSETTA_REFUSAL);
+        assert!(ROSETTA_REFUSAL.contains("softwareupdate --install-rosetta"));
         assert!(
-            ROSETTA_REFUSAL.contains("softwareupdate --install-rosetta")
-                && ROSETTA_REFUSAL.contains("--arm64-only")
+            !ROSETTA_REFUSAL.contains("--arm64-only"),
+            "no single-arch escape"
         );
     }
 
-    /// Each arm asks only what it needs: `--arm64-only` neither probe; a missing stable
-    /// target stops before Rosetta is asked, with the target remedies laid out; both
-    /// present is a universal cut.
+    /// A missing stable target stops before Rosetta is asked, with the target remedies
+    /// laid out; both present pass.
     #[test]
-    fn each_arm_asks_only_the_probes_it_needs() {
-        let asked = Cell::new(0);
-        let probe = || {
-            asked.set(asked.get() + 1);
-            Ok(())
-        };
-        assert!(
-            !universal_gate(true, probe, || unreachable!("arm64-only asks no Rosetta")).unwrap()
-        );
-        assert_eq!(
-            asked.get(),
-            0,
-            "--arm64-only must not probe the x86_64 target"
-        );
-
+    fn a_missing_target_stops_before_rosetta_is_asked() {
         let err = universal_gate(
-            false,
             || Err(Error::new("x86_64-apple-darwin target missing")),
             || unreachable!("a missing target stops before Rosetta is asked"),
         )
@@ -4402,8 +3715,7 @@ mod universal_gate_tests {
             err.contains("target missing") && err.contains("fix:  rustup +stable target add"),
             "{err}"
         );
-
-        assert!(universal_gate(false, || Ok(()), || Ok(())).unwrap());
+        assert!(universal_gate(|| Ok(()), || Ok(())).is_ok());
     }
 
     /// The one Rosetta probe runs `/usr/bin/arch -x86_64 /usr/bin/true`, and a failed
@@ -4431,33 +3743,6 @@ mod universal_gate_tests {
             ROSETTA_REFUSAL
         );
         assert_eq!(rosetta_runs(&mut |_| Ok(exited(0))), Ok(()));
-    }
-
-    /// Bound to the real gate: `run_all` — which `publish.rs` runs before `ledger::claim` —
-    /// decides universality through `universal_gate` with the REAL Rosetta probe. Asserted as
-    /// source because the alternative is a builder without Rosetta.
-    #[test]
-    fn the_pre_claim_gate_asks_rosetta() {
-        let gates = include_str!("gates.rs");
-        let body = &gates[gates.find("pub fn run_all(").expect("run_all")..];
-        let body = &body[..body.find("\n}\n").expect("end of run_all")];
-        // Split so these assertions do not match themselves.
-        let decided = body
-            .find(concat!(
-                "universal_gate(",
-                "opts.arm64_only, x86_target_probe"
-            ))
-            .expect("run_all decides universality through universal_gate");
-        assert!(
-            body[decided..].contains(concat!("rosetta_runs(", "&mut |command| command.output())")),
-            "run_all must hand universal_gate the real Rosetta probe"
-        );
-        let publish = include_str!("publish.rs");
-        let gated = publish
-            .find("gates::run_all(")
-            .expect("the cut runs the gates");
-        let claimed = publish.find("ledger::claim(").expect("the cut claims");
-        assert!(gated < claimed, "the gates must run before the claim");
     }
 }
 
@@ -4501,104 +3786,7 @@ mod cut_lease_tests {
 }
 
 #[cfg(test)]
-mod launchd_qos_tests {
-    use super::*;
-    use crate::publish::CutKind;
-
-    fn rerun(kind: CutKind) -> Rerun {
-        Rerun {
-            under_launcher: false,
-            ..Rerun::of(kind, Some("me/scratch"))
-        }
-    }
-
-    #[test]
-    fn a_shell_and_an_interactive_agent_are_the_calibrated_cases() {
-        for tier in [SpawnTier::Shell, SpawnTier::Interactive] {
-            assert_eq!(
-                launchd_qos_verdict(&tier, true, &rerun(CutKind::Real))
-                    .expect("calibrated tiers pass"),
-                None,
-                "{tier:?} must pass silently"
-            );
-        }
-    }
-
-    /// `launchctl submit`'s tier, refused BEFORE the claim rather than sampled
-    /// after it.
-    #[test]
-    fn a_utility_job_is_refused_with_the_launcher_remedy() {
-        let err = launchd_qos_verdict(
-            &SpawnTier::Other("background".to_string()),
-            true,
-            &rerun(CutKind::Real),
-        )
-        .expect_err("a starved tier must not reach the claim");
-        let msg = err.to_string();
-        assert!(msg.contains("\"background\""), "it names the tier: {msg}");
-        assert!(msg.contains("nothing was claimed"), "{msg}");
-        assert!(
-            msg.contains("fix:  tools/cut-launch.sh --release-credentials <path>"),
-            "the one remedy is the launcher, which sets the tier itself: {msg}"
-        );
-        assert!(
-            !msg.contains("interactive shell"),
-            "a shell under aterm.app is refused by the provenance gate: {msg}"
-        );
-    }
-
-    /// The fix repeats THIS run: copied from a dry run's or a rehearsal's refusal, it
-    /// must not start a real cut, which claims a build number and publishes.
-    #[test]
-    fn the_launcher_remedy_keeps_the_runs_own_flags() {
-        for (kind, spelled) in [
-            (
-                CutKind::DryRun,
-                "fix:  tools/cut-launch.sh --dry-run --release-credentials <path>",
-            ),
-            (
-                CutKind::Rehearse,
-                "fix:  tools/cut-launch.sh --rehearse me/scratch --release-credentials <path>",
-            ),
-        ] {
-            let msg = launchd_qos_verdict(
-                &SpawnTier::Other("background".to_string()),
-                true,
-                &rerun(kind),
-            )
-            .expect_err("a starved tier must not reach the claim")
-            .to_string();
-            assert!(msg.ends_with(spelled), "{kind:?}: {msg}");
-        }
-    }
-
-    /// Cannot-tell is a NOTE, not a refusal — the opposite of the identity gate,
-    /// and deliberately: the cost here is a resumable flake, not a bad artifact.
-    #[test]
-    fn an_unreadable_tier_notes_and_proceeds() {
-        let note = launchd_qos_verdict(&SpawnTier::Unknown, true, &rerun(CutKind::Real))
-            .expect("cannot-tell must not block a release")
-            .expect("but it must say something");
-        assert!(note.contains("ProcessType=Interactive"), "{note}");
-    }
-
-    /// No smoke, nothing to starve.
-    #[test]
-    fn no_paint_smoke_makes_the_tier_irrelevant() {
-        assert_eq!(
-            launchd_qos_verdict(
-                &SpawnTier::Other("background".to_string()),
-                false,
-                &rerun(CutKind::Real)
-            )
-            .expect("nothing to starve"),
-            None
-        );
-    }
-}
-
-#[cfg(test)]
-mod closure_tests {
+mod submodule_tests {
     use super::*;
     use crate::ledger::RunOut;
     use std::sync::Mutex;
@@ -4626,13 +3814,6 @@ mod closure_tests {
                 calls: Mutex::new(Vec::new()),
             }
         }
-        fn saw(&self, needle: &str) -> bool {
-            self.calls
-                .lock()
-                .expect("calls")
-                .iter()
-                .any(|c| c.contains(needle))
-        }
     }
 
     impl GitRunner for FakeGit {
@@ -4649,9 +3830,6 @@ mod closure_tests {
             }
         }
     }
-
-    const HEAD: &str = "1111111111111111111111111111111111111111";
-    const TIP: &str = "2222222222222222222222222222222222222222";
 
     #[test]
     fn a_submodule_off_its_gitlink_is_refused_and_named() {
@@ -4730,188 +3908,126 @@ mod closure_tests {
         );
         assert!(msg.contains("fix:"), "{msg}");
     }
-
-    #[test]
-    fn a_closure_untouched_by_the_diff_is_identical() {
-        let git = FakeGit::new(vec![
-            ("cat-file -e", out(0, "")),
-            ("merge-base --is-ancestor", out(0, "")),
-            ("diff --name-only", out(0, "")),
-        ]);
-        assert_eq!(
-            cutter_source_closure(&git, HEAD, TIP),
-            SourceClosure::Identical
-        );
-        // The diff must be SCOPED — an unscoped one would call every peer push a
-        // change to the cutter and hand the race straight back.
-        assert!(
-            git.saw("-- crates vendor"),
-            "the diff must name SOURCE_INPUTS"
-        );
-    }
-
-    #[test]
-    fn a_stamp_this_checkout_does_not_have_is_unresolvable() {
-        let git = FakeGit::new(vec![("cat-file -e", out(1, ""))]);
-        assert!(matches!(
-            cutter_source_closure(&git, HEAD, TIP),
-            SourceClosure::Unresolvable(_)
-        ));
-    }
-
-    /// Provenance, not coincidence: a binary from a foreign branch whose files
-    /// happen to match is still not this tree's cutter. BOTH directions must be
-    /// asked and refused — a missing answer defaults to success here.
-    #[test]
-    fn a_stamp_off_this_line_of_history_is_unresolvable() {
-        let git = FakeGit::new(vec![
-            ("cat-file -e", out(0, "")),
-            ("merge-base --is-ancestor 1111", out(1, "")),
-            ("merge-base --is-ancestor 2222", out(1, "")),
-        ]);
-        match cutter_source_closure(&git, HEAD, TIP) {
-            SourceClosure::Unresolvable(why) => assert!(why.contains("one line"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        assert!(
-            !git.saw("diff --name-only"),
-            "no diff is taken off the line"
-        );
-    }
-
-    /// A real cut builds the published commit, usually OLDER than the tip the
-    /// cutter compiled at: a stamp that DESCENDS from the head is the
-    /// same line of history, and an untouched closure makes it that head's cutter.
-    /// Before, only a stamp that was an ancestor of HEAD counted, so every such cut
-    /// would have been refused.
-    #[test]
-    fn a_stamp_that_descends_from_the_head_is_the_same_line() {
-        let git = FakeGit::new(vec![
-            ("cat-file -e", out(0, "")),
-            // stamp (1111) is NOT an ancestor of head (2222)…
-            ("merge-base --is-ancestor 1111", out(1, "")),
-            // …but head is an ancestor of the stamp.
-            ("merge-base --is-ancestor 2222", out(0, "")),
-            ("diff --name-only", out(0, "")),
-        ]);
-        assert_eq!(
-            cutter_source_closure(&git, HEAD, TIP),
-            SourceClosure::Identical
-        );
-        assert!(git.saw("merge-base --is-ancestor 2222222222222222222222222222222222222222 1111"));
-    }
-
-    /// The list in this module is a copy of the one `build.rs` watches and judges
-    /// dirty. Copies drift; this refuses the drift instead of trusting a comment.
-    #[test]
-    fn the_source_closure_matches_the_one_build_rs_judges() {
-        let build_rs = include_str!("../build.rs");
-        let start = build_rs
-            .find("const SOURCE_INPUTS: &[&str] = &[")
-            .expect("build.rs declares SOURCE_INPUTS");
-        let body = &build_rs[start..];
-        let body = &body[..body.find("];").expect("terminated array")];
-        let declared: Vec<String> = body
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix('"'))
-            .filter_map(|l| l.split('"').next())
-            .map(str::to_string)
-            .collect();
-        assert_eq!(
-            declared,
-            SOURCE_INPUTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            "gates::SOURCE_INPUTS and build.rs's SOURCE_INPUTS have drifted — the identity \
-             gate would then admit a binary built from source it cannot see"
-        );
-    }
 }
 
 #[cfg(test)]
 mod cutter_identity_tests {
     use super::*;
+    use crate::ledger::RunOut;
 
     const HEAD: &str = "2617295d1111111111111111111111111111aaaa";
     const OLDER: &str = "15f2b5b6bc51d9ef56e5e4fa50f434fca07f40ee";
 
-    /// The closure verdict every pre-existing case was written under: the stamp
-    /// and HEAD differ AND so does the cutter's own source.
-    fn moved() -> SourceClosure {
-        SourceClosure::Changed(vec!["crates/aterm-release/src/publish.rs".to_string()])
+    /// A git that answers `rev-parse <c>^1` with `parent` and the diff with `changed`.
+    struct Claimed {
+        parent: &'static str,
+        changed: &'static str,
+    }
+
+    impl GitRunner for Claimed {
+        fn git(&self, args: &[&str]) -> Result<RunOut> {
+            let text = match args.first() {
+                Some(&"rev-parse") => self.parent,
+                Some(&"diff") => self.changed,
+                _ => "",
+            };
+            Ok(RunOut {
+                status: 0,
+                stdout: text.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn unrelated() -> Claimed {
+        Claimed {
+            parent: OLDER,
+            changed: "crates/aterm-release/src/publish.rs\n",
+        }
     }
 
     #[test]
-    fn the_trees_own_binary_passes_silently() {
-        assert!(matches!(
-            cutter_identity_verdict(HEAD, HEAD, &moved(), false),
-            Ok(None)
-        ));
+    fn the_commits_own_binary_is_its_cutter() {
+        let note = own_cutter_with(&unrelated(), HEAD, HEAD).expect("its own");
+        assert!(note.contains("itself"), "{note}");
     }
 
-    /// A real cut by a binary older than its own source.
+    /// Another commit's binary is refused, whatever moved between them: the release
+    /// re-runs as the release commit's own cutter instead of reconciling two trees.
     #[test]
-    fn a_stale_binary_cannot_cut_for_real() {
-        let err = cutter_identity_verdict(OLDER, HEAD, &moved(), false)
-            .expect_err("a stale cutter must not cut a real release");
-        let msg = err.to_string();
-        assert!(msg.contains(OLDER), "{msg}");
-        assert!(msg.contains(HEAD), "{msg}");
-        assert!(
-            msg.contains("targo clean --release -p aterm-release"),
-            "{msg}"
+    fn another_commits_binary_is_refused_with_the_one_way_to_its_own() {
+        let why = own_cutter_with(&unrelated(), OLDER, HEAD).expect_err("not its own");
+        assert_eq!(
+            why,
+            format!("this aterm-release binary was built from {OLDER}, not {HEAD}")
         );
+        let refusal = own_cutter_refusal(&why, HEAD);
         assert!(
-            msg.contains("crates/aterm-release/src/publish.rs"),
-            "the refusal names what moved: {msg}"
+            refusal.contains("targo --unverified ship release")
+                && refusal.contains("targo clean --release -p aterm-release"),
+            "{refusal}"
         );
+        // a doc-only descendant is another commit too: no source closure is reasoned about
+        let docs = Claimed {
+            parent: OLDER,
+            changed: "docs/NOTE.md\n",
+        };
+        assert!(own_cutter_with(&docs, OLDER, HEAD).is_err());
     }
 
-    /// "Cannot tell" must refuse, not pass — an unstamped binary is exactly as
-    /// unproven as a stale one.
+    /// The claim commit is the claimed commit plus its ledger line and changelog roll:
+    /// the claimed commit's cutter finishes it (a resume, an abandon, a recovery).
+    /// NEGATIVE CONTROLS: a third path, or another parent, is another commit.
     #[test]
-    fn an_unstamped_binary_fails_closed() {
-        let err = cutter_identity_verdict("unknown", HEAD, &moved(), false)
-            .expect_err("an unstamped cutter must fail closed");
-        assert!(err.to_string().contains("no build commit"), "{err}");
-    }
-
-    #[test]
-    fn a_dirty_built_binary_fails_closed() {
-        let err = cutter_identity_verdict(DIRTY_BUILD_COMMIT, HEAD, &moved(), false)
-            .expect_err("uncommitted build-time code must never publish after the tree is clean");
+    fn a_claim_commit_is_finished_by_the_cutter_of_the_commit_it_claims() {
+        let claim = Claimed {
+            parent: OLDER,
+            changed: "CHANGELOG.md\nRELEASES.ledger\n",
+        };
+        let note = own_cutter_with(&claim, OLDER, HEAD).expect("the claim's cutter");
+        assert!(note.contains("claim commit"), "{note}");
+        let recut = Claimed {
+            parent: OLDER,
+            changed: "RELEASES.ledger\n",
+        };
         assert!(
-            err.to_string().contains("dirty repository source closure"),
-            "{err}"
+            own_cutter_with(&recut, OLDER, HEAD).is_ok(),
+            "a recut rolls no section"
         );
+        let more = Claimed {
+            parent: OLDER,
+            changed: "CHANGELOG.md\nRELEASES.ledger\ncrates/aterm-release/src/gates.rs\n",
+        };
+        assert!(own_cutter_with(&more, OLDER, HEAD).is_err());
+        let other_parent = Claimed {
+            parent: "3333333333333333333333333333333333333333",
+            changed: "RELEASES.ledger\n",
+        };
+        assert!(own_cutter_with(&other_parent, OLDER, HEAD).is_err());
     }
 
-    /// A dry-run publishes nowhere, so it proceeds — but says so, because its
-    /// results came from code other than the tree.
+    /// "Cannot tell" refuses: an unstamped or dirty-built binary is never any commit's
+    /// cutter, not even through a claim commit.
     #[test]
-    fn a_dry_run_proceeds_but_says_so() {
-        let note = cutter_identity_verdict(OLDER, HEAD, &moved(), true)
-            .expect("a dry-run must not be blocked")
-            .expect("a mismatched dry-run must say something");
-        assert!(note.contains("dry-run publishes nowhere"), "{note}");
-        assert!(note.contains("OTHER code"), "{note}");
-        assert!(
-            cutter_identity_verdict("unknown", HEAD, &moved(), true).is_ok(),
-            "an unstamped dry-run is not blocked either"
-        );
-        // ...and a matching dry-run stays silent.
-        assert!(matches!(
-            cutter_identity_verdict(HEAD, HEAD, &moved(), true),
-            Ok(None)
-        ));
+    fn an_unstamped_or_dirty_binary_fails_closed() {
+        let claim = Claimed {
+            parent: "unknown",
+            changed: "RELEASES.ledger\n",
+        };
+        let why = own_cutter_with(&claim, "unknown", HEAD).expect_err("unstamped");
+        assert!(why.contains("no build commit"), "{why}");
+        let why = own_cutter_with(&unrelated(), DIRTY_BUILD_COMMIT, HEAD).expect_err("dirty");
+        assert!(why.contains("dirty repository source closure"), "{why}");
     }
 
+    /// A dry-run publishes nowhere, so it proceeds — but the gate says so; a real run
+    /// (or a rehearsal) is refused.
     #[test]
-    fn a_stale_rehearsal_is_refused_because_it_mutates_a_remote() {
-        let err = cutter_identity_verdict(OLDER, HEAD, &moved(), false)
-            .expect_err("a scratch-repository publication still needs the tree's own cutter");
-        assert!(err.to_string().contains(OLDER), "{err}");
+    fn only_a_dry_run_proceeds_with_another_commits_cutter() {
+        let other = "4444444444444444444444444444444444444444";
+        assert!(own_cutter_gate(&unrelated(), other, true).is_ok());
+        let err = own_cutter_gate(&unrelated(), other, false).expect_err("refused");
+        assert!(err.to_string().contains("fix:"), "{err}");
     }
 
     /// The stamp must actually be wired. A dirty test build deliberately carries
@@ -4925,46 +4041,6 @@ mod cutter_identity_tests {
             BUILD_COMMIT.chars().all(|c| c.is_ascii_hexdigit()),
             "not hex: {BUILD_COMMIT}"
         );
-    }
-
-    /// THE RACE THIS GATE USED TO LOSE. A peer pushes to another program while
-    /// the cutter is compiling; HEAD moves; not one byte the binary was built
-    /// from moved with it. The binary IS what this tree builds, so it cuts —
-    /// and says which two commits it reconciled.
-    #[test]
-    fn a_peer_push_that_misses_the_cutters_source_does_not_stale_it() {
-        let note = cutter_identity_verdict(OLDER, HEAD, &SourceClosure::Identical, false)
-            .expect("an unchanged source closure is not a stale cutter")
-            .expect("it must say what it reconciled");
-        assert!(note.contains(OLDER), "{note}");
-        assert!(note.contains(HEAD), "{note}");
-        assert!(note.contains("source closure"), "{note}");
-    }
-
-    /// ...but an unstamped or dirty binary is never rescued by a closure answer:
-    /// there is no commit to compare, so `Identical` cannot be meant about it.
-    #[test]
-    fn the_closure_escape_needs_a_real_stamp() {
-        for stamp in ["unknown", DIRTY_BUILD_COMMIT] {
-            assert!(
-                cutter_identity_verdict(stamp, HEAD, &SourceClosure::Identical, false).is_err(),
-                "{stamp} must fail closed whatever the closure says"
-            );
-        }
-    }
-
-    /// An unresolvable closure refuses and says it could not tell — never the
-    /// permissive answer.
-    #[test]
-    fn an_unresolvable_closure_refuses_and_says_so() {
-        let err = cutter_identity_verdict(
-            OLDER,
-            HEAD,
-            &SourceClosure::Unresolvable("not in this checkout".to_string()),
-            false,
-        )
-        .expect_err("cannot tell is a refusal");
-        assert!(err.to_string().contains("cannot be established"), "{err}");
     }
 }
 
@@ -5011,6 +4087,24 @@ mod toolchain_pin_tests {
         let after = pin_first_success(&cell, || Ok(PathBuf::from("/seal/beta/bin")))
             .expect("the retry resolves");
         assert_eq!(after, Path::new("/seal/beta/bin"));
+    }
+
+    /// `ship release`'s prover, pinned before any resolution: every later ask of the
+    /// process answers it, never the store's current build — and a second, different
+    /// pin is refused rather than splitting the run across two compilers.
+    #[test]
+    fn a_release_pins_its_journaled_prover_before_any_resolution() {
+        let cell: OnceLock<PathBuf> = OnceLock::new();
+        let journaled = Path::new("/store/trust/9192/bin");
+        pin_into(&cell, journaled).expect("first pin");
+        let asked = pin_first_success(&cell, || Ok(PathBuf::from("/store/trust/current/bin")))
+            .expect("pinned");
+        assert_eq!(asked, journaled, "the store's current build is never asked");
+        assert!(
+            pin_into(&cell, journaled).is_ok(),
+            "the same pin again is no change"
+        );
+        assert!(pin_into(&cell, Path::new("/store/trust/9300/bin")).is_err());
     }
 }
 
@@ -5101,454 +4195,6 @@ mod discovery_order_tests {
             vec![stage2.join("bin")]
         );
         fs::remove_dir_all(&root).ok();
-    }
-}
-
-#[cfg(test)]
-mod provenance_gate_tests {
-    use super::*;
-    use crate::publish::CutKind;
-
-    /// A fresh real cut started from a shell, not under the launcher.
-    fn shell_cut() -> Rerun {
-        Rerun {
-            command: "tools/cut-launch.sh --release-credentials <path>".to_string(),
-            under_launcher: false,
-        }
-    }
-
-    /// Clean toolchain, untracked cutter: silent pass.
-    #[test]
-    fn a_clean_toolchain_under_an_untracked_cutter_passes() {
-        assert!(provenance_verdict(&[], false, None, &shell_cut()).is_ok());
-    }
-
-    /// The v0.83.0 shape: a tagged trustc. The refusal names the path, the attribute,
-    /// the post-claim failure it pre-empts, and the remedies — the heal (`aterm pkg
-    /// repair`, the cutter's own), never a re-install that writes the same tagged files.
-    #[test]
-    fn a_tagged_trustc_is_refused_before_the_claim_with_the_remedies() {
-        let trustc = PathBuf::from(
-            "/Users//me/Library/Application Support/aterm/pkg/store/trust/8590/bin/trustc",
-        );
-        let err = provenance_verdict(&[("trustc", trustc.clone())], false, None, &shell_cut())
-            .expect_err("a tagged compiler must not cut");
-        let msg = err.to_string();
-        assert!(msg.contains(&trustc.display().to_string()), "{msg}");
-        assert!(msg.contains("trustc:"), "{msg}");
-        assert!(msg.contains("BEFORE the claim"), "{msg}");
-        assert!(msg.contains("proof_snapshot.py"), "what it breaks: {msg}");
-        assert!(
-            msg.contains("xattr -d"),
-            "why nothing here can fix it: {msg}"
-        );
-        assert!(msg.contains("fix:  `aterm pkg repair`"), "remedy 1: {msg}");
-        assert!(
-            msg.contains("the cutter clears its own toolchain and binary"),
-            "remedy 1, the cutter's half: {msg}"
-        );
-        assert!(
-            !msg.contains("uninstall")
-                && !msg.contains("re-seed")
-                && !msg.contains("TRUST_STAGE2_BIN"),
-            "no re-install, no lane, no environment knob: {msg}"
-        );
-        assert!(msg.contains("tools/cut-launch.sh"), "remedy 3: {msg}");
-        // …and remedy 3 must not send the operator to the launcher that starves
-        // the paint smoke. `launchctl submit` may appear only as the warning it
-        // now is.
-        assert!(
-            msg.contains("not `launchctl submit`"),
-            "remedy 3 names the wrong launcher without warning against it: {msg}"
-        );
-        assert!(msg.contains("QOS_CLASS_UTILITY"), "remedy 3: {msg}");
-        assert!(
-            !msg.contains("cutter PROCESS is provenance-tracked"),
-            "not measured tracked: {msg}"
-        );
-    }
-
-    /// A clean toolchain does not save a tracked cutter process: the tag follows the
-    /// parent too, and the probe write is what shows it. Both causes are named — a cutter
-    /// whose own binary the heal just cleared is tracked until it is started again, and the
-    /// refusal must not blame a parent that may be clean.
-    #[test]
-    fn a_tracked_cutter_process_is_refused_even_with_a_clean_toolchain() {
-        let err = provenance_verdict(&[], true, None, &shell_cut())
-            .expect_err("a tracked cutter must not cut");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cutter PROCESS is provenance-tracked"),
-            "{msg}"
-        );
-        assert!(msg.contains("probe file"), "{msg}");
-        assert!(
-            msg.contains("its own binary carried the tag when it was started")
-                && msg.contains("a fresh start can run clean"),
-            "the cleared-binary cause: {msg}"
-        );
-        assert!(msg.contains("or it runs under a tracked parent"), "{msg}");
-        assert!(
-            msg.contains("\nfix:  tools/cut-launch.sh --release-credentials <path>"),
-            "the launcher is the one fix for a tracked process: {msg}"
-        );
-        assert!(
-            !msg.contains("aterm pkg repair"),
-            "a repair clears files, never a running process: {msg}"
-        );
-    }
-
-    /// Under the launcher the launcher is no remedy — the job already is it. What tracks
-    /// that job, with the toolchain clean, is the targo shim it execs, which this gate
-    /// neither reads nor clears and `aterm pkg repair` does; the refusal names the repair
-    /// and then the same launcher run again.
-    #[test]
-    fn a_tracked_cut_under_the_launcher_is_sent_to_the_repair_not_back_to_the_launcher() {
-        let under = Rerun {
-            under_launcher: true,
-            ..shell_cut()
-        };
-        let msg = provenance_verdict(&[], true, None, &under)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.ends_with(
-                "\nfix:  aterm pkg repair   (it clears a tagged targo shim, which the job execs), \
-                 then tools/cut-launch.sh --release-credentials <path>"
-            ),
-            "{msg}"
-        );
-        assert!(!msg.contains("untracked)"), "{msg}");
-        // With a carrier left, the repair is the fix and the launcher is not offered again.
-        let msg = provenance_verdict(
-            &[("trustc", PathBuf::from("/s/bin/trustc"))],
-            false,
-            None,
-            &under,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(msg.contains("fix:  `aterm pkg repair`"), "{msg}");
-        assert!(!msg.contains("\nor:"), "{msg}");
-    }
-
-    /// A resume's and a dry run's refusal repeat THAT run: a resume that still has to
-    /// rebuild is told `--resume` (a fresh cut is refused while one is journaled), and a
-    /// dry run's copied fix must not start a real cut.
-    #[test]
-    fn the_launcher_fix_repeats_this_run() {
-        for (rerun, spelled) in [
-            (
-                Rerun::resume(),
-                "\nfix:  tools/cut-launch.sh --resume   (runs the cut",
-            ),
-            (
-                Rerun::of(CutKind::DryRun, None),
-                "\nfix:  tools/cut-launch.sh --dry-run --release-credentials <path>   (runs",
-            ),
-        ] {
-            let rerun = Rerun {
-                under_launcher: false,
-                ..rerun
-            };
-            let msg = provenance_verdict(&[], true, None, &rerun)
-                .unwrap_err()
-                .to_string();
-            assert!(msg.contains(spelled), "{rerun:?}: {msg}");
-        }
-    }
-
-    /// Every carrier is named, in the order checked — the operator should not fix one
-    /// and discover the next.
-    #[test]
-    fn every_carrier_is_named_at_once() {
-        let err = provenance_verdict(
-            &[
-                ("trustc", PathBuf::from("/s/bin/trustc")),
-                ("targo", PathBuf::from("/s/bin/targo")),
-                ("the cutter's own binary", PathBuf::from("/t/cargo-ship")),
-            ],
-            true,
-            None,
-            &shell_cut(),
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        let a = msg.find("trustc: /s/bin/trustc").expect("trustc named");
-        let b = msg.find("targo: /s/bin/targo").expect("targo named");
-        let c = msg
-            .find("the cutter's own binary: /t/cargo-ship")
-            .expect("cutter named");
-        assert!(a < b && b < c, "{msg}");
-    }
-
-    /// A tag the heal could not clear is still refused — the refusal stays for every
-    /// carrier left — and the refusal says the heal ran and why it did not take.
-    #[test]
-    fn a_tag_the_heal_left_is_refused_and_says_the_heal_ran() {
-        let trustc = PathBuf::from("/s/bin/trustc");
-        let err = provenance_verdict(
-            &[("trustc", trustc.clone())],
-            false,
-            Some("xattr exited 1"),
-            &shell_cut(),
-        )
-        .expect_err("a tag that survived the heal must not cut");
-        let msg = err.to_string();
-        assert!(msg.contains("trustc: /s/bin/trustc carries"), "{msg}");
-        assert!(
-            msg.contains("launchd job first, and the tag stayed: xattr exited 1"),
-            "{msg}"
-        );
-        assert!(msg.contains("the toolchain and the cutter"), "{msg}");
-        assert!(msg.contains("BEFORE the claim"), "{msg}");
-        // With nothing left tagged the heal's reason is not a carrier: a tracked cutter
-        // is refused for itself alone.
-        let msg = provenance_verdict(&[], true, Some("xattr exited 1"), &shell_cut())
-            .unwrap_err()
-            .to_string();
-        assert!(!msg.contains("tag stayed"), "{msg}");
-    }
-
-    /// A store-shaped toolchain: `store/trust/current -> 9192`, the gate handed the
-    /// `current/bin` spelling. The heal covers the REAL `bin/` and `lib/` — never the link
-    /// (the heal does not follow one) — a `targo` in the same `bin/` adds nothing, one in
-    /// another directory adds that directory, and the cutter's own binary is a root of its
-    /// own as a FILE, never the `target/` it sits in.
-    #[cfg(unix)]
-    #[test]
-    fn the_toolchain_heal_covers_the_real_bin_and_lib_and_the_cutter() {
-        let d = env::temp_dir().join(format!("aterm-release-heal-roots-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        let build = d.join("store/trust/9192");
-        fs::create_dir_all(build.join("bin")).unwrap();
-        fs::create_dir_all(build.join("lib")).unwrap();
-        fs::write(build.join("bin/trustc"), b"x").unwrap();
-        fs::write(build.join("bin/targo"), b"x").unwrap();
-        std::os::unix::fs::symlink(&build, d.join("store/trust/current")).unwrap();
-        let cutter = d.join("target/release/aterm-release");
-        fs::create_dir_all(cutter.parent().unwrap()).unwrap();
-        fs::write(&cutter, b"x").unwrap();
-        let stage2 = d.join("store/trust/current/bin");
-        let real = fs::canonicalize(&build).unwrap();
-        let cutter_real = fs::canonicalize(&cutter).unwrap();
-        let mut want = vec![real.join("bin"), real.join("lib"), cutter_real.clone()];
-        want.sort();
-        assert_eq!(
-            toolchain_heal_roots(&stage2.join("trustc"), &stage2, &cutter),
-            want
-        );
-        let elsewhere = d.join("targo-bin");
-        fs::create_dir_all(&elsewhere).unwrap();
-        fs::write(elsewhere.join("targo"), b"x").unwrap();
-        let mut want = vec![
-            real.join("bin"),
-            real.join("lib"),
-            fs::canonicalize(&elsewhere).unwrap(),
-            cutter_real.clone(),
-        ];
-        want.sort();
-        assert_eq!(
-            toolchain_heal_roots(&stage2.join("trustc"), &elsewhere, &cutter),
-            want
-        );
-        // A bundle with no lib/ heals its bin/ alone; nothing resolvable heals nothing.
-        fs::remove_dir_all(build.join("lib")).unwrap();
-        let mut want = vec![real.join("bin"), cutter_real];
-        want.sort();
-        assert_eq!(
-            toolchain_heal_roots(&stage2.join("trustc"), &stage2, &cutter),
-            want
-        );
-        assert!(
-            toolchain_heal_roots(
-                &d.join("absent/trustc"),
-                &d.join("absent"),
-                &d.join("absent/cutter")
-            )
-            .is_empty()
-        );
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    /// A scratch toolchain the way a cut sees it: `bin/trustc`, `bin/targo`, a dylib under
-    /// `lib/`, and a cutter binary in a `target/` of its own.
-    #[cfg(target_os = "macos")]
-    struct ScratchToolchain {
-        _dir: aterm_tempfile::TempDir,
-        trustc: PathBuf,
-        stage2: PathBuf,
-        cutter: PathBuf,
-        files: [PathBuf; 4],
-    }
-
-    #[cfg(target_os = "macos")]
-    impl ScratchToolchain {
-        fn new(label: &str) -> Self {
-            let dir = aterm_tempfile::Builder::new()
-                .prefix(&format!("aterm-release-heal-{label}-"))
-                .tempdir()
-                .unwrap();
-            for sub in ["bundle/bin", "bundle/lib", "target/release"] {
-                fs::create_dir_all(dir.path().join(sub)).unwrap();
-            }
-            let stage2 = dir.path().join("bundle/bin");
-            let files = [
-                stage2.join("trustc"),
-                stage2.join("targo"),
-                dir.path().join("bundle/lib/libstd-x.dylib"),
-                dir.path().join("target/release/aterm-release"),
-            ];
-            for file in &files {
-                fs::write(file, b"not a compiler").unwrap();
-            }
-            Self {
-                trustc: files[0].clone(),
-                cutter: files[3].clone(),
-                stage2,
-                files,
-                _dir: dir,
-            }
-        }
-
-        /// The gate's toolchain half — carriers of `attr` after `heal`, then the verdict
-        /// for an untracked cutter process (the process probe is the one half a test
-        /// process cannot choose, and it is pinned by the verdict tests above).
-        fn gate(&self, heal: atpkg::provenance::Healer, attr: &str) -> Result<()> {
-            let healed = heal_toolchain(&self.trustc, &self.stage2, &self.cutter, heal);
-            let carriers = toolchain_carriers(&self.trustc, &self.stage2, &self.cutter, attr)?;
-            provenance_verdict(&carriers, false, healed.why(), &shell_cut())
-        }
-    }
-
-    /// The attribute the synthetic half tags with: one a test can set, read through the
-    /// very `listxattr` path the gate reads.
-    #[cfg(target_os = "macos")]
-    const PROBE: &str = "user.aterm.probe";
-
-    /// The real launchd heal job, over [`PROBE`].
-    #[cfg(target_os = "macos")]
-    fn heal_probe(roots: &[PathBuf], scratch: &Path) -> atpkg::provenance::HealOutcome {
-        atpkg::provenance::heal_with(roots, scratch, PROBE)
-    }
-
-    /// A heal that clears nothing — the negative control.
-    #[cfg(target_os = "macos")]
-    fn heal_nothing(roots: &[PathBuf], _scratch: &Path) -> atpkg::provenance::HealOutcome {
-        atpkg::provenance::HealOutcome::Unavailable {
-            carriers: roots.to_vec(),
-            why: String::from("the control heals nothing"),
-        }
-    }
-
-    /// THE CUTTER CURES ITS OWN TOOLCHAIN, non-vacuously on any machine: every file of a
-    /// scratch toolchain and the cutter's own binary carry a synthetic attribute; with a
-    /// heal that clears nothing the gate refuses and names all four (and the dylib under
-    /// its library label), and after the REAL launchd heal job over that attribute the gate
-    /// passes with nothing tagged.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_tagged_scratch_toolchain_and_cutter_are_cured_and_then_pass_the_gate() {
-        let t = ScratchToolchain::new("synthetic");
-        for file in &t.files {
-            let out = Command::new("/usr/bin/xattr")
-                .args(["-w", PROBE, "1"])
-                .arg(file)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let msg = t
-            .gate(heal_nothing, PROBE)
-            .expect_err("the negative control: nothing cleared, the gate refuses")
-            .to_string();
-        for (label, file) in [
-            ("trustc", &t.files[0]),
-            ("targo", &t.files[1]),
-            ("a library trustc loads", &t.files[2]),
-            ("the cutter's own binary", &t.files[3]),
-        ] {
-            assert!(
-                msg.contains(&format!("{label}: {} carries", file.display())),
-                "{label}: {msg}"
-            );
-        }
-        assert!(
-            msg.contains("the tag stayed: the control heals nothing"),
-            "{msg}"
-        );
-        t.gate(heal_probe, PROBE)
-            .expect("the heal clears the toolchain and the cutter, and the gate passes");
-        for file in &t.files {
-            assert!(
-                !atpkg::provenance::carries(file, PROBE),
-                "{}",
-                file.display()
-            );
-        }
-    }
-
-    /// THE REAL TAG. Files this test process writes carry `com.apple.provenance` exactly
-    /// when it is tracked (an agent's shell, a shell inside a tracked aterm.app) — the shape
-    /// a tagged trust bundle and a cutter built from such a shell have. Tracked: the
-    /// control refuses on the real attribute, and the real heal clears it so the gate
-    /// passes. Untracked: nothing is tagged, both pass — vacuous, and said so on stderr.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_real_tag_on_a_scratch_toolchain_is_cured_before_the_gate_reads_it() {
-        let attr = atpkg::provenance::PROVENANCE_XATTR;
-        let t = ScratchToolchain::new("real");
-        let tracked = atpkg::provenance::carries(&t.trustc, attr);
-        eprintln!("this test process tracked={tracked}");
-        let control = t.gate(heal_nothing, attr);
-        assert_eq!(control.is_err(), tracked, "{control:?}");
-        t.gate(atpkg::provenance::heal, attr)
-            .expect("the real heal leaves nothing tagged");
-        for file in &t.files {
-            assert!(
-                !atpkg::provenance::carries(file, attr),
-                "{} still tagged",
-                file.display()
-            );
-        }
-    }
-
-    /// The predicate the gate reads, on a real file with a synthetic attribute: listed
-    /// where set, absent where not, and a missing path is an error (which the gate turns
-    /// into a refusal, never a pass).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_gate_reads_the_attribute_through_listxattr() {
-        let d = env::temp_dir().join(format!("aterm-release-provenance-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        let tagged = d.join("trustc");
-        let clean = d.join("targo");
-        fs::write(&tagged, b"x").unwrap();
-        fs::write(&clean, b"x").unwrap();
-        let out = Command::new("/usr/bin/xattr")
-            .args(["-w", "user.aterm.probe", "1"])
-            .arg(&tagged)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            atpkg::provenance::xattr_names(&tagged)
-                .unwrap()
-                .iter()
-                .any(|n| n == "user.aterm.probe")
-        );
-        assert!(!atpkg::provenance::carries(&clean, "user.aterm.probe"));
-        assert!(atpkg::provenance::xattr_names(&d.join("absent")).is_err());
-        let _ = fs::remove_dir_all(&d);
     }
 }
 
@@ -5799,7 +4445,7 @@ mod tag_free_tests {
     }
 
     /// A cut tag's remedy is the bump its preflight twin names
-    /// (`tools/release-preflight.sh`: `fix "pub bump aterm --minor --write"`): a hand
+    /// (the old release preflight's `fix "pub bump aterm --minor --write"`): a hand
     /// edit of `Cargo.toml` leaves `Cargo.lock` behind, and the cutter's own
     /// locked-metadata gate then refuses.
     #[test]
@@ -6742,7 +5388,7 @@ mod staged_bundle_liveness_tests {
     //! THE PRE-CLAIM LIVENESS GATE: a live process under a cut staging
     //! bundle refuses, "could not look" refuses, and only an answered empty look
     //! passes. The owner's aterm ran out of `dist/cut-app/aterm.app` (pid 85619) while
-    //! `bundle::assemble` would have `rm -rf`'d that directory unchecked.
+    //! `bundle::prepare_staging` would have `rm -rf`'d that directory unchecked.
 
     use super::*;
     use crate::bundle::RunningProcess;
@@ -7070,6 +5716,39 @@ mod published_commit_tests {
             "edited in the cut tree",
             "the change was not discarded"
         );
+
+        // THE ONE JUDGE: a file `.git/info/exclude` hides from `git status` is still a
+        // change to the cut tree, as `clean_tree` would refuse it right after.
+        let in_tree = |args: &[&str]| {
+            let out = testing::git()
+                .arg("-C")
+                .arg(&checkout.tree)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        in_tree(&["checkout", "-q", "--", "a"]);
+        fs::write(checkout.tree.join("stray.txt"), "left here").unwrap();
+        let info = repo.work().join(".git/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), "stray.txt\n").unwrap();
+        assert_eq!(
+            in_tree(&["status", "--porcelain"]),
+            "",
+            "porcelain sees nothing"
+        );
+        let error = place_published(&repo.git(), &repo.work(), &source(&second))
+            .expect_err("a file only info/exclude hides is a change")
+            .to_string();
+        assert!(
+            error.contains("has changes") && error.contains("stray.txt"),
+            "{error}"
+        );
+        fs::remove_file(checkout.tree.join("stray.txt")).unwrap();
+        place_published(&repo.git(), &repo.work(), &source(&second))
+            .expect("a clean cut tree moves");
     }
 
     /// A directory at the cut tree's path that is not this repository's worktree is
@@ -7257,673 +5936,8 @@ mod published_commit_tests {
         assert_eq!(report.gated_by_tree.as_deref(), Some(&gated[..9]));
     }
 
-    /// The compiler the measure tests' cut builds with.
+    /// The prover the gate tests' cut judges with.
     const CUT_TC: &str = "/store/trust/9192/bin trustc 43f8b339f8322f6b4cd1d9f7ae9a914eda5fef22";
-
-    /// NOTHING SHIPS UNMEASURED, against real git and the store
-    /// the gate writes. With nothing measured, a real cut REFUSES — naming the
-    /// command that measures the tree — and a dry run states that it would;
-    /// a merge-contract PASS is no measurement; a MEASURE receipt that says
-    /// `measured no`, one about another commit, and a narrowed one that says
-    /// `measured yes` are refused, each named; `measured yes` under the tree's
-    /// MEASURE key, from another commit's run over the same bytes, passes and
-    /// names that run; and `measured yes` under the commit's own key passes.
-    #[test]
-    fn a_real_cut_refuses_a_tree_no_measure_receipt_measured() {
-        let repo = Repo::new("measure");
-        let head = repo.commit("ship me", &[("src/lib.rs", "v1")]);
-        let tree = repo.run(&["rev-parse", "HEAD^{tree}"]);
-        let git = repo.git();
-        let measure = |key: &str, run: &str, scope: &str, measured: &str| {
-            fs::write(
-                repo.receipts().join(key),
-                format!(
-                    "{RECEIPT_MAGIC}\nhead {run}\ntree {tree}\nmode measure\nscope {scope}\n\
-                     verdict PASS\nmerge-contract no\nmeasured {measured}\nskipped none\n\
-                     toolchain {CUT_TC}\nbuild-env none\nbuild-config none\nwhen 1\n"
-                ),
-            )
-            .unwrap();
-        };
-        let measure_gate =
-            |git: &dyn GitRunner, refuse| measure_gate_with(git, refuse, CUT_TC, "HEAD");
-        let measure_report = |git: &dyn GitRunner, receipts: &Path| {
-            super::measure_report(git, &Stores::own(receipts.to_path_buf()), CUT_TC, "HEAD")
-        };
-        let (by_commit, by_tree) = (
-            format!("{RECEIPT_MEASURE_PREFIX}{head}"),
-            format!("{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{tree}"),
-        );
-        let refused = |why: &str| {
-            let err = measure_gate(&git, true)
-                .expect_err("a real cut refuses")
-                .to_string();
-            assert!(err.contains("is not MEASURED"), "{err}");
-            assert!(err.contains(why), "missing {why:?}: {err}");
-            assert!(
-                err.contains(&format!("git worktree add --detach <dir> {head}"))
-                    && err.contains("tools/verify.sh --measure")
-                    && err.contains("Nothing was claimed."),
-                "{err}"
-            );
-            let line = measure_gate(&git, false).expect("a dry run states it");
-            assert!(line.contains("NOT measured") && line.contains("a real cut would refuse"));
-        };
-        refused(&format!("no MEASURE receipt for {}", short(&head)));
-        // A merge-contract PASS is not a measurement.
-        repo.gate_receipt(&head);
-        refused("no MEASURE receipt");
-        measure(&by_commit, &head, "workspace", "no");
-        refused(&format!(
-            "`{RECEIPT_MEASURE_PREFIX}{}` says `measured no`",
-            short(&head)
-        ));
-        measure(&by_commit, &"e".repeat(40), "workspace", "yes");
-        refused("is about another head");
-        measure(&by_commit, &head, "crate:aterm-conformance", "yes");
-        refused("is a narrowed run's");
-        // By the tree, from another commit's run over the same bytes.
-        let other = "f".repeat(40);
-        measure(&by_tree, &other, "workspace", "yes");
-        assert_eq!(
-            measure_report(&git, &repo.receipts()).unwrap(),
-            MeasureReport::Measured {
-                key: format!(
-                    "{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{}",
-                    short(&tree)
-                ),
-                run: short(&other).to_string(),
-                from: None,
-            }
-        );
-        let line = measure_gate(&git, true).expect("measured by its tree");
-        assert!(
-            line.contains("MEASURED") && line.contains(short(&other)),
-            "{line}"
-        );
-        // …and by its own commit's key, which is read first.
-        measure(&by_commit, &head, "workspace", "yes");
-        assert_eq!(
-            measure_report(&git, &repo.receipts()).unwrap(),
-            MeasureReport::Measured {
-                key: format!("{RECEIPT_MEASURE_PREFIX}{}", short(&head)),
-                run: short(&head).to_string(),
-                from: None,
-            }
-        );
-
-        // THE SAME COMPILER: the attack's own
-        // fixture — `measured yes` for these bytes with no `toolchain` line —
-        // MEASURED the tree for any cut. Now a receipt that names no compiler,
-        // or another one, is no measurement for this cut, under either key.
-        let retool = |key: &str, run: &str, toolchain: Option<&str>| {
-            let text = fs::read_to_string(repo.receipts().join(key)).unwrap();
-            let kept: String = text
-                .lines()
-                .filter(|l| !l.starts_with("toolchain "))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            let text = match toolchain {
-                Some(t) => kept.replace("when 1\n", &format!("toolchain {t}\nwhen 1\n")),
-                None => kept,
-            };
-            assert!(text.contains(&format!("head {run}\n")), "{text}");
-            fs::write(repo.receipts().join(key), text).unwrap();
-        };
-        let older = "/store/trust/9100/bin trustc 0000000000000000000000000000000000000000";
-        retool(&by_commit, &head, None);
-        retool(&by_tree, &other, Some(older));
-        refused("names no compiler, and this cut builds with");
-        refused(&format!("was measured with `{older}`"));
-        // A trustc that names no commit cannot be told from another build.
-        let unknown = "/store/trust/9192/bin trustc unknown";
-        retool(&by_commit, &head, Some(unknown));
-        let err = measure_gate_with(&git, true, unknown, "HEAD")
-            .expect_err("no commit, no match")
-            .to_string();
-        assert!(err.contains("name no commit"), "{err}");
-        // The control: the cut's own compiler under the tree's key measures.
-        retool(&by_tree, &other, Some(CUT_TC));
-        let line = measure_gate(&git, true).expect("the same compiler");
-        assert!(line.contains(CUT_TC), "{line}");
-
-        // THE SAME BUILD: a measurement of a release
-        // build made under the caller's `RUSTFLAGS` — or by a run that does not
-        // say — measured a binary this cut, whose builds clear their
-        // environment, does not build.
-        let reenv = |key: &str, env: Option<&str>| {
-            let text = fs::read_to_string(repo.receipts().join(key)).unwrap();
-            let kept: String = text
-                .lines()
-                .filter(|l| !l.starts_with("build-env "))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            let text = match env {
-                Some(e) => kept.replace("when 1\n", &format!("build-env {e}\nwhen 1\n")),
-                None => kept,
-            };
-            fs::write(repo.receipts().join(key), text).unwrap();
-        };
-        let flagged = "RUSTFLAGS=\"-Copt-level=0\"";
-        reenv(&by_tree, Some(flagged));
-        refused(&format!("measured a release build under `{flagged}`"));
-        reenv(&by_tree, None);
-        refused("does not say what build environment its release build took");
-        reenv(&by_tree, Some("none"));
-        let line = measure_gate(&git, true).expect("the same build");
-        assert!(line.contains("MEASURED"), "{line}");
-
-        // THE SAME CONFIG FILES: a measurement whose builds read
-        // a `~/.cargo/config.toml` or an ancestor's config — or a run that
-        // does not say — measured a binary this cut, which reads the tree's
-        // own config in an empty Cargo home, does not build.
-        let reconfig = |key: &str, config: Option<&str>| {
-            let text = fs::read_to_string(repo.receipts().join(key)).unwrap();
-            let kept: String = text
-                .lines()
-                .filter(|l| !l.starts_with("build-config "))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            let text = match config {
-                Some(c) => kept.replace("when 1\n", &format!("build-config {c}\nwhen 1\n")),
-                None => kept,
-            };
-            fs::write(repo.receipts().join(key), text).unwrap();
-        };
-        let home = "cargo-home/config.toml=0123456789abcdef0123456789abcdef01234567";
-        reconfig(&by_tree, Some(home));
-        refused(&format!(
-            "measured a release build reading the cargo config files `{home}`, and this cut \
-             reads only the tree's own (`none`)"
-        ));
-        reconfig(&by_tree, None);
-        refused("does not say what cargo config files its release build read");
-        reconfig(&by_tree, Some("none"));
-        let line = measure_gate(&git, true).expect("the same config files");
-        assert!(line.contains("MEASURED"), "{line}");
-    }
-
-    /// Every entry under `dir`, each file with its bytes and modification time — what
-    /// "nothing was written there" is checked against.
-    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
-        let mut out = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for entry in fs::read_dir(&d).unwrap().flatten() {
-                let path = entry.path();
-                let meta = fs::symlink_metadata(&path).unwrap();
-                if meta.is_dir() {
-                    stack.push(path.clone());
-                }
-                // A directory's own time moves with the test's writes; its
-                // entries are what is compared.
-                let (bytes, when) = if meta.is_file() {
-                    (fs::read(&path).unwrap(), meta.modified().unwrap())
-                } else {
-                    (Vec::new(), std::time::UNIX_EPOCH)
-                };
-                out.push((path, bytes, when));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    /// RECEIPTS ACROSS CLONES: the cut
-    /// runs from a clone of its own, and a MEASURE or a PASS filed in the main
-    /// checkout's store was invisible to it. A checkout named by
-    /// `aterm-release.receiptsFrom` is read too — tree-keyed receipts only,
-    /// under every rule of this clone's (the compiler, `build-env`,
-    /// `build-config`, the tree), never written — and the transcript names the
-    /// store a receipt came from. Unnamed, nothing there is read.
-    #[test]
-    fn a_cut_clone_reads_tree_receipts_from_the_checkout_it_names_and_nothing_else() {
-        let main = Repo::new("across-main");
-        let head = main.commit("ship me", &[("src/lib.rs", "v1")]);
-        let tree = main.run(&["rev-parse", "HEAD^{tree}"]);
-        // The cut clone: its own .git, its own (empty) store, the same commit.
-        let cut_dir = main.root.path().join("cut");
-        let out = testing::git()
-            .args(["clone", "-q"])
-            .arg(main.work())
-            .arg(&cut_dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        let cut = Git::new(&cut_dir);
-        let cut_store = cut_dir.join(".git/aterm-verify/receipts");
-        let main_store = main.receipts();
-        let by_tree = format!("{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{tree}");
-        let measured = |toolchain: &str, env: &str, config: &str, about: &str| {
-            format!(
-                "{RECEIPT_MAGIC}\nhead {head}\ntree {about}\nmode measure\nscope workspace\n\
-                 verdict PASS\nmerge-contract no\nmeasured yes\nskipped none\n\
-                 toolchain {toolchain}\nbuild-env {env}\nbuild-config {config}\nwhen 1\n"
-            )
-        };
-        let configure = |name: &str| {
-            let out = testing::git()
-                .arg("-C")
-                .arg(&cut_dir)
-                .args(["config", "--add", RECEIPTS_FROM_KEY, name])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-        };
-        let gate = |refuse| measure_gate_with(&cut, refuse, CUT_TC, "HEAD");
-
-        // The main checkout measured these bytes with this compiler — and the
-        // cut clone, naming nothing, does not see it.
-        fs::write(
-            main_store.join(&by_tree),
-            measured(CUT_TC, "none", "none", &tree),
-        )
-        .unwrap();
-        let err = gate(true).expect_err("unnamed, another store is never read");
-        assert!(err.to_string().contains("no MEASURE receipt"), "{err}");
-
-        // Named: it counts, and the line says where it came from.
-        configure(main.work().to_str().unwrap());
-        let before = snapshot(main.root.path().join("work/.git").as_path());
-        let line = gate(true).expect("measured in the named checkout");
-        let shown_store = fs::canonicalize(&main_store).unwrap();
-        assert!(
-            line.contains("MEASURED")
-                && line.contains(&format!(
-                    "(from the receipt store {})",
-                    shown_store.display()
-                )),
-            "{line}"
-        );
-        // A commit-keyed MEASURE receipt there is not read: only the tree's key.
-        fs::remove_file(main_store.join(&by_tree)).unwrap();
-        fs::write(
-            main_store.join(format!("{RECEIPT_MEASURE_PREFIX}{head}")),
-            measured(CUT_TC, "none", "none", &tree),
-        )
-        .unwrap();
-        assert!(gate(true).is_err(), "a commit key in another store counts");
-        fs::remove_file(main_store.join(format!("{RECEIPT_MEASURE_PREFIX}{head}"))).unwrap();
-
-        // Every rule holds there exactly as here: another compiler, a build
-        // environment, other config files, another tree — each refused, named.
-        let older = "/store/trust/9100/bin trustc 0000000000000000000000000000000000000000";
-        for (text, why) in [
-            (
-                measured(older, "none", "none", &tree),
-                format!("was measured with `{older}`"),
-            ),
-            (
-                measured(CUT_TC, "RUSTFLAGS=\"-Copt-level=0\"", "none", &tree),
-                "measured a release build under".to_string(),
-            ),
-            (
-                measured(CUT_TC, "none", "cargo-home/config.toml=0123", &tree),
-                "measured a release build reading the cargo config files".to_string(),
-            ),
-            (
-                measured(CUT_TC, "none", "none", &"a".repeat(40)),
-                "is about another tree".to_string(),
-            ),
-        ] {
-            fs::write(main_store.join(&by_tree), text).unwrap();
-            let err = gate(true)
-                .expect_err("a mismatch counts from nowhere")
-                .to_string();
-            assert!(
-                err.contains(&why) && err.contains("(from the receipt store"),
-                "missing {why:?}: {err}"
-            );
-        }
-        fs::write(
-            main_store.join(&by_tree),
-            measured(CUT_TC, "none", "none", &tree),
-        )
-        .unwrap();
-
-        // The PASS of the main checkout gates HEAD by its tree, named.
-        let pass = format!(
-            "{RECEIPT_MAGIC}\nhead {head}\ntree {tree}\nmode fast\nscope workspace\n\
-             verdict PASS\nmerge-contract yes\nskipped none\nwhen 1\n"
-        );
-        fs::write(
-            main_store.join(format!("{RECEIPT_TREE_PREFIX}{tree}")),
-            &pass,
-        )
-        .unwrap();
-        let stores = Stores::of(&cut).unwrap();
-        assert_eq!(stores.others, vec![shown_store.clone()]);
-        let report = receipt_report(&cut, &stores).unwrap();
-        assert_eq!(report.ungated, Vec::<String>::new());
-        assert_eq!(report.gated_from.as_deref(), Some(shown_store.as_path()));
-
-        // This clone's own receipt is read first.
-        fs::create_dir_all(&cut_store).unwrap();
-        fs::write(
-            cut_store.join(&by_tree),
-            measured(CUT_TC, "none", "none", &tree),
-        )
-        .unwrap();
-        fs::write(
-            cut_store.join(format!("{RECEIPT_TREE_PREFIX}{tree}")),
-            &pass,
-        )
-        .unwrap();
-        let line = gate(true).expect("measured here");
-        assert!(!line.contains("from the receipt store"), "{line}");
-        let report = receipt_report(&cut, &Stores::of(&cut).unwrap()).unwrap();
-        assert_eq!(report.gated_from, None);
-
-        // Nothing in the other checkout's .git was written, moved or touched.
-        let mut expected = before;
-        let main_git = main.root.path().join("work/.git");
-        let added = [
-            main_store.join(format!("{RECEIPT_TREE_PREFIX}{tree}")),
-            main_store.join(&by_tree),
-        ];
-        expected.retain(|(p, ..)| !added.contains(p));
-        let mut after = snapshot(&main_git);
-        after.retain(|(p, ..)| !added.contains(p));
-        assert_eq!(after, expected, "the other store was written");
-
-        // A name that is no checkout is stated, never fatal.
-        configure(main.root.path().join("nowhere").to_str().unwrap());
-        let stores = Stores::of(&cut).unwrap();
-        assert_eq!(stores.unresolved.len(), 1, "{stores:?}");
-        fs::remove_file(cut_store.join(&by_tree)).unwrap();
-        fs::write(
-            main_store.join(&by_tree),
-            measured(older, "none", "none", &tree),
-        )
-        .unwrap();
-        let err = gate(true).expect_err("nothing measured").to_string();
-        assert!(err.contains("is not a git checkout"), "{err}");
-    }
-
-    /// A cut clone and the checkout it names, at one commit; `stores` reads both.
-    struct TwoClones {
-        main: Repo,
-        cut_dir: PathBuf,
-        head: String,
-        tree: String,
-    }
-
-    impl TwoClones {
-        fn new(name: &str) -> Self {
-            let main = Repo::new(name);
-            let head = main.commit("ship me", &[("src/lib.rs", "v1")]);
-            let tree = main.run(&["rev-parse", "HEAD^{tree}"]);
-            let cut_dir = main.root.path().join("cut");
-            for args in [
-                vec![
-                    "clone".to_string(),
-                    "-q".into(),
-                    main.work().display().to_string(),
-                    cut_dir.display().to_string(),
-                ],
-                vec![
-                    "-C".into(),
-                    cut_dir.display().to_string(),
-                    "config".into(),
-                    "--add".into(),
-                    RECEIPTS_FROM_KEY.into(),
-                    main.work().display().to_string(),
-                ],
-            ] {
-                assert!(
-                    testing::git()
-                        .args(&args)
-                        .output()
-                        .unwrap()
-                        .status
-                        .success()
-                );
-            }
-            fs::create_dir_all(cut_dir.join(".git/aterm-verify/receipts")).unwrap();
-            Self {
-                main,
-                cut_dir,
-                head,
-                tree,
-            }
-        }
-        fn cut(&self) -> Git {
-            Git::new(&self.cut_dir)
-        }
-        fn own(&self) -> PathBuf {
-            self.cut_dir.join(".git/aterm-verify/receipts")
-        }
-        fn foreign(&self) -> PathBuf {
-            fs::canonicalize(self.main.receipts()).unwrap()
-        }
-        /// A MEASURE receipt of these bytes with `toolchain`, saying `measured`.
-        fn measure(&self, toolchain: &str, measured: &str, when: u64) -> String {
-            let (head, tree) = (&self.head, &self.tree);
-            format!(
-                "{RECEIPT_MAGIC}\nhead {head}\ntree {tree}\nmode measure\nscope workspace\n\
-                 verdict PASS\nmerge-contract no\nmeasured {measured}\nskipped none\n\
-                 toolchain {toolchain}\nbuild-env none\nbuild-config none\nwhen {when}\n"
-            )
-        }
-        /// A merge-contract receipt of these bytes: a PASS, or a FAIL.
-        fn gate(&self, pass: bool, when: u64) -> String {
-            let (head, tree) = (&self.head, &self.tree);
-            let (verdict, contract) = if pass {
-                ("PASS", "yes")
-            } else {
-                ("FAIL", "no")
-            };
-            format!(
-                "{RECEIPT_MAGIC}\nhead {head}\ntree {tree}\nmode fast\nscope workspace\n\
-                 verdict {verdict}\nmerge-contract {contract}\nskipped none\nwhen {when}\n"
-            )
-        }
-    }
-
-    /// THE NEWEST RUN DECIDES, ACROSS STORES: in one store a
-    /// later run's receipt replaces an earlier one's under the same key, so a
-    /// later `measured no` (or a FAIL) un-measures (un-gates) the bytes. Across
-    /// stores the lookup took the first store that held a PASSING receipt, so a
-    /// newer `measured no` here let an older `measured yes` in the main checkout
-    /// count — and an older own pass beat a newer failure there. Among the
-    /// receipts about these bytes, this compiler and this build, the newest
-    /// decides; one about another compiler takes no part, whatever its age.
-    #[test]
-    fn the_newest_receipt_about_the_same_bytes_decides_across_stores() {
-        let w = TwoClones::new("newest-decides");
-        let cut = w.cut();
-        let key = format!("{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{}", w.tree);
-        let report = || measure_report(&cut, &Stores::of(&cut).unwrap(), CUT_TC, "HEAD").unwrap();
-        let older = "/store/trust/9100/bin trustc 0000000000000000000000000000000000000000";
-
-        // Own NEWER `measured no`, the main checkout's OLDER `measured yes`: not measured.
-        fs::write(w.own().join(&key), w.measure(CUT_TC, "no", 20)).unwrap();
-        fs::write(w.foreign().join(&key), w.measure(CUT_TC, "yes", 10)).unwrap();
-        let MeasureReport::Unmeasured { why } = report() else {
-            panic!(
-                "an older pass elsewhere outvoted a newer failure here: {:?}",
-                report()
-            );
-        };
-        assert!(
-            why.contains("says `measured no`") && why.contains("in an older run"),
-            "{why}"
-        );
-        // Own OLDER `measured yes`, the main checkout's NEWER `measured no`: not measured.
-        fs::write(w.own().join(&key), w.measure(CUT_TC, "yes", 10)).unwrap();
-        fs::write(w.foreign().join(&key), w.measure(CUT_TC, "no", 20)).unwrap();
-        assert!(
-            matches!(report(), MeasureReport::Unmeasured { .. }),
-            "an older own pass beat a newer failure elsewhere: {:?}",
-            report()
-        );
-        // The newer run passed, there: measured, from there.
-        fs::write(w.own().join(&key), w.measure(CUT_TC, "no", 10)).unwrap();
-        fs::write(w.foreign().join(&key), w.measure(CUT_TC, "yes", 20)).unwrap();
-        assert!(
-            matches!(report(), MeasureReport::Measured { from: Some(ref s), .. } if *s == w.foreign()),
-            "{:?}",
-            report()
-        );
-        // A newer receipt from ANOTHER compiler is no verdict about this one's
-        // build: the older matching pass still counts — as before, a mismatch
-        // only sends the lookup on.
-        fs::write(w.own().join(&key), w.measure(older, "no", 30)).unwrap();
-        fs::write(w.foreign().join(&key), w.measure(CUT_TC, "yes", 10)).unwrap();
-        assert!(
-            matches!(report(), MeasureReport::Measured { from: Some(_), .. }),
-            "{:?}",
-            report()
-        );
-
-        // The merge contract's tree receipts, the same way.
-        let pass_key = format!("{RECEIPT_TREE_PREFIX}{}", w.tree);
-        let gated = || {
-            receipt_report(&cut, &Stores::of(&cut).unwrap())
-                .unwrap()
-                .ungated
-                .is_empty()
-        };
-        fs::write(w.own().join(&pass_key), w.gate(false, 20)).unwrap();
-        fs::write(w.foreign().join(&pass_key), w.gate(true, 10)).unwrap();
-        assert!(
-            !gated(),
-            "an older PASS elsewhere outvoted a newer FAIL here"
-        );
-        fs::write(w.own().join(&pass_key), w.gate(true, 10)).unwrap();
-        fs::write(w.foreign().join(&pass_key), w.gate(false, 20)).unwrap();
-        assert!(
-            !gated(),
-            "an older own PASS outvoted a newer FAIL elsewhere"
-        );
-        fs::write(w.foreign().join(&pass_key), w.gate(true, 20)).unwrap();
-        let report = receipt_report(&cut, &Stores::of(&cut).unwrap()).unwrap();
-        assert!(report.ungated.is_empty(), "{report:?}");
-        assert_eq!(report.gated_from, Some(w.foreign()));
-        assert_eq!(report.head_verdict.as_deref(), Some("PASS"));
-    }
-
-    /// `ship measure verdict` — THE ONE MEASURE JUDGE the release scripts ask.
-    /// For the compiler `--prover` names, the commit's own receipt from
-    /// an older seal sends the judge on to the main checkout's tree receipt,
-    /// which counts; 1 when nothing measured it; 2 when it cannot answer.
-    #[test]
-    fn measure_verdict_answers_as_the_cut_judges_for_the_prover_named() {
-        let w = TwoClones::new("measure-verdict");
-        let bin = w.main.root.path().join("stage2/bin");
-        fs::create_dir_all(&bin).unwrap();
-        let commit = "43f8b339f8322f6b4cd1d9f7ae9a914eda5fef22";
-        fs::write(
-            bin.join("trustc"),
-            format!("#!/bin/sh\necho 'rustc 1.99.0-dev (fixture)'\necho 'commit-hash: {commit}'\n"),
-        )
-        .unwrap();
-        fs::set_permissions(
-            bin.join("trustc"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-        let tc = toolchain_at(&bin).unwrap();
-        assert_eq!(
-            tc,
-            format!(
-                "{} trustc {commit}",
-                fs::canonicalize(&bin).unwrap().display()
-            )
-        );
-        let verdict = || run_measure_verdict(&w.cut_dir, "HEAD", Some(&bin));
-        assert_eq!(verdict(), 1, "nothing measured it");
-        let stale = "/nonexistent/bin trustc 0123456789abcdef0123456789abcdef01234567";
-        fs::write(
-            w.own().join(format!("{RECEIPT_MEASURE_PREFIX}{}", w.head)),
-            w.measure(stale, "yes", 30),
-        )
-        .unwrap();
-        assert_eq!(verdict(), 1, "measured only with another compiler");
-        fs::write(
-            w.foreign().join(format!(
-                "{RECEIPT_MEASURE_PREFIX}{RECEIPT_TREE_PREFIX}{}",
-                w.tree
-            )),
-            w.measure(&tc, "yes", 10),
-        )
-        .unwrap();
-        assert_eq!(
-            verdict(),
-            0,
-            "the main checkout measured these bytes with this compiler"
-        );
-        assert_eq!(
-            run_measure_verdict(&w.cut_dir, "no-such-rev", Some(&bin)),
-            2,
-            "a commit git cannot name is no answer"
-        );
-        assert_eq!(
-            run_measure_verdict(&w.cut_dir, "HEAD", Some(&w.main.root.path().join("none"))),
-            2,
-            "a prover that is not there is no answer"
-        );
-    }
-
-    /// The tree's own config, as the gate records it: git's blob id of each of
-    /// `.cargo/config` and `.cargo/config.toml` the tree holds, in that order
-    /// — never a directory of that name, and `none` for neither. A MEASURE
-    /// receipt that read the tree's config passes; one that read an older
-    /// version of it, or it and an ancestor's, does not.
-    #[test]
-    fn a_measurement_reads_the_trees_own_cargo_config_and_nothing_else() {
-        let repo = Repo::new("measure-config");
-        repo.commit("no config", &[("src/lib.rs", "v1")]);
-        let git = repo.git();
-        assert_eq!(tree_build_config(&git, "HEAD").unwrap(), "none");
-        repo.commit(
-            "configs",
-            &[
-                (".cargo/config.toml", "[build]\nrustflags = []\n"),
-                (".cargo/config/nested", "a directory is no config file"),
-            ],
-        );
-        let blob = repo.run(&["rev-parse", "HEAD:.cargo/config.toml"]);
-        let own = format!("repo/.cargo/config.toml={blob}");
-        assert_eq!(tree_build_config(&git, "HEAD").unwrap(), own);
-
-        let head = repo.run(&["rev-parse", "HEAD"]);
-        let tree = repo.run(&["rev-parse", "HEAD^{tree}"]);
-        let key = format!("{RECEIPT_MEASURE_PREFIX}{head}");
-        let write = |config: &str| {
-            fs::write(
-                repo.receipts().join(&key),
-                format!(
-                    "{RECEIPT_MAGIC}\nhead {head}\ntree {tree}\nmode measure\nscope workspace\n\
-                     verdict PASS\nmerge-contract no\nmeasured yes\nskipped none\n\
-                     toolchain {CUT_TC}\nbuild-env none\nbuild-config {config}\nwhen 1\n"
-                ),
-            )
-            .unwrap();
-        };
-        write(&own);
-        assert!(matches!(
-            measure_report(&git, &Stores::own(repo.receipts()), CUT_TC, "HEAD").unwrap(),
-            MeasureReport::Measured { .. }
-        ));
-        for other in [
-            "none".to_string(),
-            "repo/.cargo/config.toml=0000000000000000000000000000000000000000".to_string(),
-            format!("{own} ancestor/.cargo/config.toml={blob}"),
-            format!("{own} repo/.cargo/config.toml+include:x.toml=missing"),
-        ] {
-            write(&other);
-            let MeasureReport::Unmeasured { why } =
-                measure_report(&git, &Stores::own(repo.receipts()), CUT_TC, "HEAD").unwrap()
-            else {
-                panic!("measured reading `{other}`, and this cut reads `{own}`");
-            };
-            assert!(
-                why.contains(&format!("reads only the tree's own (`{own}`)")),
-                "{why}"
-            );
-        }
-    }
 
     /// NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE, judged
     /// from the lane's FACTS, against real git and the store the
@@ -8106,9 +6120,10 @@ mod published_commit_tests {
     /// the cut's own gates in the cut's order, runs every gate after the
     /// cutter identity whatever the one before it said, and names each one
     /// that would refuse, in the cut's words. With the predecessor's fixtures,
-    /// release notes and a handoff policy in the commit and a MEASURE and a
-    /// TRUST facts for it from the cut's compiler, it passes, however far
-    /// HEAD and the working tree have moved.
+    /// release notes and a handoff policy in the commit, its bundle built in this
+    /// clone (the release journal names it) with a `measured yes` receipt filed under
+    /// the bundle's executable digest, and TRUST facts for it from the cut's
+    /// compiler, it passes, however far HEAD and the working tree have moved.
     #[test]
     fn ship_check_judges_the_named_commit_with_the_cuts_own_gates() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -8187,21 +6202,19 @@ mod published_commit_tests {
         let text = found.transcript();
         for needle in [
             &format!(
-                "ok      cutter identity: this check was built from {} itself",
+                "ok      cutter identity: built from {} itself",
                 short(&candidate)
             ),
             "ok      CHANGELOG [Unreleased]: 1 entries, no '''",
             "ok      handoff fixtures of v0.1.0 checked in: 1 desks, 1 pinned",
             "ok      handoff policy a cut seals into the bundle: ",
             &format!(
-                "REFUSE  MEASURE tier — the tree this cut builds \
-                 ({candidate}) is not MEASURED"
+                "REFUSE  MEASURE tier — no bundle of {} is built in this clone yet",
+                short(&candidate)
             ),
+            "builds it once and MEASURE judges those bytes; nothing is signed unmeasured",
             &format!(
-                "git worktree add --detach <dir> {candidate}`, then `tools/verify.sh --measure`"
-            ),
-            &format!(
-                "REFUSE  TRUST lane — the tree this cut builds \
+                "REFUSE  TRUST lane — the tree this cut releases \
                  ({candidate}) has no passing whole-tree Trust advisory run"
             ),
             &format!(
@@ -8211,14 +6224,36 @@ mod published_commit_tests {
             assert!(text.contains(needle), "missing {needle:?}:\n{text}");
         }
 
-        // The receipts the cut reads, filed for the candidate, from its compiler.
+        // What the cut reads: the candidate's bundle, built in this clone (its
+        // release journal names it), and the MEASURE receipt filed under that
+        // bundle's executable digest; and trust facts for it, from its compiler.
         let tree = repo.run(&["rev-parse", &format!("{candidate}^{{tree}}")]);
+        let macho = "ab".repeat(32);
+        crate::release::Journal {
+            version: "0.2.0".to_string(),
+            commit: candidate.clone(),
+            artifact: Some(crate::release::Artifact {
+                key: "cd".repeat(32),
+                app: repo.root.path().join("cache/aterm.app"),
+                macho_sha256: macho.clone(),
+                build: 1_790_000_100,
+            }),
+            ..crate::release::Journal::default()
+        }
+        .save(
+            &repo
+                .work()
+                .join(".git")
+                .join(crate::release::RELEASE_DIR)
+                .join(crate::release::JOURNAL_FILE),
+        )
+        .unwrap();
         fs::write(
             repo.receipts()
-                .join(format!("{RECEIPT_MEASURE_PREFIX}{candidate}")),
+                .join(aterm_verify::receipt::measure_key(&macho)),
             format!(
                 "{RECEIPT_MAGIC}\nhead {candidate}\ntree {tree}\nmode measure\nscope workspace\n\
-                 verdict PASS\nmerge-contract no\nmeasured yes\nskipped none\n\
+                 verdict PASS\nmerge-contract no\nmeasured yes\nartifact {macho}\nskipped none\n\
                  toolchain {cut_tc}\nbuild-env none\nbuild-config none\nwhen 1\n"
             ),
         )
@@ -8323,21 +6358,30 @@ mod published_commit_tests {
             why.contains("every release seals a handoff policy into its bundle"),
             "{why}"
         );
-        // Another compiler than the one the receipts name: both receipt gates
-        // refuse, naming both; no compiler at all: both refuse, saying why.
+        // Another compiler than the one the trust facts name: the TRUST gate
+        // refuses; no compiler at all: it refuses, saying why. MEASURE judges the
+        // bytes by their digest, whatever compiles here now — the cut compiles
+        // nothing.
         let other = "/store/trust/9100/bin trustc 0000000000000000000000000000000000000000";
         let found = check(&candidate, Ok(other.to_string()));
-        assert_eq!(found.refused(), ["MEASURE tier", "TRUST lane"]);
-        assert!(
-            found.transcript().contains(&format!(
-                "was measured with `{cut_tc}`, and this cut builds with `{other}`"
-            )),
-            "{}",
-            found.transcript()
-        );
+        assert_eq!(found.refused(), ["TRUST lane"], "{}", found.transcript());
         let found = check(&candidate, Err("no Trust toolchain here".to_string()));
-        assert_eq!(found.refused(), ["MEASURE tier", "TRUST lane"]);
+        assert_eq!(found.refused(), ["TRUST lane"]);
         assert!(found.transcript().contains("no Trust toolchain here"));
+        // The bytes, not the commit: a receipt about other bytes measures nothing.
+        fs::write(
+            repo.receipts()
+                .join(aterm_verify::receipt::measure_key(&macho)),
+            format!(
+                "{RECEIPT_MAGIC}\nhead {candidate}\nmode measure\nscope workspace\n\
+                 verdict PASS\nmerge-contract no\nmeasured yes\nartifact {}\nwhen 1\n",
+                "ef".repeat(32)
+            ),
+        )
+        .unwrap();
+        let found = check(&candidate, tc());
+        assert_eq!(found.refused(), ["MEASURE tier"], "{}", found.transcript());
+        assert!(found.transcript().contains("is about other bytes"));
         // A version no release can carry, and a name that is no commit, are
         // refused before any gate.
         let patch = repo.commit(
@@ -8699,9 +6743,9 @@ mod published_commit_tests {
     /// `ship check` answers only with the commit's OWN cutter: the check a shared checkout
     /// builds is whatever that checkout holds, and a checker whose rules are not the judged
     /// commit's could say READY for a commit whose own cutter then refuses. The cut's
-    /// identity rule decides, first: a check built from the commit, or from a commit whose
-    /// cutter source closure is byte-identical, answers; any other REFUSES TO ANSWER — an
-    /// error, before any gate, naming how to ask with the commit's own cutter.
+    /// identity rule decides, first: a check built from the commit answers; any other
+    /// REFUSES TO ANSWER — an error, before any gate, naming how to ask with the commit's
+    /// own cutter.
     #[test]
     fn ship_check_answers_only_with_the_commits_own_cutter() {
         let repo = Repo::new("precheck-identity");
@@ -8715,66 +6759,40 @@ mod published_commit_tests {
         );
         let git = repo.git();
         let tc = || Ok(CUT_TC.to_string());
-        // Built from a commit whose cutter sources are the judged commit's: it
-        // is that commit's cutter, and says so as its first line.
-        let docs = repo.commit("a doc", &[("docs/NOTE.md", "prose\n")]);
-        let found = precheck_with(&git, &docs, &candidate, tc()).expect("identical closure");
+        // The commit's own cutter answers, and says so as its first line.
+        let found = precheck_with(&git, &candidate, &candidate, tc()).expect("its own");
         assert_eq!(found.gates[0].name, "cutter identity");
-        let Ok(line) = &found.gates[0].outcome else {
-            panic!("{}", found.transcript());
-        };
-        assert!(
-            line.starts_with(&format!(
-                "cutter identity: built from {candidate}, tree is at {docs} — nothing under \
-                 the cutter's own source closure moved"
-            )),
-            "{line}"
+        assert_eq!(
+            found.gates[0].outcome,
+            Ok(format!(
+                "cutter identity: built from {} itself",
+                short(&candidate)
+            ))
         );
-        // NEGATIVE CONTROLS: other rules answer nothing. A checker built before
-        // the judged commit changed them...
-        let rules = repo.commit(
-            "new rules",
-            &[("crates/aterm-release/src/gates.rs", "// other rules\n")],
-        );
+        // NEGATIVE CONTROLS: other rules answer nothing — a checker built before the
+        // judged commit (even one that moved only a doc)...
+        let docs = repo.commit("a doc", &[("docs/NOTE.md", "prose\n")]);
         let refused = |stamp: &str| {
-            precheck_with(&git, &rules, stamp, tc())
-                .expect_err("another tree's rules answer nothing")
+            precheck_with(&git, &docs, stamp, tc())
+                .expect_err("another commit's rules answer nothing")
                 .to_string()
         };
         let why = refused(&candidate);
         for needle in [
             &format!(
-                "ship check will not answer for {rules}: this aterm-release binary was built \
-                 from {candidate}"
+                "ship check will not answer for {docs}: this aterm-release binary was built \
+                 from {candidate}, not {docs}"
             ),
-            "1 of the cutter's own source files moved between them \
-             (crates/aterm-release/src/gates.rs)",
             &format!(
-                "fix:  ask with the commit's own cutter — `PUB_SOURCE_COMMIT={rules} \
+                "fix:  ask with the commit's own cutter — `PUB_SOURCE_COMMIT={docs} \
                  publish/pre-promote`"
             ),
         ] {
             assert!(why.contains(needle), "missing {needle:?}:\n{why}");
         }
-        // ...one that names no commit, or a dirty source closure...
+        // ...one that names no commit, or a dirty source closure.
         assert!(refused("unknown").contains("carries no build commit"));
         assert!(refused(DIRTY_BUILD_COMMIT).contains("dirty repository source closure"));
-        // ...and one built on another line of history.
-        repo.run(&["checkout", "-q", "--orphan", "elsewhere"]);
-        let foreign = repo.commit("another history", &[("Cargo.toml", cargo)]);
-        let why = refused(&foreign);
-        assert!(why.contains("are not one line of history"), "{why}");
-        // The commit's own cutter answers.
-        assert_eq!(
-            precheck_with(&git, &rules, &rules, tc())
-                .expect("its own")
-                .gates[0]
-                .outcome,
-            Ok(format!(
-                "cutter identity: this check was built from {} itself",
-                short(&rules)
-            ))
-        );
     }
 
     #[test]
@@ -8960,5 +6978,41 @@ mod published_commit_tests {
         let report = receipt_report(&repo.git(), &Stores::own(repo.receipts())).unwrap();
         assert_eq!(report.ungated.len(), 3, "{report:?}");
         assert_eq!(report.newest_gated, None);
+    }
+}
+
+#[cfg(test)]
+mod trust_from_source_tests {
+    use super::*;
+
+    /// The from-source remedy builds Trust from the pinned Trust seed and seals it, and
+    /// the three-way remedy carries that one spelling. Until 2026-09-30 both said
+    /// `python3 x.py build --stage 2 in $HOME/trust`, which runs whatever stage0 the
+    /// checkout's gitignored bootstrap.toml names — on the owner's Mac, until
+    /// 2026-09-29, a "genesis" adapter running stock rustup Rust under Trust names.
+    #[test]
+    fn the_from_source_remedy_is_the_seed_first_recreator_then_a_seal() {
+        assert!(
+            TRUST_FROM_SOURCE.contains(
+                "python3 scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed \
+                 --no-register"
+            ),
+            "{TRUST_FROM_SOURCE}"
+        );
+        assert!(
+            TRUST_FROM_SOURCE.contains("scripts/promote-toolchain.sh"),
+            "{TRUST_FROM_SOURCE}"
+        );
+        assert!(
+            TRUST_TOOLCHAIN_REMEDIES.contains(TRUST_FROM_SOURCE),
+            "{TRUST_TOOLCHAIN_REMEDIES}"
+        );
+        for remedy in [TRUST_FROM_SOURCE, TRUST_TOOLCHAIN_REMEDIES] {
+            assert!(!remedy.contains("x.py"), "a bare x.py build: {remedy}");
+            assert!(
+                !remedy.contains("--genesis"),
+                "a stock-Rust stage0: {remedy}"
+            );
+        }
     }
 }

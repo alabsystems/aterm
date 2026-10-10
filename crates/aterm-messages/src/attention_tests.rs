@@ -1445,12 +1445,12 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
         (
             "first-run",
             80,
-            " ℹ Installing ALab tools   40%                           disk busy   Details ›  ",
+            " ℹ Installing ALab tools   39%                           disk busy   Details ›  ",
         ),
         (
             "first-run",
             120,
-            " ℹ Installing ALab tools   40%              3 of 10 programs                                     disk busy   Details ›  ",
+            " ℹ Installing ALab tools   39%              3 of 10 programs                                     disk busy   Details ›  ",
         ),
     ];
     let mut failures = Vec::new();

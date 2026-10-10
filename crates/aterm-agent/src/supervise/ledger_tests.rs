@@ -761,7 +761,7 @@ fn a_reply_the_archive_lost_says_so() {
     );
 }
 
-/// Round seven, finding 58: a worker whose ledger an aterm update could not
+/// A worker whose ledger an aterm update could not
 /// carry answers `history` with ` unheld_below=` on its header (on stderr,
 /// as `aterm ctl` prints it). The ledger then says the turns were lost to
 /// the update, not that nobody drove the session.

@@ -83,6 +83,45 @@ pub fn encode_key_with_layout(
     event_type: KeyEventType,
     base_layout_key: Option<char>,
 ) -> Vec<u8> {
+    encode_key_with_text(key, modifiers, mode, event_type, base_layout_key, None)
+}
+
+/// [`encode_key_with_layout`] plus `layout_text`: the character the user's
+/// ACTIVE layout typed for this press, when the host knows it.
+///
+/// `key` is the layout's UNSHIFTED key (winit's `key_without_modifiers`), and
+/// without a layout the engine can only re-derive what Shift and Caps Lock
+/// make of it from the US table ([`typed_character`]). That guess is wrong on
+/// every other layout — German Shift+2 types `"`, not `@`; AZERTY Shift+&
+/// types `1`; Russian Shift+ф types `Ф`; Caps Lock + a types `A` — and the
+/// host already holds the answer (the OS's composed text). So when it is
+/// given, a TEXT press writes it: the legacy and text-preserving kitty modes
+/// put it on the wire as UTF-8 in place of the derived glyph, kitty
+/// `REPORT_ALTERNATE_KEYS` reports it as the shifted key while Shift is held
+/// (the spec's "shifted version, in the currently active keyboard layout"),
+/// and `REPORT_ASSOCIATED_TEXT` carries it as the text. The kitty key CODE
+/// stays `key`'s, the layout's unshifted key, as kitty reports it.
+///
+/// It is honoured only for a `Key::Character` press with no Ctrl, Alt, Meta,
+/// Hyper or Super — a TEXT press. A chord keeps its own encoding from the
+/// base key (Ctrl+c is 0x03 and Alt+a is `ESC a` on every layout), and a
+/// control character is never text. `None` (a controller-built key, a host
+/// with no layout text) keeps the US derivation.
+#[must_use]
+// Skip: the keyboard encoder family — byte-sequence building (Vec
+// push/extend) and key-table lookups over absent std bodies. The
+// encoded bytes are exhaustively unit-tested against the kitty/xterm
+// specs (encode_tests.rs).
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn encode_key_with_text(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    event_type: KeyEventType,
+    base_layout_key: Option<char>,
+    layout_text: Option<char>,
+) -> Vec<u8> {
+    let layout_text = text_press_glyph(key, modifiers, layout_text);
     // Kitty folds keypad keys onto their non-keypad equivalents unless the
     // app opted into telling them apart (disambiguate) or into the dedicated
     // KP numbers report-all-keys uses — the spec's legacy rule: "All keypad
@@ -162,7 +201,14 @@ pub fn encode_key_with_layout(
     }
 
     if should_encode_kitty_event(kitty_key, modifiers, mode, event_type) {
-        return encode_kitty(kitty_key, modifiers, mode, event_type, base_layout_key);
+        return encode_kitty(
+            kitty_key,
+            modifiers,
+            mode,
+            event_type,
+            base_layout_key,
+            layout_text,
+        );
     }
 
     // For release events without Kitty protocol, return nothing
@@ -170,17 +216,71 @@ pub fn encode_key_with_layout(
         return Vec::new();
     }
 
+    // Ctrl on a NON-LATIN layout: the layout's letter (Russian 'с') has no
+    // control byte, so Ctrl+С fell through to the plain glyph and wrote 'с'
+    // where every macOS terminal writes ETX — Ctrl+C could not interrupt on
+    // a Cyrillic, Greek or Hebrew layout. The physical key's US letter
+    // (`base_layout_key`, 'c') names the control byte. Kitty is untouched
+    // above: it reports the layout's key (`CSI 1089;5u`) with the US key in
+    // its base-layout field, and the application resolves it there.
+    let ctrl_twin = ctrl_layout_twin(key, modifiers, base_layout_key);
+    let key = ctrl_twin.as_ref().unwrap_or(key);
+
     // The kitty protocol supersedes xterm modifyOtherKeys: an app that pushed
     // kitty flags (agent TUIs can push CSI > ... u AND set modifyOtherKeys=2)
     // negotiated kitty semantics, so a key the kitty gate deliberately left
     // as text (Shift+a -> 'A') must not be re-escaped in the xterm dialect.
     if !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
-        && let Some(bytes) = encode_xterm_other_keys(key, modifiers, mode)
+        && let Some(bytes) = encode_xterm_other_keys(key, modifiers, mode, layout_text)
     {
         return bytes;
     }
 
-    encode_legacy(key, modifiers, mode)
+    encode_legacy(key, modifiers, mode, layout_text)
+}
+
+/// The chord modifiers that make a press something other than TEXT: with any
+/// of them held the key encodes from its base (a control byte, an ESC
+/// prefix, a CSI form), never from the layout's composed character.
+const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
+    .union(Modifiers::ALT)
+    .union(Modifiers::META)
+    .union(Modifiers::HYPER)
+    .union(Modifiers::SUPER);
+
+/// `layout_text` when it may stand for this press's text: a character key,
+/// no [`NON_TEXT_MODIFIERS`], and a printable glyph. See
+/// [`encode_key_with_text`].
+#[cfg_attr(trust_verify, trust::skip)]
+fn text_press_glyph(key: &Key, modifiers: Modifiers, layout_text: Option<char>) -> Option<char> {
+    if !matches!(key, Key::Character(_)) || modifiers.intersects(NON_TEXT_MODIFIERS) {
+        return None;
+    }
+    layout_text.filter(|glyph| !glyph.is_control())
+}
+
+/// The US letter a Ctrl chord on a non-Latin layout stands for: `Some('c')`
+/// for Ctrl + Russian 'с' (physical C), so the chord sends the C0 byte
+/// Terminal.app and iTerm2 send for it. Only a LETTER the control table does
+/// not know, on a physical key whose US twin is a letter: a Latin layout's
+/// own letters keep their bytes, and a letter on a US digit or symbol key
+/// (AZERTY 'é' on the 2 key, German 'ö' on the ; key) stays as it is rather
+/// than turning into an unrelated control byte.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ctrl_layout_twin(key: &Key, modifiers: Modifiers, base_layout_key: Option<char>) -> Option<Key> {
+    let Key::Character(c) = key else {
+        return None;
+    };
+    if !modifiers.contains(Modifiers::CTRL)
+        || c.is_ascii()
+        || !c.is_alphabetic()
+        || ctrl_character(*c).is_some()
+    {
+        return None;
+    }
+    base_layout_key
+        .filter(char::is_ascii_alphabetic)
+        .map(Key::Character)
 }
 
 /// Modifier and lock keys, mirroring kitty's `is_modifier_key`: the spec
@@ -358,6 +458,7 @@ fn encode_kitty(
     mode: KeyboardMode,
     event_type: KeyEventType,
     base_layout_key: Option<char>,
+    layout_text: Option<char>,
 ) -> Vec<u8> {
     let kitty_modifiers = kitty_modifiers_for_event(key, modifiers, event_type);
 
@@ -371,8 +472,9 @@ fn encode_kitty(
     }
 
     let (primary_code, alternate_code, base_layout_code) =
-        kitty_key_codes(key, kitty_modifiers, mode, base_layout_key);
-    let associated_text = associated_text_codepoints(key, kitty_modifiers, mode, event_type);
+        kitty_key_codes(key, kitty_modifiers, mode, base_layout_key, layout_text);
+    let associated_text =
+        associated_text_codepoints(key, kitty_modifiers, mode, event_type, layout_text);
 
     let mod_value = kitty_modifiers.kitty_encoded();
     let report_events = mode.contains(KeyboardMode::REPORT_EVENT_TYPES);
@@ -585,6 +687,7 @@ fn kitty_key_codes(
     modifiers: Modifiers,
     mode: KeyboardMode,
     base_layout_key: Option<char>,
+    layout_text: Option<char>,
 ) -> (u32, Option<u32>, Option<u32>) {
     match key {
         Key::Named(named) => (named.kitty_code(), None, None),
@@ -593,7 +696,12 @@ fn kitty_key_codes(
             if !mode.contains(KeyboardMode::REPORT_ALTERNATE_KEYS) {
                 return (primary, None, None);
             }
+            // The shifted key is "the shifted version, in the currently active
+            // keyboard layout" (spec), present only while Shift is held: the
+            // layout's own glyph when the host gave it (German Shift+2 is `"`,
+            // 34), the US table's otherwise.
             let alternate = shifted_character(*c, modifiers)
+                .map(|us| layout_text.map_or(us, |t| if t == *c { shift_level(t) } else { t }))
                 .map(u32::from)
                 .filter(|alt| *alt != primary);
             // base_layout_key: the US QWERTY equivalent of this physical key.
@@ -616,6 +724,7 @@ fn associated_text_codepoints(
     modifiers: Modifiers,
     mode: KeyboardMode,
     event_type: KeyEventType,
+    layout_text: Option<char>,
 ) -> Option<u32> {
     if !mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT)
         || !mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
@@ -631,18 +740,13 @@ fn associated_text_codepoints(
 
     match key {
         Key::Character(c) => {
-            // CapsLock composes uppercase letters exactly like Shift on macOS
-            // (caps OR shift → uppercase; caps+shift stays uppercase). The
-            // shift table alone missed caps: `caps+a` reported text 'a' while
-            // the modifier field correctly said caps — kitty embeds the text
-            // the OS produced ('A').
-            let text = if c.is_ascii_lowercase()
-                && modifiers.intersects(Modifiers::SHIFT | Modifiers::CAPS_LOCK)
-            {
-                c.to_ascii_uppercase()
-            } else {
-                shifted_character(*c, modifiers).unwrap_or(*c)
-            };
+            // Kitty embeds the text the OS produced: the layout's when the
+            // host gave it, else the derivation, in which CapsLock composes
+            // uppercase letters exactly like Shift on macOS (caps OR shift →
+            // uppercase; caps+shift stays uppercase). The shift table alone
+            // missed caps: `caps+a` reported text 'a' while the modifier field
+            // correctly said caps.
+            let text = layout_text.unwrap_or_else(|| typed_character(*c, modifiers));
             if text.is_control() {
                 None
             } else {
@@ -726,6 +830,49 @@ fn named_key_text(named: NamedKey) -> Option<char> {
         NamedKey::Backspace => '\x7f',
         _ => return None,
     })
+}
+
+/// The Shift LEVEL a layout's typed glyph stands for, for kitty's shifted
+/// key: the glyph itself, except that a lowercase letter typed with Shift held
+/// is Caps Lock's doing — xkb's Lock cancels Shift on a letter, so Caps Lock +
+/// Shift + a types 'a' — and the level, which no lock touches, is its capital
+/// ('A', as kitty reports it). Its caller reads a glyph this way only when it
+/// IS the unshifted key: a layout may put another lowercase letter on its
+/// Shift level (Swiss German Shift+ö is é, French Linux Shift+* is µ), and
+/// that letter is the level as it is. A capital that is not one character
+/// ('ß') leaves the glyph as it is.
+#[cfg_attr(trust_verify, trust::skip)]
+fn shift_level(glyph: char) -> char {
+    if !glyph.is_lowercase() {
+        return glyph;
+    }
+    let mut upper = glyph.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(capital), None) => capital,
+        _ => glyph,
+    }
+}
+
+/// The character a TEXT press of base key `c` types when no layout says
+/// otherwise: Shift through the US table ([`shifted_character`]), and Caps
+/// Lock upper-casing a letter — caps OR shift gives the capital, as macOS
+/// composes it and as kitty's associated text reports it. The fallback for a
+/// key that carries no layout text (a controller's `key a mods=caps`); a
+/// window press hands the encoder the layout's own character instead
+/// ([`encode_key_with_text`]), and asks this function whether it differs.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn typed_character(c: char, modifiers: Modifiers) -> char {
+    let shifted = shifted_character(c, modifiers).unwrap_or(c);
+    if !modifiers.contains(Modifiers::CAPS_LOCK) {
+        return shifted;
+    }
+    // A capital that is one character: 'ß' (→ "SS") stays as it is.
+    let mut upper = shifted.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(capital), None) => capital,
+        _ => shifted,
+    }
 }
 
 /// The glyph SHIFT composes from base key `c` on the US layout (`'h'`→`'H'`, `'2'`→`'@'`,
@@ -987,7 +1134,7 @@ fn win32_escape_record(
     mode: KeyboardMode,
     base_layout_key: Option<char>,
 ) -> Option<Win32KeyRecord> {
-    let legacy = encode_legacy(key, modifiers, mode);
+    let legacy = encode_legacy(key, modifiers, mode, None);
     if !conhost_holds_once_switched(&legacy) {
         return None;
     }
@@ -1107,7 +1254,17 @@ fn encode_win32_record_pair(record: &Win32KeyRecord) -> Vec<u8> {
 // table lookups — absent std bodies (alloc + iterator class). The encoded
 // bytes are exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
-fn encode_legacy(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8> {
+fn encode_legacy(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    layout_text: Option<char>,
+) -> Vec<u8> {
+    // Caps Lock is read once, for TEXT: Caps Lock + a types 'A' (xterm's
+    // XLookupString applies Lock; kitty and Terminal.app send the OS text).
+    // A window press brings the layout's own character; a controller key
+    // carries none, so the text press derives it ([`typed_character`]).
+    let caps_lock = modifiers.contains(Modifiers::CAPS_LOCK);
     // Caps Lock is a LOCK state, never a chord modifier in legacy xterm encoding —
     // it belongs only to the Kitty modifier byte (which still reports it). Left in,
     // it makes `has_modifiers` true with Caps Lock engaged, so arrows / Home-End /
@@ -1126,7 +1283,20 @@ fn encode_legacy(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8>
         modifiers
     };
     match key {
-        Key::Character(c) => encode_character_legacy(*c, modifiers, mode),
+        // A TEXT press writes the character it types: the layout's when the
+        // window gave it (only a Shift/lock press carries one), else Caps
+        // Lock's capital. A chord, and Shift with no lock, are the legacy
+        // encoder's own (its Shift table, its control and ESC forms).
+        Key::Character(c) => match layout_text.or_else(|| {
+            (caps_lock && !modifiers.intersects(NON_TEXT_MODIFIERS))
+                .then(|| typed_character(*c, modifiers | Modifiers::CAPS_LOCK))
+        }) {
+            Some(glyph) => {
+                let mut buf = [0u8; 4];
+                glyph.encode_utf8(&mut buf).as_bytes().to_vec()
+            }
+            None => encode_character_legacy(*c, modifiers, mode),
+        },
         Key::Named(named) => encode_named_legacy(*named, modifiers, mode),
     }
 }
@@ -1134,7 +1304,12 @@ fn encode_legacy(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8>
 // Skip: the `Key` inspection walks table slices / iterators (absent std
 // bodies). Exhaustively unit-tested against the kitty/xterm specs.
 #[cfg_attr(trust_verify, trust::skip)]
-fn encode_xterm_other_keys(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Option<Vec<u8>> {
+fn encode_xterm_other_keys(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    layout_text: Option<char>,
+) -> Option<Vec<u8>> {
     let level = mode.xterm_modify_other_keys_level();
     if level == 0 {
         return None;
@@ -1159,9 +1334,17 @@ fn encode_xterm_other_keys(key: &Key, modifiers: Modifiers, mode: KeyboardMode) 
     // keys xterm sends through its legacy path (notably Alt+Backspace and
     // Ctrl+Backspace). Keypad keys are excluded above because xterm classifies
     // them under modifyKeypadKeys, never modifyOtherKeys.
-    let apply = match level {
-        1 => xterm_modify_other_keys_level1_applies(key, effective_mods),
-        2 => xterm_modify_other_keys_level2_applies(key, effective_mods),
+    //
+    // Level 2 escapes a Shift-only character whose SHIFTED keysym is in
+    // '@'..DEL, and that keysym is the LAYOUT's when the host gave it: German
+    // Shift+2 is `"`, ordinary text, where the US table's '@' is escaped.
+    // Decided here, beside the verified level-2 rule, which reads the table.
+    let apply = match (level, key, layout_text) {
+        (1, ..) => xterm_modify_other_keys_level1_applies(key, effective_mods),
+        (2, Key::Character(_), Some(glyph)) if effective_mods == Modifiers::SHIFT => {
+            (u32::from(b'@')..=u32::from(0x7f_u8)).contains(&u32::from(glyph))
+        }
+        (2, ..) => xterm_modify_other_keys_level2_applies(key, effective_mods),
         _ => false,
     };
     if !apply {
@@ -1288,3 +1471,6 @@ fn write_u32(buf: &mut Vec<u8>, val: u32) {
 #[cfg(test)]
 #[path = "encode_tests.rs"]
 mod encode_tests;
+#[cfg(test)]
+#[path = "layout_text_tests.rs"]
+mod layout_text_tests;

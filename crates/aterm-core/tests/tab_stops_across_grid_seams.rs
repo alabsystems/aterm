@@ -134,18 +134,12 @@ fn an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds() {
 
 // ---------------------------------------------- retention across the adopt ----
 
-/// retention is the host'S config, not the checkpoint'S.
+/// Retention is the host's config, not the checkpoint's.
 ///
-/// The seamless-update adopt path builds a live terminal the normal way — the
-/// host's `apply_config` calls `set_scrollback_line_limit(scrollback_lines)` —
-/// and then calls `restore_checkpoint`, which replaces both grids wholesale
-/// with grids `restore_grid` builds with no limit (deliberately, so the ≤256
-/// carried history lines are not dropped on the way in). Nothing put the
-/// configured limit back, so every adopted session retained scrollback
-/// unbounded for the rest of its life: a seamless update silently withdrew a
-/// setting the user had set and the engine had already accepted. `apply_config`
-/// could not repair it either — it early-outs when the limit is unchanged, so
-/// only a live config edit re-armed it.
+/// The adopt path applies the host's `set_scrollback_line_limit`, then
+/// `restore_checkpoint` replaces both grids with unlimited ones (so the ≤256
+/// carried history lines are not dropped on the way in); the configured limit
+/// must be put back, since `apply_config` early-outs when it is unchanged.
 ///
 /// The control is the session that never updated: after the same 400 lines it
 /// must retain the same number.

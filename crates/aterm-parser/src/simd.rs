@@ -34,7 +34,7 @@
 /// AVX2 (runtime-detected) processes 32 bytes per iteration; SSE2 (baseline,
 /// no detection needed) processes 16 bytes per iteration and also serves as
 /// the tail handler for the AVX2 loops.
-#[cfg(all(target_arch = "x86_64", not(kani)))]
+#[cfg(target_arch = "x86_64")]
 mod x86_simd {
     use std::arch::x86_64::*;
 
@@ -377,7 +377,7 @@ mod x86_simd {
 /// reference wherever `cargo test` runs.
 ///
 /// That arm is load-bearing, not a convenience. While the cfg read
-/// `all(target_arch = "aarch64", not(kani))` the aarch64 arm had NO
+/// `target_arch = "aarch64"` alone the aarch64 arm had NO
 /// differential guard anywhere — the exhaustive and random-buffer
 /// differentials were themselves `target_arch = "x86_64"`-gated. Breaking the
 /// `wrapping_sub(0x20)` / `worst > 0x5E` bias identity below (`0x5E` -> `0x5F`,
@@ -390,7 +390,7 @@ mod x86_simd {
 /// What a non-aarch64 host cannot check is the CODEGEN contract above — that
 /// these folds still lower to `umaxv`/`uminv`. That stays an `--emit asm`
 /// inspection on an aarch64 box; the differentials guard the semantics.
-#[cfg(all(not(kani), any(target_arch = "aarch64", test)))]
+#[cfg(any(target_arch = "aarch64", test))]
 mod arm_simd {
     /// Find first C0 control byte (< 0x20) via chunked classification.
     #[inline]
@@ -526,15 +526,15 @@ fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
     // is the common case on CRLF-terminated output (one empty run per line) and dense
     // CSI/UTF-8 TUI redraws. Byte-identical to the SIMD/scalar result (which returns
     // `Some(0)` for a non-printable first byte and `None` for empty input), and the
-    // predicate matches `find_non_printable_scalar` verbatim, so the Kani equivalence
-    // proofs are preserved. On the pure-ASCII hot run this is one predicted-not-taken
-    // branch before the existing dispatch.
+    // predicate matches `find_non_printable_scalar` verbatim, which the tier
+    // differentials below hold every arm to. On the pure-ASCII hot run this is one
+    // predicted-not-taken branch before the existing dispatch.
     match input.first() {
         Some(&b0) if !(0x20..=0x7E).contains(&b0) => return Some(0),
         None => return None,
         _ => {}
     }
-    #[cfg(all(target_arch = "x86_64", not(kani)))]
+    #[cfg(target_arch = "x86_64")]
     {
         // AVX2 only pays off once a full 32-byte chunk exists; shorter inputs
         // go straight to the inlined SSE2 path with no detection branch.
@@ -545,7 +545,7 @@ fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
         return x86_simd::find_non_printable_sse2(input);
     }
 
-    #[cfg(all(target_arch = "aarch64", not(kani)))]
+    #[cfg(target_arch = "aarch64")]
     {
         return arm_simd::find_non_printable_neon(input);
     }
@@ -556,26 +556,9 @@ fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
 
 /// Scalar implementation (LLVM auto-vectorized).
 /// Used as fallback when SIMD is not available.
-#[cfg(not(kani))]
 #[inline]
 fn find_non_printable_scalar(input: &[u8]) -> Option<usize> {
     input.iter().position(|&b| !(0x20..=0x7E).contains(&b))
-}
-
-/// Kani-specific scalar implementation.
-/// Uses an explicit indexed loop to prevent LLVM auto-vectorization with
-/// NEON intrinsics (simd_reduce_max) that Kani cannot model.
-#[cfg(kani)]
-fn find_non_printable_scalar(input: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i < input.len() {
-        let b = input[i];
-        if b < 0x20 || b > 0x7E {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Find the next byte that's not in the printable ASCII range.
@@ -627,7 +610,7 @@ pub(crate) fn find_c0_control(input: &[u8]) -> Option<usize> {
 #[inline]
 #[allow(unreachable_code)]
 fn find_c0_control_simd(input: &[u8]) -> Option<usize> {
-    #[cfg(all(target_arch = "x86_64", not(kani)))]
+    #[cfg(target_arch = "x86_64")]
     {
         if input.len() >= 32 && x86_simd::has_avx2() {
             // SAFETY: We just checked that AVX2 is available
@@ -636,7 +619,7 @@ fn find_c0_control_simd(input: &[u8]) -> Option<usize> {
         return x86_simd::find_c0_control_sse2(input);
     }
 
-    #[cfg(all(target_arch = "aarch64", not(kani)))]
+    #[cfg(target_arch = "aarch64")]
     {
         return arm_simd::find_c0_control_neon(input);
     }
@@ -644,22 +627,9 @@ fn find_c0_control_simd(input: &[u8]) -> Option<usize> {
     find_c0_control_scalar(input)
 }
 
-#[cfg(not(kani))]
 #[inline]
 fn find_c0_control_scalar(input: &[u8]) -> Option<usize> {
     input.iter().position(|&b| b < 0x20)
-}
-
-#[cfg(kani)]
-fn find_c0_control_scalar(input: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] < 0x20 {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Find the first byte in `input` that equals any of the `needles`.
@@ -680,7 +650,7 @@ pub(crate) fn find_any_of<const N: usize>(input: &[u8], needles: [u8; N]) -> Opt
 #[inline]
 #[allow(unreachable_code)]
 fn find_any_of_simd<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<usize> {
-    #[cfg(all(target_arch = "x86_64", not(kani)))]
+    #[cfg(target_arch = "x86_64")]
     {
         if input.len() >= 32 && x86_simd::has_avx2() {
             // SAFETY: We just checked that AVX2 is available
@@ -689,7 +659,7 @@ fn find_any_of_simd<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<us
         return x86_simd::find_any_of_sse2(input, needles);
     }
 
-    #[cfg(all(target_arch = "aarch64", not(kani)))]
+    #[cfg(target_arch = "aarch64")]
     {
         return arm_simd::find_any_of_neon(input, needles);
     }
@@ -697,32 +667,9 @@ fn find_any_of_simd<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<us
     find_any_of_scalar(input, needles)
 }
 
-#[cfg(not(kani))]
 #[inline]
 fn find_any_of_scalar<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<usize> {
     input.iter().position(|&b| needles.contains(&b))
-}
-
-/// Kani-specific scalar implementation.
-///
-/// Explicit nested indexed loops (no iterators) so the proof models a plain
-/// scan instead of an auto-vectorized one Kani cannot reason about, matching
-/// [`find_c0_control_scalar`].
-#[cfg(kani)]
-fn find_any_of_scalar<const N: usize>(input: &[u8], needles: [u8; N]) -> Option<usize> {
-    let mut i = 0;
-    while i < input.len() {
-        let b = input[i];
-        let mut j = 0;
-        while j < N {
-            if b == needles[j] {
-                return Some(i);
-            }
-            j += 1;
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -888,10 +835,9 @@ mod tests {
     //     `target_arch = "x86_64"`-gated;
     //   * only the SSE2/AVX2 tier calls stay x86-gated, x86_64 being the one
     //     target with more than one tier to name.
-    #[cfg(not(kani))]
     #[test]
     fn test_tiers_exhaustive_bytes_and_positions() {
-        #[cfg(all(target_arch = "x86_64", not(kani)))]
+        #[cfg(target_arch = "x86_64")]
         let avx2 = x86_simd::has_avx2();
         for size in [1usize, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65] {
             for pos in 0..size {
@@ -937,7 +883,7 @@ mod tests {
                         "neon any_of size {size} pos {pos} byte 0x{byte:02X}"
                     );
 
-                    #[cfg(all(target_arch = "x86_64", not(kani)))]
+                    #[cfg(target_arch = "x86_64")]
                     {
                         assert_eq!(
                             x86_simd::find_non_printable_sse2(&data),
@@ -988,10 +934,9 @@ mod tests {
     // chunk, where an arm must still return the FIRST.
     //
     // Arch-neutral for the same reason, and by the same three layers.
-    #[cfg(not(kani))]
     #[test]
     fn test_tiers_random_buffers() {
-        #[cfg(all(target_arch = "x86_64", not(kani)))]
+        #[cfg(target_arch = "x86_64")]
         let avx2 = x86_simd::has_avx2();
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
         let mut next = move || {
@@ -1051,7 +996,7 @@ mod tests {
                 "neon any_of {data:02X?}"
             );
 
-            #[cfg(all(target_arch = "x86_64", not(kani)))]
+            #[cfg(target_arch = "x86_64")]
             {
                 assert_eq!(x86_simd::find_non_printable_sse2(&data), np);
                 assert_eq!(x86_simd::find_c0_control_sse2(&data), c0);

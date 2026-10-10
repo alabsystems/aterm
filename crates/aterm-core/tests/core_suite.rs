@@ -49,7 +49,9 @@ mod replay_corpus_probe;
 mod replay_offset_determinism;
 mod resize_preserves_non_bmp;
 mod resize_quiet_flap_identity;
+mod resize_rewrap_fidelity;
 mod ris_preserves_host_policy;
+mod saved_cursor_follows_resize;
 mod scroll_pin_across_alt_screen;
 mod scrollback_content_integrity;
 mod scrollback_preserves_extras;
@@ -62,6 +64,7 @@ mod sgr_rendition_parity;
 mod shell_mark_rows_across_resize;
 mod tab_stops_across_grid_seams;
 mod unicode_content_generation;
+mod vi_motions_scrolled_back;
 
 // OSC 1337 `File=` fixtures shared by the `image_*` modules.
 #[path = "support/osc1337.rs"]

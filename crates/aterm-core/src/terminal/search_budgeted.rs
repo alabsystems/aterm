@@ -106,6 +106,9 @@ pub(crate) struct BudgetedSearchState {
     case_sensitive: bool,
     /// Regex mode the cursor was issued for.
     is_regex: bool,
+    /// The `ambiguous_width` policy the engine measures columns under (a live
+    /// switch moves no `content_seq`, so it is keyed here).
+    ambiguous_width: aterm_types::text_shaping::AmbiguousWidth,
     /// Scrollback line count at start (fixed while the snapshot key holds:
     /// any change bumps `content_seq`). Rows below this are history lines.
     scrollback: usize,
@@ -289,6 +292,7 @@ impl Terminal {
                     && state.query == query
                     && state.case_sensitive == case_sensitive
                     && state.is_regex == is_regex
+                    && state.ambiguous_width == self.ambiguous_width()
             }
             _ => false,
         };
@@ -302,7 +306,8 @@ impl Terminal {
             let oldest = usize::try_from(grid.oldest_absolute_row()).unwrap_or(usize::MAX);
             let scrollback = grid.scrollback_lines();
             let total_rows = scrollback.saturating_add(usize::from(self.rows()));
-            let engine = BudgetedSearch::new(query, case_sensitive, is_regex, oldest, total_rows)?;
+            let engine = BudgetedSearch::new(query, case_sensitive, is_regex, oldest, total_rows)?
+                .with_ambiguous_width(self.ambiguous_width());
             let cursor = allocate_cursor(&NEXT_BUDGETED_SEARCH_CURSOR)
                 .ok_or(BudgetedSearchError::CursorSpaceExhausted)?;
             self.budgeted_search = Some(BudgetedSearchState {
@@ -312,6 +317,7 @@ impl Terminal {
                 query: query.to_string(),
                 case_sensitive,
                 is_regex,
+                ambiguous_width: self.ambiguous_width(),
                 scrollback,
                 engine,
                 emitted_matches: 0,
@@ -350,7 +356,7 @@ impl Terminal {
             let text = i
                 .checked_sub(state.scrollback)
                 .and_then(|visible_row| u16::try_from(visible_row).ok())
-                .and_then(|r| self.get_line_text(i32::from(r), None))
+                .and_then(|r| self.written_line_text(i32::from(r)))
                 .unwrap_or_default();
             state.engine.feed_row_owned(text);
         }
@@ -467,6 +473,7 @@ impl Terminal {
                 && state.query == query
                 && state.case_sensitive == case_sensitive
                 && state.is_regex == is_regex
+                && state.ambiguous_width == self.ambiguous_width()
             {
                 // The completed scan already verified these matches; reuse them.
                 return state.engine.results();

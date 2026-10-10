@@ -25,10 +25,10 @@
 //! counted from (`watch --report`), else `null`; `report` is the inbox row id
 //! of the worker's report `watch --mail` folded into an `EVENT turn` line
 //! (its `rows=` is that body's row count), else `null`; a `MAIL …` line is
-//! `kind` `mail`, its words the summary. A limit episode's lines (round 17):
+//! `kind` `mail`, its words the summary. A limit episode's lines:
 //! `EXTEND until=<UTC> reset=<text>` is `extend`; the journal-only `ESCALATED
 //! seq=<n> …` and `CLEARED seq=<n> …` are `escalated` and `cleared`, their
-//! `seq=` read like an EVENT's. The turn-end policy's lines (lane B2 stage 2)
+//! `seq=` read like an EVENT's. The turn-end policy's lines
 //! — `CONTINUED` and `TYPED seq=<n> rule=<id> <text>`, `RESTARTED seq=<n>
 //! rule=<id> <what>` (the host's restart in place, D3/D7), the journal-only
 //! `WAITING seq=<n> until=<UTC> <why>`, `SKIPPED` and `UNVERIFIED seq=<n>
@@ -39,8 +39,7 @@
 //! box, `approval_loop`'s module header), and so is the journal-only `DIALOG
 //! seq=<n> rule=<id|-> <rows>` every question decision writes — the
 //! dialog's rows as drawn, joined by ` ⏎ ` (answered under
-//! `answer-recommended@v1`, or `-` escalated; the critique of 2026-09-25,
-//! O3: the incident's four escalations kept no rows), and so is the
+//! `answer-recommended@v1`, or `-` escalated), and so is the
 //! journal-only `DECLINED seq=<n> rule=<id> <subject> => <text>` a decline
 //! writes once its Enter landed (a box refused with a reason the worker
 //! reads, never handed to a person: `approval_loop.rs`), and the question

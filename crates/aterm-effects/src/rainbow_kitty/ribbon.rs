@@ -39,7 +39,8 @@
 //! * Cells of a cohort share its clock ([`live_since`]): each typing key
 //!   refreshes `alive_at` on the un-abandoned cohorts of its row
 //!   ([`Ribbon::place`]), so a mark ages only once the hand stops or leaves the
-//!   row ([`Ribbon::leave_row`]); the swoosh then retracts it toward the caret
+//!   row ([`Ribbon::leave_row`]); the swoosh then retracts it toward the caret,
+//!   or a fold flows it into its kept end (`Ribbon::flow_row`)
 //!   ([`Ribbon::advance_swoosh`], [`Ribbon::retract_x`]).
 //! * Abutting typed cohorts on a row are folded into one each frame
 //!   ([`Ribbon::heal_seams`]); the brighter side owns a boundary.
@@ -72,8 +73,10 @@
 //!   `the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_80_under_the_bar`
 //!   and `the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme`.
 //! * Chroma is spent before white ([`onto_luma`]): a dark stop climbs its own
-//!   hue to full value and only then toward white, and [`BED_SAT_FLOOR`]
-//!   gives the green→blue crossing its neighbours' chroma. The "black gaps"
+//!   hue to full value and only then toward white. The arc is S 1.00 end to
+//!   end, so the green→blue crossing carries its neighbours' chroma;
+//!   [`BED_SAT_FLOOR`] is the identity on the arc and guards a caller's
+//!   off-arc colour. The "black gaps"
 //!   seen on glass were lost chroma at the bar's luminance, not holes. There
 //!   is no floor against the GROUND: wherever it exceeds the bar it costs the
 //!   text its contrast, so a dark-foreground theme's dim bed (Solarized Dark)
@@ -125,10 +128,16 @@
 //! * Re-wetting is monotone ([`Ribbon::place`]): a live cell laid again
 //!   keeps its attack age (with a fresh identity for the content witness);
 //!   a leaving or expired one takes a fresh attack.
-//! * One finger, one row (`place`, [`Ribbon::leave_row`]): a typed row
-//!   change retracts the row the hand left toward its end nearest the caret,
-//!   at the caret block's left edge ([`Ribbon::advance_swoosh`],
-//!   [`Ribbon::retract_x`]).
+//! * One finger, one row (`place`, [`Ribbon::leave_row`]): no key on the new
+//!   row holds the row the hand left. A typed fold one row down flows that row
+//!   (`Ribbon::flow_row`, `Cohort::flow`): from its own last key it drifts as
+//!   one rigid band into its kept fold end (`Ribbon::flow_target`;
+//!   [`Ribbon::retract_x`] clamps it at that cell's outer edge), fades far end
+//!   first and is dark by [`FLOW_TOTAL_S`]; a cohort already past its grace
+//!   keeps its swoosh. Any other row change abandons the row toward the column
+//!   the hand left (`Ribbon::abandon_row`, `retract_col = from.1`), and the
+//!   retract sucks in to that column's left edge. Pinned by
+//!   `the_row_the_hand_folded_off_drifts_into_the_fold_and_fades_as_one_band`.
 //! * The editing hand holds its phrase ([`Ribbon::hold_phrase`], v3 §2.3);
 //!   an erase whose echo lands a tick late still retracts from the landing
 //!   (`pending_erase`).

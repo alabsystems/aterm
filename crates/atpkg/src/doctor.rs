@@ -311,21 +311,6 @@ fn unserved_platform_next(
     (!program.starts_with('*')).then(|| format!("aterm pkg install {program}"))
 }
 
-/// The ONE doctor line for installed files that still carry `com.apple.provenance` — the
-/// files every package pass and `aterm pkg repair` clear ([`crate::provenance::heal_store`])
-/// and could not: how many, what that breaks, and the verb that tries again. At most 160
-/// characters with the speaker's prefix. Pure, so the words are pinned by a test that
-/// mints a synthetic attribute rather than the one it cannot.
-pub(crate) fn provenance_line(scan: &crate::provenance::Scan) -> String {
-    let n = scan.carriers.len();
-    format!(
-        "warn — {} still {} a macOS tag (com.apple.provenance) that release builds refuse. \
-         fix: aterm pkg repair",
-        crate::provenance::count_of(n, "installed file"),
-        if n == 1 { "carries" } else { "carry" },
-    )
-}
-
 /// What the WORKSPACE the operator is standing in demands of the installed Trust
 /// toolchain, as decided by the installed `targo` itself (`targo locate-project
 /// --workspace` parses the manifest, compiles nothing, and refuses a `[trust]` policy
@@ -375,11 +360,6 @@ pub struct LocalSealProbe {
 pub struct Probes {
     pub workspace: Option<WorkspacePolicyProbe>,
     pub local_seal: Option<LocalSealProbe>,
-    /// The extended attribute the bundle/shim scan looks for —
-    /// [`crate::provenance::PROVENANCE_XATTR`] in production. Injected because that name
-    /// cannot be minted by a test (`xattr -w com.apple.provenance` is refused), so the
-    /// scan is exercised with a `user.*` attribute through the very `listxattr` path.
-    pub provenance_attr: &'static str,
     /// Whether packages update here on their own: the manager armed, and `[packages]
     /// enabled` on — Automatic updates, default on, with the retired `auto_update` folded
     /// in ([`crate::config::PackagesConfig::enabled`]). With [`Self::excluded`], what the
@@ -417,6 +397,10 @@ pub struct Probes {
     /// ([`claude_defaults_state`]) — or `None` when this report does not read that
     /// file (the default: a fixture has no Claude settings).
     pub claude_defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>,
+    /// Whether Spotlight skips `~/Developer`, as MEASURED for this report
+    /// ([`crate::devroot::spotlight`]), or `None` when this report does not measure (the
+    /// default: a fixture plants nothing).
+    pub spotlight: Option<crate::devroot::Spotlight>,
 }
 
 impl Default for Probes {
@@ -424,7 +408,6 @@ impl Default for Probes {
         Self {
             workspace: None,
             local_seal: None,
-            provenance_attr: crate::provenance::PROVENANCE_XATTR,
             automatic: true,
             excluded: Vec::new(),
             config_notes: Vec::new(),
@@ -434,6 +417,7 @@ impl Default for Probes {
             index_head: false,
             cc: None,
             claude_defaults: None,
+            spotlight: None,
         }
     }
 }
@@ -1056,7 +1040,6 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
             .ok()
             .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
         local_seal: probe_local_seal(layout, home.as_deref()),
-        provenance_attr: crate::provenance::PROVENANCE_XATTR,
         automatic: crate::manager_enabled() && cfg.enabled(),
         excluded: cfg.exclude().to_vec(),
         config_notes: cfg.config_notes(),
@@ -1068,6 +1051,20 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
+        spotlight: home.as_deref().map(|h| {
+            // The probe can take its whole clock on a loaded machine: say so first, so
+            // the wait never reads as a hang.
+            if let (root, crate::devroot::RootIs::Folder) = crate::devroot::root_at(h)
+                && crate::noindex::SUPPORTED
+            {
+                eprintln!(
+                    "{prefix}: measuring whether Spotlight skips {} (up to {}s)…",
+                    root.display(),
+                    crate::noindex::Timing::DEFAULT.worst_case().as_secs()
+                );
+            }
+            crate::devroot::spotlight(h)
+        }),
     };
     let mut report = Vec::new();
     let mut faults = Vec::new();
@@ -1375,7 +1372,7 @@ pub fn run_with(
     let _ = writeln!(
         out,
         "{p}: this atpkg is {} at {}",
-        env!("CARGO_PKG_VERSION"),
+        aterm_types::version::app_version(),
         std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown path>".to_string())
@@ -1595,27 +1592,6 @@ pub fn run_with(
     }
     // No count here: (11) says how many programs are active, from the tally that counts a
     // dev-linked program too (this loop's own count said 0 beside (11)'s 1 for one).
-
-    // (5a) INSTALLED FILES THAT STILL CARRY `com.apple.provenance` (macOS).
-    //
-    // A file a provenance-tracked process writes carries the tag, and a tagged executable,
-    // shim or dylib tags what it writes in turn — every object file and proof snapshot a
-    // release cut builds with it, which tools/proof_snapshot.py refuses AFTER the ledger
-    // claim (v0.83.0 burned a build number on `trust/8590`). Every package pass and
-    // `aterm pkg repair` clear it ([`crate::provenance::heal_store`]); this reads what the
-    // clearing left, over the same roots, and says it in ONE line — nothing when clean.
-    //
-    // A WARNING, never a PROBLEM: every tool still runs — only a release cut cannot use
-    // it — and doctor clears nothing itself: it reports what is on disk.
-    if cfg!(target_os = "macos") {
-        let scan = crate::provenance::scan_roots(
-            &crate::provenance::store_roots(layout),
-            probes.provenance_attr,
-        );
-        if !scan.carriers.is_empty() {
-            let _ = writeln!(out, "{p}: {}", provenance_line(&scan));
-        }
-    }
 
     // (5c) SOLVERS THE `trust` BUNDLE PINS PRIVATELY.
     //
@@ -2115,97 +2091,38 @@ pub fn run_with(
         }
     }
 
-    // (7b) SPOTLIGHT EXPOSURE OF RUST BUILD OUTPUT. `mds` indexing build output is one of
-    // the two amplifiers that let a busy build stall WindowServer into a watchdog kill
-    // (`crate::noindex` carries the measurement), and the one a per-directory rename removes.
-    //
-    // A WARNING, never a PROBLEM: nothing here is structurally broken, the scan is a
-    // NAME-based heuristic over a depth-limited walk, and doctor must not invent a fault
-    // from evidence it did not measure (`is_problem_state`'s allow-by-prefix rule, above).
-    // And doctor NEVER probes: measuring exclusion means writing a probe file into the
-    // user's tree, and doctor does not mutate. It reports the exposure and names the verb
-    // that measures it.
-    //
-    // The depth under $HOME is `noindex::DOCTOR_DEPTH`'s to state (its note has the
-    // measurement). Dot-directories are pruned, and that is sound rather than merely
-    // cheap: their whole subtree is already excluded (measured). So are the six folders
-    // macOS guards with a consent dialog and `Library` (`noindex::SKIP_DIRS`) — a walk
-    // that raised aterm's name on a privacy modal at the
-    // top of an unattended pass is the one cost this scan may never impose, which is why
-    // the line below says which places were not walked. Anything deeper than the constant
-    // is the deliberate `aterm pkg noindex scan <root>`, which the line below names.
-    //
-    // No `cfg` here by design: `noindex::scan` returns an empty, `complete` scan on
-    // non-macOS, so the whole block prints nothing there — the same discipline as
-    // `store.rs`'s unconditional `platform::exclude_from_backup`.
-    if let Some(home) = home {
-        let found = crate::noindex::scan(
-            home,
-            crate::noindex::DOCTOR_DEPTH,
-            &crate::noindex::Budget::DOCTOR,
+    // (7b) THE DEVELOPER ROOT ([`crate::devroot`], macOS): every checkout under `$HOME`
+    // belongs in `~/Developer`, the one folder the owner adds to Spotlight's Search Privacy
+    // list — a WARNING with the verb that moves them once that folder exists (a note before
+    // it does), never a PROBLEM (nothing is broken). Then whether Spotlight skips that
+    // folder, from a MEASUREMENT the caller made (a probe planted in it and a later
+    // control beside it), never from its name: `None` is a report that does not measure,
+    // and says nothing.
+    if crate::noindex::SUPPORTED
+        && let Some(home) = home
+    {
+        let row = crate::devroot::devroot_row(&crate::devroot::survey(home));
+        let _ = writeln!(
+            out,
+            "{p}: {} — devroot: {}",
+            level_word(row.level),
+            row.text
         );
-        let exposed: Vec<&crate::noindex::Target> = found.exposed().collect();
-        if exposed.is_empty() && !found.targets.is_empty() {
-            // The provenance caveat every surface carries: `exclusion_of` reads the NAME,
-            // and `.noindex` is observed behaviour, not a documented Apple API — and doctor,
-            // which never probes, is the last surface that should sound sure.
-            let _ = writeln!(
-                out,
-                "{p}: ok — {} cargo target dir(s) under {} are hidden from Spotlight — that \
-                 is what the NAMES say; `aterm pkg noindex verify <dir>` measures it",
-                found.targets.len(),
-                home.display()
-            );
-        } else if !exposed.is_empty() {
-            let size = crate::noindex::size_of_all(&exposed, &crate::noindex::Budget::DOCTOR_SIZE);
-            // WHICH of them the unattended pass can reach. The pass renames only a
-            // target dir beside a Cargo.toml (`noindex::apply_under`, `require_repo`): a
-            // FREE-STANDING one (`$HOME/trust/build/bootstrap`) is pointed at by an env var or
-            // a build system the pass cannot re-point, so every pass skips it. Say which
-            // are which, and what moves the free ones — a count that never falls otherwise
-            // reads as a pass that is not doing its job.
-            let (in_repo, free): (Vec<&crate::noindex::Target>, Vec<&crate::noindex::Target>) =
-                exposed
-                    .iter()
-                    .copied()
-                    .partition(|t| crate::noindex::repo_of(&t.path).is_some());
-            let reach = spotlight_reach(in_repo.len(), &free);
-            let _ = writeln!(
-                out,
-                // State, reach, the action, then the list/measure verbs, then why.
-                "{p}: warn — {at_least}{} of {} cargo target dir(s) under {} are indexed by \
-                 Spotlight ({}); {reach}{now}; `aterm pkg noindex` lists them, `aterm pkg \
-                 noindex verify <dir>` measures one (indexing build output can stall \
-                 WindowServer; [machine] spotlight_noindex, default on)",
-                exposed.len(),
-                found.targets.len(),
-                home.display(),
-                crate::noindex::human_size(&size),
-                // THE REMEDY ONLY WHEN IT REACHES SOMETHING: `--all` walks with
-                // `require_repo`, so with every dir free-standing it is a no-op.
-                // A budget-stopped scan counted only what it reached, and the default
-                // report keeps only this row's first clause, so the count says "at least".
-                at_least = if found.complete { "" } else { "at least " },
-                now = if in_repo.is_empty() {
-                    String::new()
-                } else {
-                    " — now: `aterm pkg machine apply` (or `aterm pkg noindex apply --all`, \
-                     which walks with the verb's larger budget)"
-                        .to_string()
-                }
-            );
-        }
-        if !found.complete {
-            let _ = writeln!(
-                out,
-                "{p}: note — the Spotlight-exposure scan did not cover all of {}; \
-                 `aterm pkg noindex scan <root>` covers a tree it did not reach",
-                home.display()
-            );
-        }
+    }
+    if let Some(row) = probes
+        .spotlight
+        .as_ref()
+        .and_then(crate::devroot::spotlight_row)
+    {
+        let _ = writeln!(
+            out,
+            "{p}: {} — spotlight: {}",
+            level_word(row.level),
+            row.text
+        );
     }
 
-    // (7b) UNIVERSAL CONTROL (macOS): the other machine setting the pass applies per
+    // (7c) UNIVERSAL CONTROL (macOS): the machine setting the pass applies per
     // this report (R5). Read through `defaults -currentHost`, never written here; the
     // line carries the revert when it is off and the opt-out when it is about to be.
     if cfg!(target_os = "macos") {
@@ -3864,7 +3781,17 @@ const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 pub(crate) fn output_bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
 ) -> Option<std::process::Output> {
-    bounded(cmd, false, probe_timeout())
+    output_bounded_within(cmd, probe_timeout())
+}
+
+/// [`output_bounded`] within the caller's `within` instead of [`PROBE_TIMEOUT`]: a probe
+/// with its own ceiling (`crate::platform`'s Spotlight and `defaults` reads), whose tests
+/// hand it a hang detector instead.
+pub(crate) fn output_bounded_within(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+) -> Option<std::process::Output> {
+    bounded(cmd, false, within)
 }
 
 /// [`PROBE_TIMEOUT`], or a test's shorter one (`ShorterProbes`, unix tests only).
@@ -3907,8 +3834,7 @@ impl Drop for ShorterProbes {
 }
 
 /// [`output_bounded`] that keeps stderr too, within `within` — for a probe whose refusal
-/// is the answer (`crate::prereq`: a broken compiler's first stderr line, verbatim). Both
-/// pipes are read after exit, so it is for probes whose output is a line or two.
+/// is the answer (`crate::prereq`: a broken compiler's first stderr line, verbatim).
 pub(crate) fn output_bounded_capturing(
     cmd: &mut aterm_uds::spawnfd::Command,
     within: std::time::Duration,
@@ -3916,13 +3842,28 @@ pub(crate) fn output_bounded_capturing(
     bounded(cmd, true, within)
 }
 
+/// The most of a probe's stdout or stderr that is kept: a version answer is a line or two.
+/// A child that writes more is not answering one; its pipe is no longer read, so it fills
+/// and the child meets the deadline, as every probe did before the pipes were read while it
+/// ran.
+const PROBE_OUTPUT_CAP: usize = 1 << 20;
+
+/// [`output_bounded`] and [`output_bounded_capturing`]: the child's pipes are read WHILE it
+/// runs and once more when it has exited, and never waited on past that.
+///
+/// WHY NOT `read_to_end` AFTER THE EXIT. The child's exit does not close its pipes: any
+/// process it started holds them for as long as it lives. A `cargo` wrapper that backgrounds
+/// a usage logger or starts a server answered `-vV` in 0.08 s and then held the reroute's
+/// probe for the 20 s its background `sleep` lived (measured 2026-09-30; a process that
+/// never exits held it forever, and the command the probe stood in front of never ran).
+/// Everything the child itself wrote is in the pipe by the time it has exited, so the last
+/// read takes what is there and stops — on unix the pipes are non-blocking ([`Capture`]).
 fn bounded(
     cmd: &mut aterm_uds::spawnfd::Command,
     keep_stderr: bool,
     within: std::time::Duration,
 ) -> Option<std::process::Output> {
     use aterm_uds::spawnfd::Stdio;
-    use std::io::Read as _;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3934,7 +3875,11 @@ fn bounded(
         .spawn()
         .ok()?;
     let deadline = std::time::Instant::now() + within;
+    let mut stdout = Capture::new(child.stdout.take());
+    let mut stderr = Capture::new(child.stderr.take());
     let status = loop {
+        stdout.pump();
+        stderr.pump();
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
@@ -3949,22 +3894,133 @@ fn bounded(
             Err(_) => return None,
         }
     };
-    // The child has exited, so its stdout is closed and this read cannot block —
-    // and a version line is one line, far inside any pipe buffer, so nothing
-    // could have wedged the child on a full pipe before it got here either.
-    let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_end(&mut stdout);
-    }
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_end(&mut stderr);
-    }
     Some(std::process::Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.finish(deadline),
+        stderr: stderr.finish(deadline),
     })
+}
+
+/// One pipe of a [`bounded`] probe, read without ever blocking on it: non-blocking, so a
+/// read takes what is in the pipe and returns.
+#[cfg(unix)]
+struct Capture<R> {
+    /// `None` at end of file, after an error, or when it could not be made non-blocking —
+    /// a pipe that could block is never read.
+    pipe: Option<R>,
+    out: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl<R: std::io::Read + std::os::fd::AsRawFd> Capture<R> {
+    fn new(pipe: Option<R>) -> Self {
+        let pipe = pipe.filter(|pipe| {
+            let fd = pipe.as_raw_fd();
+            // SAFETY: `fd` is the open read end of a pipe this process owns (`pipe` holds
+            // it for the whole call), and F_GETFL/F_SETFL read and set its status flags and
+            // touch no memory.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+            }
+        });
+        Self {
+            pipe,
+            out: Vec::new(),
+        }
+    }
+
+    /// Read what is in the pipe now, up to [`PROBE_OUTPUT_CAP`].
+    fn pump(&mut self) {
+        let mut chunk = [0u8; 8192];
+        while let Some(pipe) = self.pipe.as_mut() {
+            let room = PROBE_OUTPUT_CAP.saturating_sub(self.out.len());
+            if room == 0 {
+                return;
+            }
+            let want = room.min(chunk.len());
+            match pipe.read(&mut chunk[..want]) {
+                Ok(0) => self.pipe = None,
+                Ok(n) => self.out.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => self.pipe = None,
+            }
+        }
+    }
+
+    /// What the child wrote: the pipe read once more after it exited, and no longer.
+    fn finish(mut self, _deadline: std::time::Instant) -> Vec<u8> {
+        self.pump();
+        self.out
+    }
+}
+
+/// One pipe of a [`bounded`] probe where a pipe cannot be made non-blocking: a thread reads
+/// it, and [`Capture::finish`] waits for its end of file only until the probe's deadline,
+/// then takes what it has read. The thread outlives the probe only while a process the
+/// child left behind holds the pipe open.
+#[cfg(not(unix))]
+struct Capture {
+    /// What the thread has read, and whether it is done reading.
+    read: std::sync::Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
+}
+
+#[cfg(not(unix))]
+impl Capture {
+    fn new<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let read = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), pipe.is_none())));
+        if let Some(mut pipe) = pipe {
+            // The thread's handle is not called `shared`: the lock-order census
+            // names a lock by its receiver, and a `shared` taken in a fn named `new`
+            // reads as the one aterm-net's relay holds across `io::Error::new`.
+            let filled = std::sync::Arc::clone(&read);
+            let spawned = std::thread::Builder::new()
+                .name("probe-pipe".into())
+                .spawn(move || {
+                    use std::io::Read as _;
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let got = pipe.read(&mut chunk);
+                        let mut read = filled.lock().unwrap_or_else(|e| e.into_inner());
+                        match got {
+                            Ok(n) if n > 0 && read.0.len() < PROBE_OUTPUT_CAP => {
+                                let keep = n.min(PROBE_OUTPUT_CAP - read.0.len());
+                                read.0.extend_from_slice(&chunk[..keep]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            // End of file, an error, or past the cap (the pipe is no longer
+                            // read, as on unix).
+                            _ => {
+                                read.1 = true;
+                                return;
+                            }
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                read.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+            }
+        }
+        Self { read }
+    }
+
+    /// Nothing to do: the thread reads as the child writes.
+    fn pump(&mut self) {}
+
+    /// What the thread read by its end of file, or by `deadline`, whichever came first.
+    fn finish(self, deadline: std::time::Instant) -> Vec<u8> {
+        loop {
+            {
+                let read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+                if read.1 || std::time::Instant::now() >= deadline {
+                    return read.0.clone();
+                }
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(PROBE_POLL.min(remaining));
+        }
+    }
 }
 
 /// Copy-pasteable manual PATH-append for the shell of THIS platform: PowerShell on Windows
@@ -4251,48 +4307,12 @@ fn upstream_index_on_path(
     })
 }
 
-/// The clause of the Spotlight warning that says how far the unattended apply reaches
-/// (`aterm pkg machine apply`, which the window runs as it opens and a terminal session once
-/// a day): the exposed target dirs beside a
-/// Cargo.toml are its to migrate; the FREE-STANDING ones (`free`, no Cargo.toml beside
-/// them) are pointed at by an env var or a build system it cannot re-point, so it never
-/// renames them and the operator has to — by name, after re-pointing. Up to three are
-/// named; a count that names nothing sends the reader to `aterm pkg noindex` to find out
-/// which.
-fn spotlight_reach(in_repo: usize, free: &[&crate::noindex::Target]) -> String {
-    const SHOWN: usize = 3;
-    let named = || {
-        let mut names: Vec<String> = free
-            .iter()
-            .take(SHOWN)
-            .map(|t| t.path.display().to_string())
-            .collect();
-        if free.len() > SHOWN {
-            names.push(format!("+{} more", free.len() - SHOWN));
-        }
-        names.join(", ")
-    };
-    match (in_repo, free.len()) {
-        (_, 0) => "aterm migrates them once a day, at the first window or terminal session \
-             (every one is beside a Cargo.toml)"
-            .to_string(),
-        (0, _) => format!(
-            "NONE is beside a Cargo.toml, so aterm never renames any of them: each \
-             is a free-standing target dir an env var or a build system points at ({}) — \
-             re-point that, then `aterm pkg noindex apply <dir>` by name",
-            named()
-        ),
-        (r, f) => format!(
-            "aterm migrates the {r} beside a Cargo.toml once a day, at the first window or \
-             terminal session; the other {f} \
-             {} free-standing — an env var or a build system points at {} ({}), which \
-             aterm cannot re-point, so it never renames {} — re-point that, then `aterm pkg \
-             noindex apply <dir>` by name",
-            if f == 1 { "is" } else { "are" },
-            if f == 1 { "it" } else { "each" },
-            named(),
-            if f == 1 { "it" } else { "them" },
-        ),
+/// A devroot row's weight in this report's words.
+fn level_word(level: crate::devroot::Level) -> &'static str {
+    match level {
+        crate::devroot::Level::Ok => "ok",
+        crate::devroot::Level::Warn => "warn",
+        crate::devroot::Level::Note => "note",
     }
 }
 

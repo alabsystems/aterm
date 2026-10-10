@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pet follows the caret it cannot see (owner report, 2026-09-19).
+//! The pet follows the caret it cannot see.
 //!
 //! Programs that hide the cursor with DECTCEM while repainting (progress bars,
 //! spinners, pagers, editors, LLM consoles) still have a caret. The host sends

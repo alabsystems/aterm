@@ -86,11 +86,11 @@ fn render_input_eq_compares_sprites_by_value_and_atlas_by_identity() {
     let mut b = term.cell_frame(3, 12);
     a.free_sprites = vec![free(2, 5, 8, 8)];
     b.free_sprites = vec![free(2, 5, 8, 8)];
-    // ATLASES compare by SNAPSHOT IDENTITY (`Arc::as_ptr`), never `version`
-    // (split-pane audit): baker versions are deterministic PER ENGINE INSTANCE,
-    // so a rebuilt engine replays its predecessor's version sequence with
-    // different texels. Two DISTINCT Arcs at the same version are exactly that
-    // case — calling them equal is the stale-atlas aliasing the audit outlawed.
+    // ATLASES compare by SNAPSHOT IDENTITY (`Arc::as_ptr`), never `version`:
+    // baker versions are deterministic PER ENGINE INSTANCE, so a rebuilt
+    // engine replays its predecessor's version sequence with different texels.
+    // Two DISTINCT Arcs at the same version are exactly that case — calling
+    // them equal is stale-atlas aliasing.
     a.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 7)));
     b.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 7)));
     assert_ne!(

@@ -7,29 +7,14 @@
 //!
 //! ## Why this is first-party
 //!
-//! `embed-resource` did this job until 2026-09-14, and it stopped compiling on
-//! the one lane that matters — the native `x86_64-pc-windows-msvc` build — the
-//! day `libc` became first-party (`c4441a9ca`, 2026-08-30). `embed-resource`
-//! pulls `vswhom` (and `vswhom-sys`) only under
-//! `cfg(all(target_os = "windows", target_env = "msvc"))`, to locate a Visual
-//! Studio install when `rc.exe` is not on `PATH`, and those two crates reach
-//! into `libc::wchar_t` (vswhom-sys) and `libc::wcslen` (vswhom).
-//! `crates/aterm-libc` declares NO target-specific ABI on Windows on purpose —
-//! the Windows cell is the 14 `core::ffi` primitives and nothing else, and "a
-//! target consumer that starts using a non-primitive item fails closed when
-//! compiled" is the documented contract (`libc-oracle/gen/README.md`).
-//!
-//! No cross build from a Mac could ever see this, and the reason is not the
-//! target triple: `embed-resource` is a BUILD-dependency, build-dependencies
-//! compile for the HOST, and that `cfg` is evaluated against the host — so on
-//! an Apple host `vswhom` is simply not in the graph, whatever `--target` says
-//! (`xtask gate cells --cell win` type-checks `-p aterm` for the msvc triple
-//! and passes right through it). Only a native Windows-msvc host compiles
-//! `vswhom`, and nobody built there between 2026-08-29 and 2026-09-14, so the
-//! shipped Windows binary was unbuildable for two weeks without a single gate
-//! going red. Declaring `wchar_t` and `wcslen` for Windows would have traded
-//! the crate's stated design for one third-party build helper; deleting the
-//! helper costs nothing the product uses.
+//! `embed-resource` pulled `vswhom`/`vswhom-sys` on Windows-msvc hosts, which
+//! need `libc::wchar_t`/`wcslen`; `crates/aterm-libc` declares only the
+//! `core::ffi` primitives on Windows by design (`libc-oracle/gen/README.md`).
+//! Build-dependencies compile for the HOST, so a cross build from a Mac never
+//! sees that graph (`xtask gate cells --cell win` passes right through it):
+//! only a native Windows-msvc build breaks. Declaring `wchar_t`/`wcslen` in
+//! aterm-libc would trade its design for one build helper; dropping the helper
+//! cost nothing the product uses.
 //!
 //! ## What it does
 //!
@@ -48,9 +33,9 @@
 //! `apps/aterm-win/build.ps1` runs), through the `WindowsSdkVerBinPath` variable
 //! `vcvars` exports, or by scanning the documented Windows Kits install root for
 //! the newest SDK. `ATERM_RC` names a compiler explicitly when none of those
-//! apply. A machine with no resource compiler gets an honest [`Outcome`] the
-//! caller turns into a warning or a hard error — the same warn-don't-fail
-//! posture `crates/aterm/build.rs` documents — never a silent no-op.
+//! apply. A machine with no resource compiler gets an [`Outcome`] the caller
+//! turns into a warning or an error (`crates/aterm/build.rs`), never a silent
+//! no-op.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -145,12 +130,9 @@ pub fn compile(rc: &Path) -> Outcome {
     let (compiler, dialect) = match locate_compiler(&target_env, &target_arch) {
         Ok(found) => found,
         Err(why) => {
-            // A miss is a fact about the BOX, and the box changes without the
-            // source changing: the next build may run inside a Developer
-            // prompt, or after the SDK was installed. Cargo fingerprints only
-            // the env vars a build script declares, so declare the ones the
-            // search read — on the miss path only, so a build that FOUND its
-            // compiler is not re-run by every PATH difference between shells.
+            // A miss can be fixed without a source change (a Developer prompt,
+            // an SDK install), so declare the env vars the search read. Only
+            // on the miss path: a hit must not re-run on every PATH change.
             for var in [
                 "PATH",
                 "WindowsSdkVerBinPath",
@@ -251,11 +233,9 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
 
     let gnu = target_env == "gnu";
 
-    // 1. An explicit choice wins outright — including on a box where the
-    //    heuristics below would also have found something. It is still held
-    //    to the TARGET's linker: a `.res` handed to GNU `ld` fails at link
-    //    time with "file format not recognized", a failure no `Outcome` could
-    //    explain, so a dialect the target cannot consume is refused here.
+    // 1. An explicit choice wins outright, but is held to the TARGET's
+    //    linker: a `.res` handed to GNU `ld` fails later with "file format
+    //    not recognized", so refuse that dialect here.
     if let Some(explicit) = std::env::var_os("ATERM_RC") {
         let p = PathBuf::from(explicit);
         let found = if p.is_file() {
@@ -309,15 +289,10 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
             }
             looked.push(format!("{}", p.display()));
         }
-        // 3. The documented Windows Kits root, EVERY installed SDK version,
-        //    newest first. Not just the newest: a version directory without
-        //    rc.exe is a real layout, not a hypothetical — this x64 box carries
-        //    10.0.14393.0, 10.0.15063.0, 10.0.16299.0 and 10.0.17134.0, each
-        //    with an `x64\` subdirectory and no rc.exe in it, beside the one
-        //    complete 10.0.26100.0 — and a partial NEWER kit (debuggers or
-        //    signing tools only) beside a full older SDK would otherwise hide
-        //    the compiler one directory over. Both program roots are tried;
-        //    on this x64 box the SDK lives under the (x86) one.
+        // 3. The documented Windows Kits root, every installed SDK version,
+        //    newest first: partial kits (an arch directory with no rc.exe)
+        //    are common, and a partial newer kit must not hide a full older
+        //    one. Both program roots are tried; x64 installs under (x86).
         for root_var in ["ProgramFiles(x86)", "ProgramFiles"] {
             let Some(root) = std::env::var_os(root_var) else {
                 continue;

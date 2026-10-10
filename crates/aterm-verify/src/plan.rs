@@ -64,16 +64,6 @@ pub enum Lane {
     /// one under a stage that is driving it (in `target/` the test stage
     /// relinked `aterm-gui` with dev features).
     DriverTarget,
-    /// `target/conformance-release/` — the RELEASE `aterm` the paint and spin
-    /// suites judge, built here and HANDED to them (`ATERM_PAINT_BIN`). It is
-    /// the directory those suites' own helper builds into when run by hand, so
-    /// a hand run and the gate share one warm artifact.
-    ///
-    /// It lives UNDER `target/` and is still a lane of its own, because a lane
-    /// is a cargo target directory and cargo's build lock is taken per target
-    /// directory: the main lane's children never open this one, so priming it
-    /// contends with nothing the test compile is doing.
-    ConformanceRelease,
     /// `target-trust/` — the Trust verification lane's slots
     /// (`tools/trust-gate-all.sh --target-root`, one target dir per slot under
     /// it). Verified artifacts are built with different flags from every other
@@ -127,12 +117,11 @@ pub enum StageId {
     /// the driver lane after every row the test run waits for, and waited for
     /// by nothing but that barrier ([`NOT_AWAITED`], 2026-09-29).
     TailDriverBuilds,
-    /// The RELEASE `aterm` the paint and spin suites judge, built in its own
-    /// lane at t0 so the measuring stage finds it warm. MEASURE tier.
-    ConformanceRelease,
     /// The tests the parallel run skips because they MEASURE the machine or
     /// the release artifact (`stages::MEASURING_TESTS`, aterm-conformance's
-    /// paint and spin), run with nothing else in flight. MEASURE tier.
+    /// paint and spin), run with nothing else in flight over the release
+    /// bundle the run was handed ([`crate::Ctx::measure_artifact`]). MEASURE
+    /// tier.
     MeasuringTests,
     ControlSocketSmoke,
     GuiSmoke,
@@ -146,7 +135,6 @@ pub enum StageId {
     /// alternate-screen flap an app cannot see, read by `status`, `resizes`
     /// and `cast drift` in a private headless `aterm` this run built.
     RenderDesync,
-    KaniFloor,
     CrossCells,
     /// `xtask gate forge`, every tier (2026-09-25).
     Forge,
@@ -166,18 +154,20 @@ pub enum StageId {
 ///   tree builds, passes its tests, lints, formats, proves its obligations and
 ///   drives its binaries. Its verdict is about the change.
 /// * MEASURE — [`MEASURE_TIER`]: the stages that measure the MACHINE or the
-///   RELEASE ARTIFACT rather than decide correctness — frame timings, input
-///   latencies, and the fat-LTO release build the paint and spin matrices
-///   judge. Run by `--measure` and `--full`; a release cut requires a green one
-///   for the tree it cuts.
-/// * FULL — [`FULL_ONLY`]: the sealed fabric rung, the trust-mc / Kani floor,
-///   the cross-cell type-check, the startup comparison and the Codex live
-///   upgrade, `--full`'s own.
+///   RELEASE ARTIFACT rather than decide correctness — frame timings and input
+///   latencies of the release bundle the run is handed (`--measure <APP>`,
+///   `--full <APP>`; the release builds it once, and the gate builds no release
+///   `aterm` of its own). A release signs only bytes a green one measured.
+/// * FULL — [`FULL_ONLY`]: the sealed fabric rung, the cross-cell type-check,
+///   the startup comparison and the Codex live upgrade, `--full`'s own.
 ///
 /// WHY THE SPLIT (the 2026-09-26 gate audit, measured on two loaded runs):
 /// the release build took 3351 s and 3525 s beside every push's gate, and the
 /// same load turned correctness verdicts red on timing. The measuring work
 /// still runs — before anything ships — just not as a condition of landing.
+/// Since 2026-10-09 the release build is not the gate's at all: the release
+/// builds its bundle once and hands it to the MEASURE tier, so the bytes it
+/// judged are the bytes that ship.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     Land,
@@ -189,11 +179,7 @@ pub enum Tier {
 /// list the plan filters on ([`StageId::tier`]), the verdict of a run that did
 /// not run it names ([`tier_titles`]), and a MEASURE receipt's `measured yes`
 /// covers. Adding a stage here moves it out of the merge contract.
-pub const MEASURE_TIER: [StageId; 3] = [
-    StageId::ConformanceRelease,
-    StageId::MeasuringTests,
-    StageId::GuiSmoke,
-];
+pub const MEASURE_TIER: [StageId; 2] = [StageId::MeasuringTests, StageId::GuiSmoke];
 
 /// The `--full`-only stages, in their ladder order: the sealed fabric rung,
 /// declared in the driver lane before the first barrier so the test run waits
@@ -205,9 +191,8 @@ pub const MEASURE_TIER: [StageId; 3] = [
 /// release carries, while every per-commit test run waited behind it. The
 /// fabric's authorization semantics stay per commit through the plaintext
 /// end-to-end suites.
-pub const FULL_ONLY: [StageId; 5] = [
+pub const FULL_ONLY: [StageId; 4] = [
     StageId::SealedLane,
-    StageId::KaniFloor,
     StageId::CrossCells,
     StageId::StartCompare,
     StageId::CodexLiveUpgrade,
@@ -311,31 +296,29 @@ pub struct StageSpec {
     /// Stages that must have FINISHED before this one starts, under the same
     /// barrier rule as [`StageSpec::after_lanes`] (`crate::sched::awaited`).
     /// Empty except for the doctests, which await the test compile
-    /// ([`Lane::Doctests`]); where [`MeasureOverlap::AfterLand`] holds the
-    /// MEASURE tier's workspace build behind the land tier's on a host whose
-    /// memory cannot hold them all at once; and where
-    /// [`TrustOverlap::AfterTests`] holds the trust lane behind the land
-    /// tier's builds and tests; and where [`LandBuilds::OneAtATime`] chains
-    /// the land tier's builds.
+    /// ([`Lane::Doctests`]); the trust lane, which
+    /// [`TrustOverlap::AfterTests`] holds behind the land tier's builds, test
+    /// run and doctests in every plan that has both; and where
+    /// [`LandBuilds::OneAtATime`] chains the land tier's builds.
     pub after_stages: Vec<StageId>,
 }
 
 /// THE ROWS THAT COMPILE AT WORKSPACE SCALE, declared once (2026-10-03): each
-/// builds the `aterm-gui` graph (or, for the release artifact, the whole
-/// `aterm` binary fat-LTO) and is what fills a small host's memory. Rows in one
-/// lane run one at a time, so the builds a tier runs AT ONCE are the distinct
-/// lanes among its rows here ([`concurrent_builds`]). The other compiling rows
+/// builds the `aterm-gui` graph and is what fills a small host's memory. Rows in
+/// one lane run one at a time, so the builds a tier runs AT ONCE are the
+/// distinct lanes among its rows here ([`concurrent_builds`]). Every one is the
+/// land tier's: the MEASURE tier builds no release `aterm` (it is handed the
+/// release's bundle), so it compiles nothing at this scale. The other compiling rows
 /// — the xtask verbs, the oracle and L0 workspaces, the trust lane, whose
 /// verifier is capped at RAM / 8 by `targo trust` itself — build far smaller
 /// graphs and are not counted. Nor are the doctests here: they await the test
 /// compile, so they never run beside it and the peak is unchanged; beside the
 /// test run, where they take its place, [`builds_beside_tests`] counts them.
-pub const WORKSPACE_BUILDS: [StageId; 5] = [
+pub const WORKSPACE_BUILDS: [StageId; 4] = [
     StageId::TestCompile,
     StageId::Tippy,
     StageId::DriverBuilds,
     StageId::TailDriverBuilds,
-    StageId::ConformanceRelease,
 ];
 
 /// The memory one concurrent workspace build needs at its peak: 2 GiB.
@@ -355,7 +338,7 @@ pub const WORKSPACE_BUILD_BYTES: u64 = 2 * crate::disk::GIB;
 /// release build as a 4th, swap reached 6.9 of 8 GiB, every compile sat in
 /// state U at 15-37% CPU, timing-bound stages failed and the run did not finish
 /// in 2 hours. So both numbers are what that host holds and no more; a 12 GiB
-/// host holds 5 and overlaps, the 128 GiB host 63.
+/// host holds 5, the 128 GiB host 63.
 pub const HOST_RESERVE_BYTES: u64 = 2 * crate::disk::GIB;
 
 /// How many workspace builds `ram` bytes hold at once (at 2 GiB each beyond the
@@ -559,9 +542,8 @@ pub fn concurrent_builds(plan: &[StageSpec], tier: Tier) -> usize {
 /// tier's but the test compile, which ends before it (tippy and the tail
 /// driver builds); the doctests, which since 2026-10-05 start when the test
 /// compile ends and run beside it ([`Lane::Doctests`]) — rustdoc compiles each
-/// crate's doctests, so they count as one build, the fail-closed figure; and
-/// the MEASURE tier's release build, which [`measure_overlap`] holds only
-/// behind the land tier's builds. Where tippy awaits the tail driver row
+/// crate's doctests, so they count as one build, the fail-closed figure. Where
+/// tippy awaits the tail driver row
 /// ([`LandBuilds::OneAtATime`]) the two never overlap, so one land build runs
 /// beside the tests, not two.
 #[must_use]
@@ -576,7 +558,6 @@ pub fn builds_beside_tests(plan: &[StageSpec]) -> usize {
         .saturating_sub(chained)
         .max(chained)
         + doctests
-        + concurrent_builds(plan, Tier::Measure)
 }
 
 /// The line a run prints at its start when the memory narrows the test pool
@@ -600,13 +581,14 @@ pub fn test_pool_note(ram: Option<u64>, plan: &[StageSpec], jobs: usize) -> Opti
 
 /// The start lines about this host's memory: what it holds and what the plan
 /// runs at once, stated once, then each change it forces
-/// ([`measure_overlap`], [`trust_overlap`], [`test_pool_note`]). Empty when
-/// nothing changes. Where wired memory takes RAM from the builds
-/// ([`build_memory`]) the head states the usable figure instead, and is the
-/// one line that says the land tier builds one at a time ([`land_builds`]);
-/// every decision then uses that smaller RAM. `memtotal`: the RAM figure is
-/// Linux's `MemTotal` ([`crate::Ctx::host_memtotal`]), so every GiB figure is
-/// in the OS's units, not the installed size.
+/// ([`test_pool_note`]). Empty when nothing changes. The trust lane's hold is
+/// not among them: memory does not decide it ([`TrustOverlap::note`]). Where
+/// wired memory takes RAM from the builds ([`build_memory`]) the head states
+/// the usable figure instead, and is the one line that says the land tier
+/// builds one at a time ([`land_builds`]); every decision then uses that
+/// smaller RAM. `memtotal`: the RAM figure is Linux's `MemTotal`
+/// ([`crate::Ctx::host_memtotal`]), so every GiB figure is in the OS's units,
+/// not the installed size.
 #[must_use]
 pub fn memory_notes(
     ram: Option<u64>,
@@ -615,15 +597,9 @@ pub fn memory_notes(
     plan: &[StageSpec],
     jobs: usize,
 ) -> Vec<String> {
-    let build = build_memory(ram, usable);
-    let changes: Vec<String> = [
-        measure_overlap(build, plan).note(memtotal),
-        trust_overlap(build, plan).note(memtotal),
-        test_pool_note(build, plan, jobs),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let changes: Vec<String> = test_pool_note(build_memory(ram, usable), plan, jobs)
+        .into_iter()
+        .collect();
     let serial = land_builds(ram, usable, plan) != LandBuilds::Together;
     if changes.is_empty() && !serial {
         return changes;
@@ -643,120 +619,15 @@ pub fn memory_notes(
     std::iter::once(head).chain(changes).collect()
 }
 
-/// "the land tier runs N[ and the MEASURE tier M]": the workspace builds each
-/// tier of `plan` runs at once.
+/// "the land tier runs N": the workspace builds `plan` runs at once (the
+/// MEASURE tier builds none: [`WORKSPACE_BUILDS`]).
 fn tiers_run(plan: &[StageSpec]) -> String {
-    let measure = concurrent_builds(plan, Tier::Measure);
-    format!(
-        "the land tier runs {}{}",
-        concurrent_builds(plan, Tier::Land),
-        if measure > 0 {
-            format!(" and the MEASURE tier {measure}")
-        } else {
-            String::new()
-        },
-    )
+    format!("the land tier runs {}", concurrent_builds(plan, Tier::Land))
 }
 
 /// The unit label a GiB figure carries when it is Linux's `MemTotal`.
 fn memtotal_label(memtotal: bool) -> &'static str {
     if memtotal { " (MemTotal)" } else { "" }
-}
-
-/// The RAM, in whole GiB, that holds `builds` workspace builds at once.
-fn ram_for(builds: usize) -> u64 {
-    let builds = u64::try_from(builds).unwrap_or(u64::MAX);
-    HOST_RESERVE_BYTES.saturating_add(builds.saturating_mul(WORKSPACE_BUILD_BYTES))
-        / crate::disk::GIB
-}
-
-/// May the MEASURE tier's workspace builds overlap the land tier's, on a host
-/// with this much memory? A pure decision over (RAM, plan), so it is tested
-/// without the real host ([`measure_overlap`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MeasureOverlap {
-    /// Nothing changes: one tier alone, or memory enough for every build at
-    /// once.
-    Overlaps,
-    /// The MEASURE tier's builds wait for every land-tier build to finish.
-    AfterLand {
-        /// The host's physical memory, in bytes.
-        ram: u64,
-        /// The workspace builds it holds at once ([`builds_held`]).
-        holds: u64,
-        /// The workspace builds the land tier runs at once.
-        land: usize,
-        /// The workspace builds the MEASURE tier runs at once.
-        measure: usize,
-    },
-    /// The MEASURE tier's builds wait as in [`MeasureOverlap::AfterLand`]
-    /// because the host's memory could not be read: the serial order is the
-    /// one that cannot swap a small host, so an unknown host gets it.
-    RamUnread,
-}
-
-/// Decide [`MeasureOverlap`] for `plan` on a host with `ram` bytes: the
-/// MEASURE tier's builds wait when the two tiers' concurrent workspace builds
-/// together exceed what the memory holds, or when the memory is unknown.
-#[must_use]
-pub fn measure_overlap(ram: Option<u64>, plan: &[StageSpec]) -> MeasureOverlap {
-    let land = concurrent_builds(plan, Tier::Land);
-    let measure = concurrent_builds(plan, Tier::Measure);
-    match ram {
-        Some(ram) if land > 0 && measure > 0 => {
-            let holds = builds_held(ram);
-            if u64::try_from(land + measure).unwrap_or(u64::MAX) > holds {
-                MeasureOverlap::AfterLand {
-                    ram,
-                    holds,
-                    land,
-                    measure,
-                }
-            } else {
-                MeasureOverlap::Overlaps
-            }
-        }
-        None if land > 0 && measure > 0 => MeasureOverlap::RamUnread,
-        _ => MeasureOverlap::Overlaps,
-    }
-}
-
-impl MeasureOverlap {
-    /// Hold every MEASURE-tier workspace build behind every land-tier one.
-    /// Only scheduling moves: no row is added, removed or reordered.
-    pub fn apply(self, plan: &mut [StageSpec]) {
-        if self == MeasureOverlap::Overlaps {
-            return;
-        }
-        let land: Vec<StageId> = plan
-            .iter()
-            .filter(|s| s.id.tier() == Tier::Land && WORKSPACE_BUILDS.contains(&s.id))
-            .map(|s| s.id)
-            .collect();
-        for s in plan.iter_mut() {
-            if s.id.tier() == Tier::Measure && WORKSPACE_BUILDS.contains(&s.id) {
-                s.after_stages.clone_from(&land);
-            }
-        }
-    }
-
-    /// The line a run prints at its start when the builds wait; `None` when
-    /// nothing changes. [`memory_notes`] states the RAM before it; `memtotal`
-    /// labels the needed figure as `MemTotal`, as [`memory_notes`] does.
-    #[must_use]
-    pub fn note(self, memtotal: bool) -> Option<String> {
-        match self {
-            MeasureOverlap::Overlaps => None,
-            MeasureOverlap::RamUnread => {
-                Some("verify: the MEASURE tier builds after the land tier's".to_string())
-            }
-            MeasureOverlap::AfterLand { land, measure, .. } => Some(format!(
-                "verify: the MEASURE tier builds after the land tier's ({} GiB{} runs them together)",
-                ram_for(land + measure),
-                memtotal_label(memtotal),
-            )),
-        }
-    }
 }
 
 /// `ram` bytes in GiB, FLOORED to a tenth, never rounded up: Linux's MemTotal
@@ -792,90 +663,64 @@ fn tenths_text(tenths: u64) -> String {
 /// test run starts, so they move nothing).
 const TEST_RUN_END: StageId = StageId::Test;
 
-/// May the trust lane verify beside the workspace builds and the land tier's
-/// test run, on a host with this much memory? A pure decision over (RAM,
-/// plan), the same shape as [`MeasureOverlap`] ([`trust_overlap`]).
+/// May the trust lane verify beside the land tier's workspace builds, its test
+/// run and its doctests? Not while the verifier's verdict budgets are clocks:
+/// a pure decision over the plan ([`trust_overlap`]), the same on every host.
 ///
-/// WHY (measured 2026-10-04, an 8 GiB, 6-core Mac, two merge-contract runs of
-/// one tree): verifying while the test stage compiled and ran (load 54), the
-/// verifier's per-function budgets tripped on load and proved counts swung
-/// run to run — aterm-lexicon 90 then 40, aterm-policy 62 then 42,
-/// aterm-wasm 18 then 127 — so its ratchet rows failed or passed by chance.
+/// WHY: on the deployed Trust seal (321aaeda7, store build 9192) a proof's
+/// verdict is decided within WALL-CLOCK budgets, so CPU contention changes it,
+/// and a lane run beside the land tier's builds loses proofs it keeps alone.
+/// MEASURED 2026-10-09 on an 18-core, 128 GiB Mac, where RAM alone had let the
+/// lane start with the run, beside the test compile, the test run, the
+/// doctests, tippy and the cells (load 20-37 for its 21 minutes):
+/// aterm-codec, its source unchanged, proved 270 of 565 in two gate runs,
+/// the load at its check's start 50.35 and 22.83 (its
+/// `target-trust/logs/aterm-codec@0.101.0.log.cost`); the same seal's
+/// whole-tree release lane, run alone at load 5.1 the day before, proved 389.
+/// Its floor is 383, so every change touching aterm-codec failed the gate on
+/// load the gate itself made. First seen 2026-10-04 on an 8 GiB, 6-core Mac
+/// (load 54): aterm-lexicon 90 then 40, aterm-policy 62 then 42, aterm-wasm 18
+/// then 127 — then read as memory, and held only where RAM ran out.
 ///
-/// COST: on that host the lane's wall now follows the ~50-60 min land tier
-/// instead of overlapping it, and the exclusive tail follows the lane, so a
-/// change touching a verified library can take a merge-contract run past
-/// 2 h (not yet measured).
+/// COST: the lane's wall follows the land tier's builds and test run instead
+/// of overlapping them, and the exclusive tail follows the lane, so a change
+/// touching a verified library adds the lane's wall (21 minutes in that run)
+/// to the merge contract's.
+///
+/// DELETION POINT: when Trust's P5 seal makes every verdict-changing bound a
+/// count, a lane beside the builds decides as it does alone, so overlapping is
+/// safe again: delete this hold — this enum, [`trust_overlap`], its call in
+/// [`plan`] and its start line in [`crate::run`] — and the trust lane starts
+/// with the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustOverlap {
-    /// Nothing changes: no trust lane or no land-tier build in the plan, or
-    /// memory to spare beyond the workspace builds that run at once.
+    /// Nothing to hold: the plan has no trust lane, or no land-tier build to
+    /// hold it behind (the MEASURE tier alone).
     Overlaps,
-    /// The trust lane waits for every workspace build (the MEASURE tier's
-    /// too, in `--full`), the land tier's test run and its doctests.
-    AfterTests {
-        /// The host's physical memory, in bytes.
-        ram: u64,
-        /// The workspace builds it holds at once ([`builds_held`]).
-        holds: u64,
-        /// The workspace builds the land tier runs at once.
-        land: usize,
-        /// The MEASURE tier's builds that run beside the land tier's — 0
-        /// when there are none, or when [`measure_overlap`] already holds
-        /// them behind the land tier's.
-        measure: usize,
-        /// The RAM, in whole GiB, from which the lane runs beside every
-        /// workspace build of both tiers.
-        need: u64,
-    },
-    /// The trust lane waits as in [`TrustOverlap::AfterTests`] because the
-    /// host's memory could not be read.
-    RamUnread,
+    /// The trust lane waits for every workspace build, the land tier's test
+    /// run and its doctests.
+    AfterTests,
 }
 
-/// Decide [`TrustOverlap`] for `plan` on a host with `ram` bytes: the trust
-/// lane waits when the memory holds no more than the workspace builds that
-/// run at once — the land tier's, plus the MEASURE tier's where
-/// [`measure_overlap`] lets them overlap — or when the memory is unknown.
+/// Decide [`TrustOverlap`] for `plan`: the trust lane waits whenever the plan
+/// has one and the land tier builds, whatever the host's RAM.
 #[must_use]
-pub fn trust_overlap(ram: Option<u64>, plan: &[StageSpec]) -> TrustOverlap {
-    let land = concurrent_builds(plan, Tier::Land);
-    if land == 0 || !plan.iter().any(|s| s.id == StageId::TrustAdvisory) {
-        return TrustOverlap::Overlaps;
-    }
-    match ram {
-        Some(ram) => {
-            let measure = if measure_overlap(Some(ram), plan) == MeasureOverlap::Overlaps {
-                concurrent_builds(plan, Tier::Measure)
-            } else {
-                0
-            };
-            let holds = builds_held(ram);
-            if holds <= u64::try_from(land + measure).unwrap_or(u64::MAX) {
-                TrustOverlap::AfterTests {
-                    ram,
-                    holds,
-                    land,
-                    measure,
-                    need: ram_for(land + concurrent_builds(plan, Tier::Measure) + 1),
-                }
-            } else {
-                TrustOverlap::Overlaps
-            }
-        }
-        None => TrustOverlap::RamUnread,
+pub fn trust_overlap(plan: &[StageSpec]) -> TrustOverlap {
+    if concurrent_builds(plan, Tier::Land) == 0
+        || !plan.iter().any(|s| s.id == StageId::TrustAdvisory)
+    {
+        TrustOverlap::Overlaps
+    } else {
+        TrustOverlap::AfterTests
     }
 }
 
 impl TrustOverlap {
-    /// Hold the trust lane behind every workspace build of either tier,
-    /// `TEST_RUN_END` (the test run) and the doctests beside it. Only
-    /// scheduling moves: no row is added, removed or reordered. Two of those
-    /// wait themselves, and the trust lane awaits what they await too, which
-    /// [`crate::sched::check_after_lanes`] requires: the MEASURE tier's
-    /// release build may wait behind the land tier's builds
-    /// ([`measure_overlap`]), and the test run waits on the driver lane's
-    /// awaited rows, which end before it starts.
+    /// Hold the trust lane behind every workspace build, `TEST_RUN_END` (the
+    /// test run) and the doctests beside it. Only scheduling moves: no row is
+    /// added, removed or reordered. The test run waits itself, and the trust
+    /// lane awaits what it awaits too, which [`crate::sched::check_after_lanes`]
+    /// requires: the driver lane's awaited rows, which end before it starts.
     pub fn apply(self, plan: &mut [StageSpec]) {
         if self == TrustOverlap::Overlaps {
             return;
@@ -899,19 +744,18 @@ impl TrustOverlap {
         }
     }
 
-    /// The line a run prints at its start when the trust lane waits; `None`
-    /// when nothing changes. [`memory_notes`] states the RAM before it;
-    /// `memtotal` labels the needed figure as [`MeasureOverlap::note`] does.
+    /// The line a run prints at its start when the trust lane waits, with the
+    /// reason; `None` when nothing is held. Printed apart from
+    /// [`memory_notes`]: memory does not decide it.
     #[must_use]
-    pub fn note(self, memtotal: bool) -> Option<String> {
-        const WAITS: &str = "verify: the trust lane verifies after the tests and builds";
+    pub fn note(self) -> Option<&'static str> {
         match self {
             TrustOverlap::Overlaps => None,
-            TrustOverlap::RamUnread => Some(WAITS.to_string()),
-            TrustOverlap::AfterTests { need, .. } => Some(format!(
-                "{WAITS} ({need} GiB{} runs it beside them)",
-                memtotal_label(memtotal)
-            )),
+            TrustOverlap::AfterTests => Some(
+                "verify: the trust lane verifies after the land tier's builds, tests and \
+                 doctests — its proof budgets are clocks, so beside them it loses proofs it \
+                 keeps alone",
+            ),
         }
     }
 }
@@ -940,21 +784,15 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::LibcOracleTarget => under_root("libc-oracle/target"),
         Lane::XtaskTarget => under_root("target-xtask"),
         Lane::DriverTarget => under_root("target-drivers"),
-        // The release `aterm` the measuring stage hands paint and spin in
-        // `ATERM_PAINT_BIN` / `ATERM_SPIN_BIN` (`release_bin` in
-        // `crates/aterm-conformance/tests/support/mod.rs` builds none).
-        Lane::ConformanceRelease => under_root("target/conformance-release"),
         Lane::TrustTarget => under_root("target-trust"),
     }
 }
 
 /// Does this run measure paint and spin? They are `aterm-conformance`'s, so
-/// the measuring stage — and the release artifact it hands them, and so its
-/// prime — has something to run exactly when the selection compiles that
-/// crate. Whole-tree always does. A narrowing that does not REMOVES all
-/// three rather than skipping them: `--test paint` names no target outside
-/// that crate (cargo refuses it), and a minutes-long release build for
-/// nobody is the opposite of what the prime is for.
+/// the measuring stage has something to run exactly when the selection
+/// compiles that crate. Whole-tree always does. A narrowing that does not
+/// REMOVES it rather than skipping it: `--test paint` names no target outside
+/// that crate (cargo refuses it).
 #[must_use]
 fn measures_paint_and_spin(scope: &Scope) -> bool {
     scope.includes_crate("aterm-conformance")
@@ -966,21 +804,20 @@ fn measures_paint_and_spin(scope: &Scope) -> bool {
 /// Two things can remove a stage entirely (as opposed to skipping it):
 ///  * a narrowing that does not compile a stage's crate drops it, because
 ///    there is nothing for it to run: `aterm-link` for the sealed fabric
-///    lane, `aterm-conformance` for the measuring tests and their release
-///    prime ([`measures_paint_and_spin`]);
+///    lane, `aterm-conformance` for the measuring tests
+///    ([`measures_paint_and_spin`]);
 ///  * the MODE picks the tiers ([`Tier`]): the default runs the LAND tier and
 ///    not the MEASURE tier — and its verdict NAMES every MEASURE stage it left
 ///    out ([`tier_titles`]), so the removal is never silent — `--measure` runs
 ///    the MEASURE tier alone, and `--full` both plus its own ([`FULL_ONLY`]).
 ///
-/// Three things move WHEN a stage runs, never whether or where it prints, each
-/// decided from the RAM the builds can have ([`Ctx::build_memory`]): on a
+/// Two things move WHEN a stage runs, never whether or where it prints: on a
 /// host whose wired memory leaves too little for the land tier's builds at
-/// once, their chain one behind another ([`land_builds`]); on one whose
-/// memory cannot hold both tiers' workspace builds at once, the MEASURE
-/// tier's wait for the land tier's ([`measure_overlap`]); and on one with no
-/// room beyond the land tier's builds, the trust lane's wait for them and the
-/// tests ([`trust_overlap`]).
+/// once, decided from the RAM the builds can have ([`Ctx::build_memory`]),
+/// their chain one behind another ([`land_builds`]); and in every plan with a
+/// trust lane and land-tier builds, whatever the RAM, the trust lane's wait
+/// for those builds, the test run and the doctests ([`trust_overlap`]: the
+/// verifier's budgets are clocks).
 ///
 /// Nothing else is conditional here. Absent TOOLS produce skips inside a stage,
 /// never a missing stage, because a stage that vanishes is a stage nobody
@@ -992,9 +829,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .filter(|s| ctx.mode.runs(s.id.tier()))
         .collect();
     land_builds(ctx.host_memory, ctx.host_usable, &v).apply(&mut v);
-    let ram = ctx.build_memory();
-    measure_overlap(ram, &v).apply(&mut v);
-    trust_overlap(ram, &v).apply(&mut v);
+    trust_overlap(&v).apply(&mut v);
     v
 }
 
@@ -1118,7 +953,7 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     // `atpkg` (the pack, below) and held the test run's start with it.
     v.push(spec(
         StageId::DeliveryTooling,
-        "delivery tooling (installer channel and guards, cargo pin, export policy and content scan, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup, atpkg index and publish producers, publisher bootstrap; offline)",
+        "delivery tooling (installer channel and guards, cargo pin, export policy and content scan, site sync, dev signing identity, fabric demo cleanup, atpkg index and publish producers, publisher bootstrap; offline)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -1128,17 +963,16 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     ));
     // THE TRUST VERIFICATION LANE (2026-09-27), advisory, beside the probe it
     // belongs with — a LAND-tier stage, so the merge contract runs it. Its own
-    // lane: it compiles in its own target dirs and verifies, so on a host with
-    // memory to spare it starts at t0 and overlaps the test compile and run; on
-    // one whose memory holds no more than the workspace builds that run at
-    // once it waits for them (both tiers', in `--full`) and the land tier's
-    // test run and doctests ([`trust_overlap`], 2026-10-04: under that load
-    // its budgets tripped and proved counts swung run to run). The exclusive tail
-    // waits for it the way it waits for every stage declared before it. In every
-    // mode it verifies the libraries and admitted forks a change touched, the
-    // heaviest named and left to the release's whole-tree run
-    // (`stages::trust_advisory` says why, with the measurement); the row's own
-    // verdict line names what it verified and what it did not.
+    // lane: it compiles in its own target dirs and verifies, and on every host
+    // it waits for the land tier's workspace builds, test run and doctests
+    // ([`trust_overlap`]: the verifier's budgets are clocks, and under their
+    // load proved counts fell and swung run to run — 2026-10-04 on 8 GiB,
+    // 2026-10-09 on 128 GiB, where RAM alone had let it start at t0). The
+    // exclusive tail waits for it the way it waits for every stage declared
+    // before it. In every mode it verifies the libraries and admitted forks a
+    // change touched, the heaviest named and left to the release's whole-tree
+    // run (`stages::trust_advisory` says why, with the measurement); the row's
+    // own verdict line names what it verified and what it did not.
     v.push(spec(
         StageId::TrustAdvisory,
         "trust advisory lane (targo trust check --lib --allow-l0-gaps: the libraries a change touched, the heaviest left to the release's whole-tree run; the up-only ratchet floor)",
@@ -1197,20 +1031,6 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
         "driver builds (the smokes' aterm-gui and aterm-ctl)",
         Lane::DriverTarget,
     ));
-    // THE CONFORMANCE RELEASE ARTIFACT (2026-09-22; the MEASURE tier's since
-    // 2026-09-26) — a fat-LTO, one-codegen-unit `--release -p aterm`, 326 s
-    // cold, built at t0 in its own lane so the exclusive measuring stage that
-    // judges it finds it warm (its own first child is the same build, a
-    // fingerprint check by then). Nothing waits on this lane: the point is to
-    // overlap everything else, and the measuring stage, being exclusive,
-    // cannot start before it has finished anyway.
-    if measures_paint_and_spin(scope) {
-        v.push(spec(
-            StageId::ConformanceRelease,
-            "conformance release artifact (paint/spin build it otherwise)",
-            Lane::ConformanceRelease,
-        ));
-    }
     // THE SEALED FABRIC RUNG (2026-09-14; `--full` only since 2026-09-27, see
     // [`FULL_ONLY`]). `tests/two_nodes_sealed.rs` is `#![cfg(feature =
     // "sealed")]`, so the workspace test run compiles it to nothing and this
@@ -1262,7 +1082,9 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     // THE MEASURING TESTS (2026-09-23; the MEASURE tier's since 2026-09-26):
     // the paint and spin matrices, which the test run skips
     // (`stages::MEASURING_TESTS`). They judge the RELEASE artifact's frame
-    // timings, so like the smokes below they run with nothing else in flight.
+    // timings — the bundle the release built once and handed this run
+    // (2026-10-09; the gate's own fat-LTO build of it is gone) — so like the
+    // smokes below they run with nothing else in flight.
     if measures_paint_and_spin(scope) {
         v.push(exclusive(
             StageId::MeasuringTests,
@@ -1285,7 +1107,9 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     ));
     // THE PACING SMOKE, MEASURE tier since 2026-09-26: it gates a real
     // window's frames, input->present, key->write and present->glass — the
-    // machine's latencies, which the headless smoke above cannot see.
+    // machine's latencies, which the headless smoke above cannot see — of the
+    // release bundle the run was handed (2026-10-09), so the latencies judged
+    // are the shipped bytes'.
     v.push(exclusive(
         StageId::GuiSmoke,
         "gui typing-pacing smoke",
@@ -1371,11 +1195,6 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
         Lane::DriverTarget,
     ));
     // THE `--full`-ONLY STAGES ([`FULL_ONLY`]).
-    v.push(spec(
-        StageId::KaniFloor,
-        "trust-mc / Kani BMC floor (config-free parser harnesses)",
-        Lane::MainTarget,
-    ));
     // THE WHOLE MATRIX, COMPILED. Every tier type-checks the host's own
     // cell (the test and lint lanes) and, since 2026-09-25, the five
     // cells no fleet box hosts (`ForeignCells` above); forge measures all
@@ -1459,7 +1278,7 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     // Codex people actually run, which is the lane's whole point.
     //
     // So it is in the tier that already holds world-dependent evidence (the
-    // trust-mc floor), where a missing prerequisite is a NAMED SKIP —
+    // cross-cell matrix and its installed stds), where a missing prerequisite is a NAMED SKIP —
     // counted, printed with the lane's own reason, and
     // forfeiting that run's contract claim, never a pass — and a FAIL after a
     // vendor update with an unchanged tree is exactly what the tier is for:
@@ -1557,9 +1376,9 @@ mod tests {
     }
 
     /// THE MEASURE LADDER IS THE MEASURE TIER, IN LADDER ORDER (2026-09-26):
-    /// `--measure` plans exactly [`MEASURE_TIER`] — the release artifact, the
-    /// measuring tests and the pacing smoke — and not one stage of the merge
-    /// contract.
+    /// `--measure` plans exactly [`MEASURE_TIER`] — the measuring tests and the
+    /// pacing smoke, over the bundle it is handed — and not one stage of the
+    /// merge contract. It builds no release `aterm` of its own (2026-10-09).
     #[test]
     fn the_measure_ladder_is_the_measure_tier_in_ladder_order() {
         assert_eq!(ids(&ctx(Mode::Measure, Scope::workspace())), MEASURE_TIER);
@@ -1576,8 +1395,8 @@ mod tests {
     /// is one the mode runs — nothing else decides it — and [`tier_titles`]
     /// names exactly the MEASURE stages the same scope would plan, which is
     /// what the default's verdict lists as `not part of the merge contract`.
-    /// A scope without `aterm-conformance` names no release prime: it would
-    /// not have built one either.
+    /// A scope without `aterm-conformance` names no measuring tests: it would
+    /// not have run them either.
     #[test]
     fn a_stage_is_planned_iff_the_mode_runs_its_tier_and_the_left_out_tier_is_named() {
         for scope in [
@@ -1604,7 +1423,7 @@ mod tests {
             assert_eq!(
                 tier_titles(&scope, Tier::Measure)
                     .iter()
-                    .any(|t| t.starts_with("conformance release artifact")),
+                    .any(|t| t.starts_with("measuring tests")),
                 scope.includes_crate("aterm-conformance"),
                 "{}",
                 scope.label()
@@ -1613,7 +1432,6 @@ mod tests {
         assert_eq!(
             tier_titles(&Scope::workspace(), Tier::Measure),
             [
-                "conformance release artifact (paint/spin build it otherwise)",
                 "measuring tests (--workspace; run alone)",
                 "gui typing-pacing smoke",
             ]
@@ -1819,9 +1637,9 @@ mod tests {
         assert!(crate::sched::awaited(&full, test).any(|j| j == sealed));
     }
 
-    /// THE STAGE-SET PROOF across modes and scopes. Three rows follow their
+    /// THE STAGE-SET PROOF across modes and scopes. Two rows follow their
     /// own crates: the sealed lane is aterm-link's, and the measuring tests
-    /// and their release prime are aterm-conformance's. Every mode and scope
+    /// are aterm-conformance's. Every mode and scope
     /// plans EXACTLY the whole-tree ladder of its mode minus the rows its
     /// crates dropped — in the same order, nothing else lost. With the
     /// literal fast ladder above, the MEASURE tier and `--full`'s own stages,
@@ -1842,9 +1660,7 @@ mod tests {
                     .iter()
                     .filter(|id| match id {
                         StageId::SealedLane => c.scope.includes_sealed_lane(),
-                        StageId::ConformanceRelease | StageId::MeasuringTests => {
-                            measures_paint_and_spin(&c.scope)
-                        }
+                        StageId::MeasuringTests => measures_paint_and_spin(&c.scope),
                         _ => true,
                     })
                     .copied()
@@ -1859,11 +1675,7 @@ mod tests {
         }
         // A scope holding none of the crates drops every one of those rows.
         let scoped = ids(&ctx(Mode::Full, Scope::crate_only("aterm-grid")));
-        for id in [
-            StageId::SealedLane,
-            StageId::ConformanceRelease,
-            StageId::MeasuringTests,
-        ] {
+        for id in [StageId::SealedLane, StageId::MeasuringTests] {
             assert!(!scoped.contains(&id), "{id:?}");
         }
         let link_only = ids(&ctx(Mode::Full, Scope::crate_only("aterm-link")));
@@ -1909,10 +1721,7 @@ mod tests {
     /// THE TESTS THE RUN SKIPS RUN ALONE, IN THE TIER THAT OWNS THEM
     /// (2026-09-26). The test run skips the measuring tests, so a plan without
     /// their stage would drop them silently: every mode that runs the MEASURE
-    /// tier over aterm-conformance runs them, exclusive, after the
-    /// conformance-release prime they use. (The launchd copy tests ran alone
-    /// in a LAND-tier lane of their own until 2026-09-30; their deadlines are
-    /// hang detectors now, and they run in the parallel test run.)
+    /// tier over aterm-conformance runs them, exclusive, as its first barrier.
     #[test]
     fn the_measuring_tests_run_alone_in_the_measure_tier_in_every_scope() {
         for mode in MODES {
@@ -1937,8 +1746,6 @@ mod tests {
                 if let Some(measuring) = measuring {
                     assert!(p[measuring].exclusive, "{what}");
                     assert_eq!(p[measuring].lane, Lane::MainTarget, "{what}");
-                    let prime = at(StageId::ConformanceRelease).expect("the prime");
-                    assert!(prime < measuring, "{what}: the prime must finish first");
                     assert_eq!(barrier, measuring, "{what}: the first barrier");
                 }
             }
@@ -1963,14 +1770,6 @@ mod tests {
         assert_eq!(
             dir(&c, Lane::DriverTarget).as_deref(),
             Some("/repo/target-drivers")
-        );
-        // THE HELPER'S OWN PATH, not a path of this gate's choosing:
-        // `release_bin` builds into `<root>/target/conformance-release`, and a
-        // lane that named any other directory would prime an artifact nothing
-        // reads while the suites still built their own.
-        assert_eq!(
-            dir(&c, Lane::ConformanceRelease).as_deref(),
-            Some("/repo/target/conformance-release")
         );
         assert_eq!(
             dir(&c, Lane::FreezeGateTarget).as_deref(),
@@ -2045,21 +1844,16 @@ mod tests {
             "a healthy 8 GiB host keeps the caller's count"
         );
         assert_eq!(healthy.build_jobs_ceiling(), Some(8));
-        // A `--measure` run has no land-tier build, and its release build is
-        // capped all the same.
+        // A `--measure` run builds no workspace, and its measuring tests'
+        // compile is capped all the same.
         let measure = host(Mode::Measure, GIB * 9 / 2);
         assert_eq!(jobs_in(&measure.child_env_add).as_deref(), Some("2"));
-        assert_eq!(
-            jobs_in(&crate::stages::conformance_release_cmd(&measure).envs).as_deref(),
-            Some("2"),
-            "a degraded host caps the MEASURE tier's release build too"
-        );
     }
 
     /// THE TEST POOL'S MEMORY CAP (2026-10-04): the binaries the host holds
     /// beside the builds that can run during the test run — the land tier's
-    /// two besides the test compile, the doctests (beside it since
-    /// 2026-10-05), and in `--full` the release build too.
+    /// two besides the test compile and the doctests (beside it since
+    /// 2026-10-05). `--full` adds none: its MEASURE tier builds nothing.
     #[test]
     fn the_test_pool_is_as_wide_as_the_memory_beside_the_builds() {
         use crate::testrun::{FLOOR_JOBS, memory_jobs};
@@ -2070,7 +1864,7 @@ mod tests {
             plan(&ctx(Mode::Measure, Scope::workspace()).with_host_memory(Some(128 * GIB)));
         assert_eq!(
             (builds_beside_tests(&fast), builds_beside_tests(&full)),
-            (3, 4)
+            (3, 3)
         );
         // The doctests are the one beside the test run that the peak does not
         // count: they await the test compile.
@@ -2087,7 +1881,7 @@ mod tests {
             "3 held, 3 beside"
         );
         assert_eq!(memory_jobs(Some(16 * GIB), &fast), 4);
-        assert_eq!(memory_jobs(Some(16 * GIB), &full), 3);
+        assert_eq!(memory_jobs(Some(16 * GIB), &full), 4);
         assert_eq!(
             memory_jobs(Some(GIB), &fast),
             FLOOR_JOBS,
@@ -2133,239 +1927,108 @@ mod tests {
         );
     }
 
-    /// THE MEASURE TIER'S BUILD WAITS ONLY WHERE MEMORY RUNS OUT (2026-10-03),
-    /// decided as a pure function of (RAM, plan). On the measured 8 GiB host
-    /// `--full`'s land tier runs 3 workspace builds at once and the release
-    /// build would be a 4th, past the 3 that host holds: the release build
-    /// then waits for every land-tier build, and one line says so. On a 12 GiB
-    /// host (5 held) or the 128 GiB one nothing moves and nothing is said;
-    /// with memory unread the release build waits too, and the line says why. One tier alone never waits on any host, so
-    /// `--measure` and the land tier keep their plans. Only scheduling moves:
-    /// the rows, their order and their titles are the overlapping plan's.
+    /// THE MEASURE TIER BUILDS NOTHING AT WORKSPACE SCALE (2026-10-09): it is
+    /// handed the release's bundle, so no host's memory holds it behind the
+    /// land tier's builds and no start line says so. Every workspace build is
+    /// the land tier's, and `--full` plans the land tier's waits exactly.
     #[test]
-    fn a_small_host_builds_the_measure_tier_after_the_land_tier_and_says_so() {
+    fn the_measure_tier_compiles_no_workspace_build() {
         const GIB: u64 = crate::disk::GIB;
-        assert_eq!(builds_held(8 * GIB), 3);
-        assert_eq!(builds_held(12 * GIB), 5);
-        assert_eq!(builds_held(GIB), 0);
+        for id in WORKSPACE_BUILDS {
+            assert_eq!(id.tier(), Tier::Land, "{id:?}");
+        }
         let full = plan(&ctx(Mode::Full, Scope::workspace()).with_host_memory(Some(128 * GIB)));
         assert_eq!(concurrent_builds(&full, Tier::Land), 3);
-        assert_eq!(concurrent_builds(&full, Tier::Measure), 1);
-
-        let small = measure_overlap(Some(8 * GIB), &full);
-        assert_eq!(
-            small,
-            MeasureOverlap::AfterLand {
-                ram: 8 * GIB,
-                holds: 3,
-                land: 3,
-                measure: 1,
-            }
-        );
-        assert_eq!(
-            small.note(false).as_deref(),
-            Some(
-                "verify: the MEASURE tier builds after the land tier's (10 GiB runs them together)"
-            )
-        );
-        // The RAM, what it holds and what each tier runs: stated once, first.
-        // The trust lane waits there too, so the land tier's own `--full`
-        // memory lines are three.
-        assert_eq!(
-            memory_notes(Some(8 * GIB), None, false, &full, 2),
-            [
-                "verify: 8 GiB RAM holds 3 workspace build(s) at once; the land tier runs 3 and \
-                 the MEASURE tier 1",
-                "verify: the MEASURE tier builds after the land tier's (10 GiB runs them together)",
-                "verify: the trust lane verifies after the tests and builds (12 GiB runs it beside \
-                 them)",
-            ]
-        );
-        // Linux's MemTotal for an 8 GiB box: the head states the RAM the
-        // decision used, so its own figures reproduce `holds`.
-        let linux = memory_notes(Some(8 * GIB - GIB * 3 / 10), None, true, &full, 2);
+        assert_eq!(concurrent_builds(&full, Tier::Measure), 0);
+        let measure = plan(&ctx(Mode::Measure, Scope::workspace()));
+        assert_eq!(concurrent_builds(&measure, Tier::Measure), 0);
         assert!(
-            linux[0].starts_with("verify: 7.7 GiB RAM (MemTotal) holds 2 workspace build(s)"),
-            "{linux:?}"
+            measure.iter().all(|s| s.after_stages.is_empty()),
+            "{measure:?}"
         );
-        // The needed figures are in the same units, so the box they name
-        // really runs the builds together.
-        assert_eq!(
-            linux[1],
-            "verify: the MEASURE tier builds after the land tier's (10 GiB (MemTotal) runs them \
-             together)"
-        );
-        assert!(
-            linux[2].contains("GiB (MemTotal) runs it beside them"),
-            "{linux:?}"
-        );
-        // Memory unread: the safe, serial order, and the head says why.
-        let unread = measure_overlap(None, &full);
-        assert_eq!(unread, MeasureOverlap::RamUnread);
-        assert_eq!(
-            memory_notes(None, None, false, &full, 2)[..2],
-            [
-                "verify: this host's RAM could not be read",
-                "verify: the MEASURE tier builds after the land tier's",
-            ]
-        );
-        for big in [Some(12 * GIB), Some(128 * GIB)] {
-            assert_eq!(
-                measure_overlap(big, &full),
-                MeasureOverlap::Overlaps,
-                "{big:?}"
-            );
-            assert_eq!(measure_overlap(big, &full).note(false), None, "{big:?}");
-        }
-        // One tier alone overlaps nothing, however small the host.
-        for mode in [Mode::Fast, Mode::Measure] {
-            let p = plan(&ctx(mode, Scope::workspace()));
-            assert_eq!(
-                measure_overlap(Some(GIB), &p),
-                MeasureOverlap::Overlaps,
-                "{mode:?}"
+        for ram in [Some(GIB), Some(8 * GIB), None] {
+            assert!(
+                memory_notes(ram, None, false, &measure, 2).is_empty(),
+                "{ram:?}"
             );
         }
-
-        // Through `plan`: the small host's release build awaits exactly the
-        // land tier's workspace builds, every one of them before the first
-        // barrier; nothing else differs from the big host's plan.
-        let on = |ram| plan(&ctx(Mode::Full, Scope::workspace()).with_host_memory(Some(ram)));
-        let (small, big) = (on(8 * GIB), on(128 * GIB));
-        assert_eq!(big, full);
-        // An unread host plans exactly what the small one does.
-        assert_eq!(plan(&ctx(Mode::Full, Scope::workspace())), small);
-        let release = small
-            .iter()
-            .position(|s| s.id == StageId::ConformanceRelease)
-            .expect("the release build");
-        let mut waited: Vec<StageId> = crate::sched::awaited(&small, release)
-            .map(|j| small[j].id)
-            .collect();
-        waited.sort_by_key(|id| *id as u8);
         assert_eq!(
-            waited,
-            [
-                StageId::TestCompile,
-                StageId::Tippy,
-                StageId::DriverBuilds,
-                StageId::TailDriverBuilds
-            ]
+            memory_notes(Some(8 * GIB), None, false, &full, 8)[0],
+            "verify: 8 GiB RAM holds 3 workspace build(s) at once; the land tier runs 3"
         );
-        // Equal but for the waits the memory added, on the two rows it adds
-        // them to; on the big host only the doctests wait on a stage (their
-        // own wait on the test compile, which every host plans alike).
-        assert_eq!(
-            full.iter()
-                .filter(|s| !s.after_stages.is_empty())
-                .map(|s| s.id)
-                .collect::<Vec<_>>(),
-            [StageId::Doctests]
-        );
-        for (a, b) in small.iter().zip(&full) {
-            if matches!(a.id, StageId::ConformanceRelease | StageId::TrustAdvisory) {
-                let unwaited = StageSpec {
-                    after_stages: Vec::new(),
-                    ..a.clone()
-                };
-                assert_eq!(&unwaited, b);
-            } else {
-                assert_eq!(a, b);
-            }
-        }
-        // Whatever the mode and scope, the small host's plan stays
-        // deadlock-free and keeps every row.
-        for mode in MODES {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-conformance"),
-                Scope::changed("main", vec!["aterm-gui".into()], true),
-            ] {
-                let p = plan(&ctx(mode, scope.clone()).with_host_memory(Some(8 * GIB)));
-                crate::sched::check_after_lanes(&p).expect("deadlock-free");
-                assert_eq!(p.len(), plan(&ctx(mode, scope)).len());
-            }
-        }
     }
 
-    /// THE TRUST LANE VERIFIES AFTER THE TESTS WHERE MEMORY RUNS OUT
-    /// (2026-10-04), decided as a pure function of (RAM, plan). On the
-    /// measured 8 GiB host the land tier's 3 workspace builds fill the 3 it
-    /// holds, so the trust lane awaits them, the test run ([`TEST_RUN_END`],
-    /// the run itself since 2026-10-05, with the rows it awaits) and the
-    /// doctests beside it, and one line says so; with memory unread it waits
-    /// too. A 12 GiB (5 held) or 128 GiB host keeps it at t0 and says
-    /// nothing; a plan with no trust lane is unchanged.
+    /// THE TRUST LANE VERIFIES AFTER THE LAND TIER'S BUILDS, TESTS AND
+    /// DOCTESTS ON EVERY HOST (2026-10-09; on hosts short of memory since
+    /// 2026-10-04), decided as a pure function of the plan: the verifier's
+    /// budgets are clocks, so RAM to spare does not make a lane beside them
+    /// prove what it proves alone ([`TrustOverlap`]). Through `plan`, the
+    /// 128 GiB, 8 GiB and unread hosts plan alike: the lane awaits exactly the
+    /// land tier's workspace builds, the test run with the driver-lane rows it
+    /// awaits (which end before it starts) and the doctests beside it, so in no
+    /// interleaving does it run beside one. Its start line gives that reason
+    /// and no memory figure; a plan with no trust lane or no land build holds
+    /// nothing.
     #[test]
-    fn a_small_host_verifies_the_trust_lane_after_the_tests_and_says_so() {
+    fn the_trust_lane_verifies_after_the_tests_on_every_host_and_says_why() {
         const GIB: u64 = crate::disk::GIB;
         let fast = |ram| plan(&ctx(Mode::Fast, Scope::workspace()).with_host_memory(ram));
         let big = fast(Some(128 * GIB));
         assert_eq!(concurrent_builds(&big, Tier::Land), 3);
+        assert_eq!(trust_overlap(&big), TrustOverlap::AfterTests);
+        assert_eq!(fast(Some(8 * GIB)), big, "RAM moves nothing here");
+        assert_eq!(fast(None), big, "nor does unread RAM");
 
-        let small = trust_overlap(Some(8 * GIB), &big);
+        // The start line says why, and memory says nothing of it: the big
+        // host prints no memory line, the 8 GiB host only the test pool's.
+        let note = TrustOverlap::AfterTests.note().expect("a start line");
+        assert!(note.contains("clocks") && !note.contains("GiB"), "{note}");
         assert_eq!(
-            small,
-            TrustOverlap::AfterTests {
-                ram: 8 * GIB,
-                holds: 3,
-                land: 3,
-                measure: 0,
-                need: 10,
-            }
+            memory_notes(Some(128 * GIB), None, false, &big, 8),
+            Vec::<String>::new()
         );
-        // The RAM once, then each change: the land tier's 8 GiB run.
         assert_eq!(
             memory_notes(Some(8 * GIB), None, false, &big, 8),
             [
                 "verify: 8 GiB RAM holds 3 workspace build(s) at once; the land tier runs 3",
-                "verify: the trust lane verifies after the tests and builds (10 GiB runs it beside \
-                 them)",
                 "verify: the test pool runs at most 2 binaries at once, beside 3 workspace build(s)",
             ]
         );
-
-        let unread = trust_overlap(None, &big);
-        assert_eq!(unread, TrustOverlap::RamUnread);
         assert_eq!(
             memory_notes(None, None, false, &big, 2),
-            [
-                "verify: this host's RAM could not be read",
-                "verify: the trust lane verifies after the tests and builds",
-            ]
+            Vec::<String>::new()
         );
 
-        for ram in [Some(12 * GIB), Some(128 * GIB)] {
-            assert_eq!(trust_overlap(ram, &big), TrustOverlap::Overlaps, "{ram:?}");
-            assert_eq!(trust_overlap(ram, &big).note(false), None, "{ram:?}");
-        }
-        // No trust lane (the MEASURE tier alone): nothing to hold.
+        // Nothing to hold: no trust lane (the MEASURE tier alone, or a plan
+        // without the row), or no land-tier build to hold it behind.
         let measure = plan(&ctx(Mode::Measure, Scope::workspace()));
-        assert_eq!(trust_overlap(Some(GIB), &measure), TrustOverlap::Overlaps);
-        assert_eq!(trust_overlap(None, &measure), TrustOverlap::Overlaps);
+        assert_eq!(trust_overlap(&measure), TrustOverlap::Overlaps);
+        assert_eq!(TrustOverlap::Overlaps.note(), None);
+        let without = |drop: &dyn Fn(StageId) -> bool| -> Vec<StageSpec> {
+            big.iter().filter(|s| !drop(s.id)).cloned().collect()
+        };
+        assert_eq!(
+            trust_overlap(&without(&|id| id == StageId::TrustAdvisory)),
+            TrustOverlap::Overlaps
+        );
+        assert_eq!(
+            trust_overlap(&without(&|id| WORKSPACE_BUILDS.contains(&id))),
+            TrustOverlap::Overlaps
+        );
 
-        // Through `plan`: the trust lane starts at t0 on the big host, and on
-        // the small one (and an unread one) awaits exactly the land tier's
-        // workspace builds, the test run with the driver-lane rows it awaits
-        // (which end before it starts), and the doctests beside it — so no
-        // verifier runs beside a test.
+        // What it awaits.
         let trust = |p: &[StageSpec]| {
             p.iter()
                 .position(|s| s.id == StageId::TrustAdvisory)
                 .expect("the trust lane")
         };
-        let t = trust(&big);
-        let none = vec![false; big.len()];
-        assert!(
-            crate::sched::ready(&big, &none, &none, 0, t),
-            "t0 on 128 GiB"
-        );
-        let (small, unread) = (fast(Some(8 * GIB)), fast(None));
-        assert_eq!(small, unread);
-        let mut waited: Vec<StageId> = crate::sched::awaited(&small, trust(&small))
-            .map(|j| small[j].id)
-            .collect();
-        waited.sort_by_key(|id| *id as u8);
+        let awaited = |p: &[StageSpec]| {
+            let mut ids: Vec<StageId> = crate::sched::awaited(p, trust(p))
+                .map(|j| p[j].id)
+                .collect();
+            ids.sort_by_key(|id| *id as u8);
+            ids
+        };
         let mut want = vec![
             StageId::TestCompile,
             StageId::Test,
@@ -2376,26 +2039,36 @@ mod tests {
             StageId::TailDriverBuilds,
         ];
         want.sort_by_key(|id| *id as u8);
-        assert_eq!(waited, want);
+        assert_eq!(awaited(&big), want);
+        let none = vec![false; big.len()];
+        assert!(
+            !crate::sched::ready(&big, &none, &none, 0, trust(&big)),
+            "not at t0 on 128 GiB"
+        );
         // TEST_RUN_END is the test run, and the doctests no longer mark its
         // end: they run beside it, in a lane of their own.
-        let pos = |id| small.iter().position(|s| s.id == id).expect("planned");
+        let pos = |id| big.iter().position(|s| s.id == id).expect("planned");
         assert_eq!(TEST_RUN_END, StageId::Test);
         assert_ne!(
-            small[pos(StageId::Test)].lane,
-            small[pos(StageId::Doctests)].lane
+            big[pos(StageId::Test)].lane,
+            big[pos(StageId::Doctests)].lane
         );
         // Awaiting the test run is accepted only with what it awaits: drop
         // one of those and the plan is refused.
-        let mut short = small.clone();
-        let trust_row = trust(&short);
-        short[trust_row]
+        crate::sched::check_after_lanes(&big).expect("deadlock-free");
+        let mut short = big.clone();
+        short[trust(&big)]
             .after_stages
             .retain(|id| *id != StageId::AtpkgTooling);
         assert!(crate::sched::check_after_lanes(&short).is_err());
-        crate::sched::check_after_lanes(&small).expect("deadlock-free");
-        // Only the trust row moves; on the big host it waits on nothing.
-        for (a, b) in small.iter().zip(&big) {
+        // Only the trust row moves: undo its wait and the ladder is the one
+        // declared.
+        let free: Vec<StageSpec> = declared(&Scope::workspace())
+            .into_iter()
+            .filter(|s| Mode::Fast.runs(s.id.tier()))
+            .collect();
+        assert_eq!(free.len(), big.len());
+        for (a, b) in big.iter().zip(&free) {
             if a.id == StageId::TrustAdvisory {
                 let unwaited = StageSpec {
                     after_stages: Vec::new(),
@@ -2407,48 +2080,53 @@ mod tests {
             }
         }
 
-        // `--full`: the release build counts where it overlaps the land
-        // tier's builds. 10 GiB holds 4 and lets the tiers overlap (3 + 1),
-        // so the trust lane waits; 12 GiB holds 5 and it does not.
+        // `--full` holds it the same way on every host, the sealed rung among
+        // the driver-lane rows the test run awaits there; and in every
+        // interleaving either ladder reaches, nothing it awaits runs beside it.
         let full = |ram| plan(&ctx(Mode::Full, Scope::workspace()).with_host_memory(ram));
-        let full_big = full(Some(128 * GIB));
-        assert_eq!(
-            trust_overlap(Some(10 * GIB), &full_big),
-            TrustOverlap::AfterTests {
-                ram: 10 * GIB,
-                holds: 4,
-                land: 3,
-                measure: 1,
-                need: 12,
-            }
-        );
-        assert_eq!(
-            trust_overlap(Some(12 * GIB), &full_big),
-            TrustOverlap::Overlaps
-        );
-        // On 8 GiB the release build waits for the land tier's builds
-        // (`measure_overlap`) and the trust lane awaits it as well, so no
-        // verifier runs beside the fat-LTO build either; on 10 GiB, where
-        // the release build waits on nothing, the same set. (The sealed rung
-        // is one of the driver-lane rows the test run awaits in `--full`.)
-        for ram in [Some(8 * GIB), Some(10 * GIB), None] {
+        let mut want_full = want.clone();
+        want_full.push(StageId::SealedLane);
+        want_full.sort_by_key(|id| *id as u8);
+        for ram in [Some(128 * GIB), Some(8 * GIB), None] {
             let p = full(ram);
+            assert_eq!(trust_overlap(&p), TrustOverlap::AfterTests, "{ram:?}");
             crate::sched::check_after_lanes(&p).expect("deadlock-free");
-            let mut waited: Vec<StageId> = crate::sched::awaited(&p, trust(&p))
-                .map(|j| p[j].id)
-                .collect();
-            waited.sort_by_key(|id| *id as u8);
-            let mut want_full = want.clone();
-            want_full.push(StageId::ConformanceRelease);
-            want_full.push(StageId::SealedLane);
-            want_full.sort_by_key(|id| *id as u8);
-            assert_eq!(waited, want_full, "{ram:?}");
+            assert_eq!(awaited(&p), want_full, "{ram:?}");
         }
-        let none = vec![false; full_big.len()];
-        assert!(
-            crate::sched::ready(&full_big, &none, &none, 0, trust(&full_big)),
-            "t0 on 128 GiB --full"
-        );
+        for p in [big.clone(), full(Some(128 * GIB))] {
+            let t = trust(&p);
+            let held: Vec<usize> = crate::sched::awaited(&p, t).collect();
+            for pick in 0..3_u32 {
+                let n = p.len();
+                let (mut started, mut done) = (vec![false; n], vec![false; n]);
+                let mut running: Vec<usize> = Vec::new();
+                let mut seed = 0x9e37_79b9_u32;
+                while done.iter().any(|d| !d) {
+                    while let Some(i) =
+                        (0..n).find(|&i| crate::sched::ready(&p, &started, &done, running.len(), i))
+                    {
+                        started[i] = true;
+                        running.push(i);
+                    }
+                    assert!(!running.is_empty(), "deadlock");
+                    if running.contains(&t) {
+                        assert!(
+                            held.iter().all(|h| done[*h]),
+                            "the trust lane beside an unfinished row it awaits"
+                        );
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let k = match pick {
+                        0 => 0,
+                        1 => running.len() - 1,
+                        _ => seed as usize % running.len(),
+                    };
+                    done[running.remove(k)] = true;
+                }
+            }
+        }
     }
 
     /// WIRED MEMORY PAST A HEALTHY HOST'S SERIALISES THE LAND TIER'S BUILDS
@@ -2517,8 +2195,6 @@ mod tests {
             [
                 "verify: 4.5 GiB of 8 GiB is usable (3.5 GiB wired) — the land tier builds one \
                  at a time; a reboot frees wired memory",
-                "verify: the trust lane verifies after the tests and builds (10 GiB runs it beside \
-                 them)",
                 "verify: the test pool runs at most 2 binaries at once, beside 2 workspace build(s)",
             ]
         );
@@ -2544,7 +2220,7 @@ mod tests {
         assert_eq!(
             memory_notes(Some(16 * GIB), Some(7 * GIB), false, &full_big, 8)[0],
             "verify: 7 GiB of 16 GiB is usable (9 GiB wired) and holds 3 workspace build(s) at \
-             once; the land tier runs 3 and the MEASURE tier 1"
+             once; the land tier runs 3"
         );
 
         // The chain: each land-tier build awaits every earlier one, the tail
@@ -2582,8 +2258,6 @@ mod tests {
             [
                 "verify: 5 GiB of 8 GiB is usable (3 GiB wired) — the land tier builds two at a \
                  time, tippy after the test compile; a reboot frees wired memory",
-                "verify: the trust lane verifies after the tests and builds (10 GiB runs it beside \
-                 them)",
                 "verify: the test pool runs at most 2 binaries at once, beside 3 workspace build(s)",
             ]
         );

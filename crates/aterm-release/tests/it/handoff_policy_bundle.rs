@@ -76,8 +76,9 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         aterm_bin: exe,
     };
 
-    // THE CUT'S ORDER: assemble, then sign.
-    let app = bundle::assemble(&spec).expect("the bundle step");
+    // THE RELEASE'S ORDER: the build lays the bundle out, the cut signs it.
+    let app = scratch.join("aterm.app");
+    bundle::assemble_at(&spec, &app).expect("the bundle step");
     let placed = app.join(BUNDLE_PATH);
     let source = std::fs::read(repo.join(SOURCE_PATH)).expect("the checked-in policy");
     assert_eq!(

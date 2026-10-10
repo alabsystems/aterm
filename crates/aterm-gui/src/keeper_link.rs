@@ -438,7 +438,7 @@ pub(crate) struct Recovery {
 fn build() -> String {
     format!(
         "{}+{}",
-        aterm_types::version::APP_VERSION,
+        crate::build_info::version(),
         crate::build_info::build_number()
     )
 }

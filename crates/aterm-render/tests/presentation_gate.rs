@@ -18,7 +18,7 @@
 //!
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `PresentationGate` derived model (`aterm_spec::derive::presentation_gate_model`)
-//!   carries the `NoColorForText` invariant. `cargo test -p aterm-spec`
+//!   carries the `NoColorForText` invariant. `targo --unverified test -p aterm-spec`
 //!   (`derived_presentation_gate_proves_and_catches_text_colored_as_emoji`) runs the
 //!   REAL `ty` binary over the whole bounded state space: it PROVES the invariant at
 //!   `Buggy=0` and CATCHES the old coverage-only gate at `Buggy=1` (counterexample).

@@ -1103,20 +1103,18 @@ fn every_growth_at_the_glass_take_s_geometry_follows_its_text_and_flows() {
     }
 }
 
-/// **ONE COINCIDENT LETTER DOES NOT CHANGE THE EXIT** — the A/B the
-/// forensics proved the mechanism with. A is THE NO-TWIN CONTROL: letters
-/// only, each line's case alternating, so no glyph of a line stands under
-/// the same glyph on the line above (asserted) — GREEN before the fix, the
-/// follow pass was never the problem where nothing twinned. B is the same
+/// **ONE COINCIDENT LETTER DOES NOT CHANGE THE EXIT.** A is THE NO-TWIN
+/// CONTROL: letters only, each line's case alternating, so no glyph of a line
+/// stands under the same glyph on the line above (asserted). B is the same
 /// text with ONE letter of its second line changed to the letter the first
 /// line has at that column: one interior twin at wrap 2, nothing else
 /// different — the same lengths, wraps and cadence. Every wrap of both
-/// follows and flows, and each of B's carries within two cells of A's —
-/// three growths since the review restored the flow spec's 13a matrix (the
-/// letter B changed is on the row above wrap 3's line too).
+/// follows and flows, and each of B's carries within two cells of A's over
+/// three growths (the flow spec's 13a matrix; the letter B changed is on the
+/// row above wrap 3's line too).
 ///
-/// RED before 2026-09-23, measured: A's wrap 2 followed `+77` and flowed;
-/// B's followed `+0`, retired `+86`, and was gone at 140 ms.
+/// The recorded bug: A's wrap 2 followed `+77` and flowed; B's followed `+0`,
+/// retired `+86`, and was gone at 140 ms.
 #[test]
 fn one_coincident_letter_does_not_change_the_exit() {
     let width = OWNER_90.cols - 4;
@@ -1486,8 +1484,8 @@ fn the_owner_s_text_at_21_columns_keeps_its_own_walk_past_the_remnant() {
 #[test]
 fn a_space_typed_before_the_wrap_s_echo_lands_leaves_the_moved_word_relaid() {
     // The nine takes replay on their own hosts and clocks, on the binary's
-    // threads (`par_map`, 2026-10-05: 3.5 s on one thread alone, 53.3 s under
-    // the merge gate's load); the first failing take in this order raises its
+    // threads (`par_map`: 3.5 s on one thread alone, 53.3 s under the merge
+    // gate's load); the first failing take in this order raises its
     // own panic.
     let takes: Vec<(u64, usize)> = [10, 20, 40]
         .into_iter()
@@ -1504,7 +1502,7 @@ fn a_space_typed_before_the_wrap_s_echo_lands_leaves_the_moved_word_relaid() {
 }
 
 /// …THE CONTROL: the same wraps with a LETTER after the first wrap key
-/// (`WHYX`) — green before the fix, at every lag.
+/// (`WHYX`) at every lag.
 #[test]
 fn the_control_a_letter_typed_before_the_wrap_s_echo_lands() {
     let text = NATURAL.replacen("AUDIT WHY ATERM", "AUDIT WHYX ATERM", 1);

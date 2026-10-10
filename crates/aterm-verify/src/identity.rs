@@ -12,8 +12,9 @@
 //! Two identities close that:
 //!
 //!  * [`SourceIdentity`] — HEAD plus the working-tree state of every path that
-//!    differs from it (tracked changes, untracked non-ignored files, edits an
-//!    assume-unchanged or skip-worktree flag hides from git, and each
+//!    differs from it (tracked changes, untracked files the tree's own
+//!    `.gitignore` files do not ignore, edits an assume-unchanged or
+//!    skip-worktree flag hides from git, and each
 //!    submodule's checkout — its commit and, recursively, its own such paths),
 //!    each as a blob id and exec bit, a link target, a commit, or "absent". It is a statement
 //!    about the CONTENT a compiler would read, so the same change reads the same
@@ -406,9 +407,10 @@ pub fn changes_since(root: &Path, path_env: &OsStr, base: &str) -> Option<Vec<St
 /// Every path of `root` whose working tree differs from commit `base` (`None`:
 /// an unborn HEAD, from which every tracked path differs), with its state —
 /// tracked changes staged or not (the compiler reads the working tree),
-/// untracked non-ignored files, the edits an index flag hides, and beneath every
-/// gitlink the submodule's own, as [`TreeState::capture`] says — never the
-/// gate's own state. `None` when git cannot answer.
+/// untracked files by [`untracked_split`]'s rule, the edits an index flag
+/// hides, and beneath every gitlink the submodule's own, as
+/// [`TreeState::capture`] says — never the gate's own state. `None` when git
+/// cannot answer.
 ///
 /// THE ONE LISTING (2026-10-02). The gate decides WHAT TREE it measured by it
 /// ([`TreeState::capture`]: the identity, the sync's proof, the tripwire) and
@@ -429,8 +431,12 @@ pub fn changes_since(root: &Path, path_env: &OsStr, base: &str) -> Option<Vec<St
 /// snapshot (which carries both as plain dirt) listed it: every sync's proof
 /// failed ("the checkout is changing faster than it can be copied"), and the
 /// Trust lane took no fork for such an edit outside a fork's directory.
-/// tools/trust-gate-all.sh's `tree_clean` is this rule's shell mirror.
-fn dirty_against(
+/// tools/trust-gate-all.sh's `tree_clean` is this rule's shell mirror. Public
+/// so the release's clean-tree judge can read this listing instead of `git
+/// status --porcelain`, which also reads `.git/info/exclude` and
+/// `core.excludesFile`.
+#[must_use]
+pub fn dirty_against(
     root: &Path,
     path_env: &OsStr,
     base: Option<&str>,
@@ -614,8 +620,9 @@ fn matches_index_entry(
     }
 }
 
-/// Untracked, non-ignored files under `root` (never the gate's own state, and
-/// never the file this run's own output is going to — see [`claim_own_output`]).
+/// Untracked files under `root` by [`untracked_split`]'s rule (never the gate's
+/// own state, and never the file this run's own output is going to — see
+/// [`claim_own_output`]).
 #[must_use]
 pub fn untracked_paths(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
     Some(untracked_split(root, path_env)?.0)
@@ -623,19 +630,38 @@ pub fn untracked_paths(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
 
 /// `(the tree's untracked files, the ones that are this run's own output)`.
 ///
-/// One `git ls-files --others` for both, because every caller needs the first
-/// and the ladder needs to be able to SAY the second.
+/// One listing for both, because every caller needs the first and the ladder
+/// needs to be able to SAY the second.
+///
+/// ONLY THE TREE'S OWN RULES IGNORE A PATH: the `.gitignore` files HEAD holds,
+/// never `.git/info/exclude` or `core.excludesFile`, which are one checkout's
+/// config and not the tree. `--exclude-standard` read both, so a file only a
+/// checkout's own exclude list ignored read clean here and dirty to the Trust
+/// lane's `tree_clean`: two judges of one tree. An untracked `.gitignore` the
+/// rules ignore (one that ignores itself) is listed too: it hides whatever it
+/// names beside it, and cargo compiles a `build.rs` by its being there.
 #[must_use]
 pub fn untracked_split(root: &Path, path_env: &OsStr) -> Option<(Vec<String>, Vec<String>)> {
-    let out = stdout_bytes(git(root, path_env).args([
+    let others = stdout_bytes(git(root, path_env).args([
         "ls-files",
-        "--others",
-        "--exclude-standard",
         "-z",
+        "--others",
+        "--exclude-per-directory=.gitignore",
     ]))?;
+    let ignored = stdout_bytes(git(root, path_env).args([
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--directory",
+        "--exclude-per-directory=.gitignore",
+    ]))?;
+    let hidden_rules = split_z(&ignored)
+        .into_iter()
+        .filter(|p| p == ".gitignore" || p.ends_with("/.gitignore"));
     let mut tree = Vec::new();
     let mut own = Vec::new();
-    for p in split_z(&out) {
+    for p in split_z(&others).into_iter().chain(hidden_rules) {
         if is_gate_state(&p) {
             continue;
         }
@@ -905,7 +931,6 @@ impl ToolchainIdentity {
                     child_ceiling: Some(Duration::from_secs(60)),
                     remove_env: &[],
                     add_env: &[],
-                    compile_qos: crate::exec::CompileQos::Utility,
                 },
             );
             let text = std::fs::read_to_string(&log).unwrap_or_default();
@@ -1217,6 +1242,69 @@ mod tests {
         );
         assert_eq!(commit_hash_in("commit-hash: unknown\n"), None);
         assert_eq!(commit_hash_in("rustc 1.0\n"), None);
+    }
+
+    #[test]
+    fn only_the_trees_own_gitignore_files_ignore_an_untracked_path() {
+        let tmp = crate::mktemp_dir("atv-ident-ign").expect("mktemp");
+        let path_env = std::env::var_os("PATH").unwrap_or_default();
+        let run = |args: &[&str]| {
+            let ok = git(&tmp, &path_env)
+                .args([
+                    "-c",
+                    "user.name=gate",
+                    "-c",
+                    "user.email=gate@example.invalid",
+                ])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        let write = |p: &str, text: &str| {
+            let full = tmp.join(p);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, text).expect("write");
+        };
+        run(&["init", "-q"]);
+        write(".gitignore", "by-tree\n");
+        run(&["add", ".gitignore"]);
+        run(&["commit", "-qm", "init"]);
+        // One checkout's config, never the tree's rules.
+        write(".git/info/exclude", "by-info\n");
+        write(".git/global-excludes", "by-global\n");
+        let global = tmp.join(".git/global-excludes");
+        run(&[
+            "config",
+            "core.excludesFile",
+            global.to_str().expect("utf-8"),
+        ]);
+        for p in ["by-tree", "by-info", "by-global", "plain", "hides/build.rs"] {
+            write(p, "x\n");
+        }
+        // An untracked .gitignore that ignores itself and what is beside it.
+        write("hides/.gitignore", ".gitignore\nbuild.rs\n");
+
+        let (tree, own) = untracked_split(&tmp, &path_env).expect("listing");
+        assert_eq!(
+            tree,
+            ["by-global", "by-info", "plain", "hides/.gitignore"],
+            "only a tracked .gitignore ignores a path, and a hidden rule file is dirt"
+        );
+        assert!(own.is_empty(), "{own:?}");
+        let state = TreeState::capture(&tmp, &path_env).expect("capture");
+        assert!(
+            state.dirty.contains_key("by-info") && !state.dirty.contains_key("by-tree"),
+            "{:?}",
+            state.dirty.keys()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

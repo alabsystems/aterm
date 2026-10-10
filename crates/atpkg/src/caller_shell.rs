@@ -426,11 +426,13 @@ mod tests {
             "the truncation this asserts away needs a name past 15 bytes, not {own:?}"
         );
         assert_eq!(me, own, "{me}");
-        let mut child = std::process::Command::new("/bin/sleep")
+        // `spawnfd`'s, as every stand-in here: it holds its stdio and nothing
+        // else of this process, not another test thread's pipe while it lives.
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("/bin/sleep");
         await_exec(child.id(), "sleep");
@@ -631,12 +633,12 @@ mod tests {
             "",
             "--dangerously-skip-permissions",
         ];
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", "read -r _", "sh"])
             .args(tail)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("/bin/sh");
         // The last word is the sign the exec happened (see `await_exec`); what is asserted

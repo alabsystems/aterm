@@ -7,9 +7,7 @@
 //! beside the command, in `crates/aterm-link/tests/world/fabric_on.rs`
 //! (`a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model`),
 //! because that is the crate whose integration tests can run the binary
-//! (`CARGO_BIN_EXE_aterm-link`). It used to be a shell fixture around
-//! `tools/fabric-enable.sh`; the script is a wrapper over the command now, and
-//! the transaction it modelled is Rust.
+//! (`CARGO_BIN_EXE_aterm-link`).
 
 use aterm_spec::{derive::fabric_capability_publication_model, verify};
 

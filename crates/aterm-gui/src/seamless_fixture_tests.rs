@@ -113,6 +113,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.100.0", "shell-integration"),
     ("v0.100.0", "stalled-sequence"),
     ("v0.100.0", "twelve-panes"),
+    ("v0.101.0", "claude-code-1049"),
+    ("v0.101.0", "colour-and-shell"),
+    ("v0.101.0", "held-pane"),
+    ("v0.101.0", "history"),
+    ("v0.101.0", "history-carry"),
+    ("v0.101.0", "incident-55x149"),
+    ("v0.101.0", "link-dense"),
+    ("v0.101.0", "link-dense-history"),
+    ("v0.101.0", "policy-repaint"),
+    ("v0.101.0", "policy-visible"),
+    ("v0.101.0", "shell-integration"),
+    ("v0.101.0", "stalled-sequence"),
+    ("v0.101.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -133,8 +146,8 @@ const PINNED_DESKS: &[(&str, &str)] = &[
 /// from the check (the round-four review).
 ///
 /// The release cutter reads this table FROM THIS SOURCE, like
-/// [`PINNED_DESKS`] (`aterm-release`'s `gates::handoff_fixtures_of`), and so
-/// does `tools/release-preflight.sh`: keep it a literal table of
+/// [`PINNED_DESKS`] (`aterm-release`'s `gates::handoff_fixtures_of`, which `ship
+/// release` asks before anything is staged): keep it a literal table of
 /// `("vX.Y.0", "<desk>")` pairs. A desk added here is one every release from
 /// its floor on must write (the fixture README says how).
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -198,6 +211,51 @@ fn assert_held_panes_shown(desk: &Desk, incoming: &IncomingHandoff) {
                 shown.local_id
             );
         }
+        // What v0.101.0 on carry beside the screen; an older release's
+        // `parent.toml` records none of it and is asked about none.
+        if let Some(sid) = &expected.sid {
+            assert_eq!(
+                shown.sid.as_ref().map(SessionId::as_str),
+                Some(sid.as_str()),
+                "{label}: held pane {} keeps the session id it was known by",
+                shown.local_id
+            );
+        }
+        if let Some(take) = expected.history_take {
+            assert_eq!(
+                shown
+                    .history
+                    .carry
+                    .as_ref()
+                    .map(crate::handoff_history::HistoryCarry::take),
+                Some(take).filter(|take| *take > 0),
+                "{label}: held pane {}'s scrollback sidecar is taken, {take} line(s) deep",
+                shown.local_id
+            );
+        }
+        if let Some(dropped) = expected.history_dropped {
+            assert_eq!(
+                (shown.history.dropped, shown.history.lost),
+                (dropped, dropped),
+                "{label}: held pane {} loses nothing at this hop but what its parent counted",
+                shown.local_id
+            );
+        }
+        if let Some(control) = expected.control {
+            assert_eq!(
+                shown.control.is_some(),
+                control,
+                "{label}: held pane {}'s control carry crosses",
+                shown.local_id
+            );
+        }
+        if let Some(seen) = expected.failure_seen {
+            assert_eq!(
+                shown.failure_seen, seen,
+                "{label}: held pane {} says whether its failure was seen",
+                shown.local_id
+            );
+        }
     }
 }
 
@@ -243,6 +301,23 @@ struct HeldExpectation {
     exit_code: Option<i32>,
     #[serde(default)]
     exit_signal: Option<u8>,
+    /// What the producer carried beside the screen, recorded from v0.101.0
+    /// on: the pane's session id, how many lines of its scrollback its
+    /// `.h<id>.hist` sidecar carries (`0` for none), whether its control carry
+    /// crossed, and whether the person had seen its failure. Absent from older
+    /// releases' `parent.toml`: their producers carried the screen alone.
+    #[serde(default)]
+    sid: Option<String>,
+    #[serde(default)]
+    history_take: Option<u64>,
+    /// The lines of its scrollback the producer counted as left behind
+    /// (`HeldPaneCarry::history_dropped`), recorded from v0.101.0 on.
+    #[serde(default)]
+    history_dropped: Option<u64>,
+    #[serde(default)]
+    control: Option<bool>,
+    #[serde(default)]
+    failure_seen: Option<bool>,
 }
 
 /// The screen the producer carried for one session.
@@ -309,6 +384,17 @@ struct SessionExpectation {
     repaint: Option<bool>,
     #[serde(default)]
     history_dropped: Option<u64>,
+    /// THE META AND RECORD v0.101.0 ADDED, recorded from v0.101.0 on: whether
+    /// the meta carries the engine's in-flight output state (the REP
+    /// character every session that printed anything has, an open link, the
+    /// XTPUSHSGR stack...), and the render debt the record carries, the rows
+    /// the parent's engine owed a carried alternate screen (`"<shift>,<pushed>"`,
+    /// absent for none). Absent from older releases' `parent.toml`: their
+    /// producers wrote neither, and every such session adopts owing nothing.
+    #[serde(default)]
+    output_state: Option<bool>,
+    #[serde(default)]
+    render_debt: Option<String>,
 }
 
 /// One desk directory, read.
@@ -342,6 +428,15 @@ impl Desk {
     fn hist_name(&self, local_id: u64) -> String {
         format!(
             "{}.s{local_id}.hist",
+            self.parent.manifest.trim_end_matches(".toml")
+        )
+    }
+
+    /// The name of held pane `local_id`'s history sidecar beside the
+    /// manifest (v0.101.0 on).
+    fn held_hist_name(&self, local_id: u64) -> String {
+        format!(
+            "{}.h{local_id}.hist",
             self.parent.manifest.trim_end_matches(".toml")
         )
     }
@@ -951,6 +1046,109 @@ fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
     }
 }
 
+/// A HELD PANE'S SCROLLBACK LANDS, after Commit (v0.101.0 on): each shown
+/// pane is restored as `App::restore_held_leaf` restores it — the engine
+/// [`crate::held_pane_session`] builds from its screen, the import's keys
+/// reserved under that engine's first lock ([`crate::held_pane_history`]) —
+/// and imported by the worker every adopted session's carry goes through.
+/// Every line the parent stamped is imported and none is lost but what the
+/// parent counted, and the pane's history is then exactly the parent's
+/// sidecar lines (read by the line codec alone, [`sidecar_history`]) with
+/// every link dropped, line for line and cell for cell: a held pane has no
+/// process behind it, and like its screen ([`assert_held_panes_shown`]) its
+/// scrollback leaves nothing to click. A pane whose producer carried no
+/// scrollback (every held pane before v0.101.0) imports nothing.
+///
+/// [`assert_held_panes_shown`] sees only the sidecar's stamp: the frames are
+/// decoded and the lines placed here, so a held import this build broke would
+/// pass that check and lose the pane's scrollback in the field.
+fn assert_held_history_imports(desk: &Desk, held: Vec<crate::seamless::HeldPane>) {
+    let label = desk.label();
+    for pane in held {
+        let id = pane.local_id;
+        let expected = desk
+            .parent
+            .held
+            .iter()
+            .find(|expected| expected.local_id == id)
+            .unwrap_or_else(|| panic!("{label}: parent.toml has held pane {id}"));
+        let take = expected.history_take.unwrap_or(0);
+        let dropped = expected.history_dropped.unwrap_or(0);
+        let session = crate::held_pane_session(
+            id,
+            pane.sid.unwrap_or_else(SessionId::generate),
+            &pane.checkpoint,
+            None,
+            aterm_types::Appearance::Dark,
+        );
+        let Some(history) = crate::held_pane_history(&session.term, pane.history) else {
+            assert_eq!(
+                (take, dropped),
+                (0, 0),
+                "{label}: held pane {id} owes the import nothing only when its parent carried \
+                 and counted no scrollback"
+            );
+            continue;
+        };
+        assert_eq!(
+            history.claim.is_some(),
+            take > 0,
+            "{label}: held pane {id}'s import keys are reserved in front of its restored screen"
+        );
+        let restored = history_lines(
+            &label,
+            &session.term.lock().unwrap_or_else(PoisonError::into_inner),
+        );
+        assert!(
+            restored.is_empty(),
+            "{label}: held pane {id}'s screen restores no scrollback of its own"
+        );
+        let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+            session: id,
+            term: Arc::clone(&session.term),
+            history,
+        }])
+        .remove(0);
+        assert_eq!(
+            (
+                report.failed.as_deref(),
+                report.failed_lines,
+                report.cleared
+            ),
+            (None, 0, false),
+            "{label}: held pane {id}'s import settles"
+        );
+        assert_eq!(
+            (report.imported, report.lost(), report.held_pane),
+            (take, dropped, true),
+            "{label}: held pane {id} imports every line its parent carried, and loses none but \
+             what its parent counted"
+        );
+        let mut want = if take > 0 {
+            sidecar_history(&label, &desk.read(&desk.held_hist_name(id)), take)
+        } else {
+            Vec::new()
+        };
+        for line in &mut want {
+            line.clear_hyperlinks();
+        }
+        let got = history_lines(
+            &label,
+            &session.term.lock().unwrap_or_else(PoisonError::into_inner),
+        );
+        assert_same_lines(
+            &label,
+            &got,
+            &want,
+            &format!("held pane {id}'s history is its parent's sidecar, every link dropped"),
+        );
+        assert!(
+            !got.iter().any(Line::has_hyperlinks),
+            "{label}: held pane {id}'s scrollback shows no link"
+        );
+    }
+}
+
 /// The text of absolute row `abs` of `terminal`'s history-holding grid (the
 /// saved primary under an alternate screen), history or visible; `None` once
 /// the row is evicted or past the screen.
@@ -1084,6 +1282,21 @@ fn assert_meta_state_crosses(
             "{label}: session {id}'s completed-command count crosses"
         );
     }
+    if let Some(state) = expected.output_state {
+        assert_eq!(
+            !checkpoint.output_state.is_default(),
+            state,
+            "{label}: session {id}'s in-flight output state crosses"
+        );
+    }
+}
+
+/// The render debt `parent.toml` recorded for a session, `"<shift>,<pushed>"`,
+/// read here rather than by the consumer's parser, which is what is checked.
+fn recorded_render_debt(label: &str, row: &str) -> (i32, i32) {
+    row.split_once(',')
+        .and_then(|(shift, pushed)| Some((shift.parse().ok()?, pushed.parse().ok()?)))
+        .unwrap_or_else(|| panic!("{label}: a recorded render debt reads: {row:?}"))
 }
 
 /// One carried Settings draft as `(leaf, key, text)`. The leaf is its path in
@@ -1263,7 +1476,8 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
 /// and so the adoption proof, equal what that release's parent committed to.
 /// Every history sidecar the parent named is taken before the proof
 /// ([`assert_history_taken`]) and imported whole after it
-/// ([`assert_history_imports`]).
+/// ([`assert_history_imports`]), a held pane's too
+/// ([`assert_held_history_imports`]).
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1289,7 +1503,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         assert_proof_function_is_the_parents(desk);
 
         let mut staged = stage(desk, None);
-        let incoming = take_incoming_as(ReceiverShape::Current);
+        let mut incoming = take_incoming_as(ReceiverShape::Current);
         assert_eq!(
             incoming.adopted.len(),
             desk.parent.session.len(),
@@ -1321,6 +1535,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         );
         drafts_carried += assert_settings_drafts_placed(desk, &incoming);
         assert_held_panes_shown(desk, &incoming);
+        let held = std::mem::take(&mut incoming.held);
         for expected in &desk.parent.session {
             let adopted = incoming
                 .adopted
@@ -1370,6 +1585,19 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
                 adopted.local_id
             );
             assert_meta_state_crosses(&label, expected, checkpoint);
+            // THE RENDER DEBT CROSSES (v0.101.0 on): the successor owes the
+            // program exactly the rows its parent's engine owed it, so the
+            // same epoch judge and repaint nudge judge the tab; a session
+            // whose parent recorded none owes nothing.
+            assert_eq!(
+                adopted.render_debt,
+                expected
+                    .render_debt
+                    .as_deref()
+                    .map(|row| recorded_render_debt(&label, row)),
+                "{label}: session {} owes its program the rows its parent's engine owed it",
+                adopted.local_id
+            );
             // THE SHELL'S MARK AUTHORITY CROSSES: the requirement and the very
             // nonce the running shell signs with, reassembled by this build
             // from the older producer's meta — or every mark is dropped for
@@ -1410,6 +1638,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             "{label}: THE HANDOFF COMPLETES — the child's proof is the parent's expectation"
         );
         assert_history_imports(desk, sessions);
+        assert_held_history_imports(desk, held);
         drop(ready);
         staged.ready_write = None;
         staged.teardown();
@@ -1808,6 +2037,7 @@ fn a_repainted_session_is_counted_for_the_landing_row() {
 #[cfg(target_os = "macos")]
 const PINNED_RENDEZVOUS: &[&str] = &[
     "v0.91.0", "v0.92.0", "v0.93.0", "v0.94.0", "v0.95.0", "v0.97.0", "v0.98.0", "v0.100.0",
+    "v0.101.0",
 ];
 
 /// The fixed inputs every rendezvous capture runs over, in every release and in

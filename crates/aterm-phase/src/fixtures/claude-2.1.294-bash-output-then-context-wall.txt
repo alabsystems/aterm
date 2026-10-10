@@ -1,0 +1,51 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a Bash call (`date > stamp.txt && echo stamped`) and, the follow-up request too long, the real context wall Claude Code draws after the output: a second column-2 `⎿` row under the same call, `⏺ Bash(…)` / `⎿  stamped` / `⎿  Context limit reached · …` (above it, a collapsed Read and its own wall; the old reader read neither the second nor, under the call, the third)
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 6:50 AM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Baked for 6s · done 6:50 AM
+
+❯ toolstart
+
+⏺ Bash(date > stamp.txt && echo stamped)
+  ⎿  stamped
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Baked for 6s · done 6:50 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

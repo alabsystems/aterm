@@ -487,16 +487,6 @@ impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::spec_unmodeled(
-            reason = "the TerminalModes model does not model grapheme cluster mode (mode 2027)"
-        )
-    )]
-    fn set_grapheme_cluster_mode(&mut self, enabled: bool) {
-        self.modes.grapheme_cluster_mode = enabled;
-    }
-
-    #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::spec_unmodeled(
             reason = "the TerminalModes model does not model application keypad (DECKPAM/DECKPNM)"
         )
     )]
@@ -623,12 +613,11 @@ impl TerminalHandler<'_> {
             1243 => self.modes.bidi_arrow_swap,
             2004 => self.modes.bracketed_paste,
             2026 => self.modes.synchronized_output,
-            2027 => self.modes.grapheme_cluster_mode,
             2031 => self.modes.report_color_scheme,
             2048 => self.modes.in_band_size_reports,
             2500 => self.modes.bidi_box_mirroring,
             2501 => self.modes.bidi_autodetection,
-            9001 => self.modes.win32_input_mode,
+            9001 if self.modes.win32_input_enabled => self.modes.win32_input_mode,
             _ => return None,
         })
     }

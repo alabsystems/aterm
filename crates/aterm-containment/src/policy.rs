@@ -4,8 +4,8 @@
 
 //! Containment policy — maps mode to allowed capabilities.
 //!
-//! These functions and the tests below are the specification; the opt-in
-//! `kani_proofs` harnesses re-check the same table.
+//! These functions and the tests below are the specification: the tests
+//! enumerate every mode and every ordered pair of modes.
 
 use crate::capability::{FsCapability, NetworkCapability, ProcessCapability};
 use crate::mode::ContainmentMode;
@@ -32,8 +32,7 @@ pub struct Capabilities {
 ///
 /// The policy is defined once and is immutable — it encodes the security
 /// contract between the launcher and aterm. This Rust implementation IS the
-/// specification, pinned by the tests in this module and re-checked by the
-/// opt-in, `#[cfg(kani)]`-gated `kani_proofs` harnesses.
+/// specification, pinned by the tests in this module over all four modes.
 #[derive(Debug, Clone, Copy)]
 pub struct ContainmentPolicy;
 

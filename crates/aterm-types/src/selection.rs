@@ -156,80 +156,6 @@ pub const fn glyph_cell_span(
     }
 }
 
-#[cfg(kani)]
-mod kani_proofs {
-    use super::{selection_contains_block, selection_contains_linear};
-
-    #[kani::proof]
-    fn block_selection_is_symmetric_across_anchor_order() {
-        let row: i32 = kani::any();
-        let col: usize = kani::any();
-        let start_row: i32 = kani::any();
-        let start_col: usize = kani::any();
-        let end_row: i32 = kani::any();
-        let end_col: usize = kani::any();
-
-        kani::assume(col < 1024);
-        kani::assume(start_col < 1024);
-        kani::assume(end_col < 1024);
-
-        let forward = selection_contains_block(row, col, start_row, start_col, end_row, end_col);
-        let reverse = selection_contains_block(row, col, end_row, end_col, start_row, start_col);
-
-        kani::assert(
-            forward == reverse,
-            "block containment must be independent of anchor ordering",
-        );
-    }
-
-    #[kani::proof]
-    fn linear_single_row_matches_inclusive_column_range() {
-        let row: i32 = kani::any();
-        let col: usize = kani::any();
-        let start_col: usize = kani::any();
-        let end_col: usize = kani::any();
-
-        kani::assume(col < 1024);
-        kani::assume(start_col < 1024);
-        kani::assume(end_col < 1024);
-        kani::assume(start_col <= end_col);
-
-        let result = selection_contains_linear(row, col, row, start_col, row, end_col);
-        let expected = col >= start_col && col <= end_col;
-
-        kani::assert(
-            result == expected,
-            "single-row linear containment must match inclusive column bounds",
-        );
-    }
-
-    #[kani::proof]
-    fn block_selection_matches_normalized_rectangle() {
-        let row: i32 = kani::any();
-        let col: usize = kani::any();
-        let start_row: i32 = kani::any();
-        let start_col: usize = kani::any();
-        let end_row: i32 = kani::any();
-        let end_col: usize = kani::any();
-
-        kani::assume(col < 1024);
-        kani::assume(start_col < 1024);
-        kani::assume(end_col < 1024);
-
-        let min_row = start_row.min(end_row);
-        let max_row = start_row.max(end_row);
-        let min_col = start_col.min(end_col);
-        let max_col = start_col.max(end_col);
-        let result = selection_contains_block(row, col, start_row, start_col, end_row, end_col);
-        let expected = row >= min_row && row <= max_row && col >= min_col && col <= max_col;
-
-        kani::assert(
-            result == expected,
-            "block containment must match the normalized selection rectangle",
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +262,49 @@ mod tests {
         assert!(!selection_contains_block(4, 7, 3, 10, 1, 5));
         assert!(!selection_contains_block(2, 4, 3, 10, 1, 5));
         assert!(!selection_contains_block(2, 11, 3, 10, 1, 5));
+    }
+
+    /// Containment against the shapes it names, over every point and both
+    /// anchors with row -2..=2 and col 0..=4 (15,625 point-anchor triples,
+    /// each anchor order): a block is the normalized rectangle whichever
+    /// anchor came first, and a linear span on one row is the inclusive column
+    /// range — and, across rows, the reading-order span from the start cell
+    /// through the end cell.
+    #[test]
+    fn containment_matches_the_normalized_shapes() {
+        let points: Vec<(i32, usize)> = (-2..=2)
+            .flat_map(|row| (0..=4).map(move |col| (row, col)))
+            .collect();
+        for &(row, col) in &points {
+            for &(r1, c1) in &points {
+                for &(r2, c2) in &points {
+                    let rect = row >= r1.min(r2)
+                        && row <= r1.max(r2)
+                        && col >= c1.min(c2)
+                        && col <= c1.max(c2);
+                    assert_eq!(
+                        selection_contains_block(row, col, r1, c1, r2, c2),
+                        rect,
+                        "block ({r1},{c1})..({r2},{c2}) at ({row},{col})"
+                    );
+                    assert_eq!(
+                        selection_contains_block(row, col, r2, c2, r1, c1),
+                        rect,
+                        "block ({r2},{c2})..({r1},{c1}) at ({row},{col})"
+                    );
+                    if (r1, c1) <= (r2, c2) {
+                        let span = (r1, c1) <= (row, col) && (row, col) <= (r2, c2);
+                        assert_eq!(
+                            selection_contains_linear(row, col, r1, c1, r2, c2),
+                            span,
+                            "linear ({r1},{c1})..({r2},{c2}) at ({row},{col})"
+                        );
+                        if r1 == r2 && row == r1 {
+                            assert_eq!(span, c1 <= col && col <= c2);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

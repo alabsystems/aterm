@@ -42,10 +42,6 @@ fn gui_fixture_defaults_disable_machine_writes_and_preserve_explicit_edits() {
         Some(false)
     );
     assert_eq!(
-        machine.get("spotlight_noindex").and_then(|v| v.as_bool()),
-        Some(false)
-    );
-    assert_eq!(
         machine.get("universal_control").and_then(|v| v.as_str()),
         Some("leave")
     );
@@ -268,9 +264,11 @@ fn self_check_executable_reader() {
     );
     // Keep the shell blocked in its own builtin, with the daemon mention in
     // its command line. Piped stdin stays open until cleanup; no child escapes.
-    let mut mention = std::process::Command::new("sh")
+    // `spawnfd`'s: the shell holds its stdio and nothing else of this process,
+    // not another test thread's pipe (a `ps` read's, say) while it waits.
+    let mut mention = aterm_uds::spawnfd::command("sh")
         .args(["-c", "read -r _; : aterm-gui --headless"])
-        .stdin(std::process::Stdio::piped())
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("spawn a shell that names the daemon");
     let pid = mention.id().to_string();

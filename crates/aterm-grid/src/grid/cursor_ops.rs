@@ -39,7 +39,7 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[inline]
     pub fn move_cursor_to(&mut self, row: u16, col: u16) {
         self.set_cursor(row, col);
@@ -446,7 +446,7 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     /// ENSURES: old(self.storage.cursor.col) > 0 implies self.storage.cursor.col == old(self.storage.cursor.col) - 1
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn backspace(&mut self) {
         self.storage.clear_pending_wrap();
         self.storage.cursor.col = self.storage.cursor.col.saturating_sub(1);
@@ -459,7 +459,7 @@ impl Grid {
     /// ENSURES: self.storage.saved_cursor.valid == true
     /// ENSURES: self.storage.saved_cursor.cursor == old(self.storage.cursor)
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn save_cursor(&mut self) {
         self.storage.save_cursor();
         debug_assert!(self.storage.saved_cursor().valid);
@@ -472,7 +472,7 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// ENSURES: self.storage.saved_cursor.valid implies self.storage.cursor.row < self.storage.visible_rows
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn restore_cursor(&mut self) {
         let saved = self.storage.saved_cursor();
         if saved.valid {
@@ -484,6 +484,12 @@ impl Grid {
             let col = self.storage.clamp_col_for_row(row, saved.cursor.col);
             self.storage
                 .restore_saved_cursor(super::Cursor::new(row, col));
+            // A deferred wrap holds only at the right margin: a saved column a
+            // resize left inside the row restores none (the terminal's DECRC
+            // applies the same rule).
+            if col < self.storage.max_col_for_row(row) {
+                self.storage.clear_pending_wrap();
+            }
         }
     }
 }

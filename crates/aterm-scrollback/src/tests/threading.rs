@@ -108,8 +108,7 @@ fn scrollback_moves_between_threads_when_guarded_by_mutex() {
 
 /// Exercises the Cell<u8> decompress_failures path through Arc<Mutex>:
 /// a worker thread corrupts a warm block and reads until quarantine.
-/// This is the behavioral test for the #6024 Cell<u8> change — the
-/// mutation through `&self` in `decompress()` must work correctly when
+/// The mutation through `&self` in `decompress()` (#6024) must work when
 /// accessed through Mutex-guarded cross-thread sharing.
 #[test]
 fn cell_failure_counting_works_through_mutex_across_threads() {

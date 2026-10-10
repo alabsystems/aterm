@@ -777,10 +777,18 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 /// `.stdin(..)`, before `spawn`. `dir` is the world's scratch root: the FIFO's
 /// name lives there only until both ends are open.
 ///
+/// The instance holds its stdio (the lifeline on stdin) and NOTHING ELSE of
+/// this process (`inherit_nothing`): a std child under the pinned seal keeps
+/// any descriptor another test thread had open unflagged at the spawn — a
+/// `ps` or `lsof` pipe between its `pipe()` and its `F_SETFD` — and an
+/// instance lives as long as its world, so that read would wait as long.
+///
 /// # Panics
 /// The FIFO could not be made in `dir` — a broken fixture, never a reason to boot
 /// an unwatched instance.
 pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    cmd.inherit_nothing();
     aterm_uds::lifeline::arm_for_process(cmd, dir)
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", dir.display()));
 }
@@ -789,8 +797,8 @@ pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
 /// The app updater and automatic package updates are off (settings, 2026-09-23: no
 /// environment veto exists), and so is automatic primer installation. Package opt-out
 /// alone still runs machine settings, and a scratch HOME does not isolate macOS
-/// preferences, so both machine policies are explicit.
-pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nenabled = false\nauto_apply = false\n\n[packages]\nenabled = false\n\n[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+/// preferences, so the machine policy is explicit.
+pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nenabled = false\nauto_apply = false\n\n[packages]\nenabled = false\n\n[machine]\nuniversal_control = \"leave\"\n";
 
 /// Seed a private config once; an intentional fixture edit survives relaunch.
 pub fn prepare_fixture_config(tmp: &Path) {

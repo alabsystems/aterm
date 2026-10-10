@@ -14,9 +14,8 @@
 //! ~74% ink and on light as ~26% ink: dark-mode text looked systematically
 //! bolder than the same face on a light theme.
 //!
-//! This is the theorem NO single audit item owns: W2 owns the remap's float
-//! laws (range / monotone / degenerate guard, in `text_blending.rs`); THIS file
-//! composes them into the end-user guarantee — *perceived weight is invariant
+//! W2 owns the remap's float laws (range / monotone / degenerate guard, in
+//! `text_blending.rs`); THIS file composes them into the end-user guarantee — *perceived weight is invariant
 //! under fg↔bg swap* — over an exhaustive coverage × polarity × contrast
 //! lattice, driving the SHIPPING blend.
 //!
@@ -27,7 +26,7 @@
 //! division nor the gamma curve is expressible in the `ty` Expr language (no
 //! `*` / `/` / `pow`). Per the repo's box-drawing-rounding precedent, the
 //! machine check for such an arithmetic law is an exhaustive/dense lattice test
-//! under plain `cargo test`. The BOOLEAN gate that turns the remap on (`Linear`
+//! under plain `targo --unverified test`. The BOOLEAN gate that turns the remap on (`Linear`
 //! vs `LinearCorrected`, endpoint exactness) is the part carried by `ty`
 //! (`text_blend_gate_model`); this file carries the SCALING invariant.
 

@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! .app assembly (release spec §6 `bundle.rs`): build this claim's staging
-//! bundle, `dist/cut-<build>.noindex/aterm.app`, from
+//! .app assembly (release spec §6 `bundle.rs`): lay out the release's bundle
+//! ([`assemble_at`], once, by the build: `artifact.rs`) from
 //! the `apps/aterm-mac/Info.plist` template via in-process string substitution
-//! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit
-//! with the `-dirty` rule matching crates/aterm/build.rs), copy the static
+//! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit — the
+//! release commit's short id, never dirty: the build reads git objects), copy the static
 //! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns) and the
 //! successor's handoff policy (`publish/handoff-policy.toml`), nest
-//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, and write the
+//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS; prepare this claim's staging
+//! directory, `dist/cut-<build>.noindex/` ([`prepare_staging`]), which the cut
+//! copies the measured bundle into to sign; and write the
 //! `dist/aterm-<ver>-build.txt` provenance record. No `.metadata_never_index` marker
-//! (see [`assemble`]: inert for Spotlight, and its one reader is deleted).
+//! (see [`prepare_staging`]: inert for Spotlight, and its one reader is deleted).
 //!
 //! Port of the layout phase of the retired `apps/aterm-mac/build-app.sh`
 //! (steps 2–6c + 8) — that script was deleted with the shell pipeline and is
@@ -24,14 +26,18 @@
 //! copied like every other resource instead of being generated inline.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// Everything [`assemble`] + [`write_provenance`] need, resolved by the caller.
+/// The release bundle's `CFBundleIdentifier` — the identifier a Developer-ID
+/// signing/notarization profile binds to.
+pub const BUNDLE_ID: &str = "com.aterm.aterm";
+
+/// Everything [`assemble_at`] + [`write_provenance`] need, resolved by the caller.
 pub struct BundleSpec {
-    /// Workspace root (locates the apps/aterm-mac templates + git).
+    /// The tree the bundle's resources come from (the apps/aterm-mac templates, the
+    /// handoff policy): the build's snapshot of the release commit's objects.
     pub repo_root: PathBuf,
-    /// `dist/` — receives this claim's `cut-<build>.noindex/aterm.app` and the build.txt
-    /// provenance record.
+    /// `dist/` — receives the build.txt provenance record, beside the dSYM
+    /// [`write_provenance`] looks for.
     pub out_dir: PathBuf,
     /// Workspace-derived release version, canonical MAJOR.MINOR.PATCH ("0.2.0") →
     /// CFBundleShortVersionString and the `aterm-<ver>-build.txt` name.
@@ -43,46 +49,11 @@ pub struct BundleSpec {
     /// CFBundleIdentifier (default com.aterm.aterm — the identifier a
     /// Developer-ID signing/notarization profile would bind to).
     pub bundle_id: String,
-    /// ATermGitCommit stamp — short=12 with the `-dirty` rule; produce it via
-    /// [`git_commit_stamp`] so the plist and the binary's own ATERM_GIT_COMMIT
-    /// agree byte-for-byte.
+    /// ATermGitCommit stamp — short=12, the spelling the build pins as the binary's
+    /// own ATERM_GIT_COMMIT, so the plist and the binary agree byte-for-byte.
     pub git_commit: String,
-    /// The ship-ready (universal, stripped) binaries from `buildplan::run`.
+    /// The ship-ready (universal, stripped) binary from `buildplan::run`.
     pub aterm_bin: PathBuf,
-}
-
-/// Pure `-dirty` rule, EXACTLY matching crates/aterm/build.rs: the suffix
-/// is only appended to a REAL commit — an unborn/.git-less tree stamps a bare
-/// "unknown", never "unknown-dirty", so the plist and the binary agree.
-pub fn commit_stamp(short_commit: Option<&str>, dirty: bool) -> String {
-    match short_commit {
-        Some(c) if dirty => format!("{c}-dirty"),
-        Some(c) => c.to_string(),
-        None => "unknown".to_string(),
-    }
-}
-
-/// IO wrapper for [`commit_stamp`]: probe git the same way build.rs does
-/// (`rev-parse --short=12 HEAD` + `status --porcelain`; every probe
-/// best-effort → "unknown" rather than failing).
-pub fn git_commit_stamp(repo_root: &Path) -> String {
-    let commit = git_out(repo_root, &["rev-parse", "--short=12", "HEAD"]);
-    let dirty = git_out(repo_root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-    commit_stamp(commit.as_deref(), dirty)
-}
-
-fn git_out(repo_root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
 }
 
 /// Stamp the Info.plist TEMPLATE (apps/aterm-mac/Info.plist) in-process — the
@@ -202,11 +173,12 @@ pub fn is_staging_dir_name(name: &str) -> bool {
 /// 3. the pre-claim gate (`gates::staged_bundle_liveness_gate`) refuses the cut —
 ///    for free, before a build number is burned — while any process runs out of
 ///    ANY staging directory, or when the process list cannot be read;
-/// 4. [`assemble`] re-asks at the moment it would `rm -rf` its own directory (a
-///    resume that rebuilds), and [`prune_staging_dirs`] removes an older directory
-///    only when the process list PROVES nothing runs from it.
+/// 4. [`prepare_staging`] re-asks at the moment it would `rm -rf` its own
+///    directory (a resume that copies the measured bundle in again), and
+///    [`prune_staging_dirs`] removes an older directory only when the process list
+///    PROVES nothing runs from it.
 ///
-/// Every step after `build` reads the bundle from here too; nothing copies it
+/// Every step after `sign` reads the bundle from here too; nothing copies it
 /// anywhere else (a release installs from the DMG; the dev app is
 /// tools/dev-app.sh's). Once a real or rehearsed cut is done,
 /// [`discard_staged_app`] removes this claim's staging directory too (under the
@@ -377,25 +349,26 @@ fn discard_staged_dir(
     std::fs::remove_dir_all(&dir).map_err(|e| format!("rm -rf {}: {e}", dir.display()))
 }
 
-/// Assemble this claim's staging bundle, [`staged_app_path`] (build-app.sh steps
-/// 2–6c). Returns the .app path. Signing is NOT done here — the caller runs `sign::`
-/// next (inside-out), then dmg, then [`write_provenance`] (whose binary_sha256 must
-/// cover the SIGNED bytes, so it must run after signing — same order as the script).
-pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
-    let mac_dir = spec.repo_root.join("apps/aterm-mac");
-    let app = staged_app_path(&spec.out_dir, spec.build_number);
-
-    // NO `.metadata_never_index` MARKER: as a Spotlight exclusion it is inert (MEASURED
-    // on macOS 26.6.2, crates/atpkg/src/noindex.rs) and nothing else reads it. The
-    // exclusion that works is the staging directory's `.noindex` name
-    // ([`staging_dir_name`]).
-    let staging_dir = spec.out_dir.join(staging_dir_name(spec.build_number));
-
-    // NO LIVE BUNDLE UNDER THIS `rm -rf`. The pre-claim gate refused the cut if
-    // anything ran out of a staging directory, but that answer is a build ago; ask
-    // again at the moment of deleting. The directory is this claim's own, so it
-    // exists here only on a resume that rebuilds — and a process running out of it
-    // (someone launched the half-built bundle) is refused, never deleted under.
+/// Prepare THIS claim's staging directory and return where its bundle goes,
+/// [`staged_app_path`] — absent on return: the cut copies the measured bundle
+/// there to sign it. Older staging directories go only when provably unused
+/// ([`prune_staging_dirs`]), before this claim's own is made, so a failed cut
+/// leaves exactly one.
+///
+/// NO LIVE BUNDLE UNDER THIS `rm -rf`. The pre-claim gate refused the cut if
+/// anything ran out of a staging directory, but that answer is a build ago; this
+/// asks again at the moment of deleting. The directory is this claim's own, so it
+/// holds a bundle here only on a resume that signs again — and a process running
+/// out of it (someone launched the half-signed bundle) is refused, never deleted
+/// under.
+///
+/// NO `.metadata_never_index` MARKER: as a Spotlight exclusion it is inert
+/// (MEASURED on macOS 26.6.2, crates/atpkg/src/noindex.rs) and nothing else reads
+/// it. The exclusion that works is the staging directory's `.noindex` name
+/// ([`staging_dir_name`]).
+pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
+    let app = staged_app_path(dist, build);
+    let staging_dir = dist.join(staging_dir_name(build));
     let processes = running_processes();
     if app.exists() {
         match processes.as_deref() {
@@ -408,7 +381,7 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
                 ));
             }
             Some(list) => {
-                if let Some((_, pids)) = live_staging_dirs(&spec.out_dir, list)
+                if let Some((_, pids)) = live_staging_dirs(dist, list)
                     .into_iter()
                     .find(|(dir, _)| *dir == staging_dir)
                 {
@@ -422,20 +395,33 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
             }
         }
     }
-    // Older staging directories go only when provably unused — see
-    // [`prune_staging_dirs`]. Before this claim's own is created, so a failed build
-    // leaves exactly one.
-    for line in prune_staging_dirs(&spec.out_dir, &staging_dir, processes.as_deref()) {
+    for line in prune_staging_dirs(dist, &staging_dir, processes.as_deref()) {
         println!("==> {line}");
     }
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
-
-    // --- 2. lay out the bundle -------------------------------------------
-    println!("==> assembling {}", app.display());
     if app.exists() {
         std::fs::remove_dir_all(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }
+    Ok(app)
+}
+
+/// Lay out the release's bundle at `app` (build-app.sh steps 2–6c), which must not
+/// exist yet. Signing is NOT done here: the build lays out an unsigned bundle once,
+/// MEASURE judges it, and the cut signs a byte copy of it (inside-out), then
+/// packages it and runs [`write_provenance`] (whose binary_sha256 must cover the
+/// SIGNED bytes, so it must run after signing — same order as the script).
+pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
+    let mac_dir = spec.repo_root.join("apps/aterm-mac");
+    if app.exists() {
+        return Err(format!(
+            "{} already exists — a bundle is laid out once, into a fresh place",
+            app.display()
+        ));
+    }
+
+    // --- 2. lay out the bundle -------------------------------------------
+    println!("==> assembling {}", app.display());
     let macos = app.join("Contents/MacOS");
     let resources = app.join("Contents/Resources");
     std::fs::create_dir_all(&macos).map_err(|e| format!("create {}: {e}", macos.display()))?;
@@ -540,10 +526,10 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     // this bundle — only after this bundle passed its codesign check — is the
     // one this cut wrote. Copied byte for byte from the checked-in source,
     // after the same strict read the pre-claim gate ran.
-    let policy = place_handoff_policy(&spec.repo_root, &app)?;
+    let policy = place_handoff_policy(&spec.repo_root, app)?;
     println!("    handoff policy: {policy}");
 
-    Ok(app)
+    Ok(())
 }
 
 /// Read the checked-in handoff policy
@@ -625,8 +611,15 @@ fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
 /// Write `dist/aterm-<ver>-build.txt` — the per-artifact provenance record
 /// (build-app.sh step 8, same KEY=value fields in the same order). MUST run
 /// AFTER signing: binary_sha256 covers the shipped Contents/MacOS/aterm
-/// bytes, and codesign rewrites them.
-pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Result<PathBuf, String> {
+/// bytes, and codesign rewrites them. `pre_sign_sha256` is the digest of those
+/// bytes BEFORE signing — the executable MEASURE judged (build once): the record
+/// binds what shipped to what was measured.
+pub fn write_provenance(
+    spec: &BundleSpec,
+    app: &Path,
+    signed_by: &str,
+    pre_sign_sha256: &str,
+) -> Result<PathBuf, String> {
     let shipped = app.join("Contents/MacOS/aterm");
     // In-process sha256 (aterm-digest): the digest on record is provably the digest of
     // the bytes on disk, not of whatever a shelled hasher happened to read.
@@ -657,6 +650,7 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
          built={}\n\
          bundle_id={}\n\
          binary_sha256={}\n\
+         pre_sign_sha256={pre_sign_sha256}\n\
          signed_by={}\n\
          has_dsym={}\n\
          layout=one-binary\n\

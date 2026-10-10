@@ -131,14 +131,20 @@ impl App {
             return;
         };
         let posted = self.messages.post(msg, wall_stamp_now(), Instant::now());
-        if matches!(posted.outcome, PostOutcome::New | PostOutcome::Restated) {
-            aterm_log::info!("exceptions: {:?} {}", posted.outcome, entry.key());
-            if posted.outcome == PostOutcome::New
-                && let Some(line) = entry.log_line_text()
-            {
-                aterm_log::info!("{line}");
+        match posted.outcome {
+            PostOutcome::New => {
+                aterm_log::info!("exceptions: {:?} {}", posted.outcome, entry.key());
+                if let Some(line) = entry.log_line_text() {
+                    aterm_log::info!("{line}");
+                }
+                self.digest_moved();
             }
-            self.digest_moved();
+            // Words moving in place: not news for `aterm.log` (as a pass's).
+            PostOutcome::Restated => {
+                aterm_log::debug!("exceptions: {:?} {}", posted.outcome, entry.key());
+                self.digest_moved();
+            }
+            PostOutcome::Duplicate | PostOutcome::Suppressed | PostOutcome::Superseded(_) => {}
         }
     }
 
@@ -271,6 +277,7 @@ impl App {
     /// ([`Self::except_clear`] is that).
     fn except_end(&mut self, key: &str) -> bool {
         self.ripening.retain(|claim| claim.key != key);
+        self.entries_refused.remove(key);
         let ended = self.messages.clear_digest(key, Instant::now());
         if ended {
             aterm_log::info!("exceptions: cleared {key}");
@@ -300,7 +307,12 @@ impl App {
     /// A reporter's whole current answer for `family`: what still holds is
     /// posted or kept, and what the pass no longer names ends once it has gone
     /// unnamed for ten minutes (the digest's own clock, armed by
-    /// `messages_deadline`, ends it if no later look comes).
+    /// `messages_deadline`, ends it if no later look comes). AN ENTRY WHOSE
+    /// WORDS THE DOOR REFUSES IS STILL NAMED ([`Self::checked_entry`]): the
+    /// fact holds, so an open entry under its key stands in the words it was
+    /// last shown in, and its clock does not start — a wording fault never
+    /// ends a fact (2026-10-08: the upgrade's own-work line, refused at every
+    /// look, would have been filed `Resolved` while its cause stood).
     pub(crate) fn except_replace(&mut self, family: Family, entries: &[Entry]) {
         if family.mode() != Mode::Level || entries.iter().any(|e| e.family() != family) {
             aterm_log::error!(
@@ -309,15 +321,34 @@ impl App {
             );
             return;
         }
-        let msgs: Vec<Message> = entries
-            .iter()
-            .filter_map(|entry| self.checked_entry(entry))
-            .collect();
-        let sync =
-            self.messages
-                .sync_digest(&family.prefix(), msgs, wall_stamp_now(), Instant::now());
+        let prefix = family.prefix();
+        let named: Vec<String> = entries.iter().map(Entry::key).collect();
+        // A refusal this pass no longer names is over: said again if it returns.
+        self.entries_refused
+            .retain(|key, _| !key.starts_with(&prefix) || named.contains(key));
+        let mut msgs: Vec<Message> = Vec::with_capacity(entries.len());
+        let mut refused: Vec<String> = Vec::new();
+        for (entry, key) in entries.iter().zip(named) {
+            match self.checked_entry(entry) {
+                Some(msg) => msgs.push(msg),
+                None => refused.push(key),
+            }
+        }
+        let sync = self.messages.sync_digest_keeping(
+            &prefix,
+            msgs,
+            &refused,
+            wall_stamp_now(),
+            Instant::now(),
+        );
         if sync.posted + sync.restated + sync.resolved > 0 {
-            aterm_log::info!("exceptions: {family:?} {sync:?}");
+            // A restatement alone is words moving in place (a count, an age),
+            // at most once per `RESTATE_QUIET`: not news for `aterm.log`.
+            if sync.posted + sync.resolved > 0 {
+                aterm_log::info!("exceptions: {family:?} {sync:?}");
+            } else {
+                aterm_log::debug!("exceptions: {family:?} {sync:?}");
+            }
             for entry in entries
                 .iter()
                 .filter(|e| sync.posted_keys.contains(&e.key()))
@@ -466,6 +497,14 @@ impl App {
                 self.except_clear(message_reporters::DISK_SETTINGS_KEY);
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
             }
+            // The developer root: raised while a measurement finds Spotlight
+            // indexing it, ended by the one that finds it skipped. An unmeasured
+            // look (`None`) leaves the line as the last measurement left it.
+            HostNote::DevRoot { indexed } => match indexed {
+                Some(true) => self.except(&message_reporters::devroot_indexed_entry()),
+                Some(false) => self.except_clear(message_reporters::DEVROOT_INDEXED_KEY),
+                None => {}
+            },
             HostNote::UpgradeCannotRun { sid, step, dir } => {
                 self.host_noted.insert(format!("upgrade:{sid}"));
                 self.except(&message_reporters::upgrade_cannot_run_entry(
@@ -885,14 +924,23 @@ impl App {
     }
 
     /// The entry as a checked message, or `None` (and ONE `aterm.log` error
-    /// naming the key) when its words fail the rule: an owner is never shown
-    /// words the rule refuses, and the roster test
+    /// naming the key, said again only once its words have passed or its
+    /// fault has changed: a level family restates at every look) when its
+    /// words fail the rule: an owner is never shown words the rule refuses,
+    /// and the roster test
     /// (`host_exceptions_tests::every_host_entry_passes_the_door_and_the_caps`) fails in the gate first.
     fn checked_entry(&mut self, entry: &Entry) -> Option<Message> {
+        let key = entry.key();
         match entry.message() {
-            Ok(msg) => Some(msg),
+            Ok(msg) => {
+                self.entries_refused.remove(&key);
+                Some(msg)
+            }
             Err(fault) => {
-                aterm_log::error!("exceptions: {} recorded, not shown: {fault:?}", entry.key());
+                if self.entries_refused.get(&key) != Some(&fault) {
+                    aterm_log::error!("exceptions: {key} recorded, not shown: {fault:?}");
+                    self.entries_refused.insert(key, fault);
+                }
                 None
             }
         }
@@ -1213,6 +1261,51 @@ mod tests {
             app.messages.digest().is_empty(),
             "no second look was needed"
         );
+    }
+
+    /// A WORDING FAULT NEVER ENDS A FACT (2026-10-08: the upgrade's own-work
+    /// line restated in words the door refuses, twelve times in a day): the
+    /// pass still names its key, so the open entry stands in the words it was
+    /// shown in and no clock starts — the digest's own settle past
+    /// `RESOLVE_AFTER` leaves it open. NEGATIVE CONTROL: a pass that stops
+    /// naming it starts the clock as before.
+    #[test]
+    fn a_refused_restatement_leaves_its_entry_open() {
+        use aterm_messages::need::RESOLVE_AFTER;
+        use std::time::{Duration, Instant};
+        let mut app = App::headless_for_test();
+        app.except_replace(Family::Upgrade, &[tab_one()]);
+        let id = app.messages.digest().entries[0].id;
+        let shown = app.messages.digest_entry(id).expect("open").detail;
+        let refused = Entry::new(
+            Family::Upgrade,
+            "",
+            "own-work",
+            "Claude in tab 1 is still on 2.1.283",
+            Why::OnlyYou(Reason::new(
+                "aterm never ends running work, and it is waiting on background work of its own",
+            )),
+            Then::step("Stop that work in the tab when it suits you"),
+        );
+        assert_eq!(refused.key(), tab_one().key(), "the same fact");
+        assert!(refused.message().is_err(), "words the door refuses");
+        for _ in 0..3 {
+            app.except_replace(Family::Upgrade, std::slice::from_ref(&refused));
+        }
+        assert_eq!(
+            app.messages.digest_deadline(),
+            None,
+            "a fact still named starts no clock"
+        );
+        let _ = app.settle_messages(Instant::now() + RESOLVE_AFTER + Duration::from_secs(1));
+        let open = app
+            .messages
+            .digest_entry(id)
+            .expect("still open past the clock");
+        assert_eq!(open.detail, shown, "in the words it was shown in");
+        // NEGATIVE CONTROL: unnamed, the clock runs.
+        app.except_replace(Family::Upgrade, &[]);
+        assert!(app.messages.digest_deadline().is_some());
     }
 
     /// The page and the wire read ONE digest: an entry restated after its

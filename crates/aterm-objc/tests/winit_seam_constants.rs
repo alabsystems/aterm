@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W9 phase 2 — THE SEAM'S CONSTANT RECIPE, EXECUTED.
-//!
-//! # The gap this closes
+//! The seam's constants, `_Static_assert`ed against the SDK on BOTH arches.
 //!
 //! `vendor/winit/src/platform_impl/macos/aterm_objc_seam.rs`'s `consts` module
-//! carries 42 AppKit and Foundation values, and its header says exactly the
-//! right thing about how they are checked:
+//! carries AppKit and Foundation values, and its header gives the recipe:
 //!
 //! ```text
 //! Every value below is `_Static_assert`ed against the SDK on BOTH arches
@@ -15,34 +12,20 @@
 //!   $ cc -arch x86_64 -fsyntax-only /tmp/c.m   # passes
 //! ```
 //!
-//! **It was a comment.** Nothing in the tree ran it, nothing re-ran it when a
-//! row was added, and nothing would have noticed if a future edit made it
-//! false. `aterm-gui`'s `consts` module has a real test
-//! (`appkit::consts_tests`) that diffs every row against the `objc2` expression
-//! it replaced — but that oracle is only available while `objc2-app-kit` is a
-//! dependency of `aterm-gui`, and it says so itself. The vendored fork has no
-//! equivalent: `winit` is a path dependency and NOT a workspace member, so
-//! `cargo test --workspace` never compiles a test inside it.
+//! This file runs it. `winit` is a path dependency, NOT a workspace member, so
+//! `targo test --workspace` never compiles a test inside it; `aterm-objc` is a
+//! member, and these constants feed its sends.
 //!
-//! This file is the recipe, run. It lives here because `aterm-objc` IS a
-//! workspace member and because these constants exist to feed this crate's
-//! sends.
-//!
-//! # Why the campaign cares about exactly this shape
-//!
-//! `NS_TEXT_ALIGNMENT_CENTER` shipped as `2` — which is RIGHT alignment —
-//! because its `#if TARGET_ABI_USES_IOS_VALUES` guard was read as "iOS vs
-//! macOS" when on Apple Silicon it reduces to `!TARGET_CPU_X86_64`. It
-//! compiled, every test passed, every encoding read back correct, and only an
-//! A/B pixel capture caught it. The defence adopted afterwards was the recipe
-//! above. A defence that has never been executed is a claim.
+//! Why: `NS_TEXT_ALIGNMENT_CENTER` shipped as `2` (RIGHT alignment) because its
+//! `#if TARGET_ABI_USES_IOS_VALUES` guard was read as "iOS vs macOS" when on
+//! Apple Silicon it reduces to `!TARGET_CPU_X86_64`. Every test passed; only a
+//! pixel capture caught it.
 //!
 //! # Non-vacuity, three ways
 //!
 //! * The table must cover the seam's `consts` module EXACTLY — every constant
 //!   parsed out of the file must have a row here, and every row must name a
-//!   constant that is really there. A value added to the seam without a row
-//!   fails this test rather than slipping past it.
+//!   constant that is really there.
 //! * The assertion uses the RUST literal verbatim, so the thing checked is what
 //!   `view.rs` and `window_delegate.rs` actually compile against, not a second
 //!   transcription of the SDK.
@@ -60,7 +43,7 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 /// `(Rust constant, the SDK spelling it claims to equal)`.
 ///
 /// The SDK name is written out rather than derived from the Rust name by
-/// un-snake-casing it. A derivation would be a fourth guess — and it would be
+/// un-snake-casing it. A derivation would be a second guess — and it would be
 /// wrong for `NS_APPKIT_VERSION_NUMBER_10_12`, `NS_CRITICAL_REQUEST` and
 /// `NS_WINDOW_ABOVE`, none of which is the mechanical camel-case of its Rust
 /// spelling.
@@ -99,21 +82,21 @@ const ROWS: &[(&str, &str)] = &[
     // ---- NSRequestUserAttentionType ----
     ("NS_CRITICAL_REQUEST", "NSCriticalRequest"),
     ("NS_INFORMATIONAL_REQUEST", "NSInformationalRequest"),
-    // ---- the rest of W8's ----
+    // ---- window, drag, KVO, AppKit version ----
     ("NS_BACKING_STORE_BUFFERED", "NSBackingStoreBuffered"),
     ("NS_DRAG_OPERATION_NONE", "NSDragOperationNone"),
     ("NS_DRAG_OPERATION_COPY", "NSDragOperationCopy"),
     ("NS_KEY_VALUE_OBSERVING_OPTION_NEW", "NSKeyValueObservingOptionNew"),
     ("NS_KEY_VALUE_OBSERVING_OPTION_OLD", "NSKeyValueObservingOptionOld"),
     ("NS_APPKIT_VERSION_NUMBER_10_12", "NSAppKitVersionNumber10_12"),
-    // ---- W10, event.rs ----
+    // ---- event.rs ----
     ("NS_EVENT_MODIFIER_FLAG_SHIFT", "NSEventModifierFlagShift"),
     ("NS_EVENT_MODIFIER_FLAG_CONTROL", "NSEventModifierFlagControl"),
     ("NS_EVENT_MODIFIER_FLAG_OPTION", "NSEventModifierFlagOption"),
     ("NS_EVENT_MODIFIER_FLAG_COMMAND", "NSEventModifierFlagCommand"),
     ("NS_EVENT_TYPE_APPLICATION_DEFINED", "NSEventTypeApplicationDefined"),
     ("NS_EVENT_SUBTYPE_WINDOW_EXPOSED", "NSEventSubtypeWindowExposed"),
-    // ---- W9 phase 2, view.rs ----
+    // ---- view.rs ----
     ("NS_EVENT_PHASE_BEGAN", "NSEventPhaseBegan"),
     ("NS_EVENT_PHASE_CHANGED", "NSEventPhaseChanged"),
     ("NS_EVENT_PHASE_ENDED", "NSEventPhaseEnded"),
@@ -121,11 +104,11 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_EVENT_PHASE_MAY_BEGIN", "NSEventPhaseMayBegin"),
     ("NS_NOT_FOUND", "NSNotFound"),
     ("NS_UTF8_STRING_ENCODING", "NSUTF8StringEncoding"),
-    // ---- W12, app_state.rs's activation policy ----
+    // ---- app_state.rs's activation policy ----
     ("NS_APPLICATION_ACTIVATION_POLICY_REGULAR", "NSApplicationActivationPolicyRegular"),
     ("NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY", "NSApplicationActivationPolicyAccessory"),
     ("NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED", "NSApplicationActivationPolicyProhibited"),
-    // ---- W12, app.rs's swizzled -sendEvent: ----
+    // ---- app.rs's swizzled -sendEvent: ----
     //
     // The eleven `NSEventType` enumerators the fork matches on. `objc2-app-kit`
     // generated them as a Rust `enum`; the numbering is NOT dense across the
@@ -155,7 +138,7 @@ fn seam() -> PathBuf {
 /// `(name, literal)` for every `const` in the seam, at any visibility.
 ///
 /// The visibility grammar is `sdk_consts::strip_const_decl`'s, shared with
-/// `gui_appkit_constants.rs` — it is this file's fourteenth-pass finding, and
+/// `gui_appkit_constants.rs`;
 /// `sdk_consts::the_parser_reads_every_visibility_spelling` pins it.
 fn seam_constants() -> Vec<(String, String)> {
     let src = std::fs::read_to_string(seam()).expect("the seam is readable");

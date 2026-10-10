@@ -88,27 +88,8 @@ impl Grid {
         for i in 0..ring_scrollback {
             let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
             let row = &self.storage.rows[i];
-            // A row whose logical line continues (its successor, the next ring
-            // row or the first visible row, is a wrap continuation) was filled
-            // to its last column by autowrap, so its trailing blanks are
-            // content: materialize the full width, or a width sweep erodes one
-            // space per chunk boundary. Except when the continuation opens with
-            // a wide cell: a wide char that cannot start at the last column
-            // wraps early, leaving that cell unwritten.
-            let successor = self.storage.rows.get(i + 1);
-            let len = if row.line_size() == super::LineSize::SingleWidth
-                && successor.is_some_and(super::Row::is_wrapped)
-            {
-                // Autowrap filled this row, so its trailing blanks are content.
-                // A successor opening wide means exactly one cell (the
-                // early-wrap hole) was never written.
-                let hole = successor
-                    .and_then(|r| r.as_slice().first())
-                    .is_some_and(super::Cell::is_wide);
-                row.cols() - u16::from(hole)
-            } else {
-                row.len()
-            };
+            // The successor is the next ring row or the first visible row.
+            let len = history_row_len(row, self.storage.rows.get(i + 1));
             lines.push(Self::row_to_line_with_stored_extras_at_len(
                 row, extras, len,
             ));
@@ -237,6 +218,8 @@ impl Grid {
         // rebuild. As with the Kitty unscroll (`scroll_unscroll.rs`), a spurious
         // rebuild is harmless and a missed one is silently wrong.
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
+        // A bulk re-entry into the ring (and, detached, the staged rows).
+        self.enforce_history_link_budget();
     }
 
     /// Build a single scrollback [`Row`](crate::Row) plus its preserved extras
@@ -251,6 +234,26 @@ impl Grid {
         let mut row = unsafe { crate::Row::new(new_cols, &mut self.storage.pages) };
         let extras = super::scroll_fill::fill_row_into(&mut row, line, new_cols, self.styles());
         (row, extras)
+    }
+}
+
+/// How many cells of a history row (one leaving the grid as a [`Line`]) are
+/// its logical line's content.
+///
+/// A row whose logical line continues (its successor is a wrap continuation)
+/// was filled to its last column by autowrap, so its trailing blanks are
+/// content: it is read at its full width, or a width sweep erodes one space per
+/// chunk boundary. Only a recorded early-wrap hole is left out
+/// ([`Row::continued_len`](crate::Row::continued_len)): a successor that opens
+/// with a wide glyph says nothing about the last cell, which may hold a space
+/// or a glyph the program wrote there. Any other row is read to its length.
+pub(super) fn history_row_len(row: &crate::Row, successor: Option<&crate::Row>) -> u16 {
+    if row.line_size() == super::LineSize::SingleWidth
+        && successor.is_some_and(crate::Row::is_wrapped)
+    {
+        row.continued_len()
+    } else {
+        row.len()
     }
 }
 

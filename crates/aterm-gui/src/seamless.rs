@@ -1514,20 +1514,24 @@ fn checkpoint_meta_bound_violation(meta: &CheckpointMeta) -> Option<MetaBoundVio
     // THE DECSC SLOTS ARE BOUNDED BY THE PROTOCOL, NOT BY THE GRID. A saved
     // cursor is absolute coordinates that nothing reads until DECRC or a 1049
     // exit, and those clamp to the grid AT THAT MOMENT (`Grid::set_cursor`;
-    // xterm's `CursorRestore` likewise, over a `sc->row` its `ScreenResize`
-    // never touched). `Terminal::resize` therefore leaves `cursor_save` alone,
-    // so after a shrink an honest slot names a row the grid no longer has —
-    // and if the grid grows back before the slot is read, the cursor lands on
-    // its original row, which is the behaviour a restored engine must keep.
+    // xterm's `CursorRestore` likewise). `Terminal::resize` moves a slot only
+    // with its text (the demote, the reveal, the rewrap: xterm's
+    // `AdjustSavedCursor`, `Grid::lend_saved_cursor`), so after a shrink that
+    // trimmed the blank row it was on an honest slot names a row the grid no
+    // longer has — and if the grid grows back before the slot is read, the
+    // cursor lands on that row, which is the behaviour a restored engine must
+    // keep.
     //
     // Bounding the slot at `rows`/`cols` here is what refused every automatic
     // self-update from v0.87.0 through v0.90.0 on the owner's daily driver
     // (2026-09-22): the "update staged" bar takes one chrome row, every 56-row
     // session was 55 rows at the park, and the Claude Code tab's slot — saved
-    // by 1049 from a prompt on row 55 — read `55 >= 55`. Clamping the slot at
-    // capture instead was measured lossy (the successor grows back to 56 rows
-    // seconds later and its 1049 exit then landed one row above the live
-    // engine's), so the bound is the engine's own ceiling: a row the slot could
+    // by 1049 from a prompt on row 55 — read `55 >= 55` (the slot now follows
+    // the prompt up the demoted row, but a trimmed-row slot is still past the
+    // grid). Clamping the slot at capture instead was measured lossy (the
+    // successor grew back to 56 rows seconds later and its 1049 exit landed one
+    // row off the text it was saved on), so the bound is the engine's own
+    // ceiling: a row the slot could
     // only carry if it were forged. The restore path indexes nothing with it
     // (`SavedCursorRepr::into_saved` builds a bare `Cursor`), so the ceiling is
     // a sanity bound, not a memory bound.

@@ -12,14 +12,6 @@
 //! Tier 0 here says the description holds over its whole bounded space, and only
 //! a Tier-1 bind in the code's own tests (`align`'s, for the worker lifecycle)
 //! makes it a statement about the program that compiled.
-//!
-//! The ledger ring (`HarnessLedgerRing`, §11 item 5) and the grid spine's turn
-//! machine (`HarnessTurnObservation`, §4.2/§5.8.1) were modelled here too.
-//! Their subsystems, `harness::ring` and `harness::observe`, were deleted with
-//! the second harness stack on 2026-09-23, and a model of code that no longer
-//! exists proves nothing about anything; they went in the same change. The
-//! limit-recovery ladder's model (`HarnessFailureRecovery`, §11 item 7) followed
-//! on 2026-09-25, when the ladder itself was deleted from `harness::limits`.
 
 use super::*;
 
@@ -28,7 +20,7 @@ use super::*;
 /// returns after the reader and writer workers have both finished or been
 /// cancelled and joined. Tier-1 runs the real `align::capture_bounded` with
 /// escaped descendants and observes both worker completions at return.
-/// `Buggy=1` recovers the historical early-return shape: child exit alone is
+/// `Buggy=1` is the early-return shape: child exit alone is
 /// treated as enough, leaking a worker past the caller's deadline.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -84,7 +76,7 @@ pub fn harness_capture_worker_lifecycle_model() -> Model {
 /// writer locks reveal. A BACKGROUND TERMINAL a finished turn left running
 /// (`terminal`: a unified-exec process in a session of its own under the
 /// daemon) runs there too, its thread idle, and dies with the restart
-/// (measured, review of 2026-09-26). The owner's `--skip`/`--defer` on a tab
+/// (measured). The owner's `--skip`/`--defer` on a tab
 /// whose conversation the daemon runs (`owner_held`) keeps that conversation
 /// where it is, and a Codex attached to the daemon that the sweep does not
 /// list (`unseen`: another aterm instance, a pane, an unreadable TUI) was
@@ -185,12 +177,11 @@ pub fn harness_codex_daemon_update_model() -> Model {
     }
 }
 
-/// THE LIVE UPGRADE'S LADDER (the owner's decision of 2026-09-28, after a
-/// Codex upgrade sat behind in tab 1 for ten hours and the owner asked "do I
-/// need to do something? … I want upgrades to be applied automatically"):
-/// "Time ladder — prefer a natural pause; the longer it has been behind, the
-/// less it waits: after 20 min a pause that only looks quiet counts, after 1 h
-/// 'you're at the tab' means only that you typed in the last 20 s, and by
+/// THE LIVE UPGRADE'S LADDER (the owner's decision, after a Codex upgrade sat
+/// behind for ten hours): "Time ladder — prefer a natural pause; the longer
+/// it has been behind, the less it waits: after 20 min a pause that only
+/// looks quiet counts, after 1 h 'you're at the tab' means only that you
+/// typed in the last 20 s, and by
 /// about 2 h it moves at the first such pause. It never types over a draft, a
 /// dialog or running work." `aterm_agent::harness::upgrade::gate` and
 /// `upgrade::rung`, `upgrade_drive::St::still`, `upgrade_codex::daemon_turn`
@@ -220,9 +211,7 @@ pub fn harness_codex_daemon_update_model() -> Model {
 /// 20 s of it is another session's, and holds nothing more. What the lane
 /// can NEVER place holds it for as long as it runs (`work` 2, `HiddenStarts`):
 /// a SUBAGENT's turn — its turns draw on no main screen, its own
-/// conversation's included; the third review of 2026-09-28 found three
-/// subagents of the owner's tab's own conversation on its daemon, running on
-/// their own after their spawn — whether the kernel names this client's
+/// conversation's included — whether the kernel names this client's
 /// conversation (then it IS this client's) or not; and a root's with this
 /// client the daemon's only Codex (a thread no tab shows — or this client's
 /// own conversation while its screen shows another thread, a subagent's or
@@ -232,7 +221,7 @@ pub fn harness_codex_daemon_update_model() -> Model {
 /// under a GOAL this screen's footer shows (`goal`: `Pursuing goal (…)`), a
 /// turn of this client's own may run where the screen reads idle — the goal's
 /// next turn streams under the last turn's end row with no status row, the
-/// last words standing (measured 2026-09-28, `GOAL_NEXT_TURN_0_158`) — so
+/// last words standing (measured, `GOAL_NEXT_TURN_0_158`) — so
 /// such a turn (`TurnStarts` under `goal`) keeps the still run going and the
 /// looks reading it, and the lane places NOTHING under a goal (`other_seen`
 /// counts no look there). `Move`'s own-work clause is the real rule as it
@@ -261,21 +250,16 @@ pub fn harness_codex_daemon_update_model() -> Model {
 /// SAFETY, each with its `Buggy` member (the ratchet's non-vacuity, and each
 /// dead action caught ALONE — `verify::audit_dead_negative_controls`):
 /// `NeverOverADraft` (`MoveOverADraft`), `NeverOverABox` (`MoveOverABox`),
-/// `NeverWithinKeysGap` (`NowWaivesThePerson`: the owner's `--now` as it was
-/// until 2026-09-28, which waived the person outright), and
+/// `NeverWithinKeysGap` (`NowWaivesThePerson`: a `--now` that waives the
+/// person outright), and
 /// `NoRunningWorkInterrupted` (`MoveMidTurn`: a daemon-mode client ended while
 /// its own thread runs a turn — the report's proposed repaint-proof move;
 /// Codex 0.158.0's binary holds `Disconnected from this task. The current
 /// turn was stopped.` for some case of an `/exit`, unmeasured which; and
-/// `PlacedUnderAGoal`: the still run placing this client's own goal turn —
-/// the second review of 2026-09-28, which drove the incident's goal looks
-/// with one more thread on the daemon through that rule, and it typed
-/// `/exit` at 06:12:42Z, mid-goal; and `PlacedAsItRan`: the still run
-/// placing whatever ran through two of its looks — a subagent of this
-/// client's own conversation, another's subagent, a root with no other Codex
-/// attached — the third review of 2026-09-28, whose probe drove the owner's
-/// shape, one conversation and its subagents under one TUI, through that
-/// rule, and it typed `/exit` while a subagent of the tab's own ran) — the
+/// `PlacedUnderAGoal`: the still run placing this client's own goal turn,
+/// typing `/exit` mid-goal; and `PlacedAsItRan`: the still run placing
+/// whatever ran through two of its looks — a subagent of this client's own
+/// conversation, another's subagent, a root with no other Codex attached) — the
 /// moves record what stood when they were taken (`at_*`).
 /// `QuietPauseCounts`
 /// (`SeqSettle`): a look at a pause the ladder counts from Settled never waits
@@ -285,12 +269,11 @@ pub fn harness_codex_daemon_update_model() -> Model {
 /// `TheGraceNarrowsAtKeysOnly` (`AttendedWithoutLadder`: a pause from
 /// KeysOnly on, nothing standing but a person merely near the tab, waited
 /// on), `EitherMarkIsRead` (`BlindReader`: an idle `»` screen not read),
-/// `AnotherSessionsTurnHoldsNothing` (`OtherTurnHolds`: this branch's first
-/// cut, which held an idle client for every thread of its daemon — another
-/// tab's goal included, placed or not — deciding so where no goal shows here)
-/// and `AnUnpinnedDaemonKeepsItsTabDue` (`PinDropsDue`:
-/// this branch's first cut again, which let a current client on an unpinned
-/// daemon go, so nothing in the window pinned it). Each mutant fires only
+/// `AnotherSessionsTurnHoldsNothing` (`OtherTurnHolds`: an idle client held
+/// for every thread of its daemon — another tab's goal included, placed or
+/// not — deciding so where no goal shows here) and
+/// `AnUnpinnedDaemonKeepsItsTabDue` (`PinDropsDue`: a current client on an
+/// unpinned daemon let go, so nothing in the window pins it). Each mutant fires only
 /// from a state no mutant has touched (`slipped`): one slip per behaviour —
 /// what "caught ALONE" asks — which also keeps the `Buggy = 1` space inside
 /// the interpreter's budget (`non_vacuity_ratchet`'s
@@ -349,8 +332,7 @@ pub fn harness_upgrade_ladder_model() -> Model {
                 work = 0;
             }
             // A turn the lane can NEVER place: a SUBAGENT's — one this
-            // client's conversation spawned (the owner's daemon, 2026-09-28:
-            // three of them, their turns begun after the spawn), or another
+            // client's conversation spawned, or another
             // conversation's — or a root's with this client the daemon's only
             // Codex. It never draws on this screen, which reads idle at the
             // same words look after look: nothing of it moves. Before the
@@ -492,8 +474,8 @@ pub fn harness_upgrade_ladder_model() -> Model {
                 slipped = 1;
                 reads = 0;
             }
-            // Every thread of the daemon holds the client (this branch's first
-            // cut), deciding so at an idle client whose screen has placed
+            // Every thread of the daemon holds the client, deciding so at an
+            // idle client whose screen has placed
             // another session's running turn.
             action OtherTurnHolds when (
                 Buggy == 1 && slipped == 0 &&
@@ -503,15 +485,15 @@ pub fn harness_upgrade_ladder_model() -> Model {
                 slipped = 1;
                 scoped = 0;
             }
-            // A current client on an unpinned daemon let go (this branch's
-            // first cut): nothing in the window pins that daemon.
+            // A current client on an unpinned daemon let go: nothing in the
+            // window pins that daemon.
             action PinDropsDue when (
                 Buggy == 1 && slipped == 0 && kept == 1 && behind == 0 && pinned == 0
             ) {
                 slipped = 1;
                 kept = 0;
             }
-            // The owner's `--now` as it was: the person waived outright.
+            // A `--now` that waives the person outright.
             action NowWaivesThePerson when (
                 Buggy == 1 && slipped == 0 &&
                 behind == 1 && work == 0 && draft == 0 && dialog == 0 &&
@@ -562,8 +544,7 @@ pub fn harness_upgrade_ladder_model() -> Model {
                 at_keys = keys;
                 at_work = work;
             }
-            // The still run placing through a goal (the round before the
-            // second review of 2026-09-28): the goal's own hidden turn ran
+            // The still run placing through a goal: the goal's own hidden turn ran
             // through two looks of this screen's run, as another session's
             // would, and the client was ended mid-goal.
             action PlacedUnderAGoal when (
@@ -579,9 +560,8 @@ pub fn harness_upgrade_ladder_model() -> Model {
                 at_work = work;
             }
 
-            // The still run placing whatever ran through two of its looks (the
-            // round before the third review of 2026-09-28): a turn the lane
-            // can never place — a subagent of this client's own conversation,
+            // The still run placing whatever ran through two of its looks: a
+            // turn the lane can never place — a subagent of this client's own conversation,
             // whose turns never drew here, another's subagent, a root with no
             // other Codex attached — taken for another session's, and the
             // client ended over it. The model counts no looks of such a turn
@@ -616,8 +596,7 @@ pub fn harness_upgrade_ladder_model() -> Model {
 }
 
 /// "THE UPGRADE LANDS" — the ladder's law as a property of whole behaviours
-/// (the owner, 2026-09-28: "I want upgrades to be applied automatically"; the
-/// law of aterm's own update ladder: ACTIVITY DELAYS; IT NEVER DISABLES):
+/// (the law of aterm's own update ladder: ACTIVITY DELAYS; IT NEVER DISABLES):
 /// `[]<>(moved-and-pinned \/ a-floor-stands)` — again and again, the move is
 /// done and the daemon pinned (`behind = 0 /\ pinned = 1`); or, while the
 /// move is owed, one of the floors no rung relaxes stands: a turn running
@@ -639,9 +618,8 @@ pub fn harness_upgrade_ladder_model() -> Model {
 /// the world's, and any may go on for ever — a goal-mode Codex turn included,
 /// which is why a floor that keeps standing satisfies the goal (the upgrade
 /// does not move over this client's running work: a daemon-mode client in
-/// goal mode waits for its goal to pause, which the owner's decision of
-/// 2026-09-28 will let aterm do briefly itself — the named `goal` wait is
-/// that seam). What the verdict ASSUMES, and nothing more:
+/// goal mode waits for its goal to pause; the named `goal` wait is the seam
+/// where aterm may pause it itself). What the verdict ASSUMES, and nothing more:
 ///
 /// * `Advance`, weakly fair — the wall clock moves;
 /// * `Look`, weakly fair — the lane keeps looking at an idle screen it can
@@ -703,12 +681,11 @@ pub fn harness_upgrade_ladder_liveness() -> Liveness {
 /// session-file scan. The process-start token represents the kernel PID-reuse
 /// guard.
 ///
-/// AND A NOTICE WHOSE PROCESS IS GONE HOLDS NOTHING FOR EVER (2026-09-27).
-/// Before this, an announced upgrade whose notified process had exited or
-/// crashed without a relaunch waited on it for good once a person resumed the
-/// conversation by hand, in the same tab or another: every visit said
-/// `wait:notice-owned-by-other-process` before any step, and the owner's
-/// `--now` could not move it. Once the kernel proves that process gone (its
+/// AND A NOTICE WHOSE PROCESS IS GONE HOLDS NOTHING FOR EVER. Without this,
+/// an announced upgrade whose notified process exited without a relaunch
+/// waits on it for good once a person resumes the conversation by hand
+/// (`wait:notice-owned-by-other-process` at every visit, `--now` included).
+/// Once the kernel proves that process gone (its
 /// pid names no process, or another one: `gone`), the live process holding the
 /// conversation, which was never asked, is ASKED AFRESH (`Reask`). The upgrade
 /// is pending again in a NEW ROUND: the round's markers are forgotten and the
@@ -731,14 +708,14 @@ pub fn harness_upgrade_ladder_liveness() -> Liveness {
 /// Properties: `OnlyIssuerSignaled`, `NoDuplicateOwnerSignal`,
 /// `NoPartialScanSignal`; `OnlyOnItsOwnAnswer`, meaning a restart acts only on
 /// a READY to a notice typed to the process it signals; and
-/// `NeverWaitsOnAGoneNotice`. ONE KNOB PER DEFECT: `NoReask` is the reducer
-/// before this fix, which never asks afresh (the re-arm after a rest reaches
+/// `NeverWaitsOnAGoneNotice`. ONE KNOB PER DEFECT: `NoReask` is a reducer
+/// that never asks afresh (the re-arm after a rest reaches
 /// only a stopped round, never an announced one waiting on a gone notice).
 /// `KeepRound` is the tempting wrong fix,
 /// which asks afresh but keeps the round, so the gone process's READY answers
-/// the new notice's marker. `Buggy=1` is the reducers before the fix at once:
-/// the old conversation-keyed one, which accepts READY in another tab or after
-/// a partial scan, and main's, which never asks afresh. Outside the model: the
+/// the new notice's marker. `Buggy=1` is both broken reducers at once: a
+/// conversation-keyed one, which accepts READY in another tab or after a
+/// partial scan, and one that never asks afresh. Outside the model: the
 /// release a gone process was owed, which nothing can type to it
 /// (`upgrade_drive::St::notice_gone` drops it and the ledger says so). Tier-0
 /// is aterm-spec's `derived_harness_upgrade_notice_owner`; Tier-1 is
@@ -893,19 +870,17 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
 /// - `NoSilentWait`, about the agent's own work: it is waited for and never
 ///   ended, but once the re-ask clock has run out only a PERSON makes the
 ///   upgrade wait without a word. Otherwise it asks again, naming what runs,
-///   or gives up (`silent`). That is the tab of 2026-09-26: an old Claude Code
-///   sat four days behind two poll loops that could never end, told once and
-///   never again.
+///   or gives up (`silent`): an old Claude Code once sat four days behind two
+///   poll loops that could never end, told once and never again.
 /// - `NeverEndsRunningWork`: aterm never ends the agent while its own work
 ///   runs, at a break, or on a status of Claude's own that is not `idle`
 ///   (`cut`).
 /// - `NoHastySupersede`: a READY answer gets a whole bound of its own before
-///   work it outlives supersedes it, by a re-ask or a give-up (`hasty`). The
-///   review of 2026-09-26 found that a notice's clock alone gave up on a READY
-///   answered seconds before.
+///   work it outlives supersedes it, by a re-ask or a give-up (`hasty`), never
+///   on the notice's clock alone.
 ///
-/// CLAUDE'S OWN STATUS LAGGING AN IDLE SCREEN (`lag`, the review of
-/// 2026-09-27): `busy` or `shell` standing over a screen the session's own
+/// CLAUDE'S OWN STATUS LAGGING AN IDLE SCREEN (`lag`): `busy` or `shell` standing over a
+/// screen the session's own
 /// reader read idle, looks in a row, with nothing under the agent the kernel
 /// can see. Work in the agent's own process — a background agent, a workflow
 /// — is no process under it, and that status is the one word that says it
@@ -1048,8 +1023,8 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// (`aterm_agent::harness::upgrade`, `next_step`, `gate_announce`,
 /// `clock_held`, `gate_release`, `transcript_has_ready`,
 /// `directed_since_ready`, and the driver's record transitions). The
-/// incident it is written for (2026-09-25/26, tab `s-d3346b29dd236432b852`):
-/// Claude Code parked the session at its weekly usage limit (`⚠ Usage limit
+/// incident it is written for: Claude Code parked the session at its weekly usage limit
+/// (`⚠ Usage limit
 /// reached · continuing automatically at 6am`), which reads idle to the
 /// gates; the upgrade typed four notices into it half an hour apart, gave up
 /// two hours later, and at 06:00 all four were delivered at once — the agent
@@ -1065,8 +1040,8 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// `unread`: a notice typed while limited sits queued, read when the limit
 /// resets. `holding`: the agent read a notice and stopped for the restart;
 /// `ready`: its last word is READY to a marker the record still keeps
-/// (`live`). `owed`: one release line is owed. THE CONVERSATION (the second
-/// review of 2026-09-26): `told`, someone directed the agent — a person, a
+/// (`live`). `owed`: one release line is owed. THE CONVERSATION: `told`, someone
+/// directed the agent — a person, a
 /// peer, the supervisor — since its latest READY or the latest notice, and
 /// it has not answered yet; `directed`, it answered such a direction and took
 /// it up. Four ghosts: `blind`, a notice was typed while limited; `stuck`, the
@@ -1076,13 +1051,13 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// dropped while the agent held for the restart.
 ///
 /// THE AGENT'S OWN WORK UNDER A READY (composed with the drain bound's
-/// re-ask, `HarnessUpgradeDrainBound`, 2026-09-27): past the bound an
+/// re-ask, `HarnessUpgradeDrainBound`): past the bound an
 /// announced upgrade asks again (`Supersede`) — or, its asks spent, gives up
 /// over the answer (`GiveUpOutlived`) — and a gave-up one voids it (`Void`),
 /// owing the release. A person's hold voids in either phase. Both are the
 /// environment's holds; Tier-1 checks each where the model allows it.
 ///
-/// A BREAK THAT MAY NEVER END (`brk`, 2026-09-27): the agent's turn is over
+/// A BREAK THAT MAY NEVER END (`brk`): the agent's turn is over
 /// and only work it started runs — two widowed `tail -f` shells under a
 /// Claude Code whose status read `shell`, every screen a break and no idle
 /// point for as long as they lived. The environment enters a break and may
@@ -1096,8 +1071,8 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// an idle point, so a give-up at a break that never ends left the agent
 /// holding.
 ///
-/// `Look` is DERIVED FROM THE REDUCER'S OWN GUARDS (the review of
-/// 2026-09-26): enabled exactly where neither `Restart` nor `Release` nor
+/// `Look` is DERIVED FROM THE REDUCER'S OWN GUARDS: enabled exactly where neither
+/// `Restart` nor `Release` nor
 /// `DropRelease` is — the guards spelled again inside it (the release's
 /// point, typed or dropped, is one term: the two split it by the direction),
 /// which the Tier-0 test checks state by state. The hand-written clauses it
@@ -1105,11 +1080,9 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// what was to be proved: with F2 reverted, or the release never typed, or
 /// both, `NeverStranded` still held.
 ///
-/// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
-/// upgrades stalled" — tab `s-d3346b29dd236432b852` sat `failed:unanswered`
-/// for 1d22h, its late READY voided under the background gate it always
-/// runs, and `Phase::Failed(_) => Wait("failed")` was terminal for the
-/// target). `rest`: the stopped round (gave up, or stopped otherwise) has
+/// NO STOP IS FOR GOOD (a tab once sat `failed:unanswered` for 1d22h, its
+/// late READY voided under the background gate, `Phase::Failed(_) =>
+/// Wait("failed")` terminal). `rest`: the stopped round (gave up, or stopped otherwise) has
 /// rested the real `RETRY_S` — the environment's clock (`Rests`), begun again
 /// by every stop and by the void of a gave-up round's late READY, and not
 /// held at a limit (the round it starts types nothing there). `Rearm`: the
@@ -1119,7 +1092,7 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// owed is carried: typed, or dropped, until the round's rest runs out — at
 /// a break too — and past it the new round's first notice, also a break's,
 /// supersedes it. The last
-/// word (`Look`) is now the upgrade's QUIET word — nothing it would do for
+/// word (`Look`) is the upgrade's QUIET word — nothing it would do for
 /// the agent at this look: a stopped round's `wait:failed` while it rests,
 /// which the host looks at again, is one. A fifth ghost, `stalled`: the quiet
 /// word said at a stopped round whose rest has run out — a permanent wait.
@@ -1142,23 +1115,21 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// stopped round whose rest has run out always has a new round (or its late
 /// READY's restart) enabled, so the quiet word is never said past it. ONE
 /// KNOB PER DEFECT, each caught on its own: `Terminal` (a stopped round is
-/// for good: no `Rearm`, today's terminal `failed`), `NoF1` (notices and
+/// for good: no `Rearm`, a terminal `failed`), `NoF1` (notices and
 /// the clock at a limit), `NoF2` (a gave-up upgrade deaf to a late READY),
 /// `NoOwe` (nothing abandoned owes a release), `NoType` (a release owed,
 /// never typed), `KeepReady` (a stop keeps the round's markers, and the
-/// release waits on a READY no phase acts on — the review's first blocker),
-/// `LastWhileOwed` (a stop's own word is the host's last, with a release
-/// still owed — its second), `StaleDirection` (a direction the agent
-/// answered with READY still counts, and drops the release its void owes —
-/// the second review's blocker), `UnansweredDirection` (a direction counts
+/// release waits on a READY no phase acts on), `LastWhileOwed` (a stop's own
+/// word is the host's last, with a release still owed), `StaleDirection` (a
+/// direction the agent answered with READY still counts, and drops the
+/// release its void owes), `UnansweredDirection` (a direction counts
 /// before the agent answers it, and a look mid-turn drops the release the
 /// READY it then gives needed), `ReadyOverDirection` (a READY stays the last
 /// word past a direction the agent never answered — an Esc, a message met by
 /// a `<synthetic>` row), `IdleOnlyRelease` (the release and a gave-up
-/// upgrade's void only at an idle point, never at a break — the
-/// 2026-09-27 incident). `Buggy = 1` is the reducer before the fix, the
-/// incident's three at once (`NoF1`, `NoF2`, `NoOwe`), and the terminal
-/// `failed` of 2026-09-27 (`Terminal`). Tier-1 in
+/// upgrade's void only at an idle point, never at a break). `Buggy = 1` is
+/// the incident's three at once (`NoF1`, `NoF2`, `NoOwe`) and the terminal
+/// `failed` (`Terminal`). Tier-1 in
 /// aterm-agent's `harness::upgrade_drive` tests drives the real reducer,
 /// gates, record transitions, transcript readers and the host's reading of
 /// each step's word over every reachable state — a gave-up round's late
@@ -1305,7 +1276,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // the bound (the environment's hold, as `Void`'s is): an
             // announced upgrade asks again, naming what runs, and the new
             // notice supersedes the answer — its READY is no longer the last
-            // word after the latest notice (the four-day tab of 2026-09-26).
+            // word after the latest notice.
             action Supersede when (
                 ready == 1 && live == 1 && limited == 0 && phase == 1 &&
                 window == 1 && asks <= MaxAsks - 1
@@ -1448,7 +1419,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
 /// THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT (aterm-agent
 /// `harness/upgrade.rs`, `next_step` over `Facts::work_ended`;
 /// `harness/upgrade_drive.rs`, `St::work_seen`, `St::time_work` and the visit's
-/// same-visit re-arm). The incident (2026-09-28, s-692e6 "Free disk space"):
+/// same-visit re-arm). The incident:
 /// the agent answered every notice within seconds — "I can't stop yet, my
 /// workflow is still running; ask again later" — so the round asked four
 /// times at breaks of that work, gave up, rested two hours, re-armed and asked
@@ -1459,7 +1430,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
 /// point and a new multi-hour workflow began. The rest cycles only while the
 /// point the "not yet" waited for keeps going to the loop.
 ///
-/// AND NO WAIT THERE OUTLIVES THE RE-ASK'S WINDOW (the review of 2026-09-28):
+/// AND NO WAIT THERE OUTLIVES THE RE-ASK'S WINDOW:
 /// the ask at the end of the work goes once the RESTART's gate is open but for
 /// the READY, and that gate never reads past Claude's status — a `shell` or
 /// `busy` left over the idle screen after the agent's background shell ended
@@ -1489,8 +1460,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
 /// past its window waited the restart gate's word. DIALS, each caught alone:
 /// `Buggy = 1` every build before (the quiet word there, an ask anywhere, the
 /// wait past the window); `Nag = 1` an ask with no work seen since the notice;
-/// `Hold = 1` the wait at the end of the work holds past the window (the
-/// first build of the ask at the end of the work, before that review).
+/// `Hold = 1` the wait at the end of the work holds past the window.
 ///
 /// Tier-1: aterm-agent's `harness::upgrade` tests
 /// (`the_work_end_reducer_is_bound_to_its_model`) drive the real `next_step`
@@ -1623,8 +1593,8 @@ pub fn harness_upgrade_work_end_model() -> Model {
 /// `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the
 /// driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`:
 /// `decide_turn_end`'s auth arm and its login hold; both over `aterm_phase`'s
-/// wall reader). The incident it is written for (2026-09-27, tab
-/// `s-b5cf2faabac5ce5127bd`, Claude Code 2.1.281): the login expired, and
+/// wall reader). The incident it is written for (Claude Code 2.1.281): the
+/// login expired, and
 /// every turn after it ended in milliseconds on Claude Code's synthetic
 /// `authentication_failed` row, drawn `⏺ Login expired · Please run
 /// /login`, which the reader read as idle with no wall. The supervisor typed
@@ -1667,7 +1637,7 @@ pub fn harness_upgrade_work_end_model() -> Model {
 /// given up on), `ClockAtWall` (the re-ask window runs at the wall and the
 /// lift does not start it again), `NoSee` (the supervisor's reader misses the
 /// wall), `NoHold` (a lost login is continued once its row leaves the
-/// screen). `Buggy = 1` is 0.93.0 and main before the fix, all five at once:
+/// screen). `Buggy = 1` is all five at once:
 /// the incident — notices typed into the wall and spent into a give-up, the
 /// supervisor's continuations into it, nobody told. Tier-0 in aterm-spec's
 /// `derived_harness_login_wall`; Tier-1 in aterm-agent's
@@ -1846,8 +1816,7 @@ pub fn harness_login_wall_model() -> Model {
 /// `notice_scan`, `queued_until`, `queued_copies`, `Scan::rests_until`,
 /// `queue_rest`, `transcript_limit_until`, `next_step`, `requested_step`,
 /// `announce_asks`, `clock_held`; the driver's `queue_facts`). The incident it
-/// is written for (the owner's report of 2026-09-27, tab
-/// `s-c543f4e0edd3439e5791`, Claude Code 2.1.280): the session stood at its
+/// is written for (Claude Code 2.1.280): the session stood at its
 /// weekly limit; the upgrade typed four notices half an hour apart — each
 /// answered within two seconds by Claude Code's `You've hit your weekly limit`
 /// row, and each read as ASKED, the limit's banner no longer on the screen —
@@ -1884,9 +1853,9 @@ pub fn harness_login_wall_model() -> Model {
 /// `RetypeMax` (the real `REQUEUE_MAX`) notices wait untaken; into a full
 /// queue only once it has RESTED (`Rests`, the passing of the real
 /// `queue_rest`) — one copy per rest, never the half-hourly pile — and the
-/// rest GROWS with every copy unread (the owner, 2026-09-27: a limit that
-/// names no reset and lasts for days still added a copy every two and a half
-/// hours, about ten a day): shorter than a day for the first `Daily` (the
+/// rest GROWS with every copy unread (a fixed rest under a limit that names
+/// no reset and lasts for days still adds about ten copies a day): shorter than a day
+/// for the first `Daily` (the
 /// real `QUEUE_REST_DOUBLINGS`: two, four, eight, sixteen hours), a day for
 /// every one after. `NowAsks` is the owner's `Upgrade now` on a full queue:
 /// one copy more, the person asking — never while the limit shows on the
@@ -1920,15 +1889,13 @@ pub fn harness_login_wall_model() -> Model {
 /// ask again). ONE KNOB PER DEFECT, each caught on its own: `CountRetype` (a
 /// notice typed again spends an ask, and at the bound is given up on:
 /// `NoGiveUpUntaken`), `Unbounded` (a queued notice is typed again every time
-/// its limit is over by the transcript's word, full queue or not — this
-/// branch before the bound: `CopiesBounded`), `NoBound` (a queued notice
-/// holds the upgrade until the model takes it, whatever the transcript says
-/// — the first fix before its review, which left an idle session waiting for
-/// a person: `NeverStranded`), `ForGood` (a full queue waits for the model
-/// with no rest — b77f7c28e before its review: an idle session whose limit
-/// had long ended waited for good, and the owner was told it "moves once that
-/// ends": `NeverStranded`), `Flat` (every rest of a full queue as long as the
-/// first, whatever it holds unread — d5cc7f01c, a copy every two and a half
+/// its limit is over by the transcript's word, full queue or not:
+/// `CopiesBounded`), `NoBound` (a queued notice holds the upgrade until the
+/// model takes it, whatever the transcript says, leaving an idle session
+/// waiting for a person: `NeverStranded`), `ForGood` (a full queue waits for
+/// the model with no rest, so an idle session whose limit had long ended
+/// waits for good: `NeverStranded`), `Flat` (every rest of a full queue as
+/// long as the first, whatever it holds unread — a copy every two and a half
 /// hours for as long as the limit stands: `CopiesPerDayBounded`). `Buggy = 1`
 /// is a COMPOSITE of two builds, so that the ratchet, which walks `Buggy = 1`
 /// alone, sees every invariant caught: the owner's build (0.93.0, and main's
@@ -2521,7 +2488,7 @@ pub fn harness_model_priority_model() -> Model {
 /// (`aterm_agent::harness::upgrade_models::model_moves_now`; WHICH model is
 /// [`harness_model_priority_model`]'s).
 ///
-/// The incident (2026-09-25): a warm conversation on `claude-opus-5` was
+/// The incident: a warm conversation on `claude-opus-5` was
 /// restarted 2.1.282 -> 2.1.283 while the managed 2.1.283 offered
 /// `claude-opus-5-5`, and came back on Opus 5. The rule then took a due move
 /// only when the prompt cache was COLD — an hour without an answer — which a
@@ -2605,10 +2572,9 @@ pub fn harness_model_ladder_model() -> Model {
 /// remembers of it — the rule, the ladder, the announcement and the settle
 /// step as ONE lifecycle for one conversation.
 ///
-/// THE RULE it transcribes is `model_due` as it stands since the owner's
-/// decision of 2026-09-27, *"SAME FAMILY FIRST, THEN THE PRIORITY LIST"*,
-/// over the build's offer (`upgrade_models::offered`). On this projection its
-/// moves are the ones the list-only rule of 2026-09-24 made — Opus 5 moves to
+/// THE RULE it transcribes is `model_due`, *"SAME FAMILY FIRST, THEN THE
+/// PRIORITY LIST"*, over the build's offer (`upgrade_models::offered`). On
+/// this projection its moves are the ones a list-only rule makes — Opus 5 moves to
 /// Opus 5.5 by its own family's step, whoever chose it; Fable crosses to Opus
 /// 5.5 by the list's step, only when nobody chose it; nothing moves down,
 /// sideways, or off a model the list does not name — with ONE exception the
@@ -2639,7 +2605,7 @@ pub fn harness_model_ladder_model() -> Model {
 ///   recorded before the one act (`ModelRecord::asked`), taken back when that
 ///   act is never sent (`ModelRecord::take_back`, `Refused`), the model the
 ///   line asks for (`upgrade_models::line_model`: the site's own, else none
-///   kept of a `--model` the record marks FAILED, since 2026-10-01), and what
+///   kept of a `--model` the record marks FAILED), and what
 ///   the new process then runs (`live_model_at`: its launch flag until it
 ///   answers).
 ///
@@ -2659,8 +2625,8 @@ pub fn harness_model_ladder_model() -> Model {
 /// (`St::for_target` and the notice carrying `model_to` as `model_list`);
 /// `GiveUp` (`St::give_up`); the relaunch's ask of `st.model_list`, written
 /// right before its line is typed and taken back when the line is not
-/// (`relaunch::relaunch`, since 2026-10-02: no restart writes it before its
-/// signal), and the line itself (`relaunch::with_model`); `Refused`'s
+/// (`relaunch::relaunch`: no restart writes it before its signal), and the
+/// line itself (`relaunch::with_model`); `Refused`'s
 /// `St::unsent`; and
 /// which view (managed or native) `visit_models` and `riding_model_in` judge
 /// the session by, and the pre-filter's keep rule over two views — the model
@@ -2685,7 +2651,7 @@ pub fn harness_model_ladder_model() -> Model {
 /// `flag` = what this harness's relaunches left on the process's line: `0`
 /// nothing (the launch's own flags), `1` its `--model claude-opus-5-5`, `2` no
 /// `--model` at all — a relaunch asking none dropped that ask once the record
-/// marked it FAILED (2026-10-01), the person's flag long replaced;
+/// marked it FAILED, the person's flag long replaced;
 /// `PersonFlag` = before that it was launched with a
 /// person's own `--model`: `1` an id (`claude-fable-5-1` in the model), `2` a
 /// family ALIAS (`fable`, `opus`: `model-alias`, see above); `DefaultFable` =
@@ -2705,11 +2671,11 @@ pub fn harness_model_ladder_model() -> Model {
 /// space stays the healthy one plus the forged states). The first three are
 /// stated over the rule's verdict (`due`), the visit's decision (`mto`) and
 /// THE RIDE — the model a restart of the round asks for, announced or after a
-/// give-up (`phase > 0 && ann == 1`), held to them since 2026-10-01 over what
+/// give-up (`phase > 0 && ann == 1`), held to them over what
 /// the visit could read (its target fixed by the notice, so the offer is not
 /// re-read; a model the visit could not read bars nothing the record does
 /// not). Each law carries a `Judge*` mutant (the rule) and a `Ride*` one (the
-/// ride unguarded, the code before 2026-10-01):
+/// ride unguarded):
 ///
 /// * `UpTheListOnly` — the verdict, the decision and the ride go only UP the
 ///   list: never down, never sideways, never off a model the list does not
@@ -2738,7 +2704,7 @@ pub fn harness_model_ladder_model() -> Model {
 ///   MODEL LADDER says (a cold cache, a restart happening anyway, or the warm
 ///   wait over). Mutant `LadderWaitsForCold`: the rule before `2d4656f32`,
 ///   which moved only on a cold cache, so an active session never moved (the
-///   2026-09-25 incident: a restart onto 2.1.283 kept `claude-opus-5`).
+///   incident: a restart onto 2.1.283 kept `claude-opus-5`).
 /// * `AnnouncedModelRides` — once announced, the model is the one the
 ///   relaunch asks for, even after the READY answer re-warms the cache.
 ///   Mutant `LadderRetakenAfterReady`: the decision re-taken at every visit,
@@ -2749,29 +2715,26 @@ pub fn harness_model_ladder_model() -> Model {
 ///   the same model is asked for again) and `SettleNeverVerifies` (never
 ///   applied, so a person who moves off it by hand is moved back).
 /// * `AppliedAskStands` — an ask once applied is never recorded failed: it
-///   ran. Mutant `SettleFailsAnAskThatRan`: the settle step before
-///   2026-09-27, whose failed arm did not read `applied`, so a person's later
+///   ran. Mutant `SettleFailsAnAskThatRan`: a settle step whose failed arm
+///   does not read `applied`, so a person's later
 ///   `/model` turned a verified ask into a `model-failed` one and the
 ///   harness's own `--model` then read as a person's.
 /// * `AskedOnlyByARelaunch` — an ask on the record is one a relaunch's line
 ///   carried (the harness's `--model`, `flag`). Mutant `RefusedKeepsTheAsk`:
-///   the refusal before 2026-10-01 (review of the ride's guard), which kept
-///   the ask written before a signal that was never sent, so it settled as
-///   FAILED though no relaunch ran — the model barred for good, and from the
-///   round whose READY the refusal left standing. (The restart in place's
-///   refusal and a line never typed after a signal kept it too, until
-///   2026-10-02: the ask is now the line's own.)
+///   a refusal that keeps the ask written before a signal that was never
+///   sent, so it settles as FAILED though no relaunch ran — the model barred
+///   for good, and from the round whose READY the refusal left standing.
 /// * `NeverRelaunchedOntoAFailedModel` — a model recorded FAILED is never what
 ///   a relaunch starts the conversation on: here `live` reads
 ///   `claude-opus-5-5` only off a line that names it. Mutant
-///   `RelaunchKeepsAFailedFlag`: the line before 2026-10-01, which, asking no
+///   `RelaunchKeepsAFailedFlag`: a line which, asking no
 ///   model of its own (the upgrade's build restart, a restart in place or on
 ///   exit with nothing riding), kept the launch's `--model` verbatim
 ///   (`relaunch::with_model` with `None`) — this harness's own ask the record
 ///   had marked FAILED included, so the relaunch asked for it again.
 ///
-/// FIXED 2026-10-01 — the ride's exemption was a gap in the CODE (skeptic
-/// review, 2026-09-27): an announced model rode whatever the visit decided,
+/// THE RIDE'S GUARD — an unguarded ride is a gap in the CODE: an announced
+/// model rode whatever the visit decided,
 /// and a gave-up upgrade's late READY relaunched with the `model_list` its
 /// notice carried, so the relaunch asked for `claude-opus-5-5` (a) after it
 /// was recorded FAILED, (b) over a person's `/model claude-fable-5-1` typed
@@ -2780,7 +2743,7 @@ pub fn harness_model_ladder_model() -> Model {
 /// `Visit`'s ride branch), and `aterm-spec`'s
 /// `derived_harness_model_switch_ride_keeps_the_move_laws` proves none of
 /// (a)–(c) reachable, each still reached through its `Ride*` mutant. Gap (a)
-/// had a second road, THE LINE (review of 2026-10-01): a relaunch asking no
+/// had a second road, THE LINE: a relaunch asking no
 /// model kept the launch's `--model`, so a harness ask recorded FAILED rode
 /// every later restart of the process it started on (the `Relaunch`'s and,
 /// added for it, `Restart`'s effect, `flag == 1` running it). Closed by
@@ -2987,7 +2950,7 @@ pub fn harness_model_switch_model() -> Model {
             // gave up: the ask recorded, the agent ended, the relaunch runs
             // what its line asks — the notice's model, else the launch flag it
             // kept (never the harness's own ask recorded FAILED, which it
-            // drops: `line_model`, 2026-10-01), else what the transcript last
+            // drops: `line_model`), else what the transcript last
             // named. There is a restart to make only while a build is due or
             // this visit moves the model.
             action Relaunch when (forged == 0 && fresh == 1 && phase > 0 && (Build == 1 || mto == 1)) {
@@ -3028,8 +2991,7 @@ pub fn harness_model_switch_model() -> Model {
             // The signal refused: nothing relaunched, the phase as it was
             // (`St::unsent`), and no ask stands — an ask is written only
             // right before the relaunch line that carries it is typed, and
-            // TAKEN BACK when that line is not (`ModelRecord::take_back`,
-            // 2026-10-01; the line's own since 2026-10-02).
+            // TAKEN BACK when that line is not (`ModelRecord::take_back`).
             action Refused when (
                 forged == 0 && fresh == 1 && phase > 0 && ann == 1 && (Build == 1 || mto == 1)
             ) {
@@ -3109,9 +3071,8 @@ pub fn harness_model_switch_model() -> Model {
                 fresh = if Buggy == 1 { 1 } else { fresh };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
-            // THE RIDE UNGUARDED, one law at a time (the code before
-            // 2026-10-01, which carried a notice's model whatever the visit
-            // decided): the visit from a state where the guard bars the ride,
+            // THE RIDE UNGUARDED, one law at a time (a notice's model carried
+            // whatever the visit decided): the visit from a state where the guard bars the ride,
             // its every other effect the healthy one's, the ride kept — the
             // announced round's decision (`mto`) and the round's model
             // (`ann`) a late READY after a give-up still asks for.
@@ -3195,7 +3156,7 @@ pub fn harness_model_switch_model() -> Model {
                 fresh = if Buggy == 1 { 1 } else { fresh };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
-            // The refusal before 2026-10-01: the ask written before the
+            // A refusal that keeps the ask: the ask written before the
             // signal kept though the signal was never sent, from a process no
             // relaunch of this harness's ever asked anything of.
             action RefusedKeepsTheAsk when (
@@ -3208,7 +3169,7 @@ pub fn harness_model_switch_model() -> Model {
                 mto = if Buggy == 1 { 0 } else { mto };
                 forged = if Buggy == 1 { 1 } else { forged };
             }
-            // THE LINE before 2026-10-01: a relaunch asking no model of its
+            // THE LINE unguarded: a relaunch asking no model of its
             // own — the upgrade's build restart, a restart with nothing
             // riding — kept the launch's `--model` verbatim, this harness's
             // own ask recorded FAILED included, and runs it again.
@@ -3246,7 +3207,7 @@ pub fn harness_model_switch_model() -> Model {
             // (`phase == 1 && ann == 1`) is that ride, and the RIDE — the
             // model a round's restart asks for, announced or after a give-up
             // (`phase > 0 && ann == 1`) — is held to the first three laws as
-            // well (2026-10-01), over what the visit could read: never onto
+            // well, over what the visit could read: never onto
             // anything applied or failed, and from a model it read only as
             // the rule would move it (the target fixed by the notice, the
             // offer not re-read).
@@ -3289,7 +3250,7 @@ pub fn harness_model_switch_model() -> Model {
                 set == 0 || flag == 1;
             // A model recorded FAILED is never what a relaunch starts the
             // conversation on: `live` reads it only off a line naming it, so
-            // this is the line never carrying it (2026-10-01).
+            // this is the line never carrying it.
             invariant NeverRelaunchedOntoAFailedModel:
                 fl == 0 || live <= 0 || live > 1;
         }

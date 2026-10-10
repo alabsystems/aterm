@@ -10,7 +10,8 @@
 mod reflow_map;
 
 use self::reflow_map::{
-    ExtrasCopyCtx, ExtrasSource, chunk_cells_to_rows, copy_cells_to_row, source_coords_for_row,
+    ExtrasCopyCtx, ExtrasSource, TrackedPoint, chunk_cells_to_rows, copy_cells_to_row,
+    source_coords_for_row,
 };
 use super::resize_undo::UndoRow;
 use super::row_u16;
@@ -121,6 +122,67 @@ struct ReflowResult {
     extras: CellExtras,
     cursor_row: usize,
     cursor_col: u16,
+    /// Where the saved (DECSC) cursor landed, when it named a rewrapped row.
+    saved: Option<(usize, u16)>,
+}
+
+/// The cursors a width rewrap carries to their new cells, the way a reference
+/// terminal carries them (kitty `rewrap`'s `CursorTrack`s, Ghostty's tracked
+/// pins): index [`LIVE`] is the live cursor, [`SAVED`] the saved one (DECSC,
+/// and the 1049 slot the host lends the grid for the resize). Each is a source
+/// `(row, col)` before the rewrap and the `(row, col)` its cell lands on after.
+struct RewrapCursors {
+    src: [Option<(usize, u16)>; 2],
+    dst: [Option<(usize, u16)>; 2],
+}
+
+const LIVE: usize = 0;
+const SAVED: usize = 1;
+
+impl RewrapCursors {
+    /// The cursors on source row `row`: their columns, by index.
+    fn cols_on(&self, row: usize) -> [Option<u16>; 2] {
+        self.src
+            .map(|src| src.and_then(|(r, c)| (r == row).then_some(c)))
+    }
+
+    /// A row that is not rewrapped (blank, or DECDWL/DECDHL in place) keeps
+    /// its cursors on its one new row, clamped to the new width.
+    fn place_on_row(&mut self, row: usize, new_row: usize, new_cols: u16) {
+        for (i, col) in self.cols_on(row).into_iter().enumerate() {
+            if let Some(col) = col {
+                self.dst[i] = Some((new_row, col.min(new_cols.saturating_sub(1))));
+            }
+        }
+    }
+
+    /// Tracked points for a line chunked from `cells`: each cursor's logical
+    /// offset into the line, from the `offsets` its rows give it. The saved
+    /// cursor keeps a gap past the line's content (`TrackedPoint::keeps_gap`).
+    fn points(offsets: [Option<usize>; 2]) -> [TrackedPoint; 2] {
+        let [live, saved] = offsets;
+        [
+            TrackedPoint {
+                offset: live,
+                at: None,
+                keeps_gap: false,
+            },
+            TrackedPoint {
+                offset: saved,
+                at: None,
+                keeps_gap: true,
+            },
+        ]
+    }
+
+    /// Take the chunker's answers.
+    fn land(&mut self, points: &[TrackedPoint; 2]) {
+        for (i, point) in points.iter().enumerate() {
+            if let Some(at) = point.at {
+                self.dst[i] = Some(at);
+            }
+        }
+    }
 }
 
 /// May the rewrap merge consume `row` as a soft-wrap continuation of the
@@ -160,9 +222,7 @@ fn resize_double_width_row_in_place(
     new_cols: u16,
     new_pages: &mut PageStore,
     new_rows: &mut Vec<Row>,
-    cursor_row: usize,
-    cursor_col: u16,
-    cursor: &mut (usize, u16),
+    cursors: &mut RewrapCursors,
     old_extras: Option<&CellExtras>,
     new_extras: &mut CellExtras,
 ) {
@@ -196,14 +256,13 @@ fn resize_double_width_row_in_place(
             cells,
             0,
             copy_len,
+            content_len,
             new_cols,
             dest_row,
             &mut extras_ctx,
         );
     }
-    if cursor_row == row_idx {
-        *cursor = (new_rows.len(), cursor_col.min(new_cols.saturating_sub(1)));
-    }
+    cursors.place_on_row(row_idx, new_rows.len(), new_cols);
     new_rows.push(new_row);
 }
 
@@ -256,6 +315,38 @@ impl Grid {
         policy: ResizePolicy,
     ) {
         self.resize_with_reflow_mode_and_policy(new_rows, new_cols, ReflowMode::Disabled, policy);
+    }
+
+    /// Lend this grid the host's saved cursor (DECSC, or the 1049 slot) for the
+    /// resize that follows, so the grid carries it to its text like its own
+    /// cursor: through a width rewrap (to the cell its text lands on), the
+    /// rewrap's push of top rows into history, a rows-grow reveal, a rows-shrink
+    /// top-demote, the boundary-continuation lift and the deficit fill, the
+    /// offloaded re-attach's fill included. Take it back with
+    /// [`Self::take_lent_saved_cursor`] once the resize (or re-attach) returns.
+    ///
+    /// The slot is the host's: the terminal keeps one per screen (xterm
+    /// `sc[0]`/`sc[1]`), so it lends each grid the one that belongs to it.
+    /// Every reference terminal moves it with its text: xterm
+    /// (`AdjustSavedCursor`), Alacritty (`grow_lines`), kitty (`screen_resize`
+    /// tracks both saved cursors through `rewrap`), Ghostty (`Screen.resize`
+    /// reflows the saved cursor's pin) and WezTerm. Left behind, a full-screen
+    /// app's exit (1049) restored the cursor onto earlier output. A slot past
+    /// the grid names no text and is left where it is; DECRC and the 1049 exit
+    /// clamp what they read.
+    pub fn lend_saved_cursor(&mut self, saved: Option<super::Cursor>) {
+        self.storage.saved_cursor = crate::SavedCursor {
+            cursor: saved.unwrap_or_default(),
+            valid: saved.is_some(),
+            pending_wrap: false,
+        };
+    }
+
+    /// Take back the saved cursor lent by [`Self::lend_saved_cursor`], where
+    /// the resize carried it; the grid keeps none of its own afterwards.
+    pub fn take_lent_saved_cursor(&mut self) -> Option<super::Cursor> {
+        let saved = std::mem::take(&mut self.storage.saved_cursor);
+        saved.valid.then_some(saved.cursor)
     }
 
     /// The one resize implementation: every public resize forwards here. Same
@@ -441,18 +532,17 @@ impl Grid {
                 .min(bound);
             let col = self.storage.clamp_col_for_row(row, self.storage.cursor.col);
             self.storage.set_cursor_position(row, col);
+            // The saved cursor moves with its row and is not clamped (DECRC
+            // and the 1049 exit clamp what they read): a slot a shrink left
+            // past the grid, on the blank row it trimmed, stays below the
+            // content it followed, and a later grow restores it there.
             if self.storage.saved_cursor.valid {
-                let saved = self
+                self.storage.saved_cursor.cursor.row = self
                     .storage
                     .saved_cursor
                     .cursor
                     .row
-                    .saturating_add(row_u16(revealed))
-                    .min(bound);
-                self.storage.saved_cursor.cursor.row = saved;
-                self.storage.saved_cursor.cursor.col = self
-                    .storage
-                    .clamp_col_for_row(saved, self.storage.saved_cursor.cursor.col);
+                    .saturating_add(row_u16(revealed));
             }
         }
         // Re-attach the revealed ring rows' extras at their final viewport rows,
@@ -1352,6 +1442,11 @@ impl Grid {
                 result.extras.shift_rows_up_by(0, n);
             }
             result.cursor_row -= push_count;
+            // The saved cursor rides the push too; one whose row went to
+            // history is left on the top row, as a rows-only demote leaves it.
+            result.saved = result
+                .saved
+                .map(|(row, col)| (row.saturating_sub(push_count), col));
         }
 
         let kept = target_rows.min(result.rows.len());
@@ -1394,6 +1489,13 @@ impl Grid {
         let max_row = row_u16(self.storage.rows.len().saturating_sub(1));
         self.storage.cursor.row = row_u16(result.cursor_row).min(max_row);
         self.storage.cursor.col = result.cursor_col.min(new_cols.saturating_sub(1));
+        // The saved cursor's row is not clamped: one whose row fell off the
+        // bottom (rows past the target below the cursor are dropped) stays
+        // past the grid, as a trimmed row's slot does (`resize_viewport_state`).
+        if let Some((row, col)) = result.saved {
+            self.storage.saved_cursor.cursor.row = row_u16(row);
+            self.storage.saved_cursor.cursor.col = col.min(new_cols.saturating_sub(1));
+        }
     }
 
     /// How many top rows of a rewrapped viewport conhost demotes to its
@@ -1431,6 +1533,9 @@ impl Grid {
     /// Reads rows directly from the ring buffer instead of cloning the grid; a
     /// reusable merge buffer handles continuation concatenation without
     /// per-line allocations.
+    ///
+    /// The live cursor and the saved one ride the rewrap to the cells their
+    /// text lands on (`RewrapCursors`).
     fn reflow_rewrap_columns(
         &mut self,
         target_rows: u16,
@@ -1443,7 +1548,15 @@ impl Grid {
         let mut new_pages = PageStore::new();
         let visible_count = usize::from(self.storage.visible_rows);
         let mut new_rows: Vec<Row> = Vec::with_capacity(visible_count);
-        let mut cursor = (cursor_row, cursor_col);
+        // A saved cursor names a cell only while it is on a row the grid has;
+        // past the grid (a shrink left it there) it names no text and stays.
+        let saved = self.storage.saved_cursor;
+        let saved_src = (saved.valid && usize::from(saved.cursor.row) < visible_count)
+            .then(|| (usize::from(saved.cursor.row), saved.cursor.col));
+        let mut cursors = RewrapCursors {
+            src: [Some((cursor_row, cursor_col)), saved_src],
+            dst: [None, None],
+        };
         let mut merge_buf: Vec<super::Cell> = Vec::with_capacity(self.storage.cols as usize);
         let mut merge_coords: Vec<CellCoord> = Vec::new();
         let mut new_extras = CellExtras::new();
@@ -1486,9 +1599,7 @@ impl Grid {
                     new_cols,
                     &mut new_pages,
                     &mut new_rows,
-                    cursor_row,
-                    cursor_col,
-                    &mut cursor,
+                    &mut cursors,
                     old_extras,
                     &mut new_extras,
                 );
@@ -1509,7 +1620,7 @@ impl Grid {
                     new_cols,
                     &mut new_pages,
                     &mut new_rows,
-                    &mut cursor,
+                    &mut cursors,
                     old_extras,
                     &mut new_extras,
                 );
@@ -1521,15 +1632,17 @@ impl Grid {
                     new_row.set_wrapped(true);
                 }
                 new_row.set_line_size(source_line_size);
-                if cursor_row == first_row_idx {
-                    cursor = (new_rows.len(), cursor_col.min(new_cols.saturating_sub(1)));
-                }
+                cursors.place_on_row(first_row_idx, new_rows.len(), new_cols);
                 new_rows.push(new_row);
             } else {
                 let was_wrapped = row.is_wrapped();
                 let first_idx = new_rows.len();
                 let cells = &row.as_slice()[..copy_len];
-                let offset = (cursor_row == first_row_idx).then(|| usize::from(cursor_col));
+                let mut points = RewrapCursors::points(
+                    cursors
+                        .cols_on(first_row_idx)
+                        .map(|col| col.map(usize::from)),
+                );
                 let mut extras_ctx = ExtrasCopyCtx {
                     // Single source row `i` chunked across new rows → compute coords.
                     source: if old_extras.is_some() {
@@ -1540,15 +1653,18 @@ impl Grid {
                     old_extras,
                     new_extras: &mut new_extras,
                 };
+                // Content is the row's own length: ConPTY's cursor-row cells
+                // past it are copied, not counted.
                 chunk_cells_to_rows(
                     cells,
+                    usize::from(row.len()),
                     new_cols,
                     &mut new_pages,
                     &mut new_rows,
-                    offset,
-                    &mut cursor,
+                    &mut points,
                     &mut extras_ctx,
                 );
+                cursors.land(&points);
                 // Inherit the original row's wrapped flag on the first chunk, as
                 // the shrink path does, so a continuation of a scrollback line
                 // keeps its flag (cross-boundary search/copy).
@@ -1561,14 +1677,16 @@ impl Grid {
             }
             i += 1;
         }
+        let (cursor_row, cursor_col) = cursors.dst[LIVE].unwrap_or((cursor_row, cursor_col));
         self.finalize_reflow(
             target_rows,
             ReflowResult {
                 rows: new_rows,
                 pages: new_pages,
                 extras: new_extras,
-                cursor_row: cursor.0,
-                cursor_col: cursor.1,
+                cursor_row,
+                cursor_col,
+                saved: cursors.dst[SAVED],
             },
             new_cols,
             policy,
@@ -1578,6 +1696,13 @@ impl Grid {
     /// Merge continuation rows into `merge_buf`, then chunk into new rows.
     ///
     /// Advances `*i` past all continuation rows consumed.
+    ///
+    /// A row the next one continues was filled to its last column by autowrap,
+    /// so all its cells are content, trailing blanks included (padded to the
+    /// full old width, or a width sweep erodes one space per chunk boundary),
+    /// except a recorded early-wrap hole (`Row::continued_len`): that one cell
+    /// is dropped, also when the wrap blanked it with a background colour, and
+    /// a space or glyph really written in the last column is kept.
     #[allow(clippy::too_many_arguments)]
     fn merge_continuation_rows(
         &self,
@@ -1592,13 +1717,18 @@ impl Grid {
         new_cols: u16,
         new_pages: &mut PageStore,
         new_rows: &mut Vec<Row>,
-        cursor: &mut (usize, u16),
+        cursors: &mut RewrapCursors,
         old_extras: Option<&CellExtras>,
         new_extras: &mut CellExtras,
     ) {
         merge_buf.clear();
         merge_coords.clear();
-        let mut cursor_offset: Option<usize> = None;
+        let mut offsets: [Option<usize>; 2] = [None, None];
+        // Where the line's content ends in `merge_buf`: after the last source
+        // row with content. An inner row's pad counts once later content
+        // follows it; the last row's trailing blanks and ConPTY's cursor-cell
+        // extension do not.
+        let mut content_end = 0usize;
 
         // Save the first row's wrapped flag and line_size before merging: a
         // continuation of a scrollback line must keep its flag for
@@ -1610,7 +1740,6 @@ impl Grid {
             .map_or(LineSize::SingleWidth, Row::line_size);
 
         // Copy first row's cells.
-        let old_cols = usize::from(self.storage.cols);
         let mut row_start = merge_buf.len();
         let mut row_idx = start;
         if let Some(row) = self.row(row_u16(start)) {
@@ -1619,9 +1748,14 @@ impl Grid {
             if old_extras.is_some() {
                 merge_coords.extend(source_coords_for_row(row_u16(start), len));
             }
+            if len > 0 {
+                content_end = merge_buf.len();
+            }
         }
-        if cursor_row == start {
-            cursor_offset = Some(usize::from(cursor_col));
+        for (k, col) in cursors.cols_on(start).into_iter().enumerate() {
+            if let Some(col) = col {
+                offsets[k] = Some(usize::from(col));
+            }
         }
 
         // Copy continuation rows.
@@ -1636,21 +1770,21 @@ impl Grid {
             // screen is one logical line.
             #[cfg(any(test, feature = "testing"))]
             super::count_reflow_row_op();
-            // The appended row continues onto this one, so autowrap filled it to
-            // its last column and its trailing blanks are content: pad to the
-            // full old width, or a width sweep erodes one space per chunk
-            // boundary. Except when the continuation opens with a wide cell: a
-            // wide char that cannot start at the last column wraps early,
-            // leaving that cell unwritten, and padding it would insert a
-            // phantom space.
-            let early_wrap_hole = self
-                .row(row_u16(*i))
-                .and_then(|cont| cont.as_slice().first())
-                .is_some_and(super::Cell::is_wide);
-            // The hole is exactly one cell (a width-2 glyph wraps early only
-            // when one column remains), so pad up to it.
-            let pad_to = row_start + old_cols - usize::from(early_wrap_hole);
-            while merge_buf.len() < pad_to {
+            // The row just appended is continued by this one: it contributes
+            // its full old width less a recorded hole. Pad up to that, or cut
+            // a hole its length covers (a hole blanked with a background).
+            let continued = self
+                .row(row_u16(row_idx))
+                .map_or(0, |prev| usize::from(prev.continued_len()));
+            let row_end = row_start + continued;
+            if merge_buf.len() > row_end {
+                merge_buf.truncate(row_end);
+                if old_extras.is_some() {
+                    merge_coords.truncate(row_end);
+                }
+                content_end = content_end.min(row_end);
+            }
+            while merge_buf.len() < row_end {
                 if old_extras.is_some() {
                     merge_coords.push(CellCoord::new(
                         row_u16(row_idx),
@@ -1668,8 +1802,13 @@ impl Grid {
                 if old_extras.is_some() {
                     merge_coords.extend(source_coords_for_row(row_u16(*i), len));
                 }
-                if cursor_row == *i {
-                    cursor_offset = Some(off + usize::from(cursor_col));
+                if len > 0 {
+                    content_end = merge_buf.len();
+                }
+                for (k, col) in cursors.cols_on(*i).into_iter().enumerate() {
+                    if let Some(col) = col {
+                        offsets[k] = Some(off + usize::from(col));
+                    }
                 }
             }
         }
@@ -1698,12 +1837,17 @@ impl Grid {
             // alongside `new_pages` in the same reflow result.
             let mut new_row = unsafe { Row::new(new_cols, new_pages) };
             new_row.set_line_size(first_row_line_size);
-            if cursor_offset.is_some() {
-                *cursor = (new_rows.len(), cursor_col.min(new_cols.saturating_sub(1)));
+            for (k, offset) in offsets.into_iter().enumerate() {
+                if offset.is_some()
+                    && let Some((_, col)) = cursors.src[k]
+                {
+                    cursors.dst[k] = Some((new_rows.len(), col.min(new_cols.saturating_sub(1))));
+                }
             }
             new_rows.push(new_row);
         } else {
             let first_idx = new_rows.len();
+            let mut points = RewrapCursors::points(offsets);
             let mut extras_ctx = ExtrasCopyCtx {
                 // MERGE path: cells span several source rows, so the explicit
                 // (reused) coord table is required — not pure row arithmetic.
@@ -1717,13 +1861,14 @@ impl Grid {
             };
             chunk_cells_to_rows(
                 merge_buf,
+                content_end,
                 new_cols,
                 new_pages,
                 new_rows,
-                cursor_offset,
-                cursor,
+                &mut points,
                 &mut extras_ctx,
             );
+            cursors.land(&points);
             // Inherit the first merge row's wrapped flag and line_size on the
             // first output chunk, as the other paths do.
             if first_idx < new_rows.len() {

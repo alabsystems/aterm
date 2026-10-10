@@ -40,7 +40,9 @@ impl DiskBackedScrollback {
     /// excludes disk usage. Use [`cold_disk_used`](Self::cold_disk_used) for disk usage.
     #[must_use]
     pub(crate) fn total_memory_used(&self) -> usize {
-        self.bytes_used + self.cold_memory_used()
+        // Saturating, as `Scrollback::memory_used` and `Line::memory_used` are:
+        // exact whenever the sum fits, `usize::MAX` otherwise.
+        self.bytes_used.saturating_add(self.cold_memory_used())
     }
 
     /// Get reclaimable storage bytes used for budget enforcement.

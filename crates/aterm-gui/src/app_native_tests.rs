@@ -110,6 +110,34 @@ fn machine_child_fixture(name: &str) -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
+/// Whether `pid` is still this process's child, looked at without reaping it:
+/// `WNOWAIT` leaves an exited child waitable, so this never takes the reap from
+/// the helper under test. Polls until the child is no longer ours (the helper,
+/// or the reaper it handed the child to, collected it) or `within` runs out — a
+/// hang detector, not a latency budget — and says whether it still is.
+#[cfg(unix)]
+fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + within;
+    loop {
+        // SAFETY: a zeroed `siginfo_t` is a valid out-parameter.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
+        let ours = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        } == 0;
+        if !ours || Instant::now() >= deadline {
+            return ours;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A timed-out read reaps the child it owns, and the next read recovers.
 ///
 /// A take proves the reap only if the fixture ran inside the budget (the
@@ -158,17 +186,13 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
     let error = result.unwrap_err();
     assert!(elapsed < JOB, "the read waited for its child: {elapsed:?}");
     assert!(error.contains("timed out"), "{error}");
-    assert!(!error.contains("could not be confirmed"), "{error}");
-    let mut status = 0;
-    // SAFETY: WNOHANG only observes the fixture's recorded direct child. The
-    // helper must already have reaped it, so it is no longer our child.
-    assert_eq!(
-        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ECHILD)
+    // Reaped, by the helper or, when the kill's exit outlasts the helper's 250 ms
+    // cleanup tail (it did at load 108), by the reaper it hands the child to;
+    // `machine_command_child_outliving_cleanup_is_still_reaped` pins that
+    // hand-off. Which of the two did it is a latency, not a contract.
+    assert!(
+        !child_still_ours(pid, aterm_spec::wait::MUST_HAPPEN),
+        "the timed-out child was left an unreaped zombie: {error}"
     );
     dispatch_native_machine_read(&mut service, MachineReadEvent::Finished(Err(error)), || {
         panic!("no queued rerun")
@@ -176,7 +200,10 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
     assert!(!service.machine().refreshing);
     dispatch_native_machine_read(&mut service, MachineReadEvent::Request, || Ok(()));
     let mut next = aterm_uds::spawnfd::command("/bin/sh");
-    next.args(["-c", "printf '%s\n' 'atpkg: machine-state: universal-control=default; policy=off; noindex=true; spotlight-exposed=2; spotlight-hidden=8; spotlight-migratable=1; scan=complete; home=account'"]);
+    next.args([
+        "-c",
+        "printf '%s\n' 'atpkg: machine-state: universal-control=default; policy=off; home=account'",
+    ]);
     let output = machine_command_output(
         &mut next,
         "owned successful read",
@@ -217,7 +244,7 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
 #[cfg(target_os = "macos")]
 #[test]
 fn machine_command_child_outliving_cleanup_is_still_reaped() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let fixture = machine_child_fixture("drain");
     let pid_path = fixture.path().join("pid");
     let (mut master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -254,26 +281,9 @@ fn machine_command_child_outliving_cleanup_is_still_reaped() {
     let error = result.expect_err("the read timed out");
     // A hang detector, not a budget: the drained exit finishes within a
     // second or so, and the reaper looks every 100 ms.
-    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let mut status = 0;
     let mut reaped_here = false;
-    let still_ours = loop {
-        // SAFETY: a non-reaping peek at the fixture's own pid.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
-        let ours = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-            )
-        } == 0;
-        if !ours || Instant::now() >= deadline {
-            break ours;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let still_ours = child_still_ours(pid, aterm_spec::wait::MUST_HAPPEN);
     if still_ours {
         // SAFETY: close the master so the drain ends, then reap the
         // fixture so no zombie outlives the failure.
@@ -431,7 +441,7 @@ fn machine_apply_timeout_and_failed_write_settle_as_failure() {
     assert!(!app.native_packages_service.machine().refreshing);
 
     let stdout = format!(
-        "atpkg: {}spotlight-noindex 1 dir(s) migrated\n{}preference write did not land\n{}applied — spotlight-noindex 1 dir(s) migrated\n",
+        "atpkg: {}some-setting changed\n{}preference write did not land\n{}applied — some-setting changed\n",
         atpkg::cli::MACHINE_SETTINGS_MARKER,
         atpkg::cli::MACHINE_APPLY_FAILED_PREFIX,
         atpkg::cli::MACHINE_VERDICT_PREFIX
@@ -454,13 +464,8 @@ fn machine_apply_timeout_and_failed_write_settle_as_failure() {
     // completion carrying none makes the host re-read; no record-missing
     // event is posted here, so that read is the only one.
     assert_eq!(events.len(), 1, "{events:?}");
-    assert!(
-        matches!(&events[0], Wake::PkgMachineSettings(body) if body == "spotlight-noindex 1 dir(s) migrated")
-    );
-    assert_eq!(
-        verdict.as_deref(),
-        Some("applied — spotlight-noindex 1 dir(s) migrated")
-    );
+    assert!(matches!(&events[0], Wake::PkgMachineSettings(body) if body == "some-setting changed"));
+    assert_eq!(verdict.as_deref(), Some("applied — some-setting changed"));
     let historical = stdout
         .lines()
         .filter(|line| !line.starts_with(atpkg::cli::MACHINE_APPLY_FAILED_PREFIX))
@@ -10143,6 +10148,7 @@ fn focused_native_text_field_receives_space_and_submit_before_activation() {
         key: Key::Named(key),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     assert!(app.native_input_event(wid, &press(NamedKey::Space)));
@@ -10285,6 +10291,7 @@ fn bare_return_activates_the_pages_primary_default_button() {
         key: Key::Named(key),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     assert!(app.native_input_event(wid, &press(NamedKey::Space)));
@@ -10338,6 +10345,7 @@ fn settings_search_field_honors_readline_control_keys() {
         key: Key::Character(c),
         mods: Modifiers::CTRL,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let (_, view) = app.active_native_view(wid).unwrap();
@@ -10408,6 +10416,7 @@ fn settings_search_field_ctrl_arrows_walk_words_off_macos() {
         key,
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let left = |mods| chord(Key::Named(NamedKey::ArrowLeft), mods);

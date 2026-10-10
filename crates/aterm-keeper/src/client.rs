@@ -232,17 +232,17 @@ impl KeeperClient {
         }
     }
 
-    /// HELLO as a status client, then ask for the status text.
+    /// HELLO as a status client of build `build`, then ask for the status text.
     ///
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
-    pub fn status(&self) -> io::Result<String> {
+    pub fn status(&self, build: &str) -> io::Result<String> {
         self.send(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::Status,
                 caps: 0,
-                build: env!("CARGO_PKG_VERSION").to_string(),
+                build: build.to_string(),
                 marker: None,
             },
             None,
@@ -667,12 +667,12 @@ mod tests {
         let own = Identity::for_self(crate::identity::IdentityPolicy::Designated).expect("own");
 
         let sock = dir.join("nc.sock");
-        let mut nc = std::process::Command::new("/usr/bin/nc")
+        let mut nc = aterm_uds::spawnfd::command("/usr/bin/nc")
             .arg("-dlU")
             .arg(&sock)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn nc");
         // A hang detector: `nc` binds, then listens; a dial between the two is

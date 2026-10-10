@@ -24,7 +24,8 @@ use super::MAX_INTERMEDIATES;
 
 /// Whether the per-byte `OscPut` pushes a data byte onto an `osc_data` of
 /// `len` bytes: the guard itself, which the `OscPut` arm calls and
-/// `proofs::osc_bulk_copy_matches_per_byte_puts` reasons from.
+/// `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
+/// holds the bulk path's [`osc_bulk_copy_len`] to.
 #[inline]
 pub(crate) fn osc_put_keeps(len: usize) -> bool {
     len < MAX_OSC_DATA
@@ -32,8 +33,8 @@ pub(crate) fn osc_put_keeps(len: usize) -> bool {
 
 /// How many of `n` OSC data bytes the bulk path appends to an `osc_data` of
 /// `len` bytes: the prefix [`osc_put_keeps`] would keep one byte at a time.
-/// `proofs::osc_bulk_copy_matches_per_byte_puts` proves the two agree and the
-/// cap holds.
+/// `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
+/// checks the two agree and the cap holds.
 #[inline]
 pub(crate) fn osc_bulk_copy_len(len: usize, n: usize) -> usize {
     n.min(MAX_OSC_DATA.saturating_sub(len))
@@ -276,44 +277,8 @@ impl Parser {
     }
 
     /// Process a single byte through the state machine (inner implementation).
-    ///
-    /// Under Kani/trust-mc this carries a function contract: starting from a
-    /// state satisfying the TLA+ `TypeInvariant` (see [`Parser::type_invariant`]),
-    /// processing any byte preserves it. The real dispatch lives in
-    /// [`Parser::process_byte_dispatch`] because the Kani contract proc-macro
-    /// no-ops on a bare `macro!()` body — it needs a real call expression to wrap.
-    /// In non-Kani builds the `#[inline]` wrapper compiles away to a direct call.
-    #[cfg_attr(kani, kani::requires(self.type_invariant()))]
-    #[cfg_attr(
-        kani,
-        kani::modifies(
-            &self.state,
-            &self.params,
-            &self.intermediates,
-            &self.osc_data,
-            &self.osc_discard,
-            &self.current_param,
-            &self.param_started,
-            &self.dcs_active,
-            &self.apc_active,
-            &self.utf8_buffer,
-            &self.utf8_len,
-            &self.utf8_expected,
-            &self.string_utf8,
-            &self.subparam_mask,
-            &self.last_was_colon
-        )
-    )]
-    #[cfg_attr(kani, kani::ensures(|_| self.type_invariant()))]
     #[inline]
     pub(crate) fn process_byte_inner<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
-        self.process_byte_dispatch(byte, sink);
-    }
-
-    /// The state-machine dispatch body for a single byte, separated from
-    /// [`Parser::process_byte_inner`] so the latter can carry a Kani contract.
-    #[inline]
-    pub(crate) fn process_byte_dispatch<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
         process_byte_impl!(self, byte, sink);
     }
 
@@ -334,12 +299,9 @@ impl Parser {
             input,
             sink,
             |sink, printable| {
-                // `take_printable` (via `find_non_printable`) returns only bytes
-                // in 0x20-0x7E — all valid single-byte UTF-8 codepoints.
-                // Kani proof `printable_slice_is_valid_utf8` verifies this.
                 // SAFETY: take_printable returns only bytes 0x20-0x7E, all valid
-                // single-byte UTF-8. Kani proof `printable_slice_is_valid_utf8`
-                // verifies this invariant (#7866).
+                // single-byte UTF-8 (#7866); `simd::tests::test_take_printable`
+                // and the exhaustive tier differentials pin the scan.
                 let s = unsafe { std::str::from_utf8_unchecked(printable) };
                 sink.print_str(pty_wrap_ref(s));
             },
@@ -538,8 +500,9 @@ impl Parser {
         // the position of the FIRST control byte, so every byte in [0..n)
         // is a data byte the slow path maps to OscPut, which pushes only
         // while `osc_put_keeps(osc_data.len())`. `osc_bulk_copy_len` keeps
-        // that same prefix and drops the rest (proved against that guard for
-        // every `len` and `n`: `proofs::osc_bulk_copy_matches_per_byte_puts`), and
+        // that same prefix and drops the rest (checked against that guard at
+        // every breakpoint of every `len`:
+        // `tests::batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`), and
         // `remaining.get(n..)` then lands on the control byte, which both
         // paths process the same way. `osc_over_capacity_truncation_parity`
         // (tests/batch.rs) drives both paths across the boundary.
@@ -968,9 +931,9 @@ impl Parser {
     /// beyond `char::from_u32` lets Trust lower it natively and prove every
     /// obligation, while the caller's loop stays obligation-free.
     ///
-    /// `pub(crate)` so the THRU-4a bulk lane's Kani equivalence proof
-    /// (`proofs.rs::bulk_decode_first_sequence_matches_scalar`) can check the
-    /// vectorized path against this exact scalar oracle.
+    /// `pub(crate)` so the THRU-4a bulk lane's exhaustive first-sequence test
+    /// (`utf8_simd::tests::bulk_first_sequence_matches_scalar_for_every_lead_and_continuation_class`)
+    /// holds the bulk path to this exact scalar oracle.
     #[inline]
     pub(crate) fn decode_multibyte_char(lead: u8, rem: &[u8]) -> Option<(char, usize)> {
         // Each branch produces Option<(char, bytes_consumed_from_rem)>.

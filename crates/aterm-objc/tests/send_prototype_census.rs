@@ -226,8 +226,7 @@ fn no_transmuted_prototype_in_the_winit_backend_is_spelled_extern_c() {
     // not evidence that the two it exists for are still spelled right.
     let backend = repo_root().join("vendor/winit/src/platform_impl/macos");
     let app = std::fs::read_to_string(backend.join("app.rs")).expect("app.rs");
-    // W12 re-typed it `unsafe extern "C-unwind" fn(Id, Sel, Id)` — the
-    // `SwizzleSite` derives the row's encoding from that type, and its
+    // The `SwizzleSite` derives the row's encoding from that type, and its
     // `original()` chains to the displaced IMP through it, so the spelling
     // is the one the raise unwinds through.
     assert!(
@@ -252,10 +251,8 @@ fn no_transmuted_prototype_in_the_winit_backend_is_spelled_extern_c() {
 /// `NSException` raised beneath the panic guard would meet its `catch_unwind`
 /// as a foreign exception and abort — the v0.72.0 shape. `objc_event_drive`'s
 /// controls 1a and 1b prove the BEHAVIOUR on every gate run; this pins the
-/// TEXT, because the override was re-ported once already (W12 moved it onto
-/// `SwizzleSite` on a branch cut before the containment landed) and a merge
-/// that inverted the two guards would compile, pass the encoding checks and
-/// only be found by the driver. Refuse it here, before it is run.
+/// TEXT, because a merge that inverted the two guards would compile, pass the
+/// encoding checks and only be found by the driver.
 #[test]
 fn the_send_event_override_keeps_stop_app_on_panic_outside_and_contain_inside() {
     let app =

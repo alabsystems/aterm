@@ -1222,36 +1222,45 @@ pub fn autoreleasepool<R>(f: impl FnOnce(&AutoreleasePool) -> R) -> R {
     out
 }
 
-/// Build a +1 `NSString` from a Rust `&str`.
+/// Build a +1 `NSString` holding exactly `s`.
 ///
-/// Uses `alloc` + `initWithBytes:length:encoding:` so the result is owned, not
-/// autoreleased, and needs no pool.
+/// Uses `alloc` + `initWithCharacters:length:` so the result is owned, not
+/// autoreleased, and needs no pool. The string is built from its UTF-16 code
+/// units, the unit an `NSString` stores and [`ns_string_to_rust`] reads back:
+/// `initWithBytes:length:encoding:` decodes UTF-8 as an external
+/// representation and drops a leading U+FEFF as a byte-order mark.
 #[must_use]
 pub fn ns_string(s: &str) -> Option<Obj> {
-    const NS_UTF8: usize = 4;
+    let units: Vec<u16> = s.encode_utf16().collect();
     let cls = class(c"NSString");
-    // SAFETY: `alloc` returns +1 uninitialised; `initWithBytes:length:encoding:`
-    // consumes it and returns +1 or nil (`from_owned` maps nil to `None`). The
-    // bytes are read for `len` bytes during the call only.
+    // SAFETY: `alloc` returns +1 uninitialised; `initWithCharacters:length:`
+    // (`@32@0:8r^S16Q24`) consumes it and returns +1 or nil (`from_owned` maps
+    // nil to `None`). It copies `units.len()` code units during the call only.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
-        let raw = alloc(cls, sel(c"alloc"));
+        let raw = alloc(cls, crate::sel!(alloc));
         if raw.is_null() {
             return None;
         }
-        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u8, usize, usize) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u16, usize) -> Id = msg();
         let obj = init(
             raw,
-            sel(c"initWithBytes:length:encoding:"),
-            s.as_ptr(),
-            s.len(),
-            NS_UTF8,
+            crate::sel!(initWithCharacters:length:),
+            units.as_ptr(),
+            units.len(),
         );
         Obj::from_owned(obj)
     }
 }
 
-/// Copy an `NSString`'s UTF-8 bytes into an owned Rust `String`.
+/// Copy an `NSString`'s contents into an owned Rust `String`.
+///
+/// Reads the string's counted UTF-16 code units (`-length`, then
+/// `-getCharacters:range:`), never a C string: `-UTF8String` stops at the
+/// first U+0000, and answers NULL for a string holding an unpaired surrogate,
+/// so a paste of `a\0b` read as `a` and a paste cut mid-surrogate-pair read as
+/// nothing at all. An unpaired surrogate, which an `NSString` can hold and a
+/// Rust `String` cannot, becomes U+FFFD; everything else is exact.
 ///
 /// # Safety
 /// `s` must be a live `NSString` (or nil, which yields an empty string).
@@ -1261,15 +1270,30 @@ pub unsafe fn ns_string_to_rust(s: Id) -> String {
         return String::new();
     }
     autoreleasepool(|_| {
-        // SAFETY: `s` is a live NSString. `UTF8String` is an interior pointer
-        // valid until the pool pops; it is copied before then.
+        // SAFETY: `s` is a live NSString. `-length` is `Q16@0:8`, the count of
+        // UTF-16 code units. `-getCharacters:range:` is `v40@0:8^S16{_NSRange=QQ}24`
+        // and writes exactly `range.length` units into the buffer; the range is
+        // the whole string, so it is in bounds, and the buffer holds that many.
+        // Its length is set only after the call has written them.
         unsafe {
-            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
-            let p = utf8(s, sel(c"UTF8String"));
-            if p.is_null() {
+            let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+            let n = length(s, crate::sel!(length));
+            if n == 0 {
                 return String::new();
             }
-            CStr::from_ptr(p).to_string_lossy().into_owned()
+            let mut units: Vec<u16> = Vec::with_capacity(n);
+            let get: unsafe extern "C-unwind" fn(Id, Sel, *mut u16, crate::NSRange) = msg();
+            get(
+                s,
+                crate::sel!(getCharacters:range:),
+                units.as_mut_ptr(),
+                crate::NSRange {
+                    location: 0,
+                    length: n,
+                },
+            );
+            units.set_len(n);
+            String::from_utf16_lossy(&units)
         }
     })
 }

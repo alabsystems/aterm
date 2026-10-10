@@ -122,10 +122,7 @@
 //!
 //! # Not decided here
 //!
-//! A root laid by a provenance-tracked process carries com.apple.provenance, like every file
-//! such a process creates; the store heal at the end of the door clears it in place
-//! ([`crate::provenance::heal_store`], whose roots include `compat/`). Not covered:
-//! `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
+//! Not covered: `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
 //! consumer that runs `store/trust/current/bin` by absolute path (aterm-verify's store
 //! discovery, `tools/bootstrap-publisher.sh`, the release gates).
 //!
@@ -2177,13 +2174,7 @@ mod tests {
                 0,
                 None,
                 "doctor",
-                // The macOS tag is a fact about which process wrote the fixture, and the
-                // routed form lays more files (its root): an attribute nothing sets keeps
-                // the count out of a comparison of shim forms.
-                &crate::doctor::Probes {
-                    provenance_attr: "user.aterm.absent",
-                    ..crate::doctor::Probes::default()
-                },
+                &crate::doctor::Probes::default(),
                 &mut out,
                 &mut err,
             );

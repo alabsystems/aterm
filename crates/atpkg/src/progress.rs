@@ -1097,8 +1097,7 @@ pub fn pass_running(layout: &crate::store::Layout, now_unix: u64) -> bool {
 ///
 /// This used to fork `/bin/kill -0 <pid>` and wait for it, "keeping atpkg's non-test
 /// code `unsafe`-free". That reason had already lapsed — this very file calls
-/// `libc::poll` and `libc::dup2` a few hundred lines up, and the crate probes a pid
-/// exactly this way in [`crate::provenance`]'s heal job — while the cost was real and
+/// `libc::poll` and `libc::dup2` a few hundred lines up — while the cost was real and
 /// repeated: [`snapshot_running`] runs on every `__pending` stub invocation while a pass is live,
 /// and the GUI tailer's foreign-pid probe calls it every 2 s for as long as ANOTHER
 /// installer holds the store lock (a multi-GB pass queued behind `--wait-lock` for 40

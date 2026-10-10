@@ -14,7 +14,8 @@
 //! `aterm-search/tests/conformance_streaming.rs`. The per-method `#[refines]`
 //! anchors in `engine/operations.rs` bind those model actions. Calls that add or
 //! remove multiple matches atomically are deliberately outside that exact scalar
-//! transition abstraction and remain covered by the local/Kani invariant suites.
+//! transition abstraction and remain covered by the engine's
+//! `verify_all_invariants`, which the streaming tests assert after every step.
 //!
 //! This module implements a streaming search system that:
 //! - Searches through content incrementally (row by row)
@@ -27,16 +28,17 @@
 //!
 //! | ID | Invariant | Discharged by |
 //! |----|-----------|---------------|
-//! | INV-SEARCH-1 | `CurrentIndexValid` | model Tier-0/Tier-1 + Kani |
-//! | INV-SEARCH-2 | `ResultPositionsValid` | Kani only (not scalar-expressible) |
-//! | INV-SEARCH-3 | `MemoryBounded` | model Tier-0/Tier-1 + Kani |
-//! | INV-SEARCH-4 | `NoDuplicateResults` | Kani only (not scalar-expressible) |
-//! | INV-SEARCH-5 | `ScanProgressConsistent` | model Tier-0/Tier-1 + Kani |
-//! | INV-SEARCH-6 | `TotalMatchesConsistent` | model Tier-0/Tier-1 + Kani |
+//! | INV-SEARCH-1 | `CurrentIndexValid` | model Tier-0/Tier-1 + `verify_all_invariants` |
+//! | INV-SEARCH-2 | `ResultPositionsValid` | `verify_all_invariants` (not scalar-expressible) |
+//! | INV-SEARCH-3 | `MemoryBounded` | model Tier-0/Tier-1 + `verify_all_invariants` |
+//! | INV-SEARCH-4 | `NoDuplicateResults` | `verify_all_invariants` (not scalar-expressible) |
+//! | INV-SEARCH-5 | `ScanProgressConsistent` | model Tier-0/Tier-1 + `verify_all_invariants` |
+//! | INV-SEARCH-6 | `TotalMatchesConsistent` | model Tier-0/Tier-1 + `verify_all_invariants` |
 //!
 //! INV-SEARCH-2/-4 quantify over per-result data (coordinates, duplicates), so
-//! they remain Kani-owned bounded-local proofs (`proofs.rs`), ledger-joined via
-//! `proof_anchor!` in `spec_proof_anchors.rs`.
+//! no scalar model carries them: the engine's `verify_all_invariants` checks
+//! them over the real results, and the streaming and regex tests assert it
+//! after every operation.
 //!
 //! ## State Machine
 //!
@@ -135,16 +137,3 @@ mod tests;
 
 #[cfg(test)]
 mod regex_tests;
-
-#[cfg(kani)]
-mod proofs;
-
-#[cfg(kani)]
-mod proofs_gaps;
-
-// Kani half of the unified verifier ledger: `proof_anchor!` records joining the
-// `#[cfg(kani)]` harnesses above to the derived StreamingSearch machine. The
-// registrations are decoupled from the harnesses (which stock cargo strips) and
-// gated ONLY by the `spec-anchors` feature / test builds — the §4 pattern.
-#[cfg(any(test, feature = "spec-anchors"))]
-mod spec_proof_anchors;

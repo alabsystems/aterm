@@ -39,7 +39,7 @@ path = "tests/vt.rs"
 
 # Isolated: launches the RELEASE binary headless and pixel-checks timed takes
 # behind its own serial lock; the MEASURE tier's `measuring tests` stage
-# (tools/verify.sh --measure) runs it.
+# (tools/verify.sh --measure <APP>) runs it.
 [[test]]
 name = "paint"
 path = "tests/paint.rs"

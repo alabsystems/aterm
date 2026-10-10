@@ -4,7 +4,10 @@
 
 //! Minimal grapheme helpers needed by search indexing.
 
+#[cfg(test)]
 use aterm_grapheme::grid_graphemes;
+use aterm_grapheme::grid_graphemes_with;
+use aterm_types::text_shaping::AmbiguousWidth;
 
 /// Greek small letter final sigma (U+03C2).
 const FINAL_SIGMA: char = '\u{03C2}';
@@ -96,7 +99,7 @@ pub(crate) fn lower_fold(s: &str) -> String {
 /// Reference implementation retained for equivalence testing against
 /// [`ColumnMap::end_column`]. Production code uses `ColumnMap` for
 /// O(log G) lookups (#5672).
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[must_use]
 pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
     let mut column: usize = 0;
@@ -123,21 +126,22 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
 /// the engine's counter, not beside it.
 #[must_use]
 pub fn display_columns(text: &str) -> usize {
-    // Match ColumnMap's ASCII-only Kani abstraction without bringing the
-    // Unicode segmenter's property-table searches into bounded proofs.
-    #[cfg(kani)]
-    {
-        text.len()
+    display_columns_with(text, AmbiguousWidth::Single)
+}
+
+/// [`display_columns`] under the terminal's `ambiguous_width` policy, the
+/// frame a [`SearchIndex`](crate::SearchIndex) built with the same policy
+/// measures its matches in.
+#[must_use]
+pub fn display_columns_with(text: &str, ambiguous: AmbiguousWidth) -> usize {
+    // Printable ASCII holds no East Asian Ambiguous character, so the
+    // identity holds under either policy.
+    if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+        return text.len();
     }
-    #[cfg(not(kani))]
-    {
-        if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
-            return text.len();
-        }
-        // Width-only callers need no byte-offset lookups: the map's same
-        // grid walk, without a coordinate entry for every grapheme.
-        aterm_grapheme::str_grid_columns(text)
-    }
+    // Width-only callers need no byte-offset lookups: the map's same
+    // grid walk, without a coordinate entry for every grapheme.
+    aterm_grapheme::str_grid_columns_with(text, ambiguous)
 }
 
 /// Map a byte offset in lowercased text back to the corresponding byte offset
@@ -147,7 +151,7 @@ pub fn display_columns(text: &str) -> usize {
 /// → 1-byte 'k'), so searching in the lowered text and using byte offsets
 /// directly on the original produces wrong columns. This mapping tracks
 /// per-char byte expansion/contraction.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> usize {
     let mut orig_offset = 0usize;
     let mut low_offset = 0usize;
@@ -200,30 +204,15 @@ struct ClusterColumns {
 }
 
 impl ColumnMap {
-    /// Build a column map from line text.
-    ///
-    /// Under Kani, uses ASCII byte-identity mapping to avoid CBMC path
-    /// explosion from `unicode_segmentation::grapheme_indices` internal
-    /// binary searches on Unicode property tables. All Kani proof inputs
-    /// are ASCII where byte offset == grapheme boundary == display column.
-    /// See #6119.
-    #[cfg(kani)]
-    pub fn new(text: &str) -> Self {
-        // Kani inputs are always ASCII, so use the O(1) identity path.
-        Self {
-            entries: None,
-            text_len: text.len(),
-        }
-    }
-
-    /// Build a column map from line text.
+    /// Build a column map from line text, East Asian Ambiguous characters as
+    /// wide as the terminal's `ambiguous_width` policy draws them.
     ///
     /// For pure-ASCII text, skips grapheme iteration entirely — O(1)
     /// construction with O(1) lookups via identity mapping (#7375).
     /// For non-ASCII text, builds the full grapheme map in O(G).
-    #[cfg(not(kani))]
-    pub fn new(text: &str) -> Self {
-        // Fast path: printable ASCII only — byte offset == display column.
+    pub fn new(text: &str, ambiguous: AmbiguousWidth) -> Self {
+        // Fast path: printable ASCII only — byte offset == display column, under
+        // either ambiguous-width policy (ASCII holds no ambiguous character).
         // Control characters such as tab/newline/carriage return can have
         // zero display width, so they must use the full grapheme map.
         if text.is_ascii() && text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
@@ -240,7 +229,7 @@ impl ColumnMap {
         // where the grid paints 3, a keycap 1 where it paints 2, and the `ය`
         // the grid folds into the cell before it a cell of its own, so every
         // later column on the row named a cell beside the text.
-        for g in grid_graphemes(text) {
+        for g in grid_graphemes_with(text, ambiguous) {
             entries.push(ClusterColumns {
                 offset: g.byte_offset,
                 start: g.start_col,
@@ -364,6 +353,8 @@ impl LowerByteMap {
 
 #[cfg(test)]
 mod tests {
+    use aterm_types::text_shaping::AmbiguousWidth;
+
     use super::{
         ColumnMap, LowerByteMap, byte_to_column, display_columns, map_lower_byte_to_original,
     };
@@ -393,7 +384,7 @@ mod tests {
                 let text = format!("{left}{right}");
                 assert_eq!(
                     display_columns(&text),
-                    ColumnMap::new(&text).end_column(text.len()),
+                    ColumnMap::new(&text, AmbiguousWidth::Single).end_column(text.len()),
                     "text={text:?}"
                 );
             }
@@ -411,7 +402,7 @@ mod tests {
     #[test]
     fn column_map_matches_byte_to_column_ascii() {
         let text = "hello world, this is a test line!";
-        let map = ColumnMap::new(text);
+        let map = ColumnMap::new(text, AmbiguousWidth::Single);
         for offset in 0..=text.len() {
             assert_eq!(
                 map.end_column(offset),
@@ -425,7 +416,7 @@ mod tests {
     #[test]
     fn column_map_matches_byte_to_column_cjk() {
         let text = "ab日本語cd";
-        let map = ColumnMap::new(text);
+        let map = ColumnMap::new(text, AmbiguousWidth::Single);
         for offset in 0..=text.len() {
             assert_eq!(
                 map.end_column(offset),
@@ -438,7 +429,7 @@ mod tests {
     /// ColumnMap handles empty strings.
     #[test]
     fn column_map_empty_string() {
-        let map = ColumnMap::new("");
+        let map = ColumnMap::new("", AmbiguousWidth::Single);
         assert_eq!(map.span(0, 0), (0, 0));
     }
 
@@ -454,7 +445,7 @@ mod tests {
             "\t\n\r abc",              // control chars + ASCII
         ];
         for text in &texts {
-            let map = ColumnMap::new(text);
+            let map = ColumnMap::new(text, AmbiguousWidth::Single);
             for offset in 0..=text.len() {
                 assert_eq!(
                     map.end_column(offset),
@@ -472,7 +463,7 @@ mod tests {
     fn column_map_long_line_all_offsets() {
         // 80 CJK chars = 240 bytes, 160 display columns
         let text: String = "日本語テスト漢字表示".chars().cycle().take(80).collect();
-        let map = ColumnMap::new(&text);
+        let map = ColumnMap::new(&text, AmbiguousWidth::Single);
         for offset in 0..=text.len() {
             assert_eq!(
                 map.end_column(offset),
@@ -553,83 +544,5 @@ mod tests {
                 text.len()
             );
         }
-    }
-}
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::byte_to_column;
-
-    /// byte_to_column monotonicity: a <= b implies byte_to_column(s, a) <= byte_to_column(s, b).
-    /// Uses ASCII content where grapheme iteration is trivial for Kani.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn byte_to_column_monotonic() {
-        let s = "hello world";
-        let a: usize = kani::any();
-        let b: usize = kani::any();
-        kani::assume(a <= b);
-        kani::assume(b <= s.len());
-
-        let col_a = byte_to_column(s, a);
-        let col_b = byte_to_column(s, b);
-
-        kani::assert(col_a <= col_b, "byte_to_column must be monotonic");
-    }
-
-    /// For pure ASCII strings, byte_to_column(s, n) == n (identity mapping).
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn byte_to_column_ascii_identity() {
-        let s = "abcdefghij";
-        let n: usize = kani::any();
-        kani::assume(n <= s.len());
-
-        let col = byte_to_column(s, n);
-
-        kani::assert(col == n, "ASCII: byte offset must equal column");
-    }
-
-    /// byte_to_column(s, 0) == 0 for any string: no graphemes precede offset 0.
-    ///
-    /// Symbolic over string selection: proves byte_to_column(s, 0) == 0
-    /// holds for strings of varying lengths and content types,
-    /// selected symbolically.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn byte_to_column_identity_at_zero() {
-        let case: u8 = kani::any();
-        kani::assume(case <= 3);
-
-        let s = match case {
-            0 => "",            // empty string
-            1 => "a",           // single char
-            2 => "hello world", // multi-word
-            _ => "abcdefghij",  // max-length ASCII
-        };
-
-        let col = byte_to_column(s, 0);
-        kani::assert(
-            col == 0,
-            "byte_to_column(s, 0) must be 0 for any string content",
-        );
-    }
-
-    /// byte_to_column(s, n) <= display_width(s) for any offset n within bounds.
-    /// The column position can never exceed the total display width of the string.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn byte_to_column_bounded_by_display_width() {
-        let s = "hello world";
-        let n: usize = kani::any();
-        kani::assume(n <= s.len() + 1);
-
-        let col = byte_to_column(s, n);
-        let display_width = aterm_grapheme::str_width(s);
-
-        kani::assert(
-            col <= display_width,
-            "column must not exceed total display width",
-        );
     }
 }

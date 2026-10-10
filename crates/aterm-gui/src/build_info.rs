@@ -6,13 +6,15 @@
 //! ([`about_fields`]) and over the control socket
 //! (`aterm-ctl version`, see [`crate::control`]).
 //!
-//! `VERSION` comes from the shared application identity; the commit, build
-//! number and build time are the binary's [`BuildStamp`], stamped by
-//! `crates/aterm/build.rs`.
+//! Every build fact — the version, commit, build number, build time, compiler,
+//! profile and release marker — is the binary's [`BuildStamp`], compiled into
+//! `crates/aterm` and installed there first thing in `main`; this library
+//! compiles none of them in and reads them at runtime (`stamp()`).
 //! [`binary_signature`] is computed at runtime from the actual executable, so it
 //! reflects the EXACT shipped bytes (the `.app`'s signed binary hashes differently
 //! from the bare `target/release` binary — which is correct: it is what's running).
 
+use aterm_types::version::BuildStamp;
 use std::hash::Hasher;
 use std::sync::OnceLock;
 
@@ -32,89 +34,8 @@ pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
 /// row — `alab.systems`, from the one identity every surface shares.
 pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
-/// Application identity shared across the one binary: `[workspace.package]
-/// version`, as written, in every build.
-pub(crate) const VERSION: &str = aterm_types::version::APP_VERSION;
-
-/// THE PER-COMMIT HALF OF BUILD PROVENANCE, stamped into the shipped binary by
-/// `crates/aterm/build.rs` and handed to this library at the top of `main`
-/// ([`install_build_stamp`], spelled by [`build_stamp!`](crate::build_stamp)).
-///
-/// WHY IT IS NOT AN `env!` OF THIS CRATE (2026-10-05). It was, stamped by this
-/// crate's own build script, and every value here moves with every commit. A
-/// build script's `rustc-env` reaches every unit of its package, so a commit that
-/// touched nothing here (an empty one, a docs edit) re-ran that script and
-/// recompiled all of aterm-gui (its lib, its lib tests, its examples and bin)
-/// and then everything that links it. Measured on the incremental dev profile:
-/// an empty commit cost 185 s of `targo --unverified test --workspace
-/// --no-run` (aterm-gui, aterm-release and aterm recompiled); in the gate, whose
-/// `CARGO_INCREMENTAL=0` makes each a cold compile of ~900k lines, it was most
-/// of a test-compile stage. Stamped in the binary crate instead, a commit
-/// recompiles that crate's own small units and relinks.
-///
-/// The values and their meaning are unchanged: every surface (About, `aterm
-/// ctl version`, the menu signature, the handoff identity, the bundle's build
-/// number) reads them through the accessors below. A process whose `main` never
-/// installed a stamp (the dev-only `aterm-gui` bin and its examples) reads
-/// [`BuildStamp::UNSTAMPED`]: the facts a build without git always carried
-/// (`unknown`, build `0`), which the handoff already refuses outside
-/// `debug_assertions`. This library's own test binary reads `TEST_STAMP`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BuildStamp {
-    /// Short commit (12 hex, `-dirty` suffixed for an uncommitted tree), or
-    /// `"unknown"` without git.
-    pub git_commit: &'static str,
-    /// All forty hexadecimal commit characters, or `"unknown"`.
-    pub git_commit_full: &'static str,
-    /// `"true"` when the tree had uncommitted changes, else `"false"`.
-    pub git_dirty: &'static str,
-    /// UTC build timestamp (RFC3339), or `"unknown"`.
-    pub build_time: &'static str,
-    /// Monotonic build number (see [`build_number`]).
-    pub build_number: &'static str,
-    /// Commits since the newest release tag (see [`dev_commits`]).
-    pub dev_commits: &'static str,
-}
-
-impl BuildStamp {
-    /// What a process reads before (or without) [`install_build_stamp`].
-    pub const UNSTAMPED: Self = Self {
-        git_commit: "unknown",
-        git_commit_full: "unknown",
-        git_dirty: "false",
-        build_time: "unknown",
-        build_number: "0",
-        dev_commits: "0",
-    };
-}
-
-static STAMP: OnceLock<BuildStamp> = OnceLock::new();
-
-/// Install the running binary's [`BuildStamp`]. The binary's `main` calls this
-/// first, before anything reads provenance; the first install wins, so nothing
-/// later in the process can re-stamp it.
-pub fn install_build_stamp(stamp: BuildStamp) {
-    let _ = STAMP.set(stamp);
-}
-
-/// The [`BuildStamp`] of the crate that expands it, read from the `rustc-env`
-/// values `crates/aterm/build.rs` emits. Only a crate whose build script emits
-/// them can expand it: the compile fails otherwise, never a silent default.
-#[macro_export]
-macro_rules! build_stamp {
-    () => {
-        $crate::BuildStamp {
-            git_commit: env!("ATERM_GIT_COMMIT"),
-            git_commit_full: env!("ATERM_GIT_COMMIT_FULL"),
-            git_dirty: env!("ATERM_GIT_DIRTY"),
-            build_time: env!("ATERM_BUILD_TIME"),
-            build_number: env!("ATERM_BUILD_NUMBER"),
-            dev_commits: env!("ATERM_DEV_COMMITS"),
-        }
-    };
-}
-
-/// What this library's OWN test binary reads: a clean, stamped, CURRENT build.
+/// What this library's OWN test binary reads: a clean, stamped, CURRENT Trust
+/// build.
 ///
 /// Its tests were written against a compile-time stamp that always carried the
 /// tree's real commit and its committer epoch, so they exercise the stamped
@@ -123,22 +44,48 @@ macro_rules! build_stamp {
 /// fixed stamp keeps both true and makes the suite deterministic: the commit is
 /// a recognisable non-commit, and the build number is 2065's epoch, far above
 /// any real release and well inside the sub-2^32 range `CFBundleVersion` takes.
+/// The version is the workspace's (test-only: the library itself compiles none
+/// in), and the compiler is a fixed Trust `-vV`.
 #[cfg(test)]
 const TEST_STAMP: BuildStamp = BuildStamp {
+    app_version: env!("CARGO_PKG_VERSION"),
     git_commit: "7e57b1d0c0de",
     git_commit_full: "7e57b1d0c0de7e57b1d0c0de7e57b1d0c0de7e57",
     git_dirty: "false",
     build_time: "2065-01-24T05:20:00Z",
     build_number: "3000000000",
     dev_commits: "1",
+    compiler_version_line: "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)",
+    compiler_commit: "321aaeda75478038420d97830f14724c33c8dc39",
+    compiler_host: "aarch64-apple-darwin",
+    compiler_trust_version: "0.1.0",
+    compiler_flavor: "t",
+    build_profile: "debug",
+    trust_verify: "off",
+    release_build: false,
 };
 
+/// The running binary's build facts: the stamp `crates/aterm` installs first
+/// thing in `main` (`aterm_types::version`), which every surface here (About,
+/// `aterm ctl version`, the menu signature, the handoff identity, the bundle's
+/// build number) reads through the accessors below. A process whose `main`
+/// installed none (the dev-only `aterm-gui` bin and its examples) reads
+/// [`BuildStamp::UNSTAMPED`]: the facts a build without git always carried
+/// (`unknown`, build `0`), which the handoff already refuses outside
+/// `debug_assertions`. This library's own test binary reads `TEST_STAMP`.
 fn stamp() -> &'static BuildStamp {
     #[cfg(test)]
     let unstamped = &TEST_STAMP;
     #[cfg(not(test))]
     let unstamped = &BuildStamp::UNSTAMPED;
-    STAMP.get().unwrap_or(unstamped)
+    aterm_types::version::installed().unwrap_or(unstamped)
+}
+
+/// Application identity shared across the one binary: `[workspace.package]
+/// version`, as written, in every build.
+#[must_use]
+pub(crate) fn version() -> &'static str {
+    stamp().app_version
 }
 
 /// Short git commit the binary was built from, with a `-dirty` suffix when the
@@ -196,53 +143,76 @@ pub(crate) fn dev_commits() -> &'static str {
 
 /// Whether a release lane produced this binary. `targo --unverified ship cut` (both
 /// architecture builds) and the Linux release lane set `ATERM_RELEASE_BUILD`
-/// for the build, and no ordinary build does, so its presence at compile time
-/// IS the release/dev discriminator — read by display surfaces only (the DEV
-/// signature of [`crate::menu::version_signature`]). No Windows lane goes through
-/// the release cutter, so every Windows build reads `· DEV` today, truthfully;
-/// only a Windows release lane may ever set it. It carries no version: every
-/// build reports [`VERSION`].
-pub(crate) const IS_RELEASE_BUILD: bool = option_env!("ATERM_RELEASE_BUILD").is_some();
+/// for the binary crate's compile, and no ordinary build does, so its presence
+/// at compile time IS the release/dev discriminator — read by display surfaces
+/// only (the DEV signature of [`crate::menu::version_signature`]). No Windows
+/// lane goes through the release cutter, so every Windows build reads `· DEV`
+/// today, truthfully; only a Windows release lane may ever set it. It carries no
+/// version: every build reports [`version`].
+#[must_use]
+pub(crate) fn is_release_build() -> bool {
+    stamp().release_build
+}
 
 /// Full first line of the producing compiler's `-vV`, e.g.
 /// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
 /// `rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc)` — trustc leads with the
 /// canonical `rustc` token by ecosystem contract (version-sniffing build
-/// scripts assert it) and self-identifies in the parenthetical. Stamped by
-/// `build.rs`.
-pub(crate) const COMPILER_VERSION_LINE: &str = env!("ATERM_COMPILER_VERSION_LINE");
+/// scripts assert it) and self-identifies in the parenthetical.
+#[must_use]
+pub(crate) fn compiler_version_line() -> &'static str {
+    stamp().compiler_version_line
+}
 
 /// The producing compiler's FULL git commit hash (`commit-hash:` from `-vV`), or
 /// `"unknown"`. This is what tells two coexisting 1.96.0 toolchains apart —
-/// per-binary compiler provenance. Stamped by `build.rs`.
-pub(crate) const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
+/// per-binary compiler provenance.
+#[must_use]
+pub(crate) fn compiler_commit() -> &'static str {
+    stamp().compiler_commit
+}
 
-/// The producing compiler's host triple (`host:` from `-vV`). Stamped by `build.rs`.
-pub(crate) const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
+/// The producing compiler's host triple (`host:` from `-vV`).
+#[must_use]
+pub(crate) fn compiler_host() -> &'static str {
+    stamp().compiler_host
+}
 
 /// Trust's OWN version — the `trust:` line of the producing compiler's `-vV`
-/// (e.g. `0.1.0`). This is NOT the `1.99.0-dev` in [`COMPILER_VERSION_LINE`]:
+/// (e.g. `0.1.0`). This is NOT the `1.99.0-dev` in [`compiler_version_line`]:
 /// that token is the RUST release Trust is compatible with, and it stays
 /// rustc-shaped on purpose — cargo, targo and every version-sniffing build
 /// script parse `rustc <release>` off the first line, and rustup refuses a
 /// toolchain without a `bin/rustc` — so the compatibility protocol cannot be
 /// where Trust says its own name. It says it here. `""` when the compiler
 /// reported no such line (upstream rustc, or a Trust build predating the
-/// marker). Stamped by `build.rs`.
-pub(crate) const COMPILER_TRUST_VERSION: &str = env!("ATERM_COMPILER_TRUST_VERSION");
+/// marker).
+#[must_use]
+pub(crate) fn compiler_trust_version() -> &'static str {
+    stamp().compiler_trust_version
+}
 
 /// Compiler flavor: `"r"` = upstream Rust, `"t"` = Trust (trustc). Detection order
-/// (see `build.rs` / `compiler_probe.rs`): the `-vV` self-identification,
-/// `/trust/` in the RUSTC path, `RUSTUP_TOOLCHAIN=trust`, else `"r"`. Evidence
-/// only — no build-environment override can flip it (the `build.rs` name below
-/// is a `cargo:rustc-env` conduit the build script writes, not one it reads).
-pub(crate) const COMPILER_FLAVOR: &str = env!("ATERM_COMPILER_FLAVOR");
+/// (see `crates/aterm/build.rs` / `compiler_probe.rs`): the `-vV`
+/// self-identification, `/trust/` in the RUSTC path, `RUSTUP_TOOLCHAIN=trust`,
+/// else `"r"`. Evidence only — no build-environment override can flip it.
+#[must_use]
+pub(crate) fn compiler_flavor() -> &'static str {
+    stamp().compiler_flavor
+}
 
 /// Cargo profile the binary was compiled under (`"debug"`/`"release"`).
-pub(crate) const BUILD_PROFILE: &str = env!("ATERM_BUILD_PROFILE");
+#[must_use]
+pub(crate) fn build_profile() -> &'static str {
+    stamp().build_profile
+}
 
-/// `"on"` iff `--cfg trust_verify` was active in this compile, else `"off"`.
-pub(crate) const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
+/// `"on"` iff the Trust verification pipeline was in the binary's compile, else
+/// `"off"`.
+#[must_use]
+pub(crate) fn trust_verify() -> &'static str {
+    stamp().trust_verify
+}
 
 /// Exact lowercase SHA-256 fingerprint of the raw paper master key — the one anchor
 /// that authorizes a release — or the all-zero sentinel when none is pinned (a fork).
@@ -280,8 +250,9 @@ static ATERM_UPDATE_PIN_RECORD: [u8; 64] = update_pin_record_bytes(EMBEDDED_UPDA
 /// `"unknown"` when the toolchain didn't report a hash (e.g. some distro builds).
 #[must_use]
 pub(crate) fn compiler_commit_short() -> &'static str {
-    if COMPILER_COMMIT.len() >= 8 && COMPILER_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()) {
-        &COMPILER_COMMIT[..8]
+    let commit = compiler_commit();
+    if commit.len() >= 8 && commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &commit[..8]
     } else {
         "unknown"
     }
@@ -298,13 +269,13 @@ pub(crate) fn compiler_commit_short() -> &'static str {
 /// [`build_number`], so this string can never affect an update comparison.
 #[must_use]
 pub(crate) fn version_display() -> &'static str {
-    VERSION
+    version()
 }
 
 /// The compiler's bare release, e.g. `1.96.0` / `1.96.0-dev` — the second token of
 /// the `-vV` first line (`rustc <release> (<hash> <date>)`), `"unknown"` if absent.
 fn compiler_release() -> &'static str {
-    COMPILER_VERSION_LINE
+    compiler_version_line()
         .split_whitespace()
         .nth(1)
         .unwrap_or("unknown")
@@ -316,11 +287,12 @@ fn compiler_release() -> &'static str {
 /// decides what to call the compiler; the flavor classifier already weighed the
 /// compiler's own self-identification, so this is a rendering, not a guess.
 fn toolchain_display() -> String {
-    if COMPILER_FLAVOR == "t" {
-        if COMPILER_TRUST_VERSION.is_empty() {
+    if compiler_flavor() == "t" {
+        let trust = compiler_trust_version();
+        if trust.is_empty() {
             "Trust (version unreported)".to_string()
         } else {
-            format!("Trust {COMPILER_TRUST_VERSION}")
+            format!("Trust {trust}")
         }
     } else {
         format!("Rust {}", compiler_release())
@@ -343,15 +315,17 @@ fn toolchain_display() -> String {
 #[must_use]
 pub(crate) fn compiler_summary() -> String {
     let slug = compiler_commit_short();
-    if COMPILER_FLAVOR == "t" {
+    let profile = build_profile();
+    let verify = trust_verify();
+    if compiler_flavor() == "t" {
         format!(
-            "{} \u{00b7} trustc {slug} \u{00b7} compatible with Rust {} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
+            "{} \u{00b7} trustc {slug} \u{00b7} compatible with Rust {} \u{00b7} {profile} \u{00b7} trust_verify {verify}",
             toolchain_display(),
             compiler_release(),
         )
     } else {
         format!(
-            "{} \u{00b7} rustc {slug} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
+            "{} \u{00b7} rustc {slug} \u{00b7} {profile} \u{00b7} trust_verify {verify}",
             toolchain_display(),
         )
     }
@@ -462,13 +436,17 @@ pub(crate) fn which_copy_rows(
 /// release token, unchanged, for every script that already parses it.
 #[must_use]
 pub(crate) fn control_line() -> String {
-    let trust = if COMPILER_FLAVOR != "t" {
+    let flavor = compiler_flavor();
+    let trust = if flavor != "t" {
         "none"
-    } else if COMPILER_TRUST_VERSION.is_empty() {
+    } else if compiler_trust_version().is_empty() {
         "unreported"
     } else {
-        COMPILER_TRUST_VERSION
+        compiler_trust_version()
     };
+    let host = compiler_host();
+    let profile = build_profile();
+    let verify = trust_verify();
     // `update_pin_sha256=`: the paper master this build trusts — the one anchor that
     // authorizes a release. A pure function of a compiled-in const, so it is
     // computed once, not on every `version` (every `aterm ctl` call's probe).
@@ -485,9 +463,9 @@ pub(crate) fn control_line() -> String {
     let objc_contained = 0u64;
     format!(
         "OK version={} build={} commit={} built={} \
-         arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
+         arch={} trustc={} trustc_commit={} trustc_host={host} flavor={flavor} \
          trust={trust} rust_compat={} \
-         profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
+         profile={profile} trust_verify={verify} update_pin_sha256={update_pin_sha256} \
          objc_contained={objc_contained} signature={}\n",
         version_display(),
         build_number(),
@@ -532,33 +510,7 @@ mod tests {
     fn version_display_is_shared_application_identity() {
         let v = version_display();
         assert!(!v.contains('+'), "no compiler suffix in the version: {v}");
-        assert_eq!(v, aterm_types::version::APP_VERSION);
-    }
-
-    /// On this box (stock cargo, no override, no trust toolchain) the flavor
-    /// defaults to 'r'; the compile-time constants must agree with the classifier's
-    /// contract either way (only 'r'/'t' can ever be stamped).
-    #[test]
-    fn stamped_flavor_is_r_or_t() {
-        assert!(
-            COMPILER_FLAVOR == "r" || COMPILER_FLAVOR == "t",
-            "stamped flavor must be r|t: {COMPILER_FLAVOR}"
-        );
-        assert!(TRUST_VERIFY == "on" || TRUST_VERIFY == "off");
-        // The raw -vV first line leads with `rustc` today by ecosystem contract;
-        // accept a future trustc-led banner too so the toolchain can drop the
-        // compat token without breaking this crate.
-        assert!(
-            !COMPILER_VERSION_LINE.is_empty()
-                && (COMPILER_VERSION_LINE.starts_with("rustc ")
-                    || COMPILER_VERSION_LINE.starts_with("trustc ")),
-            "unexpected -vV first line: {COMPILER_VERSION_LINE}"
-        );
-        assert_ne!(
-            compiler_release(),
-            "unknown",
-            "release parsed from the -vV line"
-        );
+        assert_eq!(v, stamp().app_version);
     }
 
     /// The section record and runtime updater are derived independently from
@@ -682,11 +634,13 @@ mod tests {
         );
         assert!(
             row.contains(&format!(
-                " \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}"
+                " \u{00b7} {} \u{00b7} trust_verify {}",
+                build_profile(),
+                trust_verify()
             )),
             "{row}"
         );
-        if COMPILER_FLAVOR == "t" {
+        if compiler_flavor() == "t" {
             assert!(row.starts_with("Trust"), "leads with Trust: {row}");
             assert!(
                 row.contains(&format!(
@@ -702,13 +656,14 @@ mod tests {
                 )),
                 "the Rust release is a labelled compatibility fact: {row}"
             );
-            if !COMPILER_TRUST_VERSION.is_empty() {
+            let trust = compiler_trust_version();
+            if !trust.is_empty() {
                 assert!(
-                    row.starts_with(&format!("Trust {COMPILER_TRUST_VERSION} \u{00b7} ")),
+                    row.starts_with(&format!("Trust {trust} \u{00b7} ")),
                     "Trust's own version, from the trust: line: {row}"
                 );
                 assert_ne!(
-                    COMPILER_TRUST_VERSION,
+                    trust,
                     compiler_release(),
                     "Trust's own version is not the rust-compat release"
                 );
@@ -780,9 +735,11 @@ mod tests {
         // `rust_compat=` is the same token `trustc=` has always carried.
         assert_eq!(value("rust_compat="), value("trustc="));
         assert_eq!(value("rust_compat="), compiler_release());
-        match COMPILER_FLAVOR {
-            "t" if COMPILER_TRUST_VERSION.is_empty() => assert_eq!(value("trust="), "unreported"),
-            "t" => assert_eq!(value("trust="), COMPILER_TRUST_VERSION),
+        match compiler_flavor() {
+            "t" if compiler_trust_version().is_empty() => {
+                assert_eq!(value("trust="), "unreported");
+            }
+            "t" => assert_eq!(value("trust="), compiler_trust_version()),
             _ => assert_eq!(value("trust="), "none"),
         }
         for key in [

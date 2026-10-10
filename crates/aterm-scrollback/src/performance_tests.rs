@@ -41,11 +41,10 @@ fn truncate_slow_path_scales_with_kept_lines() {
 
 /// Prove that push_line with line_limit does NOT degrade with scrollback size.
 ///
-/// Before #5893: every push to a full scrollback triggered O(total_lines)
-/// decompress-all truncate. After: cold tier front_offset gives O(1) truncate.
+/// #5893: cold tier front_offset gives O(1) truncate, where a decompress-all
+/// truncate costs O(total_lines) per push to a full scrollback.
 ///
-/// COUNTED, NOT TIMED (it compared wall-clock push throughput at two fill
-/// levels, ratio < 5x, and went red under a loaded gate on unchanged code). The
+/// COUNTED, NOT TIMED (wall-clock ratios went red under a loaded gate). The
 /// work a decompress-all truncate does is DECODING: every block it reads walks
 /// its serialized records. So the proof counts the records walked
 /// ([`crate::line::take_records_walked`], counted at the one walk every block
@@ -236,9 +235,9 @@ fn remove_newest_all_lines() {
 /// #5918: Prove that `remove_newest(1)` on a large scrollback does NOT spike
 /// memory to O(total_lines).
 ///
-/// Before the tier-aware fix, `remove_newest` loaded ALL kept lines into a Vec
-/// when removal spanned tiers (OOM on large scrollbacks). The tier-aware
-/// implementation decompresses at most one boundary block (~block_size lines).
+/// Loading ALL kept lines into a Vec when removal spans tiers OOMs on large
+/// scrollbacks; the tier-aware path decompresses at most one boundary block
+/// (~block_size lines).
 ///
 /// This test verifies the memory-bounded property by checking that
 /// `memory_used()` after `remove_newest(1)` stays close to the pre-removal

@@ -77,12 +77,22 @@ use crate::term_lock;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InputEvent {
     /// A key chord. `base_layout` is the US-QWERTY equivalent of the physical key,
-    /// fed to `encode_key_with_layout` so Kitty `REPORT_ALTERNATE_KEYS` carries the
+    /// fed to `encode_key_with_text` so Kitty `REPORT_ALTERNATE_KEYS` carries the
     /// 3rd CSI-u field identically for both sources (kills divergences f/h).
     Key {
         key: Key,
         mods: Modifiers,
         base_layout: Option<char>,
+        /// The character the ACTIVE LAYOUT typed for a text press, when it is not
+        /// what the engine derives from `key` (the layout's UNSHIFTED key) on its
+        /// own: German Shift+2's `"`, Caps Lock's `A`
+        /// (`keymap::layout_text` builds it from winit's composed text). Fed
+        /// to `encode_key_with_text`, which writes it for a text press and keeps
+        /// `key` for kitty key codes and every Ctrl/Alt chord. `None` from a
+        /// controller (`key`/`ctrl` verbs name no layout) and whenever the US
+        /// derivation already agrees, so the two sources still build EQUAL
+        /// events for the same intent on a US layout.
+        layout_text: Option<char>,
         /// Press / Repeat / Release. The human winit path only ever builds
         /// `Press` (releases are dropped at `on_key`); the `key` verb can request
         /// any via `type=press|repeat|release`, so a controller can drive the
@@ -232,24 +242,46 @@ impl InputEvent {
     /// never sees the folded event — the keypad identity
     /// `keymap::build_key_input` resolves is exactly what DECKPAM's SS3 forms
     /// and kitty disambiguate exist to report.
+    ///
+    /// A keypad glyph's twin carries itself as its `layout_text`: Shift picks
+    /// a keypad level and never composes, so Shift+KP_5 types the '5' the
+    /// encoder writes for it. Left to [`typed_glyph`], the main row's Shift
+    /// table made it '%' — in a native text field and in the predicted echo.
     pub(crate) fn keypad_folded(&self) -> Option<InputEvent> {
         let InputEvent::Key {
             key,
             mods,
             base_layout,
+            layout_text,
             event_type,
         } = self
         else {
             return None;
         };
         let key = key.main_block_twin()?;
+        let layout_text = match key {
+            Key::Character(glyph) => Some(glyph),
+            _ => *layout_text,
+        };
         Some(InputEvent::Key {
             key,
             mods: *mods,
             base_layout: *base_layout,
+            layout_text,
             event_type: *event_type,
         })
     }
+}
+
+/// The character a TEXT press of base key `c` types: the layout's own when the
+/// window carried it (`InputEvent::Key::layout_text`), else the engine's US
+/// derivation (Shift's table, Caps Lock's capital) — exactly the glyph the
+/// encoder writes for it, so a reader of the press's MEANING (the press
+/// classifier's predicted echo, a native page's text field) types what the
+/// terminal would have.
+#[must_use]
+pub(crate) fn typed_glyph(c: char, mods: Modifiers, layout_text: Option<char>) -> char {
+    layout_text.unwrap_or_else(|| aterm_types::keyboard::typed_character(c, mods))
 }
 
 /// Sub-cell pixel offset of the pointer INSIDE its grid cell, carried on every
@@ -999,7 +1031,7 @@ pub(crate) fn seam_egress(
 
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
 /// SOLE reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the SOLE caller
-/// of `encode_key_with_layout` / the `encode_mouse_*` family / `encode_committed_
+/// of `encode_key_with_text` / the `encode_mouse_*` family / `encode_committed_
 /// text` / `format_paste_framed` / the focus-report egress, reading the relevant mode
 /// ONCE per event — the keyboard mode LOCK-FREE from the terminal's published
 /// [`ModeMirror`] (Key/Text arms: no mutex on the press path at all), the mouse and
@@ -1117,18 +1149,20 @@ fn seam_egress_inner(
             key,
             mods,
             base_layout,
+            layout_text,
             event_type,
         } => {
             // LOCK-FREE: the keyboard mode comes from the terminal's published
             // mirror, not from a second `term_lock` behind the PTY reader's
             // `process()` slice. `process()` republishes it before every hold
             // ends, so this word is the mode the last completed batch left.
-            let bytes = aterm_types::keyboard::encode_key_with_layout(
+            let bytes = aterm_types::keyboard::encode_key_with_text(
                 key,
                 *mods,
                 modes.keyboard_mode(),
                 *event_type,
                 *base_layout,
+                *layout_text,
             );
             let d = if bytes.is_empty() {
                 Delivery::Full // faithful no-op (e.g. legacy release): nothing to deliver
@@ -1169,17 +1203,24 @@ fn seam_egress_inner(
             ..
         } => {
             let report = {
-                let t = term_lock(term);
+                let mut t = term_lock(term);
                 if t.mouse_tracking_enabled() {
                     // DEC 1016 (SGR-pixel) reports a genuine PIXEL coordinate; every
                     // other encoding reports the cell. `report_coords` resolves which
                     // under the SAME lock that reads the mode (no extra read window).
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
-                    if *pressed {
-                        Some(t.encode_mouse_press(button.code(), rx, ry, *mods))
+                    let bytes = if *pressed {
+                        t.encode_mouse_press(button.code(), rx, ry, *mods)
                     } else {
-                        Some(t.encode_mouse_release(button.code(), rx, ry, *mods))
+                        t.encode_mouse_release(button.code(), rx, ry, *mods)
+                    };
+                    // A press or release names a position too: xterm sets its
+                    // motion memo on both, so a drag that never leaves the
+                    // pressed cell reports no motion at all.
+                    if bytes.is_some() {
+                        t.note_mouse_report(rx, ry);
                     }
+                    Some(bytes)
                 } else {
                     None
                 }
@@ -1208,10 +1249,25 @@ fn seam_egress_inner(
             ..
         } => {
             let report = {
-                let t = term_lock(term);
+                let mut t = term_lock(term);
                 if t.mouse_tracking_enabled() {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
-                    Some(t.encode_mouse_motion(*buttons, rx, ry, *mods))
+                    // ONE REPORT PER POSITION (xterm ctlseqs: button-event motion
+                    // is "reported only if the mouse pointer has moved to a
+                    // different character cell"). Compared in the coordinates the
+                    // report carries, so under DEC 1016 every new pixel is new.
+                    // Here, in the source-blind seam, so a controller's motion and
+                    // a person's are deduplicated alike against the one memo every
+                    // press, release, wheel and motion report writes.
+                    if t.mouse_motion_repeats_last_report(rx, ry) {
+                        Some(None)
+                    } else {
+                        let bytes = t.encode_mouse_motion(*buttons, rx, ry, *mods);
+                        if bytes.is_some() {
+                            t.note_mouse_report(rx, ry);
+                        }
+                        Some(bytes)
+                    }
                 } else {
                     None
                 }
@@ -1273,7 +1329,7 @@ fn seam_egress_inner(
                 Fallback(WheelViewport),
             }
             let plan = {
-                let t = term_lock(term);
+                let mut t = term_lock(term);
                 // The precedence (Shift bypass > Alt local-override > tracking >
                 // alt-scroll > viewport) lives in `wheel_route` — pure, so the
                 // table is pinned by tests on every platform. The facts are read
@@ -1289,10 +1345,15 @@ fn seam_egress_inner(
                         // notch->lines conversion (vim's `mousescroll`, default 3).
                         // Multiplying here would hand vim three notches to multiply,
                         // i.e. nine lines a detent on Windows.
-                        Some(b) => WheelPlan::Write {
-                            bytes: b,
-                            repeat: lines,
-                        },
+                        Some(b) => {
+                            // A wheel notch is a press (xterm buttons 4-7): it names
+                            // the pointer's position like any other.
+                            t.note_mouse_report(rx, ry);
+                            WheelPlan::Write {
+                                bytes: b,
+                                repeat: lines,
+                            }
+                        }
                         None => WheelPlan::Swallow, // X10 (mode 9) is press-only
                     }
                 } else if route == WheelRoute::AltScroll
@@ -1473,15 +1534,23 @@ pub(crate) fn shell_escape_path(path: &str) -> String {
 /// verbatim. A path of only inert chars (alphanumerics incl. non-ASCII, `\ / :
 /// . - _`) is returned unchanged so tame paths paste clean; anything else —
 /// space, `( )` , `,` (a PowerShell array separator!), `& | < > ; @ $ ' ~` … —
-/// triggers the quotes. Known residue: cmd expands `%VAR%` and PowerShell
-/// expands `$name` even inside double quotes; no single quoting works in both
-/// shells, and such names are vanishingly rare in droppable paths. Defined
+/// triggers the quotes.
+///
+/// A name whose characters are live inside double quotes
+/// ([`live_in_double_quotes`]: a `$` expansion, which runs `$(…)`, a backtick,
+/// a typographic double quote) goes in single quotes instead
+/// ([`windows_single_quoted`]): a name is chosen by whoever made the file, and
+/// the dropped text runs when the person presses Enter. Known residue: cmd
+/// expands `%VAR%` in either form (an environment value, not code). Defined
 /// winit/fs-free so it is unit-tested on every target.
 #[cfg(any(windows, test))]
 pub(crate) fn shell_escape_path_windows(path: &str) -> String {
     let inert = |c: char| c.is_alphanumeric() || matches!(c, '\\' | '/' | ':' | '.' | '-' | '_');
     if path.chars().all(inert) {
         return path.to_string();
+    }
+    if live_in_double_quotes(path) {
+        return windows_single_quoted(path);
     }
     let mut out = String::with_capacity(path.len() + 2);
     out.push('"');
@@ -1492,6 +1561,49 @@ pub(crate) fn shell_escape_path_windows(path: &str) -> String {
         out.push(c);
     }
     out.push('"');
+    out
+}
+
+/// Whether `path` holds a character a shell aterm runs on Windows acts on
+/// inside double quotes: PowerShell and Git Bash expand `$name`, `${…}` and
+/// `$(…)` (which RUNS a command) and read a backtick (PowerShell's escape,
+/// bash's command substitution), and PowerShell ends a double-quoted string at
+/// a typographic `“ ” „` as at `"`. A `$` before a separator or at the end
+/// starts nothing (an admin share's `\\host\C$\`), so it stays double-quoted.
+#[cfg(any(windows, test))]
+fn live_in_double_quotes(path: &str) -> bool {
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' | '\u{201C}' | '\u{201D}' | '\u{201E}' => return true,
+            '$' if !matches!(chars.peek(), None | Some('\\')) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The single-quoted form for a name [`live_in_double_quotes`] refuses.
+/// PowerShell reads it literally once every character it takes for a single
+/// quote (`'` and `‘ ’ ‚ ‛`) is doubled, its own escape; Git Bash reads it
+/// literally. cmd has no single quotes, so there `^` goes before its command
+/// separator `&` and before `^` itself, and the token cannot become a second
+/// command. Such a name then reaches cmd and bash with extra characters and
+/// names no file: no quoting serves it in every shell, and a wrong path is the
+/// failure that runs nothing.
+#[cfg(any(windows, test))]
+fn windows_single_quoted(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('\'');
+    for c in path.chars() {
+        match c {
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => out.push(c),
+            '&' | '^' => out.push('^'),
+            _ => {}
+        }
+        out.push(c);
+    }
+    out.push('\'');
     out
 }
 
@@ -1959,6 +2071,7 @@ mod tests {
             key: Key::Named(NamedKey::ArrowUp),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         };
         assert_eq!(
@@ -1976,6 +2089,7 @@ mod tests {
             key: Key::Named(NamedKey::ArrowUp),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Release, // legacy: encodes to nothing
         };
         assert_eq!(
@@ -2099,6 +2213,7 @@ mod tests {
                     key: Key::Named(NamedKey::Enter),
                     mods: Modifiers::SHIFT,
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 };
                 let a = seam_egress(&term, &modes, &sink, &press, EgressMode::Interactive);
@@ -2695,18 +2810,21 @@ mod tests {
                 key: Key::Character('a'),
                 mods: Modifiers::CTRL | Modifiers::SHIFT,
                 base_layout: Some('a'),
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             },
             InputEvent::Key {
                 key: Key::Named(NamedKey::ArrowUp),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             },
             InputEvent::Key {
                 key: Key::Named(NamedKey::Enter),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             },
             InputEvent::Text("héllo 日本".to_string()),
@@ -2884,6 +3002,7 @@ mod tests {
                 key,
                 mods: Modifiers::empty(),
                 base_layout: base,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             }
         };
@@ -2899,6 +3018,7 @@ mod tests {
                 key: Key::Named(NamedKey::ArrowUp),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press
             },
         );
@@ -2912,6 +3032,7 @@ mod tests {
                 key,
                 mods: Modifiers::CTRL,
                 base_layout: base,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             }
         };
@@ -2986,6 +3107,7 @@ mod tests {
                 key,
                 mods,
                 base_layout,
+                layout_text,
                 event_type,
             } = ev
             else {
@@ -2998,12 +3120,13 @@ mod tests {
                 *mods
             };
             let t = term_lock(term);
-            aterm_types::keyboard::encode_key_with_layout(
+            aterm_types::keyboard::encode_key_with_text(
                 key,
                 mods,
                 t.keyboard_mode(),
                 *event_type,
                 *base_layout,
+                *layout_text,
             )
         }
 
@@ -3012,6 +3135,7 @@ mod tests {
             key: Key::Character('a'),
             mods: Modifiers::CTRL | Modifiers::SHIFT,
             base_layout: Some('a'),
+            layout_text: None,
             event_type: aterm_types::keyboard::KeyEventType::Press,
         };
         let human = buggy_key_bytes(&term, &ev, false);
@@ -3418,6 +3542,53 @@ mod tests {
             "\"C:\\a&b;c|d.txt\""
         );
         assert_eq!(shell_escape_path_windows("a\"b"), "\"a\"\"b\"");
+    }
+
+    /// A file NAME is chosen by whoever made the file (a download, an archive),
+    /// and a dropped path sits at the prompt until the person presses Enter.
+    /// Inside double quotes PowerShell runs `$(…)` (Git Bash too, and a
+    /// backtick in both), and PowerShell ends a double-quoted string at a
+    /// typographic `”` as at `"`. A name carrying any of them goes in single
+    /// quotes — literal in PowerShell and bash, with every character
+    /// PowerShell reads as a single quote doubled — and cmd, which has no
+    /// single quotes, gets `^` before its separator `&` and its escape `^`.
+    #[test]
+    fn shell_escape_path_windows_never_leaves_an_expansion_live() {
+        let dl = "C:\\Users\\me\\Downloads\\";
+        for (name, want) in [
+            ("a$(calc).pdf", "'a$(calc).pdf'"),
+            ("a${env:PATH}.pdf", "'a${env:PATH}.pdf'"),
+            ("a$x b.pdf", "'a$x b.pdf'"),
+            ("a`$(calc)`.pdf", "'a`$(calc)`.pdf'"),
+            (
+                "a\u{201D};calc;\u{201D}.pdf",
+                "'a\u{201D};calc;\u{201D}.pdf'",
+            ),
+            ("a\u{201C} b.pdf", "'a\u{201C} b.pdf'"),
+            ("a\u{201E} b.pdf", "'a\u{201E} b.pdf'"),
+            // The single-quote class is doubled, PowerShell's own escape.
+            ("O'Neil $(x).pdf", "'O''Neil $(x).pdf'"),
+            (
+                "a\u{2019};calc;\u{2018}$(x).pdf",
+                "'a\u{2019}\u{2019};calc;\u{2018}\u{2018}$(x).pdf'",
+            ),
+            // cmd reads `'` as a character: its separator stays escaped.
+            ("a&calc&$(x).pdf", "'a^&calc^&$(x).pdf'"),
+            ("a^&$(x).pdf", "'a^^^&$(x).pdf'"),
+        ] {
+            assert_eq!(
+                shell_escape_path_windows(&format!("{dl}{name}")),
+                want.replacen('\'', &format!("'{dl}"), 1),
+                "{name:?}"
+            );
+        }
+        // A `$` that starts nothing (an admin share's `C$\`, a trailing `$`)
+        // keeps the double quotes cmd needs for a space.
+        assert_eq!(
+            shell_escape_path_windows("\\\\host\\C$\\My Docs\\a.txt"),
+            "\"\\\\host\\C$\\My Docs\\a.txt\""
+        );
+        assert_eq!(shell_escape_path_windows("C:\\x y$"), "\"C:\\x y$\"");
     }
 
     /// The `shell_escape_path` entry point the drop site calls dispatches to the

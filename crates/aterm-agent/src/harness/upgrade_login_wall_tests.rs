@@ -261,9 +261,9 @@ fn stand_in() -> Command {
     c.arg(PARK[0])
         .env(PARK_ENV, "1")
         .env("ATERM_PARENT_SESSION_ID", TAB)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
     c
 }
 
@@ -1384,6 +1384,85 @@ fn the_state_0_93_0_left_is_read_and_recovered() {
                 && l.contains("before its time was recorded")),
         "{:?}",
         old.ledger
+    );
+}
+
+/// A GIVE-UP TAKEN BACK COUNTS NO ASK TWICE (`St::notices`, the owner's "Asked
+/// N times"): the round typed four notices and counted four; the model read
+/// the first two and the login wall answered the last two, so once the login
+/// is back the give-up is taken back as announced twice ([`upgrade::rearmed`])
+/// and its third ask is typed again. That ask was counted when the round
+/// first typed it, so the record still says four (reviewed 2026-10-09: the
+/// spend was read against the give-up's phase, not the phase the ask was
+/// taken from, and the one notice counted three — seven). A record an older
+/// build wrote, with no list of the markers its round typed, cannot tell the
+/// ask was typed before: one notice still counts one at most.
+#[cfg(unix)]
+#[test]
+fn a_give_up_taken_back_counts_no_ask_twice() {
+    // The first two notices read by the model, the last two the wall's.
+    let read_two = |transcript: String| {
+        [
+            ("2026-09-27T05:03:21.041Z", "2026-09-27T05:03:30.000Z"),
+            ("2026-09-27T05:33:25.086Z", "2026-09-27T05:33:40.000Z"),
+        ]
+        .iter()
+        .fold(transcript, |t, (wall, answer)| {
+            t.replace(
+                &auth_wall_row(wall, INCIDENT_SESSION),
+                &model_row(
+                    answer,
+                    INCIDENT_SESSION,
+                    "Not yet: two workflows still run.",
+                    "end_turn",
+                ),
+            )
+        })
+    };
+    let transcript = read_two(up_to_the_login(4));
+    let round: Vec<String> = LEDGER.iter().map(|(_, m)| m.to_string()).collect();
+    assert_eq!(upgrade::notices_received(&transcript, &round), 2);
+    let taken_back = visit_at(
+        "taken-back-count",
+        INCIDENT_SESSION,
+        // On the stand-in's build, as [`owners_state_for`] puts it.
+        |sf, now| St {
+            from: "1.0.0".to_string(),
+            notices: 4,
+            ..incident_state(Phase::Failed(GAVE_UP.to_string()), 4)(sf, now)
+        },
+        &transcript,
+        logged_in_screen_json(),
+        &to_2_1_283(),
+        usize::MAX,
+    );
+    assert_eq!(taken_back.step, "announced:3", "{taken_back:?}");
+    assert_eq!(taken_back.typed.len(), 1);
+    assert!(taken_back.typed[0].contains(LEDGER[2].1));
+    let saved = taken_back.saved.expect("state");
+    assert!(matches!(saved.phase, Phase::Announced { asks: 3, .. }));
+    assert_eq!(
+        saved.notices, 4,
+        "the third ask was counted when first typed"
+    );
+    // The record 0.93.0 wrote: no list of the round's markers.
+    let legacy = visit_at(
+        "taken-back-count-legacy",
+        INCIDENT_SESSION,
+        |sf, _| St {
+            notices: 4,
+            ..owners_state_for(sf)
+        },
+        &transcript,
+        at_owners_seq(logged_in_screen_json()),
+        &to_2_1_283(),
+        usize::MAX,
+    );
+    assert_eq!(legacy.step, "announced:3", "{legacy:?}");
+    assert_eq!(
+        legacy.saved.expect("state").notices,
+        5,
+        "one notice, one ask"
     );
 }
 

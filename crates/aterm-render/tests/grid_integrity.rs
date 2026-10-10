@@ -15,10 +15,9 @@
 //!   * **exact cover** — the cells plus the four padding bands partition the raw
 //!     surface with no gap and no overlap, on BOTH axes.
 //!
-//! This is the theorem no single audit item owns. It COMPOSES three laws each
-//! proven in isolation elsewhere:
+//! It COMPOSES three laws each proven in isolation elsewhere:
 //!   * **W1** `pad_split` — exact cover / maximal / pad-floor / near-even
-//!     (`pad_absorption.rs`, `pad_split_kani`, `pad_absorption_model`);
+//!     (`pad_absorption.rs`, `pad_absorption_model`);
 //!   * **W5** `cell_h_baseline` — `cell_h = round((asc−desc+gap)·line_height)`,
 //!     min 1 (`leading_law.rs`);
 //!   * **W12** per-window pad = `round(12·scale)` (`main.rs`
@@ -35,7 +34,7 @@
 //! `cell_h`/`cell_w` come from `round(·)` of a scaled float. The `ty` Expr
 //! language has no `*` / `/` / rounding, so — exactly as for the box-drawing
 //! rounding law and the W1 arithmetic — the machine check is an exhaustive
-//! lattice under plain `cargo test`. The ORDERING/coverage policies these
+//! lattice under plain `targo --unverified test`. The ORDERING/coverage policies these
 //! compose (near-even split, per-window no-clobber) are the parts `ty` carries
 //! (`pad_absorption_model`, `per_window_metrics_model`).
 

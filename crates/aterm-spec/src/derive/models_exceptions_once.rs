@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner's exceptions inbox raises a cause ONCE (2026-09-28): what needs a look but not now is one dismissable
-//! item, and dismissing it files it in a durable log; the same cause is never
-//! raised again, across the restarts and updates that replaced the process,
-//! and no surface shows an entry before its raise line is queued.
+//! The owner's exceptions inbox raises a cause ONCE: what needs a look but not
+//! now is one dismissable item, and dismissing it files it in a durable log;
+//! the same cause is never raised again, across the restarts and updates that
+//! replaced the process, and no surface shows an entry before its raise line is queued.
 //!
 //! Three shipped defects are the reason it is a machine and not a comment:
 //! * the upgrade stall row re-posted for a stall the owner had already read
@@ -25,7 +25,7 @@
 //! `dcause` and `reshown` are ghosts: the last cause the owner dismissed, and
 //! a dismissed cause shown again.
 //!
-//! THE UPDATE (second draft): a seamless update overlaps the old process and its
+//! THE UPDATE: a seamless update overlaps the old process and its
 //! successor for seconds, and six of the eight Full Disk Access raises came
 //! within a second of one. `succ` is 1 while a successor holds a snapshot of the
 //! FILE it loaded at launch (`sst`, `sfc`: what it saw), frozen and

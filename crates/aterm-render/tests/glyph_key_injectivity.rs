@@ -17,7 +17,7 @@
 //!
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `KeyInjectivity` derived model (`aterm_spec::derive::key_injectivity_model`)
-//!   carries the `NoCollision` invariant. `cargo test -p aterm-spec`
+//!   carries the `NoCollision` invariant. `targo --unverified test -p aterm-spec`
 //!   (`derived_key_injectivity_proves_and_catches_size_collision`) runs the REAL
 //!   `ty` binary over the whole bounded space: it PROVES the invariant at `Buggy=0`
 //!   and CATCHES a px-dropping key at `Buggy=1` (the two sizes alias) → counterexample.

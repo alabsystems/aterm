@@ -156,12 +156,16 @@ fn stepped_keeper_role() -> ! {
 /// XNU's race for a pty minor to another process's (`EREDRIVEOPEN`, -6) is
 /// redriven rather than failed.
 fn pty_with_leader() -> (OwnedFd, Child) {
+    use aterm_uds::spawnfd::InheritNothing as _;
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: two fresh descriptors this function alone owns.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let stdio = || Stdio::from(slave.try_clone().expect("dup the slave"));
     let mut cmd = Command::new("/bin/sleep");
-    cmd.arg("600")
+    // std's, for the hook below, with the strip installed first: the leader
+    // holds its terminal and nothing else of this process.
+    cmd.inherit_nothing()
+        .arg("600")
         .stdin(stdio())
         .stdout(stdio())
         .stderr(stdio());
@@ -530,7 +534,9 @@ fn born(pid: u32) -> Birth {
 
 struct Scratch {
     dir: PathBuf,
-    kids: Vec<Child>,
+    /// Each started by `spawnfd`: it holds its stdio and nothing else of this
+    /// process, not another test's pipe for as long as its role lives.
+    kids: Vec<aterm_uds::spawnfd::Child>,
     pids: Vec<u32>,
 }
 
@@ -547,9 +553,8 @@ impl Drop for Scratch {
         }
         // A relaunch the keeper fired (`echo relaunch >> <dir>/relaunches`,
         // [`keeper_config`]) is no child of this test, and its line can land
-        // while the tree is being removed — the directory then refuses to go
-        // as not empty, and stayed behind (measured 2026-09-30). One line per
-        // relaunch: remove until the directory is gone.
+        // while the tree is being removed, so the removal fails as not empty.
+        // One line per relaunch: retry until the directory is gone.
         for _ in 0..4 {
             match std::fs::remove_dir_all(&self.dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
@@ -578,7 +583,7 @@ impl Scratch {
     }
     /// Re-run this test binary as `role`, its stdio `/dev/null`.
     fn spawn(&mut self, test: &str, role: &str, extra: &[(&str, &str)]) -> usize {
-        let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
         cmd.arg(test)
             .arg("--exact")
             .arg("--nocapture")
@@ -588,9 +593,9 @@ impl Scratch {
             .env(MARK, self.mark())
             .env(TALK, self.dir.join(format!("kid-{}", self.kids.len())))
             .env(LOGS, self.dir.join("logs"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -641,9 +646,9 @@ impl Scratch {
     }
     /// Let the parked keeper `kid` go on; returns once it has run one turn,
     /// with no connection of this test open during it, so the turn's holder
-    /// scans meet only the roles as peers. (A peer's churning table — this
-    /// multi-threaded test process's — no longer reads as "unknown": a
-    /// descriptor closed mid-scan is not held, `aterm_uds::holders`.)
+    /// scans meet only the roles as peers. This multi-threaded test process's
+    /// churning descriptor table does not read as "unknown": a descriptor
+    /// closed mid-scan is not held (`aterm_uds::holders`).
     fn resume(&mut self, kid: usize) {
         std::fs::write(self.dir.join(format!("kid-{kid}.resume")), b"resume").expect("resume");
         self.await_note(kid, "turned");
@@ -670,7 +675,7 @@ impl Scratch {
     }
     fn status(&self) -> String {
         KeeperClient::connect(&self.sock(), &Identity::same_uid(), HANG)
-            .and_then(|c| c.status())
+            .and_then(|c| c.status("test"))
             .expect("status")
     }
     /// Poll the keeper's status until `pred` holds (a hang detector bounds it).
@@ -861,9 +866,7 @@ const T_UNPLACED: &str = "an_offer_the_window_could_not_place_is_released_throug
 /// failed to open, its spawn failed) and RELEASEs it through its link — the
 /// worker running on the connection the offer was made to — then quits. The
 /// keeper closes its copy and the shell is hung up: nothing is left for the
-/// next launch to bring back. (The link dropped a RELEASE for a master it had
-/// not registered itself, so the offer went back to Orphaned at that quit and
-/// its shell ran on unseen until the next launch was offered it.)
+/// next launch to bring back.
 #[test]
 fn an_offer_the_window_could_not_place_is_released_through_its_link() {
     dispatch_role();
@@ -901,9 +904,7 @@ const T_QUIET: &str = "a_successor_that_never_registered_hangs_its_shells_up_whe
 /// the Commit does, so the keeper HOLDS the master for it; the successor never
 /// registers, and quits with `exit(0)`. §5.4 row 3 judges that end — a process
 /// that never spoke to the keeper, ended cleanly — as a quit: the keeper
-/// closes its copy and the shell is hung up, as with no keeper at all. (It
-/// once orphaned every such shell after the quit, alive and unseen, for the
-/// next launch to bring back as "stopped unexpectedly".)
+/// closes its copy and the shell is hung up, as with no keeper at all.
 #[test]
 fn a_successor_that_never_registered_hangs_its_shells_up_when_it_quits() {
     dispatch_role();
@@ -1052,8 +1053,7 @@ struct Overtaken {
 /// turn reads the first claim (one frame per connection), then the exit; the
 /// claim and the BYE still behind it must be read before the death is
 /// recorded — a claim read after it is refused, and its master goes back to
-/// Orphaned with the keeper's copy kept and its shell never hung up (the
-/// 2026-09-29 gate flake, in which the keeper was the master's only holder).
+/// Orphaned with the keeper's copy kept and its shell never hung up.
 /// `role` is the next window's: `next-window[-adopt][-no-bye]`.
 fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) -> Overtaken {
     let keeper = s.spawn(test, "keeper-stepped", &[]);
@@ -1198,9 +1198,7 @@ const T_REPLY: &str = "a_reply_the_dead_window_cannot_read_loses_none_of_its_fra
 /// claim. The keeper reads the ADOPT after the window has died, and its
 /// WELCOME cannot be written; that failure must end only the keeper's writing,
 /// never its reading — the second claim and the BYE behind the ADOPT are still
-/// read, and the quit hangs both shells up. (A connection dropped on the
-/// failed write lost them: one master orphaned by a "crash", the other back to
-/// Orphaned from its dead recipient, both shells kept.)
+/// read, and the quit hangs both shells up.
 #[test]
 fn a_reply_the_dead_window_cannot_read_loses_none_of_its_frames() {
     dispatch_role();

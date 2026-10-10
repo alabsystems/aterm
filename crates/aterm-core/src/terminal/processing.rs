@@ -163,6 +163,9 @@ impl Terminal {
         // uninitialised so the compiler holds both `post_process` arms to
         // assigning it.
         let damage_class: super::custody::OutputDamage;
+        // The row moves the vi cursor rides (see `vi_follow_output`), from the
+        // same `post_process` call.
+        let vi_bands: Option<aterm_grid::RowBandMoves>;
         // Whether a selection was alive when the batch began: `post_process` can
         // destroy one in ways other than damage overlap (bad splice projection,
         // splice mixed with scroll, alt exit, the `left_alt` re-check, eviction
@@ -189,7 +192,7 @@ impl Terminal {
             let parse_end = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
 
             let grid_start = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
-            damage_class = self.post_process(lines_before, was_alt);
+            (damage_class, vi_bands) = self.post_process(lines_before, was_alt);
             // Alt-screen archive: a sync-timeout close `post_process` just forced,
             // and the rate-limited commit for apps that never use 2026.
             self.alt_archive_epilogue();
@@ -216,7 +219,7 @@ impl Terminal {
             if self.transient.pending_parser_reset {
                 self.finish_ris_batch();
             }
-            damage_class = self.post_process(lines_before, was_alt);
+            (damage_class, vi_bands) = self.post_process(lines_before, was_alt);
             // Alt-screen archive epilogue: see the gated branch above.
             self.alt_archive_epilogue();
             // Observation Kernel (L0): see the gated branch above — same seam,
@@ -286,14 +289,24 @@ impl Terminal {
         // Press custody, site 3 of 3: emit, now that the pre-batch offset, the
         // damage class and the final re-pinned offset are all known. Suppressed on
         // a screen-switching batch: before and after would belong to unrelated
-        // grids.
+        // grids. The vi cursor follows its text by the same count, for the same
+        // reason the re-pin does: its lines are counted from the live screen's
+        // top, which this batch moved down the buffer by `lines_added`. Where the
+        // band record says only some rows moved, it rides those moves instead.
+        // A screen-switching batch moves it by nothing; every batch clamps it
+        // onto the grid it ended on. It is not parked per screen as the
+        // selection is, so a cursor in main-screen history rests on the
+        // alternate screen while that is up and does not come back to its text.
+        let mut vi_lines = 0;
         if was_alt == self.modes.alternate_screen {
             let lines_added = self
                 .grid
                 .absolute_row_counter()
                 .saturating_sub(lines_before);
             self.note_output_custody(pinned_offset, damage_class, lines_added, selection_before);
+            vi_lines = lines_added;
         }
+        self.vi_follow_output(vi_lines, vi_bands);
 
         // tmux DCS passthrough (`ESC P tmux; ... ST`) works through the parser's
         // "anywhere" ESC transition, which breaks the DCS before escaped content
@@ -355,7 +368,9 @@ impl Terminal {
     /// Post-processing after parser advances: selection adjustment and BiDi sync.
     ///
     /// `was_alt` is the screen the batch started on, captured before the parser
-    /// ran.
+    /// ran. Returns the batch's damage class (press custody, site 2) and, when
+    /// it explains every row the batch moved, its row-band record, which the
+    /// epilogue hands the vi cursor.
     ///
     /// This is the engine half of the `SelectionCustody` model and implements
     /// four of its actions in one pass:
@@ -410,7 +425,10 @@ impl Terminal {
         &mut self,
         absolute_rows_before: u64,
         was_alt: bool,
-    ) -> super::custody::OutputDamage {
+    ) -> (
+        super::custody::OutputDamage,
+        Option<aterm_grid::RowBandMoves>,
+    ) {
         // Top-anchored partial scrollback inserts logical rows immediately
         // before a protected footer. Keep every durable OSC/shell anchor paired
         // with the footer content that stayed fixed on screen.
@@ -472,6 +490,21 @@ impl Terminal {
         // Drain independently: a splice is already an invalidation, but must
         // not short-circuit the flag's take and carry it into a later batch.
         let coordinates_invalidated = self.grid.take_coordinates_invalidated();
+        // The band record when it explains every row this batch moved: an exact
+        // non-empty record, no whole-screen scroll in the same batch
+        // (`scroll_delta == 0`, pinned by
+        // `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`)
+        // and no screen switch (the record came from the incoming grid). The vi
+        // cursor replays it (`vi_follow_output`). A splice degraded to
+        // `Invalidate` does not stop that: the only splice is the archival
+        // region scroll, which records its band beside it, so two that do not
+        // merge (two Codex frames in one read, the second growing its viewport)
+        // are still two exact bands.
+        let explaining_bands = (bands.len > 0
+            && !bands.inexact
+            && scroll_delta == 0
+            && was_alt == self.modes.alternate_screen)
+            .then_some(bands);
         let invalidates_coordinates = selection_row_update.is_some()
             || coordinates_invalidated
             || scroll_delta == i32::MAX
@@ -480,15 +513,9 @@ impl Terminal {
             self.content_scroll_state.invalidate();
             // The epoch bumps as always. When the band record fully explains the
             // batch's row motion, also publish it so a band-translating consumer
-            // keeps its marks on their lines. Required: an exact non-empty record;
-            // no whole-screen scroll in the same batch (`scroll_delta == 0`, pinned
-            // by `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`);
-            // no screen switch (the record came from the incoming grid); and no
-            // non-composable splice degraded to `Invalidate`.
-            let explained = bands.len > 0
-                && !bands.inexact
-                && scroll_delta == 0
-                && was_alt == self.modes.alternate_screen
+            // keeps its marks on their lines, unless a non-composable splice
+            // degraded to `Invalidate`.
+            let explained = explaining_bands.is_some()
                 && !matches!(
                     selection_row_update,
                     Some(aterm_grid::AbsoluteRowUpdate::Invalidate)
@@ -647,7 +674,7 @@ impl Terminal {
                 }
             }
         }
-        damage_class
+        (damage_class, explaining_bands)
     }
 
     /// Backdate the synchronized-output (mode 2026) start timestamp for
@@ -736,6 +763,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         resize_journal: _,
         parser: _,
         text_selection: _,
+        // The host's last-mouse-report memo: written by the input seam under
+        // the lock, read only by it; never a VT input.
+        mouse_report_memo: _,
         // The other screen's selection, parked across an alt switch; the
         // park/restore is a post_process decision, never a VT-dispatch one.
         parked_text_selection: _,

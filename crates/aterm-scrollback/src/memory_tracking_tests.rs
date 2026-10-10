@@ -81,7 +81,6 @@ fn scrollback_budgeted_bytes_tracks_through_operations() {
 }
 
 /// Proves that read-only warm-cache fills do not perturb the budget counter.
-/// Design step 5, test 1 from #5881 design doc.
 #[test]
 fn scrollback_budget_ignores_warm_cache_population() {
     // Small tiers to force warm promotion quickly.
@@ -118,7 +117,6 @@ fn scrollback_budget_ignores_warm_cache_population() {
 }
 
 /// Disk-backed: warm-cache fill does not affect budget.
-/// Design step 5, test 2 from #5881 design doc.
 #[cfg(feature = "disk-tier")]
 #[test]
 fn disk_backed_budget_ignores_warm_cache_population() {
@@ -156,7 +154,6 @@ fn disk_backed_budget_ignores_warm_cache_population() {
 }
 
 /// Disk-backed: cold-cache fill does not affect budget.
-/// Design step 5, test 3 from #5881 design doc.
 #[cfg(feature = "disk-tier")]
 #[test]
 fn disk_backed_budget_ignores_cold_cache_population() {

@@ -21,7 +21,7 @@ fn scrollback_line_limit_default_is_safe_cap() {
 #[test]
 fn scrollback_set_line_limit() {
     let mut sb = Scrollback::with_defaults();
-    // Default now has a bounded limit (#7929). Clear first to exercise the
+    // The default is a bounded limit (#7929). Clear first to exercise the
     // full Some→None→Some matrix.
     sb.set_line_limit(None);
     assert_eq!(sb.line_limit(), None);

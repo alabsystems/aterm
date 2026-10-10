@@ -678,3 +678,66 @@ fn damage_reset_repeated_cycles() {
         );
     }
 }
+
+/// THE ROW AND BOUNDS ITERATORS ARE EXACT.
+///
+/// `BitsetRowIterator` yields exactly the set bits below `max_row`, in strictly
+/// increasing order — checked against a bit-by-bit reference for every 8-bit
+/// pattern at the bottom, middle and top of a word, for every 8-bit pair
+/// straddling a word boundary, and for every `max_row` around both ends of a
+/// word. `DamageBoundsIterator` over one marked cell in every row of 1..=4 rows
+/// × 1..=16 cols, at every column up to two past the edge, yields one
+/// non-empty bounds row covering the cell when it is visible and nothing when
+/// it is not.
+#[test]
+fn bitset_and_bounds_iterators_are_exact() {
+    let reference = |bits: &[u64], max_row: u16| -> Vec<u16> {
+        (0..bits.len() * 64)
+            .filter(|&r| bits[r / 64] >> (r % 64) & 1 == 1)
+            .map(|r| u16::try_from(r).unwrap())
+            .take_while(|&r| r < max_row)
+            .collect()
+    };
+    let check = |bits: &[u64], max_row: u16| {
+        let got: Vec<u16> = BitsetRowIterator::new(bits, max_row).collect();
+        assert_eq!(got, reference(bits, max_row), "{bits:x?} below {max_row}");
+        assert!(got.windows(2).all(|w| w[0] < w[1]));
+    };
+    for byte in 0..=0xFFu64 {
+        for shift in [0, 28, 56] {
+            for max_row in 0..=66 {
+                check(&[byte << shift], max_row);
+            }
+        }
+        for high in 0..=0xFFu64 {
+            for max_row in [0, 1, 56, 63, 64, 65, 72, 127, 128] {
+                check(&[high << 56, byte], max_row);
+            }
+        }
+    }
+    check(&[], 64);
+
+    for rows in 1..=4u16 {
+        for cols in 1..=16u16 {
+            for row in 0..rows {
+                for col in 0..=cols + 2 {
+                    let mut damage = Damage::new(rows);
+                    damage.mark_cell(row, col);
+                    let bounds: Vec<_> = damage.iter_bounds(rows, cols).collect();
+                    if col < cols {
+                        let [b] = bounds.as_slice() else {
+                            panic!("{rows}x{cols} ({row}, {col}): {bounds:?}");
+                        };
+                        assert_eq!(b.line, row);
+                        assert!(b.left <= col && col < b.right && b.right <= cols, "{b:?}");
+                    } else {
+                        assert!(
+                            bounds.is_empty(),
+                            "{rows}x{cols} ({row}, {col}): {bounds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

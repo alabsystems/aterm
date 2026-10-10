@@ -109,7 +109,6 @@ fn private_launch_environment_gates_host_maintenance() {
             updates.display()
         );
         let machine = atpkg::config::load_machine();
-        assert!(!machine.spotlight_noindex());
         assert_eq!(
             machine.universal_control(),
             atpkg::config::UniversalControlPolicy::Leave
@@ -143,8 +142,7 @@ fn private_launch_environment_gates_host_maintenance() {
             // alone, so the observer's `[machine]` assertions hold either way.
             std::fs::write(
                 root.join("cfg/aterm/aterm.toml"),
-                "agents_auto_prime = false\n[machine]\nspotlight_noindex = false\n\
-                 universal_control = \"leave\"\n",
+                "agents_auto_prime = false\n[machine]\nuniversal_control = \"leave\"\n",
             )
             .unwrap();
         }

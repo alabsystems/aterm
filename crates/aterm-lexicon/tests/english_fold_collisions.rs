@@ -3,14 +3,10 @@
 //
 //! THE FOLD-COLLISION GATE.
 //!
-//! Matching folds diacritics away (`fold.rs`), which is what lets `Scheiße`
-//! match `scheisse` — and also what quietly turns a foreign expletive into an
-//! ordinary English word. Turkish `piç` folds to `pic`, so typing `pick`
-//! detonated an f-bomb at the moment the prefix `pic` was complete. It was not
-//! alone: Swedish `skit`, Latvian `sūds` -> `suds`, Slovak `piča` -> `pica`
-//! (which is also a typographic unit), Indonesian `tai`, Estonian `perse`/`sita`,
-//! Catalan `cony`, Danish `satan` and Portuguese `foder` all shipped
-//! `ambiguous = false`, i.e. loaded for every user on earth.
+//! Matching folds diacritics away (`fold.rs`), which lets `Scheiße` match
+//! `scheisse` — and can turn a foreign expletive into an ordinary English
+//! word: Turkish `piç` folds to `pic`, the prefix of `pick`; Latvian `sūds`
+//! folds to `suds`.
 //!
 //! This walks the system English dictionary and fails if ANY ordinary English
 //! word classifies as a sparkle class without being opted into. The allowlist
@@ -64,15 +60,14 @@ fn no_unambiguous_surface_is_an_ordinary_english_word() {
     );
 }
 
-/// THE PREFIX-TRANSIT GATE (2026-08-29, the `dmg` report): a curse cue fires
-/// the moment the live caret COMPLETES an unambiguous profanity surface, so a
-/// surface that is a strict PREFIX of an ordinary English word bonks mid-word
+/// THE PREFIX-TRANSIT GATE: a curse cue fires the moment the live caret
+/// COMPLETES an unambiguous profanity surface, so a surface that is a strict
+/// PREFIX of an ordinary English word bonks mid-word
 /// — the typist of `dmg` transits `dm`, of `pistol` transits `pis`, of
 /// `fickle` transits `fick`. The dictionary walk above only catches whole-word
 /// collisions; this one simulates the keystroke path: no proper prefix of any
 /// ordinary English word may scan as an unambiguous whole-token Profanity
-/// match. 201 dictionary words bonked mid-typing when this gate landed
-/// (pis 101, cono 28, sitt 9, picka 8, cok 8, bok 7, ...).
+/// match.
 ///
 /// The allowlist is for surfaces whose transit words are too obscure to
 /// outweigh a language's pinned default coverage — each needs a reason.
@@ -141,12 +136,11 @@ fn no_english_word_transits_an_unambiguous_profanity_prefix() {
     );
 }
 
-/// THE `dmg` REPORT (owner, 2026-08-29): "typing 'dmg' triggered the swear
-/// noise. it's not a swear." Vietnamese `đm` folds `đ` → `d` into the bare key
-/// `dm`, which the live caret completed one keystroke into `dmg`. The fix is
-/// the RULE — a surface that loses its marks into bare ASCII only matches
-/// mark-bearing tokens — so the whole `dm*` namespace stays silent while the
-/// marked form keeps its cue.
+/// Regression: typing `dmg` fired the swear cue. Vietnamese `đm` folds into
+/// the bare key `dm`, which the live caret completes one keystroke into `dmg`.
+/// A surface that loses its marks into bare ASCII only matches mark-bearing
+/// tokens, so the whole `dm*` namespace stays silent while the marked form
+/// keeps its cue.
 #[test]
 fn typing_dmg_is_silent_and_the_marked_form_still_fires() {
     let lex = aterm_lexicon::Lexicon::builtin();
@@ -173,8 +167,8 @@ fn typing_dmg_is_silent_and_the_marked_form_still_fires() {
     }
 }
 
-/// The report that started it: typing `pick` must stay silent — both the whole
-/// word and the `pic` prefix a live scanner sees one keystroke earlier.
+/// Regression: typing `pick` must stay silent — both the whole word and the
+/// `pic` prefix a live scanner sees one keystroke earlier.
 #[test]
 fn typing_pick_is_silent_all_the_way_through() {
     let lex = aterm_lexicon::Lexicon::builtin();

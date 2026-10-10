@@ -19,7 +19,7 @@
 //! the holder's tail) and BEFORE the reclaiming shell's own mode setup (zsh's
 //! `ESC[?2004h`, which a handback after it would switch off).
 //!
-//! The 2026-09-25 review added two more obligations. A foreground change is
+//! Two more obligations. A foreground change is
 //! not a death: a job stopped with Ctrl-Z, or a live `gdb -tui` handing the
 //! terminal to its inferior, still runs and keeps its modes — stripping them
 //! left it running without them after `fg` (`Alive`). And a reader restarted
@@ -28,17 +28,17 @@
 //! or a job that died while the readers were parked is never an edge at all —
 //! the incident again, with no handback (`Carry`).
 //!
-//! The second 2026-09-25 review added a third. A one-shot command that sets a
+//! A third: a one-shot command that sets a
 //! DISPLAY mode on purpose and exits cleanly — `tput civis`, or the `tput
 //! smcup` of the common `tput smcup; cmd; tput rmcup` wrapper — is gone the
 //! moment it exits, exactly like a SIGKILLed program, and nothing tells the two
 //! apart. Handing its mode back reverted the cursor and dropped the wrapped
 //! command onto the main screen. The incident's harm is the INPUT-hijacking
 //! modes (mouse, kitty, modifyOtherKeys, 1004, 2004, 2048, 2031), so only a
-//! gone program that armed one of those is handed back (`Display`). 2004 joined
-//! them on 2026-10-07, PG1 (docs/AUDIT-side-effects-2026-10-07.md): a `cat`
-//! that armed it under a reader that does not parse the brackets left the
-//! host's multi-line paste guard off.
+//! gone program that armed one of those is handed back (`Display`). 2004 is
+//! one because a `cat` that armed it under a reader that does not parse the
+//! brackets left the host's multi-line paste guard off
+//! (docs/AUDIT-side-effects-2026-10-07.md, PG1).
 
 use super::Model;
 

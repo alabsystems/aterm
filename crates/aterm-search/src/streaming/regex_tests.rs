@@ -27,8 +27,8 @@ fn regex_basic_pattern() {
 #[test]
 fn regex_character_class() {
     let mut search = StreamingSearch::new();
-    // Enable case-sensitive so [a-z]+ matches only lowercase (default is
-    // case-insensitive which now correctly applies (?i) to the regex too).
+    // Case-sensitive so [a-z]+ matches only lowercase (the case-insensitive
+    // default applies (?i) to the regex).
     search.toggle_case_sensitive();
     let mut content = TestContent::new(vec!["apple BANANA cherry", "GRAPE orange"]);
 
@@ -396,12 +396,8 @@ fn regex_invariants_after_operations() {
     assert_eq!(search.state(), SearchState::Idle);
 }
 
-/// Regression test: regex search with case_sensitive=false (default) produces
-/// case-insensitive matches.
-///
-/// Bug #2775: The `compile_regex` method was ignoring the `case_sensitive` flag,
-/// always producing case-sensitive regexes. The fix prepends `(?i)` when
-/// `case_sensitive` is false.
+/// Regression (#2775): regex search with case_sensitive=false (default) is
+/// case-insensitive; `compile_regex` prepends `(?i)`.
 #[test]
 fn regex_case_insensitive_default() {
     // Default config: case_sensitive=false
@@ -429,7 +425,7 @@ fn regex_case_insensitive_default() {
 #[test]
 fn regex_case_sensitive_toggled_on() {
     let mut search = StreamingSearch::new();
-    search.toggle_case_sensitive(); // Now case_sensitive=true
+    search.toggle_case_sensitive(); // case_sensitive=true
     let mut content = TestContent::new(vec!["Hello WORLD", "hello world", "HELLO"]);
 
     search

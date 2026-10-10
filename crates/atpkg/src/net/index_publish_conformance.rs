@@ -28,7 +28,6 @@ use aterm_spec::interp::{self, State};
 use aterm_update_core::{HeadAnswer, HttpError};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Every state `model` reaches, breadth-first over its actions.
 fn reachable(model: &Model) -> Vec<State> {
@@ -162,10 +161,18 @@ struct Rig {
 
 const OWN_VALID_UNTIL: &str = "2098-01-01T00:00:00Z";
 const FOREIGN_VALID_UNTIL: &str = "2098-01-02T00:00:00Z";
-/// How many indexer runs [`Rig::publish_all`] keeps in flight. A run is mostly waiting
-/// (its lock poll's sleep, then process start-up), not CPU, so lanes overlap that wait
-/// whatever the load; eight bring the 55 decisions to seven rounds.
-const LANES: usize = 8;
+/// How many indexer runs [`Rig::publish_all`] keeps in flight: four a core, from 8 to 16.
+/// One run is about 0.25 s of CPU spread over ~65 short processes (the runs' ~15 CPU-s in
+/// all is the floor), so on a loaded machine its wall is queueing for the scheduler, and
+/// more lanes win the test a larger share of it. Measured on a 14-core machine, 16 and 32
+/// lanes were within noise of each other and 55 gained nothing more, so the cap is the
+/// lower figure: fewer processes in flight, and fewer bare `Command` spawns racing each
+/// other's pipe fds (AGENTS.md, "A child process is built by `aterm_uds::spawnfd::command`").
+fn lane_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(8, |n| 4 * n.get())
+        .clamp(8, 16)
+}
 /// What [`Rig::publish`] answers: the indexer's exit 0, the channel it leaves, its transcript.
 type Run = (bool, [i64; 3], String);
 const QUAD: [&str; 4] = [
@@ -304,7 +311,11 @@ impl Rig {
         // for removal.
         let tmp = self.dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp);
-        let mut cmd = Command::new("bash");
+        // `spawnfd::command`, not a bare `Command`: sixteen of these run at once beside the
+        // other tests of this binary, and a std child inherits any descriptor another
+        // thread has open at its spawn (AGENTS.md, "A child process is built by
+        // `aterm_uds::spawnfd::command`").
+        let mut cmd = aterm_uds::spawnfd::command("bash");
         cmd.env_clear()
             .arg(root.join("tools/atpkg-index.sh"))
             .current_dir(self.dir.path())
@@ -431,7 +442,7 @@ impl Rig {
         )
     }
 
-    /// [`Rig::publish`] for every `(baseline, number, channel)` in `cases`, [`LANES`] at a
+    /// [`Rig::publish`] for every `(baseline, number, channel)` in `cases`, [`lane_count`] at a
     /// time, each lane on a channel tree of its own; the results come back in `cases`
     /// order, so the caller judges them exactly as it would one by one.
     ///
@@ -446,7 +457,7 @@ impl Rig {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let next = AtomicUsize::new(0);
         let mut done: Vec<(usize, Run)> = std::thread::scope(|s| {
-            let lanes: Vec<_> = (0..LANES)
+            let lanes: Vec<_> = (0..lane_count())
                 .map(|lane| {
                     let next = &next;
                     s.spawn(move || {

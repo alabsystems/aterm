@@ -14,9 +14,7 @@
 //! does NOT flag (a false negative) FAILS this meta-test — that is precisely the "no
 //! false negatives in the known set" the design asks for.
 //!
-//! The fixtures map onto the four findings the armed Trust now bites on:
-//!   * **L1** (finding 1) — a typo'd `proof_name` that resolves to no harness in the
-//!     manifest → `trust-ir spec-link --require-manifest` exit 1, `[L1 proof-resolves]`.
+//! The fixtures map onto the findings the armed Trust now bites on:
 //!   * **L2** (finding 2) — an anchor on an actively-anchored machine with `project=""`
 //!     → exit 1, `[L2 projection-present]`.
 //!   * **Ob.1 / L3** (finding 4) — an EXTERNAL anchor naming a non-`Next` def
@@ -38,28 +36,23 @@ use aterm_spec::derive::ring_model;
 use aterm_spec::ir::lower_to_ir;
 use aterm_spec::tla_check::TlaSpec;
 use aterm_spec::verify::{trust_ir_escalation, ty_escalation};
-use aterm_spec::xref::{ProofAnchor, ProofKind, RefinementAnchor, SpecModule};
+use aterm_spec::xref::{RefinementAnchor, SpecModule};
 
 // ---------------------------------------------------------------------------
 // Tool discovery (the escalation tier: absent, a NOT RUN notice and an early return)
 // ---------------------------------------------------------------------------
 
-/// Run `trust-ir spec-link <module> [--harness-manifest <m> --require-manifest]`,
+/// Run `trust-ir spec-link <module>`,
 /// returning (exit-code, combined stdout+stderr) — or `None` when the Trust
 /// toolchain is absent (TIERED, VERIFY-1: spec-link agreement is an
 /// external-tool obligation; the caller returns early on `None`, and the
 /// prominent notice names what did not run).
-fn spec_link(module: &Path, manifest: Option<&Path>) -> Option<(i32, String)> {
+fn spec_link(module: &Path) -> Option<(i32, String)> {
     let trust_ir = trust_ir_escalation("overclaim corpus (spec-link)")?;
     let mut cmd = Command::new(&trust_ir);
     // aterm emits the canonical TEXT format (`lower_to_ir`); trust-ir 0.2.0
     // auto-detects the `.trust_ir` extension as BINARY, so pin the format.
     cmd.arg("spec-link").arg("--format").arg("text").arg(module);
-    if let Some(m) = manifest {
-        cmd.arg("--harness-manifest")
-            .arg(m)
-            .arg("--require-manifest");
-    }
     let out = cmd.output().expect("run trust-ir spec-link");
     let combined = format!(
         "{}{}",
@@ -239,86 +232,6 @@ fn anchor(machine: &'static str, action: &'static str, project: &'static str) ->
     }
 }
 
-/// A minimal harness manifest JSON listing exactly the named harnesses.
-fn write_manifest(dir: &Path, names: &[&str]) -> PathBuf {
-    let entries: Vec<String> = names
-        .iter()
-        .map(|n| format!("{{ \"name\": \"{n}\", \"span\": \"fixture.rs:1:1\" }}"))
-        .collect();
-    let json = format!("{{ \"harnesses\": [{}] }}\n", entries.join(", "));
-    let p = dir.join("manifest.json");
-    std::fs::write(&p, json).expect("write manifest");
-    p
-}
-
-// ===========================================================================
-// RED fixture 1 — L1: a typo'd proof_name resolves to no harness in the manifest.
-// ===========================================================================
-
-#[test]
-fn red_l1_typo_proof_name_flags() {
-    let dir = tmpdir("l1");
-    let modules = vec![SpecModule::Embedded(ring_model())];
-    let a = anchor("ring", "Push", "aterm_buffer::Ring::project");
-    // A proof whose name is NOT in the manifest (a typo / dead harness).
-    let typo = ProofAnchor {
-        machine: "ring",
-        action: "Push",
-        proof_name: "ring_push_DOES_NOT_EXIST",
-        kind: ProofKind::Kani,
-        location: "fixture.rs:1:1",
-    };
-    let txt = lower_to_ir("red_l1", &modules, &[&a], &[], &[&typo]);
-    let path = dir.join("red_l1.trust_ir");
-    std::fs::write(&path, &txt).expect("write");
-    // Manifest contains a DIFFERENT, real-looking harness — so the typo is unresolved.
-    let manifest = write_manifest(&dir, &["ring_push_refines"]);
-
-    let Some((code, report)) = spec_link(&path, Some(&manifest)) else {
-        return;
-    };
-    assert_eq!(
-        code, 1,
-        "RED L1 fixture (typo proof_name) MUST exit 1 — a false negative otherwise. Report:\n{report}"
-    );
-    assert!(
-        report.contains("[L1 proof-resolves]") && report.contains("ring_push_DOES_NOT_EXIST"),
-        "RED L1 must report [L1 proof-resolves] naming the typo'd harness; report:\n{report}"
-    );
-    assert!(
-        !is_exact_explicit_design_only(code, &report, "Ring", 1),
-        "RED L1's hard proof-resolution failure must never classify as clean design-only"
-    );
-
-    // GREEN control: fix the proof_name to one the manifest contains. The
-    // binding is violation-free, but the explicitly design-only artifact remains
-    // non-certifying and therefore exits 1 by contract.
-    let good = ProofAnchor {
-        proof_name: "ring_push_refines",
-        ..typo
-    };
-    let good_txt = lower_to_ir("ctl_l1", &modules, &[&a], &[], &[&good]);
-    let good_path = dir.join("ctl_l1.trust_ir");
-    std::fs::write(&good_path, &good_txt).expect("write");
-    let Some((code, report)) = spec_link(&good_path, Some(&manifest)) else {
-        return;
-    };
-    assert_exact_explicit_design_only(
-        code,
-        &report,
-        "Ring",
-        1,
-        "GREEN L1 control (resolved proof_name)",
-    );
-    assert!(
-        report.contains("harness manifest")
-            && report.contains("(1 harness), checked 1 proof binding"),
-        "GREEN L1 must prove the manifest was consulted and exactly one proof resolved; \
-        report:\n{report}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 // ===========================================================================
 // RED fixture 2 — L2: an anchor on an actively-anchored machine with project="".
 // ===========================================================================
@@ -329,11 +242,11 @@ fn red_l2_empty_projection_flags() {
     let modules = vec![SpecModule::Embedded(ring_model())];
     // Actively-anchored machine (Ring) with an anchor carrying NO projection.
     let no_proj = anchor("ring", "Push", "");
-    let txt = lower_to_ir("red_l2", &modules, &[&no_proj], &[], &[]);
+    let txt = lower_to_ir("red_l2", &modules, &[&no_proj], &[]);
     let path = dir.join("red_l2.trust_ir");
     std::fs::write(&path, &txt).expect("write");
 
-    let Some((code, report)) = spec_link(&path, None) else {
+    let Some((code, report)) = spec_link(&path) else {
         return;
     };
     assert_eq!(
@@ -352,10 +265,10 @@ fn red_l2_empty_projection_flags() {
     // GREEN control: supply a non-empty projection name. This removes the L2
     // violation but does not pretend design-only linkage is certification.
     let with_proj = anchor("ring", "Push", "aterm_buffer::Ring::project");
-    let good_txt = lower_to_ir("ctl_l2", &modules, &[&with_proj], &[], &[]);
+    let good_txt = lower_to_ir("ctl_l2", &modules, &[&with_proj], &[]);
     let good_path = dir.join("ctl_l2.trust_ir");
     std::fs::write(&good_path, &good_txt).expect("write");
-    let Some((code, report)) = spec_link(&good_path, None) else {
+    let Some((code, report)) = spec_link(&good_path) else {
         return;
     };
     assert_exact_explicit_design_only(
@@ -414,10 +327,10 @@ fn red_l3_external_anchor_on_typeok_flags_in_rust_and_artifact() {
     // ---- Lowered artifact (L3): an anchor naming TypeOK is rejected with [Ob.1].
     let modules = vec![module];
     let bad = anchor("Fixture", "TypeOK", "fixture::project");
-    let txt = lower_to_ir("red_l3", &modules, &[&bad], &[], &[]);
+    let txt = lower_to_ir("red_l3", &modules, &[&bad], &[]);
     let path = dir.join("red_l3.trust_ir");
     std::fs::write(&path, &txt).expect("write");
-    let Some((code, report)) = spec_link(&path, None) else {
+    let Some((code, report)) = spec_link(&path) else {
         return;
     };
     assert_eq!(
@@ -436,10 +349,10 @@ fn red_l3_external_anchor_on_typeok_flags_in_rust_and_artifact() {
     // GREEN control: anchor the REAL Next action (Apply). The artifact is now
     // violation-free, while remaining explicitly design-only/non-certifying.
     let good = anchor("Fixture", "Apply", "fixture::project");
-    let good_txt = lower_to_ir("ctl_l3", &modules, &[&good], &[], &[]);
+    let good_txt = lower_to_ir("ctl_l3", &modules, &[&good], &[]);
     let good_path = dir.join("ctl_l3.trust_ir");
     std::fs::write(&good_path, &good_txt).expect("write");
-    let Some((code, report)) = spec_link(&good_path, None) else {
+    let Some((code, report)) = spec_link(&good_path) else {
         return;
     };
     assert_exact_explicit_design_only(
@@ -556,8 +469,8 @@ fn red_window_routing_corrupted_close_is_rejected_by_ty() {
 
 // ===========================================================================
 // CLEAN control — the all-real, fully-fixed lowering is violation-free
-// (Ob.1/3/4 + L1 + L2), but is never mislabeled as externally certifying.
-// Mirrors §3.3: a real anchor with a non-empty projection + a resolved proof.
+// (Ob.1/3/4 + L2), but is never mislabeled as externally certifying.
+// Mirrors §3.3: a real anchor with a non-empty projection.
 // ===========================================================================
 
 #[test]
@@ -565,27 +478,13 @@ fn clean_control_full_pass() {
     let dir = tmpdir("clean");
     let modules = vec![SpecModule::Embedded(ring_model())];
     let a = anchor("ring", "Push", "aterm_buffer::Ring::project");
-    let p = ProofAnchor {
-        machine: "ring",
-        action: "Push",
-        proof_name: "ring_push_refines",
-        kind: ProofKind::Kani,
-        location: "fixture.rs:1:1",
-    };
-    let txt = lower_to_ir("clean", &modules, &[&a], &[], &[&p]);
+    let txt = lower_to_ir("clean", &modules, &[&a], &[]);
     let path = dir.join("clean.trust_ir");
     std::fs::write(&path, &txt).expect("write");
-    let manifest = write_manifest(&dir, &["ring_push_refines"]);
 
-    let Some((code, report)) = spec_link(&path, Some(&manifest)) else {
+    let Some((code, report)) = spec_link(&path) else {
         return;
     };
     assert_exact_explicit_design_only(code, &report, "Ring", 1, "CLEAN control");
-    assert!(
-        report.contains("harness manifest")
-            && report.contains("(1 harness), checked 1 proof binding"),
-        "clean control must show the manifest was consulted and exactly one proof binding \
-         resolved; report:\n{report}"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }

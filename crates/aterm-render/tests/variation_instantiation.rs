@@ -20,8 +20,8 @@
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `VfAxisClamp` and `VfNudgeGate` derived models
 //!   (`aterm_spec::derive::{vf_axis_clamp_model, vf_nudge_gate_model}`) carry
-//!   the axis-bounds and nudge-precondition invariants; `cargo test -p
-//!   aterm-spec` proves each at `Buggy=0` and REQUIRES a counterexample at
+//!   the axis-bounds and nudge-precondition invariants; `targo --unverified
+//!   test -p aterm-spec` proves each at `Buggy=0` and REQUIRES a counterexample at
 //!   `Buggy=1` (the pre-fix behaviours: no clamping / an ungated nudge).
 //! * **Tier-1 (concrete, this file)** — the same invariants checked on the
 //!   real policy functions over exhaustive lattices that additionally cover
@@ -305,7 +305,7 @@ fn dark_nudge_gate_is_a_checked_precondition() {
 }
 
 /// PROVE (4) — SF MONO ACCEPTANCE: the system `SFNSMono.ttf` (a) really does
-/// default to the Light instance (the audit's sin 7, asserted so this test
+/// default to the Light instance (asserted so this test
 /// can never go vacuous on a future macOS that fixes the default), and (b)
 /// resolves to `wght` ≈ 400 under W9's default instantiation. Skips cleanly
 /// on hosts without the file (Linux, stripped macOS).

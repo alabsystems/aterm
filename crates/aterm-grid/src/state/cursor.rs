@@ -72,95 +72,10 @@ impl DerefMut for GridCursorState {
     }
 }
 
-/// Loop-free tab_stops for Kani. Explicit branches instead of `.to_vec()` which
-/// uses `ptr::copy_nonoverlapping` that CBMC struggles to bound.
-#[cfg(kani)]
-pub(crate) fn kani_tab_stops(cols: u16) -> Vec<bool> {
-    let n = cols.clamp(1, crate::KANI_MAX_COLS) as usize;
-    // Tab stops: only column 8 is true for cols <= 16
-    let tab: [bool; 16] = [
-        false, false, false, false, false, false, false, false, true, false, false, false, false,
-        false, false, false,
-    ];
-    let mut v = Vec::with_capacity(16);
-    if n >= 1 {
-        v.push(tab[0]);
-    }
-    if n >= 2 {
-        v.push(tab[1]);
-    }
-    if n >= 3 {
-        v.push(tab[2]);
-    }
-    if n >= 4 {
-        v.push(tab[3]);
-    }
-    if n >= 5 {
-        v.push(tab[4]);
-    }
-    if n >= 6 {
-        v.push(tab[5]);
-    }
-    if n >= 7 {
-        v.push(tab[6]);
-    }
-    if n >= 8 {
-        v.push(tab[7]);
-    }
-    if n >= 9 {
-        v.push(tab[8]);
-    }
-    if n >= 10 {
-        v.push(tab[9]);
-    }
-    if n >= 11 {
-        v.push(tab[10]);
-    }
-    if n >= 12 {
-        v.push(tab[11]);
-    }
-    if n >= 13 {
-        v.push(tab[12]);
-    }
-    if n >= 14 {
-        v.push(tab[13]);
-    }
-    if n >= 15 {
-        v.push(tab[14]);
-    }
-    if n >= 16 {
-        v.push(tab[15]);
-    }
-    v
-}
-
 impl GridCursorState {
     /// Create default tab stops (every 8 columns).
     pub(crate) fn default_tab_stops(cols: u16) -> Vec<bool> {
-        #[cfg(kani)]
-        {
-            return kani_tab_stops(cols);
-        }
-        #[cfg(not(kani))]
-        {
-            (0..cols).map(|c| c > 0 && c % 8 == 0).collect()
-        }
-    }
-
-    #[cfg(kani)]
-    pub(crate) fn kani_stub(rows: u16, cols: u16) -> Self {
-        Self {
-            cursor: Cursor::default(),
-            saved_cursor: SavedCursor::default(),
-            scroll_region: ScrollRegion::full(rows),
-            horizontal_margins: HorizontalMargins::full(cols),
-            tab_stops: Self::default_tab_stops(cols),
-            tab_defaults_suppressed: false,
-            pending_wrap: false,
-            cursor_template: Cell::EMPTY,
-            cursor_template_bg_rgb: None,
-            presentation: GridPresentationState::kani_stub(),
-        }
+        (0..cols).map(|c| c > 0 && c % 8 == 0).collect()
     }
 
     /// Get the current cursor position.
@@ -211,7 +126,7 @@ impl GridCursorState {
 
     /// Save cursor state for DECSC/DECRC.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn save_cursor(&mut self) {
         self.saved_cursor = SavedCursor {
             cursor: self.cursor,
@@ -223,14 +138,14 @@ impl GridCursorState {
     /// Return the currently saved cursor snapshot.
     #[must_use]
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn saved_cursor(&self) -> SavedCursor {
         self.saved_cursor
     }
 
     /// Restore the cursor position from a previously prepared DECRC target.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn restore_saved_cursor(&mut self, cursor: Cursor) {
         self.cursor = cursor;
         self.pending_wrap = self.saved_cursor.pending_wrap;
@@ -318,7 +233,7 @@ impl GridCursorState {
         self.tab_stops = Self::default_tab_stops(cols);
     }
 
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) fn is_tab_stop(&self, col: u16) -> bool {

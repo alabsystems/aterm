@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// W2 THIRD pass: the seven findings, each armed with the judge's own
-// counterexample AT THE SPELLING THE LIVE SITES USE.
+// Adversarial tests, each running a recorded counterexample at the spelling
+// the live sites use.
 //
 // | finding | the counterexample this file runs                                     |
 // |---------|-----------------------------------------------------------------------|
@@ -70,12 +70,9 @@ fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
 // ---------------------------------------------------------------------------
 // P3-1 / P3-4 — four pointer-shaped runtime types, four different letters.
 //
-// `Id`, `ClassPtr`, `ProtocolPtr` and `Sel` were all aliases of a raw void
-// pointer, so the ONE `Encode` impl that existed for `*mut c_void` said `"@"`
-// for all three `*mut` ones. `Sel` was newtyped in the second pass, which fixed
-// `const void *` and left `*mut c_void` — the spelling the SDK, objc2 and
-// vendored winit all use for KVO's `context:` — still registering as an OBJECT,
-// and left `Class` registering as `@` where clang emits `#`.
+// `Id`, `ClassPtr`, `ProtocolPtr` and `Sel` are distinct types, so each has its
+// own `Encode` impl: a shared `*mut c_void` alias would register KVO's
+// `context:` as an OBJECT (`@`) and `Class` as `@` where clang emits `#`.
 // ---------------------------------------------------------------------------
 
 declare_class! {
@@ -114,8 +111,8 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     assert_eq!(<*mut c_void as Encode>::ENCODING, "^v");
 
     // And they are four DIFFERENT Rust types, which is what makes four impls
-    // possible at all. `Id` used to BE `*mut c_void`, so this line would not
-    // have compiled — the two impls would have collided.
+    // possible at all; were `Id` an alias of `*mut c_void`, the impls would
+    // collide.
     assert_eq!(size_of::<Id>(), size_of::<*mut c_void>());
     assert_eq!(size_of::<ClassPtr>(), size_of::<*mut c_void>());
     assert_eq!(align_of::<Id>(), align_of::<*mut c_void>());
@@ -411,8 +408,7 @@ fn the_three_real_block_shapes_all_satisfy_the_new_encode_bounds() {
     // on the x86_64 compat slice) and a `-> bool` return — are `compile_fail`
     // doctests on the constructors, because a test that does not compile
     // cannot live in a test binary. `tests/blocks.rs` carries the positive
-    // form: `enumerateLinesUsingBlock:`'s `stop` is `*mut Bool`, and it used to
-    // be `*mut bool` until this bound refused it.
+    // form: `enumerateLinesUsingBlock:`'s `stop` is `*mut Bool`.
     // `^c`, not `*`, on x86_64: clang encodes the `BOOL` typedef, not the
     // `signed char *` it aliases — measured against Foundation's own
     // `-[NSFileManager fileExistsAtPath:isDirectory:]` (`c32@0:8@16^c24`) on

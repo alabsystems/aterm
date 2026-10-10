@@ -1003,7 +1003,7 @@ fn idle_facts() -> Facts {
 /// One fact knocked off an otherwise-go reading, and the wait it must cause.
 type Knock = (fn(&mut Facts), &'static str);
 
-/// THE QUIET UPGRADE, THE DEFAULT SINCE 2026-09-29 (the owner: "never
+/// THE QUIET UPGRADE, THE DEFAULT (the owner: "never
 /// interrupt an agent that is working"; [`Facts::quiet`], [`quiet_step`]):
 /// at a genuinely idle point — Claude's own `idle`, nothing under the agent,
 /// no box, no draft, nobody at the tab, settled — a pending round RESTARTS
@@ -1017,8 +1017,7 @@ type Knock = (fn(&mut Facts), &'static str);
 /// stood a look for waits `notice-shown` ([`Facts::unnoticed`]). THE KNOB
 /// (`upgrade_ask = true`, `quiet` false) is the ask-and-drain flow:
 /// `Announce` at the same idle point, `awaiting-ready` after it. A restart
-/// in flight, a finished move and a stopped round are the old reducer's as
-/// ever.
+/// in flight, a finished move and a stopped round are the old reducer's.
 #[test]
 fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     let quiet = Facts {
@@ -1078,8 +1077,8 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     );
 }
 
-/// A ROUND AN OLDER BUILD ANNOUNCED STILL ENDS UNDER THE QUIET UPGRADE (round
-/// eight, #4; [`quiet_step`]): the agent was told to wind down, and the quiet
+/// A ROUND AN OLDER BUILD ANNOUNCED STILL ENDS UNDER THE QUIET UPGRADE
+/// ([`quiet_step`]): the agent was told to wind down, and the quiet
 /// flow asks it nothing again. Once the agent's own work — a break of it,
 /// a shell under it, a status its idle screen does not bear out — has held
 /// the restart a whole [`REASK_S`] past the notice (or past a READY), the
@@ -1190,7 +1189,7 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
 }
 
 /// A STATUS THAT ONLY LAGS HOLDS THE QUIET RESTART UNTIL THE OWNER'S WORD
-/// (round eight, #5; [`quiet_step`]): Claude's own `shell`/`busy` left over
+/// ([`quiet_step`]): Claude's own `shell`/`busy` left over
 /// an idle screen — an agent that finished, or asked its person something,
 /// with nothing under it — let the ask flow's notice through (its turn
 /// rewrote the status), but the quiet flow types nothing, so it waited
@@ -1263,10 +1262,10 @@ fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() 
     );
 }
 
-/// NO UNTASKED SESSION IS RESTARTED WITHOUT A NOTICE (the owner's direction
-/// of 2026-09-29): the fresh restart of a conversation with no task waits
-/// `notice-shown` until the owner's waiting record has stood a look
-/// ([`Facts::unnoticed`]) — under the knob too — and then goes as before.
+/// NO UNTASKED SESSION IS RESTARTED WITHOUT A NOTICE: the fresh restart of a
+/// conversation with no task waits `notice-shown` until the owner's waiting
+/// record has stood a look ([`Facts::unnoticed`]) — under the knob too —
+/// and then goes.
 /// NEGATIVE CONTROL: a told owner's session is restarted afresh at once.
 #[test]
 fn an_untasked_session_is_restarted_only_after_the_owner_is_told() {
@@ -2139,7 +2138,7 @@ fn the_continuation_says_what_the_session_ran_before_the_restart() {
          answer: decide for yourself, prefer reversible steps, and keep going."
     );
     // Both continuations end on the same instruction, and it never invites a
-    // "waiting on the user" report (owner, 2026-09-25).
+    // "waiting on the user" report.
     let with_model = continue_prompt_with_model(&from, &to, None, Some("claude-opus-5-5"));
     for text in [&said, &bare, &with_model] {
         assert!(text.ends_with(CARRY_ON), "{text}");
@@ -3251,7 +3250,7 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     for (what, rows) in &tasked {
         assert!(transcript_tasked(&text(rows), &[]), "{what}");
     }
-    // An unknown shape reads as someone's (the old behaviour), never as none.
+    // An unknown shape reads as someone's, never as none.
     let odd = r#"{"type":"user","message":{"role":"user","content":{"weird":1}}}"#.to_string();
     assert!(transcript_tasked(&text(&[&odd]), &[]));
     // Folded a line at a time, the answer is the same, and stays: a prompt
@@ -3278,10 +3277,10 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     assert!(super::super::upgrade_codex::ANNOUNCE_HEAD.starts_with(HARNESS_MARK));
 }
 
-/// D1: THE SUPERVISOR'S OWN TURNS ARE NO TASK EITHER (the review of
-/// 2026-09-26). `keep going` and `answer_text` carry no mark — their words
-/// are the owner's — but the loop's ledger records every text it types, and
-/// when ([`TaskScan::supervisor_typed`]), and a row with the same words
+/// THE SUPERVISOR'S OWN TURNS ARE NO TASK EITHER. `keep going` and
+/// `answer_text` carry no mark — their words are the owner's — but the
+/// loop's ledger records every text it types, and when
+/// ([`TaskScan::supervisor_typed`]), and a row with the same words
 /// (however wrapped), recorded as they were typed, is the harness's: the
 /// E2E's chain — the notice, READY, the carry-on, `keep going`,
 /// `answer_text` — holds no task. So is a command it typed (`/compact`),
@@ -3768,9 +3767,9 @@ fn break_with_work() -> Facts {
     }
 }
 
-/// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
+/// NO STOP IS FOR GOOD (the owner: "you should NEVER have
 /// upgrades stalled"): EVERY reason a round stops for rests `RETRY_S` —
-/// `failed` at an idle point, `background` at a break, as before — and then
+/// `failed` at an idle point, `background` at a break — and then
 /// the reducer starts a new round (`Step::Rearm`), at an idle point, at a
 /// break (the break's own rule lets it through: it types nothing and ends
 /// nothing), at a usage limit and at the login wall. NEGATIVE CONTROL: one
@@ -3958,7 +3957,7 @@ fn a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go() {
     }
 }
 
-// ------------------------------------ the notices queued behind a limit (2026-09-27)
+// ------------------------------------ the notices queued behind a limit
 
 /// A READY marker as aterm 0.93.0 typed it.
 const QUEUED_MARKER: &str = "ATERM-UPGRADE-READY-6a57ff7a";
@@ -4310,7 +4309,7 @@ fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
 }
 
 /// The ladder's rungs: twenty minutes, an hour and two hours behind, and
-/// nothing before a start is known (owner, 2026-09-28).
+/// nothing before a start is known.
 #[test]
 fn the_ladder_climbs_by_how_long_the_session_has_been_behind() {
     assert_eq!(rung(0), Rung::Prefer);
@@ -4352,7 +4351,7 @@ fn the_ladder_climbs_by_how_long_the_session_has_been_behind() {
 /// full queue, the agent's own turn (its status, its busy footer), a turn in
 /// a Codex daemon the screen does not show (its own thread's, a goal, or one
 /// the lane cannot place in another session), a box, a draft, and a
-/// keystroke within KEYS_GAP_S each still wait (owner, 2026-09-28).
+/// keystroke within KEYS_GAP_S each still wait.
 #[test]
 fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     let at = |rung: Rung, f: Facts| Facts { rung, ..f };

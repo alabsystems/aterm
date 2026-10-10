@@ -208,7 +208,3 @@ fn setup_then_join_produce_an_anchor_and_a_roster_the_client_accepts() {
         Err(RosterReject::Verify)
     );
 }
-
-// (The unset-anchor tripwire that stood here was deleted 2026-08-15 as part of the
-// arming commit, exactly as its own doc prescribed. The tier is ARMED: pins.rs names
-// the paper master minted by `atpkg-keys setup --id m3`.)

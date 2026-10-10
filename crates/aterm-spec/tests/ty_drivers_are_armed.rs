@@ -3,48 +3,23 @@
 
 //! Every `ty check` in this workspace must arm the whole state space.
 //!
-//! This is a STRUCTURAL gate, and it exists because the same defect has now been
-//! found twice, in a different driver each time:
+//! A STRUCTURAL gate: an unarmed driver was found twice, in a different driver
+//! each time, so the rule is enforced over the source itself — if you invoke
+//! `ty check`, `arm_whole_space_check` must be right there with it. The
+//! discovered `ty` can have an unsound reduction that prints `No errors found
+//! (exhaustive).` and exits 0 on a spec violated three steps from `Init` (see
+//! `verify::arm_whole_space_check`), so an unarmed driver answers "proved"
+//! about a space it never entered. A source scan, not a runtime hook: the
+//! failure is a driver that never calls the shared helper at all.
 //!
-//! * **2026-07-30** — `ty_check_derived` ran with partial-order reduction on and
-//!   booked a false proof; fixed by adding `arm_whole_space_check`, in one file.
-//! * **2026-08-06** — `spec_xref_closure` hand-rolled its own argument list,
-//!   never got that fix, and measured a dead-action set on a space POR had
-//!   collapsed from 128 states to 1. Auditing that turned up **five more**
-//!   unarmed `ty check` drivers, including the isolation family's
-//!   security-boundary specs.
-//!
-//! Both fixes were correct and neither was structural: they patched the driver
-//! that happened to be noticed. A third driver would have been found by a third
-//! incident. So the rule is enforced over the source itself — if you invoke
-//! `ty check`, `arm_whole_space_check` must be right there with it.
-//!
-//! Why it matters more than tidiness: the `ty` this machine discovers has an
-//! unsound reduction. It prints `Model checking complete: No errors found
-//! (exhaustive).` and exits 0 on a spec whose invariant is violated three steps
-//! from `Init` (see `verify::arm_whole_space_check`). An unarmed driver is not
-//! slightly weaker — it is a checker that answers "proved" about a space it
-//! never entered.
-//!
-//! Deliberately a source scan and not a runtime hook: the failure mode is a
-//! driver that never calls the shared helper at all, which no amount of
-//! instrumentation inside the helper can observe.
-//!
-//! **The second rule (2026-09-28): every `ty` spawn goes through
-//! `verify::ty_output`.** `ty` sizes its memory budget by the number of live
-//! `ty`/`cargo`/`rustc` processes, and a search the budget stops still exits 0
-//! under a header that says `exhaustive` — a false green to anything that
-//! reads the exit status. `ty_output` classifies that stop (exit 5, or a
-//! `Model checking stopped:` line) as an `Err` naming INCOMPLETE, so it fails
-//! closed (2026-10-01; until then it serialised every spawn behind a lock
-//! instead). It does that only for the drivers that call it: one
-//! `Command::output()` of its own reads a stopped search as a pass. Same shape
-//! as the arming rule, same scan, one more fact per driver — and it covers
-//! `ty trace validate` drivers too, which take no arming but go through the one
-//! place that decides what a `ty` transcript may be credited as. The one other
-//! door is `verify::ty_child`, the `--cases` co-process spawn (2026-10-01): it
-//! shares `ty_output`'s environment, and its client reads no verdict it was
-//! not sent as one.
+//! **The second rule: every `ty` spawn goes through `verify::ty_output`.** `ty`
+//! sizes its memory budget by the live `ty`/`cargo`/`rustc` processes, and a
+//! search the budget stops still exits 0 under an `exhaustive` header.
+//! `ty_output` classifies that stop (exit 5, or a `Model checking stopped:`
+//! line) as an INCOMPLETE `Err`; a driver's own `Command::output()` reads it
+//! as a pass. It covers `ty trace validate` drivers too. The one other door is
+//! `verify::ty_child`, the `--cases` co-process spawn: it shares `ty_output`'s
+//! environment, and its client reads no verdict it was not sent as one.
 
 use std::path::{Path, PathBuf};
 
@@ -102,11 +77,8 @@ const WINDOW: usize = 40;
 
 /// Whether a region names the CHECKER — `ty` as a word or an identifier prefix
 /// (`ty`, `"ty"`, `ty_bin`, `ty_path`) — rather than merely containing the two
-/// letters. The first version of this scan asked `region.contains("ty")`, and
-/// a `cargo check --keep-going` driver in xtask's gate whose comments say
-/// "type error", "exactly" and "TRIPLE-SCOPED" was reported as an unarmed
-/// model check for it (2026-09-03); the substring test made the gate say
-/// something false about a site that never runs `ty` at all.
+/// letters: a substring test reads "type error" or "exactly" in a `cargo
+/// check` driver's comments as an unarmed model check.
 fn mentions_ty(region: &str) -> bool {
     region
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -115,7 +87,7 @@ fn mentions_ty(region: &str) -> bool {
 
 /// Whether a region CALLS `ty_output` — or `ty_child`, the `--cases`
 /// co-process door with the same environment, whose client protocol fails
-/// closed on its own (2026-10-01) — the name as a whole identifier, so
+/// closed on its own — the name as a whole identifier, so
 /// `pty_output(` or `dirty_output(` beside an unrouted driver never reads as
 /// its routing.
 fn calls_ty_output(region: &str) -> bool {
@@ -168,9 +140,7 @@ fn scan(path: &Path, rel: &str) -> Vec<Driver> {
         let region = lines[lo..hi].join("\n");
         // A `cargo` driver is one that RUNS cargo — `Command::new("cargo")`,
         // `$CARGO`, or the workspace's cargo_bin helper — not one whose
-        // comments mention the word (the 2026-09-03 sharpening skipped on any
-        // lowercase "cargo" in the region, which a future ty driver's prose
-        // could carry).
+        // comments mention the word, which a ty driver's prose could carry.
         let runs_cargo = region.contains("Command::new(\"cargo\")")
             || region.contains("env!(\"CARGO\")")
             || region.contains("var_os(\"CARGO\")")

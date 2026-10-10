@@ -115,10 +115,9 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
 }
 
 /// The gate is a LATCH: it stops painting only after a SUSTAINED fast run with
-/// nothing in flight. The model used to close on a single abstract `ConfirmFast`,
-/// and the binding above never noticed because it only ever fired that action at an
-/// already-closed latch — so the one property the model exists to pin was unpinned.
-/// This drives the sequence a single-sample close cannot survive, on BOTH sides.
+/// nothing in flight. This drives the sequence a single-sample close cannot
+/// survive, on BOTH sides (the binding above only fires `ConfirmFast` at an
+/// already-closed latch, so it cannot pin this).
 #[test]
 fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     let model = aterm_spec::derive::predictive_echo_visibility_model();

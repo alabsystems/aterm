@@ -3,11 +3,9 @@
 
 //! The `machine` verb, run as a PROCESS.
 //!
-//! Every other test of this feature is a unit test over pure functions and a fake
-//! `defaults` port. That left the one thing the window actually consumes — the bytes
-//! `atpkg machine` writes to stdout — pinned only by a hand-typed literal in the GUI's
-//! own test, on the other side of the seam. A reword on this side would have kept both
-//! suites green and left the card reading "not read yet" forever.
+//! The window consumes the bytes `atpkg machine` writes to stdout; the other tests of this
+//! feature are unit tests over pure functions and a fake `defaults` port, so this pins the
+//! seam: a reword here would leave the card reading "not read yet" forever.
 //!
 //! THE MACHINE IS NOT TOUCHED. Every child here runs with a temp `HOME`, and the
 //! synthetic-home guard refuses on exactly that basis — `defaults` writes the ACCOUNT's
@@ -17,7 +15,7 @@
 
 use std::process::{Command, Stdio};
 
-/// A temp `HOME` with nothing in it: no config, no store, no build directories.
+/// A temp `HOME` with nothing in it: no config, no store.
 struct Fixture {
     root: aterm_tempfile::TempDir,
     home: std::path::PathBuf,
@@ -78,9 +76,6 @@ fn the_read_prints_exactly_one_parseable_record_and_exits_zero() {
         "exactly one `machine-state:` record, and it parses: {stdout:?}"
     );
     let state = &records[0];
-    // A temp HOME with no build directories: the counts are real, not invented.
-    assert_eq!(state.exposed, 0, "{stdout:?}");
-    assert_eq!(state.would_migrate, 0, "{stdout:?}");
     assert!(!state.config_unreadable, "{stdout:?}");
     // And the prose above it: the verdict prefix the card quotes, on its own lines.
     assert!(

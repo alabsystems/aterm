@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Where atpkg's UNASKED notices go — the lines a library call says on its own (a
-//! `[packages]` or `[machine]` table it could not read, a configured prefix it will not use,
-//! a lay that could not stay provenance-clean), never what a verb prints as its answer.
+//! `[packages]` or `[machine]` table it could not read, a configured prefix it will not
+//! use), never what a verb prints as its answer.
 //!
 //! In atpkg's own CLI they are stderr lines: a verb the person typed shows them, and a pass
 //! the window spawns has its stderr kept in `aterm.log`. The two HOSTS that call this
@@ -30,11 +30,6 @@ static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// no way back, because a host never becomes a verb.
 pub fn to_host_log() {
     TO_HOST_LOG.store(true, Ordering::Relaxed);
-}
-
-/// Whether this process is a host whose notices are log records ([`to_host_log`]).
-pub(crate) fn hosted() -> bool {
-    TO_HOST_LOG.load(Ordering::Relaxed)
 }
 
 /// Say no unasked notice in this process. For the `__reroute` hidden verb

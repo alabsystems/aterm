@@ -704,7 +704,7 @@ mod start_tests {
             return;
         };
         std::thread::sleep(Duration::from_millis(20));
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn /bin/sleep");
@@ -734,7 +734,7 @@ mod start_tests {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let moment = SystemTime::now();
         std::thread::sleep(Duration::from_millis(20));
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn /bin/sleep");
@@ -859,10 +859,12 @@ mod parent_and_path_tests {
     /// shell still runs. The sleep dies by SIGKILL, never a crash signal.
     #[test]
     fn an_orphan_reads_parent_one() {
-        let mut shell = std::process::Command::new("/bin/sh")
+        // `spawnfd`'s: the shell and the `sleep` it leaves hold their stdio and
+        // nothing else of this process, not another test thread's pipe.
+        let mut shell = crate::spawnfd::command("/bin/sh")
             .args(["-c", "/bin/sleep 120 & echo $!; read -r _"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::piped())
             .spawn()
             .expect("sh");
         let mut line = String::new();

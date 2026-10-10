@@ -8,6 +8,7 @@
 
 pub(crate) use super::builtin_patterns::BuiltinRules;
 use aterm_regex::Regex;
+use aterm_types::text_shaping::AmbiguousWidth;
 #[cfg(test)]
 use std::cmp::Ordering;
 
@@ -412,12 +413,28 @@ impl SmartSelection {
     /// A column at or past the end of the text names an empty cell: `None`.
     #[must_use]
     pub fn word_boundaries_at_column(&self, text: &str, column: usize) -> Option<(usize, usize)> {
-        let byte_pos = column_to_byte_pos(text, column);
+        self.word_boundaries_at_column_with(text, column, AmbiguousWidth::Single)
+    }
+
+    /// [`word_boundaries_at_column`](Self::word_boundaries_at_column) with the
+    /// columns measured under the terminal's `ambiguous_width` policy: with
+    /// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`)
+    /// takes the two cells the grid draws it in.
+    #[must_use]
+    pub fn word_boundaries_at_column_with(
+        &self,
+        text: &str,
+        column: usize,
+        ambiguous: AmbiguousWidth,
+    ) -> Option<(usize, usize)> {
+        let byte_pos = column_to_byte_pos_with(text, column, ambiguous);
         if byte_pos >= text.len() {
             return None;
         }
         let (start_byte, end_byte) = self.word_boundaries_at(text, byte_pos)?;
-        Some(byte_span_to_columns(text, start_byte, end_byte))
+        Some(byte_span_to_columns_with(
+            text, start_byte, end_byte, ambiguous,
+        ))
     }
 
     /// Get basic word boundaries (fallback when no rule matches).
@@ -491,8 +508,14 @@ fn is_word_char(seps: Option<&str>, ch: char) -> bool {
 /// cluster's display width is the wrong charge for an Indic conjunct and
 /// double-click landed on the wrong cells. A column inside a multi-cell
 /// grapheme names its start; past the text, `text.len()`.
+#[cfg(test)]
 pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
-    for g in aterm_grapheme::grid_graphemes(text) {
+    column_to_byte_pos_with(text, column, AmbiguousWidth::Single)
+}
+
+/// [`column_to_byte_pos`] under the terminal's `ambiguous_width` policy.
+fn column_to_byte_pos_with(text: &str, column: usize, ambiguous: AmbiguousWidth) -> usize {
+    for g in aterm_grapheme::grid_graphemes_with(text, ambiguous) {
         if column < g.end_col {
             return g.byte_offset;
         }
@@ -506,14 +529,25 @@ pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
 /// A grapheme the grid folds into the cell before it (the `ය` of Sinhala
 /// `ක්‍ය`) starts in that cell, so a word that starts with one still covers
 /// the cell its first letter is drawn in.
+#[cfg(test)]
 pub(crate) fn byte_span_to_columns(
     text: &str,
     start_byte: usize,
     end_byte: usize,
 ) -> (usize, usize) {
+    byte_span_to_columns_with(text, start_byte, end_byte, AmbiguousWidth::Single)
+}
+
+/// [`byte_span_to_columns`] under the terminal's `ambiguous_width` policy.
+fn byte_span_to_columns_with(
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+    ambiguous: AmbiguousWidth,
+) -> (usize, usize) {
     let mut start = None;
     let mut end = 0;
-    for g in aterm_grapheme::grid_graphemes(text) {
+    for g in aterm_grapheme::grid_graphemes_with(text, ambiguous) {
         if g.byte_offset >= end_byte {
             break;
         }

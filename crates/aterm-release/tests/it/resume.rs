@@ -88,7 +88,7 @@ fn recutting_a_published_version_is_refused() {
     assert!(err.contains("the next release is v0.3.0"), "{err}");
     assert!(
         err.contains("commit and push, then `pub stage aterm` and `pub publish aterm`, then cut"),
-        "a cut builds the published commit, so the next version must be published \
+        "a cut releases the published commit, so the next version must be published \
          first: {err}"
     );
     assert!(
@@ -116,7 +116,8 @@ fn journal() -> Journal {
         build_number: 1_783_918_101,
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c".into(),
         min_build: None,
-        arm64_only: false,
+        artifact: Some("aa".repeat(32)),
+        macho_sha256: Some("bb".repeat(32)),
         linux: None,
         manifest_signed: false,
         signature_required: false,
@@ -137,9 +138,9 @@ fn first_incomplete_walks_the_step_order() {
         Some("lock"),
         "a fresh journal acquires the remote lease before build"
     );
-    j.done = vec!["lock".into(), "build".into(), "selfcheck".into()];
+    j.done = vec!["lock".into(), "sign".into(), "selfcheck".into()];
     assert_eq!(j.first_incomplete(), Some("tag"));
-    j.done = ["lock", "build", "selfcheck", "tag"]
+    j.done = ["lock", "sign", "selfcheck", "tag"]
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -152,14 +153,14 @@ fn first_incomplete_walks_the_step_order() {
     j.done = vec![
         "selfcheck".into(),
         "lock".into(),
-        "build".into(),
+        "sign".into(),
         "tag".into(),
     ];
     assert_eq!(j.first_incomplete(), Some("publish"));
     // A gap resumes at the GAP, not after the highest completed step: the
     // journal records what finished; skipping an incomplete earlier one is
     // never safe.
-    j.done = vec!["lock".into(), "build".into(), "tag".into()];
+    j.done = vec!["lock".into(), "sign".into(), "tag".into()];
     assert_eq!(j.first_incomplete(), Some("selfcheck"));
     j.done = STEPS.iter().map(|s| s.to_string()).collect();
     assert_eq!(
@@ -174,7 +175,7 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     let dir = tmpdir("journal-prefix");
     let path = dir.path().join("state.toml");
     for done in [
-        vec!["build".to_string()],
+        vec!["sign".to_string()],
         vec!["lock".to_string(), "publish".to_string()],
         vec!["lock".to_string(), "lock".to_string()],
         vec!["lock".to_string(), "unknown".to_string()],
@@ -204,25 +205,6 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     let mut malformed_owner = journal();
     malformed_owner.commit = "abcd".into();
     assert!(malformed_owner.save(&path).is_err());
-}
-
-/// The website hook's exit contract, pinned: `publish/post-promote` documents
-/// 0 synced-or-deferred, 3 no site checkout, 4 live-site lag — and ONLY a code
-/// outside that contract (1 hard failure, 2 usage, or a signal) is a failure,
-/// which since 2026-09-23 is a loud WARNING and never a parked journal.
-#[test]
-fn the_site_hook_exit_contract_is_pinned() {
-    use publish::{SiteHookOutcome, site_hook_outcome};
-    assert_eq!(site_hook_outcome(Some(0)), SiteHookOutcome::Synced);
-    assert_eq!(site_hook_outcome(Some(3)), SiteHookOutcome::NoSiteCheckout);
-    assert_eq!(site_hook_outcome(Some(4)), SiteHookOutcome::LiveLagging);
-    for failing in [Some(1), Some(2), Some(5), Some(127), None] {
-        assert_eq!(
-            site_hook_outcome(failing),
-            SiteHookOutcome::Failed,
-            "{failing:?} must be reported as a failure — never pass silently"
-        );
-    }
 }
 
 /// ONE JOURNAL FORMAT (2026-09-23; 11 since 2026-09-26) — and a HEADER every format
@@ -255,7 +237,12 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
         )
         .unwrap();
     };
+    // The publish-once cutters' (0.94-0.101) list: `build` where this one signs.
+    let publish_once = "\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
     for (format, done, named) in [
+        // A rebuilding cutter's journal: a cut it claimed is a cut only it can
+        // finish — this cutter would sign bytes it never measured.
+        ("format = 11\n", publish_once.to_string(), "format-11"),
         // A pre-publish-once cutter's journal: a cut it started is a cut only it can
         // finish.
         ("format = 10\n", through_unlock.to_string(), "format-10"),
@@ -303,7 +290,7 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
         } else {
             let error = triage.expect_err("an unfinished one blocks").to_string();
             assert!(
-                error.contains(named) && error.contains("--resume` hands it"),
+                error.contains(named) && error.contains("only the cutter built at its claim"),
                 "{error}"
             );
         }
@@ -326,7 +313,7 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
 
     // NEGATIVE CONTROL: the current step list at the current format loads and is
     // cleared by the next cut; an in-flight one blocks it, by name.
-    let now_through_unlock = "\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
+    let now_through_unlock = "\"lock\", \"sign\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
     write(
         &format!("format = {}\n", publish::JOURNAL_FORMAT),
         now_through_unlock,
@@ -342,7 +329,7 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
     );
     write(
         &format!("format = {}\n", publish::JOURNAL_FORMAT),
-        "\"lock\", \"build\", \"selfcheck\", \"tag\"",
+        "\"lock\", \"sign\", \"selfcheck\", \"tag\"",
     );
     let in_flight = Journal::load(&path).unwrap().unwrap();
     assert_eq!(in_flight.first_incomplete(), Some("publish"));
@@ -356,10 +343,11 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
         error.contains("already in progress") && error.contains("publish"),
         "{error}"
     );
-    // The format-10 step list, or a retired `site` entry, under the current number is
-    // corruption, not history.
+    // The format-10 or format-11 step list, or a retired `site` entry, under the
+    // current number is corruption, not history.
     for stale in [
         through_unlock.to_string(),
+        publish_once.to_string(),
         format!("{now_through_unlock}, \"site\""),
     ] {
         write(&format!("format = {}\n", publish::JOURNAL_FORMAT), &stale);
@@ -443,7 +431,7 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
             other => other.to_string(),
         })
         .chain(std::iter::once(
-            "done = [\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"]"
+            "done = [\"lock\", \"sign\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"]"
                 .to_string(),
         ))
         .collect::<Vec<_>>()
@@ -539,74 +527,6 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
     );
 }
 
-/// A FAILING WEBSITE HOOK LEAVES THE CUT COMPLETE. The hook stub exits 1 (the
-/// post-promote contract's "hard failure"); the follow-up reports a WARNING that
-/// names the release complete and prints the exact retry command, the journal on
-/// disk stays complete, and the next fresh cut is not refused by it. Before
-/// 2026-09-23 this exact failure parked the journal at `site` and refused every
-/// following cut with "a cut is already in progress".
-#[test]
-fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
-    let dir = tmpdir("journal-site-hook-fails");
-    let path = dir.path().join("cut-state.toml");
-    let mut complete = journal();
-    complete.release_id = Some(55);
-    complete.release_intent = true;
-    complete.done = STEPS.iter().map(|step| (*step).to_string()).collect();
-    complete.save(&path).unwrap();
-
-    let hook = dir.path().join("post-promote");
-    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-    let mut ran = Vec::new();
-    let follow = publish::site_follows_the_cut(&hook, "0.92.0", &mut |h| {
-        ran.push(h.to_path_buf());
-        Ok(Some(1))
-    });
-    assert_eq!(ran, vec![hook.clone()], "the hook is asked once");
-    assert_eq!(
-        follow,
-        publish::SiteFollow::Ran {
-            version: "0.92.0".into(),
-            outcome: publish::SiteHookOutcome::Failed,
-            failure: Some("exit 1".into()),
-        }
-    );
-    let lines = follow.lines().join("\n");
-    assert!(lines.contains("WARNING"), "{lines}");
-    assert!(lines.contains("COMPLETE"), "{lines}");
-    assert!(
-        lines.contains("PUB_VERSION=0.92.0 publish/post-promote --latest"),
-        "the exact retry command: {lines}"
-    );
-
-    let after = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(after.first_incomplete(), None, "the journal stays complete");
-    assert!(
-        publish::fresh_cut_journal_triage(
-            Some(&publish::JournalHeader::read(&path).unwrap().unwrap()),
-            publish::CutKind::Real
-        )
-        .unwrap(),
-        "and the next cut is not refused by it"
-    );
-
-    // A hook that cannot even be started is the same warning, never an error…
-    let unstartable = publish::site_follows_the_cut(&hook, "0.92.0", &mut |_| {
-        Err(std::io::Error::other("permission denied"))
-    });
-    assert!(
-        unstartable.lines().join("\n").contains("cannot run"),
-        "{unstartable:?}"
-    );
-    // …a success says so, and a tree with no hook skips without running anything.
-    let synced = publish::site_follows_the_cut(&hook, "0.92.0", &mut |_| Ok(Some(0)));
-    assert!(synced.lines()[0].contains("synced"), "{synced:?}");
-    let absent = publish::site_follows_the_cut(&dir.path().join("absent"), "0.92.0", &mut |_| {
-        panic!("an absent hook is never run")
-    });
-    assert_eq!(absent, publish::SiteFollow::NoHook);
-}
-
 #[test]
 fn journal_round_trips_and_marks_persist_immediately() {
     let dir = tmpdir("journal");
@@ -630,12 +550,12 @@ fn journal_round_trips_and_marks_persist_immediately() {
 
     // mark() persists IMMEDIATELY (journal-every-step) and is idempotent.
     j.mark("lock", &path).expect("mark lock");
-    j.mark("build", &path).expect("mark build");
-    j.mark("build", &path).expect("mark build again");
+    j.mark("sign", &path).expect("mark sign");
+    j.mark("sign", &path).expect("mark sign again");
     let back = Journal::load(&path).unwrap().unwrap();
     assert_eq!(
         back.done,
-        vec!["lock".to_string(), "build".to_string()],
+        vec!["lock".to_string(), "sign".to_string()],
         "no duplicate entries"
     );
     assert_eq!(back.first_incomplete(), Some("selfcheck"));
@@ -694,7 +614,7 @@ fn journal_persists_signature_ratchet_and_actual_key_fail_closed() {
     j.save(&path).unwrap();
     assert_eq!(Journal::load(&path).unwrap().unwrap(), j);
 
-    j.done.extend(["lock".into(), "build".into()]);
+    j.done.extend(["lock".into(), "sign".into()]);
     let error = j.save(&path).unwrap_err().to_string();
     assert!(
         error.contains("without its required manifest signature"),
@@ -1964,35 +1884,60 @@ fn cli_parses_the_whole_spec_5_surface() {
             commit: Some("f37ddc740".to_string())
         }
     );
-    // The MEASURE judge the release scripts ask (2026-10-01).
+    // The one release command: its flags, the Linux declaration carried, and the two
+    // names for a release commit refused together.
+    let release = |args: &[&str]| match parse(args) {
+        Ok(cli::Cmd::Release(opts)) => Ok(opts),
+        Ok(other) => panic!("{args:?} parsed as {other:?}"),
+        Err(e) => Err(e),
+    };
+    let plain = release(&["release"]).unwrap();
+    assert_eq!(plain, crate::release::ReleaseOptions::default());
+    let full = release(&[
+        "release",
+        "--bump",
+        "--linux-artifacts",
+        "/h",
+        "--linux-target",
+        "aarch64",
+        "--linux-worker",
+        "aarch64=arm:/r",
+        "--release-credentials",
+        "/c.toml",
+        "--engine",
+        "/e",
+        "--dry-run",
+        "--verbose",
+    ])
+    .unwrap();
+    assert!(full.bump && full.dry_run && full.verbose && !full.forget);
     assert_eq!(
-        parse(&["measure", "verdict"]).unwrap(),
-        cli::Cmd::MeasureVerdict {
-            commit: "HEAD".into(),
-            prover: None
-        }
+        full.linux.artifacts.as_deref(),
+        Some(std::path::Path::new("/h"))
     );
+    assert_eq!(full.linux.targets, ["aarch64-unknown-linux-gnu"]);
     assert_eq!(
-        parse(&[
-            "measure",
-            "verdict",
-            "--commit",
-            "f37ddc740",
-            "--prover",
-            "/s/bin"
-        ])
-        .unwrap(),
-        cli::Cmd::MeasureVerdict {
-            commit: "f37ddc740".into(),
-            prover: Some("/s/bin".into())
-        }
+        full.linux.cut_args(),
+        [
+            "--linux-artifacts",
+            "/h",
+            "--linux-target",
+            "aarch64",
+            "--linux-worker",
+            "aarch64=arm:/r"
+        ]
     );
+    let mac = release(&["release", "--commit", "f37ddc740", "--mac-only"]).unwrap();
+    assert_eq!(mac.commit.as_deref(), Some("f37ddc740"));
+    assert_eq!(mac.linux.cut_args(), ["--mac-only"]);
     for bad in [
-        &["measure"][..],
-        &["measure", "judge"],
-        &["measure", "verdict", "--commit"],
-        &["measure", "verdict", "--commit", "a", "--commit", "b"],
-        &["measure", "verdict", "--update-ratchet"],
+        &["release", "--bump", "--commit", "a"][..],
+        &["release", "--commit"],
+        &["release", "--commit", "a", "--commit", "b"],
+        &["release", "--engine"],
+        &["release", "--linux-target", "riscv64"],
+        &["release", "--resume"],
+        &["measure", "verdict"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
@@ -2162,19 +2107,17 @@ fn cli_parses_the_whole_spec_5_surface() {
         "{yank_flag_error}"
     );
 
-    let cli::Cmd::Cut { opts, abandon, .. } = parse(&[
-        "cut",
-        "--dry-run",
-        "--min-build",
-        "42",
-        "--gate",
-        "--arm64-only",
-    ])
-    .unwrap() else {
+    let cli::Cmd::Cut { opts, abandon, .. } =
+        parse(&["cut", "--dry-run", "--min-build", "42"]).unwrap()
+    else {
         panic!("expected Cut");
     };
     assert!(abandon.is_none());
-    assert!(opts.dry_run && opts.gate && opts.arm64_only && !opts.resume);
+    assert!(opts.dry_run && !opts.resume);
+    assert!(
+        parse(&["cut", "--dry-run", "--gate"]).is_err(),
+        "the deep gate is the release's trust and measure steps"
+    );
     assert_eq!(opts.min_build, Some(42));
 
     let cli::Cmd::Cut { opts, .. } = parse(&[
@@ -2252,7 +2195,10 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         (vec!["cut", "--rehearse"], "OWNER/REPO"),
         (vec!["cut", "--resume", "--dry-run"], "--resume"),
         (vec!["cut", "--resume", "--min-build", "7"], "--resume"),
-        (vec!["cut", "--abandon", "v0.26.0", "--gate"], "--abandon"),
+        (
+            vec!["cut", "--abandon", "v0.26.0", "--mac-only"],
+            "--abandon",
+        ),
         (
             vec!["cut", "--dry-run", "--rehearse", "o/r"],
             "mutually exclusive",
@@ -2404,120 +2350,12 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
         false,
         false,
         None,
-        None,
     )
     .unwrap_err()
     .to_string();
     assert_eq!(error, publish::RECOVERY_STOPPED_PROCESS_REFUSAL);
     assert!(publish::RECOVERY_STOPPED_PROCESS_BANNER.contains("OPERATOR ASSERTION"));
     assert!(publish::RECOVERY_STOPPED_PROCESS_BANNER.contains("cannot cancel"));
-}
-
-// ---------------------------------------------------------------------------
-// resume's provenance gate (the fresh cut's pre-claim gate, re-run before a rebuild)
-// ---------------------------------------------------------------------------
-
-/// A resume that still has `build` to do runs the provenance gate BEFORE the pipeline,
-/// and its refusal carries the gate's own words plus the step that would rebuild.
-///
-/// MUTATION TARGET: delete the call in `resume_cut`, or make the early return
-/// unconditional — a tracked shell's `--resume` then bakes tagged artifacts and dies at
-/// the proof snapshot with the build number already burned.
-#[test]
-fn a_resume_that_will_rebuild_runs_the_provenance_gate_first() {
-    let mut j = journal();
-    j.done = vec!["lock".into()];
-    let called = std::cell::Cell::new(false);
-    let err = publish::resume_provenance_gate(&j, || {
-        called.set(true);
-        Err(ledger::Error::new(
-            "trustc: /s/bin/trustc carries com.apple.provenance",
-        ))
-    })
-    .expect_err("a tagged toolchain must not be rebuilt with");
-    assert!(called.get(), "the gate was consulted");
-    let msg = err.to_string();
-    assert!(msg.contains("would rebuild"), "{msg}");
-    assert!(msg.contains("\"build\""), "the step named: {msg}");
-    assert!(
-        msg.contains("trustc: /s/bin/trustc carries com.apple.provenance"),
-        "the gate's own words: {msg}"
-    );
-    // A gate that passes lets the rebuild through.
-    assert!(publish::resume_provenance_gate(&j, || Ok(())).is_ok());
-    // And a journal that has not even locked yet is still "will rebuild".
-    let fresh = journal();
-    assert!(publish::resume_provenance_gate(&fresh, || Err(ledger::Error::new("x"))).is_err());
-}
-
-/// A resume past `build` never consults the gate: nothing remaining compiles, so a
-/// tagged compiler cannot reach a file, and a cut one upload from finished must stay
-/// finishable — even from a tracked shell, even with a tagged toolchain installed.
-///
-/// MUTATION TARGET: drop the `is_done("build")` early return — the closure below then
-/// runs, returns its refusal, and this test goes red.
-#[test]
-fn a_resume_past_the_build_never_consults_the_provenance_gate() {
-    for done in [
-        vec!["lock", "build"],
-        vec!["lock", "build", "selfcheck", "tag"],
-        vec!["lock", "build", "selfcheck", "tag", "publish", "unlock"],
-    ] {
-        let mut j = journal();
-        j.done = done.iter().map(|s| (*s).to_string()).collect();
-        let called = std::cell::Cell::new(false);
-        publish::resume_provenance_gate(&j, || {
-            called.set(true);
-            Err(ledger::Error::new(
-                "this cutter PROCESS is provenance-tracked",
-            ))
-        })
-        .unwrap_or_else(|e| panic!("a resume past build must not be blocked ({done:?}): {e}"));
-        assert!(
-            !called.get(),
-            "the gate must not even be consulted ({done:?})"
-        );
-    }
-}
-
-/// The production gate a rebuilding resume runs IS the fresh cut's gate over the same
-/// toolchain: on this machine the two answer identically, pass or refusal, word for word.
-/// Both run READ-ONLY here ([`keep_the_installed_toolchain`]): this reads the machine's
-/// installed toolchain, and a test run must not rewrite it.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_resume_gate_is_the_fresh_cuts_gate_on_this_machine() {
-    let rerun = gates::Rerun::resume();
-    let fresh = gates::trust_stage2_bin()
-        .and_then(|bin| {
-            gates::provenance_gate_with(&bin.join("trustc"), keep_the_installed_toolchain, &rerun)
-        })
-        .map_err(|e| e.to_string());
-    let resumed = publish::toolchain_provenance_gate_with(keep_the_installed_toolchain, &rerun)
-        .map_err(|e| e.to_string());
-    assert_eq!(resumed, fresh);
-    let mut j = journal();
-    j.done = vec!["lock".into()];
-    let through_the_rule = publish::resume_provenance_gate(&j, || {
-        publish::toolchain_provenance_gate_with(keep_the_installed_toolchain, &rerun)
-    })
-    .map_err(|e| e.to_string());
-    match (&fresh, &through_the_rule) {
-        (Ok(()), Ok(())) => {}
-        (Err(f), Err(r)) => assert!(r.contains(f.as_str()), "{r}\n--- vs ---\n{f}"),
-        other => panic!("the rule must agree with the gate: {other:?}"),
-    }
-}
-
-/// A heal that changes nothing: the provenance gate's heal step, for a test that runs
-/// the gate over the machine's INSTALLED toolchain. The real heal is exercised on a
-/// scratch toolchain in the gates' own tests.
-#[cfg(target_os = "macos")]
-fn keep_the_installed_toolchain(
-    _roots: &[std::path::PathBuf],
-    _scratch: &std::path::Path,
-) -> atpkg::provenance::HealOutcome {
-    atpkg::provenance::HealOutcome::Clean
 }
 
 /// A failure that names its own verdict keeps it; any other gets `FAILED —`.

@@ -267,7 +267,6 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     grid.line_feed();
     grid.line_feed();
     grid.line_feed();
-    // Write to new visible rows
     grid.set_cursor(1, 0);
     grid.write_char('X');
     grid.set_cursor(2, 0);
@@ -441,7 +440,6 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
         grid.write_char(c);
     }
 
-    // Verify preconditions
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert!(grid.row(1).unwrap().is_wrapped(), "row 1 should be wrapped");
 
@@ -467,7 +465,6 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
         "cursor col {} should be within new_cols 10",
         grid.cursor_col()
     );
-    // Content should be correctly merged
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
     assert_eq!(grid.cell(0, 6).unwrap().char(), 'G');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'X');
@@ -554,7 +551,6 @@ fn invariants_resize_extreme_shrink_full_scrollback() {
     grid.write_char('Z');
     grid.assert_invariants();
 
-    // Grow back.
     grid.resize(8, 10);
     grid.assert_invariants();
 }
@@ -575,7 +571,6 @@ fn invariants_resize_reflow_while_scrolled_back() {
     }
     grid.assert_invariants();
 
-    // Scroll back.
     grid.scroll_display(5);
     assert!(grid.display_offset() > 0);
 
@@ -700,7 +695,6 @@ fn resize_existing_grid_to_zero_cols() {
 #[test]
 fn resize_existing_grid_to_zero_both() {
     let mut grid = Grid::with_scrollback(10, 20, 50);
-    // Generate some scrollback
     for i in 0..15u16 {
         grid.set_cursor(9, 0);
         grid.write_char((b'A' + (i % 26) as u8) as char);

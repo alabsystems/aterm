@@ -34,6 +34,7 @@ fn press(key: Key) -> InputEvent {
         key,
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -79,6 +80,7 @@ fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifi
                 key: Key::Named(NamedKey::SuperLeft),
                 mods: Modifiers::SUPER,
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             false,
@@ -217,6 +219,7 @@ fn releases_modifiers_raw_sequences_and_failed_writes_cannot_claim_an_edit() {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Release,
     };
     for event in [

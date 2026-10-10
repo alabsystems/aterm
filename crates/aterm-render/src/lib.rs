@@ -990,6 +990,34 @@ pub const CHROME_ICON_BIT: u32 = 1 << 26;
 /// [`CHROME_ICON_BIT`], so no character's key can carry it.
 pub const CHROME_ICON_SPILL_BIT: u32 = 1 << 8;
 
+/// Where a SUB-SCRIPT key ([`StyleBits::SUB`]) carries its cell's sideways
+/// nudge ([`Script::Sub`](aterm_core::terminal::Script::Sub)) in
+/// [`GlyphKey::ch_or_id`]: the top byte, as the nudge's two's-complement bits.
+/// A script key holds a code point (21 bits) or a glyph id (16) below it, and
+/// is never procedural, so the shade and icon bits never share the byte.
+pub const SUB_NUDGE_SHIFT: u32 = 24;
+
+/// Fold a [`Script::Sub`](aterm_core::terminal::Script::Sub) cell's sideways
+/// nudge into its glyph key, so each nudge is its own raster, which the
+/// script rasterizer moves sideways by it. A key that carries no script
+/// bit (a rule glyph, an emoji) and a nudge of zero pass through untouched.
+/// Both backends key every cell through [`Renderer::resolve_cell_key`], so
+/// the CPU cache and the GPU atlas hold the one nudged raster.
+#[must_use]
+pub fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> GlyphKey {
+    match script {
+        aterm_core::terminal::Script::Sub { nudge }
+            if nudge != 0 && key.style.script() != StyleBits::REGULAR =>
+        {
+            GlyphKey {
+                ch_or_id: key.ch_or_id | (u32::from(nudge.cast_unsigned()) << SUB_NUDGE_SHIFT),
+                ..key
+            }
+        }
+        _ => key,
+    }
+}
+
 /// The glyph key of `icon` drawn at the renderer's size `px_q`, in a cell of
 /// weight `style` (only [`StyleBits::BOLD`] is read: the icon's stroke is the
 /// face's stem at that weight), spilling into its blank neighbours when
@@ -2142,6 +2170,17 @@ pub struct Renderer {
     /// the square of the pixel size, and the same 16 384 entries measured
     /// 9.6 MB at 1x and 23.8 MB on a Retina cell.
     glyph_bytes: usize,
+    /// The current glyph frame: advanced at each frame boundary
+    /// ([`Renderer::begin_frame_boundary`]) and stamped on every glyph a frame
+    /// reads, so eviction can tell the working set from the rest.
+    glyph_frame: u64,
+    /// `(entries, bytes)` the last capacity trip kept
+    /// ([`Renderer::retain_glyph_working_set`]), zero after a full clear. The
+    /// next trip waits until the cache passes twice this (or the caps, if
+    /// larger), so a frame that reads less than the frame before it — a cursor
+    /// blink, a keystroke echo, a scroll strip — cannot shrink the kept set to
+    /// its own few glyphs.
+    glyph_kept: (usize, usize),
     /// Per-char/presentation key resolve cache (primary-vs-fallback dispatch
     /// happens once per request, not once per blit). Explicit VS15 uses a
     /// distinct entry from Unicode default presentation so one cannot poison
@@ -2610,108 +2649,276 @@ pub fn project_asymmetric_pad_layout(
     }
 }
 
-/// Decoded-image LRU for the CPU renderer's inline-image pass. Each entry keeps
-/// a weak source identity plus the footprint pixel size; the value is RGBA8
-/// resampled to that size. The weak handle pins the allocation's address against
-/// reuse by a different image (ABA), without keeping the source byte buffer alive
-/// after its grid/history owners drop it. Only decoded pixels belong to this
-/// cache's byte budget. Lookup compares pointers without upgrading the weak handle.
-#[derive(Default)]
-struct ImageCache {
-    /// `(weak image identity, fp_w, fp_h) -> decoded`, MRU at the back.
-    entries: Vec<(
-        std::sync::Weak<aterm_core::grid::extra::ImageData>,
-        usize,
-        usize,
-        DecodedImage,
-    )>,
-    /// Running sum of the cached entries' `rgba.len()` — the decoded-byte
-    /// budget `put` enforces (an entry-count cap alone thrashed: with N > cap
-    /// distinct visible images, the sequential row-major scan re-decoded ALL
-    /// N every frame, forever).
+/// `(source allocation address, footprint w, footprint h)`: one placement's
+/// identity in an [`ImageCache`].
+type ImageCacheKey = (usize, usize, usize);
+
+/// The decoded inline images of one window, for BOTH renderers' image passes
+/// (the CPU blit and the GPU image plane decode and cache through this one
+/// type). Each entry keeps a weak source identity plus the footprint pixel
+/// size; the value is that footprint's [`PlacementRaster`]. The weak handle pins
+/// the allocation's address against reuse by a different image (ABA) without
+/// keeping the source byte buffer alive after its grid/history owners drop it,
+/// and lookups compare addresses without upgrading it. Only decoded pixels
+/// count toward the byte budget.
+///
+/// THE FRAME'S OWN IMAGES ARE NEVER EVICTED. [`Self::begin_frame`] is told
+/// every placement the frame shows and sizes their rasters so that together
+/// they fit [`MAX_IMAGE_WORKING_SET_BYTES`] ([`frame_raster_cap`]); an image
+/// the frame has used is then never evicted to admit another the same frame
+/// uses, by bytes or by count. The budgets (`MAX_BYTES`, `MAX_ENTRIES`) evict
+/// only what earlier frames used, least recently used first. A strict LRU
+/// under a budget smaller than what one frame shows evicts each image just
+/// before the next frame asks for it — two photos the width of the window on
+/// screen at once, a contact sheet of 81 thumbnails — and the CPU's image
+/// passes walk each row cell by cell with the cell's layers together, so
+/// layered pictures that passed it missed on every cell: one decode per
+/// covered cell and layer, seconds a frame.
+///
+/// Memory stays bounded: what the frame uses is held to its working-set
+/// budget, and after every insert the rest is held to the budgets. Lookups are
+/// hashed, so a frame with thousands of distinct images costs no scan.
+///
+/// The frame rule is a bounded model (`DecodeCacheFrameWorkingSet`, proven by
+/// the interpreter and `ty`), and the cache is checked against it step by step
+/// (`image_cache_conforms_to_the_frame_working_set_model`).
+pub struct ImageCache {
+    entries: FxHashMap<ImageCacheKey, ImageCacheEntry>,
+    /// Use order: each entry's last-use tick, least recent first.
+    order: std::collections::BTreeMap<u64, ImageCacheKey>,
+    /// The last tick handed out; every use takes the next.
+    tick: u64,
+    /// The first tick of the frame in progress: an entry used at or after it
+    /// is the frame's ([`Self::begin_frame`]).
+    frame_start: u64,
+    /// Running sum of the cached entries' `rgba.len()`.
     bytes: usize,
+    /// The most pixels one of this frame's placements is decoded to
+    /// ([`frame_raster_cap`]).
+    raster_cap: usize,
+    /// [`Self::begin_frame`]'s scratch: the frame's distinct placements and
+    /// their full raster sizes.
+    seen: FxHashSet<ImageCacheKey>,
+    demands: Vec<usize>,
 }
 
-/// One decoded + footprint-scaled inline image: straight RGBA8, row-major.
-struct DecodedImage {
-    /// Footprint pixel width (`cols * cell_w`).
-    w: usize,
-    /// Footprint pixel height (`rows * cell_h`).
-    h: usize,
-    /// `w * h * 4` straight-alpha RGBA bytes, or empty if the decode failed
-    /// (a cached negative result: the image draws nothing but is not re-decoded).
-    rgba: Vec<u8>,
+/// One [`ImageCache`] entry.
+struct ImageCacheEntry {
+    /// Held, never read: keeps the source allocation's address — the one its
+    /// key names — from being reused by another image while the entry lives.
+    _pin: std::sync::Weak<aterm_core::grid::extra::ImageData>,
+    raster: PlacementRaster,
+    /// The last use's tick (its key in [`ImageCache::order`]).
+    tick: u64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            order: std::collections::BTreeMap::new(),
+            tick: 0,
+            frame_start: 0,
+            bytes: 0,
+            raster_cap: MAX_PLACEMENT_RASTER_PX,
+            seen: FxHashSet::default(),
+            demands: Vec::new(),
+        }
+    }
 }
 
 impl ImageCache {
-    /// Entry-count ceiling. Sized past realistic thumbnail/contact-sheet sets:
-    /// the memory bound is `MAX_BYTES`, so the count cap only limits the
-    /// pointer-identity linear-scan length in `get`.
+    /// Entry-count budget for what earlier frames used (the frame in progress
+    /// keeps all of its own).
     const MAX_ENTRIES: usize = 64;
-    /// Decoded-RGBA byte budget (matches the engine's `MAX_KITTY_STORE_BYTES`).
-    /// This is the real memory bound — the previous count-only cap of 8 admitted
-    /// eight UNBOUNDED footprints (~260 MiB of full-window 4K decodes) while
-    /// thrashing on a ninth thumbnail.
+    /// Decoded-RGBA byte budget for what earlier frames used (matches the
+    /// engine's `MAX_KITTY_STORE_BYTES`). The previous count-only cap of 8
+    /// admitted eight UNBOUNDED footprints (~260 MiB of full-window 4K decodes)
+    /// while thrashing on a ninth thumbnail.
     const MAX_BYTES: usize = 64 * 1024 * 1024;
 
-    /// Look up by allocation identity + footprint, promoting to MRU on a hit.
-    /// The weak handle keeps the compared address allocated even after the source
-    /// value dies; this never dereferences a pointer to an expired value.
+    /// Start a frame that shows `placements` — every `(image, fp_w, fp_h)` it
+    /// may draw, in any order and with repeats (one per covered cell is fine).
+    /// The entries earlier frames used become evictable, and the frame's
+    /// rasters are sized to fit its working-set budget together
+    /// ([`frame_raster_cap`]). Both renderers call this once per frame, before
+    /// any lookup.
+    pub fn begin_frame<'a>(
+        &mut self,
+        placements: impl IntoIterator<
+            Item = (
+                &'a std::sync::Arc<aterm_core::grid::extra::ImageData>,
+                usize,
+                usize,
+            ),
+        >,
+    ) {
+        // A fresh tick opens the frame, so its first use of any entry —
+        // even the one the last frame used last — stamps it the frame's.
+        self.tick += 1;
+        self.frame_start = self.tick;
+        self.seen.clear();
+        self.demands.clear();
+        let mut last = None;
+        for (image, fp_w, fp_h) in placements {
+            if fp_w == 0 || fp_h == 0 {
+                continue;
+            }
+            let key = Self::key(image, fp_w, fp_h);
+            // Runs of cells share a placement: one compare, not one hash each.
+            if last == Some(key) {
+                continue;
+            }
+            last = Some(key);
+            if self.seen.insert(key) {
+                let (w, h) = placement_raster_size(fp_w, fp_h);
+                self.demands.push(w * h);
+            }
+        }
+        self.raster_cap = frame_raster_cap(&mut self.demands);
+    }
+
+    fn key(
+        image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
+        fp_w: usize,
+        fp_h: usize,
+    ) -> ImageCacheKey {
+        (std::sync::Arc::as_ptr(image) as usize, fp_w, fp_h)
+    }
+
+    /// Whether `raster`, cached for a `fp_w × fp_h` footprint, is what this
+    /// frame draws it from: a failed decode (empty) always is; a raster is when
+    /// it has the size this frame's cap gives the footprint.
+    fn current(&self, raster: &PlacementRaster, fp_w: usize, fp_h: usize) -> bool {
+        raster.rgba.is_empty()
+            || (raster.w, raster.h) == placement_raster_size_within(fp_w, fp_h, self.raster_cap)
+    }
+
+    /// Mark `key`'s entry the most recently used.
+    fn touch(&mut self, key: ImageCacheKey) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        if entry.tick == self.tick {
+            // Already the most recent use, in this frame (runs of cells share
+            // a placement): `begin_frame` takes a tick no entry holds.
+            return;
+        }
+        self.order.remove(&entry.tick);
+        self.tick += 1;
+        entry.tick = self.tick;
+        self.order.insert(self.tick, key);
+    }
+
+    /// The raster cached for `image` at this footprint, at this frame's size,
+    /// marked used by the frame in progress; `None` on a miss.
     fn get(
         &mut self,
         image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
         fp_w: usize,
         fp_h: usize,
-    ) -> Option<&DecodedImage> {
-        // Scan from the MRU end: entries are unique by (Arc, footprint), so this
-        // is the same index `position` finds, and the steady hit (the entry the
-        // previous cell just promoted) is the first compare.
-        let idx = self.entries.iter().rposition(|(a, w, h, _)| {
-            std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(image)) && *w == fp_w && *h == fp_h
-        })?;
-        // Promote to MRU: the same order `remove(idx)` + `push` leaves.
-        self.entries[idx..].rotate_left(1);
-        self.entries.last().map(|(_, _, _, v)| v)
+    ) -> Option<&PlacementRaster> {
+        let key = Self::key(image, fp_w, fp_h);
+        let entry = self.entries.get(&key)?;
+        if !self.current(&entry.raster, fp_w, fp_h) {
+            return None;
+        }
+        self.touch(key);
+        self.entries.get(&key).map(|e| &e.raster)
     }
 
-    /// The decoded image for `image` at this footprint, promoted to MRU: a hit
-    /// is one lookup, a miss runs `decode` and inserts its result ([`Self::put`]),
-    /// so the entry is the last either way.
+    /// The raster cached for `image` at this footprint, at this frame's size,
+    /// without marking it used — for batch reads that borrow several entries
+    /// at once after the frame has used them ([`Self::get_or_decode`]).
+    pub fn peek(
+        &self,
+        image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
+        fp_w: usize,
+        fp_h: usize,
+    ) -> Option<&PlacementRaster> {
+        self.entries
+            .get(&Self::key(image, fp_w, fp_h))
+            .map(|e| &e.raster)
+            .filter(|raster| self.current(raster, fp_w, fp_h))
+    }
+
+    /// The raster for `image` at this footprint: a hit is one lookup, a miss
+    /// runs `decode` and inserts its result ([`Self::put`]).
     fn get_or_insert_with(
         &mut self,
         image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
         fp_w: usize,
         fp_h: usize,
-        decode: impl FnOnce() -> DecodedImage,
-    ) -> Option<&DecodedImage> {
+        decode: impl FnOnce() -> PlacementRaster,
+    ) -> &PlacementRaster {
         if self.get(image, fp_w, fp_h).is_none() {
             self.put(image.clone(), fp_w, fp_h, decode());
         }
-        self.entries.last().map(|(_, _, _, v)| v)
+        // `put` never evicts the entry it inserted (it is the frame's, or the
+        // only one), so the key is present.
+        &self.entries[&Self::key(image, fp_w, fp_h)].raster
     }
 
-    /// Insert a freshly decoded image, holding a weak source identity to pin
-    /// the allocation address, and evicting LRU entries until both the entry-count and
-    /// decoded-byte budgets fit. A single over-budget image still inserts alone
-    /// (the loop stops on an empty list), so `put` terminates and even a huge
-    /// image is decoded once, not once per frame.
+    /// The raster for `image` at this footprint, decoded on a miss at this
+    /// frame's size ([`decode_placement_within`]); a failed decode is cached
+    /// empty, so it draws nothing and is not decoded again.
+    pub fn get_or_decode(
+        &mut self,
+        image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
+        fp_w: usize,
+        fp_h: usize,
+    ) -> &PlacementRaster {
+        let cap = self.raster_cap;
+        self.get_or_insert_with(image, fp_w, fp_h, || {
+            decode_placement_within(image, fp_w, fp_h, cap).unwrap_or(PlacementRaster {
+                w: 0,
+                h: 0,
+                rgba: Vec::new(),
+            })
+        })
+    }
+
+    /// Insert a decoded image (replacing any entry for the same placement),
+    /// then evict what earlier frames used, least recent first, until both
+    /// budgets fit or only the frame's own entries are left. A single
+    /// over-budget image still inserts, so it is decoded once.
     fn put(
         &mut self,
         image: std::sync::Arc<aterm_core::grid::extra::ImageData>,
         fp_w: usize,
         fp_h: usize,
-        value: DecodedImage,
+        raster: PlacementRaster,
     ) {
-        while !self.entries.is_empty()
-            && (self.entries.len() >= Self::MAX_ENTRIES
-                || self.bytes + value.rgba.len() > Self::MAX_BYTES)
-        {
-            let (_, _, _, evicted) = self.entries.remove(0);
-            self.bytes -= evicted.rgba.len();
+        let key = Self::key(&image, fp_w, fp_h);
+        if let Some(old) = self.entries.remove(&key) {
+            self.order.remove(&old.tick);
+            self.bytes -= old.raster.rgba.len();
         }
-        self.bytes += value.rgba.len();
-        self.entries
-            .push((std::sync::Arc::downgrade(&image), fp_w, fp_h, value));
+        self.tick += 1;
+        self.bytes += raster.rgba.len();
+        self.order.insert(self.tick, key);
+        self.entries.insert(
+            key,
+            ImageCacheEntry {
+                _pin: std::sync::Arc::downgrade(&image),
+                raster,
+                tick: self.tick,
+            },
+        );
+        while self.entries.len() > Self::MAX_ENTRIES || self.bytes > Self::MAX_BYTES {
+            let Some((&tick, &lru)) = self.order.first_key_value() else {
+                break;
+            };
+            if tick >= self.frame_start || tick == self.tick {
+                // The frame's own (and the entry just inserted, before any
+                // frame) stay, and every entry after the least recent is newer.
+                break;
+            }
+            self.order.remove(&tick);
+            if let Some(evicted) = self.entries.remove(&lru) {
+                self.bytes -= evicted.raster.rgba.len();
+            }
+        }
     }
 }
 
@@ -6030,13 +6237,20 @@ struct CachedGlyph {
     img: GlyphImage,
     /// [`glyph_ink_box`] of `img`, computed once when the entry is built.
     ink: Option<(usize, i32)>,
+    /// The last glyph frame ([`Renderer::glyph_frame`]) that read this entry:
+    /// what eviction keeps ([`Renderer::evict_glyph_caches_if_large`]).
+    used: std::cell::Cell<u64>,
 }
 
 impl CachedGlyph {
     /// Memoize `img`'s ink box and take ownership of the raster.
     fn new(img: GlyphImage) -> Self {
         let ink = glyph_ink_box(&img);
-        Self { img, ink }
+        Self {
+            img,
+            ink,
+            used: std::cell::Cell::new(0),
+        }
     }
 }
 
@@ -7353,97 +7567,6 @@ pub fn place_frame_bands(
     }
 }
 
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the W1 padding-
-/// absorption law over the FULL bit-precise integer domain (bounded only to
-/// keep `cells*cell` inside `i64` for the solver) — the arithmetic depth the
-/// `ty` model (which has no `*`/`/`) reaches only over its small lattice.
-/// CONFIG-FREE, discharged by `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`.
-/// Current verdicts (honest): `pad_split_total_below_domain` PROVED; the three
-/// nonlinear (`cells*cell`) obligations are INCONCLUSIVE under today's trust-mc
-/// frontier (fail-closed model gap, bounds-independent — verified at 2^7 too);
-/// their always-on proof weight is carried by the exhaustive odd/even lattice in
-/// `tests/pad_absorption.rs` + the `ty`-checked `PadAbsorption` model.
-#[cfg(kani)]
-mod pad_split_kani {
-    use super::pad_split;
-
-    /// Exact cover + pads floor + near-even split, for every in-domain input.
-    #[kani::proof]
-    fn pad_split_exact_cover_in_domain() {
-        let win: u32 = kani::any();
-        let pad: u32 = kani::any();
-        let cell: u32 = kani::any();
-        kani::assume(cell >= 1 && cell <= 1 << 12);
-        kani::assume(pad <= 1 << 12);
-        kani::assume(win <= 1 << 20);
-        kani::assume(win >= 2 * pad + cell);
-        let s = pad_split(win as usize, pad as usize, cell as usize);
-        kani::assert(
-            s.pad_lo + s.cells * cell as usize + s.pad_hi == win as usize,
-            "pad_lo + cells*cell + pad_hi must equal the window exactly",
-        );
-        kani::assert(
-            s.pad_lo >= pad as usize && s.pad_hi >= pad as usize,
-            "both pads must keep the configured floor",
-        );
-        kani::assert(
-            s.pad_hi >= s.pad_lo && s.pad_hi - s.pad_lo <= 1,
-            "the remainder must split near-evenly (|pad_hi - pad_lo| <= 1)",
-        );
-    }
-
-    /// Maximality: one more column/row would overflow the usable extent.
-    #[kani::proof]
-    fn pad_split_cells_maximal_in_domain() {
-        let win: u32 = kani::any();
-        let pad: u32 = kani::any();
-        let cell: u32 = kani::any();
-        kani::assume(cell >= 1 && cell <= 1 << 12);
-        kani::assume(pad <= 1 << 12);
-        kani::assume(win <= 1 << 20);
-        kani::assume(win >= 2 * pad + cell);
-        let s = pad_split(win as usize, pad as usize, cell as usize);
-        kani::assert(
-            (s.cells + 1) * cell as usize > (win - 2 * pad) as usize,
-            "cells must be the maximal grid that fits the usable extent",
-        );
-    }
-
-    /// TOTALITY below the domain: any (bounded) window smaller than one padded
-    /// cell still yields `cells == 1` and never panics/overflows.
-    #[kani::proof]
-    fn pad_split_total_below_domain() {
-        let win: u32 = kani::any();
-        let pad: u32 = kani::any();
-        let cell: u32 = kani::any();
-        kani::assume(cell <= 1 << 12);
-        kani::assume(pad <= 1 << 12);
-        kani::assume(win < 2 * pad + cell.max(1));
-        let s = pad_split(win as usize, pad as usize, cell as usize);
-        kani::assert(s.cells == 1, "below the domain the grid pins to one cell");
-    }
-
-    /// The present-side placement offset agrees with the split: content leading
-    /// edge == `pad_lo` (band_offset + the frame's own interior pad).
-    #[kani::proof]
-    fn band_offset_matches_pad_split() {
-        let win: u32 = kani::any();
-        let pad: u32 = kani::any();
-        let cell: u32 = kani::any();
-        kani::assume(cell >= 1 && cell <= 1 << 12);
-        kani::assume(pad <= 1 << 12);
-        kani::assume(win <= 1 << 20);
-        kani::assume(win >= 2 * pad + cell);
-        let s = pad_split(win as usize, pad as usize, cell as usize);
-        let frame = s.cells * cell as usize + 2 * pad as usize;
-        let off = super::band_offset(win as usize, frame);
-        kani::assert(
-            off >= 0 && off as usize == s.pad_lo - pad as usize,
-            "the centred blit offset must equal pad_lo - pad",
-        );
-    }
-}
-
 /// The font directories scanned by [`resolve_font_family`] / [`list_fonts`] / the
 /// runtime fallback, in lookup order (per-user fonts shadow system ones). BOTH the
 /// macOS and the Linux locations are listed unconditionally: a directory that does
@@ -8152,6 +8275,8 @@ impl Renderer {
             cursor_opacity: 1.0,
             glyphs: FxHashMap::default(),
             glyph_bytes: 0,
+            glyph_frame: 0,
+            glyph_kept: (0, 0),
             primary_gid_cache: FxHashMap::default(),
             keys: FxHashMap::default(),
             emoji_keys: FxHashMap::default(),
@@ -13285,6 +13410,27 @@ impl Renderer {
         ligature_break_cols_into(input, r, &self.shaping, out);
     }
 
+    /// Discard every raster image the glyph frame that just ended did not read,
+    /// with its byte accounting — the capacity eviction — and record what was
+    /// kept ([`Self::glyph_kept`]). Rasters are pure functions of their keys, so
+    /// a kept entry is exactly what re-rasterizing it would make, and the room
+    /// measured from the old set is dropped as [`Self::clear_glyph_images`]
+    /// drops it.
+    fn retain_glyph_working_set(&mut self) {
+        let frame = self.glyph_frame;
+        let mut bytes = 0usize;
+        self.glyphs.retain(|_, g| {
+            let keep = g.used.get() == frame;
+            if keep {
+                bytes = bytes.saturating_add(g.img.byte_len());
+            }
+            keep
+        });
+        self.glyph_bytes = bytes;
+        self.glyph_kept = (self.glyphs.len(), bytes);
+        self.chrome_room_memo = None;
+    }
+
     /// Discard raster images and their byte accounting together. Font, geometry,
     /// seal and capacity invalidations all use this; their other cache families
     /// retain each caller's existing invalidation policy.
@@ -13294,6 +13440,7 @@ impl Renderer {
         // can never be described by the old raster's ink.
         self.glyphs.clear();
         self.glyph_bytes = 0;
+        self.glyph_kept = (0, 0);
         // …and so does the room measured from them.
         self.chrome_room_memo = None;
     }
@@ -13455,7 +13602,9 @@ impl Renderer {
             self.glyph_bytes = self.glyph_bytes.saturating_add(img.byte_len());
             self.glyphs.insert(key, CachedGlyph::new(img));
         }
-        &self.glyphs[&key]
+        let entry = &self.glyphs[&key];
+        entry.used.set(self.glyph_frame);
+        entry
     }
 
     /// [`glyph_ink_box`] for `key`'s raster, read from the MEMO the cache entry
@@ -13546,14 +13695,21 @@ impl Renderer {
 
     /// Rasterize a SCRIPT key ([`StyleBits::SUB`]): the script-free twin's
     /// raster — cached, seated, with every face, weight and fit decision the
-    /// twin made — area-filtered and placed by [`script_drop`]. One derived raster, so a script cell needs
-    /// no second trip through the face chain, and the GPU atlas, which copies
-    /// this cache's bitmaps, draws the same pixels.
+    /// twin made — area-filtered and placed by [`script_drop`], then moved
+    /// sideways by the nudge the key carries ([`sub_nudged`]). One derived
+    /// raster, so a script cell needs no second trip through the face chain,
+    /// and the GPU atlas, which copies this cache's bitmaps, draws the same
+    /// pixels in the same place.
     fn rasterize_script(&mut self, key: GlyphKey) -> GlyphImage {
+        let nudge = ((key.ch_or_id >> SUB_NUDGE_SHIFT) as u8).cast_signed();
         let twin = GlyphKey {
             style: key.style.without_script(),
+            ch_or_id: key.ch_or_id & ((1 << SUB_NUDGE_SHIFT) - 1),
             ..key
         };
+        let shift = (f32::from(nudge) * self.cell_w as f32
+            / f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL))
+        .round() as i32;
         let (baseline, cell_h) = (self.baseline, self.cell_h);
         match self.glyph_image(twin) {
             GlyphImage::Mono {
@@ -13570,7 +13726,7 @@ impl Renderer {
                     Some(bytes) => GlyphImage::Mono {
                         width: w,
                         height: h,
-                        xmin: left,
+                        xmin: left + shift,
                         ymin: foot,
                         advance: *advance,
                         bytes,
@@ -14468,19 +14624,43 @@ impl Renderer {
         // clusters accretes unbounded CPU RAM even though `glyphs` stays small. The
         // composited runs it names go with it (at most `MAX_RUN_GLYPHS` each).
         const CLUSTER_CAP: usize = 16_384;
-        if self.glyphs.len() > GLYPH_CACHE_CAP || self.glyph_bytes > GLYPH_CACHE_BYTES {
+        // A trip waits for the caps, or for twice what the last trip kept if
+        // that is more (hysteresis: see below).
+        let (kept_entries, kept_bytes) = self.glyph_kept;
+        if self.glyphs.len() > GLYPH_CACHE_CAP.max(kept_entries.saturating_mul(2))
+            || self.glyph_bytes > GLYPH_CACHE_BYTES.max(kept_bytes.saturating_mul(2))
+        {
+            // KEEP THE WORKING SET: the frame just drawn will very likely be
+            // drawn again, so its glyphs stay and only the rest go. A full
+            // clear here cost every frame whose glyphs alone pass the cap — a
+            // screen of distinct emoji at a large zoom passes 12 MiB — a
+            // re-raster of the whole screen: its working set was wiped at
+            // every boundary and rebuilt by the frame after.
+            //
+            // AND KEEP IT THROUGH A SMALL FRAME: the next trip waits until the
+            // cache doubles what this one keeps. Without that, the set a full
+            // repaint read survived only until a frame that reads less — a
+            // cursor blink, a keystroke echo, a scroll-blit strip — and the
+            // boundary after it trimmed the cache to that frame's few glyphs,
+            // so the next full repaint re-rasterized the screen anyway. The
+            // cache stays within twice one frame's working set (or the caps),
+            // plus the new rasters of the frame in progress; a set no frame
+            // reads goes once new reads double the cache.
+            self.retain_glyph_working_set();
             // The key maps and deco masks grow in lockstep with distinct glyph
             // identities, so they ride the glyph cap: every one of these stays
             // bounded because `glyphs` (which they feed) is bounded.
-            self.clear_glyph_images();
             self.keys.clear();
             self.emoji_keys.clear();
             self.styled_keys.clear();
             // The subpixel overlay is keyed identically to `glyphs` and grows
             // in lockstep with it (at most one entry per glyph key), so it
-            // rides the same cap.
+            // keeps exactly the keys the raster cache kept.
             #[cfg(all(unix, not(target_os = "macos")))]
-            self.subpx_glyphs.clear();
+            {
+                let kept = &self.glyphs;
+                self.subpx_glyphs.retain(|key, _| kept.contains_key(key));
+            }
             // Deco (sparkle-word) coverage masks share the glyph-cap discipline so
             // the sprite cache is bounded like every other cache.
             self.deco_masks.borrow_mut().clear();
@@ -14539,6 +14719,7 @@ impl Renderer {
     ///   `draw_cursor`'s plan reuse (and its debug re-plan assert) depends on.
     fn begin_frame_boundary(&mut self) {
         self.evict_glyph_caches_if_large();
+        self.glyph_frame = self.glyph_frame.wrapping_add(1);
         self.apply_pending_styled_retires();
     }
 
@@ -14678,6 +14859,14 @@ impl Renderer {
         // before the dirty decision below reads `font_epoch` (a retire bumps it, so
         // the frame that drops a face repaints in full against the shortened set).
         self.begin_frame_boundary();
+        // ...and the window's image cache: the images this frame shows are its
+        // working set from here on, decoded at sizes that fit it together.
+        let cell = (self.cell_w, self.cell_h);
+        wc.image_cache
+            .begin_frame(input.images.iter().flatten().map(|(_, image)| {
+                let (fp_w, fp_h) = placement_footprint(&image.image, cell);
+                (&image.image, fp_w, fp_h)
+            }));
         // Install any background fallback parse that landed since the last
         // frame BEFORE the dirty decision: the epoch bump it applies is what
         // forces the repaint that turns provisional `.notdef` cells into real
@@ -18469,35 +18658,32 @@ impl Renderer {
         // source `lift` px lower. `lift == 0` (every terminal image) makes all
         // three adjustments arithmetic no-ops — the pre-lift bytes exactly.
         let lift = usize::from(image.image.band_lift_px);
-        let fp_w = image.image.cols as usize * cw;
-        let fp_h = image.image.rows as usize * ch + lift;
+        let (fp_w, fp_h) = placement_footprint(&image.image, (cw, ch));
         // Decode + scale on the first cell of a new placement; reuse thereafter.
         // The decoded cache is the PER-WINDOW `WindowCpu::image_cache`, threaded
         // in as `ic` (so the shared `Renderer` needs only `&self` here). The cache
         // HOLDS a weak identity for `image.image` and matches its address, so a
         // hit can't be the stale decode of a freed image whose address was reused.
-        let Some(decoded) = ic.get_or_insert_with(&image.image, fp_w, fp_h, || DecodedImage {
-            w: fp_w,
-            h: fp_h,
-            rgba: decode_placement(&image.image, fp_w, fp_h).unwrap_or_default(),
-        }) else {
-            return;
-        };
+        let decoded = ic.get_or_decode(&image.image, fp_w, fp_h);
         if decoded.rgba.is_empty() || decoded.w == 0 {
             // Decode failed (cached negative): draw nothing, bg shows through.
             return;
         }
-        // Source origin for THIS cell's tile within the footprint-scaled image.
-        // With a lift, every tile's source sits `lift` px lower — and the FIRST
-        // row's tile additionally owns the `[0, lift)` lip above it.
+        // Source origin for THIS cell's tile within the footprint. With a lift,
+        // every tile's source sits `lift` px lower — and the FIRST row's tile
+        // additionally owns the `[0, lift)` lip above it.
         let sx0 = image.cell_col as usize * cw;
         let lip = if image.cell_row == 0 { lift } else { 0 };
         let sy0 = image.cell_row as usize * ch + lift - lip;
-        // Frame edge AND (on a composed row) pane edge, and the decoded image's
+        // A footprint past `MAX_PLACEMENT_RASTER_PX`, or past its frame's
+        // raster cap, was decoded smaller: each footprint pixel then draws the
+        // raster pixel under its centre.
+        let scaled = (decoded.w, decoded.h) != (fp_w, fp_h);
+        // Frame edge AND (on a composed row) pane edge, and the footprint's
         // right edge: one tile width, taken once (none of them moves per pixel).
         let n = cw
             .min(w.min(x_clip).saturating_sub(x0))
-            .min(decoded.w.saturating_sub(sx0));
+            .min(fp_w.saturating_sub(sx0));
         for dy in 0..ch + lip {
             // The lip rows land ABOVE the cell band; `y0 >= lift` by construction
             // (the lift is at most `pad_top + head`, the very band `y0` sits
@@ -18507,13 +18693,22 @@ impl Renderer {
             if py >= h {
                 break;
             }
-            let sy = sy0 + dy;
-            if sy >= decoded.h {
+            let fy = sy0 + dy;
+            if fy >= fp_h {
                 break;
             }
+            let sy = if scaled {
+                placement_raster_coord(fy, fp_h, decoded.h)
+            } else {
+                fy
+            };
             for dx in 0..n {
                 let pxx = x0 + dx;
-                let sx = sx0 + dx;
+                let sx = if scaled {
+                    placement_raster_coord(sx0 + dx, fp_w, decoded.w)
+                } else {
+                    sx0 + dx
+                };
                 let si = (sy * decoded.w + sx) * 4;
                 let (r, g, b, a) = (
                     decoded.rgba[si],
@@ -18537,7 +18732,8 @@ impl Renderer {
     /// resolves keys through the EXACT same dispatch (CPU/GPU parity).
     pub fn resolve_cell_key(&mut self, cluster: Option<&str>, cell: &RenderCell) -> GlyphKey {
         if cell.text_presentation {
-            return self.glyph_key_text_styled(cell.ch, cell_style(cell));
+            let key = self.glyph_key_text_styled(cell.ch, cell_style(cell));
+            return sub_nudged(key, cell.script);
         }
         if let Some(cl) = cluster
             && let Some(k) = self.glyph_key_cluster(cl)
@@ -18547,7 +18743,8 @@ impl Renderer {
         if cell.emoji_presentation {
             self.glyph_key_emoji(cell.ch)
         } else {
-            self.glyph_key_styled(cell.ch, cell_style(cell))
+            let key = self.glyph_key_styled(cell.ch, cell_style(cell));
+            sub_nudged(key, cell.script)
         }
     }
 
@@ -19817,9 +20014,11 @@ fn row_cells_differ(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> b
 
 /// The NON-CELL half of [`row_differs_shifted`]: DEC line size (row-level AND
 /// the per-column runs a composed row carries), the per-pane default-background
-/// runs, and the row's inline-image placements.
+/// runs, the BiDi visual→logical map, and the row's inline-image placements.
 ///
-/// Every clause here is O(1) or O(runs) — never a per-cell walk — which is why
+/// Every clause here is O(1) or O(runs) — never a per-cell walk (a BiDi map is
+/// walked only on a row the reorder permuted, which no stamp vouches for
+/// anyway: stamps are refused while any row is in visual order) — which is why
 /// the D-2 stamp path keeps comparing them EXACTLY instead of delegating to the
 /// revision. That matters most for `images`: an image placement need not mark
 /// row damage to stay fresh (the extras walk refills it unconditionally), so a
@@ -19835,6 +20034,10 @@ fn row_meta_differs(
     a.line_sizes[ra] != b.line_sizes[rb]
         || row_spans(a, ra) != row_spans(b, rb)
         || default_bg_spans(a, ra) != default_bg_spans(b, rb)
+        // The BiDi map decides which painted cells a (logical) selection
+        // lights, and two orders of the same cells can look alike. Empty on
+        // every unpermuted row, so O(1) there.
+        || a.visual_to_logical_row(ra) != b.visual_to_logical_row(rb)
         || !memo.rows_eq(&a.images[ra], &b.images[rb])
 }
 
@@ -22329,7 +22532,7 @@ pub fn cell_style(cell: &RenderCell) -> StyleBits {
     }
     match cell.script {
         aterm_core::terminal::Script::Normal => {}
-        aterm_core::terminal::Script::Sub => bits |= StyleBits::SUB.0,
+        aterm_core::terminal::Script::Sub { .. } => bits |= StyleBits::SUB.0,
     }
     StyleBits(bits)
 }
@@ -22352,10 +22555,14 @@ pub const SUB_CEILING: f32 = 0.42;
 /// a raster placed the renderers' way (left edge `cell_x + xmin`, bottom edge
 /// `cell_y + baseline - ymin`) scaled about the middle of its `advance` and,
 /// vertically, about the cell's FLOOR (its foot stays on the floor, its top
-/// comes down), by [`SCRIPT_SCALE`] — or by less, for a glyph so tall (a
-/// parenthesis, a fallback symbol filling its cell) that its top would rise
-/// past [`SUB_CEILING`]. A pure function of the box and the cell, so the CPU
-/// cache and the GPU atlas — which takes the CPU's raster — place one glyph.
+/// comes down), by [`SCRIPT_SCALE`]. Every sub glyph so stands on ONE line,
+/// the cell's baseline scaled the same way. A glyph so tall that its top
+/// would rise past [`SUB_CEILING`] — an `i` or `j` whose dot stands above the
+/// capitals, a slash, a parenthesis, a fallback symbol filling its cell — is
+/// scaled by less about that line, so it still stands on it beside its
+/// neighbours instead of sinking below them. A pure function of the box and
+/// the cell, so the CPU cache and the GPU atlas — which takes the CPU's
+/// raster — place one glyph.
 #[must_use]
 pub fn script_drop(
     (xmin, ymin, width, height): (i32, i32, usize, usize),
@@ -22364,15 +22571,18 @@ pub fn script_drop(
     cell_h: usize,
 ) -> (i32, i32, usize, usize) {
     let floor = cell_h as f32;
-    let bottom = (baseline - ymin) as f32;
-    let reach = floor - (bottom - height as f32);
+    let base = baseline as f32;
+    let bottom = base - ymin as f32;
+    let rise = base - (bottom - height as f32);
     let ceiling = (floor * SUB_CEILING).ceil();
-    let s = if reach > 0.0 {
-        SCRIPT_SCALE.min((floor - ceiling) / reach)
+    // The line every sub glyph stands on.
+    let line = floor - (floor - base) * SCRIPT_SCALE;
+    let s = if rise > 0.0 {
+        SCRIPT_SCALE.min(((line - ceiling) / rise).max(0.0))
     } else {
         SCRIPT_SCALE
     };
-    let new_bottom = (floor - (floor - bottom) * s).round() as i32;
+    let new_bottom = (line - (base - bottom) * s).round() as i32;
     // Rounding never lifts the top past the ceiling.
     let h = (((height as f32) * s).round() as i32)
         .min(new_bottom - ceiling as i32)
@@ -23389,52 +23599,48 @@ pub type CharFgWalk<'a> = SparseRowWalk<'a, CharFg>;
 /// scales the halo stamp alpha ([`fire_halo_alpha`]).
 pub type FireHaloWalk<'a> = SparseRowWalk<'a, FireHaloCell>;
 
-/// Sparkle-v2 §7.5 ledger row "ink merge-walk ≡ probe" — the Trust harness
-/// (`trust-mc` discharges `#[kani::proof]` MIR via `ay`; **authored-pending-
-/// build**: the managed trust-mc 20065 cannot build this crate, whose graph has
-/// a host build script — docs/TOOLCHAIN-PACKAGE-MANAGER.md §15 risk 1 — so this
-/// harness is authored, not re-run — PROOF_CARRYING_PERFORMANCE.md §0). The
-/// runnable-now companions are the sorted-unique property tests + the
-/// `debug_assert` probe check in [`sparse_row_slice`].
-#[cfg(kani)]
-mod ink_walk_kani_proofs {
+/// Sparkle-v2 §7.5 ledger row "ink merge-walk ≡ probe": under the sorted-unique
+/// invariant (strictly ascending `col` within a row slice, which
+/// [`sparse_row_slice`] `debug_assert`s), the lockstep merge-walk answers every
+/// ascending-column query exactly as the per-cell binary-search probe it
+/// replaced (§4.1) — same hit or miss, same bytes.
+#[cfg(test)]
+mod ink_walk_tests {
     use super::{InkCell, InkWalk};
 
-    /// Under the sorted-unique invariant (strictly ascending `col` within a
-    /// row slice), the lockstep merge-walk answers every ascending-column
-    /// query identically to the per-cell binary-search probe it replaced
-    /// (§4.1): same hit/miss, same bytes — for ALL bounded slices and ALL
-    /// ascending query sequences.
-    #[kani::proof]
-    #[kani::unwind(6)]
+    /// Every sorted-unique slice over columns 0..=7 (all 256 subsets, a distinct
+    /// colour per cell) × every non-decreasing query triple over 0..=8 (8 is past
+    /// every cell), repeated queries included: the walk is length-uniform and
+    /// compares columns only, so this is every shape of slice and query order.
+    #[test]
     fn merge_walk_equals_binary_search_probe() {
-        const N: usize = 4; // bounded slice; the walk is length-uniform
-        let mut slice = [InkCell {
-            row: 0,
-            col: 0,
-            color: [0, 0, 0],
-        }; N];
-        for c in &mut slice {
-            c.col = kani::any();
-            c.color = [kani::any(), kani::any(), kani::any()];
-        }
-        // The §4.1 invariant: sorted with unique cols (property-tested live).
-        kani::assume(slice.windows(2).all(|w| w[0].col < w[1].col));
-
-        let mut walk = InkWalk::new(&slice);
-        let mut prev: u16 = 0;
-        for _ in 0..3 {
-            let col: u16 = kani::any();
-            kani::assume(col >= prev); // the column loop never rewinds
-            prev = col;
-            let probe = slice
-                .binary_search_by(|c| c.col.cmp(&col))
-                .ok()
-                .map(|i| slice[i].color);
-            kani::assert(
-                walk.at(col) == probe,
-                "merge-walk must equal the binary-search probe on sorted-unique ink",
-            );
+        for subset in 0u16..256 {
+            let slice: Vec<InkCell> = (0u8..8)
+                .filter(|col| subset >> col & 1 == 1)
+                .map(|col| InkCell {
+                    row: 0,
+                    col: u16::from(col),
+                    color: [col, 0x40 | col, 0x80 | col],
+                })
+                .collect();
+            for a in 0..=8u16 {
+                for b in a..=8 {
+                    for c in b..=8 {
+                        let mut walk = InkWalk::new(&slice);
+                        for col in [a, b, c] {
+                            let probe = slice
+                                .binary_search_by(|cell| cell.col.cmp(&col))
+                                .ok()
+                                .map(|i| slice[i].color);
+                            assert_eq!(
+                                walk.at(col),
+                                probe,
+                                "slice {subset:08b}, queries {a} {b} {c}, at {col}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -25405,9 +25611,36 @@ pub fn decode_image_to_footprint(
     scaling: aterm_core::grid::extra::ImageScaling,
     source_rect: Option<aterm_core::grid::extra::SourceRect>,
 ) -> Option<Vec<u8>> {
+    decode_image_to_raster(
+        bytes,
+        format,
+        (fp_w, fp_h),
+        (fp_w, fp_h),
+        scaling,
+        source_rect,
+    )
+}
+
+/// [`decode_image_to_footprint`] onto a `raster` box that STANDS FOR the
+/// `footprint`: the footprint itself, or ([`placement_raster_size`]) the
+/// footprint scaled down uniformly, each raster pixel then covering a little
+/// more than one footprint pixel. Fit and Stretch are defined by their box, so
+/// they decode into the raster box as they would into the footprint; a
+/// pixel-exact source keeps its size RELATIVE to the footprint, so on a
+/// smaller raster it shrinks by the same ratio. With `raster == footprint` this
+/// is [`decode_image_to_footprint`] exactly.
+fn decode_image_to_raster(
+    bytes: &[u8],
+    format: aterm_core::grid::extra::ImageFormat,
+    footprint: (usize, usize),
+    raster: (usize, usize),
+    scaling: aterm_core::grid::extra::ImageScaling,
+    source_rect: Option<aterm_core::grid::extra::SourceRect>,
+) -> Option<Vec<u8>> {
     use aterm_core::grid::extra::{ImageFormat, ImageScaling};
     use std::borrow::Cow;
-    if fp_w == 0 || fp_h == 0 {
+    let ((fp_w, fp_h), (box_w, box_h)) = (footprint, raster);
+    if fp_w == 0 || fp_h == 0 || box_w == 0 || box_h == 0 {
         return None;
     }
     let (src, src_w, src_h): (Cow<'_, [u8]>, usize, usize) = match format {
@@ -25448,37 +25681,234 @@ pub fn decode_image_to_footprint(
     // pixel-exact answer. Returning the owned buffer directly is byte-identical
     // AND skips a full multi-megapixel float pass on the event-loop thread. (A
     // BORROWED raw raster takes the per-policy path, which copies it.)
-    if (src_w, src_h) == (fp_w, fp_h)
+    let unscaled = (box_w, box_h) == (fp_w, fp_h);
+    if (src_w, src_h) == (box_w, box_h)
+        && (unscaled || scaling != ImageScaling::PixelExact)
         && let Cow::Owned(owned) = src
     {
         return Some(owned);
     }
     Some(match scaling {
-        ImageScaling::Fit => fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h),
-        ImageScaling::Stretch => resample_rgba(&src, src_w, src_h, fp_w, fp_h),
-        ImageScaling::PixelExact => place_rgba_at_origin(&src, src_w, src_h, fp_w, fp_h),
+        ImageScaling::Fit => fit_rgba_into_footprint(&src, src_w, src_h, box_w, box_h),
+        ImageScaling::Stretch => resample_rgba(&src, src_w, src_h, box_w, box_h),
+        ImageScaling::PixelExact if unscaled => {
+            place_rgba_at_origin(&src, src_w, src_h, fp_w, fp_h)
+        }
+        // One source pixel per FOOTPRINT pixel: on a raster `box/fp` the
+        // footprint's size, the source is that much smaller too.
+        ImageScaling::PixelExact => {
+            let shrink = |n: usize, to: usize, of: usize| {
+                usize::try_from((n as u64 * to as u64).div_ceil(of as u64))
+                    .unwrap_or(usize::MAX)
+                    .max(1)
+            };
+            let (sw, sh) = (shrink(src_w, box_w, fp_w), shrink(src_h, box_h, fp_h));
+            let small = resample_rgba(&src, src_w, src_h, sw, sh);
+            place_rgba_at_origin(&small, sw, sh, box_w, box_h)
+        }
     })
 }
 
-/// Decode `image` onto its `fp_w × fp_h` footprint box exactly as both
+/// The most pixels an inline-image placement is decoded to, by either renderer:
+/// 128 MiB of RGBA, the budget the engine gives ALL of one screen's images
+/// (`MAX_LIVE_IMAGE_BYTES`), and more than any full window up to 8K
+/// (7680 × 4320).
+///
+/// A placement's footprint is `cols × cell_w` by `rows × cell_h` DEVICE px, and
+/// its cells are fixed when it is placed, so a later font zoom grows it with the
+/// square of the cell: an `imgcat` as wide as the window, placed at 26 px and
+/// zoomed to the 200 px font ceiling, is a 22 320 × 22 892 footprint — 1.9 GiB
+/// of RGBA to resample on the event loop, per zoom step, and to keep in the
+/// decode cache.
+/// No decodable source has this many pixels (PNG and sixel stop at 4096 a
+/// side), so past it the footprint is decoded at this many and drawn by NEAREST
+/// sampling ([`placement_raster_size`]), which leaves every footprint within it
+/// byte-identical.
+pub const MAX_PLACEMENT_RASTER_PX: usize = 8192 * 4096;
+
+/// The decoded image bytes either renderer keeps for the images ONE frame
+/// draws: two rasters at [`MAX_PLACEMENT_RASTER_PX`] — two footprints the
+/// width of the window and as tall as the engine places them (4096 px), even
+/// on a 6K window. A frame whose placements' rasters pass it together —
+/// layered pictures, a zoom far past the size they were placed at — has each
+/// decoded smaller ([`frame_raster_cap`]), so the frame's images always fit
+/// its decode cache and are each decoded once.
+pub const MAX_IMAGE_WORKING_SET_BYTES: usize = 2 * MAX_PLACEMENT_RASTER_PX * 4;
+
+/// The longest side a placement raster has: the largest 2D texture the GPU
+/// renderer's Metal arm takes (16 384), so its image plane can hold any raster
+/// this decodes. (A device with a smaller limit skips a larger one, as it
+/// always has.)
+pub const MAX_PLACEMENT_RASTER_SIDE: usize = 16_384;
+
+/// The `(w, h)` a `fp_w × fp_h` footprint's raster is decoded at: the footprint
+/// itself while it is within [`MAX_PLACEMENT_RASTER_PX`] and
+/// [`MAX_PLACEMENT_RASTER_SIDE`], else the footprint scaled down uniformly
+/// (aspect kept, each side at least 1 px) until it is.
+#[must_use]
+pub fn placement_raster_size(fp_w: usize, fp_h: usize) -> (usize, usize) {
+    raster_size_at_most(fp_w, fp_h, MAX_PLACEMENT_RASTER_PX)
+}
+
+/// [`placement_raster_size`] held to at most `cap_px` pixels too (one frame's
+/// [`frame_raster_cap`]): that raster when it is within the cap, else the
+/// footprint scaled down uniformly to it. Never more pixels than either.
+#[must_use]
+pub fn placement_raster_size_within(fp_w: usize, fp_h: usize, cap_px: usize) -> (usize, usize) {
+    let full = placement_raster_size(fp_w, fp_h);
+    if full.0.saturating_mul(full.1) <= cap_px {
+        full
+    } else {
+        raster_size_at_most(fp_w, fp_h, cap_px.clamp(1, MAX_PLACEMENT_RASTER_PX))
+    }
+}
+
+/// The footprint, or the footprint scaled down uniformly until it has at most
+/// `px` pixels (`px >= 1`) and no side past [`MAX_PLACEMENT_RASTER_SIDE`].
+fn raster_size_at_most(fp_w: usize, fp_h: usize, px: usize) -> (usize, usize) {
+    let px = px as u128;
+    const SIDE: u128 = MAX_PLACEMENT_RASTER_SIDE as u128;
+    let (w, h) = (fp_w as u128, fp_h as u128);
+    if w == 0 || h == 0 || (w <= SIDE && h <= SIDE && w * h <= px) {
+        return (fp_w, fp_h);
+    }
+    // The area bound: `w·s × h·s` with `s² = px / (w·h)`, each side floored,
+    // so the product never exceeds `px`.
+    let (mut rw, mut rh) = if w * h > px {
+        ((px * w / h).isqrt(), (px * h / w).isqrt())
+    } else {
+        (w, h)
+    };
+    // The side bound, at the same aspect (shrinking only ever lowers the area).
+    if rw > SIDE {
+        rh = rh * SIDE / rw;
+        rw = SIDE;
+    }
+    if rh > SIDE {
+        rw = rw * SIDE / rh;
+        rh = SIDE;
+    }
+    // Within the footprint and at least one pixel a side; `rw, rh <= w, h`, so
+    // the narrowing is lossless. A sliver whose short side floored to 0 keeps
+    // one pixel there and its long side is trimmed to the cap.
+    let (mut rw, mut rh) = (rw.clamp(1, w), rh.clamp(1, h));
+    if rw * rh > px {
+        if rh == 1 {
+            rw = px;
+        } else {
+            rh = px;
+        }
+    }
+    (rw as usize, rh as usize)
+}
+
+/// The most pixels each of one frame's placements is decoded to, so that their
+/// rasters together fit [`MAX_IMAGE_WORKING_SET_BYTES`]. `demands` holds the
+/// pixel count of each DISTINCT placement's [`placement_raster_size`] (and is
+/// reordered).
+///
+/// [`MAX_PLACEMENT_RASTER_PX`] — no change at all — while they fit as they are,
+/// which is every frame short of several window-sized pictures at once. Past
+/// that, the water level: the largest cap `L` with `Σ min(demand, L)` within
+/// the budget, so the small pictures keep their size and only the largest
+/// shrink. A raster past the cap is drawn by nearest sampling, as a zoomed
+/// footprint's is. Both renderers size a frame's rasters by this one rule, so
+/// they decode the same bytes.
+#[must_use]
+pub fn frame_raster_cap(demands: &mut [usize]) -> usize {
+    const BUDGET: usize = MAX_IMAGE_WORKING_SET_BYTES / 4;
+    let total = demands.iter().fold(0usize, |sum, &d| sum.saturating_add(d));
+    if total <= BUDGET {
+        return MAX_PLACEMENT_RASTER_PX;
+    }
+    demands.sort_unstable();
+    let mut left = BUDGET;
+    for (i, &demand) in demands.iter().enumerate() {
+        // An even share of what is left; every later demand is at least this
+        // one, so once one passes its share they all hold to it.
+        let share = left / (demands.len() - i);
+        if demand > share {
+            return share.max(1);
+        }
+        left -= demand;
+    }
+    MAX_PLACEMENT_RASTER_PX
+}
+
+/// A placement's footprint in device px at `cell` px cells: `cols × cell_w` by
+/// `rows × cell_h`, plus the chrome band's lift
+/// ([`band_lift_px`](aterm_core::grid::extra::ImageData::band_lift_px)) — the
+/// box both renderers decode it for.
+#[must_use]
+pub fn placement_footprint(
+    image: &aterm_core::grid::extra::ImageData,
+    (cell_w, cell_h): (usize, usize),
+) -> (usize, usize) {
+    (
+        usize::from(image.cols) * cell_w,
+        usize::from(image.rows) * cell_h + usize::from(image.band_lift_px),
+    )
+}
+
+/// The raster pixel a footprint pixel `f` (of `fp` along this axis) samples on a
+/// `raster`-px axis: the one under its CENTRE, `⌊(f + ½) · raster / fp⌋` — what
+/// a GPU's nearest sampler picks for the same pixel. `f` itself when the raster
+/// is the footprint.
+fn placement_raster_coord(f: usize, fp: usize, raster: usize) -> usize {
+    let at = (2 * f as u64 + 1) * raster as u64 / (2 * fp.max(1) as u64);
+    usize::try_from(at).unwrap_or(usize::MAX)
+}
+
+/// One placement decoded for drawing: straight RGBA8, row-major, `w × h` —
+/// [`placement_raster_size`] of the footprint it was decoded for. An empty
+/// `rgba` is a failed decode, kept so the image is not decoded again.
+pub struct PlacementRaster {
+    /// Raster width in pixels.
+    pub w: usize,
+    /// Raster height in pixels.
+    pub h: usize,
+    /// `w * h * 4` straight-alpha RGBA bytes, or empty.
+    pub rgba: Vec<u8>,
+}
+
+/// Decode `image` for its `fp_w × fp_h` footprint box exactly as both
 /// renderers draw it: [`decode_image_to_footprint`] over the part of the box
 /// from the image's in-cell offset
 /// ([`cell_offset_px`](aterm_core::grid::extra::ImageData::cell_offset_px),
 /// Kitty `X=`/`Y=`) on, the strip before it left transparent. The CPU blit and
 /// the GPU image plane both decode through here, so they cannot place an
 /// offset image differently.
+///
+/// The raster is [`placement_raster_size`] of the footprint — the footprint
+/// itself unless it passes [`MAX_PLACEMENT_RASTER_PX`] or
+/// [`MAX_PLACEMENT_RASTER_SIDE`] — and a footprint pixel `(x, y)` draws the
+/// raster pixel under its centre, scaled by `w / fp_w` and `h / fp_h`.
 #[must_use]
 pub fn decode_placement(
     image: &aterm_core::grid::extra::ImageData,
     fp_w: usize,
     fp_h: usize,
-) -> Option<Vec<u8>> {
-    let decode = |w, h| {
-        decode_image_to_footprint(
+) -> Option<PlacementRaster> {
+    decode_placement_within(image, fp_w, fp_h, MAX_PLACEMENT_RASTER_PX)
+}
+
+/// [`decode_placement`] to a raster of at most `cap_px` pixels
+/// ([`placement_raster_size_within`]): one frame's placements are decoded
+/// under that frame's [`frame_raster_cap`].
+#[must_use]
+pub fn decode_placement_within(
+    image: &aterm_core::grid::extra::ImageData,
+    fp_w: usize,
+    fp_h: usize,
+    cap_px: usize,
+) -> Option<PlacementRaster> {
+    let (w, h) = placement_raster_size_within(fp_w, fp_h, cap_px);
+    let decode = |footprint, raster| {
+        decode_image_to_raster(
             &image.bytes,
             image.format,
-            w,
-            h,
+            footprint,
+            raster,
             image.scaling,
             image.source_rect,
         )
@@ -25486,20 +25916,27 @@ pub fn decode_placement(
     let (ox, oy) = image.cell_offset_px;
     let (ox, oy) = (usize::from(ox), usize::from(oy));
     if (ox, oy) == (0, 0) {
-        return decode(fp_w, fp_h);
+        let rgba = decode((fp_w, fp_h), (w, h))?;
+        return Some(PlacementRaster { w, h, rgba });
     }
     if ox >= fp_w || oy >= fp_h {
         return None;
     }
-    let (area_w, area_h) = (fp_w - ox, fp_h - oy);
-    let area = decode(area_w, area_h)?;
-    let mut out = vec![0u8; fp_w * fp_h * 4];
+    // The offset on the raster is the pixel its footprint offset samples, so
+    // the raster starts where the drawn footprint does; `rx < w`, `ry < h`.
+    let (rx, ry) = (
+        placement_raster_coord(ox, fp_w, w),
+        placement_raster_coord(oy, fp_h, h),
+    );
+    let (area_w, area_h) = (w - rx, h - ry);
+    let area = decode((fp_w - ox, fp_h - oy), (area_w, area_h))?;
+    let mut rgba = vec![0u8; w * h * 4];
     let row_bytes = area_w * 4;
     for (y, row) in area.chunks_exact(row_bytes).enumerate() {
-        let d = ((oy + y) * fp_w + ox) * 4;
-        out[d..d + row_bytes].copy_from_slice(row);
+        let d = ((ry + y) * w + rx) * 4;
+        rgba[d..d + row_bytes].copy_from_slice(row);
     }
-    Some(out)
+    Some(PlacementRaster { w, h, rgba })
 }
 
 /// Copy the `w × h` sub-rectangle at `(x, y)` out of a row-major RGBA8 raster
@@ -25593,21 +26030,22 @@ fn fit_rgba_into_footprint(
     fp_h: usize,
 ) -> Vec<u8> {
     let (dst_w, dst_h) = aspect_fit_box(src_w, src_h, fp_w, fp_h);
-    if (dst_w, dst_h) == (fp_w, fp_h) {
-        return resample_rgba(src, src_w, src_h, fp_w, fp_h);
-    }
-    let scaled = resample_rgba(src, src_w, src_h, dst_w, dst_h);
     let mut out = vec![0u8; fp_w * fp_h * 4];
     // Centered: the letterbox bars split evenly (the odd pixel goes to the
-    // bottom/right, so a 1-px band never lands on top of the image).
+    // bottom/right, so a 1-px band never lands on top of the image). Resampled
+    // straight into its box: no box-sized intermediate.
     let off_x = (fp_w - dst_w) / 2;
     let off_y = (fp_h - dst_h) / 2;
-    let row_bytes = dst_w * 4;
-    for y in 0..dst_h {
-        let s = y * row_bytes;
-        let d = ((off_y + y) * fp_w + off_x) * 4;
-        out[d..d + row_bytes].copy_from_slice(&scaled[s..s + row_bytes]);
-    }
+    resample_rgba_into(
+        src,
+        src_w,
+        src_h,
+        &mut out,
+        fp_w,
+        (off_x, off_y),
+        dst_w,
+        dst_h,
+    );
     out
 }
 
@@ -25624,8 +26062,7 @@ fn fit_rgba_into_footprint(
 /// strike; otherwise it is `>=` every strike. Tier-1 is the exhaustive strike
 /// lattice in `tests/emoji_resample.rs`; Tier-0 is the `StrikeSelection`
 /// derived model in aterm-spec (the real `ty` checker PROVES the law at
-/// `Buggy=0` and CATCHES the pre-W10 always-largest request at `Buggy=1`);
-/// `#[cfg(kani)]` trust-mc harnesses below cover the full `u16` domain.
+/// `Buggy=0` and CATCHES the pre-W10 always-largest request at `Buggy=1`).
 #[doc(hidden)]
 #[must_use]
 pub fn select_strike_ppem(strikes: &[u16], target: u16) -> Option<u16> {
@@ -25648,10 +26085,10 @@ pub fn select_strike_ppem(strikes: &[u16], target: u16) -> Option<u16> {
 /// `Σ_s overlap(d, s) == src` — the `1/(src·sh)`-normalized 2-D weights sum
 /// to exactly 1, so the box filter neither gains nor loses energy (the
 /// checkerboard theorem); dually `Σ_d overlap(d, s) == dst` (every source
-/// texel's mass is fully distributed). Proven over an exhaustive lattice in
-/// `tests/emoji_resample.rs` and by the `#[cfg(kani)]` trust-mc harnesses
-/// below. WAIVER: products like `d·src` are outside `ty`'s Expr language
-/// (no `*`), so this law has no derived model — the lattice + BMC carry it.
+/// texel's mass is fully distributed). Checked over an exhaustive lattice in
+/// `tests/emoji_resample.rs`. WAIVER: products like `d·src` are outside `ty`'s
+/// Expr language (no `*`), so this law has no derived model — the lattice
+/// carries it.
 #[doc(hidden)]
 #[must_use]
 pub fn area_overlap(d: usize, s: usize, src: usize, dst: usize) -> u64 {
@@ -25776,12 +26213,55 @@ fn fit_color_glyph(
 /// (`tests/emoji_resample.rs`); the GPU pulls byte-identical output through
 /// the shared glyph caches / [`decode_image_to_footprint`], so CPU/GPU parity
 /// holds by construction.
+///
+/// The result is the only buffer the size of the output: the filter runs one
+/// output row at a time (`resample_rgba_into`).
 #[doc(hidden)]
 #[must_use]
 pub fn resample_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * 4];
-    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
-        return out;
+    resample_rgba_into(src, sw, sh, &mut out, dw, (0, 0), dw, dh);
+    out
+}
+
+/// [`resample_rgba`] written straight into the `dw × dh` box at `at` of
+/// `out`, a row-major RGBA8 raster `out_w` px wide; every pixel of the box is
+/// written and nothing outside it. A fitted image is resampled in place inside
+/// its letterboxed footprint this way, with no box-sized intermediate.
+///
+/// THE FILTER WORKS ONE OUTPUT ROW AT A TIME: the source rows a row reads are
+/// converted to premultiplied linear light as it first reads them
+/// ([`PremulRows`], two rows resident), and the row's filtered texels are
+/// encoded straight into `out`. Its memory is a few rows, not the two
+/// full-size float planes (source and output, 16 bytes a pixel each) it used to
+/// hold — at a zoomed placement's raster budget the output plane alone was
+/// 512 MiB. The arithmetic per output texel is unchanged, term for term and in
+/// the same order, so the bytes are too.
+#[allow(clippy::too_many_arguments)]
+fn resample_rgba_into(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    out: &mut [u8],
+    out_w: usize,
+    at: (usize, usize),
+    dw: usize,
+    dh: usize,
+) {
+    if dw == 0 || dh == 0 {
+        return;
+    }
+    let (ox, oy) = at;
+    // Output row `dy`'s bytes in `out`.
+    let row_out = |dy: usize| {
+        let d = ((oy + dy) * out_w + ox) * 4;
+        d..d + dw * 4
+    };
+    if sw == 0 || sh == 0 {
+        for dy in 0..dh {
+            out[row_out(dy)].fill(0);
+        }
+        return;
     }
     // Identity fast path (perf): at 1:1 both the area and bilinear filters are the
     // identity, so a per-texel copy is byte-identical to the resampled path and
@@ -25791,233 +26271,197 @@ pub fn resample_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> 
     // blind `copy_from_slice` would leak the dead RGB). Visible texels copy
     // verbatim (exact — no LUT round-trip).
     if (sw, sh) == (dw, dh) {
-        for (o, px) in out
+        for (dy, line) in src[..dw * dh * 4].chunks_exact(dw * 4).enumerate() {
+            for (o, px) in out[row_out(dy)]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(line.as_chunks::<4>().0)
+            {
+                *o = if px[3] != 0 { *px } else { [0; 4] };
+            }
+        }
+        return;
+    }
+    let area = dw * 2 <= sw || dh * 2 <= sh;
+    let mut rows = PremulRows::new(src, sw);
+    let mut filtered = vec![0f32; dw * 4];
+    // The area filter's source columns per output column, computed once.
+    let spans: Vec<(usize, usize)> = if area {
+        (0..dw)
+            .map(|dx| (dx * sw / dw, ((dx + 1) * sw - 1) / dw))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for dy in 0..dh {
+        if area {
+            area_row_premul(&mut rows, &spans, (sw, sh), (dw, dh), dy, &mut filtered);
+        } else {
+            bilinear_row_premul(&mut rows, (sw, sh), (dw, dh), dy, &mut filtered);
+        }
+        // Unpremultiply + linear → sRGB. `a == 0` stays fully-zero RGBA.
+        for (o, px) in out[row_out(dy)]
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
-            .zip(src[..dw * dh * 4].as_chunks::<4>().0)
+            .zip(filtered.as_chunks::<4>().0)
         {
-            if px[3] != 0 {
-                o.copy_from_slice(px);
+            let a = px[3];
+            if a <= 0.0 {
+                *o = [0; 4];
+                continue;
             }
+            let enc = |l: f32| {
+                let idx = ((l / a).clamp(0.0, 1.0) * LIN2SRGB_N as f32).round() as usize;
+                LINEAR_TO_SRGB_LUT[idx]
+            };
+            *o = [
+                enc(px[0]),
+                enc(px[1]),
+                enc(px[2]),
+                (a * 255.0).round().clamp(0.0, 255.0) as u8,
+            ];
         }
-        return out;
     }
-    // sRGB → linear-light, PREMULTIPLIED: an `a=0` texel carries zero mass, so
-    // whatever RGB payload it holds contributes exactly 0 to every output texel.
-    let mut pm = Vec::with_capacity(sw * sh * 4);
-    for px in src[..sw * sh * 4].as_chunks::<4>().0 {
-        let a = f32::from(px[3]) / 255.0;
-        pm.push(SRGB_TO_LINEAR_LUT[px[0] as usize] * a);
-        pm.push(SRGB_TO_LINEAR_LUT[px[1] as usize] * a);
-        pm.push(SRGB_TO_LINEAR_LUT[px[2] as usize] * a);
-        pm.push(a);
-    }
-    let filtered = if dw * 2 <= sw || dh * 2 <= sh {
-        area_rgba_premul(&pm, sw, sh, dw, dh)
-    } else {
-        bilinear_rgba_premul(&pm, sw, sh, dw, dh)
-    };
-    // Unpremultiply + linear → sRGB. `a == 0` stays fully-zero RGBA.
-    for (o, px) in out
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(filtered.as_chunks::<4>().0)
-    {
-        let a = px[3];
-        if a <= 0.0 {
-            continue;
-        }
-        let enc = |l: f32| {
-            let idx = ((l / a).clamp(0.0, 1.0) * LIN2SRGB_N as f32).round() as usize;
-            LINEAR_TO_SRGB_LUT[idx]
-        };
-        o[0] = enc(px[0]);
-        o[1] = enc(px[1]);
-        o[2] = enc(px[2]);
-        o[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
-    out
 }
 
-/// Bilinear (2x2-tap) resample over the premultiplied linear plane — the
-/// mild-ratio arm of [`resample_rgba`].
-fn bilinear_rgba_premul(pm: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
-    let mut out = vec![0f32; dw * dh * 4];
+/// A packed straight-alpha sRGB RGBA8 source, converted ROW BY ROW to
+/// premultiplied linear light (sRGB → linear by LUT, times alpha) as the filter
+/// reads it: an `a=0` texel carries zero mass, so whatever RGB payload it holds
+/// contributes exactly 0 to every output texel. Two rows are resident — all the
+/// bilinear filter reads for one output row, and all the area filter reads at
+/// once, since it walks each output row's source rows in order and the next
+/// output row starts on the last of them or the one after. The filters read rows
+/// in nondecreasing order, so each source row is converted once.
+struct PremulRows<'a> {
+    src: &'a [u8],
+    sw: usize,
+    /// `(source row, its premultiplied linear texels)`; `None` is empty.
+    slots: [(Option<usize>, Vec<f32>); 2],
+}
+
+impl<'a> PremulRows<'a> {
+    fn new(src: &'a [u8], sw: usize) -> Self {
+        let slot = || (None, Vec::with_capacity(sw * 4));
+        Self {
+            src,
+            sw,
+            slots: [slot(), slot()],
+        }
+    }
+
+    /// Source row `y`'s slot, converting the row into one unless it is
+    /// resident. The slot it replaces never holds row `keep`; of the others, an
+    /// empty one goes first, else the one holding the lower (older) row.
+    fn load(&mut self, y: usize, keep: Option<usize>) -> usize {
+        if let Some(i) = self.slots.iter().position(|(row, _)| *row == Some(y)) {
+            return i;
+        }
+        let (r0, r1) = (self.slots[0].0, self.slots[1].0);
+        let i = if keep.is_some() && r0 == keep {
+            1
+        } else if keep.is_some() && r1 == keep {
+            0
+        } else {
+            // `None < Some(_)`: an empty slot is the lower.
+            usize::from(r1 < r0)
+        };
+        let line = &self.src[y * self.sw * 4..(y + 1) * self.sw * 4];
+        let (row, pm) = &mut self.slots[i];
+        *row = Some(y);
+        pm.clear();
+        for px in line.as_chunks::<4>().0 {
+            let a = f32::from(px[3]) / 255.0;
+            pm.push(SRGB_TO_LINEAR_LUT[px[0] as usize] * a);
+            pm.push(SRGB_TO_LINEAR_LUT[px[1] as usize] * a);
+            pm.push(SRGB_TO_LINEAR_LUT[px[2] as usize] * a);
+            pm.push(a);
+        }
+        i
+    }
+
+    /// The texels of the row in slot `i` (from [`Self::load`]).
+    fn row(&self, i: usize) -> &[f32] {
+        &self.slots[i].1
+    }
+}
+
+/// One output row `dy` of the bilinear (2x2-tap) resample over the
+/// premultiplied linear source — the mild-ratio arm of [`resample_rgba`].
+fn bilinear_row_premul(
+    rows: &mut PremulRows<'_>,
+    (sw, sh): (usize, usize),
+    (dw, dh): (usize, usize),
+    dy: usize,
+    out: &mut [f32],
+) {
     let fx = sw as f32 / dw as f32;
     let fy = sh as f32 / dh as f32;
-    for dy in 0..dh {
-        let sy = ((dy as f32 + 0.5) * fy - 0.5).max(0.0);
-        let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(sh - 1);
-        let wy = sy - y0 as f32;
-        for dx in 0..dw {
-            let sx = ((dx as f32 + 0.5) * fx - 0.5).max(0.0);
-            let x0 = sx.floor() as usize;
-            let x1 = (x0 + 1).min(sw - 1);
-            let wx = sx - x0 as f32;
-            let di = (dy * dw + dx) * 4;
-            for c in 0..4 {
-                let p00 = pm[(y0 * sw + x0) * 4 + c];
-                let p10 = pm[(y0 * sw + x1) * 4 + c];
-                let p01 = pm[(y1 * sw + x0) * 4 + c];
-                let p11 = pm[(y1 * sw + x1) * 4 + c];
-                let top = p00 + (p10 - p00) * wx;
-                let bot = p01 + (p11 - p01) * wx;
-                out[di + c] = top + (bot - top) * wy;
-            }
+    let sy = ((dy as f32 + 0.5) * fy - 0.5).max(0.0);
+    let y0 = sy.floor() as usize;
+    let y1 = (y0 + 1).min(sh - 1);
+    let wy = sy - y0 as f32;
+    let i0 = rows.load(y0, Some(y1));
+    let i1 = rows.load(y1, Some(y0));
+    let (r0, r1) = (rows.row(i0), rows.row(i1));
+    for dx in 0..dw {
+        let sx = ((dx as f32 + 0.5) * fx - 0.5).max(0.0);
+        let x0 = sx.floor() as usize;
+        let x1 = (x0 + 1).min(sw - 1);
+        let wx = sx - x0 as f32;
+        let di = dx * 4;
+        for c in 0..4 {
+            let p00 = r0[x0 * 4 + c];
+            let p10 = r0[x1 * 4 + c];
+            let p01 = r1[x0 * 4 + c];
+            let p11 = r1[x1 * 4 + c];
+            let top = p00 + (p10 - p00) * wx;
+            let bot = p01 + (p11 - p01) * wx;
+            out[di + c] = top + (bot - top) * wy;
         }
     }
-    out
 }
 
-/// Exact-footprint AREA (box) filter over the premultiplied linear plane —
-/// the heavy-minification arm of [`resample_rgba`]. Destination texel
-/// `(dx, dy)` integrates its FULL source footprint with the exact integer
-/// [`area_overlap`] weights; per axis the weights sum to `sw` (resp. `sh`),
-/// so the `1/(sw*sh)` normalization is a true partition of unity — no source
-/// texel skipped, no energy invented.
-fn area_rgba_premul(pm: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
-    let mut out = vec![0f32; dw * dh * 4];
+/// One output row `dy` of the exact-footprint AREA (box) filter over the
+/// premultiplied linear source — the heavy-minification arm of
+/// [`resample_rgba`]. Destination texel `(dx, dy)` integrates its FULL source
+/// footprint (`spans[dx]` columns) with the exact integer [`area_overlap`]
+/// weights; per axis the weights sum to `sw` (resp. `sh`), so the
+/// `1/(sw*sh)` normalization is a true partition of unity — no source texel
+/// skipped, no energy invented. Each texel's terms are summed source row by
+/// source row, left to right, as a texel-at-a-time loop sums them.
+fn area_row_premul(
+    rows: &mut PremulRows<'_>,
+    spans: &[(usize, usize)],
+    (sw, sh): (usize, usize),
+    (dw, dh): (usize, usize),
+    dy: usize,
+    out: &mut [f32],
+) {
     let norm = 1.0 / (sw as f32 * sh as f32);
-    for dy in 0..dh {
-        // Source rows overlapping this footprint (integer bounds; see
-        // `area_overlap` for the unit convention).
-        let y0 = dy * sh / dh;
-        let y1 = ((dy + 1) * sh - 1) / dh;
-        for dx in 0..dw {
-            let x0 = dx * sw / dw;
-            let x1 = ((dx + 1) * sw - 1) / dw;
-            let mut acc = [0f32; 4];
-            for y in y0..=y1 {
-                let wy = area_overlap(dy, y, sh, dh) as f32;
-                for x in x0..=x1 {
-                    let w = wy * area_overlap(dx, x, sw, dw) as f32;
-                    let si = (y * sw + x) * 4;
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += pm[si + c] * w;
-                    }
+    // Source rows overlapping this footprint (integer bounds; see
+    // `area_overlap` for the unit convention).
+    let y0 = dy * sh / dh;
+    let y1 = ((dy + 1) * sh - 1) / dh;
+    out.fill(0.0);
+    for y in y0..=y1 {
+        let wy = area_overlap(dy, y, sh, dh) as f32;
+        let i = rows.load(y, None);
+        let line = rows.row(i);
+        for (dx, &(x0, x1)) in spans.iter().enumerate() {
+            let acc = &mut out[dx * 4..dx * 4 + 4];
+            for x in x0..=x1 {
+                let w = wy * area_overlap(dx, x, sw, dw) as f32;
+                let si = x * 4;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += line[si + c] * w;
                 }
-            }
-            let di = (dy * dw + dx) * 4;
-            for (c, a) in acc.iter().enumerate() {
-                out[di + c] = a * norm;
             }
         }
     }
-    out
-}
-
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the W10 resampling
-/// laws over the bit-precise integer domain — the arithmetic depth the `ty`
-/// model (no `*`) cannot reach. CONFIG-FREE, discharged by
-/// `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`.
-/// The two `area_overlap` sums are UNROLLED, not loops, on purpose: an 8-trip
-/// loop outruns the config-free default unwind, and the driver reports that as
-/// "panic reached" at the loop head, classified GENUINE — a false
-/// counterexample that failed the floor (a `while` form proves under
-/// `--default-unwind 10`, which is config). Current verdicts: the two
-/// `area_overlap` obligations and the empty-set
-/// totality are INCONCLUSIVE (solver undecided — `d*src` nonlinearity, same
-/// class as `pad_split_kani`'s nonlinear three), and the strike law is
-/// undecided through its iterator fold; none yields a counterexample. Their
-/// always-on proof weight is carried by the exhaustive lattices in
-/// `tests/emoji_resample.rs` + the `ty`-checked `StrikeSelection` model
-/// (aterm-spec).
-#[cfg(kani)]
-mod resample_kani {
-    use super::{area_overlap, select_strike_ppem};
-
-    /// Partition of unity: for any footprint (`d < dst`) the integer weights
-    /// over the source texels sum to exactly `src` — normalized they sum to 1.
-    #[kani::proof]
-    fn area_overlap_partition_of_unity() {
-        let src: usize = kani::any();
-        let dst: usize = kani::any();
-        let d: usize = kani::any();
-        kani::assume(src >= 1 && src <= 8);
-        kani::assume(dst >= 1 && dst <= 8);
-        kani::assume(d < dst);
-        let w = |s: usize| {
-            if s < src {
-                area_overlap(d, s, src, dst)
-            } else {
-                0
-            }
-        };
-        let sum = w(0) + w(1) + w(2) + w(3) + w(4) + w(5) + w(6) + w(7);
-        kani::assert(
-            sum == src as u64,
-            "footprint weights must sum to exactly src",
-        );
-    }
-
-    /// Dual (mass conservation): a source texel's weight over all destination
-    /// footprints sums to exactly `dst` — no texel dropped or double-counted.
-    #[kani::proof]
-    fn area_overlap_mass_conservation() {
-        let src: usize = kani::any();
-        let dst: usize = kani::any();
-        let s: usize = kani::any();
-        kani::assume(src >= 1 && src <= 8);
-        kani::assume(dst >= 1 && dst <= 8);
-        kani::assume(s < src);
-        let w = |d: usize| {
-            if d < dst {
-                area_overlap(d, s, src, dst)
-            } else {
-                0
-            }
-        };
-        let sum = w(0) + w(1) + w(2) + w(3) + w(4) + w(5) + w(6) + w(7);
-        kani::assert(
-            sum == dst as u64,
-            "a source texel's mass must be fully distributed",
-        );
-    }
-
-    /// The strike law (bounded ppems — the iterator fold is BMC-heavy at full
-    /// `u16`; the value bound loses no structure, only magnitude): the choice
-    /// is an available strike, adequate-and-minimal when an adequate strike
-    /// exists, else the maximum.
-    #[kani::proof]
-    fn select_strike_min_adequate_else_max() {
-        let strikes = [kani::any::<u16>(), kani::any::<u16>(), kani::any::<u16>()];
-        let target: u16 = kani::any();
-        kani::assume(strikes[0] <= 8 && strikes[1] <= 8 && strikes[2] <= 8 && target <= 8);
-        let c = match select_strike_ppem(&strikes, target) {
-            Some(c) => c,
-            None => {
-                kani::assert(false, "a non-empty strike set always yields a choice");
-                return;
-            }
-        };
-        kani::assert(strikes.contains(&c), "the choice is an available strike");
-        let any_adequate = strikes.iter().any(|&s| s >= target);
-        if any_adequate {
-            kani::assert(c >= target, "an adequate strike exists: choice adequate");
-            for &s in &strikes {
-                if s >= target {
-                    kani::assert(c <= s, "minimal among the adequate strikes");
-                }
-            }
-        } else {
-            for &s in &strikes {
-                kani::assert(s <= c, "no adequate strike: choice is the maximum");
-            }
-        }
-    }
-
-    /// Totality at the empty end: no carrying strike → `None` (the COLR/mono
-    /// fallback path), never a panic or a fabricated ppem.
-    #[kani::proof]
-    fn select_strike_empty_is_none() {
-        let target: u16 = kani::any();
-        kani::assert(
-            select_strike_ppem(&[], target).is_none(),
-            "an empty strike set has no choice",
-        );
+    for a in out.iter_mut() {
+        *a *= norm;
     }
 }
 
@@ -26998,6 +27442,40 @@ mod tests {
         assert!(dirty[2], "the newly selected row must be dirty");
         assert!(!dirty[3], "a row untouched by the drag must NOT repaint");
         assert!(d.any_dirty && !d.is_gate_hit());
+    }
+
+    /// A BiDi row's visual→logical map decides which painted cells a (logical)
+    /// selection lights, and two orders of one row can paint alike (a row of
+    /// one repeated letter). A map-only change leaves cells, clusters and the
+    /// selection span equal, so it must dirty the row itself, or the highlight
+    /// stays on the old cells.
+    #[test]
+    fn compute_dirty_rows_marks_a_row_whose_bidi_map_changed() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+        let mut term = Terminal::new(4, 8);
+        term.process(b"\r\n\r\naaaa\r\n");
+        let mut prev = term.cell_frame(4, 8);
+        prev.selection
+            .start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
+        prev.selection.update_selection(2, 0, SelectionSide::Right);
+        let mut cur = prev.clone();
+        cur.visual_to_logical[2] = vec![3, 2, 1, 0];
+        assert!(prev.cells == cur.cells && prev.selection == cur.selection);
+        assert!(!prev.selection_contains_cell(2, 3, false, false));
+        assert!(cur.selection_contains_cell(2, 3, false, false));
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(d) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("a map-only change takes the row-damage path");
+        };
+        assert!(dirty[2], "the reordered row repaints");
+        assert!(
+            !dirty[0] && !dirty[1],
+            "rows without a map change stay clean"
+        );
+        assert!(d.any_dirty);
     }
 
     /// A LIVE selection recolour (OSC 17 / OSC 19, or the OSC 21 pair) leaves the
@@ -28681,7 +29159,7 @@ mod tests {
             scaling: ImageScaling::PixelExact,
             source_rect: None,
         };
-        let out = decode_placement(&image, 4, 4).expect("decodes");
+        let out = decode_placement(&image, 4, 4).expect("decodes").rgba;
         assert_eq!(out.len(), 4 * 4 * 4);
         for y in 0..4 {
             for x in 0..4 {
@@ -28695,9 +29173,121 @@ mod tests {
             ..image
         };
         assert_eq!(
-            decode_placement(&unmoved, 4, 4).expect("decodes")[3],
+            decode_placement(&unmoved, 4, 4).expect("decodes").rgba[3],
             0xFF,
             "no offset: the raster starts at the corner"
+        );
+    }
+
+    /// A footprint is decoded at its own size up to the raster budget and
+    /// scaled down uniformly past it — on either bound, whatever its shape.
+    #[test]
+    fn placement_raster_size_holds_every_footprint_to_the_budget() {
+        let (px, side) = (MAX_PLACEMENT_RASTER_PX, MAX_PLACEMENT_RASTER_SIDE);
+        for fp in [
+            (1, 1),
+            (7680, 4320),
+            (8192, 4096),
+            (side, 2048),
+            (2048, side),
+        ] {
+            assert_eq!(placement_raster_size(fp.0, fp.1), fp, "{fp:?} is within");
+        }
+        for (fw, fh) in [
+            (8193, 4096),
+            (22_320, 22_892),
+            (side + 1, 1),
+            (1, 65_535 * 600),
+            (65_535 * 600, 65_535 * 600),
+            (3, side * 4),
+        ] {
+            let (w, h) = placement_raster_size(fw, fh);
+            assert!(
+                w >= 1 && h >= 1 && w <= fw && h <= fh,
+                "{fw}x{fh} -> {w}x{h}"
+            );
+            assert!(
+                w <= side && h <= side && w * h <= px,
+                "{fw}x{fh} -> {w}x{h}"
+            );
+            // Uniform: each side is the footprint's times ONE factor, floored —
+            // so `w/fw` and `h/fh` agree to within a pixel of either side
+            // (unless a side sits on the 1 px floor).
+            let skew = (w as u128 * fh as u128).abs_diff(h as u128 * fw as u128);
+            assert!(
+                w == 1 || h == 1 || skew <= (fw + fh) as u128,
+                "{fw}x{fh} -> {w}x{h} is not uniform"
+            );
+        }
+    }
+
+    /// Past the budget every policy draws what it would on the footprint, at
+    /// the raster's scale: a stretch still spans it, a pixel-exact raster keeps
+    /// its size relative to the footprint, an in-cell offset moves with it.
+    #[test]
+    fn decode_placement_scales_an_over_budget_footprint_down_uniformly() {
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
+        let raw = |w: u16, h: u16, px: &[[u8; 4]], scaling, offset| ImageData {
+            bytes: px.concat(),
+            format: ImageFormat::RawRgba8 {
+                width: w,
+                height: h,
+            },
+            cols: 1,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: offset,
+            scaling,
+            source_rect: None,
+        };
+        let (red, blue) = ([0xFF, 0, 0, 0xFF], [0, 0, 0xFF, 0xFF]);
+        let at = |r: &PlacementRaster, x: usize, y: usize| {
+            let i = (y * r.w + x) * 4;
+            [r.rgba[i], r.rgba[i + 1], r.rgba[i + 2], r.rgba[i + 3]]
+        };
+
+        // Stretch across a footprint wider than any texture side.
+        let fp = (40_000, 4);
+        let wide = decode_placement(
+            &raw(2, 1, &[red, blue], ImageScaling::Stretch, (0, 0)),
+            fp.0,
+            fp.1,
+        )
+        .expect("decodes");
+        assert_eq!((wide.w, wide.h), placement_raster_size(fp.0, fp.1));
+        assert_eq!(wide.rgba.len(), wide.w * wide.h * 4);
+        assert_eq!(at(&wide, 0, 0), red);
+        assert_eq!(at(&wide, wide.w - 1, wide.h - 1), blue);
+
+        // Pixel-exact: 4x4 of a 40 000 px square footprint is 1/10 000 of each
+        // side, so on the raster it is the one corner pixel.
+        let fp = (40_000, 40_000);
+        let exact = decode_placement(
+            &raw(4, 4, &[red; 16], ImageScaling::PixelExact, (0, 0)),
+            fp.0,
+            fp.1,
+        )
+        .expect("decodes");
+        assert_eq!((exact.w, exact.h), placement_raster_size(fp.0, fp.1));
+        assert!(exact.w * exact.h <= MAX_PLACEMENT_RASTER_PX);
+        assert_eq!(at(&exact, 0, 0), red);
+        assert_eq!(at(&exact, 1, 0)[3], 0, "the rest of the footprint is clear");
+        assert_eq!(at(&exact, 0, 1)[3], 0, "the rest of the footprint is clear");
+
+        // An in-cell offset lands where its footprint pixel samples the raster.
+        let offset = decode_placement(
+            &raw(4, 4, &[red; 16], ImageScaling::PixelExact, (20_000, 0)),
+            fp.0,
+            fp.1,
+        )
+        .expect("decodes");
+        let rx = placement_raster_coord(20_000, fp.0, offset.w);
+        assert_eq!(at(&offset, rx, 0), red);
+        assert_eq!(
+            at(&offset, rx - 1, 0)[3],
+            0,
+            "the strip before the offset is clear"
         );
     }
 
@@ -28752,7 +29342,7 @@ mod tests {
             a.clone(),
             4,
             4,
-            DecodedImage {
+            PlacementRaster {
                 w: 4,
                 h: 4,
                 rgba: vec![0xAA; 4 * 4 * 4],
@@ -28774,6 +29364,12 @@ mod tests {
             ic.get(&a, 8, 8).is_none(),
             "same Arc, different footprint must miss"
         );
+    }
+
+    /// Start an [`ImageCache`] frame that names no placement (the cache-policy
+    /// tests insert their own rasters at full size).
+    fn next_frame(ic: &mut ImageCache) {
+        ic.begin_frame(std::iter::empty());
     }
 
     /// Small distinct `ImageData` Arcs for cache-policy tests.
@@ -28804,14 +29400,16 @@ mod tests {
             let identity = Arc::as_ptr(&source);
             let decoded_bytes = rgba.len();
             let mut cache = ImageCache::default();
-            cache.put(source.clone(), 1, 1, DecodedImage { w: 1, h: 1, rgba });
+            cache.put(source.clone(), 1, 1, PlacementRaster { w: 1, h: 1, rgba });
             assert_eq!(
                 Arc::strong_count(&source),
                 1,
                 "cache owns no source payload"
             );
             assert_eq!(cache.get(&source, 1, 1).unwrap().rgba.len(), decoded_bytes);
+            assert_eq!(cache.peek(&source, 1, 1).unwrap().rgba.len(), decoded_bytes);
             assert!(cache.get(&source, 2, 1).is_none());
+            assert!(cache.peek(&source, 2, 1).is_none());
 
             // Negative control: the historical strong cache owner kept the
             // entire source alive after the last grid/history owner dropped it.
@@ -28821,7 +29419,8 @@ mod tests {
             drop(historical_owner);
             assert!(observed.upgrade().is_none(), "source Vec must be released");
             drop(observed);
-            assert_eq!(cache.entries[0].0.as_ptr(), identity);
+            let pinned = cache.entries.values().next().expect("one entry");
+            assert_eq!(pinned._pin.as_ptr(), identity);
             let replacement = mk_image_arc();
             assert_ne!(
                 Arc::as_ptr(&replacement),
@@ -28829,6 +29428,7 @@ mod tests {
                 "weak cache key pins address"
             );
             assert!(cache.get(&replacement, 1, 1).is_none());
+            assert!(cache.peek(&replacement, 1, 1).is_none());
             assert_eq!((cache.entries.len(), cache.bytes), (1, decoded_bytes));
             eprintln!(
                 "CPU image cache: 16777216 source bytes released; {decoded_bytes} decoded bytes retained"
@@ -28851,7 +29451,7 @@ mod tests {
                 img.clone(),
                 4,
                 4,
-                DecodedImage {
+                PlacementRaster {
                     w: 4,
                     h: 4,
                     rgba: vec![i as u8; 4 * 4 * 4],
@@ -28865,13 +29465,13 @@ mod tests {
         }
     }
 
-    /// The byte budget is enforced LRU-first, and a single over-budget decode
-    /// still inserts (alone) so `put` terminates and the image is decoded once,
-    /// not once per frame.
+    /// The byte budget is enforced LRU-first over what earlier frames drew,
+    /// and a single over-budget decode still inserts (alone) so `put`
+    /// terminates and the image is decoded once, not once per frame.
     #[test]
     fn image_cache_byte_budget_evicts_lru_and_admits_oversized_entry() {
         let quarter = ImageCache::MAX_BYTES / 4 + 1;
-        let mk_decoded = |fill: u8, len: usize| DecodedImage {
+        let mk_decoded = |fill: u8, len: usize| PlacementRaster {
             w: 1,
             h: 1,
             rgba: vec![fill; len],
@@ -28883,11 +29483,13 @@ mod tests {
             mk_image_arc(),
         );
         let mut ic = ImageCache::default();
+        next_frame(&mut ic);
         ic.put(a.clone(), 1, 1, mk_decoded(1, quarter));
         ic.put(b.clone(), 1, 1, mk_decoded(2, quarter));
         ic.put(c.clone(), 1, 1, mk_decoded(3, quarter));
-        // Three quarters+1 fit; a fourth overflows the budget and must evict
-        // only the LRU entry (A).
+        // Three quarters+1 fit; a fourth, in a later frame, overflows the
+        // budget and must evict only the LRU entry (A).
+        next_frame(&mut ic);
         ic.put(d.clone(), 1, 1, mk_decoded(4, quarter));
         assert!(
             ic.get(&a, 1, 1).is_none(),
@@ -28896,7 +29498,9 @@ mod tests {
         assert!(ic.get(&b, 1, 1).is_some(), "B retained");
         assert!(ic.get(&c, 1, 1).is_some(), "C retained");
         assert!(ic.get(&d, 1, 1).is_some(), "new entry inserted");
-        // A single over-budget decode evicts everything and inserts alone.
+        // A single over-budget decode, in a later frame, evicts everything and
+        // inserts alone.
+        next_frame(&mut ic);
         let huge = mk_image_arc();
         ic.put(huge.clone(), 1, 1, mk_decoded(5, ImageCache::MAX_BYTES + 1));
         assert!(
@@ -28907,8 +29511,8 @@ mod tests {
         assert_eq!(ic.entries.len(), 1, "exactly the oversized entry remains");
     }
 
-    /// Entry-count ceiling still bounds the cache when every decode is tiny
-    /// (e.g. cached negative results), keeping `get`'s linear scan short.
+    /// The entry-count budget still bounds what earlier frames used when every
+    /// decode is tiny (e.g. cached negative results).
     #[test]
     fn image_cache_count_ceiling_evicts_lru() {
         let images: Vec<_> = (0..ImageCache::MAX_ENTRIES + 1)
@@ -28916,11 +29520,12 @@ mod tests {
             .collect();
         let mut ic = ImageCache::default();
         for img in &images {
+            next_frame(&mut ic);
             ic.put(
                 img.clone(),
                 1,
                 1,
-                DecodedImage {
+                PlacementRaster {
                     w: 1,
                     h: 1,
                     rgba: Vec::new(),
@@ -28928,8 +29533,391 @@ mod tests {
             );
         }
         assert_eq!(ic.entries.len(), ImageCache::MAX_ENTRIES);
-        assert!(ic.get(&images[0], 1, 1).is_none(), "oldest evicted at cap");
+        assert!(ic.peek(&images[0], 1, 1).is_none(), "oldest evicted at cap");
+        assert!(ic.get(&images[0], 1, 1).is_none());
         assert!(ic.get(&images[1], 1, 1).is_some(), "second-oldest retained");
+    }
+
+    /// More distinct images than the entry cap, drawn by every frame — a
+    /// contact sheet of 81 thumbnails — are each decoded ONCE, and so are
+    /// however many a frame draws: the count budget evicts only what earlier
+    /// frames used.
+    #[test]
+    fn image_cache_keeps_the_frame_working_set_past_the_entry_cap() {
+        let n = ImageCache::MAX_ENTRIES + 17;
+        let images: Vec<_> = (0..n).map(|_| mk_image_arc()).collect();
+        let tiny = || PlacementRaster {
+            w: 1,
+            h: 1,
+            rgba: vec![0; 4],
+        };
+        let mut ic = ImageCache::default();
+        let mut decodes = 0;
+        for _frame in 0..3 {
+            next_frame(&mut ic);
+            for image in &images {
+                let _ = ic.get_or_insert_with(image, 1, 1, || {
+                    decodes += 1;
+                    tiny()
+                });
+            }
+        }
+        assert_eq!(decodes, n, "each image is decoded once, not once per frame");
+
+        // A frame of 2 000 distinct images — past any fixed ceiling — keeps
+        // every one; the earlier frame's images go instead.
+        next_frame(&mut ic);
+        let more: Vec<_> = (0..2_000).map(|_| mk_image_arc()).collect();
+        for image in &more {
+            ic.put(image.clone(), 1, 1, tiny());
+        }
+        assert_eq!(ic.entries.len(), more.len(), "the frame keeps all it drew");
+        assert!(ic.get(&more[0], 1, 1).is_some(), "its first image included");
+        assert!(
+            ic.get(&images[0], 1, 1).is_none(),
+            "an earlier frame's images go"
+        );
+        // The next frame draws none of them: back under the count budget.
+        next_frame(&mut ic);
+        ic.put(mk_image_arc(), 1, 1, tiny());
+        assert_eq!(ic.entries.len(), ImageCache::MAX_ENTRIES);
+    }
+
+    /// Two images that pass the byte budget together, drawn by every frame —
+    /// two window-wide photos on screen at once — are decoded ONCE: the budget
+    /// never evicts one the frame in progress drew to admit the other, so the
+    /// next frame finds both. (What one frame draws is held to
+    /// `MAX_IMAGE_WORKING_SET_BYTES` by its raster cap, not by eviction.)
+    #[test]
+    fn image_cache_keeps_the_frame_working_set_past_the_byte_budget() {
+        let big = ImageCache::MAX_BYTES / 2 + 1;
+        let raster = |len: usize| PlacementRaster {
+            w: 1,
+            h: 1,
+            rgba: vec![0; len],
+        };
+        let (a, b) = (mk_image_arc(), mk_image_arc());
+        let mut ic = ImageCache::default();
+        let mut decodes = 0;
+        for _frame in 0..3 {
+            next_frame(&mut ic);
+            for image in [&a, &b] {
+                let _ = ic.get_or_insert_with(image, 1, 1, || {
+                    decodes += 1;
+                    raster(big)
+                });
+            }
+        }
+        assert_eq!(decodes, 2, "each image is decoded once, not once per frame");
+        assert!(ic.bytes > ImageCache::MAX_BYTES);
+
+        // A frame drawing neither trims back to the budget.
+        next_frame(&mut ic);
+        ic.put(mk_image_arc(), 1, 1, raster(1));
+        assert!(ic.bytes <= ImageCache::MAX_BYTES);
+    }
+
+    /// The image the last frame used LAST, used first by the next frame, is
+    /// that frame's: a decode the same frame inserts past the byte budget
+    /// evicts the earlier frame's other images, never it.
+    #[test]
+    fn image_cache_the_last_used_image_is_the_next_frames_own() {
+        let big = ImageCache::MAX_BYTES / 2 + 1;
+        let raster = |len: usize| PlacementRaster {
+            w: 1,
+            h: 1,
+            rgba: vec![0; len],
+        };
+        let (old, kept, new) = (mk_image_arc(), mk_image_arc(), mk_image_arc());
+        let mut ic = ImageCache::default();
+        next_frame(&mut ic);
+        ic.put(old.clone(), 1, 1, raster(1));
+        ic.put(kept.clone(), 1, 1, raster(big));
+        next_frame(&mut ic);
+        assert!(ic.get(&kept, 1, 1).is_some());
+        ic.put(new.clone(), 1, 1, raster(big));
+        assert!(
+            ic.peek(&kept, 1, 1).is_some(),
+            "the frame's own image stays"
+        );
+        assert!(ic.peek(&new, 1, 1).is_some());
+        assert!(ic.peek(&old, 1, 1).is_none(), "an earlier frame's goes");
+    }
+
+    /// THE FRAME KEEPS WHAT IT USES, as a bounded model of [`ImageCache`]'s use
+    /// order: the tick, the frame's first tick, and for two entries their
+    /// residency, last-use tick and a ghost flag for "the frame in progress
+    /// used it". `put`'s eviction is modelled as a permission — it may evict
+    /// any entry last used before the frame began — so the invariant holds for
+    /// every eviction order the budgets could choose. `Buggy` replays the frame
+    /// boundary this cache was first written with: `begin_frame` took no tick of
+    /// its own, so the entry the last frame used last kept its old tick through
+    /// its first use in the next frame and was evictable while that frame drew
+    /// it.
+    fn decode_cache_frame_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            DecodeCacheFrameWorkingSet {
+                const Buggy = 0;
+                const MaxTick = 7;
+                var tick = 0;
+                var frame_start = 0;
+                var a_res = 0;
+                var a_tick = 0;
+                var a_used = 0;
+                var b_res = 0;
+                var b_tick = 0;
+                var b_used = 0;
+                action Begin when (tick + 1 <= MaxTick) {
+                    tick = if Buggy == 1 { tick } else { tick + 1 };
+                    frame_start = tick + 1;
+                    a_used = 0;
+                    b_used = 0;
+                }
+                action UseA when (a_res == 1 && tick + 1 <= MaxTick) {
+                    tick = if a_tick == tick { tick } else { tick + 1 };
+                    a_tick = if a_tick == tick { a_tick } else { tick + 1 };
+                    a_used = 1;
+                }
+                action PutA when (a_res == 0 && tick + 1 <= MaxTick) {
+                    tick = tick + 1;
+                    a_tick = tick + 1;
+                    a_res = 1;
+                    a_used = 1;
+                }
+                action EvictA when (a_res == 1 && a_tick + 1 <= frame_start) {
+                    a_res = 0;
+                }
+                action UseB when (b_res == 1 && tick + 1 <= MaxTick) {
+                    tick = if b_tick == tick { tick } else { tick + 1 };
+                    b_tick = if b_tick == tick { b_tick } else { tick + 1 };
+                    b_used = 1;
+                }
+                action PutB when (b_res == 0 && tick + 1 <= MaxTick) {
+                    tick = tick + 1;
+                    b_tick = tick + 1;
+                    b_res = 1;
+                    b_used = 1;
+                }
+                action EvictB when (b_res == 1 && b_tick + 1 <= frame_start) {
+                    b_res = 0;
+                }
+                invariant FrameKeepsWhatItUses:
+                    (a_used == 0 || a_res == 1) && (b_used == 0 || b_res == 1);
+            }
+        }
+    }
+
+    /// Tier 0 and Tier 1 for [`decode_cache_frame_model`]: the model is proven
+    /// (and its `Buggy` boundary caught), then random walks drive the REAL
+    /// cache — frame boundaries, hits, decodes whose bytes push the budget so a
+    /// put evicts — fire each step on the model (a put's evictions as `Evict`
+    /// steps, which must be enabled), and compare the model's tick, frame start,
+    /// residency and last-use ticks with the cache's own after every step. The
+    /// negative control replays the same walks on the `Buggy` model, which the
+    /// projection must reject.
+    #[test]
+    fn image_cache_conforms_to_the_frame_working_set_model() {
+        let model = decode_cache_frame_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        // The walks run the same rules past the proof's tick bound.
+        let model = aterm_spec::interp::with_consts(&model, &[("MaxTick", 1_000)]);
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        // Either raster fits the byte budget alone; the two together pass it.
+        let big = || PlacementRaster {
+            w: 1,
+            h: 1,
+            rgba: vec![0; ImageCache::MAX_BYTES / 2 + 1],
+        };
+        let images = [mk_image_arc(), mk_image_arc()];
+        let names = [
+            ("A", "UseA", "PutA", "EvictA"),
+            ("B", "UseB", "PutB", "EvictB"),
+        ];
+        let resident = |ic: &ImageCache| images.each_ref().map(|i| ic.peek(i, 1, 1).is_some());
+        let conforms = |ic: &ImageCache, state: &std::collections::BTreeMap<&str, i64>| {
+            let tick = |image| ic.entries[&ImageCache::key(image, 1, 1)].tick as i64;
+            let now = resident(ic);
+            state["tick"] == ic.tick as i64
+                && state["frame_start"] == ic.frame_start as i64
+                && state["a_res"] == i64::from(now[0])
+                && state["b_res"] == i64::from(now[1])
+                && (!now[0] || state["a_tick"] == tick(&images[0]))
+                && (!now[1] || state["b_tick"] == tick(&images[1]))
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut fired = std::collections::BTreeSet::new();
+        let mut buggy_rejected = 0;
+        for _walk in 0..400 {
+            let mut ic = ImageCache::default();
+            let mut state = model.init_state();
+            let mut buggy_state = buggy.init_state();
+            let mut buggy_ok = true;
+            for _step in 0..24 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let before = resident(&ic);
+                let mut steps = Vec::new();
+                if seed.is_multiple_of(3) {
+                    ic.begin_frame(std::iter::empty());
+                    steps.push("Begin");
+                } else {
+                    let i = (seed / 3 % 2) as usize;
+                    let (_, use_, put, _) = names[i];
+                    if ic.get(&images[i], 1, 1).is_some() {
+                        steps.push(use_);
+                    } else {
+                        ic.put(images[i].clone(), 1, 1, big());
+                        steps.push(put);
+                        let after = resident(&ic);
+                        for (j, &(_, _, _, evict)) in names.iter().enumerate() {
+                            if before[j] && !after[j] {
+                                steps.push(evict);
+                            }
+                        }
+                    }
+                }
+                for &step in &steps {
+                    assert!(
+                        model.fire(step, &mut state),
+                        "{step} is not enabled: {state:?}"
+                    );
+                    fired.insert(step);
+                    buggy_ok &= buggy.fire(step, &mut buggy_state);
+                }
+                assert!(conforms(&ic, &state), "after {steps:?}: {state:?}");
+                assert!(model.check_invariant("FrameKeepsWhatItUses", &state));
+                buggy_ok &= conforms(&ic, &buggy_state);
+            }
+            buggy_rejected += usize::from(!buggy_ok);
+        }
+        for action in ["Begin", "UseA", "PutA", "EvictA", "UseB", "PutB", "EvictB"] {
+            assert!(fired.contains(action), "the walks never took {action}");
+        }
+        assert!(
+            buggy_rejected > 0,
+            "the projection must reject the frame boundary that took no tick"
+        );
+    }
+
+    /// A raster cached at another frame's size is not this frame's: when the
+    /// frame's raster cap shrinks the placement's raster (more pictures on
+    /// screen), the lookup misses and the decode replaces the old entry, and
+    /// when the cap lets it grow back, it is decoded at full size again.
+    #[test]
+    fn image_cache_decodes_a_placement_at_its_frame_size() {
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
+        let image = |fill: u8| {
+            std::sync::Arc::new(ImageData {
+                bytes: [fill, 0, 0, 255].repeat(4),
+                format: ImageFormat::RawRgba8 {
+                    width: 2,
+                    height: 2,
+                },
+                scaling: ImageScaling::Stretch,
+                ..(*mk_image_arc()).clone()
+            })
+        };
+        // Three footprints whose full rasters pass the working set together.
+        let fp = (8192, 4096);
+        let pictures: Vec<_> = (0..3).map(|i| image(10 * i + 1)).collect();
+        let mut ic = ImageCache::default();
+        let shown = |ic: &mut ImageCache, n: usize| {
+            ic.begin_frame(pictures[..n].iter().map(|p| (p, fp.0, fp.1)));
+        };
+
+        shown(&mut ic, 1);
+        let full = ic.get_or_decode(&pictures[0], fp.0, fp.1);
+        assert_eq!((full.w, full.h), fp, "alone, it decodes at full size");
+
+        shown(&mut ic, 3);
+        assert!(
+            ic.get(&pictures[0], fp.0, fp.1).is_none(),
+            "the full-size raster is not this frame's"
+        );
+        for picture in &pictures {
+            let small = ic.get_or_decode(picture, fp.0, fp.1);
+            assert!(small.w * small.h * 4 <= MAX_IMAGE_WORKING_SET_BYTES / 3);
+        }
+        assert_eq!(ic.entries.len(), 3, "the full-size entry was replaced");
+        assert!(ic.bytes <= MAX_IMAGE_WORKING_SET_BYTES);
+        // The next frame showing the same three finds all three.
+        shown(&mut ic, 3);
+        for picture in &pictures {
+            assert!(ic.get(picture, fp.0, fp.1).is_some());
+        }
+
+        shown(&mut ic, 1);
+        assert!(ic.get(&pictures[0], fp.0, fp.1).is_none());
+        let full = ic.get_or_decode(&pictures[0], fp.0, fp.1);
+        assert_eq!((full.w, full.h), fp, "alone again, full size again");
+    }
+
+    /// THE FRAME'S RASTERS FIT ITS WORKING SET. Under the budget the cap
+    /// changes nothing; past it, the water level holds the sum within the
+    /// budget while every picture smaller than the level keeps its size.
+    #[test]
+    fn frame_raster_cap_fits_the_frame_in_its_working_set() {
+        let budget = MAX_IMAGE_WORKING_SET_BYTES / 4;
+        let full = MAX_PLACEMENT_RASTER_PX;
+        assert_eq!(frame_raster_cap(&mut []), full);
+        assert_eq!(
+            frame_raster_cap(&mut [full, full]),
+            full,
+            "two fit as they are"
+        );
+        for demands in [
+            vec![full; 3],
+            vec![full; 16],
+            vec![1_000, 2_000, full, full, full],
+            vec![budget / 2, budget / 2, 1],
+            vec![budget / 3 + 1; 3],
+            vec![budget, 1],
+        ] {
+            let mut sorted = demands.clone();
+            let cap = frame_raster_cap(&mut sorted);
+            let held: usize = demands.iter().map(|&d| d.min(cap)).sum();
+            assert!(held <= budget, "{held} px held at cap {cap}");
+            assert!(cap >= 1);
+            for &d in &demands {
+                if d <= budget / demands.len() {
+                    assert!(d <= cap, "a demand under an even share keeps its size");
+                }
+            }
+        }
+    }
+
+    /// [`placement_raster_size_within`] never has more pixels than its cap
+    /// or than the full raster, keeps a footprint within both as it is, and is
+    /// [`placement_raster_size`] under the full cap.
+    #[test]
+    fn placement_raster_size_within_holds_every_footprint_to_its_cap() {
+        let fps = [
+            (1, 1),
+            (7680, 9320),
+            (22_320, 22_892),
+            (100_000, 30),
+            (30, 100_000),
+            (16_385, 1),
+            (1, 16_385),
+            (65_535 * 200, 233),
+        ];
+        for &(w, h) in &fps {
+            assert_eq!(
+                placement_raster_size_within(w, h, MAX_PLACEMENT_RASTER_PX),
+                placement_raster_size(w, h)
+            );
+            let (fw, fh) = placement_raster_size(w, h);
+            for cap in [1, 2, 7, 1_000, 22_369_621, MAX_PLACEMENT_RASTER_PX] {
+                let (rw, rh) = placement_raster_size_within(w, h, cap);
+                assert!(rw >= 1 && rh >= 1 && rw <= w && rh <= h, "{w}x{h} @ {cap}");
+                assert!(rw * rh <= cap.max(1), "{w}x{h} @ {cap}: {rw}x{rh}");
+                assert!(rw * rh <= fw * fh, "{w}x{h} @ {cap}: {rw}x{rh}");
+                if fw * fh <= cap {
+                    assert_eq!((rw, rh), (fw, fh));
+                }
+            }
+        }
     }
 
     /// REGRESSION (idx4): the runtime face-swap setters must drop the rasterized
@@ -40111,6 +41099,145 @@ mod glyph_cache_accounting_tests {
             r.glyphs.contains_key(&key),
             "the small refill must stay warm"
         );
+    }
+
+    /// Replace `key`'s cached raster with an opaque one of `bytes` bytes and
+    /// charge the difference — only the payload is synthetic, as in the byte-cap
+    /// tests above (a screen of colour emoji at a large zoom, without
+    /// rasterizing one). The entry keeps the frame stamp of its last read.
+    fn inflate(r: &mut Renderer, key: GlyphKey, bytes: usize) {
+        let entry = r.glyphs.get_mut(&key).expect("the glyph is cached");
+        let used = entry.used.get();
+        r.glyph_bytes -= entry.img.byte_len();
+        *entry = CachedGlyph::new(GlyphImage::Mono {
+            width: bytes,
+            height: 1,
+            xmin: 0,
+            ymin: 0,
+            advance: 1.0,
+            bytes: vec![0xFF; bytes],
+        });
+        entry.used.set(used);
+        r.glyph_bytes += bytes;
+    }
+
+    /// A frame whose glyphs ALONE pass the byte budget — a screen of distinct
+    /// emoji at a large zoom — keeps them across the frame boundary: a full
+    /// clear there made every such frame re-rasterize its whole screen. What
+    /// the frame did not read still goes, and so does the working set once
+    /// later frames read enough else to double the cache.
+    #[test]
+    fn glyph_eviction_keeps_the_working_set_of_the_frame_just_drawn() {
+        const BYTE_CAP: usize = 12 * 1024 * 1024;
+        let mut r = renderer();
+        let (hot, cold) = (r.glyph_key('A'), r.glyph_key('B'));
+        // Frame 1 reads `cold`.
+        r.evict_caches_if_large();
+        let _ = r.glyph_image(cold);
+        // Frame 2's working set is `hot`, a raster bigger than the budget (an
+        // emoji screen's worth, seeded so as not to rasterize one).
+        r.evict_caches_if_large();
+        let _ = r.glyph_image(hot);
+        let big = GlyphImage::Mono {
+            width: BYTE_CAP + 1,
+            height: 1,
+            xmin: 0,
+            ymin: 0,
+            advance: 1.0,
+            bytes: vec![0xFF; BYTE_CAP + 1],
+        };
+        r.glyph_bytes += big.byte_len() - r.glyphs[&hot].img.byte_len();
+        r.glyphs.get_mut(&hot).expect("hot is cached").img = big;
+        assert_accounted(&r);
+        assert!(r.glyph_bytes > BYTE_CAP);
+
+        // Frame 3 begins: over budget, so the cache trims — to frame 2's reads.
+        r.evict_caches_if_large();
+        assert!(
+            r.glyphs.contains_key(&hot),
+            "the working set of the frame just drawn survives the boundary"
+        );
+        assert!(
+            !r.glyphs.contains_key(&cold),
+            "what that frame did not read is evicted"
+        );
+        assert_accounted(&r);
+
+        // Frame 3 reads nothing, and frame 4 begins under twice what was kept:
+        // the kept set stays (a small frame does not shrink it).
+        r.evict_caches_if_large();
+        assert!(
+            r.glyphs.contains_key(&hot),
+            "a frame that reads less does not trim the kept set"
+        );
+        // Frame 4 reads `cold` at the same size, doubling the cache past the
+        // kept set: frame 5 begins with a trip that keeps frame 4's reads only.
+        let _ = r.glyph_image(cold);
+        inflate(&mut r, cold, BYTE_CAP + 2);
+        assert_accounted(&r);
+        r.evict_caches_if_large();
+        assert!(
+            !r.glyphs.contains_key(&hot),
+            "a working set no frame reads is evicted once the cache doubles"
+        );
+        assert!(r.glyphs.contains_key(&cold));
+        assert_eq!(r.glyph_bytes, BYTE_CAP + 2);
+        assert_accounted(&r);
+    }
+
+    /// THE KEPT SET OUTLIVES A SMALL FRAME, through the real CPU draw path. A
+    /// full repaint whose glyphs pass the byte budget, then a frame that redraws
+    /// only the cursor's row, then a full repaint: the glyphs the first one read
+    /// are still resident when the third begins. The boundary after the
+    /// cursor-only frame trimmed the cache to THAT frame's reads, so every
+    /// cursor blink between two full repaints cost the second one a
+    /// re-raster of the whole screen (measured: 800 emoji at 64 px, 233 ms
+    /// against 8.5 ms).
+    #[test]
+    fn a_screen_of_glyphs_past_the_budget_survives_a_cursor_only_frame() {
+        const BYTE_CAP: usize = 12 * 1024 * 1024;
+        let text = "ABCDEFGH";
+        let mut r = renderer();
+        let mut term = aterm_core::terminal::Terminal::new(3, 8);
+        term.process(format!("{text}\r\n\r\n").as_bytes());
+        let mut wc = WindowCpu::new();
+        // Frame 1: a full repaint reads the top row's glyphs.
+        let _ = r.render_input_cached(&mut wc, &term.cell_frame(3, 8));
+        let keys: Vec<GlyphKey> = text
+            .chars()
+            .map(|ch| {
+                let cell = RenderCell {
+                    ch,
+                    ..RenderCell::default()
+                };
+                r.resolve_cell_key(None, &cell)
+            })
+            .collect();
+        let each = BYTE_CAP / keys.len() + 1;
+        for &key in &keys {
+            inflate(&mut r, key, each);
+        }
+        assert_accounted(&r);
+        assert!(r.glyph_bytes > BYTE_CAP, "the screen passes the budget");
+
+        // Frame 2: only the cursor moves, along the empty bottom row.
+        term.process(b"\x1b[3;5H");
+        let input = term.cell_frame(3, 8);
+        let _ = r.render_input_cached(&mut wc, &input);
+        // Frame 3: a full repaint. Its boundary must not have trimmed the
+        // screen's glyphs to frame 2's reads: they are the inflated rasters
+        // still, not fresh ones.
+        wc.invalidate();
+        let _ = r.render_input_cached(&mut wc, &input);
+        for (ch, key) in text.chars().zip(&keys) {
+            assert_eq!(
+                r.glyphs.get(key).map(|g| g.img.byte_len()),
+                Some(each),
+                "{ch:?}, read by the full repaint before a cursor-only frame, \
+                 was evicted and re-rasterized"
+            );
+        }
+        assert_accounted(&r);
     }
 
     /// **THE GLYPH CACHE'S BYTE TOTAL IS THE CACHE'S OWN.** An entry is

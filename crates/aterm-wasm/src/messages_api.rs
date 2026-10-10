@@ -162,8 +162,10 @@ pub(crate) fn pct_encode(s: &str) -> String {
             out.push(b as char);
         } else {
             out.push('%');
-            out.push(HEX[usize::from(b >> 4)] as char);
-            out.push(HEX[usize::from(b & 0x0f)] as char);
+            // `as usize`, not `usize::from`: the verifier sees through a cast
+            // but not a trait call, so only this way is `< 16` a proof.
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
         }
     }
     out
@@ -183,6 +185,26 @@ fn whole(n: f64) -> u64 {
     } else {
         0
     }
+}
+
+/// The band row that frame pixel row `y` falls in: rows of `cell_h` px (zero
+/// reads as one) stack from `grid_top`, and `None` is above them. Free of
+/// floats (the caller converts), because the verifier models no function that
+/// holds an `f64`: here it proves the subtraction (the guard runs first); the
+/// divisor is never zero but this seal certifies no division-by-zero proof.
+fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
+    if y < grid_top {
+        return None;
+    }
+    let cell_h = if cell_h == 0 { 1 } else { cell_h };
+    Some((y - grid_top) / cell_h)
+}
+
+/// The tick's reply ([`AtermTerminal::messages_tick`]): bit 0, the band
+/// changed; bit 1, its row count did. A function of its own because the
+/// verifier cannot model the tick's body, so only here is the shift proved.
+fn tick_bits(changed: bool, rows_moved: bool) -> u32 {
+    u32::from(changed || rows_moved) | (u32::from(rows_moved) << 1)
 }
 
 /// The band's host metrics a lib hands this module: one cell's width and
@@ -215,6 +237,11 @@ pub(crate) struct WebBand {
     details: bool,
     /// The chip the pointer lights, `None` off the band.
     hover: Option<Hover>,
+    /// The frame pixel the page's pointer was last on
+    /// ([`AtermTerminal::band_hover`]), `None` before any: the lit chip is
+    /// resolved again from it whenever the band's layout changes under a
+    /// still pointer (ruling 441 (f)).
+    pointer: Option<(f64, f64)>,
     /// CSS `forced-colors`' five system colours while the page is forced.
     forced: Option<ForcedPalette>,
     /// The page theme's background, foreground and cursor.
@@ -275,6 +302,7 @@ impl WebBand {
             visible: true,
             details: false,
             hover: None,
+            pointer: None,
             forced: None,
             theme,
             ansi,
@@ -487,7 +515,7 @@ impl WebBand {
         if !(x >= 0.0 && y >= 0.0) {
             return None;
         }
-        let row = (y as usize).checked_sub(m.grid_top)? / m.cell_h.max(1);
+        let row = band_row(y as usize, m.grid_top, m.cell_h)?;
         (row < self.committed()).then(|| {
             (
                 row,
@@ -684,7 +712,9 @@ impl page::Host for WebDesk {
 /// a day or more either way) reads as UTC.
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
-        -((timezone_offset_min * 60.0).round() as i64)
+        // The sign flips in the float (exact, and `round` is symmetric), so
+        // no integer negation is left that could overflow.
+        (timezone_offset_min * -60.0).round() as i64
     } else {
         0
     }
@@ -854,11 +884,14 @@ impl AtermTerminal {
         band.journal_push(lines);
         let rows_moved = committed.regrid.is_some();
         let m = self.band_metrics();
-        let changed = self.band.prepare(self.cols, m.cell_w, m.pad);
+        let mut changed = self.band.prepare(self.cols, m.cell_w, m.pad);
+        if self.settle_band_hover() {
+            changed |= self.band.prepare(self.cols, m.cell_w, m.pad);
+        }
         if changed || rows_moved {
             self.note_band_change(rows_moved);
         }
-        u32::from(changed || rows_moved) | (u32::from(rows_moved) << 1)
+        tick_bits(changed, rows_moved)
     }
 
     /// [`Self::messages_next_wake_ms`] at `now`.
@@ -875,7 +908,11 @@ impl AtermTerminal {
     fn band_redraw_at(&mut self, now: Instant) {
         self.band.now = now;
         let m = self.band_metrics();
-        if self.band.prepare(self.cols, m.cell_w, m.pad) {
+        let mut changed = self.band.prepare(self.cols, m.cell_w, m.pad);
+        if self.settle_band_hover() {
+            changed |= self.band.prepare(self.cols, m.cell_w, m.pad);
+        }
+        if changed {
             self.note_band_change(false);
         }
     }
@@ -904,7 +941,10 @@ impl AtermTerminal {
             return;
         }
         self.band.details = available;
+        // The chips change meaning: nothing is lit until the pointer moves
+        // again (its last pixel is forgotten with the hover).
         self.band.hover = None;
+        self.band.pointer = None;
         // The view's layout is keyed by the center and the width, not the
         // links: a fresh view re-lays, and its invalidation repaints even an
         // empty band (a painted one must not keep the old links).
@@ -945,9 +985,21 @@ impl AtermTerminal {
 
     /// [`Self::band_hover`] at `now`.
     pub(crate) fn band_hover_at(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        self.band.pointer = Some((x, y));
+        let hover = self.band_hover_under(x, y);
+        if self.band.hover == hover {
+            return false;
+        }
+        self.band.hover = hover;
+        self.band_redraw_at(now);
+        true
+    }
+
+    /// The chip a pointer at frame pixel `(x, y)` lights, through the layout
+    /// the painter drew; `None` off the band and where a press does nothing.
+    fn band_hover_under(&self, x: f64, y: f64) -> Option<Hover> {
         let m = self.band_metrics();
-        let hover = self
-            .band
+        self.band
             .cell_under(x, y, self.cols, m)
             .and_then(|(row, col)| {
                 let target = self.band.hover_target(self.band.hit(row, col, self.cols))?;
@@ -955,12 +1007,26 @@ impl AtermTerminal {
                     row: u8::try_from(row).ok()?,
                     target,
                 })
-            });
+            })
+    }
+
+    /// THE LIT CHIP FOLLOWS THE LAYOUT under a still pointer (ruling 441 (f),
+    /// the web twin of rulings 417 (k) and 418 (a)): a press, a hold's fold, a
+    /// `done`, a row gone stale or a new row moves the band's chips, and the
+    /// page resolves the hover only on `pointermove`, so a Complete echo drew
+    /// the pressed row's `Details ›` as a lit, empty chip for its whole fade.
+    /// After every prepare that can move the chips, the hover is resolved
+    /// again from the pointer's last pixel; `true` when the lit chip changed
+    /// (the caller re-prepares).
+    fn settle_band_hover(&mut self) -> bool {
+        let hover = self
+            .band
+            .pointer
+            .and_then(|(x, y)| self.band_hover_under(x, y));
         if self.band.hover == hover {
             return false;
         }
         self.band.hover = hover;
-        self.band_redraw_at(now);
         true
     }
 
@@ -1048,7 +1114,12 @@ impl AtermTerminal {
         let kept = read_kept(lines);
         let mut log = MessageLog::empty();
         log.replay_all(kept.lines);
+        // The log moved from nothing to what was kept: the revision moves
+        // past the replaced center's, or a site gating on the page's `rev=`
+        // never saw the restore (rulings 388 (5), 441 (e)).
+        let replaced = self.band.center.revision();
         self.band.center = MessageCenter::new(log, now);
+        self.band.center.follow_revision(replaced);
         self.band.now = now;
         self.band.restored = true;
         format!(
@@ -1069,6 +1140,9 @@ impl AtermTerminal {
     pub(crate) fn compose_band_into_frame(&mut self) {
         let m = self.band_metrics();
         let _ = self.band.prepare(self.cols, m.cell_w, m.pad);
+        if self.settle_band_hover() {
+            let _ = self.band.prepare(self.cols, m.cell_w, m.pad);
+        }
         let at = BandFrame {
             cols: self.cols,
             cell_w: m.cell_w,
@@ -1482,9 +1556,13 @@ mod tests {
         assert_eq!(t.band_rows(), 1);
         assert_eq!(t.messages_next_wake_ms_at(t0), 5000.0);
         assert_eq!(t.messages_next_wake_ms_at(t0 + ms(1234)), 3766.0);
-        assert_eq!(t.messages_tick_at(t0 + ms(5000)) & 1, 1, "the row folds");
+        assert_eq!(t.messages_tick_at(t0 + ms(5000)), 1, "the row folds");
         // The shrink's quiet, then nothing.
-        let _ = t.messages_tick_at(t0 + ms(5000) + aterm_messages::SHRINK_QUIET);
+        assert_eq!(
+            t.messages_tick_at(t0 + ms(5000) + aterm_messages::SHRINK_QUIET),
+            3,
+            "the band changed and its row left"
+        );
         assert_eq!(t.band_rows(), 0);
         assert!(t.messages_next_wake_ms_at(t0 + ms(7000)) < 0.0);
     }
@@ -2012,6 +2090,64 @@ mod tests {
         assert_eq!(t.band_press_at(x, 400.0, t0 + ms(5)), "OK none");
     }
 
+    /// A STILL POINTER'S LIT CHIP FOLLOWS THE LAYOUT (ruling 441 (f)), under
+    /// ruling 341's "a pointer lights only where a press acts": an echo is
+    /// `Hit::Nothing` and a press there is `OK none`, so the chip the pointer
+    /// lit never stays lit on the echo a row leaves (the web twin of rulings
+    /// 417 (k) and 418 (a)). A progress row the pointer rests on ends `done …
+    /// ok` (a Complete echo): the band draws as a twin's that took the same
+    /// lines with no pointer at all. (A Details press on a plain warning
+    /// leaves no echo — only an animated row records one — so the press itself
+    /// does not reach this.)
+    #[test]
+    fn a_still_pointers_chip_never_lights_the_echo() {
+        let (mut t, t0) = clocked(12, 60);
+        let (mut twin, _) = clocked(12, 60);
+        twin.band.reset_at(t0);
+        for x in [&mut t, &mut twin] {
+            x.set_chrome(6, 0);
+            let _ = x.notice_at("progress p pct=40 Downloading assets", t0, stamp());
+            x.set_details_view_at(true, t0);
+            let _ = x.messages_tick_at(t0 + ms(2100));
+        }
+        assert_eq!(t.band_rows(), 1, "premise: revealed");
+        let (x, y) = band_px(&t, 0, 20);
+        assert!(t.band_hover_at(x, y, t0 + ms(2101)), "the body lights");
+        for b in [&mut t, &mut twin] {
+            let _ = b.messages_tick_at(t0 + ms(2101));
+            b.render();
+        }
+        assert!(t.rgba() != twin.rgba(), "control: the lit chip shows");
+        for b in [&mut t, &mut twin] {
+            let reply = b.notice_at("done p ok Downloaded assets", t0 + ms(2102), stamp());
+            assert!(reply.starts_with("OK"), "{reply}");
+        }
+        let at = t0 + ms(2200);
+        for b in [&mut t, &mut twin] {
+            let _ = b.messages_tick_at(at);
+            b.render();
+        }
+        let echo = t
+            .band
+            .view
+            .layout()
+            .and_then(|p| p.rows.first().map(|r| r.kind))
+            .expect("a laid-out row");
+        assert!(
+            matches!(echo, aterm_messages::RowKind::Echo(_)),
+            "premise: the echo is on the band: {echo:?}"
+        );
+        let differ = t.rgba() != twin.rgba();
+        let flips = t.band_hover_at(x, y, at);
+        t.render();
+        let resolved = t.rgba() == twin.rgba();
+        assert!(
+            !differ,
+            "the echo draws a lit chip the still pointer left (a fresh hover at the same \
+             pixel changes the lit state: {flips}; after it the frames agree: {resolved})"
+        );
+    }
+
     /// Without a Details view, `notice act <id> details` performs nothing AND
     /// changes nothing — nothing was shown, so nothing is marked seen — while
     /// with one it marks the row seen, as native's press does.
@@ -2526,6 +2662,151 @@ mod tests {
             "~/src/aterm",
         ] {
             assert_eq!(pct_encode(s), aterm_control::wire::pct_encode(s), "{s:?}");
+        }
+    }
+
+    /// The band row under frame pixel row `y` is `y.checked_sub(grid_top)? /
+    /// cell_h.max(1)` (the expression `band_row` replaced in `cell_under`,
+    /// guard first so the verifier proves the subtraction): `None` above the
+    /// band, a zero cell height read as one, the same quotient out to
+    /// `usize::MAX`.
+    #[test]
+    fn band_row_is_the_pixel_rows_band_row() {
+        assert_eq!(band_row(9, 10, 16), None, "above the band");
+        assert_eq!(band_row(10, 10, 16), Some(0), "the band's first pixel row");
+        assert_eq!(band_row(25, 10, 16), Some(0), "row 0's last pixel row");
+        assert_eq!(band_row(26, 10, 16), Some(1), "row 1's first pixel row");
+        assert_eq!(band_row(13, 10, 0), Some(3), "a zero height reads as one");
+        assert_eq!(band_row(usize::MAX, 0, 1), Some(usize::MAX));
+        let edges = [
+            0,
+            1,
+            2,
+            9,
+            10,
+            15,
+            16,
+            17,
+            31,
+            32,
+            1000,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for y in edges {
+            for top in edges {
+                for h in [0, 1, 2, 3, 16, 17, usize::MAX] {
+                    assert_eq!(
+                        band_row(y, top, h),
+                        y.checked_sub(top).map(|d| d / h.max(1)),
+                        "y={y} top={top} h={h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A pixel on a committed band row is that row and the geometry's column;
+    /// a pixel above the band, below its last row, negative or not a number
+    /// is `None`. At every pixel row of a two-row band and the grid under it,
+    /// with the real metrics and a zero cell height, `cell_under` answers what
+    /// its body answered before `band_row` (written out here).
+    #[test]
+    fn cell_under_is_the_band_cell_under_a_pixel() {
+        let (mut t, t0) = clocked(12, 60);
+        t.set_chrome(6, 4);
+        let _ = t.notice_at("post ci sev=warn Disk nearly full", t0, stamp());
+        let _ = t.notice_at("post ci sev=error Deploy failed", t0 + ms(40), stamp());
+        assert_eq!(t.band.committed(), 2);
+        let m = t.band_metrics();
+        assert_eq!((m.pad, m.grid_top), (6, 10), "pad 6, head 4");
+        let cell = |x: f64, y: f64| t.band.cell_under(x, y, 60, m);
+        let (top, ch) = (m.grid_top as f64, m.cell_h as f64);
+        let x3 = (m.pad + 3 * m.cell_w + m.cell_w / 2) as f64;
+        assert_eq!(cell(x3, top - 1.0), None, "the chrome above the band");
+        assert_eq!(cell(x3, top), Some((0, 3)), "the band's first pixel row");
+        assert_eq!(cell(x3, top + ch - 0.5), Some((0, 3)));
+        assert_eq!(cell(x3, top + ch), Some((1, 3)));
+        assert_eq!(cell(x3, top + 2.0 * ch - 0.5), Some((1, 3)));
+        assert_eq!(cell(x3, top + 2.0 * ch), None, "the grid under the band");
+        assert_eq!(cell(0.0, top), Some((0, 0)), "the gutter is column 0");
+        for (x, y) in [(-1.0, top), (x3, -1.0), (f64::NAN, top), (x3, f64::NAN)] {
+            assert_eq!(cell(x, y), None, "({x}, {y})");
+        }
+        let before = |x: f64, y: f64, m: BandMetrics| -> Option<(usize, usize)> {
+            if !(x >= 0.0 && y >= 0.0) {
+                return None;
+            }
+            let row = (y as usize).checked_sub(m.grid_top)? / m.cell_h.max(1);
+            (row < t.band.committed()).then(|| {
+                (
+                    row,
+                    WebBand::geometry(60, m.cell_w, m.pad).cell_at(x as usize),
+                )
+            })
+        };
+        for metrics in [m, BandMetrics { cell_h: 0, ..m }] {
+            for py in 0..m.grid_top + 3 * m.cell_h {
+                for x in [0.0, x3, x3 + 0.75, 10_000.0, -0.5] {
+                    let y = py as f64 + 0.5;
+                    assert_eq!(
+                        t.band.cell_under(x, y, 60, metrics),
+                        before(x, y, metrics),
+                        "({x}, {y}) {metrics:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tick's reply: bit 0, the band changed (a row-count change is a
+    /// change); bit 1, its row count did.
+    #[test]
+    fn the_tick_reply_is_two_bits() {
+        assert_eq!(tick_bits(false, false), 0);
+        assert_eq!(tick_bits(true, false), 1);
+        assert_eq!(tick_bits(false, true), 3);
+        assert_eq!(tick_bits(true, true), 3);
+    }
+
+    /// `getTimezoneOffset()` minutes WEST of UTC are the engine's seconds
+    /// EAST, rounded half away from zero; a day or more either way, or not a
+    /// number, is UTC. Over a sweep of the open day `utc_offset_s` is the
+    /// negated rounded product it replaced, value for value.
+    #[test]
+    fn a_page_offset_is_seconds_east_of_utc() {
+        for (west_min, east_s) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (420.0, -25_200),
+            (-120.0, 7_200),
+            (-330.0, 19_800),
+            (-345.0, 20_700),
+            (0.125, -8),
+            (-0.125, 8),
+            (1439.999, -86_400),
+            (-1439.999, 86_400),
+        ] {
+            assert_eq!(utc_offset_s(west_min), east_s, "{west_min}");
+        }
+        for junk in [
+            1440.0,
+            -1440.0,
+            1e300,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(utc_offset_s(junk), 0, "{junk}");
+        }
+        let replaced = |m: f64| -((m * 60.0).round() as i64);
+        for i in -(1440 * 8 - 1)..1440 * 8 {
+            let m = f64::from(i) / 8.0;
+            assert_eq!(utc_offset_s(m), replaced(m), "{m}");
+            let odd = m + 0.013_7;
+            if odd.abs() < 1440.0 {
+                assert_eq!(utc_offset_s(odd), replaced(odd), "{odd}");
+            }
         }
     }
 
@@ -3183,5 +3464,58 @@ mod tests {
                 .contains(" actions=Upgrade%20now"),
             "the record keeps its word"
         );
+    }
+
+    /// The `rev=` and `total=` fields of the page's head line.
+    fn page_head(page: &str) -> (String, String) {
+        let head = page.lines().nth(1).expect("the page's head line");
+        let field = |name: &str| {
+            head.split('\t')
+                .find_map(|f| f.strip_prefix(name))
+                .expect("a head field")
+                .to_string()
+        };
+        (field("rev="), field("total="))
+    }
+
+    /// A RESTORE MOVES THE PAGE'S `rev=` (ruling 441 (e)). Ruling 388 (5):
+    /// the site reads the page again after a notice or a tick, "the head's
+    /// `rev=` says whether the log moved", and `MessageCenter::revision` bumps
+    /// on every observable change. A restore that moves the log from no
+    /// records to two moves `rev=` too. Control: a post after the restore
+    /// moves it.
+    #[test]
+    fn the_restore_moves_the_pages_rev() {
+        let (mut prev, p0) = clocked(20, 80);
+        for line in [
+            "post ci Build finished",
+            "post ci sev=warn hold=100 Disk nearly full",
+        ] {
+            let reply = prev.notice_at(line, p0, stamp());
+            assert!(reply.starts_with("OK"), "{line}: {reply}");
+        }
+        let _ = prev.messages_tick_at(p0 + ms(10));
+        let kept: Vec<String> = prev
+            .messages_log_since_at(0.0)
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        let (mut t, t0) = clocked(20, 80);
+        let wall = stamp().unix_ms + 90_000;
+        let (rev0, total0) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_eq!(total0, "0", "premise: nothing yet");
+        let reply = t.messages_restore_at(&kept.join("\n"), t0 + ms(1));
+        assert!(reply.starts_with("OK records=2 "), "{reply}");
+        let _ = t.messages_tick_at(t0 + ms(2));
+        let (rev1, total1) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_eq!(total1, "2", "premise: the log moved");
+        assert_ne!(
+            rev1, rev0,
+            "the restore moved the log from 0 to 2 records and `rev=` did not move"
+        );
+        let _ = t.notice_at("post ci sev=warn Fresh warning", t0 + ms(3), stamp());
+        let (rev2, _) = page_head(&t.messages_page_at("", false, 0, wall));
+        assert_ne!(rev2, rev1, "control: a post moves it");
     }
 }

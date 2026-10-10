@@ -10,7 +10,6 @@ use super::super::*;
 
 /// Exhaustively verify the transition table has valid entries.
 ///
-/// This is a runtime equivalent of the Kani proof `transition_table_lookup_safe`.
 /// It checks all 14 × 256 = 3584 entries to ensure:
 /// - All action values are valid ActionType variants (0-15)
 /// - All next_state values are valid State variants (0-13)
@@ -26,7 +25,6 @@ fn transition_table_all_entries_valid() {
         for byte in 0..256usize {
             let transition = TRANSITIONS[state_idx][byte];
 
-            // Verify action is valid
             let action_u8 = transition.action as u8;
             assert!(
                 action_u8 <= ACTION_TYPE_MAX,
@@ -37,7 +35,6 @@ fn transition_table_all_entries_valid() {
                 ACTION_TYPE_MAX
             );
 
-            // Verify next_state is valid
             let next_state_idx = transition.next_state as usize;
             assert!(
                 next_state_idx < STATE_MAX,
@@ -48,13 +45,11 @@ fn transition_table_all_entries_valid() {
                 STATE_MAX
             );
 
-            // Count for statistics
             action_counts[action_u8 as usize] += 1;
             state_counts[next_state_idx] += 1;
         }
     }
 
-    // Verify we checked all entries
     let total_entries: usize = action_counts.iter().sum();
     assert_eq!(
         total_entries,

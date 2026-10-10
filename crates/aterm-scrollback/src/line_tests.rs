@@ -53,13 +53,12 @@ fn serialize_lines_roundtrip() {
     }
 }
 
-/// Regression (round 12): `deserialize_lines` must not retain a Vec whose
-/// capacity is driven by an untrusted, inflated `count`. A crafted block can
-/// declare a huge line count, contain one valid line, then stop — the old code
-/// reserved `count.min((len-4)/5)` slots (~16K+ `Line` structs for an ~82 KiB
-/// page) and never shrank, so when the page was cached by DiskColdTier the spare
-/// capacity was pinned but uncounted by page_byte_size (len-based), defeating
-/// cache_byte_limit. The reservation is now capped and the Vec shrunk to fit.
+/// Regression: `deserialize_lines` must not retain a Vec whose capacity is
+/// driven by an untrusted, inflated `count`. A crafted block can declare a huge
+/// line count, contain one valid line, then stop; reserving
+/// `count.min((len-4)/5)` slots (~16K+ `Line` structs for an ~82 KiB page)
+/// without shrinking pins spare capacity in DiskColdTier's cache that
+/// page_byte_size (len-based) does not count, defeating cache_byte_limit.
 #[test]
 fn deserialize_lines_bounds_capacity_for_inflated_count() {
     // A well-formed single-line block: [count=1][valid line record].
@@ -894,7 +893,7 @@ fn styled_row(text: &str) -> Line {
 /// `e` + U+0301 is 149 CELLS but 150 CHARACTERS, and the strict decoder
 /// compared the attrs RLE's character count to the cell cap, so the whole
 /// visible screen was "not canonical" and every in-session update refused.
-/// Fails on the old comparison (`cells > max_cells_per_line`).
+/// Fails on that comparison (`cells > max_cells_per_line`).
 #[test]
 fn strict_checkpoint_decoder_admits_a_full_styled_row_with_a_combining_mark() {
     let text = format!("{}e\u{301}", "a".repeat(148));
@@ -1018,9 +1017,7 @@ fn fuzz_crash_4950_line_codec_no_overflow() {
         lines.len()
     );
 
-    // Phase 2: round-trip is vacuously satisfied (empty lines).
-
-    // Phase 3: Line::deserialize on full data — version 0x31 is treated as
+    // Phase 2: Line::deserialize on full data — version 0x31 is treated as
     // non-legacy (any non-zero version uses v1+ format). Bytes 2..6 are zero
     // so content_len=0 and it parses as an empty-content line.
     let single = Line::deserialize(data);
@@ -1331,7 +1328,7 @@ fn record_is_valid_agrees_with_deserialize_on_malformed_records() {
 
 // ── Inline images in history ────────────────────────────────────────────────
 //
-// The property under test is that `Line` now HAS somewhere to keep a picture,
+// The property under test is that `Line` HAS somewhere to keep a picture,
 // and that keeping it does not lie to the memory budget. The end-to-end
 // "scroll it off, scroll back, the tiles are there" test lives in aterm-core
 // (`tests/image_survives_scrollback.rs`); these pin the storage contract.
@@ -1461,17 +1458,13 @@ fn serialization_drops_the_image_and_keeps_everything_else() {
     );
 }
 
-/// `clear_hyperlinks` DROPS THE LINKS AND NOTHING ELSE (the 2026-09-22/23
-/// update audit, plan P2-4). A self-update's producer uses it on a screen line
-/// whose record is past the wire's size bound, so the line must still read,
+/// `clear_hyperlinks` DROPS THE LINKS AND NOTHING ELSE. A self-update's
+/// producer uses it on a screen line whose record is past the wire's size
+/// bound, so the line must still read,
 /// render and wrap exactly as it did: the text, the attrs, `WRAPPED`, the
 /// underline colours and the images all stay. And the cleared line must
 /// serialize byte-for-byte like one that never had a link, because the wire
 /// only admits canonical records.
-///
-/// RED before the fix: `Line` had no way to drop only its hyperlinks (the
-/// field is private and nothing wrote it after construction), so this does
-/// not compile on the old crate.
 #[test]
 fn clearing_hyperlinks_drops_the_links_and_keeps_everything_else() {
     let red = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);

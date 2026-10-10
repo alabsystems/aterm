@@ -7,9 +7,9 @@ fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-held-{label}-"))
 }
 
-/// The row a real hold writes: the measured `tree_root` pair of claude build
-/// 2026092601 on this Windows box (the GUI log, 2026-09-27 — full 64-hex digests)
-/// and the real asset name, so the pending stub is tested at the length it prints.
+/// The row a real hold writes: a measured `tree_root` pair of claude build 2026092601
+/// (full 64-hex digests) and the real asset name, so the pending stub is tested at the
+/// length it prints.
 fn real_held_row() -> String {
     crate::state::held_failed(
         "tree_root mismatch: expected \
@@ -23,8 +23,7 @@ fn real_held_row() -> String {
 /// A HELD row (`held: last attempt failed with …; <retry>`) is quoted by `which` as
 /// the reason nothing runs — the row already names the failure and the retry — and
 /// said by the pending stub WITHOUT the "the next pass installs it" promise the
-/// `error` arm makes (41 failed passes behind that promise on one Windows box,
-/// 2026-09-14..22) and without a bump, which could only make a pass repeat the hold.
+/// `error` arm makes and without a bump, which could only make a pass repeat the hold.
 /// The cap that keeps the retry whole under a long failure is
 /// `the_held_stub_line_caps_the_failure_and_prints_the_retry_whole`'s.
 #[test]
@@ -106,9 +105,8 @@ fn the_held_stub_line_caps_the_failure_and_prints_the_retry_whole() {
 /// canonical row lands in the record (with the pass outcome naming it), no `error:`
 /// head is put on it, and the hard-failure count it contributes is 0 — so a pass
 /// that met a hold exits clean and the window waits its 6 hours instead of re-running
-/// a "failed" pass on its failure backoff, 10 minutes doubling to 2 hours (41 of
-/// those, 2026-09-14..22). `doctor` still counts the row as a problem, which is where
-/// the retry belongs.
+/// a "failed" pass on its failure backoff, 10 minutes doubling to 2 hours. `doctor`
+/// still counts the row as a problem, which is where the retry belongs.
 #[test]
 fn a_held_member_is_the_bootstrap_lanes_skip_not_its_failure() {
     let layout = temp_layout("skip");

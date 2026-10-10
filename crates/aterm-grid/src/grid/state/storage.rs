@@ -4,7 +4,6 @@
 
 //! Storage- and history-oriented `Grid` state.
 
-use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 
 use aterm_scrollback::ScrollbackStorage;
@@ -12,6 +11,7 @@ use aterm_scrollback::ScrollbackStorage;
 use super::super::GenerationTracker;
 use super::super::LineSize;
 use super::super::ScrolledRowExtras;
+use super::super::ring_extras::RingExtras;
 use super::super::scroll_convert::LazyBuffer;
 use super::super::{CellCoord, CellExtra};
 use super::super::{HorizontalMargins, PageStore, Row, ScrollRegion};
@@ -199,8 +199,10 @@ pub struct GridStorage {
     /// Indexed by ring buffer scrollback position, oldest first.
     ///
     /// `Option<Box<>>` avoids 120 bytes of empty Vec headers per plain-text
-    /// row: `None` = no overflow data (common, 8 bytes).
-    pub ring_extras: VecDeque<Option<Box<ScrolledRowExtras>>>,
+    /// row: `None` = no overflow data (common, 8 bytes). The container keeps
+    /// running sums of what the boxes retain, for `Grid::memory_used` and the
+    /// history link budget (`grid::ring_extras`).
+    pub(crate) ring_extras: RingExtras,
     /// The alt-screen resize undo: what the last rows-only shrink(s) of a grid
     /// that keeps no history took off the screen, for a grow back with nothing
     /// drawn in between to hand back exactly (`grid::resize_undo`). `None`
@@ -303,49 +305,6 @@ impl GridStorage {
             // SAFETY: every row in GridStorage is allocated by its own pages;
             // drain transfers ownership and removes all access through rows.
             unsafe { row.recycle(&mut self.pages) };
-        }
-    }
-
-    #[cfg(kani)]
-    pub(crate) fn kani_stub(
-        pages: PageStore,
-        rows: Vec<Row>,
-        visible_rows: u16,
-        cols: u16,
-        max_scrollback: usize,
-    ) -> Self {
-        Self {
-            pages,
-            rows,
-            visible_rows,
-            cols,
-            max_scrollback,
-            total_lines: visible_rows as usize,
-            display_offset: 0,
-            ring_head: 0,
-            scrollback: None,
-            lazy_buffer: LazyBuffer::new(),
-            scrollback_detached_for_reflow: false,
-            pending_scrollback_settings: None,
-            pending_fill_target: None,
-            detached_reader_aim: None,
-            compress_offload_active: false,
-            flood_truncated_lines: 0,
-            ring_byte_watermark: None,
-            scrollback_clear_gen: 0,
-            history_renumber_epoch: 0,
-            history_reveal_gen: 0,
-            ring_extras: VecDeque::new(),
-            resize_undo: None,
-            generations: GenerationTracker::new(),
-            absolute_row_counter: u64::from(visible_rows),
-            // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
-            content_gen: 1,
-            reader_live_bottom_gen: 0,
-            wrap_serial: 0,
-            any_double_width: false,
-            has_horizontal_margins: false,
-            cursor_state: GridCursorState::kani_stub(visible_rows, cols),
         }
     }
 
@@ -514,11 +473,7 @@ impl GridStorage {
     /// Push extracted extras into ring_extras, boxing non-empty entries.
     #[inline]
     pub(crate) fn push_ring_extras(&mut self, extracted: ScrolledRowExtras) {
-        self.ring_extras.push_back(if extracted.is_empty() {
-            None
-        } else {
-            Some(Box::new(extracted))
-        });
+        self.ring_extras.push_extracted(extracted);
     }
 
     #[must_use]
@@ -820,19 +775,12 @@ impl GridStorage {
         let col = self.clamp_col_for_row(row, self.cursor.col);
         self.set_cursor_position(row, col);
 
-        if self.saved_cursor.valid {
-            self.saved_cursor.cursor.row =
-                self.saved_cursor.cursor.row.min(new_rows.saturating_sub(1));
-            let saved_row = self.saved_cursor.cursor.row;
-            self.saved_cursor.cursor.col =
-                self.clamp_col_for_row(saved_row, self.saved_cursor.cursor.col);
-            // Clear stale pending_wrap — the saved cursor may no longer be at the
-            // right margin after resize, making the deferred wrap invalid.
-            let max_col = self.max_col_for_row(saved_row);
-            if self.saved_cursor.cursor.col < max_col {
-                self.saved_cursor.pending_wrap = false;
-            }
-        }
+        // The saved cursor is not clamped here. It names a cell by absolute
+        // coordinates: the resize moves it only with its text (the reveal,
+        // the demote, the rewrap, the lift and the fill), and DECRC and the
+        // 1049 exit clamp what they read, as xterm's `CursorRestore` does. A
+        // slot on a row a shrink trimmed stays past the grid, so a grow back
+        // restores it onto that row (`Grid::lend_saved_cursor`).
 
         self.reset_scroll_region();
         self.reset_horizontal_margins();
@@ -1149,9 +1097,6 @@ mod tests {
     /// slices exactly as it was and allocates nothing from the page store. The
     /// swap chain is a PERMUTATION of `Row` structs: no slice is lost,
     /// duplicated (two rows aliasing one arena slice) or freshly allocated.
-    ///
-    /// The all-sizes lemma is the Kani pair in `grid/proofs_kani_scroll.rs`
-    /// (`shift_visible_rows_{up,down}_permutes_row_slices`), for trust-mc.
     #[test]
     fn shift_visible_rows_permutes_row_slices_and_allocates_nothing_at_capacity() {
         const ROWS: u16 = 6;
@@ -1238,7 +1183,8 @@ mod tests {
         g.storage.push_ring_extras(extras);
         assert_eq!(g.storage.ring_extras.len(), 1);
         // Empty extras stored as None (optimization)
-        assert!(g.storage.ring_extras[0].is_none());
+        assert!(g.storage.ring_extras.get(0).is_none());
+        g.storage.ring_extras.assert_running_sums();
     }
 
     // =========================================================================
@@ -1310,15 +1256,18 @@ mod tests {
         assert_eq!(g.storage.tab_stops.len(), len_before);
     }
 
+    /// The saved cursor stays where it was saved; DECRC clamps what it reads
+    /// (`Grid::restore_cursor`).
     #[test]
-    fn resize_viewport_clamps_saved_cursor() {
+    fn resize_viewport_leaves_the_saved_cursor_to_its_reader() {
         let mut g = make_storage(24, 80);
         g.storage.set_cursor_position(20, 70);
         g.storage.save_cursor();
         g.storage.resize_viewport_state(10, 40);
         let saved = g.storage.saved_cursor();
-        assert!(saved.cursor.row < 10);
-        assert!(saved.cursor.col < 40);
+        assert_eq!((saved.cursor.row, saved.cursor.col), (20, 70));
+        g.restore_cursor();
+        assert_eq!((g.cursor_row(), g.cursor_col()), (9, 39));
     }
 
     // =========================================================================

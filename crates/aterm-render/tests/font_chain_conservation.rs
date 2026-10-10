@@ -6,13 +6,11 @@
 //! COMPLETE input space, plus a prove-and-catch mutant and a real-renderer
 //! binding.
 //!
-//! ## Two tiers, one property set
+//! ## The complete input space
 //!
-//! * **Tier-1 (concrete, this file)** — the chain's inputs are 8 coverage bits ×
-//!   2 lazy-parse bits × 4 policy bools = 16384 cases. That is not a sample: it is
-//!   the entire domain, so this is a complete proof of P1–P4 for the real policy.
-//! * **Tier-2 (symbolic, trust-mc)** — `aterm_render::font_chain::kani_proofs`,
-//!   discharged by `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`.
+//! The chain's inputs are 8 coverage bits × 2 lazy-parse bits × 4 policy bools
+//! = 16384 cases. That is not a sample: it is the entire domain, so this is a
+//! complete check of P1–P4 for the real policy.
 //!
 //! The real-renderer section at the bottom binds the policy to actual ink, which
 //! no pure proof can do: a key that NAMES a face still has to rasterize.

@@ -3,6 +3,11 @@
 
 //! SHA-256, transcribed from FIPS 180-4 section 6.2: the reference algorithm,
 //! checkable line by line against the standard.
+//!
+//! THE ONE SHA-256 IN THE TREE: `aterm-verify`, which takes no dependencies,
+//! compiles this file by path (as it does atpkg's toolchain resolution), so the key
+//! a MEASURE receipt is filed under and the digest the release cutter signs the
+//! same bytes under are one function. It names nothing outside itself.
 
 /// The SHA-256 block size, in bytes (FIPS 180-4 sec. 1: 512 bits).
 pub(crate) const BLOCK_LEN: usize = 64;
@@ -52,18 +57,10 @@ const K: [u32; 64] = [
 /// A streaming SHA-256 hasher.
 ///
 /// [`finalize`](Sha256::finalize) returns a plain `[u8; 32]`; it derefs to
-/// `&[u8]` and converts with the identity `From`.
-///
-/// # Example
-///
-/// ```rust
-/// use aterm_digest::Sha256;
-///
-/// let mut h = Sha256::new();
-/// h.update(b"hello ");
-/// h.update(b"world");
-/// assert_eq!(h.finalize(), Sha256::digest(b"hello world"));
-/// ```
+/// `&[u8]` and converts with the identity `From`. Fed in pieces or whole, it
+/// answers the same digest (the crate docs show both; the tests below hold it at
+/// every padding boundary). No example here: this file names nothing outside
+/// itself, so it compiles into `aterm-verify` too.
 #[derive(Clone)]
 pub struct Sha256 {
     /// Working hash value H^(i).
@@ -245,7 +242,13 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hex;
+
+    /// Lowercase hex, here rather than the crate's: this file is the one SHA-256 in
+    /// the tree, and `aterm-verify` (which takes no dependencies) compiles it by path,
+    /// so its tests name nothing outside it.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     // -----------------------------------------------------------------------
     // FIPS 180-4 / NIST published vectors

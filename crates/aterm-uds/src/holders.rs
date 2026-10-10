@@ -701,12 +701,14 @@ mod tests {
     }
 
     /// A `sleep` whose stdin is `/dev/null`, once the kernel shows it holding
-    /// the device; and that device's rdev.
-    fn a_holder_of_dev_null() -> (std::process::Child, u64) {
+    /// the device; and that device's rdev. `spawnfd`'s: it holds its stdio and
+    /// nothing else of this process, not another test thread's pipe for as
+    /// long as it lives.
+    fn a_holder_of_dev_null() -> (crate::spawnfd::Child, u64) {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
-        let child = std::process::Command::new("/bin/sleep")
+        let child = crate::spawnfd::command("/bin/sleep")
             .arg("600")
-            .stdin(std::process::Stdio::null())
+            .stdin(crate::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn");
         let started = Instant::now();
@@ -789,9 +791,9 @@ mod tests {
     fn the_scan_finds_a_child_holding_a_character_device() {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
         assert_ne!(rdev, 0, "/dev/null is a character device");
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("600")
-            .stdin(std::process::Stdio::null())
+            .stdin(crate::spawnfd::Stdio::null())
             .spawn()
             .expect("spawn");
         // The child's stdin is /dev/null from its first instruction; wait for

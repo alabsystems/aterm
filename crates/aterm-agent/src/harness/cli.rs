@@ -7,28 +7,11 @@
 //! the roster of Claude Code accounts and its report
 //! (`docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8).
 //!
-//! This is a reader. The supervisor that acts (presses a proven-safe
-//! approval, continues a turn, switches a model at a bucket limit, escalates)
-//! is the one engine in [`crate::supervise`], hosted by the window and
-//! started by `aterm drive watch|supervise`. The verbs `status`, `mark`,
-//! `enable`, `disable`, `align`, `caps`, `accounts`, `liveness`, `recover`,
-//! `nudge`, `switch`, `watch` and `config` are refused by name ([`DELETED`])
-//! with where the capability went.
-//!
 //! A reader. The supervisor that ACTS — presses a proven-safe approval,
 //! continues a turn, switches a model at a bucket limit, escalates — is the
 //! one engine in [`crate::supervise`], hosted by the window and started by
-//! `aterm drive watch|supervise`. On 2026-09-23 the second stack that used to
-//! live beside this file (`harness watch` and its wire, mark, observer, ring
-//! ledger, profiles, account rotation, alignment verdict and config table)
-//! was deleted: in its whole life none of its acts landed (design §0.4
-//! lists the five measured reasons), and it duplicated the engine. The
-//! verbs `status`, `mark`, `enable`, `disable`, `align`, `caps`, `liveness`,
-//! `recover`, `nudge`, `switch`, `watch` and `config` went with it; each is
-//! refused by name ([`DELETED`]) with where the capability went. (`accounts`
-//! went with it too and is back since 2026-10-01 as another thing: the old
-//! one discovered Claude homes and rotated nothing; this one keeps the roster
-//! the owner writes.)
+//! `aterm drive watch|supervise`. The verbs of the deleted second stack are
+//! refused by name ([`DELETED`]) with where the capability went.
 //!
 //! * `usage` folds THIS session's transcripts — the one Claude Code names in
 //!   the environment it gives its tools (`CLAUDE_CODE_SESSION_ID`, else
@@ -136,12 +119,10 @@ pub const HARNESS: &str = "claude-harness";
 pub const RETIRED: &str =
     "aterm installs nothing into an agent; a starting window removes what an older build installed";
 
-/// The verbs deleted with the second harness stack on 2026-09-23. They are
-/// named in the refusal so a script that still calls one learns where the
-/// capability went rather than reading a bare "unknown subcommand".
-/// `accounts` was one of them until 2026-10-01, when the verb came back as
-/// the roster and its report ([`AccountsCmd`]); `switch` stays refused — no
-/// verb moves a session by hand.
+/// The verbs deleted with the second harness stack. They are named in the
+/// refusal so a script that still calls one learns where the capability went
+/// rather than reading a bare "unknown subcommand". `switch` stays refused:
+/// no verb moves a session by hand.
 pub const DELETED: &[&str] = &[
     "status", "mark", "enable", "disable", "align", "caps", "liveness", "recover", "nudge",
     "switch", "watch", "config",
@@ -298,8 +279,8 @@ removal is off (`disk.apply`, `disk.auto_free_gib`, `disk.dead_build_dirs`) for 
 and for the window's automatic cleanup until it is fixed; this verb says why on stderr.
 Build directories are the ones you NAME on the line; named none, it SEARCHES for them,
 as the window's automatic cleanup does: this working directory and its worktree,
-$HOME's checkouts and their git worktrees two levels down (a `target -> target.noindex`
-link resolved), x.py's bootstrap build directories (`build/<host>/stage<N>-<kind>`, never
+the checkouts in $HOME and in ~/Developer and their git worktrees two levels down (a
+`target -> target.noindex` link resolved), x.py's bootstrap build directories (`build/<host>/stage<N>-<kind>`, never
 a sysroot, stage0 or llvm), Claude Code's temp root (each session's scratchpad) and the cells
 cache — on this working directory's volume only, never into a mount point or (macOS)
 ~/Desktop, ~/Documents or ~/Downloads. Under the rows it lists the largest build
@@ -1177,10 +1158,9 @@ pub enum Cmd {
         /// The JSON form (the rows verbatim, one object per line).
         json: bool,
     },
-    /// Upgrade live Claude Code sessions in place, cooperatively: announce,
-    /// wait for the agent's READY and for its background work to finish, then
-    /// end it with SIGTERM and resume the same conversation on the newer build
-    /// in the same tab ([`super::upgrade_drive`]).
+    /// Move live Claude Code and Codex sessions onto the newer build in
+    /// place, resuming the same conversation in the same tab
+    /// ([`super::upgrade_drive`], [`super::upgrade_codex`]).
     Upgrade {
         /// Only this tab (`s-<hex>`); empty means every session.
         sid: String,
@@ -1532,8 +1512,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             Cmd::Accounts(form)
         }
         deleted if DELETED.contains(&deleted) => {
-            // `config` was also where main's live upgrade kept its switch
-            // (`cap.upgrade.enabled`) until the two met: say where it went.
+            // `config` once held the live upgrade's switch: say where it went.
             let upgrade = if deleted == "config" {
                 " (the live upgrade's switch is `upgrade` in that table)"
             } else {
@@ -1839,8 +1818,7 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
         view.accounts.push(account);
     }
     if json {
-        // Schema 1, keys added only: `transcript_pick` gains `session-id`,
-        // `claude-pid` and `none`; `complete` and the subagent counts are new.
+        // Schema 1: keys are only ever added, never changed.
         let mut extra = Vec::new();
         if let Some((session, _, _)) = &folded {
             extra.push((
@@ -2186,8 +2164,8 @@ fn default_store_dir(home: &Path) -> PathBuf {
 /// Where `disk` looks. Every path is derived HERE and handed to
 /// [`disk::scan`], which reads no environment of its own. With no build
 /// directory named on the line it SEARCHES ([`disk::discover::discover`]):
-/// this working directory and its worktree, `$HOME`'s checkouts and their
-/// worktrees, Claude Code's temp root and the cells cache.
+/// this working directory and its worktree, the checkouts in `$HOME` and in
+/// `~/Developer` and their worktrees, Claude Code's temp root and the cells cache.
 fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
     let home = env.home.clone();
     // Who may hold a session: the running Claude Codes
@@ -2634,7 +2612,7 @@ pub struct DiskLook<'a> {
     pub targets: &'a [PathBuf],
     /// Where to SEARCH for build directories below the floor
     /// ([`disk::discover::discover`]): the agents' working directories and
-    /// their worktrees, `$HOME`'s checkouts, the agents' `CARGO_TARGET_DIR`,
+    /// their worktrees, `$HOME`'s and `~/Developer`'s checkouts, the agents' `CARGO_TARGET_DIR`,
     /// Claude Code's temp root, the cells cache. Searched only below the
     /// floor, and only what is on [`Self::volume`]'s volume is surveyed.
     pub discover: Option<&'a disk::discover::Roots>,
@@ -3370,13 +3348,12 @@ fn upgrade_opts(
 /// --now|--defer|--skip` ([`OwnerAsk`]): the recorded upgrades read, or the
 /// owner's word written ([`super::upgrade_drive::ask`]). Nothing is swept,
 /// typed or signalled. A word the busy lock kept out exits 75, like a step
-/// that could not run; any other refusal exits 1. With either switch the
-/// window's host reads off (the one `[harness]` reader,
-/// [`SupervisorConfig::from_path`]) the word is still written (it is the
-/// owner's) and stderr says what it waits on: `[harness] enabled` off,
-/// nothing moves until it is back on; `[harness] upgrade` off, the window
-/// takes no upgrade step, so the word takes effect at the next hand-run
-/// `aterm harness upgrade <sid>` or once the switch is back on.
+/// that could not run; any other refusal exits 1. With `[harness] enabled`
+/// or `upgrade` off the word is still written (it is the owner's) and stderr
+/// says what it waits on: with `enabled` off nothing moves until it is back
+/// on; with `upgrade` off the window takes no upgrade step, so the word takes
+/// effect at the next hand-run `aterm harness upgrade <sid>` or once the
+/// switch is back on.
 fn run_upgrade_owner(
     env: &Env,
     sid: &str,
@@ -3526,25 +3503,17 @@ fn run_upgrade_owner(
 /// One pass of `upgrade`: the master switch, then the sweep, every report
 /// printed, and the exit code it owes for it.
 ///
-/// The master switch gates a hand-run sweep. With aterm.toml's `[harness]
-/// enabled` reading off ([`crate::supervise::SupervisorConfig::from_path`],
-/// the reader the window's host reads the same table with) the pass answers
-/// one [`UPGRADE_BYPASSED`] line, takes no lock, types and signals nothing,
-/// and exits 1; the window's host stands down on the same switch. `[harness]
-/// upgrade` does not gate it: naming the verb is that consent; it is the
-/// window's own switch. A `--dry-run` acts on nothing, so it still sweeps and
-/// prints (after the refusal line, with a sentence on stderr saying a real
-/// run would act on none of it) and exits 0. The stderr sentence also names
-/// every restart an earlier sweep left in flight ([`stranded`]), because
-/// standing down strands it, and every note the reader has about the file.
+/// With `[harness] enabled` off ([`SupervisorConfig::from_path`], the
+/// window's host's reader) the pass answers one [`UPGRADE_BYPASSED`] line,
+/// takes no lock, types and signals nothing, and exits 1; stderr names every
+/// restart an earlier sweep left in flight ([`stranded`]) and the reader's
+/// notes. `[harness] upgrade` does not gate it: naming the verb is consent.
+/// A `--dry-run` acts on nothing, so it still sweeps, prints and exits 0.
 ///
-/// A sweep that did not run is not a success: it decided nothing.
-/// `busy:another-sweep` (another actor holds the lock, most often the
-/// window's own host at a session's step) exits 75, atpkg's "try again
-/// later" code for a single-writer lock held by a sibling
-/// ([`atpkg::lock::CONTENDED_EXIT`]), so a script retries by code.
-/// `busy:state-unwritable` and `busy:lock-unopenable` exit 1: a state
-/// directory that cannot hold a lock is not transient.
+/// A sweep that did not run decided nothing: `busy:another-sweep` exits 75
+/// ([`atpkg::lock::CONTENDED_EXIT`], "try again later"), so a script
+/// retries by code; `busy:state-unwritable` and `busy:lock-unopenable` exit
+/// 1, since a state directory that cannot hold a lock is not transient.
 fn upgrade_pass(
     env: &Env,
     opts: &super::upgrade_drive::Opts,
@@ -3699,17 +3668,13 @@ fn upgrade_line_with(
 // accounts
 // ---------------------------------------------------------------------------
 
-/// What `accounts use` says once the owner's word is recorded — EXACTLY
-/// this. The pin is in the state file, and a window's supervisor reads it at
-/// each hosted Claude Code session's turn end (aterm-gui's `harness_host`,
-/// `accounts::advise` rule 2): the session is relaunched under the pinned
-/// account there — and a session that WAITS AT THIS ACCOUNT'S OWN LIMIT,
-/// the one this word just cleared, is continued where it is
-/// (`accounts::Advice::Resume`: the limit's own continuation, typed once a
-/// clearing). It says WHO moves the sessions and when, and claims no move
-/// this command made: it made none, a session with no supervisor (or under
-/// `[harness] accounts = "off"`) follows nothing, and no move has been
-/// observed with two real accounts.
+/// What `accounts use` says once the owner's word is recorded. A window's
+/// supervisor reads the pin at each hosted session's turn end
+/// (`accounts::advise` rule 2) and relaunches it under the pinned account; a
+/// session waiting at this account's own limit is continued where it is
+/// (`accounts::Advice::Resume`). The line claims no move: this command makes
+/// none, and a session with no supervisor (or under `[harness] accounts =
+/// "off"`) follows nothing.
 pub const ACCOUNTS_USE_RECORDED: &str = "recorded: a window's supervisor moves each Claude Code \
                                          session to it at the session's next turn end, and \
                                          continues one that waits at this account's own limit";
@@ -4241,13 +4206,9 @@ fn account_mark(state: &accounts::State, label: &str) -> Option<&'static str> {
 }
 
 /// The `accounts` report as text (design §8): the header, one row per
-/// account, `next:` with every non-candidate's reason, and the line that
-/// says what acts on this state. No usage figure is shown (the JSON keeps
-/// them, and their `null`s). THE LIMIT-RESET OFFER is shown where one is on
-/// record — `offer: N left`, with `use by <time>` where its deadline was
-/// read — and a row with none is the row it was before offers were read:
-/// one is recorded only by a window that runs with `[harness] limit_reset`
-/// on, from a confirmation read exactly or a reset used.
+/// account, `next:` with every non-candidate's reason, and
+/// [`ACCOUNTS_ROTATION`]. No usage figure is shown (the JSON keeps them). A
+/// limit-reset offer on record shows as `offer: N left[, use by <time>]`.
 fn accounts_text(
     path: &Path,
     roster: &Roster,
@@ -4385,20 +4346,11 @@ fn accounts_refused_json(path: &Path, why: &str, now: i64) -> String {
 ///
 /// An unknown is `null`, never `0`; every instant is Unix seconds with its
 /// UTC form beside it as `<key>_rfc3339`; `dir` is absent for the row that
-/// names none (this machine's own login). `rotation` says what acts on this
-/// state in this build ([`ACCOUNTS_ROTATION`], as six facts): a window's
-/// supervisor follows the pin (`follows_use`), moves a session at a usage
-/// limit (`at_limit`) and, under `[harness] accounts = "early"`, ahead of
-/// one (`ahead_of_limit`), on samples its usage probe takes (`probe`: so
-/// `session_pct` and `week_pct` are `null` only for an account no settled
-/// panel was read for — as where the window is too short to show the panel
-/// whole when it is read); a limit reset is built (`limit_reset: true`), and
-/// taken only by a window that runs with `[harness] limit_reset = true`,
-/// which ships off — so `offer` is `null` for an account no confirmation and
-/// no used reset was read for; and `observed: false` — none of it has run
-/// against two real accounts, and no reset against a real wall. The facts
-/// are the BUILD's: this command does not read which mode a window runs
-/// under, nor that key.
+/// names none (this machine's own login). `rotation` is
+/// [`ACCOUNTS_ROTATION`] as six facts about the BUILD: this command does not
+/// read which mode a window runs under. `session_pct`/`week_pct` are `null`
+/// for an account no settled `/usage` panel was read for, and `offer` for one
+/// no reset confirmation was read for.
 fn accounts_json(
     path: &Path,
     roster: &Roster,
@@ -4540,12 +4492,11 @@ fn accounts_json(
     aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
 }
 
-/// `aterm harness accounts [--json]`: the report. READS the roster, the state
-/// file and the first entry of each row's login directory
-/// ([`accounts::enrolled`]); writes nothing and
+/// `aterm harness accounts [--json]`: the report. Reads the roster, the state
+/// file and each login directory ([`accounts::enrolled`]); writes nothing and
 /// takes no lock (the state file is replaced by a rename, so a read sees one
-/// whole file). A roster that does not admit is the refusal and exit 1 — and,
-/// under `--json`, a document whose `refused` says why.
+/// whole file). A roster that does not admit is exit 1 — under `--json`, a
+/// document whose `refused` says why.
 fn run_accounts_report(
     env: &Env,
     json: bool,
@@ -4609,17 +4560,13 @@ fn run_accounts_report(
 /// on would be outside the roster, and a session whose login no row names is
 /// never advised to move.
 ///
-/// The roster is read, appended to and replaced (a sibling temp file, then a
-/// rename) under the store's lock, so two `add`s do not lose a row; the text
-/// written is one [`accounts::append_rows`] already re-read, so nothing is
-/// written that the next read refuses. A roster that is a symlink is written
-/// THROUGH the link (the link stays, its target gets the row and keeps the
-/// mode it had). Every refusal is exit 1, by name, with the roster untouched:
-/// a label outside the grammar, one already listed, a roster that does not
-/// admit, one that admits but defines `account` inline (the refusal carries
-/// every row to add by hand: on a roster with no rows, `account = []`, this
-/// machine's own login and the one asked for), a state directory that is not
-/// absolute (the `dir` would be relative).
+/// The roster is read, appended to and replaced (temp file, then rename)
+/// under the store's lock, so two `add`s do not lose a row; the text written
+/// is one [`accounts::append_rows`] already re-read, so the next read cannot
+/// refuse it. A symlinked roster is written THROUGH the link. Every refusal
+/// is exit 1 with the roster untouched: a bad or already-listed label, a
+/// roster that does not admit or defines `account` inline (the refusal
+/// carries the rows to add by hand), a state directory that is not absolute.
 fn run_accounts_add(
     env: &Env,
     label: &str,
@@ -4856,19 +4803,14 @@ fn record_answers(
 ///
 /// A FLOW THAT FAILS CAN STILL LEAVE FILES IN THE DIRECTORY, and files are
 /// what enrol a row ([`accounts::login_made`]). MEASURED on 2.1.287: `claude
-/// auth status --json` with an empty directory as its home
-/// ([`accounts::HOME_ENV`]) exited 1 and left `.claude.json` (start-up keys
-/// only: `firstStartTime`, `machineID`, migration flags), its lock and
-/// `backups/` there; `auth login` is a subcommand of that same program, so
-/// its start writes them too. So a flow that exits non-zero — denied, timed
-/// out, or ended by the terminal's Ctrl-C, which this process stands aside
-/// from ([`login_flow_of`]) — is said, exit 1, and when its row's directory
-/// now holds an entry, that login is asked and its answer recorded as after
-/// a flow that exited 0: one bounded `auth status`, no browser, and the row
-/// reads `signed-out` rather than `unseen`. A failed flow on the row with no
-/// `dir` asks nothing: that row is enrolled whatever a flow did. An answer
-/// that records nothing (the login could not be asked, or the flow left no
-/// login in its directory) is said on stderr with what to run.
+/// auth status --json` in an empty home ([`accounts::HOME_ENV`]) exited 1
+/// and left `.claude.json` (start-up keys only), its lock and `backups/`;
+/// `auth login` starts the same way. So a flow that exits non-zero (denied,
+/// timed out, Ctrl-C) is said, exit 1, and when its row's directory now holds
+/// an entry that login is asked and recorded anyway, so the row reads
+/// `signed-out` rather than `unseen`. A failed flow on the row with no `dir`
+/// asks nothing: that row is enrolled whatever a flow did. An answer that
+/// records nothing is said on stderr with what to run.
 ///
 /// With stdin not a terminal the line is printed, nothing is run and the
 /// exit is 0. Where no login can be asked at all ([`AccountsHost::unaskable`])
@@ -4906,9 +4848,8 @@ fn run_accounts_login(
     if !host.stdin_is_terminal() {
         let _ = writeln!(
             err,
-            "aterm harness accounts login: not run: stdin is not a terminal, and the flow opens \
-             a browser and waits for you. Run `aterm harness accounts login {label}` in a \
-             terminal: it runs that line for this account, then records whether it is signed in"
+            "aterm harness accounts login: not run: stdin is not a terminal (the flow opens a \
+             browser and waits). Run `aterm harness accounts login {label}` in a terminal"
         );
         return ExitCode::SUCCESS;
     }
@@ -4931,8 +4872,8 @@ fn run_accounts_login(
     }
     let _ = writeln!(
         err,
-        "aterm harness accounts login: running it; when it ends, `{label}` is asked whether it \
-         is signed in and the answer is recorded"
+        "aterm harness accounts login: running; `{label}`'s sign-in is checked and recorded when \
+         it ends"
     );
     let _ = out.flush();
     let _ = err.flush();

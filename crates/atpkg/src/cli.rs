@@ -48,7 +48,9 @@ const VERBS: &[&str] = &[
     "refresh",
     "run",
     "relocate",
+    "lineage",
     "noindex",
+    "devroot",
     "machine",
     "lease",
     "lane",
@@ -112,7 +114,22 @@ const VERB_USAGE: &[(&str, &str)] = &[
     ("run", "aterm pkg run <tool> [args…]"),
     (
         "relocate",
-        "aterm pkg relocate <stage-root> [--sign <identity>] [--advisory]",
+        "aterm pkg relocate <stage-root> [--sign <identity>] [--advisory] \
+         [--donor-root <toolchain>]… [--lineage-dormant]",
+    ),
+    (
+        "lineage",
+        "aterm pkg lineage check-compiler <bin-dir> [--lineage-dormant]  — admit a Trust \
+         compiler by CONTENT (native trustc/targo/driver, no rustup/cargo/Homebrew path, a Trust \
+         -vV, clean bytes) and LINEAGE (LINEAGE or SEED-MINT checked against its bytes); prints \
+         its record\n\
+         aterm pkg lineage scan <stage> --compiler <bin-dir> [--lineage-dormant]  — refuse a \
+         payload carrying any other compiler's evidence (a stock std path, metadata, producer or \
+         rustup path); prints the provenance record\n\
+         aterm pkg lineage seed-mint <seal> <commit>  — the seal's SEED-MINT refusals, one per \
+         line\n\
+         aterm pkg lineage stamp <stage-root> --from <bin-dir>  — write LINEAGE over a staged \
+         bundle's shipped bytes",
     ),
     (
         "repair",
@@ -121,17 +138,21 @@ const VERB_USAGE: &[(&str, &str)] = &[
     ),
     (
         "noindex",
-        "aterm pkg noindex [scan] [<root>] [--depth <n>]  — cargo target dirs Spotlight indexes\n\
-         aterm pkg noindex verify <dir>                   — whether <dir> is excluded\n\
-         aterm pkg noindex migrate <dir> [--dry-run]      — rename <dir> to the excluded form\n\
-         aterm pkg noindex apply (--all | <dir>...) [--dry-run] — migrate and repoint cargo \
-         (--all: every repo target dir under $HOME)",
+        "aterm pkg noindex verify <dir>  — measure whether Spotlight indexes <dir>",
+    ),
+    (
+        "devroot",
+        "aterm pkg devroot                          — the checkouts outside ~/Developer, and \
+         what holds each\n\
+         aterm pkg devroot move (--all | <dir>...)  — move them into ~/Developer and repair \
+         what names them\n\
+         aterm pkg devroot verify                   — measure whether Spotlight skips \
+         ~/Developer",
     ),
     (
         "machine",
         "aterm pkg machine                 — the [machine] settings, as the doctor reads them\n\
-         aterm pkg machine apply           — apply them now: Universal Control off for this host,\n\
-         \u{20}                                   cargo build output hidden from Spotlight",
+         aterm pkg machine apply           — apply them now: Universal Control off for this host",
     ),
     (
         "lease",
@@ -222,6 +243,7 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "gc",
             "repair",
             "noindex",
+            "devroot",
             "machine",
         ],
     ),
@@ -236,6 +258,7 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "verify-index",
             "verify-pkg",
             "relocate",
+            "lineage",
             "lease",
             "lane",
         ],
@@ -477,9 +500,10 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     {
         return refusal;
     }
-    // THE `[machine]` SETTINGS DO NOT RIDE THE PASS (Phase 3): their $HOME walk (up to
-    // 60,000 directories / 3 s) and `defaults` run from their own verb, `aterm pkg machine
-    // apply`, which the window and the session call on their own schedule — and here, at
+    // THE `[machine]` SETTINGS DO NOT RIDE THE PASS (Phase 3): their `defaults
+    // -currentHost` writes (the two Universal Control keys; nothing is walked or renamed)
+    // run from their own verb, `aterm pkg machine apply`, which the window and the
+    // session call on their own schedule — and here, at
     // a pass's edge, only when the `[machine]` table CHANGED since it was last applied, so
     // an edit takes effect at the next pass on every lane. Before the lock: this work
     // takes none, and a contended or refused pass must not hold it hostage.
@@ -623,13 +647,18 @@ fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
         Some("refresh") => return cmd_refresh(&args[1..]),
         Some("run") => return cmd_run(&args[1..]),
         Some("relocate") => return cmd_relocate(&args[1..]),
-        // Not a store mutator: `noindex` writes nothing under `<prefix>`, so a scan of a
-        // large home never queues behind, or blocks, an install. `args[1]` is a
-        // subcommand, so its own parser owns every `-`-leading token.
+        // Read-only and store-free, like `relocate`: the lineage checker reads a toolchain
+        // or a staged tree (and `stamp` writes one file INTO a staged tree the packer owns).
+        Some("lineage") => return cmd_lineage(&args[1..]),
+        // Not store mutators at the edge: `noindex` writes nothing under `<prefix>`, and
+        // `devroot` takes the store lock itself only for a move that re-lays a dev link, so
+        // a probe or a plan never queues behind, or blocks, an install. `args[1]` is a
+        // subcommand, so each one's own parser owns every `-`-leading token.
         Some("noindex") => return cmd_noindex(&args[1..]),
+        Some("devroot") => return cmd_devroot(&args[1..]),
         // The [machine] settings' own door, run by the window and the session on their
-        // own schedule. Writes a per-host preference, renames build output inside the
-        // user's trees and records `<prefix>/machine.applied` — no store lock.
+        // own schedule. Writes a per-host preference and records
+        // `<prefix>/machine.applied` — no store lock.
         Some("machine") => return cmd_machine(&args[1..]),
         // THE HOLDER VERB ([`crate::lease::hold_for`]): no store lock — a lease is laid
         // beside the store, never in it, and a holder must be able to lease the toolchain
@@ -1942,7 +1971,9 @@ enum SelfUpdatePlan {
     /// with no row. `atpkg run` prints the note and runs the tool as it runs every other
     /// argument list instead ([`cmd_run`]).
     Forward {
-        command: std::process::Command,
+        /// Boxed: a `Command` is far larger than every other variant's payload (a line,
+        /// a row), and how large depends on the standard library that built it.
+        command: Box<std::process::Command>,
         note: Option<String>,
     },
     /// Announce, then the standard update as a child ([`selfupdate_check`]).
@@ -1964,7 +1995,7 @@ fn selfupdate_plan(
 ) -> SelfUpdatePlan {
     use crate::selfupdate::{self, Verdict};
     let forward = |note: Option<String>| SelfUpdatePlan::Forward {
-        command: crate::landing::shim_command(layout, tool, args),
+        command: Box::new(crate::landing::shim_command(layout, tool, args)),
         note,
     };
     let Some(row) = selfupdate::row_for(tool.as_str()) else {
@@ -2130,13 +2161,36 @@ fn cmd_reroute(rest: &[String]) -> ExitCode {
 /// one: a link to a live build tree older than the store's, nobody put back, with
 /// no build running through it (`seam::live_build_tree`), recorded with the one
 /// command that puts it back (`seam::replaced_from`).
+///
+/// Every call says what it left alone on the [`FOREIGN_MARKER`] line ([`FOREIGN_SEAM`]):
+/// each foreign entry with [`crate::seam::DETACH_FIX`], or `none` — also with no rustup
+/// home, where nothing can stand there.
 fn reassert_rustup_seam(layout: &crate::store::Layout) {
-    let Some(home) = crate::seam::rustup_home() else {
-        return;
+    reassert_rustup_seam_at(layout, crate::seam::rustup_home().as_deref());
+}
+
+/// [`reassert_rustup_seam`] against the rustup home `home` (`None`: no rustup home), so
+/// what the pass says for the window is provable from a test.
+fn reassert_rustup_seam_at(layout: &crate::store::Layout, home: Option<&std::path::Path>) {
+    let foreign = match home {
+        Some(home) => {
+            let said = crate::seam::reassert_reporting(layout, home);
+            for line in &said.lines {
+                println!("atpkg: {line}");
+            }
+            said.foreign
+        }
+        None => Vec::new(),
     };
-    for line in crate::seam::reassert(layout, &home) {
-        println!("atpkg: {line}");
-    }
+    let items: Vec<ForeignItem> = foreign
+        .into_iter()
+        .map(|(name, path)| ForeignItem {
+            name,
+            path,
+            fix: crate::seam::DETACH_FIX.to_string(),
+        })
+        .collect();
+    emit_marker_line(&format!("atpkg: {}", foreign_line(FOREIGN_SEAM, &items)));
 }
 
 /// Bring the trust EXEC ROOTS and every trust shim in line ([`crate::compat::reconcile`]),
@@ -4225,21 +4279,36 @@ fn relocate_headline(report: &crate::relocate::Report) -> Option<String> {
     }
 }
 
-/// `atpkg relocate <stage-root> [--sign <id>] [--advisory]` — PRODUCER-side
-/// pack-time relocation (§10.1). Vendors machine-local shared-library deps into
-/// the staged sysroot and rewrites/deletes machine-local load commands so the
-/// eventual tarball is self-contained. Run BETWEEN staging and tar so the signed
-/// `tree_root` is computed over the RELOCATED payload. Fail-closed on any
-/// unresolved machine-local reference unless `--advisory`.
+/// `atpkg relocate <stage-root> [--sign <id>] [--advisory] [--donor-root <toolchain>]…
+/// [--lineage-dormant]` — PRODUCER-side pack-time relocation (§10.1). Vendors builder-path
+/// shared-library deps into the staged sysroot — from inside the declared donor roots
+/// only, each admitted as a Trust toolchain ([`crate::lineage::check_compiler`], with
+/// `--lineage-dormant` passed through) — and rewrites/deletes builder load commands so
+/// the eventual tarball is self-contained. Run BETWEEN staging and tar so the signed
+/// `tree_root` is computed over the RELOCATED payload. Fail-closed on any unresolved
+/// builder reference unless `--advisory`; a stock toolchain's library is refused
+/// whatever the flags.
 fn cmd_relocate(rest: &[String]) -> ExitCode {
     let mut stage: Option<&str> = None;
     let mut sign_id: Option<&str> = None;
     let mut advisory = false;
+    let mut donors: Vec<&str> = Vec::new();
+    let mut policy = crate::lineage::LineagePolicy::Require;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sign" => sign_id = it.next().map(String::as_str),
             "--advisory" => advisory = true,
+            "--lineage-dormant" => policy = crate::lineage::LineagePolicy::Dormant,
+            "--donor-root" => match it.next() {
+                Some(d) => donors.push(d),
+                None => {
+                    return usage_error(
+                        "relocate",
+                        Some("--donor-root needs a toolchain directory"),
+                    );
+                }
+            },
             s if !s.starts_with('-') && stage.is_none() => stage = Some(s),
             other => {
                 // Name the grammar with the refusal. The bare "unexpected
@@ -4258,10 +4327,39 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
         eprintln!("atpkg relocate: {stage} is not a directory");
         return ExitCode::from(1);
     }
-    match crate::relocate::relocate_stage(stage_path, sign_id) {
+    // A donor root is a Trust toolchain, admitted by content and lineage before anything
+    // is copied out of it.
+    let mut donor_roots = Vec::new();
+    for d in donors {
+        let root = match std::fs::canonicalize(d) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("atpkg relocate: donor root {d}: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(refusals) = crate::lineage::check_compiler(&root.join("bin"), policy) {
+            for r in refusals {
+                eprintln!(
+                    "atpkg relocate: donor root {} REFUSED — {r}",
+                    root.display()
+                );
+            }
+            return ExitCode::from(1);
+        }
+        donor_roots.push(root);
+    }
+    match crate::relocate::relocate_stage(stage_path, sign_id, &donor_roots) {
         Ok(report) => {
             if let Some(line) = relocate_headline(&report) {
                 println!("{line}");
+            }
+            for v in &report.vendored_from {
+                println!(
+                    "atpkg relocate:   {} = donor {} (sha256 {}, byte-identical before the \
+                     re-sign)",
+                    v.name, v.donor_rel, v.sha256
+                );
             }
             if !advisory {
                 if let Err(e) = report.require_self_contained() {
@@ -4282,53 +4380,164 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
     }
 }
 
-/// The one non-macOS answer, shared by all three `noindex` subcommands so they cannot
-/// fork. `.noindex` is a behaviour MEASURED on macOS 26.6.2 and nowhere else has a
-/// Spotlight index to hide from — so the verb says "not applicable" rather than
-/// reporting a clean scan. "0 indexed" on Linux would read as a measurement, and this
-/// whole feature exists because a false-clean answer is worse than no answer (the
-/// earlier attempt planted 189 inert `.metadata_never_index` files and reported success).
-const NOINDEX_NOT_APPLICABLE: &str =
-    "atpkg noindex: not applicable — Spotlight is a macOS index; nothing to exclude here";
-
-/// What `atpkg noindex` was asked to do.
-///
-/// A parsed job rather than a bag of `Option`s threaded through the body, so the whole
-/// grammar — including which flag belongs to which subcommand — is decided by a pure
-/// function and pinned by `tests::noindex_grammar_is_exact`, with no filesystem and no
-/// 20-second probe in the loop.
-#[derive(Debug, PartialEq, Eq)]
-enum NoindexJob {
-    /// `noindex [scan] [<root>] [--depth <n>]`. `root: None` means the cwd — resolved in
-    /// the body, not here, so this stays pure.
-    Scan {
-        /// The tree to walk, as the user spelled it.
-        root: Option<String>,
-        /// Directory levels below `root` to descend.
-        depth: usize,
-    },
-    /// `noindex verify <dir>` — the empirical probe.
-    Verify {
-        /// The directory to measure.
-        dir: String,
-    },
-    /// `noindex migrate <dir> [--dry-run]` — the one rename.
-    Migrate {
-        /// The directory to rename.
-        dir: String,
-        /// Print the rename that would happen and touch nothing.
-        dry_run: bool,
-    },
-    /// `noindex apply (--all | <dir>...) [--dry-run]` — the doctor's remedy, done:
-    /// migrate and re-point cargo per repo ([`crate::noindex::apply_one`]).
-    Apply {
-        /// `--all`: every exposed repo target dir under `$HOME` at the doctor's depth.
-        all: bool,
-        /// The directories named, when not `--all`.
-        dirs: Vec<String>,
-        /// Print what would happen and touch nothing.
-        dry_run: bool,
-    },
+/// `atpkg lineage <check-compiler|scan|seed-mint|stamp> …` ([`crate::lineage`]): the ONE
+/// content-based lineage checker the packers call (tools/atpkg-pack.sh,
+/// tools/atpkg-pack-bundle.sh, tools/linux-auto-atpkg.sh and atpkg-publish-lib.sh's
+/// `atpkg_seed_mint_refusals`). Records go to stdout as `key=value` lines; refusals to
+/// stderr, one per line, exit 1 — except `seed-mint`, whose refusals ARE its output
+/// (stdout, exit 1 when any). Exit 2 is a usage error.
+fn cmd_lineage(rest: &[String]) -> ExitCode {
+    use crate::lineage::{self, LineagePolicy};
+    let refuse = |problem: &str| usage_error("lineage", Some(problem));
+    let Some(sub) = rest.first().map(String::as_str) else {
+        return usage_error("lineage", None);
+    };
+    let mut operands: Vec<&str> = Vec::new();
+    let mut compiler: Option<&str> = None;
+    let mut from: Option<&str> = None;
+    let mut policy = LineagePolicy::Require;
+    let mut it = rest[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--lineage-dormant" if matches!(sub, "check-compiler" | "scan") => {
+                policy = LineagePolicy::Dormant;
+            }
+            "--compiler" if sub == "scan" => match it.next() {
+                Some(c) => compiler = Some(c),
+                None => return refuse("--compiler needs a bin directory"),
+            },
+            "--from" if sub == "stamp" => match it.next() {
+                Some(c) => from = Some(c),
+                None => return refuse("--from needs a bin directory"),
+            },
+            s if !s.starts_with('-') => operands.push(s),
+            other => {
+                return refuse(&format!(
+                    "unexpected argument {other:?} for `lineage {sub}`"
+                ));
+            }
+        }
+    }
+    let print_record = |record: &[(&str, String)]| {
+        for (k, v) in record {
+            println!("{k}={v}");
+        }
+    };
+    let refused = |what: &str, refusals: Vec<String>| {
+        for r in refusals {
+            eprintln!("atpkg lineage: REFUSED {what} — {r}");
+        }
+        ExitCode::from(1)
+    };
+    let note_unproven = |c: &lineage::Compiler| {
+        if c.lineage == lineage::LineageProof::Unproven {
+            eprintln!(
+                "atpkg lineage: lineage NOT ENFORCED — {} carries neither {} nor {}; admitted \
+                 only because --lineage-dormant was given, and recorded as `lineage=unproven`",
+                c.content.root.display(),
+                lineage::LINEAGE_FILE,
+                lineage::SEED_MINT_FILE
+            );
+        }
+    };
+    match (sub, operands.as_slice()) {
+        ("check-compiler", [bin]) => {
+            match lineage::check_compiler(std::path::Path::new(bin), policy) {
+                Ok(c) => {
+                    note_unproven(&c);
+                    eprintln!(
+                        "atpkg lineage: compiler ADMITTED — {} (trust {}, commit {}, lineage {})",
+                        c.content.bin_dir.display(),
+                        c.content.version.trust,
+                        c.content.version.commit,
+                        c.record()
+                            .iter()
+                            .find(|(k, _)| *k == "lineage")
+                            .map_or("", |(_, v)| v.as_str())
+                    );
+                    print_record(&c.record());
+                    ExitCode::SUCCESS
+                }
+                Err(r) => refused(bin, r),
+            }
+        }
+        ("scan", [stage]) => {
+            let Some(bin) = compiler else {
+                return refuse(
+                    "scan needs --compiler <bin-dir>: the compiler whose output this is",
+                );
+            };
+            let c = match lineage::check_compiler(std::path::Path::new(bin), policy) {
+                Ok(c) => c,
+                Err(r) => return refused(bin, r),
+            };
+            note_unproven(&c);
+            let report =
+                match lineage::scan_tree(std::path::Path::new(stage), &c.content.version.commit) {
+                    Ok(r) => r,
+                    Err(e) => return refused(stage, vec![e]),
+                };
+            if !report.findings.is_empty() {
+                const SHOWN: usize = 40;
+                let n = report.findings.len();
+                let mut lines: Vec<String> = report
+                    .findings
+                    .iter()
+                    .take(SHOWN)
+                    .map(lineage::Finding::describe)
+                    .collect();
+                if n > SHOWN {
+                    lines.push(format!("… and {} more finding(s)", n - SHOWN));
+                }
+                lines.push(format!(
+                    "{n} finding(s) in {stage}: these bytes were not built by the admitted \
+                     compiler {} — rebuild them with it",
+                    c.content.version.commit
+                ));
+                return refused(stage, lines);
+            }
+            eprintln!(
+                "atpkg lineage: scan OK — {} compiled object(s) under {stage} carry no other \
+                 compiler's evidence",
+                report.objects
+            );
+            let mut record = c.record();
+            record.push(("scan_objects", report.objects.to_string()));
+            record.push(("scan_findings", "0".to_string()));
+            print_record(&record);
+            ExitCode::SUCCESS
+        }
+        ("seed-mint", [seal, commit]) => {
+            let refusals = lineage::seed_mint_refusals(std::path::Path::new(seal), commit);
+            for r in &refusals {
+                println!("{r}");
+            }
+            if refusals.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        ("stamp", [stage]) => {
+            let Some(bin) = from else {
+                return refuse(
+                    "stamp needs --from <bin-dir>: the sealed compiler the stage was copied from",
+                );
+            };
+            match lineage::stamp(std::path::Path::new(stage), std::path::Path::new(bin)) {
+                Ok(text) => {
+                    eprintln!("atpkg lineage: stamped {stage}/{}", lineage::LINEAGE_FILE);
+                    print!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(r) => refused(stage, r),
+            }
+        }
+        ("check-compiler" | "scan" | "seed-mint" | "stamp", _) => {
+            refuse(&format!("wrong operands for `lineage {sub}`"))
+        }
+        (other, _) => refuse(&format!("unknown subcommand {other:?}")),
+    }
 }
 
 /// One usage refusal: the specific complaint (`atpkg <verb>: <problem>`) when there is
@@ -4353,722 +4562,271 @@ fn print_usage_error(verb: &str, problem: Option<&str>) {
     }
 }
 
-/// Parse `noindex`'s argv. `Err(code)` has ALREADY printed the usage error.
-///
-/// Pure apart from those two `eprintln!`s, which is the point: the flag grammar is pinned
-/// by a test rather than discovered by running a verb whose `verify` form takes 20
-/// seconds and whose `migrate` form renames a directory.
-///
-/// A flag on the WRONG subcommand is a usage error, never a silent ignore. `noindex scan
-/// --dry-run` accepted-and-ignored would answer "nothing would change" about a form that
-/// changes nothing anyway — a true sentence and a wrong answer, which is exactly the
-/// shape of bug (audit D-12: `doctor --json` swallowed the flag and exited 0) that the
-/// per-verb arity work closed everywhere else.
-fn parse_noindex(rest: &[String]) -> Result<NoindexJob, ExitCode> {
+/// Parse `noindex`'s argv: `verify <dir>`, the one form. `Err(code)` has ALREADY printed
+/// the usage error. Pure apart from that, so the grammar is pinned by
+/// `tests::noindex_grammar_is_exact` without a 20-second probe in the loop.
+fn parse_noindex(rest: &[String]) -> Result<String, ExitCode> {
     let refuse = |problem: &str| usage_error("noindex", Some(problem));
-    let mut sub: Option<&str> = None;
-    let mut operands: Vec<&str> = Vec::new();
-    let mut depth: Option<usize> = None;
-    let mut dry_run = false;
-    let mut all = false;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--dry-run" => dry_run = true,
-            "--all" => all = true,
-            "--depth" => {
-                // Bounded at BOTH ends. `--depth 0` walks nothing and would report
-                // "0 indexed" over a home full of build output — the false-clean answer
-                // again — and a depth past 32 is a request to walk the machine, not a
-                // depth. A non-number is refused rather than defaulted, so a typo'd
-                // `--depth six` cannot silently become the default 6.
-                let Some(n) = it
-                    .next()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|n| (1..=32).contains(n))
-                else {
-                    return Err(refuse("--depth wants a whole number 1..=32"));
-                };
-                depth = Some(n);
-            }
-            // The subcommand is only a subcommand in the FIRST operand slot, so a
-            // directory named `scan` still reaches `noindex migrate ./scan` as the thing
-            // to rename.
-            "scan" | "verify" | "migrate" | "apply" if sub.is_none() && operands.is_empty() => {
-                sub = Some(a.as_str());
-            }
-            // `apply` takes any number of directories; every other form takes at most one.
-            s if !s.starts_with('-') && (operands.is_empty() || sub == Some("apply")) => {
-                operands.push(s);
-            }
-            other => {
-                return Err(refuse(&format!("unexpected argument {other:?}")));
-            }
-        }
-    }
-    // `scan` is the default subcommand, so bare `atpkg noindex` is a scan of the cwd.
-    let sub = sub.unwrap_or("scan");
-    let operand = operands.first().copied();
-    match sub {
-        "apply" if depth.is_some() => Err(refuse(
-            "--depth belongs to `scan`, not `apply` — `apply --all` scans at doctor's depth",
+    match rest {
+        [sub, dir] if sub == "verify" && !dir.starts_with('-') => Ok(dir.clone()),
+        [sub] if sub == "verify" => Err(refuse(
+            "`verify` names no directory — say which one, e.g. `aterm pkg noindex verify \
+             ~/Developer`",
         )),
-        "apply" if all && !operands.is_empty() => {
-            Err(refuse("`apply` takes --all OR directories, not both"))
-        }
-        "apply" if !all && operands.is_empty() => Err(refuse(
-            "`apply` wants --all or the directories to migrate, e.g. `aterm pkg noindex apply \
-             --all`",
+        [] => Err(refuse(
+            "say what to measure: `aterm pkg noindex verify <dir>`",
         )),
-        "apply" => Ok(NoindexJob::Apply {
-            all,
-            dirs: operands.iter().map(|s| (*s).to_owned()).collect(),
-            dry_run,
-        }),
-        _ if all => Err(refuse(&format!("--all belongs to `apply`, not `{sub}`"))),
-        "verify" | "migrate" if operand.is_none() => Err(refuse(&format!(
-            "`{sub}` names no directory — say which one, e.g. `aterm pkg noindex {sub} ./target`"
-        ))),
-        "scan" | "verify" if dry_run => Err(refuse(&format!(
-            "--dry-run belongs to `migrate`, not `{sub}` — `{sub}` never changes anything, \
-             so there is no rename to withhold"
-        ))),
-        "verify" | "migrate" if depth.is_some() => Err(refuse(&format!(
-            "--depth belongs to `scan`, not `{sub}` — `{sub}` acts on the one directory you name"
-        ))),
-        "verify" => Ok(NoindexJob::Verify {
-            dir: operand.unwrap_or_default().to_owned(),
-        }),
-        "migrate" => Ok(NoindexJob::Migrate {
-            dir: operand.unwrap_or_default().to_owned(),
-            dry_run,
-        }),
-        _ => Ok(NoindexJob::Scan {
-            root: operand.map(ToOwned::to_owned),
-            depth: depth.unwrap_or(crate::noindex::VERB_DEPTH),
-        }),
-    }
-}
-
-/// `atpkg noindex` — Spotlight exposure of Rust build output (§9, storage hygiene).
-///
-/// The companion to [`crate::freespace`]: `mds` grinding terabytes of build output was
-/// one of the two amplifiers that turned a busy build into a killed WindowServer.
-///
-/// The REPORT is exit 0 always: it is a report, not a gate. `verify` has THREE exit codes
-/// because the question has three answers: a script must be able to tell "measured
-/// exposed" from "could not measure" (exit 3, [`crate::noindex::Verdict::Unknown`]).
-fn cmd_noindex(rest: &[String]) -> ExitCode {
-    let job = match parse_noindex(rest) {
-        Ok(job) => job,
-        Err(code) => return code,
-    };
-    match job {
-        NoindexJob::Scan { root, depth } => noindex_scan(root.as_deref(), depth),
-        NoindexJob::Verify { dir } => noindex_verify(&dir),
-        NoindexJob::Migrate { dir, dry_run } => noindex_migrate(&dir, dry_run),
-        NoindexJob::Apply { all, dirs, dry_run } => noindex_apply(all, &dirs, dry_run),
-    }
-}
-
-/// `atpkg noindex apply (--all | <dir>...) [--dry-run]` — the doctor's Spotlight remedy,
-/// applied: each exposed cargo target dir is renamed to its `.noindex` form and the
-/// repo's `.cargo/config.toml` is pointed at the new name. `--all` is the doctor's own
-/// scan of `$HOME` (repos only — a free-standing target dir is named and left); named
-/// directories are migrated whether or not a repo sits beside them. Idempotent: an
-/// excluded directory is "already excluded", a live build is "retried next pass".
-///
-/// Exit 1 only when a rename FAILED (an I/O error); a skip with its reason is exit 0 —
-/// the verb the pass runs unattended must not read a busy build as a failure.
-fn noindex_apply(all: bool, dirs: &[String], dry_run: bool) -> ExitCode {
-    if !crate::noindex::SUPPORTED {
-        println!("{NOINDEX_NOT_APPLICABLE}");
-        return ExitCode::SUCCESS;
-    }
-    let ledger = noindex_ledger(dry_run);
-    let (outcomes, complete) = if all {
-        let Some(home) = aterm_types::dirs::home_dir() else {
-            eprintln!("atpkg noindex: no home directory to scan — name the directories instead");
-            return ExitCode::from(1);
-        };
-        println!(
-            "atpkg noindex: scanning {} (depth {})",
-            home.display(),
-            crate::noindex::DOCTOR_DEPTH
-        );
-        crate::noindex::apply_under(
-            &home,
-            crate::noindex::DOCTOR_DEPTH,
-            &crate::noindex::Budget::VERB,
-            &ledger,
-            dry_run,
-        )
-    } else {
-        (
-            dirs.iter()
-                .map(|d| {
-                    crate::noindex::apply_one(std::path::Path::new(d), &ledger, false, dry_run)
-                })
-                .collect(),
-            true,
-        )
-    };
-    let mut failed = false;
-    for line in render_applied_tagged(&outcomes, dry_run) {
-        println!("atpkg noindex: {line}");
-    }
-    // The outcome type says it now, so the verb no longer has to recognise a failure by
-    // the words in its reason string.
-    for o in &outcomes {
-        if o.failure().is_some() {
-            failed = true;
+        [_, extra, ..] if rest[0] == "verify" => {
+            Err(refuse(&format!("unexpected argument {extra:?}")))
         }
-    }
-    if !complete {
-        println!(
-            "atpkg noindex: the walk stopped at its budget — this list is a floor, not a census"
-        );
-    }
-    let migrated = outcomes.iter().filter(|o| o.migrated()).count();
-    if migrated > 0 {
-        // The same marker the pass prints, so a CLI-run apply reads the same to a parser.
-        emit_marker_line(&format!(
-            "atpkg: {}",
-            machine_settings_line(&[spotlight_entry(migrated)])
-        ));
-    }
-    if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+        [other, ..] => Err(refuse(&format!("unexpected argument {other:?}"))),
     }
 }
 
-/// The Spotlight pass's migration ledger ([`crate::noindex::Ledger`]) under the configured
-/// package prefix — created for a real run, which records each rename before it makes it;
-/// a dry run only reads it. No prefix at all (no home): a ledger that is not kept, so
-/// nothing is renamed.
-fn noindex_ledger(dry_run: bool) -> crate::noindex::Ledger {
-    let Some(mut layout) = crate::store::resolve_configured() else {
-        return crate::noindex::Ledger::unkept();
-    };
-    // A SYSTEM prefix is root's to write, and the ledger records what THIS account's pass
-    // renamed under its own home: kept there, every migration failed "could not be
-    // recorded". It lives in the account's default prefix instead, which the account owns.
-    if layout.is_system_prefix()
-        && let Some(home) = aterm_types::dirs::home_dir()
-    {
-        layout = crate::store::Layout {
-            prefix: crate::store::default_prefix(&home),
-        };
-    }
-    if !dry_run {
-        let _ = layout.ensure_dir(&layout.prefix);
-    }
-    crate::noindex::Ledger::of(&layout)
-}
-
-/// One line per outcome of an apply, plus the summary — pure, so the words are pinned.
-fn render_applied(outcomes: &[crate::noindex::Applied]) -> Vec<String> {
-    render_applied_tagged(outcomes, false)
-}
-
-/// [`render_applied`], with the dry-run tag forced on — even when every candidate was
-/// skipped or already excluded, so the preview never reads as a real run.
-fn render_applied_tagged(outcomes: &[crate::noindex::Applied], dry_run: bool) -> Vec<String> {
-    use crate::noindex::{Applied, ConfigNote, ExcludeNote, Pointer, Repair};
-    let mut lines = Vec::new();
-    let (mut migrated, mut excluded, mut skipped, mut planned) = (0usize, 0usize, 0usize, 0usize);
-    let (mut failed, mut restored, mut repaired) = (0usize, 0usize, 0usize);
-    for o in outcomes {
-        match o {
-            Applied::Migrated {
-                from,
-                to,
-                config:
-                    ConfigNote::Linked {
-                        link,
-                        exclude,
-                        link_exclude,
-                    },
-                discarded,
-            } => {
-                // The git-checkout line (noindex module doc): the config is
-                // never opened, so the line says what stands in its place.
-                migrated += 1;
-                lines.push(format!(
-                    "migrated {} -> {} (symlink {} left in place; no config edit: git checkout)",
-                    from.display(),
-                    to.display(),
-                    link.display()
-                ));
-                lines.push(match exclude {
-                    ExcludeNote::AlreadyIgnored => format!(
-                        "  git: {} is already ignored — the working tree stays clean",
-                        to.display()
-                    ),
-                    ExcludeNote::Added(p) => format!(
-                        "  git: {} added to {} — the working tree stays clean",
-                        to.display(),
-                        p.display()
-                    ),
-                    ExcludeNote::NotIgnored(why) => format!(
-                        "  git: {} is NOT ignored — {why}; git status shows it until it is",
-                        to.display()
-                    ),
-                });
-                // The link: silent when the entry that ignored the directory matches it
-                // too; its own exclude line when git status hid the directory and no entry
-                // matches the link (`target/` matches a directory, not a symlink; `target/*`
-                // matches neither); the honest row when status showed the directory too.
-                match link_exclude {
-                    ExcludeNote::AlreadyIgnored => {}
-                    ExcludeNote::Added(p) => lines.push(format!(
-                        "  git: {} added to {} — git status hid the directory and no ignore \
-                         entry matches the link; the working tree stays clean",
-                        link.display(),
-                        p.display()
-                    )),
-                    ExcludeNote::NotIgnored(why) => lines.push(format!(
-                        "  git: {} is not gitignored here — {why}",
-                        link.display()
-                    )),
-                }
-                if *discarded {
-                    lines.push(discarded_line(to));
-                }
-            }
-            Applied::Migrated {
-                from,
-                to,
-                config,
-                discarded,
-            } => {
-                migrated += 1;
-                lines.push(format!("migrated {} -> {}", from.display(), to.display()));
-                if *discarded {
-                    lines.push(discarded_line(to));
-                }
-                lines.push(match config {
-                    ConfigNote::Written(p) => {
-                        format!("  cargo: wrote [build] target-dir into {}", p.display())
-                    }
-                    ConfigNote::Rewritten(p) => {
-                        format!("  cargo: rewrote target-dir in {}", p.display())
-                    }
-                    ConfigNote::Linked { .. } => unreachable!("matched by the arm above"),
-                    ConfigNote::Untouched(why) => format!("  cargo: NOT re-pointed — {why}"),
-                });
-                if matches!(config, ConfigNote::Untouched(_)) {
-                    for hint in crate::noindex::cargo_hint(to) {
-                        lines.push(format!("  {hint}"));
-                    }
-                }
-            }
-            Applied::Planned {
-                from,
-                to,
-                pointer,
-                discards,
-            } => {
-                planned += 1;
-                lines.push(format!(
-                    "would rename {} -> {}",
-                    from.display(),
-                    to.display()
-                ));
-                if *discards {
-                    lines.push(format!(
-                        "  cargo: would first delete {}, the stale build output a removed link \
-                         left (`cargo clean` removes the link, not the directory)",
-                        to.display()
-                    ));
-                }
-                lines.push(match pointer {
-                    Pointer::None => {
-                        "  cargo: no Cargo.toml beside it — nothing would be re-pointed".into()
-                    }
-                    Pointer::Symlink => format!(
-                        "  cargo: would leave a symlink {} in place; no config edit: git checkout",
-                        from.display()
-                    ),
-                    Pointer::Config(config) => format!(
-                        "  cargo: would write [build] target-dir into {}",
-                        config.display()
-                    ),
-                });
-            }
-            Applied::Restored { link, to } => {
-                restored += 1;
-                lines.push(format!(
-                    "restored {} — {} stood over nothing (`rm -rf` through the link deletes the \
-                     directory and leaves the link), so every build through it failed; cargo \
-                     builds into it again",
-                    to.display(),
-                    link.display()
-                ));
-            }
-            Applied::Repaired { link, repair } => {
-                repaired += 1;
-                lines.push(match repair {
-                    Repair::Excluded(file) => format!(
-                        "repaired {} — git status showed the link an earlier pass laid, and would \
-                         hide the directory it stands for; {} excludes it now, so the working \
-                         tree reads as it did",
-                        link.display(),
-                        file.display()
-                    ),
-                    Repair::MovedBack { from, why } => format!(
-                        "repaired {} — {why}; {} was moved back and the link removed, so the \
-                         working tree reads as it did, and Spotlight indexes it again",
-                        link.display(),
-                        from.display()
-                    ),
-                });
-            }
-            Applied::AlreadyExcluded(p) => {
-                excluded += 1;
-                lines.push(format!(
-                    "already excluded — {} (nothing to do)",
-                    p.display()
-                ));
-            }
-            Applied::Skipped { path, reason } => {
-                skipped += 1;
-                lines.push(format!("skipped {} — {reason}", path.display()));
-            }
-            // A FAILURE IS NOT A SKIP, and the summary counts it separately so a pass
-            // that could not do its work never renders as a quiet one.
-            Applied::Failed { path, reason } => {
-                failed += 1;
-                lines.push(format!("FAILED {} — {reason}", path.display()));
-            }
-        }
-    }
-    // What else happened, after the three counts every summary has.
-    let mut tail = String::new();
-    if failed > 0 {
-        tail.push_str(&format!(", {failed} failed"));
-    }
-    if restored > 0 {
-        tail.push_str(&format!(", {restored} restored"));
-    }
-    if repaired > 0 {
-        tail.push_str(&format!(", {repaired} repaired"));
-    }
-    if planned > 0 || dry_run {
-        lines.push(format!(
-            "{planned} would migrate, {excluded} already excluded, {skipped} skipped{tail} \
-             (dry run)"
-        ));
-    } else {
-        lines.push(format!(
-            "{migrated} migrated, {excluded} already excluded, {skipped} skipped{tail}"
-        ));
-    }
-    lines
-}
-
-/// The line under a migration that first deleted the stale tree at `to`
-/// ([`crate::noindex::Applied::Migrated`]'s `discarded`) — a `cargo` line, so the pass
-/// prints it ([`noindex_pass_prints`]): build output deleted is never silent.
-fn discarded_line(to: &std::path::Path) -> String {
-    format!(
-        "  cargo: first deleted {}, the stale build output a removed link left (`cargo clean` \
-         removes the link, not the directory) — the clean, finished",
-        to.display()
-    )
-}
-
-/// `atpkg noindex scan` — which cargo target dirs under `root` Spotlight is free to walk.
-///
-/// Exit 0 whatever it finds; the one exception is having no root at all (a deleted cwd
-/// and no operand), which is a failure to do the thing asked, not a finding.
-fn noindex_scan(root: Option<&str>, depth: usize) -> ExitCode {
-    if !crate::noindex::SUPPORTED {
-        println!("{NOINDEX_NOT_APPLICABLE}");
-        return ExitCode::SUCCESS;
-    }
-    let root = match root {
-        Some(r) => std::path::PathBuf::from(r),
-        None => match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                eprintln!("atpkg noindex: no current directory to scan ({e}) — name a root");
-                return ExitCode::from(1);
-            }
-        },
-    };
-    // A ROOT THAT CANNOT BE READ IS NOT AN EMPTY TREE. `aterm pkg noindex scan ~/srcc` (a
-    // one-character typo for a `~/src` holding 40 exposed target dirs) must never print
-    // "no cargo target directories under /Users//example/srcc" at exit 0 — that is a
-    // confident false clean over a path nothing walked, the same shape as the 189 inert
-    // `.metadata_never_index` markers this feature exists to prevent. Exit 1, the same
-    // treatment a missing cwd already gets above: it is a failure to do the thing asked.
-    match std::fs::metadata(&root) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => {
-            eprintln!(
-                "atpkg noindex: {} is not a directory — name a directory to scan",
-                root.display()
-            );
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!(
-                "atpkg noindex: cannot scan {} ({e}) — check the path",
-                root.display()
-            );
-            return ExitCode::from(1);
-        }
-    }
-    println!("atpkg noindex: scanning {} (depth {depth})", root.display());
-    let scan = crate::noindex::scan(&root, depth, &crate::noindex::Budget::VERB);
-    let (n_indexed, n_hidden) = scan.counts();
-    let exposed: Vec<&crate::noindex::Target> = scan.exposed().collect();
-
-    // Sizes for the EXPOSED targets only, under ONE shared wall clock. Three things are
-    // load-bearing here. Sizing a tree we already know is hidden is the expensive half of
-    // the walk for no information, so hidden rows carry no size. Giving each of 127
-    // target dirs the full ceiling is an hour, not a report, so the elapsed time is
-    // subtracted from the budget as the pass proceeds. And the summary is the SUM of the
-    // printed rows rather than an independent walk, so the arithmetic on screen adds up.
-    let started = std::time::Instant::now();
-    let mut sizes: Vec<crate::noindex::Size> = Vec::with_capacity(exposed.len());
-    let mut total_bytes = 0u64;
-    let mut total_complete = true;
-    for target in &exposed {
-        let budget = crate::noindex::Budget {
-            max_entries: crate::noindex::Budget::VERB_SIZE.max_entries,
-            max_wall: crate::noindex::Budget::VERB_SIZE
-                .max_wall
-                .saturating_sub(started.elapsed()),
-        };
-        let size = crate::noindex::size_of(&target.path, &budget);
-        total_bytes = total_bytes.saturating_add(size.bytes);
-        total_complete &= size.complete;
-        sizes.push(size);
-    }
-
-    // Exposed first, then hidden — both already in path order from the scan. The rows
-    // that carry an action go above the rows that do not.
-    // An explicit space between the two columns, never just the field widths: a size of
-    // "at least 41.2 GiB" (or "unmeasured") overruns `{:>11}` and would otherwise abut the
-    // label as `indexedat least 41.2 GiB`.
-    for (target, size) in exposed.iter().zip(&sizes) {
-        println!(
-            "atpkg noindex: {:<7} {:>11}  {}",
-            "indexed",
-            crate::noindex::human_size(size),
-            target.path.display()
-        );
-    }
-    for target in scan.targets.iter().filter(|t| !t.exposed()) {
-        println!(
-            "atpkg noindex: {:<7} {:>11}  {}",
-            "hidden",
-            "",
-            target.path.display()
-        );
-    }
-
-    if scan.targets.is_empty() {
-        println!(
-            "atpkg noindex: no cargo target directories under {} at depth {depth}",
-            root.display()
-        );
-    } else if exposed.is_empty() {
-        println!(
-            "atpkg noindex: {n_indexed} indexed, {n_hidden} hidden — no build output here is \
-             exposed to Spotlight"
-        );
-    } else {
-        let total = crate::noindex::Size {
-            bytes: total_bytes,
-            complete: total_complete,
-        };
-        println!(
-            "atpkg noindex: {n_indexed} indexed, {n_hidden} hidden — {} of build output is in \
-             Spotlight",
-            crate::noindex::human_size(&total)
-        );
-    }
-    if !scan.complete {
-        // A truncated walk that printed a bare count would be read as a census, and
-        // "3 indexed" over a home that holds 127 target dirs is a wrong answer with a
-        // confident shape.
-        println!(
-            "atpkg noindex: the walk stopped at its budget — this list is a floor, not a census"
-        );
-    }
-    // The DISCOVERY walk and the SIZING pass have separate budgets, and the note above
-    // covers only the first. On the motivating machine — 127 target dirs, 2.0 TB — the
-    // shared 30 s sizing clock is spent on the first few trees and every remaining row
-    // gets a zero-length walk. Those rows render `unmeasured` (never `at least 0 B`,
-    // which reads as a small tree), and they need their own floor note, or the reader
-    // takes a truncated sizing pass for a measured one.
-    let sizes_truncated = sizes.iter().any(|s| !s.complete);
-    if sizes_truncated {
-        println!(
-            "atpkg noindex: the sizing pass stopped at its {}s budget — every size above is \
-             a floor, and an `unmeasured` row was not walked at all",
-            crate::noindex::Budget::VERB_SIZE.max_wall.as_secs()
-        );
-    }
-    // The biggest tree is the biggest win, and `min_by_key` over `Reverse` keeps the
-    // FIRST of a tie, so the suggestion is stable across runs rather than dependent on
-    // which equal-sized tree the walk happened to reach last.
-    if let Some(target) = sizes
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, s)| std::cmp::Reverse(s.bytes))
-        .map(|(i, _)| exposed[i])
-    {
-        println!(
-            "atpkg noindex: next — aterm pkg noindex apply {}",
-            target.path.display()
-        );
-        if sizes_truncated {
-            // "The biggest tree is the biggest win" is only true over rows that were
-            // actually measured: the pick above can name a 2 GiB tree while an 800 GiB one
-            // three rows below reads `unmeasured`.
-            println!(
-                "atpkg noindex:   (the biggest MEASURED tree — an unmeasured row above may \
-                 be larger; name one to `apply` yourself)"
-            );
-        }
-    }
-    if n_hidden > 0 {
-        // `hidden` above is [`crate::noindex::exclusion_of`] reading the NAME. The name
-        // is not the index: `.metadata_never_index` also looks like an exclusion and is
-        // inert. Only `verify` measures, and the row must not be mistaken for it.
-        println!(
-            "atpkg noindex: `hidden` is what the NAME says; `aterm pkg noindex verify <dir>` \
-             measures it"
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-/// `atpkg noindex verify <dir>` — MEASURE the exclusion, and say so in the exit code.
+/// `atpkg noindex verify <dir>` — MEASURE whether Spotlight indexes `<dir>` (§9): a probe
+/// planted in it and a control planted after it beside it ([`crate::noindex::verify`]).
 ///
 /// THREE exits, because the question has three answers: 0 excluded, 1 measured-indexed,
 /// 3 could-not-measure. The verdict's own `Display` is the whole answer line — a second
-/// sentence restating it here is how two spellings of one fact start to drift — so each
-/// arm adds only what `Display` cannot know: the path to apply.
-fn noindex_verify(dir: &str) -> ExitCode {
-    use crate::noindex::Verdict;
-    let path = std::path::Path::new(dir);
-    // The real directory behind a symlinked operand, when there is one. Every path this
-    // function PRINTS as an act must be that one: `migrate` refuses a symlink (renaming
-    // the link would move the link and leave the build output indexed where it lives), so
-    // a `next` line naming the link would be a dead end the reader cannot get out of.
-    let through_link = std::fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_symlink())
-        .then(|| std::fs::canonicalize(path).ok())
-        .flatten();
-    let act_on = through_link.as_deref().unwrap_or(path);
+/// sentence restating it here is how two spellings of one fact start to drift.
+fn cmd_noindex(rest: &[String]) -> ExitCode {
+    let dir = match parse_noindex(rest) {
+        Ok(dir) => dir,
+        Err(code) => return code,
+    };
+    verdict_exit(&measure_and_say(
+        "atpkg noindex",
+        std::path::Path::new(&dir),
+    ))
+}
+
+/// Measure `path` and print the verdict under `speaker`, announcing the wait first and
+/// naming the real directory when the operand is a symlink — the one spelling both
+/// `noindex verify` and `devroot verify` print.
+fn measure_and_say(speaker: &str, path: &std::path::Path) -> crate::noindex::Verdict {
     if crate::noindex::SUPPORTED {
         // Announce the wait BEFORE it happens. Twenty seconds of a silent cursor reads
         // as a hang, and the first thing a reader does about a hang is ^C — which kills
         // the measurement mid-probe and leaves them with no answer at all.
         println!(
-            "atpkg noindex: probing (up to {}s — the control must index first, and the \
-             margin after it scales with how long that took)",
+            "{speaker}: probing (up to {}s — the control must index first, and the margin \
+             after it scales with how long that took)",
             crate::noindex::Timing::DEFAULT.worst_case().as_secs()
         );
         // The probe measures the REAL directory (`verify` canonicalizes), so when the
         // operand is a link, say which tree the answer is about.
-        if let Some(real) = &through_link {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(real) = std::fs::canonicalize(path)
+        {
             println!(
-                "atpkg noindex: {} is a symlink — the probe measures {}",
+                "{speaker}: {} is a symlink — the probe measures {}",
                 path.display(),
                 real.display()
             );
         }
     }
     let verdict = crate::noindex::verify(path, &crate::noindex::Timing::DEFAULT);
-    println!("atpkg noindex: {}: {verdict}", path.display());
-    match &verdict {
-        Verdict::Excluded => ExitCode::SUCCESS,
-        Verdict::Indexed => {
-            println!(
-                "atpkg noindex: next — aterm pkg noindex apply {}",
-                act_on.display()
-            );
-            ExitCode::from(1)
+    println!("{speaker}: {}: {verdict}", path.display());
+    verdict
+}
+
+/// What `atpkg devroot` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum DevrootJob {
+    /// Bare `devroot`: the plan for `--all`, read-only.
+    Plan,
+    /// `devroot move (--all | <dir>...)`.
+    Move(crate::devroot::Selection),
+    /// `devroot verify`: measure whether Spotlight skips the root.
+    Verify,
+}
+
+/// Parse `devroot`'s argv. `Err(code)` has ALREADY printed the usage error.
+fn parse_devroot(rest: &[String]) -> Result<DevrootJob, ExitCode> {
+    let refuse = |problem: &str| usage_error("devroot", Some(problem));
+    match rest {
+        [] => Ok(DevrootJob::Plan),
+        [sub] if sub == "verify" => Ok(DevrootJob::Verify),
+        [sub, extra, ..] if sub == "verify" => Err(refuse(&format!(
+            "`verify` takes nothing more, not {extra:?}"
+        ))),
+        [sub] if sub == "move" => Err(refuse(
+            "`move` wants --all or the checkouts to move — it never moves anything unasked",
+        )),
+        [sub, flag] if sub == "move" && flag == "--all" => {
+            Ok(DevrootJob::Move(crate::devroot::Selection::All))
         }
-        // The verdict line above already says `unknown — <why>`.
-        Verdict::Unknown(_) => ExitCode::from(3),
-        // The verdict line above already IS the not-applicable sentence; a second one
-        // would only say it twice.
-        Verdict::NotApplicable => ExitCode::SUCCESS,
+        [sub, dirs @ ..] if sub == "move" => {
+            if let Some(bad) = dirs.iter().find(|d| d.starts_with('-')) {
+                return Err(refuse(&format!(
+                    "unexpected argument {bad:?} — `move` takes --all OR checkouts, not both"
+                )));
+            }
+            Ok(DevrootJob::Move(crate::devroot::Selection::Named(
+                dirs.iter().map(std::path::PathBuf::from).collect(),
+            )))
+        }
+        [other, ..] => Err(refuse(&format!("unexpected argument {other:?}"))),
     }
 }
 
-/// `atpkg noindex migrate <dir> [--dry-run]` — the one `rename(2)`.
+/// `atpkg devroot [move (--all | <dir>...) | verify]` — the developer root, `~/Developer`
+/// ([`crate::devroot`]).
 ///
-/// Exit 1 on refusal, never 2: the grammar was fine and the operation the user asked for
-/// did not happen, which is a different thing from being asked wrongly. 2 stays reserved
-/// for usage across the whole CLI.
-fn noindex_migrate(dir: &str, dry_run: bool) -> ExitCode {
-    use crate::noindex::Migration;
-    let path = std::path::Path::new(dir);
-    match crate::noindex::migrate(path, dry_run) {
-        Ok(Migration::Migrated { from, to }) => {
-            println!(
-                "atpkg noindex: migrated {} -> {}",
-                from.display(),
-                to.display()
-            );
-            // Say what did NOT happen. A tool that "moves" 41 GiB invites the reader to
-            // wonder what it copied and what it left behind; this one moved a directory
-            // entry inside a single parent, and if it had failed nothing would have
-            // changed.
-            println!(
-                "atpkg noindex: nothing was copied and nothing was deleted — one rename inside \
-                 the parent"
-            );
-            for line in crate::noindex::cargo_hint(&to) {
-                println!("atpkg noindex:   {line}");
+/// Bare: every checkout under `$HOME` outside the root, where each would go, and what
+/// holds each (exit 0: a report). `move`: refuses the WHOLE run, exit 3, while anything
+/// holds one of the checkouts it names (uncommitted work, a process in it or in another
+/// checkout of its repository, an agent session, a git lock, a destination in the way, a
+/// repository with submodules that would be split), exit 75 when it would re-lay a dev
+/// link while another pass holds the store; else moves them a repository at a time and
+/// repairs what names their old paths; exit 1 when a repair did not land or a checkout no
+/// longer answers `git status`. `verify`: MEASURES whether Spotlight skips the root (0
+/// skipped, 1 indexed, 3 not measured — no root, or one aterm does not open, included).
+fn cmd_devroot(rest: &[String]) -> ExitCode {
+    const SAY: &str = "atpkg devroot";
+    let job = match parse_devroot(rest) {
+        Ok(job) => job,
+        Err(code) => return code,
+    };
+    let Some(home) = aterm_types::dirs::home_dir()
+        .filter(|h| !h.as_os_str().is_empty())
+        .or_else(crate::platform::account_home)
+    else {
+        eprintln!("{SAY}: no home directory (HOME is unset and the account's is unknown)");
+        return ExitCode::from(3);
+    };
+    let (root, root_is) = crate::devroot::root_at(&home);
+    if job == DevrootJob::Verify {
+        match root_is {
+            crate::devroot::RootIs::Missing => {
+                println!(
+                    "{SAY}: {} does not exist yet — nothing to measure",
+                    root.display()
+                );
+                return ExitCode::from(3);
             }
-            println!(
-                "atpkg noindex: next — aterm pkg noindex verify {}",
-                to.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Ok(Migration::Planned { from, to }) => {
-            println!(
-                "atpkg noindex: would rename {} -> {}",
-                from.display(),
-                to.display()
-            );
-            // The same hint on the dry run: the rename is the easy half, and re-pointing
-            // cargo is the half a reader wants to have read before committing to it.
-            for line in crate::noindex::cargo_hint(&to) {
-                println!("atpkg noindex:   {line}");
+            crate::devroot::RootIs::NotOpened(why) => {
+                println!("{SAY}: not measured — {why}");
+                return ExitCode::from(3);
             }
-            ExitCode::SUCCESS
+            crate::devroot::RootIs::Folder => {}
         }
-        // Idempotence is a SUCCESS, not a complaint: re-running migrate over a tree that
-        // is already excluded is what a script does, and exit 1 there would fail a loop
-        // that has nothing wrong with it.
-        Ok(Migration::AlreadyExcluded(p)) => {
+        let verdict = measure_and_say(SAY, &root);
+        if verdict == crate::noindex::Verdict::Indexed {
             println!(
-                "atpkg noindex: already excluded — {} (nothing to do)",
-                p.display()
+                "{SAY}: fix — add {} to {}",
+                root.display(),
+                crate::devroot::SEARCH_PRIVACY
             );
-            ExitCode::SUCCESS
         }
-        Ok(Migration::NotApplicable) => {
-            println!("{NOINDEX_NOT_APPLICABLE}");
-            ExitCode::SUCCESS
+        return verdict_exit(&verdict);
+    }
+    let survey = crate::devroot::survey(&home);
+    let selection = match &job {
+        DevrootJob::Move(selection) => selection.clone(),
+        _ => crate::devroot::Selection::All,
+    };
+    if survey.outside.is_empty() {
+        println!(
+            "{SAY}: every git checkout under {} is in {} — nothing to move",
+            home.display(),
+            root.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    // The store holds the `aterm pkg link` dev links the move re-lays: read here, and
+    // locked below only when one of them moves.
+    let layout = crate::store::resolve_configured();
+    let recorded = crate::devroot::Recorded::read(layout.as_ref(), &home);
+    let plan = match crate::devroot::plan(
+        &survey,
+        &selection,
+        &crate::devroot::live_holders,
+        &recorded,
+    ) {
+        Ok(plan) => plan,
+        Err(why) => {
+            eprintln!("{SAY}: {why}");
+            return ExitCode::from(2);
         }
-        Err(e) => {
-            eprintln!("atpkg noindex: {e}");
-            ExitCode::from(1)
-        }
+    };
+    for line in crate::devroot::render_plan(&survey, &plan) {
+        println!("{SAY}: {line}");
+    }
+    let held: std::collections::BTreeSet<&std::path::Path> =
+        plan.blocked.iter().map(|(p, _)| p.as_path()).collect();
+    if job == DevrootJob::Plan {
+        println!(
+            "{SAY}: {} to move, {} held — `aterm pkg devroot move --all` moves them once \
+             nothing holds any",
+            plan.moves.len(),
+            held.len()
+        );
+        return ExitCode::SUCCESS;
+    }
+    if !plan.blocked.is_empty() {
+        println!(
+            "{SAY}: nothing moved — {} of {} checkout(s) held (above); free them and run it \
+             again",
+            held.len(),
+            plan.moves.len()
+        );
+        return ExitCode::from(3);
+    }
+    // A dev link is re-laid in the store, so the run holds the store's one writer lock
+    // the way `aterm pkg link` does — refused before anything moves, never halfway.
+    let _store = match (&layout, plan.relinks.is_empty()) {
+        (Some(layout), false) => match crate::lock::try_lock_store(layout) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                println!(
+                    "{SAY}: nothing moved — the move re-lays dev links in the package store \
+                     ({}), and {e}; run it again when that pass ends",
+                    plan.relinks
+                        .iter()
+                        .map(|r| r.program.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return ExitCode::from(crate::lock::CONTENDED_EXIT);
+            }
+        },
+        _ => None,
+    };
+    let report = crate::devroot::execute(&survey, &plan, layout.as_ref());
+    for line in &report.done {
+        println!("{SAY}: {line}");
+    }
+    for line in &report.failed {
+        eprintln!("{SAY}: FAILED {line}");
+    }
+    let code = if report.failed.is_empty() {
+        println!(
+            "{SAY}: done — next: add {} to {} once, then `aterm pkg devroot verify`",
+            root.display(),
+            crate::devroot::SEARCH_PRIVACY
+        );
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    };
+    if let Some(sig) = report.held_signal {
+        eprintln!(
+            "{SAY}: an interrupt (signal {sig}) arrived during the move and waited for it to \
+             finish; it ends this run now"
+        );
+        crate::devroot::deliver(sig);
+    }
+    code
+}
+
+/// A measured verdict's exit: 0 excluded (or no Spotlight here), 1 indexed, 3 unmeasured.
+fn verdict_exit(verdict: &crate::noindex::Verdict) -> ExitCode {
+    use crate::noindex::Verdict;
+    match verdict {
+        Verdict::Excluded | Verdict::NotApplicable => ExitCode::SUCCESS,
+        Verdict::Indexed => ExitCode::from(1),
+        Verdict::Unknown(_) => ExitCode::from(3),
     }
 }
 
@@ -5193,14 +4951,12 @@ fn repair_hook_lines(pass: &crate::hooks::HookPass) -> Vec<String> {
 ///    build's tombstone, which only an update pass may lift;
 /// 3. lay — at `Deep` — the exec root of a trust build whose `bin/rustc` is a separate copy
 ///    of `trustc`, and route every trust shim through it ([`reconcile_exec_roots`]);
-/// 4. clear the macOS provenance tag from every installed file
-///    ([`crate::provenance::heal_store`]);
-/// 5. name — and do not silently paper over — programs whose build is GONE, which no
+/// 4. name — and do not silently paper over — programs whose build is GONE, which no
 ///    local operation can fix and only a reinstall can.
 ///
 /// Exits 1 when something remains that repair cannot do locally, so a script can tell
-/// "fixed" from "needs the network" — exec roots the reconcile could not put in order,
-/// and files whose tag could not be cleared, included.
+/// "fixed" from "needs the network" — exec roots the reconcile could not put in order
+/// included.
 fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     let Some(layout) = layout else {
         return ExitCode::from(1);
@@ -5221,8 +4977,7 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     // The reroute stubs are the other store-less half: they name an atpkg, so a relocated
     // or self-updated app is exactly what repair re-lays for — this atpkg's path when it
     // stands and lasts at least as long as the one a stub names now
-    // ([`crate::stub::Embedder`]). A stub whose only fault is the macOS tag is not re-laid:
-    // the heal at the end of [`repair_store`] clears it in place.
+    // ([`crate::stub::Embedder`]).
     lay_reroute_stubs(&layout);
     // The rustup seam as every pass re-asserts it — and, this being the pass a person asked
     // for, a link to a toolchain older than the store's re-pointed at it too.
@@ -5329,12 +5084,8 @@ fn repair_store(layout: &crate::store::Layout, leftovers: &[String]) -> ExitCode
         println!(
             "repair: no programs installed — `aterm pkg install --default-set` installs the toolset"
         );
-        // The stubs in `bin/`, `agents/` and `reroute/` stand without a program, and doctor
-        // counts a tagged one with this verb as its fix: the heal runs here too. A copied
-        // command left in place keeps it from "done" all the same.
-        let healed = repair_heal(layout);
-        let settled = repair_leftovers_settled(leftovers);
-        return if healed && settled {
+        // A copied command left in place keeps it from "done" all the same.
+        return if repair_leftovers_settled(leftovers) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -5357,11 +5108,8 @@ fn repair_store(layout: &crate::store::Layout, leftovers: &[String]) -> ExitCode
              above is fixed"
         );
     }
-    // THE TAG, last, over everything repair just laid ([`repair_heal`]).
-    let healed = repair_heal(layout);
     if missing.is_empty()
         && revoked.is_empty()
-        && healed
         && failed.is_empty()
         && exec_roots_ok
         && leftovers.is_empty()
@@ -5396,32 +5144,6 @@ fn repair_leftovers_settled(leftovers: &[String]) -> bool {
     }
     println!("repair: not done — {} (see above)", leftovers.join("; "));
     false
-}
-
-/// [`repair_store`]'s last step, whatever the store holds: clear the macOS tag in place
-/// ([`crate::provenance::heal_store`]) and say what it did. `false` only while files stay
-/// tagged — the one way the heal makes repair exit 1.
-fn repair_heal(layout: &crate::store::Layout) -> bool {
-    let healed = crate::provenance::heal_store(layout);
-    match &healed {
-        crate::provenance::HealOutcome::Clean => {}
-        crate::provenance::HealOutcome::Healed { cleared } => println!(
-            "repair: cleared a macOS tag from {}",
-            crate::provenance::count_of(*cleared, "installed file")
-        ),
-        left => println!(
-            "repair: {} still {} a macOS tag (com.apple.provenance) that release builds \
-             refuse — it could not be cleared ({})",
-            crate::provenance::count_of(left.left().len(), "installed file"),
-            if left.left().len() == 1 {
-                "carries"
-            } else {
-                "carry"
-            },
-            left.why().unwrap_or("no reason given")
-        ),
-    }
-    healed.is_clean()
 }
 
 /// Step 2 of [`run_repair`], split out so it can be tested without the rc wiring step 1
@@ -7758,13 +7480,19 @@ fn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Ind
 /// THE AGENT PROGRAMS: a `claude`/`codex` whose `agents/` twin is laid and
 /// current ([`agent_twin_current`]) is what every aterm tab runs, so a foreign copy ahead
 /// on this pass's `PATH` is no shadow at all: printed as the managed row plus
-/// [`pass_path_tail`], and named on no `shadowed:` line.
+/// [`pass_path_tail`], and named on no `shadowed:` line — nor on the [`FOREIGN_MARKER`]
+/// line, which ends every reconcile ([`FOREIGN_PATH`]) naming each SHADOWED member that
+/// has an alias fix ([`alias_fix`]), with it: there is nothing for the owner to fix
+/// there (owner, 2026-09-16: the remedy is never "remove or reorder that copy"), and a
+/// shadow with no fix is a fact the pass's own line says, never the owner's to act on
+/// (review of 2026-10-09: an exception with no action is not one).
 fn reconcile_shadowed(
     layout: &crate::store::Layout,
     index_build: u64,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Vec<String> {
     let mut shadowed = Vec::new();
+    let mut foreign: Vec<ForeignItem> = Vec::new();
     let recorded = crate::status::read(layout);
     let outcome = recorded
         .as_ref()
@@ -7800,7 +7528,14 @@ fn reconcile_shadowed(
             (Some((tool, path)), None) => {
                 let state = crate::state::shadowed(build, &path);
                 match alias_fix(layout, &tool, &program, path_var) {
-                    Some(fix) => println!("atpkg: {program}: {state} on this pass's PATH — {fix}"),
+                    Some(fix) => {
+                        println!("atpkg: {program}: {state} on this pass's PATH — {fix}");
+                        foreign.push(ForeignItem {
+                            name: program.clone(),
+                            path,
+                            fix,
+                        });
+                    }
                     None => println!("atpkg: {program}: {state} on this pass's PATH"),
                 }
                 shadowed.push(program.clone());
@@ -7824,6 +7559,7 @@ fn reconcile_shadowed(
     if !shadowed.is_empty() {
         emit_marker_line(&format!("atpkg: {SHADOWED_MARKER}{}", shadowed.join(", ")));
     }
+    emit_marker_line(&format!("atpkg: {}", foreign_line(FOREIGN_PATH, &foreign)));
     shadowed
 }
 
@@ -8037,18 +7773,79 @@ pub const LOCK_ACQUIRED_MARKER: &str = "lock-acquired: ";
 /// what lets a GUI tell a pass that found a shadow from one that found none.
 pub const SHADOWED_MARKER: &str = "shadowed: ";
 /// The MANAGED-CURRENT answer, printed at the end of every successful update/seed
-/// pass: each agent program ([`crate::stub::AGENT_PROGRAMS`]) that is installed AND at
-/// its vendor's latest, as `<name> <version> (<Vendor> latest)`, `; `-separated — the R6
-/// row "the latest aterm-managed claude/codex are in use". Omitted when none qualifies.
+/// pass: each agent program ([`crate::stub::AGENT_PROGRAMS`]) that is installed and is
+/// what every aterm tab runs, `; `-separated — the R6 row "the latest aterm-managed
+/// claude/codex are in use" — as `<name> <version> (<Vendor> latest)` while it is its
+/// vendor's head, else `<name> <version> (<why not>)` ([`ManagedAgent::standing`]), so a
+/// pass that could not check one program never reads as all of them current (audit
+/// 2026-10-09: an unreached Anthropic left `Codex 0.160.0 is current` alone on the
+/// line). Omitted when no agent program is installed.
 pub const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
 
-/// `machine-settings: spotlight-noindex 73 dir(s) migrated; universal-control disabled`
+/// `machine-settings: universal-control disabled`
 /// (R5/R6): what THIS pass changed about the machine per the
 /// doctor's remedies — entries `; `-separated, the line omitted when nothing changed.
 /// The window records it as `appstatus` ledger entries (never a status-bar row) that
 /// must carry the revert ([`crate::machine::UNIVERSAL_CONTROL_REVERT`]),
 /// and Settings ▸ Security's "Last change" names it.
 pub const MACHINE_SETTINGS_MARKER: &str = "machine-settings: ";
+
+/// `foreign: <scope> <items>` — what one of a pass's looks found that aterm LEAVES ALONE
+/// because it did not lay it, with the fix that is the owner's (audit 2026-10-09: 32
+/// passes said `~/.rustup/toolchains/trust … not aterm's link; left untouched (fix: …)`
+/// and 31 said `trust: managed 9192 — SHADOWED by ~/.local/bin/trustdoc` as prose the
+/// window only logged, so none reached the owner). One line per look, every time it
+/// looks, `none` when it found nothing, so the window can end what a look no longer
+/// sees ([`foreign_line`]): [`FOREIGN_SEAM`] (the rustup seam, [`reassert_rustup_seam`])
+/// and [`FOREIGN_PATH`] (the shadow reconcile, [`reconcile_shadowed`]). Each item is
+/// `<name> <path> — <fix>`, items `; `-separated: only what atpkg names a fix for is on
+/// it, since an item with nothing to do is no exception.
+/// Informational: neither opens nor answers an announcement.
+pub const FOREIGN_MARKER: &str = "foreign: ";
+/// The rustup seam's scope on the [`FOREIGN_MARKER`] line: an entry under
+/// `~/.rustup/toolchains` that is not atpkg's ([`crate::seam::Refusal::Foreign`]), named
+/// by its seam, fixed by [`crate::seam::DETACH_FIX`].
+pub const FOREIGN_SEAM: &str = "seam";
+/// The shadow reconcile's scope on the [`FOREIGN_MARKER`] line: a foreign copy ahead of a
+/// managed program's tool on the pass's `PATH`, named by its program.
+pub const FOREIGN_PATH: &str = "path";
+/// What a scope that found nothing foreign says.
+pub const FOREIGN_NONE: &str = "none";
+
+/// One thing a look found that aterm leaves alone ([`FOREIGN_MARKER`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignItem {
+    /// The seam (`trust`) or the program (`trust`) it stands before.
+    pub(crate) name: String,
+    /// The entry or copy that is not aterm's.
+    pub(crate) path: std::path::PathBuf,
+    /// atpkg's fix sentence: an item with none is not on the line.
+    pub(crate) fix: String,
+}
+
+/// The [`FOREIGN_MARKER`] line for `scope`'s look: `foreign: seam none`, or
+/// `foreign: path trust /u/.local/bin/trustdoc — type alab-trustdoc for the managed one`.
+/// A `; ` inside a field is written `, ` so the items split back whole.
+pub(crate) fn foreign_line(scope: &str, items: &[ForeignItem]) -> String {
+    let field = |s: &str| s.replace("; ", ", ");
+    let body = if items.is_empty() {
+        FOREIGN_NONE.to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {} — {}",
+                    field(&item.name),
+                    field(&item.path.display().to_string()),
+                    field(&item.fix)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    format!("{FOREIGN_MARKER}{scope} {body}")
+}
 
 /// The `machine-state:` marker bare `atpkg machine` prints — the READ counterpart of
 /// `machine-settings:` (a change). One byte-stable line, `key=value` pairs joined by
@@ -8153,14 +7950,8 @@ pub fn machine_settings_line(entries: &[String]) -> String {
     format!("{MACHINE_SETTINGS_MARKER}{}", entries.join("; "))
 }
 
-/// The Spotlight entry: `spotlight-noindex <n> dir(s) migrated`.
-#[must_use]
-pub fn spotlight_entry(migrated: usize) -> String {
-    format!("spotlight-noindex {migrated} dir(s) migrated")
-}
-
-/// Report the actual Universal Control outcome without discarding earlier
-/// Spotlight changes or treating a failed preference write as an applied one.
+/// Report the actual Universal Control outcome without treating a failed preference
+/// write as an applied one.
 fn record_universal_control_outcome(
     outcome: crate::machine::UniversalControlOutcome,
     entries: &mut Vec<String>,
@@ -8182,174 +7973,21 @@ fn record_universal_control_outcome(
     }
 }
 
-/// What one bounded walk of a home says about Spotlight: the counts the
-/// `machine-state:` record carries, measured the one way both the read and the pass
-/// measure them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SpotlightCensus {
-    /// Cargo target dirs whose name leaves them open to Spotlight.
-    exposed: usize,
-    /// Already hidden by name.
-    hidden: usize,
-    /// Of the exposed, how many a pass would migrate — a dry-run apply, which refuses the
-    /// free-standing dir, the live build and the occupied destination exactly as the real pass
-    /// does, so this count can reach zero where `exposed` never could (the doctor records that
-    /// trap). `apply_one(.., true, true)` is pure: `Planned` is returned before any rename.
-    would_migrate: usize,
-    /// Of the exposed, the ones the same dry run refused, by reason: not beside a
-    /// Cargo.toml (only `aterm pkg noindex apply <dir>` by name moves one), held by a
-    /// running build (the next apply retries it), and refused otherwise (a destination
-    /// already in the way, a config that cannot be pointed).
-    open: OpenSplit,
-    /// `false` when the walk hit its budget: every surface then says "at least".
-    complete: bool,
-}
-
-use crate::machine::OpenSplit;
-
-/// Bare `atpkg machine`'s Spotlight sentence for `census` under `home`. With the switch off
-/// the dirs are open because of it; with it on, the counts say what an apply hides and why
-/// each other dir stays open — only the non-zero parts.
-fn spotlight_census_line(home: &str, census: &SpotlightCensus, switch_on: bool) -> String {
-    let SpotlightCensus {
-        exposed,
-        hidden,
-        would_migrate,
-        open,
-        complete,
-    } = *census;
-    let floor = if complete {
-        ""
-    } else {
-        " — at least; the scan hit its budget"
-    };
-    if !switch_on {
-        return format!(
-            "{exposed} cargo target dir(s) under {home} open to Spotlight, {hidden} hidden — \
-             [machine] spotlight_noindex = false leaves them{floor}"
-        );
-    }
-    let mut parts = Vec::new();
-    if would_migrate > 0 {
-        parts.push(format!("{would_migrate} an apply hides"));
-    }
-    let split = open.words();
-    if !split.is_empty() {
-        parts.push(split);
-    }
-    let detail = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", parts.join(", "))
-    };
-    format!(
-        "{exposed} cargo target dir(s) under {home} open to Spotlight{detail}; {hidden} \
-         hidden{floor}"
-    )
-}
-
-/// One doctor-budget walk of `home` and a dry-run apply over what it found — against the
-/// pass's `ledger`, which decides whether a stale tree in the way is one an apply clears.
-fn spotlight_census(home: &std::path::Path, ledger: &crate::noindex::Ledger) -> SpotlightCensus {
-    let scan = crate::noindex::scan(
-        home,
-        crate::noindex::DOCTOR_DEPTH,
-        &crate::noindex::Budget::DOCTOR,
-    );
-    let (exposed, hidden) = scan.counts();
-    let mut would_migrate = 0;
-    let mut open = OpenSplit::default();
-    for t in scan.exposed() {
-        match crate::noindex::apply_one(&t.path, ledger, true, true) {
-            crate::noindex::Applied::Planned { .. } => would_migrate += 1,
-            other => open.count(&other),
-        }
-    }
-    SpotlightCensus {
-        exposed,
-        hidden,
-        would_migrate,
-        open,
-        complete: scan.complete,
-    }
-}
-
-/// The Spotlight half of the pass's own `machine-state:` record, after its apply: the pass
-/// reports from the walk it already paid for. A pass that migrated nothing and failed nothing
-/// knows the posture already — every exposed dir it left was a refusal a dry run refuses
-/// identically ([`crate::noindex::apply_one`]) — so a pass that moved something (a tree
-/// moved back included), or failed to, walks again, that being the one case where the
-/// pre-apply scan no longer fits the disk. The other walk is a pass whose Spotlight half is
-/// OFF and whose Universal Control half changed something: it has no scan to report from,
-/// and a record without counts would say less than the read it replaces.
-fn spotlight_after_apply(
-    home: &std::path::Path,
-    scan: &crate::noindex::Scan,
-    outcomes: &[crate::noindex::Applied],
-    ledger: &crate::noindex::Ledger,
-) -> SpotlightCensus {
-    let moved_or_failed = outcomes.iter().any(|o| {
-        o.migrated()
-            || o.failure().is_some()
-            || matches!(
-                o,
-                crate::noindex::Applied::Repaired {
-                    repair: crate::noindex::Repair::MovedBack { .. },
-                    ..
-                }
-            )
-    });
-    if moved_or_failed {
-        return spotlight_census(home, ledger);
-    }
-    let (exposed, hidden) = scan.counts();
-    SpotlightCensus {
-        exposed,
-        hidden,
-        would_migrate: 0,
-        open: open_left(scan, outcomes),
-        complete: scan.complete,
-    }
-}
-
-/// The exposed dirs a pass left open, by why ([`OpenSplit`]), from its outcomes about the
-/// scan's EXPOSED dirs alone — what [`spotlight_census`]'s dry run counts. The pass also
-/// settles its own links and `.noindex` trees ([`crate::noindex::apply_under_scan`]), and a
-/// link it left as it was, or a tree a build held while it was to be moved back, is no
-/// directory Spotlight sees: counted, the window's card read "1 in a running build" beside
-/// nothing open to Spotlight.
-fn open_left(scan: &crate::noindex::Scan, outcomes: &[crate::noindex::Applied]) -> OpenSplit {
-    let exposed: std::collections::HashSet<&std::path::Path> =
-        scan.exposed().map(|t| t.path.as_path()).collect();
-    let mut open = OpenSplit::default();
-    for o in outcomes.iter().filter(|o| exposed.contains(o.path())) {
-        open.count(o);
-    }
-    open
-}
-
-/// Print the pass's own `machine-state:` record from `census`, the machine re-read for the
-/// Universal Control half (the keys themselves, not the apply's outcome). The same line, from
-/// the same builder, that bare `atpkg machine` prints — [`MACHINE_STATE_MARKER`] — so the
-/// window's one parser serves both.
+/// Print the pass's own `machine-state:` record: the machine re-read for the Universal
+/// Control half (the keys themselves, not the apply's outcome). The same line, from the same
+/// builder, that bare `atpkg machine` prints — [`MACHINE_STATE_MARKER`] — so the window's one
+/// parser serves both.
 fn print_machine_state_after_apply(
     cfg: &crate::config::MachineConfig,
     policy: crate::config::UniversalControlPolicy,
-    census: SpotlightCensus,
 ) {
     let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
     let (home_posture, _) = machine_home();
     let st = crate::machine::MachineState {
         universal_control: state.posture(),
         policy,
-        spotlight_noindex: cfg.spotlight_noindex(),
-        exposed: census.exposed,
-        hidden: census.hidden,
-        would_migrate: census.would_migrate,
-        scan_complete: census.complete,
         home: home_posture,
         config_unreadable: cfg.unreadable,
-        open: Some(census.open),
     };
     emit_marker_line(&format!(
         "atpkg: {MACHINE_STATE_MARKER}{}",
@@ -8362,12 +8000,9 @@ fn print_machine_state_after_apply(
 /// `machine-settings:` marker (nothing printed when nothing changed — the window's record
 /// is for a change, not a state), and record the table applied. Returns the
 /// same entries, and why nothing changed ([`MachineApply`]), so `atpkg machine apply` can
-/// say so without re-reading its own stdout. Spotlight: the doctor's scan of `$HOME`, migrated with
-/// each repo's cargo re-pointed ([`crate::noindex::apply_under`]; a live build is skipped
-/// and retried next pass). Universal Control: [`crate::machine::apply_universal_control`]
-/// through the real `defaults`. Best-effort throughout — a machine setting must never
-/// fail the toolchain pass that carried it — and every migration is also narrated on
-/// its own lines for the log.
+/// say so without re-reading its own stdout. Universal Control:
+/// [`crate::machine::apply_universal_control`] through the real `defaults`. Best-effort —
+/// a machine setting must never fail the toolchain pass that carried it.
 fn apply_machine_settings() -> MachineApply {
     let cfg = crate::config::cached_machine();
     let mut out = MachineApply::default();
@@ -8375,94 +8010,30 @@ fn apply_machine_settings() -> MachineApply {
     // AN ORPHANED PASS LEAVES THE MACHINE TO THE SUCCESSOR. A pass whose
     // spawning window is gone ([`crate::progress::watch_for_orphaning`]) finishes its
     // store work, but the `machine-settings:` line it would print reaches no window —
-    // and disabling Universal Control or migrating build directories is the loudest
-    // thing a pass does to a Mac; it must be done by a pass that can say so. The
-    // settings are idempotent per doctor's own findings, so the successor's pass, minutes
-    // later at most, applies and reports them. SILENTLY: an orphaned waiter passes
-    // through here before it blocks on the lock, and has by construction no reader
+    // and disabling Universal Control is the loudest thing a pass does to a Mac; it must
+    // be done by a pass that can say so. The setting is idempotent per doctor's own
+    // findings, so the successor's pass, minutes later at most, applies and reports it.
+    // SILENTLY: an orphaned waiter passes through here before it blocks on the lock, and
+    // has by construction no reader
     // (`an_orphaned_waiter_stands_down_silently_before_its_bound`).
     if parent_is_gone() {
         return out;
     }
-    // Off macOS there is nothing to apply — no Spotlight, no Universal Control — and
-    // nothing to say about it either: the home guard below would otherwise print a
-    // line on every Linux pass whose HOME is not the passwd home (a CI container, this
-    // crate's own integration tests), about settings that do not exist there.
-    if !crate::noindex::SUPPORTED {
+    // Off macOS there is nothing to apply — no Universal Control — and nothing to say
+    // about it either: the home guard below would otherwise print a line on every Linux
+    // pass whose HOME is not the passwd home (a CI container, this crate's own
+    // integration tests), about settings that do not exist there.
+    if !cfg!(target_os = "macos") {
         return out;
     }
     // A SYNTHETIC HOME IS A SYNTHETIC MACHINE. `defaults` writes the ACCOUNT's per-host
     // domain and ignores `$HOME`, so a pass pointed at another home — this crate's own
     // integration tests spawn passes against a temp HOME — must not touch the real
-    // machine at all. The
-    // Spotlight half follows the same rule for symmetry: it walks `$HOME`, and a home
-    // that is not this account's is not one to rename things under. One line says why,
-    // so a `sudo -H` or a CI job is never a silent no-op.
+    // machine at all. One line says why, so a `sudo -H` or a CI job is never a silent
+    // no-op.
     if let Some(reason) = machine_refusal(cfg) {
         println!("{MACHINE_NOT_APPLIED_PREFIX}{reason}");
         return out;
-    }
-    let home = aterm_types::dirs::home_dir()
-        .filter(|h| !h.as_os_str().is_empty())
-        .or_else(crate::platform::account_home);
-    // What the Spotlight half renamed, by identity: written before each rename, read by
-    // every later pass ([`crate::noindex::Ledger`]); only read when that half is off.
-    let ledger = noindex_ledger(!cfg.spotlight_noindex());
-    // The Spotlight half's own posture after its apply, for the record at the end.
-    let mut census: Option<SpotlightCensus> = None;
-    // Whether the Spotlight half left nothing to retry ([`crate::machine::forget_applied`]).
-    let mut finished = true;
-    if cfg.spotlight_noindex()
-        && let Some(home) = home.as_deref()
-    {
-        let (outcomes, scan) = crate::noindex::apply_under_scan(
-            home,
-            crate::noindex::DOCTOR_DEPTH,
-            &crate::noindex::Budget::DOCTOR,
-            &ledger,
-            false,
-        );
-        let complete = scan.complete;
-        // A TRUNCATED WALK IS NOT A FINISHED ONE. The scan pops a deterministic stack
-        // and clears it at the budget, so the same pass stops in the same place every
-        // time: without this line a home too large for the doctor's budget would look,
-        // pass after pass, exactly like a home with nothing left to do.
-        if !complete {
-            println!(
-                "atpkg noindex: the walk stopped at its budget — what it reached is done, and \
-                 `aterm pkg noindex apply --all` walks further"
-            );
-        }
-        for line in render_applied(&outcomes) {
-            if noindex_pass_prints(&line) {
-                println!("atpkg noindex: {line}");
-            }
-        }
-        let migrated = outcomes.iter().filter(|o| o.migrated()).count();
-        if migrated > 0 {
-            entries.push(spotlight_entry(migrated));
-        }
-        // A SPOTLIGHT HALF THAT FAILED SAYS SO IN THE WINDOW'S OWN WORDS, or a rename
-        // failing on every pass would reach the card as a success with a smaller count.
-        let failures: Vec<String> = outcomes
-            .iter()
-            .filter_map(|o| {
-                o.failure()
-                    .map(|(path, reason)| format!("{} ({reason})", path.display()))
-            })
-            .collect();
-        out.open = open_left(&scan, &outcomes);
-        out.walk_cut = !complete;
-        out.failed |= !failures.is_empty();
-        if !failures.is_empty() {
-            println!(
-                "{MACHINE_APPLY_FAILED_PREFIX}{} build directory migration(s) did not land: {}",
-                failures.len(),
-                failures.join("; ")
-            );
-        }
-        finished = spotlight_apply_finished(&outcomes);
-        census = Some(spotlight_after_apply(home, &scan, &outcomes, &ledger));
     }
     // Once: `universal_control()` warns on stderr about a spelling it does not know, and the
     // record below asks for the policy too.
@@ -8470,37 +8041,25 @@ fn apply_machine_settings() -> MachineApply {
     let outcome = crate::machine::apply_universal_control(policy, &crate::machine::SystemDefaults);
     let uc_failed = outcome == crate::machine::UniversalControlOutcome::WriteFailed;
     out.failed |= uc_failed;
-    out.both_off =
-        !cfg.spotlight_noindex() && policy == crate::config::UniversalControlPolicy::Leave;
-    out.no_home = cfg.spotlight_noindex() && home.is_none();
+    out.left_alone = policy == crate::config::UniversalControlPolicy::Leave;
     if let Some(line) = record_universal_control_outcome(outcome, entries) {
         println!("{line}");
     }
     if !entries.is_empty() {
         emit_marker_line(&format!("atpkg: {}", machine_settings_line(entries)));
     }
-    // The record follows the change, from this pass's own measurement, so a window that just
-    // read the change line has the state a moment later instead of spawning a walk of `$HOME`.
-    // Printed whenever the Spotlight half walked, and — with that half off — only when
-    // something changed.
-    if let Some(home) = home.as_deref() {
-        let census =
-            census.or_else(|| (!entries.is_empty()).then(|| spotlight_census(home, &ledger)));
-        if let Some(census) = census {
-            print_machine_state_after_apply(cfg, policy, census);
-        }
-    }
+    // The record follows the apply, so a window that just read the change line has the
+    // state a moment later instead of spawning a read of its own.
+    print_machine_state_after_apply(cfg, policy);
     // What the passes compare against ([`machine_table_changed`]): the table this apply
     // acted on. Only an apply that ran gets here — an orphaned, off-platform or refused
-    // one returned above — so a refusal is retried by the next pass that sees it. One that
-    // did not FINISH — a live build skipped, a rename or the `defaults` write that failed —
-    // forgets the table instead, so the next pass retries it (its lines say "retried next
-    // pass"). A walk cut at its budget is finished: it stops in the same place every time.
+    // one returned above — so a refusal is retried by the next pass that sees it. One whose
+    // `defaults` write failed forgets the table instead, so the next pass retries it.
     if let Some(layout) = crate::store::resolve_configured() {
-        if finished && !uc_failed {
-            crate::machine::record_applied(&layout, cfg);
-        } else {
+        if uc_failed {
             crate::machine::forget_applied(&layout);
+        } else {
+            crate::machine::record_applied(&layout, cfg);
         }
     }
     out
@@ -8514,14 +8073,8 @@ struct MachineApply {
     entries: Vec<String>,
     /// A change did not land: a `machine settings failed —` line was printed.
     failed: bool,
-    /// The exposed build dirs this apply left open, by why.
-    open: OpenSplit,
-    /// The Spotlight walk stopped at its budget, so dirs past it were not looked at.
-    walk_cut: bool,
-    /// `[machine]` switches both settings off.
-    both_off: bool,
-    /// The Spotlight half is on, but there is no home directory to walk.
-    no_home: bool,
+    /// `[machine] universal_control = "leave"`: nothing is the apply's to change.
+    left_alone: bool,
 }
 
 impl MachineApply {
@@ -8529,30 +8082,8 @@ impl MachineApply {
     fn nothing_changed(&self) -> String {
         if self.failed {
             "nothing changed — a change did not land".to_string()
-        } else if self.open != OpenSplit::default() {
-            let OpenSplit {
-                free_standing,
-                busy,
-                refused,
-            } = self.open;
-            let cut = if self.walk_cut {
-                "; the walk stopped at its budget"
-            } else {
-                ""
-            };
-            format!(
-                "nothing changed — {} cargo target dir(s) stay open: {}{cut}",
-                free_standing + busy + refused,
-                self.open.words()
-            )
-        } else if self.walk_cut {
-            "nothing changed — the walk stopped at its budget; `aterm pkg noindex apply --all` \
-             walks further"
-                .to_string()
-        } else if self.both_off {
-            "nothing changed — [machine] switches both settings off".to_string()
-        } else if self.no_home {
-            "nothing changed — there is no home directory to walk for build output".to_string()
+        } else if self.left_alone {
+            "nothing changed — [machine] universal_control = \"leave\"".to_string()
         } else {
             "nothing changed — already applied".to_string()
         }
@@ -8561,8 +8092,8 @@ impl MachineApply {
 
 /// `<prefix>/machine.lock`, held (blocking) for one apply of the `[machine]` settings: the
 /// window's launch apply, a session's and a pass edge carrying an edit may start at once,
-/// and two of them walking `$HOME` and renaming the same build directories together is
-/// the one thing the queue exists to stop. `None` — unqueued — with no prefix to hold it
+/// and two of them reading and writing the same per-host keys together is the one thing
+/// the queue exists to stop. `None` — unqueued — with no prefix to hold it
 /// in, or a lock file that cannot be opened. Released when the returned guard drops — by
 /// `LOCK_UN`, not by the close alone: a child any thread forks while an apply holds the
 /// queue (the window's shells) keeps a copy of its description until it execs, and a
@@ -8582,16 +8113,6 @@ fn machine_apply_queue() -> Option<crate::lock::Flock> {
     crate::lock::Flock::lock(file).ok()
 }
 
-/// Whether the Spotlight half of an apply left nothing to retry: no migration failed and
-/// no live build was skipped ([`crate::noindex::Applied::held_by_build`]). A walk cut at its
-/// budget counts as finished — it stops in the same place every time, and `aterm pkg
-/// noindex apply --all` is the verb that walks further.
-fn spotlight_apply_finished(outcomes: &[crate::noindex::Applied]) -> bool {
-    !outcomes
-        .iter()
-        .any(|o| o.failure().is_some() || o.held_by_build())
-}
-
 /// Why the `[machine]` settings must NOT touch this process's machine, or `None` when
 /// they may: `$HOME` (what `home_dir()` answers) is not the account's home, or the
 /// account could not be resolved. The decision ([`machine_home_verdict`]) is pure over
@@ -8599,14 +8120,14 @@ fn spotlight_apply_finished(outcomes: &[crate::noindex::Applied]) -> bool {
 /// Whether this verb is a pass that applies the `[machine]` settings when their table
 /// CHANGED ([`machine_table_changed`]): the three long passes and `install <name>`.
 /// `update <vendor program>` never does (the edge checks its operand) — it is the lane a
-/// `claude update` runs, and must not walk `$HOME`. The quick mutators never do.
+/// `claude update` runs, and must not write a host preference. The quick mutators never do.
 fn verb_applies_machine_settings(verb: &str) -> bool {
     matches!(verb, "install" | "seed" | "update")
 }
 
 /// Whether the `[machine]` table differs from the one last applied on this machine
 /// ([`crate::machine::changed_since_applied`]) — never applied counts as changed. A pass
-/// asks this instead of walking `$HOME` every time (Phase 3): the settings' own verb,
+/// asks this instead of applying them every time (Phase 3): the settings' own verb,
 /// which the window and the session run on their schedule, keeps them applied; a pass
 /// only carries an EDIT to them.
 fn machine_table_changed() -> bool {
@@ -8656,7 +8177,7 @@ fn machine_home() -> (crate::machine::HomePosture, Option<String>) {
 /// nothing is applied — the direction the `account_home` doc promises. No `HOME` at all
 /// (`home_dir()` is `None`: unset, and `/etc/passwd` — where macOS local accounts do not
 /// appear — has no entry) is treated as the account's home, resolved or not: there is no
-/// redirect to guard against, and the Spotlight half has no home to walk. `same` is the
+/// redirect to guard against. `same` is the
 /// filesystem's own answer ([`same_directory`]) for the spellings a string compare gets
 /// wrong — a symlinked, case-variant or firmlinked home.
 fn machine_home_verdict(
@@ -8723,22 +8244,18 @@ fn machine_home_mismatch_between(
 
 /// `atpkg machine [apply]` — the `[machine]` settings' own door.
 ///
-/// Bare `atpkg machine` READS: the doctor's Universal Control line, a Spotlight line
-/// that counts what a pass WOULD hide (not merely what is exposed), the byte-stable
+/// Bare `atpkg machine` READS: the doctor's Universal Control line, the byte-stable
 /// [`MACHINE_STATE_MARKER`] record a window reader parses, and one verdict — `next — …`
 /// naming what an apply would do, `nothing to apply`, or — on a home that is not this
-/// account's — `not applied here — <why>`. A person sees the state
-/// without wading through the toolchain rows; a window confirms it from the record. `atpkg machine apply` runs
+/// account's — `not applied here — <why>`. `atpkg machine apply` runs
 /// [`apply_machine_settings`] on the spot — what the window and the session run to keep
-/// them applied — and
-/// then says what changed, that nothing changed, or that nothing was applied and why,
-/// because a verb
-/// that applies and prints nothing looks broken. Exit 0 either way: this is a state, not
-/// a gate. Anything else is a usage error.
+/// them applied — and then says what changed, that nothing changed, or that nothing was
+/// applied and why, because a verb that applies and prints nothing looks broken. Exit 0
+/// either way: this is a state, not a gate. Anything else is a usage error.
 fn cmd_machine(rest: &[String]) -> ExitCode {
     match rest {
         [] => {
-            if !crate::noindex::SUPPORTED {
+            if !cfg!(target_os = "macos") {
                 println!("{MACHINE_VERDICT_PREFIX}not applicable — these are macOS host settings");
                 return ExitCode::SUCCESS;
             }
@@ -8748,150 +8265,40 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             let policy = cfg.universal_control();
             let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
             println!("{MACHINE_VERDICT_PREFIX}{}", state.state_line(policy));
-            // NO HOME IS NOT AN EMPTY HOME. With `$HOME` unset (a launchd job, a `su`
-            // without `-`, a sandbox) there is nothing to walk, and reporting
-            // `scan=complete; spotlight-exposed=0` said the opposite of what was known:
-            // it told the reader the machine had been measured and found clean. An
-            // absent home is an INCOMPLETE scan — the same flag a budget-truncated walk
-            // sets — so every surface that says "at least" says it here too.
-            let (mut exposed, mut hidden, mut would_migrate, mut scan_complete) =
-                (0usize, 0usize, 0usize, false);
-            let mut open = OpenSplit::default();
-            // The same rule the guard uses: `HOME=` is `Some("")`, which is not a home.
-            // The same rule the guard uses, and the same fallback: `HOME=` is `Some("")`,
-            // which is not a home, and with `HOME` unset the ACCOUNT's home is the one
-            // this process is actually configuring (`defaults` follows it regardless).
-            let walk_root = aterm_types::dirs::home_dir()
-                .filter(|h| !h.as_os_str().is_empty())
-                .or_else(crate::platform::account_home);
-            // TWO REASONS A WALK IS INCOMPLETE, AND THEY READ DIFFERENTLY. `scan`
-            // answers `complete: false` both when its root is not a readable directory
-            // and when the budget ran out; only the second is "the scan hit its
-            // budget", and telling a user with an unreadable home that they have a big
-            // one sends them to the wrong fix.
-            let root_readable = walk_root
-                .as_deref()
-                .is_some_and(|h| std::fs::metadata(h).is_ok_and(|m| m.is_dir()));
-            if let Some(home) = walk_root.as_deref().filter(|_| root_readable) {
-                let census = spotlight_census(home, &noindex_ledger(true));
-                (exposed, hidden, would_migrate, open, scan_complete) = (
-                    census.exposed,
-                    census.hidden,
-                    census.would_migrate,
-                    census.open,
-                    census.complete,
-                );
-                println!(
-                    "{MACHINE_VERDICT_PREFIX}{}",
-                    spotlight_census_line(
-                        &home.display().to_string(),
-                        &census,
-                        cfg.spotlight_noindex()
-                    )
-                );
-                // WHAT THE COUNT IS NOT A COUNT OF. The walk is bounded in depth and it
-                // prunes the folders macOS guards with a consent dialog — an automatic
-                // pass may not raise a system modal in aterm's name — so a repository in
-                // `~/Documents/GitHub` is outside every number above. Said plainly, and
-                // with the verb that reaches it, because the alternative is a clean bill
-                // of health over a place nothing looked at.
-                println!(
-                    "{MACHINE_VERDICT_PREFIX}not walked: {}, or anything deeper than {} \
-                     levels — `aterm pkg noindex scan <dir>` reads one by name",
-                    crate::noindex::skipped_names(),
-                    crate::noindex::DOCTOR_DEPTH
-                );
-            } else {
-                // The `if` above is the whole Spotlight report; without a readable home
-                // there is nothing to report and the reader must not be left to assume
-                // there was.
-                match walk_root.as_deref() {
-                    None => println!(
-                        "{MACHINE_VERDICT_PREFIX}build output was not looked at: there is no \
-                         home directory to walk (HOME is unset or empty, and the account's \
-                         home could not be resolved) — `aterm pkg noindex scan <dir>` reads \
-                         one by name"
-                    ),
-                    Some(home) => println!(
-                        "{MACHINE_VERDICT_PREFIX}build output was not looked at: {} is not a \
-                         readable directory — `aterm pkg noindex scan <dir>` reads one by name",
-                        home.display()
-                    ),
-                }
-            }
             let (home_posture, mismatch) = machine_home();
             let st = crate::machine::MachineState {
                 universal_control: state.posture(),
                 policy,
-                spotlight_noindex: cfg.spotlight_noindex(),
-                exposed,
-                hidden,
-                would_migrate,
-                scan_complete,
                 home: home_posture,
                 config_unreadable: cfg.unreadable,
-                open: Some(open),
             };
             // THE LINE THE WINDOW READS — after the prose, so a person still sees
-            // sentences first, and after the SUPPORTED check, so its absence means "not
+            // sentences first, and after the platform check, so its absence means "not
             // macOS" and never "nothing to apply".
             emit_marker_line(&format!(
                 "atpkg: {MACHINE_STATE_MARKER}{}",
                 crate::machine::machine_state_line(&st)
             ));
             // ONE verdict for both surfaces: `st.next()` is what the window's Apply button
-            // reads too, so the CLI cannot say "nothing to apply" while a pass would rename
-            // a directory.
+            // reads too, so the CLI cannot say "nothing to apply" while an apply would act.
             let refusal = machine_config_refusal(cfg).or(mismatch);
             match (refusal, st.next()) {
                 (Some(reason), _) => {
                     println!("{MACHINE_VERDICT_PREFIX}not applied here — {reason}")
                 }
-                // "NOTHING TO APPLY" IS A CLAIM ABOUT WHAT WAS SEEN. When the walk did
-                // not finish — a budget cut it short, or there was no home to walk at
-                // all — the Spotlight half of that sentence is not something this read
-                // is entitled to say, so it says what it actually knows.
-                // Exposed but unreachable: `[machine] spotlight_noindex = true` wants
-                // these hidden and no pass can do it, so "where [machine] wants them" is
-                // false. The window shows the same sentence alone, from the record's split.
-                (None, None)
-                    if scan_complete && exposed > would_migrate && cfg.spotlight_noindex() =>
-                {
-                    println!(
-                        "{MACHINE_VERDICT_PREFIX}{}",
-                        crate::machine::stay_open_verdict(exposed - would_migrate, Some(open))
-                    );
-                }
-                (None, None) if !scan_complete => println!(
-                    "{MACHINE_VERDICT_PREFIX}nothing to apply from what was seen — Universal \
-                     Control is where [machine] wants it, and the build-output scan did not \
-                     finish, so there may be more"
+                (None, false) => println!(
+                    "{MACHINE_VERDICT_PREFIX}nothing to apply — Universal Control is where \
+                     [machine] wants it"
                 ),
-                (None, None) => println!(
-                    "{MACHINE_VERDICT_PREFIX}nothing to apply — Universal Control and Spotlight are \
-                     where [machine] wants them"
+                (None, true) => println!(
+                    "{MACHINE_VERDICT_PREFIX}next — aterm pkg machine apply (Universal Control \
+                     off for this host)"
                 ),
-                (None, Some(next)) => {
-                    let mut what: Vec<String> = Vec::new();
-                    if next.universal_control {
-                        what.push("Universal Control off for this host".to_string());
-                    }
-                    if next.spotlight > 0 {
-                        what.push(format!(
-                            "{} target dir(s) hidden from Spotlight",
-                            next.spotlight
-                        ));
-                    }
-                    println!(
-                        "{MACHINE_VERDICT_PREFIX}next — aterm pkg machine apply ({})",
-                        what.join("; ")
-                    );
-                }
             }
             ExitCode::SUCCESS
         }
         [sub] if sub == "apply" => {
-            if !crate::noindex::SUPPORTED {
+            if !cfg!(target_os = "macos") {
                 println!("{MACHINE_VERDICT_PREFIX}not applicable — these are macOS host settings");
                 return ExitCode::SUCCESS;
             }
@@ -8922,7 +8329,7 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        // NAME THE WORD THAT WAS REFUSED, as `noindex` does: a bare usage block leaves
+        // NAME THE WORD THAT WAS REFUSED: a bare usage block leaves
         // the reader to diff their command against it, and `machine help` (a reasonable
         // guess) looks identical to a typo.
         other => {
@@ -8943,48 +8350,35 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Whether the automatic pass narrates one [`render_applied`] line: the rows that DID
-/// something, plus every skip the user has to act on. The pass log is not the place for
-/// 73 routine "skipped" lines every six hours — not beside a Cargo.toml, a live build
-/// (retried next pass), not applicable — nor for already-excluded rows. Any OTHER skip
-/// recurs on every pass until someone acts: a crate whose cargo config cannot be pointed
-/// (nothing renamed), a destination that already exists (audit K11). One outcome renders
-/// one `skipped` line,
-/// so each prints once per pass.
-fn noindex_pass_prints(line: &str) -> bool {
-    if line.starts_with("migrated ")
-        || line.starts_with("restored ")
-        || line.starts_with("repaired ")
-        || line.starts_with("FAILED ")
-        || line.starts_with("the walk stopped at its budget")
-        || line.starts_with("  cargo")
-        || line.starts_with("  git")
-    {
-        return true;
-    }
-    let Some(skip) = line.strip_prefix("skipped ") else {
-        return false;
-    };
-    let Some((_, reason)) = skip.split_once(" — ") else {
-        return true;
-    };
-    !(reason.starts_with("not beside a Cargo.toml")
-        || reason.starts_with("not applicable")
-        || (reason.starts_with("a build holds ") && reason.ends_with("retried next pass")))
+/// One agent program on the `managed-current:` line ([`managed_current_entries`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedAgent {
+    /// `claude`, `codex`.
+    pub(crate) name: String,
+    /// The version its active build is.
+    pub(crate) version: String,
+    /// What the parenthesis says: `<Vendor> latest` while a check that reached the vendor
+    /// this run (and within a day) found it the head; [`NOT_CHECKED`] when this run could
+    /// not reach the vendor or no check has for a day; else
+    /// [`crate::state::not_current`]'s word for its row (`held`, `failed`, …).
+    pub(crate) standing: String,
 }
 
-/// The `managed-current:` payload ([`MANAGED_CURRENT_MARKER`]) for `entries` —
-/// `(name, version, vendor)` per agent program that is installed AND at its vendor's
-/// latest, in roster order — as `claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI
-/// latest)`. `None` when no entry qualifies: the line is then omitted, so its presence
-/// means exactly "the managed agents are current".
-fn managed_current_line(entries: &[(String, String, String)]) -> Option<String> {
+/// The standing of a managed agent program whose vendor this run could not reach, or no
+/// check has reached for a day: its row is an older check's ([`ManagedAgent::standing`]).
+pub const NOT_CHECKED: &str = "not checked";
+
+/// The `managed-current:` payload ([`MANAGED_CURRENT_MARKER`]) for `entries`, in roster
+/// order — `claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)`, or
+/// `claude 2.1.280 (not checked); …` for a program the pass could not check. `None` when
+/// there is no entry: the line is then omitted.
+fn managed_current_line(entries: &[ManagedAgent]) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
     let parts: Vec<String> = entries
         .iter()
-        .map(|(name, version, vendor)| format!("{name} {version} ({vendor} latest)"))
+        .map(|a| format!("{} {} ({})", a.name, a.version, a.standing))
         .collect();
     Some(format!("{MANAGED_CURRENT_MARKER}{}", parts.join("; ")))
 }
@@ -9292,33 +8686,29 @@ pub(crate) fn agent_shell_shadow(
 }
 
 /// The entries behind [`managed_current_line`]: every [`crate::stub::AGENT_PROGRAMS`]
-/// member whose active build is a vendor build its row records as the vendor's latest
-/// (`managed 2.1.280 — Anthropic latest`, written by the vendor lane this pass or an
-/// earlier one), with that version and vendor — except the `unchecked` ones, whose vendor
-/// this run could not reach, and those whose last head check that reached the vendor is
-/// more than a day before `now`: their row is an older check's. Offline: no index names
+/// member with an active build its row names, known by a vendor version, and whose
+/// `agents/` twin is that build (what every aterm tab runs), with its version and
+/// standing ([`ManagedAgent::standing`]): its
+/// vendor's latest when its row says so and a head check reached the vendor this run and
+/// within a day before `now`; [`NOT_CHECKED`] when the vendor is among the `unchecked`
+/// (this run could not reach it) or no check has reached it for a day — the row is an
+/// older check's; else the word for why its row is not the head. Offline: no index names
 /// these programs.
 fn managed_current_entries(
     layout: &crate::store::Layout,
     unchecked: &std::collections::BTreeSet<String>,
     now: i64,
-) -> Vec<(String, String, String)> {
+) -> Vec<ManagedAgent> {
     let installed = crate::active_builds(layout);
     let status = crate::status::read(layout);
     crate::stub::AGENT_PROGRAMS
         .iter()
-        .filter(|name| !unchecked.contains(**name))
-        .filter(|name| {
-            crate::vendor_direct::ProgramStamp::read(layout, name)
-                .is_some_and(|s| s.checked_recently(now))
-        })
         .filter_map(|name| {
             let build = *installed.get(*name)?;
             let row = status.as_ref()?.programs.get(*name)?;
             if row.installed_build != Some(build) {
                 return None;
             }
-            let (version, vendor) = crate::state::vendor_latest(&row.state)?;
             // HONEST: the row this line becomes says the managed copies are
             // what every tab runs — true only when the front-of-PATH twin really IS this
             // build. A pass whose twin was not laid (agents/ unmakeable, a lane that
@@ -9326,33 +8716,36 @@ fn managed_current_entries(
             if !agent_twin_current(layout, name, build) {
                 return None;
             }
-            Some(((*name).to_string(), version.to_string(), vendor.to_string()))
+            let checked = !unchecked.contains(*name)
+                && crate::vendor_direct::ProgramStamp::read(layout, name)
+                    .is_some_and(|s| s.checked_recently(now));
+            // The version a person knows it by: its vendor row's, or its vendor build's.
+            // A build an older index laid has neither, only a store id, and says nothing.
+            let version = match crate::state::vendor_row(&row.state) {
+                Some((version, _)) => version.to_string(),
+                None if crate::vendor_direct::is_vendor_build(build) => {
+                    crate::vendor_direct::build_label(build)
+                }
+                None => return None,
+            };
+            // A row that is not the head says why in its own word (a hold, a yank, a
+            // refusal) whatever this run reached; one the vendor's channel has not
+            // judged lately — or that no lane has judged — is not checked.
+            let standing = match (crate::state::vendor_latest(&row.state), checked) {
+                (Some((_, vendor)), true) => format!("{vendor} latest"),
+                (Some(_), false) => NOT_CHECKED.to_string(),
+                (None, _) => match crate::state::not_current(&row.state) {
+                    Some((word, _)) if word != "not reached" => word.to_string(),
+                    _ => NOT_CHECKED.to_string(),
+                },
+            };
+            Some(ManagedAgent {
+                name: (*name).to_string(),
+                version,
+                standing,
+            })
         })
         .collect()
-}
-
-/// The pass-end HEAL: clear `com.apple.provenance` from every installed file a process
-/// runs ([`crate::provenance::heal_store`]). Silent — the system fixing itself is not news: one
-/// line for the log when it cleared something or could not, never on a terminal
-/// (`provenance::log_line`) and never on stdout. `aterm pkg doctor` counts what is still
-/// tagged. The caller holds the store lock.
-fn heal_store_provenance(layout: &crate::store::Layout) -> crate::provenance::HealOutcome {
-    let outcome = crate::provenance::heal_store(layout);
-    match &outcome {
-        crate::provenance::HealOutcome::Clean => {}
-        crate::provenance::HealOutcome::Healed { cleared } => {
-            crate::provenance::log_line(&format!(
-                "cleared a macOS tag from {}",
-                crate::provenance::count_of(*cleared, "installed file")
-            ));
-        }
-        left => crate::provenance::log_line(&format!(
-            "could not clear a macOS tag from {} ({})",
-            crate::provenance::count_of(left.left().len(), "installed file"),
-            left.why().unwrap_or("no reason given")
-        )),
-    }
-    outcome
 }
 
 /// Print the `managed-current:` marker at the end of every run of the vendor lane (R6:
@@ -9541,8 +8934,8 @@ fn emit_marker_line_lossy(line: &str) {
 /// A marker line as a PERSON reads it: the plain sentence a terminal shows in its place
 /// ([`emit_marker_line`]), or `None` when it says nothing a person needs — a record for the
 /// window's ledger (`managed-current:`, `machine-state:`), or a fact a line beside it
-/// already says (`group-aborted:`, `lock-acquired:`, `shadowed:`, whose programs each
-/// had a line naming the copy that runs first and the fix, and a `machine-settings:`
+/// already says (`group-aborted:`, `lock-acquired:`, `shadowed:` and `foreign:`, whose
+/// items each had a line naming the copy or entry and the fix, and a `machine-settings:`
 /// line whose one change is Universal Control, said beside it with its revert). A line
 /// that is no marker is itself. Pure, and pinned per marker.
 fn human_marker(line: &str) -> Option<String> {
@@ -9641,18 +9034,9 @@ fn human_marker(line: &str) -> Option<String> {
     if let Some(body) = marked(MACHINE_SETTINGS_MARKER) {
         // The Universal Control change is said on its own line beside this one, revert
         // and all ([`record_universal_control_outcome`]): not twice.
-        let said: Vec<String> = body
+        let said: Vec<&str> = body
             .split("; ")
             .filter(|entry| *entry != crate::machine::UNIVERSAL_CONTROL_ENTRY)
-            .map(|entry| {
-                match entry
-                    .strip_prefix("spotlight-noindex ")
-                    .and_then(|r| r.strip_suffix(" dir(s) migrated"))
-                {
-                    Some(n) => format!("hid {n} Rust build folder(s) from Spotlight"),
-                    None => entry.to_string(),
-                }
-            })
             .collect();
         return (!said.is_empty())
             .then(|| format!("Changed this Mac's settings: {}.", said.join("; ")));
@@ -9660,6 +9044,7 @@ fn human_marker(line: &str) -> Option<String> {
     if marked(LOCK_ACQUIRED_MARKER).is_some()
         || marked(GROUP_ABORTED_MARKER).is_some()
         || marked(SHADOWED_MARKER).is_some()
+        || marked(FOREIGN_MARKER).is_some()
         || marked(MANAGED_CURRENT_MARKER).is_some()
         || marked(MACHINE_STATE_MARKER).is_some()
     {
@@ -10033,8 +9418,8 @@ fn cmd_install_argv(rest: &[String]) -> ExitCode {
 /// function has already narrated on stderr.
 ///
 /// SPLIT FROM THE VERB so the grammar is decidable without dispatching. The
-/// `--default-set` route applies this machine's `[machine]` settings (Universal Control,
-/// a migrating walk of `$HOME`) and then reaches for the network, so a test that called
+/// `--default-set` route applies this machine's `[machine]` settings (Universal Control's
+/// two `defaults` keys) and then reaches for the network, so a test that called
 /// the verb to learn what an argv MEANS would do all of that to find out.
 ///
 /// The refusals carry a built `ExitCode`, not a `u8` the caller converts: every exit
@@ -10193,8 +9578,6 @@ fn cmd_install_with(
             // turns it into a `doctor` fault instead of a line in a scrollback.
             reassert_rustup_seam(layout);
             let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
-            // And the tag, silently, over the whole store this door leaves.
-            let _ = heal_store_provenance(layout);
             ExitCode::SUCCESS
         }
         Err(crate::FlowError::Linked(p)) => {
@@ -10421,8 +9804,6 @@ fn rollback_in(
                 // disk, and keeps its root, until gc takes both.
                 let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
             }
-            // The build rolled back to may carry the tag from the day it was laid.
-            let _ = heal_store_provenance(layout);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -11737,9 +11118,6 @@ fn run_update_pass(
     // ever route its shims. Best-effort like the gc above; a root that cannot be laid is
     // said on stderr and `aterm pkg repair` names it as undone.
     let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
-    // THE TAG, over everything this pass left — the exec roots just laid included, and
-    // whatever the members did: a pass with a failing member heals the rest all the same.
-    let _ = heal_store_provenance(layout);
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
     (seams.shell_hooks)(layout);
     // R6: which managed agents are at their vendor's latest, for the window's ledger — a
@@ -13233,8 +12611,6 @@ fn install_toolset(
     print_gc_abstentions("install-default-set", &report);
     // THE RUSTUP SEAM, as the update pass re-asserts it after its gc.
     (seams.rustup_seam)(layout);
-    // THE TAG, over everything the pass left, failing members or not.
-    let _ = heal_store_provenance(layout);
     (seams.shell_hooks)(layout);
     // The pass record says whether this pass reached the index, whatever it installed: the
     // verb's exit below reports its members, the stamp what the schedulers decide on.
@@ -13417,8 +12793,6 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // tippy refuses its own `bin/rustc` copy is healed at the next launch rather than at
     // the next networked pass.
     let _ = reconcile_exec_roots(&layout, crate::seam::Depth::Shallow);
-    // And the tag, at every launch, over whatever stands — silently.
-    let _ = heal_store_provenance(&layout);
     // DO NOT PROMISE WHAT THE INDEX CANNOT DELIVER: say whether the signed index serves
     // this machine, and leave a durable trace of the answer.
     report_seedless_posture(&layout);
@@ -14277,7 +13651,6 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // Order matches the pass: gc, then the roots, then the shell hook.
         reassert_rustup_seam(&layout);
         let _ = reconcile_exec_roots(&layout, crate::seam::Depth::Shallow);
-        let _ = heal_store_provenance(&layout);
         crate::hooks::refresh(&layout);
         return if failures == 0 {
             ExitCode::SUCCESS

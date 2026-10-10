@@ -141,8 +141,7 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
 
 /// A worker that says it is done is asked once: the done check is typed
 /// where `keep going` would be, and when its answer is `DONE` the task is
-/// done: nothing more is typed, and the journal says so once (`DONE …`)
-/// (owner, 2026-09-27).
+/// done: nothing more is typed, and the journal says so once (`DONE …`).
 /// Negative control: the same turn reported as progress is continued with
 /// `keep going`.
 #[test]
@@ -290,11 +289,10 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
 
 /// The read after the accept key landed between the worker's clear and its redraw
 /// (no caret row) and the loop returned with the suggestion filled: nothing pressed,
-/// nothing journaled, nothing escalated (the narrow-composer lane of 2026-09-24,
-/// 6284114bd). That read is now taken again after one more settle, and Enter goes
-/// fenced on the read that shows the fill. Negative control: a composer still torn on
-/// the second read is not judged either, nothing more is pressed, and the journal says
-/// why.
+/// nothing journaled, nothing escalated. That read is taken again after one more
+/// settle, and Enter goes fenced on the read that shows the fill. Negative control: a
+/// composer still torn on the second read is not judged either, nothing more is
+/// pressed, and the journal says why.
 #[test]
 fn a_torn_read_after_the_accept_key_is_read_again() {
     let torn = {
@@ -508,11 +506,11 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
         });
     });
     assert_eq!(count(&m, "turn"), 1, "{lines:#?}\n{:#?}", m.requests);
-    // The act quotes the vendor's line (`wall_retry_text`), never the rote
-    // `keep going`.
+    // The act names the wall (`wall_retry_text`), never the rote `keep
+    // going`, and never the screen's words.
     assert!(
         lines.iter().any(|l| l.starts_with(
-            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported \"API Error: 529 Overloaded."
+            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported an API error (overloaded)."
         )),
         "{lines:#?}"
     );
@@ -2767,16 +2765,15 @@ fn the_act_check_is_told_to_the_host_as_no_plan() {
     );
 }
 
-/// A told second the wall clock has left is told again: the loop's deadlines
-/// are `Instant`s, which on macOS do not advance while the machine sleeps,
-/// so after a sleep the real try comes later than the second the tab shows.
-/// `tell_wait` compares the second it told with the one the wait's deadline
-/// reads as now and tells again past [`WAIT_SKEW_S`]. The sleep is the told
-/// second lagging the wall clock by ten minutes. Controls: a wait's own
-/// steps, and a second a second or two off (whole-second flooring, a clock
-/// nudged), tell nothing.
+/// A wait is told at the wall second it falls at ([`Due::unix_ms`]), once
+/// however many steps, and a sleep does not move it: the deadline falls at
+/// that second however long the Mac slept ([`Session::due_at`]). The same
+/// `Instant` set again after a sleep (the policy's own pauses are `Instant`s,
+/// which a sleep stops) names a later second, and is told again. Controls:
+/// the sleep alone, and the same `Instant` set again a second or two off (the
+/// two clocks read a moment apart), tell nothing.
 #[test]
-fn a_told_second_the_wall_clock_has_left_is_told_again() {
+fn a_wait_is_told_at_its_wall_second_and_again_only_when_that_second_moves() {
     let host = ReachHost::scripted(&[]);
     let mut m = Mock::new(true, vec![busy_screen()]);
     let opts = SuperviseOpts {
@@ -2784,36 +2781,35 @@ fn a_told_second_the_wall_clock_has_left_is_told_again() {
         ..hosted(2)
     };
     let mut s = session(&mut m, None);
+    s.set_clock(TEST_NOW, PDT);
     let at = Instant::now() + Duration::from_secs(3600);
-    s.turn_end_due = Some((at, "api-error retry 1".to_string()));
+    s.set_due(at, "api-error retry 1");
     s.tell_wait(&opts);
     s.tell_wait(&opts);
     let told = host.told();
     assert_eq!(told.len(), 1, "told once, however many steps: {told:#?}");
     let first = told[0].as_ref().expect("a plan").at_unix;
-    // A second or two off is no news.
-    let mut lagging = s.wait_told.flatten().expect("a wait told");
-    lagging.unix = first - 2;
-    s.wait_told = Some(Some(lagging));
-    s.tell_wait(&opts);
-    assert_eq!(
-        host.told().len(),
-        1,
-        "flooring is no sleep: {:#?}",
-        host.told()
+    assert!(
+        (TEST_NOW + 3599..=TEST_NOW + 3600).contains(&first),
+        "the deadline's wall second: {first}"
     );
-    // Ten minutes of sleep: the wall clock is ahead of the loop's Instants.
-    lagging.unix = first - 600;
-    s.wait_told = Some(Some(lagging));
+    // Ten minutes of sleep: the wall clock jumps, the deadline does not.
+    s.set_clock(TEST_NOW + 600, PDT);
+    s.tell_wait(&opts);
+    assert_eq!(host.told().len(), 1, "{:#?}", host.told());
+    // The same `Instant` set again after the sleep: ten minutes later.
+    s.set_due(at, "api-error retry 1");
     s.tell_wait(&opts);
     let told = host.told();
-    assert_eq!(told.len(), 2, "told again after the sleep: {told:#?}");
+    assert_eq!(told.len(), 2, "told again: {told:#?}");
     let again = told[1].as_ref().expect("a plan again").at_unix;
     assert!(
-        (first - 1..=first + 1).contains(&again),
-        "the second the deadline reads as now: {first} then {again}"
+        (first + 599..=first + 601).contains(&again),
+        "{first} then {again}"
     );
-    // And then it stands: told once more, nothing.
+    // Set again two seconds on: no news.
+    s.set_clock(TEST_NOW + 602, PDT);
+    s.set_due(at, "api-error retry 1");
     s.tell_wait(&opts);
     assert_eq!(host.told().len(), 2, "{:#?}", host.told());
 }
@@ -2905,7 +2901,7 @@ fn awaits_before_turn(m: &Mock) -> usize {
 /// the API down (the hold journaled, nothing typed), and its measure turns up
 /// while the loop waits: the point is decided again at the top of the very
 /// next step, and continued exactly once under `api-back@v1`, in words that
-/// quote the vendor and say the API is back, with no rung and no hold waited
+/// name the wall and say the API is back, with no rung and no hold waited
 /// out. Each further Down answer costs exactly one step more (one more
 /// `await` before the `turn`). Negative control: a host that stays down
 /// types nothing before the hold; the point is held, and journaled so.
@@ -2924,8 +2920,8 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
     assert_eq!(continued.len(), 1, "{lines:#?}");
     assert!(
         continued[0].starts_with(
-            "CONTINUED seq=102 rule=api-back@v1 Claude Code reported \"API Error: Can't reach the \
-             API server"
+            "CONTINUED seq=102 rule=api-back@v1 Claude Code reported an API error (the API could \
+             not be reached), and"
         ) && continued[0].contains("the API is reachable again now"),
         "{lines:#?}"
     );
@@ -2986,8 +2982,8 @@ fn a_down_measure_lost_mid_wait_puts_the_outage_back_on_the_ladder() {
     assert_eq!(continued.len(), 1, "{lines:#?}");
     assert!(
         continued[0].starts_with(
-            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported \"API Error: Can't reach \
-             the API server"
+            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported an API error (the API \
+             could not be reached);"
         ) && continued[0].contains("; trying again."),
         "{lines:#?}"
     );
@@ -5311,9 +5307,8 @@ fn a_bare_clock_reset_is_placed_for_the_wall_it_belongs_to() {
 /// The owner's tab 1 through the LOOP, 2026-09-28 12:19:43 PDT: the MEASURED
 /// screen (`…weekly-goal-paused-shell-measured.txt`) read by the real reader,
 /// its `4pm` placed by the loop's clock after the print the done row says
-/// (12:19 PM). Before the reader looked under background work the screen read busy and
-/// nothing was waited on; now the loop waits until 16:02:30 PDT — the reset and its 150 s of grace —
-/// and types nothing before it.
+/// (12:19 PM). The loop waits until 16:02:30 PDT (the reset and its 150 s of
+/// grace) and types nothing before it.
 #[test]
 fn the_measured_weekly_wall_of_tab_1_is_waited_out_until_its_reset_and_grace_have_passed() {
     const WALL: &str = include_str!(
@@ -6039,8 +6034,7 @@ fn a_wall_waited_on_is_waited_on_still_when_its_rows_scroll_out_of_view() {
 /// below): a ledger whose wall was ended (the worker worked since, the screen
 /// left it) and one whose wall was acted on since seed nothing — the loop that
 /// starts on the hidden screen types nothing; and a wall long past its horizon
-/// is history. Each run is its own test (2026-10-05): the four in turn were
-/// 30 s of one test. A control runs to its 6 s stop (a wrongly seeded act
+/// is history. A control runs to its 6 s stop (a wrongly seeded act
 /// comes at the reset and its grace, ~4 s in); the positive one ends at its
 /// turn, its 9 s stop a backstop.
 mod hidden_wall {
@@ -6429,13 +6423,14 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
     assert_eq!(s.reprint_jumps, 0);
 }
 
-/// The review of 2026-09-28: a Mac that slept through a
-/// wait is noticed (the wall clock ran ahead of the monotonic one by more than a
-/// minute; a clock stepped BACK is no sleep), and the wait the policy stands on
-/// is decided again a settle later — the network is coming back — spread by the
-/// session's own share so the sessions of one account do not all type in the
-/// same second. Only where a wait stands: a point with nothing waited on is
-/// decided again by nothing here (its ask would be posted twice).
+/// A Mac that slept through a wait is noticed (the wall clock ran ahead of the
+/// monotonic one by more than a minute; a clock stepped BACK is no sleep), and
+/// a wait the sleep carried past its wall time is decided again a settle
+/// later — the network is coming back — spread by the session's own share so
+/// the sessions of one account do not all type in the same second. Only a
+/// wait that stands and that the sleep carried past: a point with nothing
+/// waited on is decided again by nothing here (its ask would be posted twice),
+/// and a wait still ahead falls at its own wall time ([`Session::due_at`]).
 #[test]
 fn a_mac_that_slept_through_the_wait_decides_the_point_again_after_a_settle() {
     use super::super::slept_through;
@@ -6445,24 +6440,30 @@ fn a_mac_that_slept_through_the_wait_decides_the_point_again_after_a_settle() {
     assert!(slept_through(20 + 61, 20), "a sleep of a minute");
     assert!(slept_through(3 * 3600, 20), "a night");
     assert!(!slept_through(-30, 20), "a clock stepped back");
-    let sched = |sid: Option<&str>, standing: bool| {
+    // A wait three hours ahead (or none), and the Mac waking at `wall_now`.
+    let sched = |sid: Option<&str>, standing: bool, wall_now: i64| {
         let mut m = Mock::new(true, vec![busy_screen()]);
         let mut s = session(&mut m, sid.map(str::to_string));
         s.set_clock(TEST_NOW, PDT);
-        let far = Instant::now() + Duration::from_secs(3 * 3600);
-        s.turn_end_due = standing.then(|| (far, "usage-weekly resets".to_string()));
+        if standing {
+            s.set_due(
+                Instant::now() + Duration::from_secs(3 * 3600),
+                "usage-weekly resets",
+            );
+        }
         // The due is `now + settle + share` for a `now` taken inside the
         // call, so it lies between `before` and `before + took` plus that
         // offset: the call's own measured time is the slack, never a guess at
         // the machine's load.
         let before = Instant::now();
-        s.woke(102, TEST_NOW + 8 * 3600, &mut super::super::Alone);
+        s.woke(102, wall_now, &mut super::super::Alone);
         let took = before.elapsed();
         s.turn_end_due
-            .map(|(at, why)| (at.duration_since(before), took, why))
+            .map(|d| (d.at.saturating_duration_since(before), took, d.why))
     };
-    // A wait stands: decided again in 30-90 s, whatever hours it had left.
-    let (after, took, why) = sched(Some("s-1"), true).expect("a wait");
+    let past = TEST_NOW + 8 * 3600;
+    // A wait the sleep carried past: decided again in 30-90 s.
+    let (after, took, why) = sched(Some("s-1"), true, past).expect("a wait");
     assert!(
         after >= WAKE_SETTLE && after < WAKE_SETTLE + WAKE_SPREAD + took,
         "{after:?} (the call took {took:?})"
@@ -6471,61 +6472,53 @@ fn a_mac_that_slept_through_the_wait_decides_the_point_again_after_a_settle() {
     // The share is the session's: 20 sessions land on several distinct seconds.
     let mut seconds = std::collections::BTreeSet::new();
     for k in 0..20 {
-        let (after, _, _) = sched(Some(&format!("s-{k}")), true).expect("a wait");
+        let (after, _, _) = sched(Some(&format!("s-{k}")), true, past).expect("a wait");
         seconds.insert(after.as_secs());
     }
     assert!(seconds.len() >= 8, "{seconds:?}");
-    // No session id: the settle alone. NEGATIVE CONTROL: no wait, nothing set.
-    let (after, took, _) = sched(None, true).expect("a wait");
+    // No session id: the settle alone.
+    let (after, took, _) = sched(None, true, past).expect("a wait");
     assert!(
         after >= WAKE_SETTLE && after <= WAKE_SETTLE + took,
         "{after:?} (the call took {took:?})"
     );
-    assert_eq!(sched(Some("s-1"), false), None);
+    // NEGATIVE CONTROLS: no wait, nothing set; a wait the Mac woke short of
+    // stands as it was.
+    assert_eq!(sched(Some("s-1"), false, past), None);
+    let (after, _, why) = sched(Some("s-1"), true, TEST_NOW + 3600).expect("still standing");
+    assert_eq!(why, "usage-weekly resets");
+    assert!(after > Duration::from_secs(3 * 3600 - 5), "{after:?}");
+}
+
+/// Every line a step of the loop said or noted ([`Heard`]).
+fn heard_lines(heard: &Heard) -> Vec<String> {
+    heard.said.iter().chain(&heard.noted).cloned().collect()
 }
 
 /// THE SLEEP, WHERE IT IS WIRED. [`Session::wait_for_next`] marks the two
 /// clocks and looks at them at every step; a wall clock that ran ahead of the
 /// monotonic one by more than a minute between two steps is a Mac that slept,
-/// and the wait that stands is decided again a settle later. The test stages
-/// the sleep in the session's own clock (a fixed clock that jumps 4 hours on
-/// every read after the first, the monotonic one standing still) and runs the
-/// real wait. NEGATIVE CONTROLS: a clock that only ticks an ordinary step, and
-/// one stepped BACK, wake nothing; a wait with nothing standing is left alone.
+/// and the wait it carried past is decided again a settle later. The test
+/// stages the sleep in the session's own clock (a fixed clock that jumps 4
+/// hours after the wait's first read, the monotonic one standing still) and
+/// runs the real wait. NEGATIVE CONTROLS: a clock that only ticks an ordinary
+/// step, and one stepped BACK, wake nothing; a wait with nothing standing is
+/// left alone.
 #[test]
 fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
     use super::super::turn_end_loop::{WAKE_SETTLE, WAKE_SPREAD};
-    struct Noted(Vec<String>);
-    impl Review for Noted {
-        fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn review(
-            &mut self,
-            _turn: &Turn,
-            _report: Option<ReportBrief>,
-            _fold: Option<Fold>,
-        ) -> Result<bool, String> {
-            Ok(false)
-        }
-        fn say(&mut self, line: &str) -> Result<(), String> {
-            self.0.push(line.to_string());
-            Ok(())
-        }
-        fn note(&mut self, line: &str) {
-            self.0.push(line.to_string());
-        }
-        fn unattended(&self) -> bool {
-            true
-        }
-    }
     let run = |step: i64, standing: bool| {
         let mut m = Mock::new(true, vec![busy_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
-        s.set_clock_step(step);
-        let far = Instant::now() + Duration::from_secs(3 * 3600);
-        s.turn_end_due = standing.then(|| (far, "usage-weekly resets".to_string()));
+        if standing {
+            s.set_due(
+                Instant::now() + Duration::from_secs(3 * 3600),
+                "usage-weekly resets",
+            );
+        }
+        // The wait marks the clocks at its entry, the jump comes after.
+        s.set_clock_jump(step);
         let seen = Turn {
             phase: Phase::Idle,
             screen: Screen {
@@ -6537,18 +6530,19 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
         };
         let began = Instant::now();
         let mut deadline = began + Duration::from_millis(600);
-        let mut review = Noted(Vec::new());
+        let mut review = Heard::default();
         let end = s.wait_for_next(seen, &hosted(30), &[], &mut deadline, &mut review);
         let took = began.elapsed();
+        let lines = heard_lines(&review);
         // The scripted server answers the first wait with a moved screen: the
         // step ends, the loop looks again. What the step did to the wait is
         // what is asserted.
-        assert!(end.is_ok(), "step {step}: {:#?}", review.0);
+        assert!(end.is_ok(), "step {step}: {lines:#?}");
         let due = s
             .turn_end_due
             .clone()
-            .map(|(at, why)| (at.duration_since(began), why));
-        (review.0, due, took)
+            .map(|d| (d.at.saturating_duration_since(began), d.why));
+        (lines, due, took)
     };
     // Four hours in one read: the Mac slept.
     let (lines, due, took) = run(4 * 3600, true);
@@ -6580,40 +6574,16 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
     assert!(lines.is_empty() && due.is_none(), "{lines:#?} {due:?}");
 }
 
-/// THE SLEEP BETWEEN TWO CALLS OF THE WAIT (the review of the merged main):
+/// THE SLEEP BETWEEN TWO CALLS OF THE WAIT:
 /// a wait that ends on an owed look or a host wake is entered again on the SAME
 /// point, and the Mac may have slept in between — the marks of the check are
 /// the point's, not one call's, so the second call sees it, and the standing
-/// due (an `Instant`, late by the sleep) is decided again a settle later.
-/// NEGATIVE CONTROLS: the same two calls with no jump between them wake
-/// nothing, and a second call on ANOTHER point starts its marks afresh (its
-/// wait was decided after the sleep).
+/// due the sleep carried past is decided again a settle later. NEGATIVE
+/// CONTROLS: the same two calls with no jump between them wake nothing, and a
+/// second call on ANOTHER seq starts its marks afresh (a sleep they miss
+/// delays nothing: the next test).
 #[test]
 fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
-    struct Noted(Vec<String>);
-    impl Review for Noted {
-        fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn review(
-            &mut self,
-            _turn: &Turn,
-            _report: Option<ReportBrief>,
-            _fold: Option<Fold>,
-        ) -> Result<bool, String> {
-            Ok(false)
-        }
-        fn say(&mut self, line: &str) -> Result<(), String> {
-            self.0.push(line.to_string());
-            Ok(())
-        }
-        fn note(&mut self, line: &str) {
-            self.0.push(line.to_string());
-        }
-        fn unattended(&self) -> bool {
-            true
-        }
-    }
     let seen = |seq: u64| Turn {
         phase: Phase::Idle,
         screen: Screen {
@@ -6629,16 +6599,20 @@ fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
         let mut m = Mock::new(true, vec![busy_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
-        let far = Instant::now() + Duration::from_secs(3 * 3600);
-        s.turn_end_due = Some((far, "usage-weekly resets".to_string()));
-        let mut review = Noted(Vec::new());
+        s.set_due(
+            Instant::now() + Duration::from_secs(3 * 3600),
+            "usage-weekly resets",
+        );
+        let mut review = Heard::default();
         let mut deadline = Instant::now() + Duration::from_millis(600);
         let first = s.wait_for_next(seen(102), &hosted(30), &[], &mut deadline, &mut review);
-        assert!(first.is_ok(), "{:#?}", review.0);
+        assert!(first.is_ok(), "{:#?}", heard_lines(&review));
         assert!(
-            !review.0.iter().any(|l| l.contains("the Mac woke")),
+            !heard_lines(&review)
+                .iter()
+                .any(|l| l.contains("the Mac woke")),
             "the first call saw no sleep: {:#?}",
-            review.0
+            heard_lines(&review)
         );
         s.set_clock(TEST_NOW + jump, PDT);
         let mut deadline = Instant::now() + Duration::from_millis(600);
@@ -6649,8 +6623,8 @@ fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
             &mut deadline,
             &mut review,
         );
-        assert!(second.is_ok(), "{:#?}", review.0);
-        (review.0, s.turn_end_due.clone().map(|(_, why)| why))
+        assert!(second.is_ok(), "{:#?}", heard_lines(&review));
+        (heard_lines(&review), s.turn_end_due.clone().map(|d| d.why))
     };
     let (lines, why) = run(4 * 3600, 102);
     assert!(
@@ -6669,8 +6643,94 @@ fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
     let (lines, _) = run(4 * 3600, 103);
     assert!(
         !lines.iter().any(|l| l.contains("the Mac woke")),
-        "another point starts afresh: {lines:#?}"
+        "another seq starts afresh: {lines:#?}"
     );
+}
+
+/// THE RESET A SLEEP CARRIED THE WAIT PAST, WHERE THE WAIT SAW NO SLEEP (the
+/// audit of 2026-10-09: `WAITING … usage-weekly resets` until the weekly
+/// reset, the Mac asleep 4.26 days across it, and no `CONTINUED …
+/// rule=usage-resume@v1` until a person resumed three tabs 11.6-14.1 h after
+/// it). A weekly limit decided before its reset waits for it; the Mac sleeps
+/// eleven hours past the reset — the wall clock jumps, the monotonic one
+/// stands still — and wakes on a repaint, so the loop waits again on the same
+/// point at a NEW seq, whose clock marks start afresh and see no sleep
+/// ([`Session::check_slept`]). The deadline falls at its wall time all the
+/// same ([`Session::due_at`]), at the wait's first step: the point is decided
+/// again on the reset now past, and the continuation is typed. NEGATIVE
+/// CONTROL: the same sleep with no wait standing types nothing.
+#[test]
+fn a_reset_a_sleep_carried_the_wait_past_is_continued_though_the_wait_saw_no_sleep() {
+    let point = |seq: u64| Turn {
+        phase: Phase::Limited {
+            message: WEEKLY_TEXT.to_string(),
+            reset: Some(WEEKLY_RESET.to_string()),
+        },
+        screen: Screen {
+            rows: weekly_limited(),
+            seq,
+            ..Screen::default()
+        },
+        timed_out: false,
+    };
+    let run = |decided: bool| {
+        let mut m = Mock::new(true, vec![weekly_limited()]);
+        let opts = hosted(30);
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        if decided {
+            let action = s
+                .turn_end_at_point(&point(102), Some(Duration::from_secs(180)), &opts)
+                .expect("a decision");
+            assert!(
+                matches!(action, TurnEndAction::WaitUntil { .. }),
+                "{action:?}"
+            );
+            s.turn_end_execute(&point(102), action, &opts, &[], &mut heard)
+                .expect("the wait is set");
+        }
+        // The wait before the sleep: the scripted server's first answer is
+        // a moved screen.
+        let mut deadline = Instant::now() + Duration::from_millis(600);
+        let before = s.wait_for_next(point(102), &opts, &[], &mut deadline, &mut heard);
+        assert!(before.is_ok(), "{:#?}", heard_lines(&heard));
+        // Asleep across the reset, woken on a repaint: the same point, a new
+        // seq.
+        s.set_clock(AFTER_RESET + 11 * 3600, PDT);
+        let mut deadline = Instant::now() + Duration::from_millis(600);
+        let after = s.wait_for_next(point(103), &opts, &[], &mut deadline, &mut heard);
+        assert!(after.is_ok(), "{:#?}", heard_lines(&heard));
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (heard_lines(&heard), typed)
+    };
+    let (lines, typed) = run(true);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("WAITING seq=102 until=") && l.ends_with("usage-weekly resets")),
+        "the reset was waited for: {lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("the Mac woke")),
+        "the wait saw no sleep: {lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("CONTINUED seq=") && l.contains("rule=usage-resume@v1")),
+        "the reset passed in the sleep is continued at once: {lines:#?}"
+    );
+    assert!(typed > 0, "{lines:#?}");
+    // NEGATIVE CONTROL.
+    let (lines, typed) = run(false);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "{lines:#?}"
+    );
+    assert_eq!(typed, 0, "{lines:#?}");
 }
 
 /// A screen as the loop reads one.
@@ -6795,19 +6855,15 @@ fn a_reset_cached_as_unix_follows_the_wall_clock() {
     );
 }
 
-/// ONE PLACEMENT IS ONE STAMP, whatever part of a second each read fell in
-/// (2026-10-02). The reset is placed once, as a unix second, and turned into an
-/// `Instant` at every reading and back into a stamp when the wait is
-/// journaled. Against a clock read in whole seconds each conversion carried its
-/// read's sub-second phase, so a reading made before a second turned and a
-/// stamp made after it put the same placement a second apart: the journal said
-/// `until=…:19Z`, then `until=…:20Z`, for one wait
-/// ([`a_wall_waited_on_is_waited_on_still_when_its_rows_scroll_out_of_view`],
-/// red 3 times in 61 recorded runs, each on a loaded machine). Staged with the
-/// clock running from 900 ms into its second: the first reading places the
-/// reset, the second turns, the second reading and every stamp come after it.
-/// The assertions hold however long the sleep takes; on the old conversion
-/// the first stamp read the placement plus one.
+/// ONE PLACEMENT IS ONE STAMP, whatever part of a second each read fell in.
+/// The reset is placed once, as a unix second, and turned into an `Instant`
+/// at every reading and back into a stamp when the wait is journaled. A
+/// conversion that carries its read's sub-second phase puts a reading made
+/// before a second turns and a stamp made after it a second apart
+/// (`until=…:19Z`, then `until=…:20Z`, for one wait). Staged with the clock
+/// running from 900 ms into its second: the first reading places the reset,
+/// the second turns, the second reading and every stamp come after it. The
+/// assertions hold however long the sleep takes.
 #[test]
 fn one_placed_reset_stamps_as_its_own_second_across_a_turning_second() {
     let mut m = Mock::new(true, vec![busy_screen()]);
@@ -6848,17 +6904,17 @@ fn one_placed_reset_stamps_as_its_own_second_across_a_turning_second() {
     assert_eq!(s.unix_of(s.instant_of(ahead)), ahead);
 }
 
-/// EVERY UNIX SECOND IS ITSELF, AT EVERY PHASE OF THE CLOCK (2026-10-03, from
-/// the review of the millisecond conversions). The deterministic half of
+/// EVERY UNIX SECOND IS ITSELF, AT EVERY PHASE OF THE CLOCK. The
+/// deterministic half of
 /// [`one_placed_reset_stamps_as_its_own_second_across_a_turning_second`]: a
 /// FIXED clock stood at nine phases of its second (no sleep, no running
 /// clock), and at each a unix second made an `Instant` by `instant_of` reads
 /// back as itself through `unix_of`, and one still ahead stamps as itself
 /// through `stamp_in`. That test reads back ~50 ms past a second's turn, where
 /// a read-back that drops its own read's phase still rounds right; from
-/// 500 ms on it cannot. Each conversion put back on whole seconds — `instant_of`,
-/// `unix_of`, or `stamp_in` in its old `now_unix() + ahead` form — fails here;
-/// the last two passed the turning-second test.
+/// 500 ms on it cannot. Each conversion put on whole seconds — `instant_of`,
+/// `unix_of`, or `stamp_in` as `now_unix() + ahead` — fails here; the last
+/// two pass the turning-second test.
 #[test]
 fn a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock() {
     let mut m = Mock::new(true, vec![busy_screen()]);
@@ -6894,16 +6950,15 @@ fn a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock() {
     );
 }
 
-/// A SWITCH CARRIED ON KEEPS ITS SECONDS, at every phase of the clock
-/// (2026-10-03). A loop that starts after another left a model switch or a
-/// Codex wind-down open puts the times the ledger's rows name on its own clock
+/// A SWITCH CARRIED ON KEEPS ITS SECONDS, at every phase of the clock. A
+/// loop that starts after another left a model switch or a Codex wind-down
+/// open puts the times the ledger's rows name on its own clock
 /// ([`Session::carried_model_switch`], [`Session::carried_wind`]), and each
 /// reads back — the switch's reset, and the wind-down's reset, hold, last
 /// Esc, opening and press in its own row words — as the second its row
 /// named. Through the real rows ([`seed_switch`], [`seed_wind_at`]) and their
-/// readers. Placed by whole seconds (the two inline copies these replaced),
-/// every time came back a second late whenever the clock stood 500 ms or more
-/// into its second.
+/// readers. Placed by whole seconds, every time comes back a second late
+/// whenever the clock stands 500 ms or more into its second.
 #[test]
 fn a_switch_carried_on_keeps_its_seconds_at_any_phase_of_the_clock() {
     use crate::supervise::approvals::{open_model_switch, open_wind_down};
@@ -6966,8 +7021,8 @@ fn a_switch_carried_on_keeps_its_seconds_at_any_phase_of_the_clock() {
 /// THE WALL IS WRITTEN DOWN, and its end. The loop that waits on a wall writes a
 /// `wall-wait@v1` row with the reset as it placed it, for a loop that follows it
 /// (a GUI replacement, a fault); a live turn drawn under the wall ends it with a
-/// `wall-wait-end@v1` row, and the ledger then holds no open wall. Before the
-/// row was written an update at that moment lost the wait for good.
+/// `wall-wait-end@v1` row, and the ledger then holds no open wall. Without
+/// the row an update at that moment loses the wait for good.
 /// NEGATIVE CONTROL: a run that never saw a wall writes neither row.
 #[test]
 fn the_wall_waited_on_is_written_to_the_ledger_and_its_end_too() {
@@ -7324,7 +7379,7 @@ impl IdleHost for LadderHost {
     }
 }
 
-/// THE STALL'S END KEEPS THE POINT UNDER IT (review of 2026-09-29): the host has
+/// THE STALL'S END KEEPS THE POINT UNDER IT: the host has
 /// one exception slot per tab, so when the raised stall ends while a point's
 /// exception still stands, the host is told that point again, not `None`.
 /// NEGATIVE CONTROL: with no point standing, the end is `exception:none`.
@@ -7354,11 +7409,11 @@ fn a_stall_that_ends_tells_the_host_the_point_that_stood_under_it() {
     assert_eq!(end(false), ["unread:none", "exception:none"]);
 }
 
-/// THE CANARY FOR A SCREEN NO READER NAMES (the review of 2026-09-29) AND THE
+/// THE CANARY FOR A SCREEN NO READER NAMES AND THE
 /// LADDER ABOVE IT (design-exceptions 9.3). A screen that reads busy on the
 /// agent's own background work alone, while the agent's OWN terminal title
 /// rests on the idle glyph (`✳`; a working agent animates it), is one this
-/// build does not read — the 4 h 44 m of 2026-09-28 in a new dress. Kept up:
+/// build does not read. Kept up:
 /// `STUCK` (rung 1, the journal), `STALLED` and the host's record (rung 2,
 /// three times as long), `EXCEPTION kind=stalled` and the host's exception (rung
 /// 3, six times), each ONCE, and the loop's end withdraws both (`CLEARED
@@ -8127,10 +8182,10 @@ fn a_wait_on_the_hosts_advice_is_decided_again_when_its_stamp_moves() {
     );
     // NEGATIVE CONTROL: before any decision the host was asked nothing.
     host.stamp.store(7, Ordering::SeqCst);
-    s.turn_end_due = Some((
+    s.set_due(
         Instant::now() + Duration::from_secs(3600),
-        "usage-session resets".to_string(),
-    ));
+        "usage-session resets",
+    );
     assert!(!s.account_edge(&opts), "no advice asked: nothing to re-ask");
     s.turn_end_due = None;
 
@@ -8804,7 +8859,7 @@ fn account_session<'m>(m: &'m mut Mock) -> (Session<'m, Mock>, Turn) {
 /// wall stands; once the worker has worked and its turn ended with no wall,
 /// THAT point asks again — the fold is what ends the latch, and asked before
 /// it the host was passed over for one more turn end (and for a whole second
-/// wall where the work ended on the limit again: the review of 2026-10-01).
+/// wall where the work ended on the limit again).
 /// NEGATIVE CONTROL: the wall read again with no work asks nothing.
 #[test]
 fn the_host_is_asked_on_the_folded_point_where_a_latch_has_ended() {
@@ -8928,10 +8983,10 @@ fn under_accounts_off_nothing_is_told_or_asked() {
             .turn_end_at_point(&wall, Some(Duration::from_secs(180)), &opts)
             .expect("a decision");
         host.stamp.store(5, Ordering::SeqCst);
-        s.turn_end_due = Some((
+        s.set_due(
             Instant::now() + Duration::from_secs(3600),
-            "usage-session resets".to_string(),
-        ));
+            "usage-session resets",
+        );
         (host.all(), s.account_edge(&opts))
     };
     assert_eq!(
@@ -9133,8 +9188,7 @@ fn a_usage_resume_typed_into_the_account_a_session_left_is_not_taken_up() {
 /// the move), tells its host `served` at the first turn that ends with no
 /// wall — and writes the answer; a loop that starts after THAT tells nothing
 /// and holds no move. A lost login told by the loop before is not told
-/// again. NEGATIVE CONTROL: until 2026-10-01 the `typed` row closed the
-/// move, and no loop ever told `served` for it.
+/// again. NEGATIVE CONTROL: the same lost login, not told yet, is told.
 #[test]
 fn a_move_seeded_from_the_ledger_is_answered_once_across_loops() {
     use crate::supervise::approvals::{
@@ -9975,9 +10029,7 @@ fn due_probe_at_a_gate(
     (first, heard.said, probe_writes(&m), host.said("probe"))
 }
 
-/// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT (the live check of
-/// 2026-10-02: seven sessions under a roster that advised the probe, no
-/// `/usage` typed in any, and nothing anywhere said why). One row a gate of
+/// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT. One row a gate of
 /// the loop's — each the same world with ONE thing changed — and for each:
 /// nothing is written, and ONE line is said,
 /// `SKIPPED seq=<n> rule=usage-probe@v1 gate=<word>`, the claim's with the
@@ -10073,10 +10125,10 @@ fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
     assert_eq!(claims, ["probe:claimed", "probed:ok"]);
 }
 
-/// THE LIVE CHECK'S CASE, IN THE WHOLE LOOP (2026-10-02): the roster advises
+/// A DUE PROBE NOT RUN, IN THE WHOLE LOOP: the roster advises
 /// the probe at a turn end whose turn the loop never read LIVE — a reply
 /// that came and went inside the settle after the Enter — and nothing is
-/// typed. The loop now SAYS so, printed (a hosted loop's printed lines are
+/// typed. The loop SAYS so, printed (a hosted loop's printed lines are
 /// its host's log) and journaled, right after the point's own line: `SKIPPED
 /// … gate=not-live`. And a host that wants the point for a step of its own
 /// is `gate=host-wants` — where the point is OFFERED to it and it takes it
@@ -11494,8 +11546,8 @@ const USAGE_LEFT_TOLD: &str = "inform:/usage was typed and not sent\nThe supervi
                                until you send or clear it; its panel is closed either way.";
 
 /// `/usage` WRITTEN AND NOT SUBMITTED (the screen moved before its Enter:
-/// `OK skipped reason=changed`) IS A RECORD AND RAISES NOTHING (the ruling
-/// of 2026-10-02: alerts have a class, and this is none): the host is told
+/// `OK skipped reason=changed`) IS A RECORD AND RAISES NOTHING (alerts have
+/// a class, and this is none): the host is told
 /// `not-written` and informed ONCE
 /// ([`IdleHost::inform`], no badge), the journal holds its one `SKIPPED`
 /// line — and no attention is set, no ask posted, nothing escalated. THE
@@ -11504,9 +11556,8 @@ const USAGE_LEFT_TOLD: &str = "inform:/usage was typed and not sent\nThe supervi
 /// here), the panel that opens is the harness's: the loop that follows
 /// closes it, and samples nothing.
 ///
-/// NEGATIVE CONTROL: ANOTHER RULE'S LEFTOVER STILL ESCALATES, exactly as
-/// before. The same world and the same skipped Enter with the claim
-/// declined — so the text left typed is the continuation's — sets the
+/// NEGATIVE CONTROL: ANOTHER RULE'S LEFTOVER STILL ESCALATES. The same world
+/// and the same skipped Enter with the claim declined — so the text left typed is the continuation's — sets the
 /// worker's `attention` to `typed, not submitted (…): `keep going``,
 /// journals `ESCALATED`, and informs nobody. And the look that finds the
 /// composer still holding `/usage` closes nothing and writes no `waiting`

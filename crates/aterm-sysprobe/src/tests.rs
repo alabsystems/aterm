@@ -185,8 +185,7 @@ fn a_linux_reading_assembles_from_the_texts() {
 /// users, a pid that exited between the listing and the read, a `vmstat`
 /// longer than the read cap, and two thermal zones.
 ///
-/// The repository holds no symlink (the spin and paint guards' source take
-/// fails closed on one), so each `/proc/<pid>/exe` link is committed as an
+/// The repository commits no symlink, so each `/proc/<pid>/exe` link is committed as an
 /// `exe.link` text file naming its target. Every call copies the tree into a
 /// private scratch directory, makes those links real there (on unix), and
 /// removes the copy when the fixture drops.

@@ -205,10 +205,9 @@ fn report_associated_text_omits_payload_for_named_key() {
 // Spec: "Additionally, with this mode [Report all keys as escape codes],
 // events for pressing modifier keys are reported." Under every other flag
 // combination — including REPORT_EVENT_TYPES — kitty's is_modifier_key gate
-// drops bare modifier events entirely, press AND release. (An earlier
-// revision reported modifier releases under 0b10-only, citing kitty #5996;
-// that issue is an unrelated IBus/Neovim display bug and never justified
-// the divergence.)
+// drops bare modifier events entirely, press AND release. (kitty #5996 is an
+// unrelated IBus/Neovim display bug; it does not justify reporting modifier
+// releases under 0b10-only.)
 // =========================================================================
 
 #[test]

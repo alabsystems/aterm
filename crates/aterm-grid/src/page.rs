@@ -28,21 +28,13 @@
 )]
 
 use std::cell::UnsafeCell;
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
-/// Page size: 64 KB in production, 256 bytes under Kani.
-///
-/// CBMC cannot model a 64 KB array symbolically in reasonable time. Offset
-/// arithmetic, allocation bounds and pooling invariants are all
-/// PAGE_SIZE-relative, so 256 bytes suffices (like `KANI_MAX_ROWS` /
-/// `KANI_MAX_COLS`).
-#[cfg(not(kani))]
+/// Page size: 64 KB.
 pub const PAGE_SIZE: usize = 64 * 1024;
-#[cfg(kani)]
-pub const PAGE_SIZE: usize = 256;
 
 /// A page of terminal data.
 ///
@@ -118,7 +110,7 @@ impl Default for Page {
 ///
 /// This is NOT a pointer - it's an index that remains valid
 /// after the page is copied, serialized, or memory-mapped.
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Offset<T> {
@@ -129,16 +121,16 @@ pub struct Offset<T> {
 }
 
 // Manual Copy/Clone impl because derive requires T: Copy, but PhantomData<T> is always Copy
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl<T> Copy for Offset<T> {}
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl<T> Clone for Offset<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl<T> Offset<T> {
     /// Create a new offset.
     ///
@@ -156,7 +148,7 @@ impl<T> Offset<T> {
     }
 
     /// Get the byte offset.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub const fn byte_offset(self) -> u32 {
         self.byte_offset
@@ -170,7 +162,7 @@ impl<T> Offset<T> {
     ///
     /// - The page must contain valid, initialized data at this offset
     /// - The type `T` at the offset must have been properly constructed
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) unsafe fn get<'a>(&self, page: &'a Page) -> Option<&'a T> {
         let offset = self.byte_offset as usize;
@@ -194,7 +186,7 @@ impl<T> Offset<T> {
     /// # Safety
     ///
     /// Same as `get`, plus exclusive access to the memory at this offset.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     #[allow(
         clippy::mut_from_ref,
@@ -226,7 +218,7 @@ pub struct PageSlice<T> {
     ptr: NonNull<T>,
     len: u16,
     page_id: PageId,
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     offset: Offset<T>,
 }
 
@@ -245,7 +237,7 @@ impl<T> PageSlice<T> {
     }
 
     /// Offset within the page.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub const fn offset(&self) -> Offset<T> {
         self.offset
@@ -302,41 +294,6 @@ unsafe impl<T: Send> Send for PageSlice<T> {}
 // `&mut PageSlice<T>`, which Rust's borrow checker guarantees is exclusive.
 unsafe impl<T: Sync> Sync for PageSlice<T> {}
 
-#[cfg(kani)]
-impl<T> PageSlice<T> {
-    /// Create a PageSlice from a raw mutable slice.
-    ///
-    /// # Safety
-    ///
-    /// This is safe because:
-    /// - Kani verification runs in a single thread
-    /// - The slice lifetime is tied to the static array
-    /// - Used only for Kani proofs, not production code
-    ///
-    /// # Arguments
-    ///
-    /// * `slice` - Mutable reference to a slice of T
-    ///
-    /// # Returns
-    ///
-    /// A PageSlice pointing to the provided slice with page_id 0 and offset 0.
-    #[must_use]
-    pub(crate) fn from_raw(slice: &mut [T]) -> Self {
-        let ptr = NonNull::new(slice.as_mut_ptr()).expect("slice pointer is null");
-        let len = slice.len().min(u16::MAX as usize) as u16;
-        Self {
-            ptr,
-            len,
-            page_id: 0,
-            #[cfg(any(test, kani, feature = "testing"))]
-            offset: Offset {
-                byte_offset: 0,
-                _marker: PhantomData,
-            },
-        }
-    }
-}
-
 #[path = "page_store.rs"]
 mod page_store;
 pub use page_store::PageStore;
@@ -345,7 +302,3 @@ pub use page_store::PageStore;
 #[cfg(test)]
 #[path = "page_tests/mod.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "page_kani_proofs.rs"]
-mod proofs;

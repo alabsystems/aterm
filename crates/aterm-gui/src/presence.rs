@@ -111,6 +111,12 @@ impl aterm_messages::presence::Host for Native {
         stall.restart.survived
     }
 
+    /// The publication's explicit restart ([`crate::input_stall::InputStallFact::act`]):
+    /// what the attention entry and the menu row name too.
+    fn stall_restart(stall: &crate::input_stall::InputStallFact) -> Option<&str> {
+        stall.act.as_ref().map(|act| act.cmd.as_str())
+    }
+
     fn is_aterms_holder(holder: &str) -> bool {
         holder == crate::harness_host::holder()
     }
@@ -1942,13 +1948,14 @@ mod tests {
         // beside that row in `menu.rs`.
     }
 
-    /// This host's stall seam: `Native`'s three accessors over the server's real
+    /// This host's stall seam: `Native`'s four accessors over the server's real
     /// [`crate::input_stall::InputStallFact`]: `since` reads the fact's instant,
-    /// `stopped` its `stopped` field (not the word) and `survived` its restart
-    /// record. Each case differs in exactly the field its accessor reads, so a
-    /// crossed or constant accessor fails one of them.
+    /// `stopped` its `stopped` field (not the word), `survived` its restart
+    /// record and `restart` the publication's explicit restart (`act`). Each
+    /// case differs in exactly the field its accessor reads, so a crossed or
+    /// constant accessor fails one of them.
     #[test]
-    fn the_native_stall_seam_reads_since_stopped_and_survived_off_the_fact() {
+    fn the_native_stall_seam_reads_since_stopped_survived_and_the_act_off_the_fact() {
         use crate::input_stall::{InputStallFact, Restart};
         use aterm_session::input_backlog::InputWord;
         let now = t0();
@@ -1960,6 +1967,7 @@ mod tests {
             stopped: false,
             rss_mb: None,
             restart: Restart::default(),
+            act: None,
         };
         let read = |fact: InputStallFact| {
             let mut s = Slot::new(now);
@@ -2004,13 +2012,14 @@ mod tests {
             w.sentence
         );
         // Survived is the restart record's.
-        let (_, chip, w) = read(InputStallFact {
+        let survived = InputStallFact {
             restart: Restart {
                 survived: true,
                 ..Restart::default()
             },
-            ..frozen
-        });
+            ..frozen.clone()
+        };
+        let (_, chip, w) = read(survived.clone());
         assert_eq!(chip, ChipLevel::Stop(StopCause::Frozen));
         assert_eq!(
             w.since,
@@ -2021,6 +2030,23 @@ mod tests {
             "{}",
             w.sentence
         );
+        // The act is the publication's: named by both frozen remedies.
+        let act = "aterm ctl @s-1 restart pid=4242 if-stalled";
+        for fact in [frozen, survived] {
+            let (_, _, w) = read(InputStallFact {
+                act: Some(crate::input_stall::StallAct {
+                    cmd: act.to_string(),
+                    promised: true,
+                }),
+                ..fact
+            });
+            assert!(
+                w.sentence.contains(&format!("; restart it with {act}"))
+                    && !w.sentence.contains("signal kill"),
+                "{}",
+                w.sentence
+            );
+        }
     }
 
     /// A Bash box in Claude Code's layout: header, the block of command (and

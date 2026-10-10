@@ -827,16 +827,19 @@ impl ChildSuccessor {
         ]
         .join("\n");
         let exe = std::env::current_exe().expect("exe");
+        // `spawnfd`'s, the shell and the child alike: each holds its stdio and
+        // nothing else, so neither (nor the orphan the shell leaves) keeps a
+        // descriptor another test thread had open unflagged at the spawn.
         let process = if orphan {
-            let shell = std::process::Command::new("/bin/sh")
+            let shell = aterm_uds::spawnfd::command("/bin/sh")
                 .arg("-c")
                 .arg(r#""$@" </dev/null >/dev/null 2>&1 & echo $!"#)
                 .arg("sh")
                 .arg(exe)
                 .args(CHILD)
                 .env(CHILD_ENV, spec)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
                 .output()
                 .expect("start the orphan through /bin/sh");
             let pid = String::from_utf8_lossy(&shell.stdout)
@@ -846,12 +849,12 @@ impl ChildSuccessor {
             Served::Orphan(Orphan(Some(pid)))
         } else {
             Served::Child(Reaped(
-                std::process::Command::new(exe)
+                aterm_uds::spawnfd::command(exe)
                     .args(CHILD)
                     .env(CHILD_ENV, spec)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .stdout(aterm_uds::spawnfd::Stdio::null())
+                    .stderr(aterm_uds::spawnfd::Stdio::null())
                     .spawn()
                     .expect("spawn the child successor"),
             ))
@@ -900,7 +903,7 @@ impl ChildSuccessor {
 
 /// A child process killed and reaped on drop, if it has not exited by then.
 #[cfg(unix)]
-struct Reaped(std::process::Child);
+struct Reaped(aterm_uds::spawnfd::Child);
 
 #[cfg(unix)]
 impl Drop for Reaped {
@@ -2125,7 +2128,7 @@ fn the_notes_say_what_the_successor_was() {
 fn a_process_started_after_a_moment_is_fresh_against_it() {
     let moment = Stamp::now();
     std::thread::sleep(Duration::from_millis(20));
-    let mut child = std::process::Command::new("/bin/sleep")
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
         .spawn()
         .expect("spawn /bin/sleep");

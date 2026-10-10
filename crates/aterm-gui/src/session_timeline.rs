@@ -3217,6 +3217,7 @@ mod input_stall_tests {
             stopped,
             rss_mb: Some(39_731),
             restart: crate::input_stall::Restart::default(),
+            act: None,
         }
     }
 

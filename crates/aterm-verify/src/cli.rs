@@ -15,10 +15,14 @@
 //! docs and the usage below now spell the bare command; `--fast` stays
 //! accepted, a no-op, so a script that types it keeps working.
 //!
-//! **`--measure` IS THE ONE MODE ADDED SINCE** (2026-09-26): the MEASURE tier
-//! ([`crate::plan::Tier`]) — the stages that measure the machine or the release
-//! artifact — left the default ladder, so the merge contract stopped judging a
-//! push by how busy the box was, and a release cut requires it instead.
+//! **`--measure <APP>` IS THE ONE MODE ADDED SINCE** (2026-09-26): the MEASURE
+//! tier ([`crate::plan::Tier`]) — the stages that measure the machine or the
+//! release artifact — left the default ladder, so the merge contract stopped
+//! judging a push by how busy the box was, and a release cut requires it
+//! instead. Since 2026-10-09 it judges the artifact it is HANDED (`--measure
+//! <APP>`, `--full <APP>`): the release builds its bundle once and the bytes
+//! MEASURE judged are the bytes it signs, so the gate builds no release `aterm`
+//! of its own.
 //!
 //! One addition for the bash shim that execs this driver: `--root <dir>` (the
 //! shim already resolved the repo root from its own path, and a compiled binary
@@ -27,7 +31,7 @@
 //! THE GATE READS NO ENVIRONMENT KNOB OF ITS OWN (2026-09-24). Every setting a
 //! person gives the gate is a flag here — `--stage-timeout`, `--test-threads`,
 //! `--test-jobs`, `--snapshot`, `--log`/`--no-log`, `--no-windows`,
-//! `--machine-lock-dir`, `--compile-qos` — because this crate links into the
+//! `--machine-lock-dir`, `--measure <APP>` — because this crate links into the
 //! shipped `aterm` (`aterm help rust`), where the owner's rule admits no
 //! environment variable that changes what it does (`aterm-update-core`'s
 //! `env_reads` gate).
@@ -40,12 +44,12 @@ use std::time::Duration;
 ///
 /// * `Fast` — the LAND tier, the per-commit merge contract: the DEFAULT, what
 ///   a bare `tools/verify.sh` runs (`--fast` spells it and changes nothing).
-/// * `Measure` — `--measure` (2026-09-26): the MEASURE tier alone — the
-///   release artifact's paint and spin matrices and the build they judge, and
-///   the typing-pacing smoke. Not the merge contract; what a release cut
-///   requires green for the tree it cuts.
-/// * `Full` — `--full`: both tiers, plus the trust-mc / Kani floor, the
-///   cross-cell type-check, the startup comparison and the Codex live upgrade.
+/// * `Measure` — `--measure <APP>` (2026-09-26): the MEASURE tier alone — the
+///   paint and spin matrices and the typing-pacing smoke, over the release
+///   bundle `<APP>` it is handed. Not the merge contract; what a release cut
+///   requires green for the bytes it signs.
+/// * `Full` — `--full <APP>`: both tiers, plus the cross-cell type-check, the
+///   startup comparison and the Codex live upgrade.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     #[default]
@@ -81,6 +85,10 @@ impl Mode {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Args {
     pub mode: Mode,
+    /// The release bundle the MEASURE tier judges: `--measure <APP>` and
+    /// `--full <APP>` name it, and a mode that runs the MEASURE tier has one
+    /// ([`ParseError::MeasureNeedsApp`]); `None` for the LAND tier alone.
+    pub artifact: Option<PathBuf>,
     /// `None` = the whole workspace.
     pub scope: Option<String>,
     /// `--changed`: narrow to the diff's crates and their dependents.
@@ -128,11 +136,6 @@ pub struct Args {
     /// place of the per-user one ([`crate::snapshot::machine_lock_dir`]). The
     /// gate's own fixture tests give every throwaway repo its own.
     pub machine_lock_dir: Option<PathBuf>,
-    /// `--compile-qos <utility|inherited>` (2026-09-30): the tier of every
-    /// compile-only child ([`crate::exec::CompileQos`]). `inherited` is a
-    /// release's MEASURE run (`tools/release.sh` step 7), admitted only with
-    /// `--measure`: every other run's compiles yield to the desktop.
-    pub compile_qos: crate::exec::CompileQos,
     /// `--baseline`: record MAIN's own reds — HEAD a clean commit of
     /// `origin/main`, the whole tree — and publish the receipt for branches to
     /// be judged against ([`crate::differential`]).
@@ -175,11 +178,9 @@ pub enum ParseError {
     /// `--baseline` with `--measure`: a baseline is main's reds for the merge
     /// contract, and a `--measure` run runs no stage of it.
     BaselineMeasure,
-    /// `--compile-qos` with no value, or one that names no tier.
-    CompileQosNeedsTier,
-    /// `--compile-qos inherited` without `--measure`: only a release's MEASURE
-    /// run keeps its compiles off UTILITY.
-    CompileQosInheritedNeedsMeasure,
+    /// `--measure` or `--full` without the release bundle it judges: the flag
+    /// (`--measure`, `--full`) whose `<APP>` is missing, or is no `.app`.
+    MeasureNeedsApp(String),
     Unknown(String),
 }
 
@@ -221,14 +222,11 @@ impl ParseError {
                                             contract; --measure runs the MEASURE tier alone, \
                                             which is not part of it"
                 .to_string(),
-            ParseError::CompileQosNeedsTier => {
-                "verify: --compile-qos needs utility or inherited".to_string()
-            }
-            ParseError::CompileQosInheritedNeedsMeasure => {
-                "verify: --compile-qos inherited is a release's MEASURE run (--measure); every \
-                 other run's compiles yield to the desktop at utility"
-                    .to_string()
-            }
+            ParseError::MeasureNeedsApp(flag) => format!(
+                "verify: {flag} needs the release bundle it judges: {flag} <path to aterm.app> \
+                 (`targo --unverified ship build` builds it: HEAD's, under a provisional number, \
+                 between releases; `ship release` runs it and hands its bundle over)"
+            ),
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
     }
@@ -247,9 +245,18 @@ where
     let mut it = args.into_iter().map(Into::into);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--fast" => out.mode = Mode::Fast,
-            "--full" => out.mode = Mode::Full,
-            "--measure" => out.mode = Mode::Measure,
+            "--fast" => {
+                out.mode = Mode::Fast;
+                out.artifact = None;
+            }
+            "--full" | "--measure" => {
+                out.mode = if a == "--full" {
+                    Mode::Full
+                } else {
+                    Mode::Measure
+                };
+                out.artifact = Some(app_value(&a, it.next().unwrap_or_default())?);
+            }
             "--changed" => out.changed = true,
             "--no-log" => out.no_log = true,
             "--no-windows" => out.no_windows = true,
@@ -288,9 +295,6 @@ where
             "--test-jobs" => {
                 out.test_jobs = Some(parse_jobs(&it.next().unwrap_or_default())?);
             }
-            "--compile-qos" => {
-                out.compile_qos = parse_compile_qos(&it.next().unwrap_or_default())?;
-            }
             "--snapshot" | "--log" | "--machine-lock-dir" => {
                 let v = path_value(&a, it.next().unwrap_or_default())?;
                 *out.path_slot(&a) = Some(v);
@@ -328,8 +332,16 @@ where
                     out.test_threads = Some(parse_threads(v)?);
                 } else if let Some(v) = a.strip_prefix("--test-jobs=") {
                     out.test_jobs = Some(parse_jobs(v)?);
-                } else if let Some(v) = a.strip_prefix("--compile-qos=") {
-                    out.compile_qos = parse_compile_qos(v)?;
+                } else if let Some((flag, v)) = a
+                    .split_once('=')
+                    .filter(|(f, _)| *f == "--measure" || *f == "--full")
+                {
+                    out.mode = if flag == "--full" {
+                        Mode::Full
+                    } else {
+                        Mode::Measure
+                    };
+                    out.artifact = Some(app_value(flag, v.to_string())?);
                 } else if let Some((flag, v)) =
                     a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f))
                 {
@@ -357,9 +369,6 @@ where
     }
     if out.baseline && out.mode == Mode::Measure {
         return Err(ParseError::BaselineMeasure);
-    }
-    if out.compile_qos == crate::exec::CompileQos::Inherited && out.mode != Mode::Measure {
-        return Err(ParseError::CompileQosInheritedNeedsMeasure);
     }
     Ok(out)
 }
@@ -408,9 +417,20 @@ fn parse_jobs(v: &str) -> Result<NonZeroU32, ParseError> {
         .map_err(|_| ParseError::TestJobsNeedsCount)
 }
 
-/// A `--compile-qos` value: `utility` or `inherited`, nothing else.
-fn parse_compile_qos(v: &str) -> Result<crate::exec::CompileQos, ParseError> {
-    crate::exec::CompileQos::parse(v).ok_or(ParseError::CompileQosNeedsTier)
+/// The `<APP>` of `--measure`/`--full`: a path whose last component is a `.app`
+/// bundle. A missing value, a flag in its place or anything else is a usage
+/// error, never a run that measures nothing: whether it is a bundle that holds
+/// an `aterm` is the run's first question ([`crate::MeasureArtifact::at`]).
+fn app_value(flag: &str, v: String) -> Result<PathBuf, ParseError> {
+    let path = PathBuf::from(&v);
+    let named_app = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.len() > ".app".len() && n.ends_with(".app"));
+    if v.starts_with("--") || !named_app {
+        return Err(ParseError::MeasureNeedsApp(flag.to_string()));
+    }
+    Ok(path)
 }
 
 /// The `--help` text: the script's own header, kept as the contract it
@@ -424,8 +444,9 @@ pub const USAGE_TEMPLATE: &str = "\
 verify — the merge contract: run it, green, before landing on main.
 
   tools/verify.sh                   # the per-commit gate (the merge contract)
-  tools/verify.sh --measure         # the MEASURE tier (a release cut requires it)
-  tools/verify.sh --full            # both tiers + trust-mc + cross-cells
+  tools/verify.sh --measure <APP>   # the MEASURE tier over a release bundle
+                                    #   (a release cut requires it)
+  tools/verify.sh --full <APP>      # both tiers + cross-cells
                                     #   + the Codex live upgrade
   tools/verify.sh --changed         # change-scoped pre-flight (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow the test compile, test run,
@@ -454,30 +475,30 @@ verify — the merge contract: run it, green, before landing on main.
             contract` — never a silent skip.
 --fast    : the default, spelled out. It changes nothing and nothing needs it;
             it is accepted so a script that types it keeps working.
---measure : the MEASURE tier alone: the stages that measure the machine or the
-            release artifact rather than decide correctness — the fat-LTO
-            release build of aterm and the paint and spin matrices that judge
-            it, and the gui typing-pacing smoke (a real window's latencies).
-            NOT the merge contract. Its receipt is filed apart (measure-<commit>,
-            measure-tree-<tree>) and says `measured yes` only when every
-            MEASURE stage ran over the whole tree and was green with nothing
-            skipped; a release cut refuses to claim a build number without one
-            for the tree it cuts.
---full    : both tiers — everything the default and --measure run — PLUS the
+--measure <APP>: the MEASURE tier alone, over the release bundle APP (an
+            aterm.app from `targo --unverified ship build`, the one build:
+            `ship release` runs it and hands the bundle over; between releases
+            it builds HEAD under a provisional number and prints the .app):
+            the stages that measure the machine or the release
+            artifact rather than decide correctness — the paint and spin
+            matrices, handed APP's aterm, and the gui typing-pacing smoke, a
+            real window of APP's aterm-gui (its latencies). The gate builds no
+            release aterm of its own. NOT the merge contract. Its receipt is
+            filed apart, under the bytes it judged (measure-artifact-<sha256 of
+            APP's Contents/MacOS/aterm>), and says `measured yes` only when
+            every MEASURE stage ran over the whole tree and was green with
+            nothing skipped; a release signs only bytes that hold one from a
+            run on its own commit, whose suite judged them.
+--full <APP>: both tiers — everything the default and --measure run — PLUS the
             sealed fabric build (aterm-link --features sealed, a transport no
             shipped binary carries), the lint of the required-features
-            targets, the trust-mc / Kani BMC
-            harnesses when those tools are installed (a named skip when
-            absent), the cross-cell type-check (every forge cell, each for its
+            targets, the cross-cell type-check (every forge cell, each for its
             own triple) and the startup-comparison
             harness's own test, PLUS — last, run alone, ~10 min — the Codex
             live upgrade, which reads THIS machine's managed store and the
             vendor's current Codex, so it is not in the per-commit contract (a
             named skip when the store holds no older Codex). Its receipt is
-            filed as a merge-contract receipt AND as a MEASURE one. On a host
-            whose RAM cannot hold every workspace build at once, the release
-            build waits for the land tier's builds, and the run's first lines
-            say so and name the RAM that runs them together.
+            filed as a merge-contract receipt AND as a MEASURE one about APP.
 --scope   : restrict the targo test/doctest/lint to `-p <crate>`; the guards
             and the socket smoke always run whole-tree (they are cheap and
             global).
@@ -584,13 +605,6 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
             (macOS) or the XDG cache directory. This moves the lock; the gate's
             own tests give each throwaway repo its own, so a fixture gate never
             queues behind the gate that is running it.
-
---compile-qos <utility|inherited>: the tier every compile-only child runs at.
-            utility (the default) lets a person's typing win the CPU from the
-            gate's compiles; the children that RUN code keep the gate's own
-            tier either way. inherited, with --measure only, is a release's
-            MEASURE run (tools/release.sh passes it): its fat-LTO build is the
-            release's critical path and must not yield to peers' builds.
 
 A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
@@ -733,46 +747,49 @@ mod tests {
         }
     }
 
-    /// `--compile-qos`: utility by default and when named; `inherited` in both
-    /// spellings with `--measure` (the release's MEASURE run, tools/release.sh);
-    /// refused without `--measure`, and a missing or unknown tier is a usage
-    /// error, never the default.
+    /// `--measure` and `--full` take the release bundle they judge, in both
+    /// spellings; a missing value, a flag in its place or a path that names no
+    /// `.app` is a usage error (exit 2), never a MEASURE run with nothing to
+    /// judge. `--fast` runs no MEASURE stage, so it drops a bundle named before
+    /// it, and `--compile-qos` is gone with the release build it tiered.
     #[test]
-    fn the_compile_qos_is_utility_unless_a_measure_run_names_inherited() {
-        use crate::exec::CompileQos;
-        assert_eq!(ok(&[]).compile_qos, CompileQos::Utility);
+    fn the_measure_tier_takes_the_bundle_it_judges() {
+        assert_eq!(ok(&[]).artifact, None);
+        let m = ok(&["--measure", "/r/aterm.app"]);
         assert_eq!(
-            ok(&["--compile-qos", "utility"]).compile_qos,
-            CompileQos::Utility
+            (m.mode, m.artifact),
+            (Mode::Measure, Some(PathBuf::from("/r/aterm.app")))
         );
+        let f = ok(&["--full=/r/aterm.app"]);
         assert_eq!(
-            ok(&["--measure", "--compile-qos", "inherited"]).compile_qos,
-            CompileQos::Inherited
+            (f.mode, f.artifact),
+            (Mode::Full, Some(PathBuf::from("/r/aterm.app")))
         );
-        assert_eq!(
-            ok(&["--compile-qos=inherited", "--measure"]).compile_qos,
-            CompileQos::Inherited
-        );
-        for (bad, err) in [
-            (
-                vec!["--compile-qos", "inherited"],
-                ParseError::CompileQosInheritedNeedsMeasure,
-            ),
-            (
-                vec!["--full", "--compile-qos=inherited"],
-                ParseError::CompileQosInheritedNeedsMeasure,
-            ),
-            (
-                vec!["--measure", "--compile-qos"],
-                ParseError::CompileQosNeedsTier,
-            ),
-            (
-                vec!["--measure", "--compile-qos=background"],
-                ParseError::CompileQosNeedsTier,
-            ),
+        assert_eq!(ok(&["--measure", "/r/aterm.app", "--fast"]).artifact, None);
+        for (bad, flag) in [
+            (vec!["--measure"], "--measure"),
+            (vec!["--full"], "--full"),
+            (vec!["--measure", "--scope", "x"], "--measure"),
+            (vec!["--measure", "/r/aterm"], "--measure"),
+            (vec!["--full=/r/.app"], "--full"),
+            (vec!["--measure="], "--measure"),
         ] {
-            assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
+            assert_eq!(
+                parse(bad.iter().copied()),
+                Err(ParseError::MeasureNeedsApp(flag.into())),
+                "{bad:?}"
+            );
         }
+        assert!(
+            ParseError::MeasureNeedsApp("--measure".into())
+                .message()
+                .contains("--measure <path to aterm.app>")
+        );
+        assert_eq!(
+            parse(["--compile-qos", "inherited"]),
+            Err(ParseError::Unknown("--compile-qos".into()))
+        );
+        assert!(!usage().contains("compile-qos"));
     }
 
     #[test]
@@ -780,10 +797,14 @@ mod tests {
         let a = ok(&["--fast", "--scope", "aterm-grid"]);
         assert_eq!(a.mode, Mode::Fast);
         assert_eq!(a.scope.as_deref(), Some("aterm-grid"));
-        assert_eq!(ok(&["--full", "--fast"]).mode, Mode::Fast);
-        assert_eq!(ok(&["--fast", "--full"]).mode, Mode::Full);
-        assert_eq!(ok(&["--full", "--measure"]).mode, Mode::Measure);
-        assert_eq!(ok(&["--measure", "--fast"]).mode, Mode::Fast);
+        assert_eq!(ok(&["--full", "/a.app", "--fast"]).mode, Mode::Fast);
+        assert_eq!(ok(&["--fast", "--full", "/a.app"]).mode, Mode::Full);
+        let both = ok(&["--full", "/a.app", "--measure", "/b.app"]);
+        assert_eq!(
+            (both.mode, both.artifact),
+            (Mode::Measure, Some(PathBuf::from("/b.app")))
+        );
+        assert_eq!(ok(&["--measure", "/a.app", "--fast"]).mode, Mode::Fast);
     }
 
     /// THE TIERS, BY MODE (2026-09-26): the default runs the LAND tier — the
@@ -802,7 +823,7 @@ mod tests {
         assert_eq!(Mode::Measure.as_str(), "measure");
         let text = usage();
         assert!(
-            text.contains("tools/verify.sh --measure         # the MEASURE tier"),
+            text.contains("tools/verify.sh --measure <APP>   # the MEASURE tier"),
             "{text}"
         );
         assert!(
@@ -815,15 +836,15 @@ mod tests {
         // A baseline is main's reds for the merge contract; `--measure` runs
         // none of it, so the two together are a usage error, not a quiet run.
         assert_eq!(
-            parse(["--measure", "--baseline"]),
+            parse(["--measure", "/a.app", "--baseline"]),
             Err(ParseError::BaselineMeasure)
         );
         assert_eq!(
-            parse(["--baseline", "--full", "--measure"]),
+            parse(["--baseline", "--full", "/a.app", "--measure", "/a.app"]),
             Err(ParseError::BaselineMeasure),
             "the last mode wins, and it is --measure"
         );
-        assert!(ok(&["--measure", "--full", "--baseline"]).baseline);
+        assert!(ok(&["--measure", "/a.app", "--full", "/a.app", "--baseline"]).baseline);
         assert!(
             ParseError::BaselineMeasure
                 .message()
@@ -873,7 +894,7 @@ mod tests {
             Some("HEAD~5")
         );
         // …and it composes with the mode, which is the whole use for it.
-        let a = ok(&["--full", "--changed"]);
+        let a = ok(&["--full", "/a.app", "--changed"]);
         assert_eq!((a.mode, a.changed), (Mode::Full, true));
     }
 
@@ -917,7 +938,7 @@ mod tests {
     fn a_baseline_is_the_whole_tree_or_a_usage_error() {
         assert!(!ok(&[]).baseline, "a run is no baseline unless asked");
         assert!(ok(&["--baseline"]).baseline);
-        let full = ok(&["--full", "--baseline"]);
+        let full = ok(&["--full", "/a.app", "--baseline"]);
         assert!(
             full.baseline && full.mode == Mode::Full,
             "either tier may baseline"
@@ -955,14 +976,14 @@ mod tests {
         assert!(!ok(&[]).no_windows, "off unless asked");
         for args in [
             vec!["--no-windows"],
-            vec!["--full", "--no-windows"],
-            vec!["--no-windows", "--measure"],
+            vec!["--full", "/a.app", "--no-windows"],
+            vec!["--no-windows", "--measure", "/a.app"],
             vec!["--changed", "--no-windows"],
             vec!["--no-windows", "--scope", "aterm-grid"],
         ] {
             assert!(ok(&args).no_windows, "{args:?}");
         }
-        let a = ok(&["--no-windows", "--full"]);
+        let a = ok(&["--no-windows", "--full", "/a.app"]);
         assert_eq!((a.mode, a.scope, a.changed), (Mode::Full, None, false));
         assert_eq!(
             parse(["--skip-gui-smoke"]),

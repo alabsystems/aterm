@@ -182,9 +182,8 @@ pub(super) fn watch_with(
 ///
 /// The whole look runs at `now` ([`at_second`]): its read decides whether a
 /// limit still holds, a wait has run out or a reset has passed at the second
-/// the watch was given, as the look itself does. Until 2026-10-04 the read
-/// asked the wall clock, so a watch handed a second before a named reset read
-/// the limit as over once the real clock had passed it.
+/// the watch was given, as the look itself does — never the wall clock, which
+/// would read a limit handed a second before its reset as over.
 pub(super) fn watch_in(
     opts: &Opts,
     tab: &str,

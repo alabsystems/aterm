@@ -1,0 +1,1769 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The release's source take: the bytes its one build compiles, made from git
+//! OBJECTS.
+//!
+//! A release builds its release commit C once (`artifact::build`; the cut signs
+//! those bytes and compiles nothing), so its source is C's tree as git stores it:
+//! C's commit object, every tree under it ([`ObjectReader`], walked here, recursing
+//! into each submodule gitlink at the commit it records) and every blob (read through
+//! ONE `git cat-file --batch` child per repository). The working tree is never read:
+//! an edit made in it (and reverted) while the build runs, an untracked file, an
+//! ignored directory or a filesystem attribute cannot reach the build, because none
+//! of them is a git object.
+//!
+//! Every git here is [`crate::ledger::object_git`]: no `GIT_*` variable, system or
+//! global config steers it, and replace refs are ignored — `git replace` would
+//! otherwise hand back another object's bytes under the id asked for. git itself
+//! checks a commit's bytes when it resolves one, but `cat-file` serves any object
+//! unchecked, and `ls-tree -r` reads every tree below the root unchecked (MEASURED: a
+//! planted subtree's entries are listed as the commit's). So every object — the
+//! commit, each tree, each gitlink's commit and each blob — is hashed here as git
+//! hashes it (`<kind> <len>\0<bytes>`) and refused unless that is the id it was read
+//! for: the one asked for, or the one its parent tree records. A replaced, corrupted
+//! or planted object cannot become a source byte, nor change which bytes are.
+//! A symbolic link is refused, in the tree and in the vendored output alike: its
+//! target is not a byte of the take, and the digest could not see what it reaches.
+//!
+//! The bytes are synced into a stable per-clone cache, `<clone>-release.noindex`
+//! beside the clone ([`CacheRoot`]): only a file whose bytes or mode differ is
+//! written, a file C no longer has is removed, and an unchanged file keeps its
+//! mtime — so cargo's path fingerprints, and with them the build, stay warm from
+//! one cut to the next. The sync is exact about names on a volume that is not (macOS's
+//! APFS ignores case and Unicode normalization by default): an entry the volume finds
+//! under another spelling of a name is not that name ([`Syncer`]). The `.noindex`
+//! name is what keeps Spotlight out of the cache (MEASURED on this Mac: a directory
+//! named `*.noindex` is excluded, a `.metadata_never_index` marker is not, and
+//! `~/Library/Caches` is indexed). One take at a time holds it ([`CacheHold`]).
+//!
+//! Dependencies come from `targo vendor --locked --versioned-dirs` into a
+//! cutter-private `CARGO_HOME` that holds no Cargo config (one found there is removed,
+//! and a root `/.cargo/config*` is refused), after every cached `.crate` the lockfile
+//! names was hashed against its `Cargo.lock` checksum (a mismatch is deleted, so cargo
+//! fetches it again and checks it as it does) and the unpacked registry sources were
+//! removed, so every crate is extracted again from an archive the lock vouches for.
+//! After vendoring, every locked crate's archive must be in that cache with the lock's
+//! checksum — that is what ties the vendored bytes to the lock. Each vendored
+//! crate's `.cargo-checksum.json` `package` must also equal the lock's checksum, which
+//! says only that vendoring agreed with the lock: cargo writes that field from the
+//! lock, not from the bytes. The vendor tree is synced byte-wise like the source. A
+//! sealed source-replacement config ([`SEALED_CONFIG`]) points crates.io at that tree
+//! and turns the network off, so the build reads nothing a cut did not check.
+//!
+//! The take's [`Snapshot::digest`] is one SHA-256 over the schema tag and the
+//! sorted `(path, kind, mode, content hash)` of every file under it — relative paths
+//! only, so the same commit has the same digest across runs and checkout paths by
+//! construction. [`Snapshot::verify`] walks it again after the build: a byte that
+//! changed while cargo ran refuses the build.
+//!
+//! Nothing here lists, reads, removes or refuses an extended attribute: the
+//! bytes are git's, and a file's attributes are not part of them.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// The digest's schema tag: a change to what the digest covers changes this.
+pub const SCHEMA: &str = "aterm-release-snapshot-v1";
+
+/// The source registry every vendored package must come from.
+const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// The sealed source-replacement config, at `<snapshot>/.cargo/config.toml`.
+///
+/// `directory = "vendor"` is relative on purpose: cargo resolves a path in a
+/// config FILE against the parent of the directory holding it — here the
+/// snapshot root — whether the file is discovered or passed with `--config`, so
+/// the config is the same bytes in every clone and the digest stays
+/// path-independent.
+pub const SEALED_CONFIG: &str = "# Written by the release cutter (crates/aterm-release/src/snapshot.rs):\n\
+# every crates.io package comes from the vendored, checksum-verified tree\n\
+# beside `src/`, and nothing is fetched while the release builds.\n\
+[source.crates-io]\n\
+replace-with = \"aterm-vendored\"\n\
+\n\
+[source.aterm-vendored]\n\
+directory = \"vendor\"\n\
+\n\
+[net]\n\
+offline = true\n";
+
+/// The system tool path every child here runs under, behind the tool's own dir.
+const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The per-clone release cache: `<clone>-release.noindex`, beside the clone.
+///
+/// One per clone, shared by every linked worktree of it (the cut tree is one, and so
+/// is a Linux worker's per-run tree), so one take at a time holds it ([`CacheHold`]);
+/// two clones never share one. Outside the working tree, so the clean-tree judge never
+/// sees it; outside `.git`, so no git operation reaches it; and named `.noindex`, the
+/// one Spotlight exclusion measured to work. It is private (mode 0700) and must be a
+/// real directory owned by this user.
+#[derive(Debug, Clone)]
+pub struct CacheRoot {
+    root: PathBuf,
+}
+
+/// One take's exclusive hold on its [`CacheRoot`], from [`CacheRoot::hold`] until it
+/// drops.
+///
+/// Every take of a clone — a cut, a dry run, a rehearsal, a Linux worker's run, from
+/// any worktree of it — syncs the same `snapshot/`, builds in the same `target/`, and
+/// recreates the same `stage/` and `cargo-home-build/`; a take that fails its
+/// [`Snapshot::verify`] removes the target. Two at once would compile each other's
+/// bytes and delete each other's output, so a take holds the cache from before its
+/// snapshot until what it built has left the cache. The hold is an advisory `flock` on
+/// `<cache>/lock` through [`aterm_update_core::FileLock`], whose drop lets go by
+/// `LOCK_UN` (clippy.toml's flock release rule), and which the kernel lets go of with a
+/// holder that dies, so there is no stale holder to judge. `<cache>/holder` names the
+/// holding pid for whoever waits.
+pub struct CacheHold {
+    cache: CacheRoot,
+    _lock: aterm_update_core::FileLock,
+}
+
+impl CacheHold {
+    /// The cache this hold is on: every take path ([`materialize`], the build's
+    /// directories) is reached through a hold, never through a bare [`CacheRoot`].
+    #[must_use]
+    pub fn cache(&self) -> &CacheRoot {
+        &self.cache
+    }
+}
+
+impl Drop for CacheHold {
+    fn drop(&mut self) {
+        // Before the lock goes (fields drop after this body), so the note never names
+        // a holder that has let go.
+        let _ = fs::remove_file(self.cache.root.join("holder"));
+    }
+}
+
+impl CacheRoot {
+    /// The cache of the clone `repo` belongs to: `repo` may be the clone itself or
+    /// any linked worktree of it (the cut tree is one), which share one cache.
+    pub fn for_repo(repo: &Path) -> Result<Self, String> {
+        let clone = main_checkout(repo)?;
+        let name = clone
+            .file_name()
+            .ok_or_else(|| format!("{} has no name to derive its cache from", clone.display()))?;
+        let mut leaf = name.to_os_string();
+        leaf.push("-release.noindex");
+        Self::at(clone.with_file_name(leaf))
+    }
+
+    /// The cache at `root`, created private when absent. Refuses a symlink, a
+    /// non-directory and a directory another user owns.
+    pub fn at(root: PathBuf) -> Result<Self, String> {
+        private_dir(&root, "release cache")?;
+        Ok(Self { root })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Hold the cache for one take. While another process holds it, say which and
+    /// wait for it: a real cut reaches its take after the ledger claim, where a refusal
+    /// would cost a resume, and the other take ends on its own (or is stopped by
+    /// whoever started it; ^C stops this one).
+    pub fn hold(&self) -> Result<CacheHold, String> {
+        match self.try_hold()? {
+            Ok(hold) => Ok(hold),
+            Err(busy) => {
+                println!("==> {busy}; waiting for it to finish (^C stops this take)");
+                let lock = aterm_update_core::FileLock::acquire(&self.root.join("lock"))
+                    .map_err(|e| format!("hold the release cache {}: {e}", self.root.display()))?;
+                self.held(lock)
+            }
+        }
+    }
+
+    /// Hold the cache when no other take does. `Ok(Err(why))` says who does.
+    pub fn try_hold(&self) -> Result<Result<CacheHold, String>, String> {
+        let lock = self.root.join("lock");
+        match aterm_update_core::FileLock::acquire_within(&lock, std::time::Duration::ZERO) {
+            Ok(lock) => self.held(lock).map(Ok),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                let who = fs::read_to_string(self.root.join("holder"))
+                    .ok()
+                    .map(|note| note.trim().to_owned())
+                    .filter(|note| !note.is_empty())
+                    .unwrap_or_else(|| "another process".to_owned());
+                Ok(Err(format!(
+                    "the release cache {} is held by {who}, another take of this clone",
+                    self.root.display()
+                )))
+            }
+            Err(e) => Err(format!("hold the release cache {}: {e}", lock.display())),
+        }
+    }
+
+    fn held(&self, lock: aterm_update_core::FileLock) -> Result<CacheHold, String> {
+        let hold = CacheHold {
+            cache: self.clone(),
+            _lock: lock,
+        };
+        // A fresh file (`create_new` will not write through a link left in its place).
+        let holder = self.root.join("holder");
+        let _ = fs::remove_file(&holder);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&holder)
+            .and_then(|mut note| writeln!(note, "pid {}", std::process::id()))
+            .map_err(|e| format!("write {}: {e}", holder.display()))?;
+        Ok(hold)
+    }
+
+    /// `snapshot/`: `src/`, `vendor/` and the sealed `.cargo/config.toml`.
+    #[must_use]
+    pub fn snapshot(&self) -> PathBuf {
+        self.root.join("snapshot")
+    }
+
+    /// The vendoring step's private `CARGO_HOME` (its verified `.crate` cache).
+    #[must_use]
+    pub fn vendor_cargo_home(&self) -> PathBuf {
+        self.root.join("cargo-home")
+    }
+
+    /// The builds' `CARGO_HOME` root, emptied before every build (one per slice
+    /// under it): an offline build over the vendored tree needs nothing in it.
+    #[must_use]
+    pub fn build_cargo_home(&self) -> PathBuf {
+        self.root.join("cargo-home-build")
+    }
+
+    /// The builds' target root (one `CARGO_TARGET_DIR` per slice under it), kept
+    /// warm across builds.
+    #[must_use]
+    pub fn target(&self) -> PathBuf {
+        self.root.join("target")
+    }
+
+    /// The release's bundles, built once and kept by what they were built as
+    /// (`artifact.rs`): `artifacts/<key>/`, COMPLETE when its record is there.
+    #[must_use]
+    pub fn artifacts(&self) -> PathBuf {
+        self.root.join("artifacts")
+    }
+
+    /// The build's stage (lipo, strip, dSYM), recreated for every build.
+    #[must_use]
+    pub fn stage(&self) -> PathBuf {
+        self.root.join("stage")
+    }
+
+    /// `TMPDIR` for every child the take runs.
+    #[must_use]
+    pub fn tmp(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
+    /// `ship release`'s preflight: the engine dry run's scratch clone and log, the
+    /// wasm32 check's source copy, target directory and log. Its own subtree, so no take
+    /// and no preflight touch the other's files.
+    #[must_use]
+    pub fn preflight(&self) -> PathBuf {
+        self.root.join("preflight")
+    }
+}
+
+/// The working tree of the clone `repo` belongs to: the parent of its common git
+/// directory when that is a `.git`, else `repo` itself. Canonical.
+pub(crate) fn main_checkout(repo: &Path) -> Result<PathBuf, String> {
+    let common = git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = PathBuf::from(common.trim());
+    let checkout = if common.file_name() == Some(OsStr::new(".git")) {
+        common
+            .parent()
+            .map_or_else(|| repo.to_path_buf(), Path::to_path_buf)
+    } else {
+        repo.to_path_buf()
+    };
+    fs::canonicalize(&checkout).map_err(|e| format!("resolve {}: {e}", checkout.display()))
+}
+
+/// Create `path` private (0700) when absent, then hold it to the crate's one rule for
+/// a release directory ([`crate::buildplan::open_release_directory`]): a real
+/// directory this user owns, made private through its opened descriptor, never a
+/// symlink.
+pub fn private_dir(path: &Path, what: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create {what} {}: {e}", path.display())),
+        }
+    }
+    let uid = crate::buildplan::current_release_uid()?;
+    crate::buildplan::open_release_directory(path, uid, true, what).map(drop)
+}
+
+/// The source take a release builds, synced and sealed.
+#[derive(Debug)]
+pub struct Snapshot {
+    /// `<cache>/snapshot`.
+    pub root: PathBuf,
+    /// `<root>/src`: commit C's tree, submodules included (`<root>/vendor` holds
+    /// every crates.io package its lockfile names).
+    pub src: PathBuf,
+    /// `<root>/.cargo/config.toml`: [`SEALED_CONFIG`].
+    pub sealed_config: PathBuf,
+    /// The full commit C the take is of.
+    pub commit: String,
+    /// [`SCHEMA`]'s SHA-256 over the take, lowercase hex.
+    pub digest: String,
+    /// What the digest was taken over, kept so [`Snapshot::verify`] can name what
+    /// changed.
+    listing: Listing,
+}
+
+/// `relpath -> "kind\0mode\0hash-or-target"`, sorted by path bytes.
+type Listing = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// What a sync did, for the transcript.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncReport {
+    pub written: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+}
+
+/// Materialize commit `commit` of `repo` (and its submodules) into the held cache,
+/// vendor its crates.io dependencies with `targo`, write the sealed config, and digest
+/// it.
+///
+/// # Errors
+/// A commit that does not resolve, a submodule whose commit is not fetched, a
+/// symbolic link in the tree or the vendored output, an object whose bytes are not
+/// the object its id names, two tree paths the volume cannot hold apart, a lockfile
+/// naming a non-crates.io source or a registry package without a checksum, a
+/// vendoring failure, a vendored checksum or archive that disagrees with the
+/// lockfile, a root Cargo config, and any filesystem failure.
+pub fn materialize(
+    repo: &Path,
+    commit: &str,
+    hold: &CacheHold,
+    targo: &Path,
+) -> Result<Snapshot, String> {
+    let cache = hold.cache();
+    let commit = git_text(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{commit}^{{commit}}"),
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "the release commit {commit} does not resolve in {}: {e}",
+            repo.display()
+        )
+    })?;
+    let commit = commit.trim().to_owned();
+    let root = cache.snapshot();
+    private_dir(&root, "release snapshot")?;
+    let mut sync = Syncer::new(&root);
+
+    let mut repos = vec![repo.to_path_buf()];
+    let mut entries = Vec::new();
+    list_tree(&mut repos, 0, &commit, b"src/", &mut entries)?;
+    read_blobs(&repos, &entries, &mut sync)?;
+
+    let src = root.join("src");
+    let vendored = vendor_into(&src, cache, targo, &mut sync)?;
+    sync.put(
+        Path::new(".cargo/config.toml"),
+        SEALED_CONFIG.as_bytes(),
+        false,
+    )?;
+    let report = sync.finish()?;
+    let listing = listing(&root)?;
+    let digest = digest_of(&listing);
+    println!(
+        "==> snapshot {} from git objects into {}: {} written, {} unchanged, {} removed; \
+         {vendored} crates vendored; digest {}",
+        &commit[..commit.len().min(12)],
+        cache.path().display(),
+        report.written,
+        report.unchanged,
+        report.removed,
+        &digest[..12]
+    );
+    Ok(Snapshot {
+        src,
+        sealed_config: root.join(".cargo/config.toml"),
+        root,
+        commit,
+        digest,
+        listing,
+    })
+}
+
+impl Snapshot {
+    /// Walk the take again and refuse when any byte, mode, link or path differs
+    /// from what [`materialize`] digested — run after the build, so a source the
+    /// build (or anything else) changed while cargo ran is a refusal, not a release.
+    pub fn verify(&self) -> Result<(), String> {
+        let now = listing(&self.root)?;
+        if digest_of(&now) == self.digest {
+            return Ok(());
+        }
+        let mut changed: Vec<String> = Vec::new();
+        for (path, line) in &self.listing {
+            match now.get(path) {
+                None => changed.push(format!("{} (removed)", String::from_utf8_lossy(path))),
+                Some(seen) if seen != line => {
+                    changed.push(format!("{} (changed)", String::from_utf8_lossy(path)));
+                }
+                Some(_) => {}
+            }
+        }
+        for path in now.keys().filter(|p| !self.listing.contains_key(*p)) {
+            changed.push(format!("{} (added)", String::from_utf8_lossy(path)));
+        }
+        let shown = changed.iter().take(10).cloned().collect::<Vec<_>>();
+        Err(format!(
+            "the release snapshot {} changed while it was built ({} path(s)): {}{} — \
+             nothing it built is used",
+            self.root.display(),
+            changed.len(),
+            shown.join(", "),
+            if changed.len() > shown.len() {
+                ", …"
+            } else {
+                ""
+            }
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git objects
+// ---------------------------------------------------------------------------
+
+/// One file of the tree: which repository holds its blob, where it goes, and how.
+struct TreeEntry {
+    repo: usize,
+    path: Vec<u8>,
+    exec: bool,
+    oid: String,
+}
+
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = crate::ledger::object_git(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} in {} failed ({}): {}",
+            args.join(" "),
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// `git <args>` in `dir` through [`crate::ledger::object_git`], its stdout as text.
+pub(crate) fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
+    String::from_utf8(git_bytes(dir, args)?)
+        .map_err(|e| format!("git {} printed non-UTF-8: {e}", args.join(" ")))
+}
+
+/// The id git gives an object of `kind` holding `data`: the object format's hash
+/// (SHA-1 for a 40-digit id, SHA-256 for a 64-digit one) over `<kind> <len>\0<data>`.
+fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
+    let algorithm = match hex_digits {
+        40 => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        64 => &ring::digest::SHA256,
+        _ => return None,
+    };
+    let mut hash = ring::digest::Context::new(algorithm);
+    hash.update(format!("{kind} {}\0", data.len()).as_bytes());
+    hash.update(data);
+    Some(aterm_codec::hex::encode_lower(hash.finish().as_ref()))
+}
+
+/// One repository's `git cat-file --batch`, asked for one object at a time, every
+/// answer held to the id and the kind asked for.
+///
+/// `cat-file` serves an object's bytes without checking them against its id (and
+/// `ls-tree -r` reads every tree below a commit's root the same way), so the bytes' own
+/// hash is the only thing that says they are that object. No `--buffer`: git flushes
+/// each answer, so a question can wait for its answer before the next is asked.
+struct ObjectReader {
+    dir: PathBuf,
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl ObjectReader {
+    fn spawn(dir: &Path) -> Result<Self, String> {
+        let mut child = crate::ledger::object_git(dir)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn git cat-file in {}: {e}", dir.display()))?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("git cat-file in {} has no pipes", dir.display()));
+        };
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// The bytes of the object `oid`, which must be a `kind`: refused unless git
+    /// answers for that id with that kind, and the bytes hash to that id. After a
+    /// refusal the reader is closed: what git writes next is not known to be the
+    /// answer to the next question.
+    fn read(&mut self, oid: &str, kind: &str) -> Result<Vec<u8>, String> {
+        let read = self.answer(oid, kind);
+        if read.is_err() {
+            drop(self.stdin.take());
+        }
+        read
+    }
+
+    fn answer(&mut self, oid: &str, kind: &str) -> Result<Vec<u8>, String> {
+        let dir = self.dir.display();
+        if !(aterm_codec::hex::is_lower(oid, 40) || aterm_codec::hex::is_lower(oid, 64)) {
+            return Err(format!(
+                "refusing to read {oid:?} in {dir}: not an object id"
+            ));
+        }
+        let stdin = self.stdin.as_mut().ok_or("git cat-file is closed")?;
+        stdin
+            .write_all(format!("{oid}\n").as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("ask git cat-file in {dir} for {oid}: {e}"))?;
+        let mut header = Vec::new();
+        self.stdout
+            .read_until(b'\n', &mut header)
+            .map_err(|e| format!("read git cat-file in {dir}: {e}"))?;
+        let line = String::from_utf8_lossy(&header);
+        let line = line.trim_end_matches('\n');
+        let mut words = line.split(' ');
+        let (Some(echo), Some(seen), Some(size), None) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            return Err(format!(
+                "git cat-file in {dir} cannot read the {kind} {oid} ({line})"
+            ));
+        };
+        if echo != oid || seen != kind {
+            return Err(format!(
+                "git cat-file in {dir} answered {echo} {seen} for the {kind} {oid}"
+            ));
+        }
+        let size: u64 = size
+            .parse()
+            .map_err(|_| format!("git cat-file in {dir} answered a bad size: {line}"))?;
+        // Read as the bytes arrive: a header whose size lies allocates nothing up front.
+        let mut data = Vec::new();
+        (&mut self.stdout)
+            .take(size.saturating_add(1))
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read the {kind} {oid} in {dir}: {e}"))?;
+        if data.pop() != Some(b'\n') || data.len() as u64 != size {
+            return Err(format!("git cat-file in {dir} cut the {kind} {oid} short"));
+        }
+        if object_id(kind, &data, oid.len()).as_deref() != Some(oid) {
+            return Err(format!(
+                "the object store of {dir} answered the {kind} {oid} with bytes that are not \
+                 that object (a corrupted or substituted object)"
+            ));
+        }
+        Ok(data)
+    }
+
+    /// End git: close its stdin, drain what a refusal left unread (so it cannot block
+    /// on a full pipe before it reads the end), and wait for it.
+    fn close(&mut self) -> (std::io::Result<std::process::ExitStatus>, String) {
+        drop(self.stdin.take());
+        let _ = std::io::copy(&mut self.stdout, &mut std::io::sink());
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        (
+            self.child.wait(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    }
+
+    /// Close the reader, refusing unless git exited cleanly.
+    fn finish(mut self) -> Result<(), String> {
+        let (status, stderr) = self.close();
+        let status =
+            status.map_err(|e| format!("wait for git cat-file in {}: {e}", self.dir.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git cat-file in {} failed ({status}): {}",
+                self.dir.display(),
+                stderr.trim()
+            ))
+        }
+    }
+}
+
+impl Drop for ObjectReader {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// Append every file of `commit`'s tree in `repos[repo]` under `prefix`, recursing
+/// into each gitlink at the commit it records. Every object is read through one
+/// [`ObjectReader`] per repository and held to its id: the commit to the id asked
+/// for, each tree and each gitlink's commit to the id its parent tree records. A
+/// gitlink whose repository is not checked out, or does not hold that commit, refuses
+/// with the command that fetches it.
+fn list_tree(
+    repos: &mut Vec<PathBuf>,
+    repo: usize,
+    commit: &str,
+    prefix: &[u8],
+    out: &mut Vec<TreeEntry>,
+) -> Result<(), String> {
+    let dir = repos[repo].clone();
+    let mut reader = ObjectReader::spawn(&dir)?;
+    let gitlinks = walk_commit(&mut reader, repo, commit, prefix, out)?;
+    reader.finish()?;
+    for (path, oid) in gitlinks {
+        let sub = dir.join(os_path(&path));
+        submodule_at(&sub, &oid, &path)?;
+        repos.push(sub);
+        let index = repos.len() - 1;
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(&path);
+        full.push(b'/');
+        list_tree(repos, index, &oid, &full, out)?;
+    }
+    Ok(())
+}
+
+/// Read `commit` and walk its tree: append each file to `out`, refuse what a release
+/// cannot build from, and return each gitlink — its path in this repository and the
+/// commit it records — for [`list_tree`] to recurse into.
+fn walk_commit(
+    reader: &mut ObjectReader,
+    repo: usize,
+    commit: &str,
+    prefix: &[u8],
+    out: &mut Vec<TreeEntry>,
+) -> Result<Vec<(Vec<u8>, String)>, String> {
+    let refusing = |e: String, rel: &[u8]| {
+        let mut path = prefix.to_vec();
+        path.extend_from_slice(rel);
+        format!(
+            "{e}: refusing {}",
+            String::from_utf8_lossy(&path).trim_end_matches('/')
+        )
+    };
+    let data = reader
+        .read(commit, "commit")
+        .map_err(|e| refusing(e, b""))?;
+    let root = commit_tree(&data, commit.len()).ok_or_else(|| {
+        format!(
+            "the commit {commit} in {} names no tree",
+            reader.dir.display()
+        )
+    })?;
+    let mut gitlinks = Vec::new();
+    let mut trees = vec![(root, Vec::new())];
+    while let Some((oid, rel)) = trees.pop() {
+        let data = reader.read(&oid, "tree").map_err(|e| refusing(e, &rel))?;
+        let entries = tree_entries(&data, commit.len() / 2).ok_or_else(|| {
+            format!(
+                "the tree {oid} in {} does not parse as one",
+                reader.dir.display()
+            )
+        })?;
+        for RawEntry { mode, name, id } in entries {
+            let mut path = rel.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            check_relative(&path)?;
+            let exec = match mode {
+                b"40000" => {
+                    trees.push((id, path));
+                    continue;
+                }
+                b"100644" => false,
+                b"100755" => true,
+                b"120000" => {
+                    return Err(format!(
+                        "{} has a symbolic link at {}: a release builds from regular files \
+                         only (what a link reaches is no byte of the snapshot, and its digest \
+                         could not see it)",
+                        reader.dir.display(),
+                        String::from_utf8_lossy(&path)
+                    ));
+                }
+                b"160000" => {
+                    gitlinks.push((path, id));
+                    continue;
+                }
+                other => {
+                    return Err(format!(
+                        "{} has a tree entry of mode {} at {}, which a release cannot build \
+                         from",
+                        reader.dir.display(),
+                        String::from_utf8_lossy(other),
+                        String::from_utf8_lossy(&path)
+                    ));
+                }
+            };
+            let mut full = prefix.to_vec();
+            full.extend_from_slice(&path);
+            out.push(TreeEntry {
+                repo,
+                path: full,
+                exec,
+                oid: id,
+            });
+        }
+    }
+    Ok(gitlinks)
+}
+
+/// The root tree a commit object names: its first line, `tree <id>`.
+fn commit_tree(data: &[u8], hex_digits: usize) -> Option<String> {
+    let line = data.strip_prefix(b"tree ")?.get(..=hex_digits)?;
+    let (id, end) = line.split_at(hex_digits);
+    let id = std::str::from_utf8(id).ok()?;
+    (end == b"\n" && aterm_codec::hex::is_lower(id, hex_digits)).then(|| id.to_owned())
+}
+
+/// One entry of a tree object, as git stores it: `<octal mode> <name>\0<raw id>`.
+struct RawEntry<'a> {
+    mode: &'a [u8],
+    name: &'a [u8],
+    /// The raw id, in lowercase hex.
+    id: String,
+}
+
+/// A tree object's entries, each id `raw_len` bytes. `None` when the bytes are not
+/// that, or a name is not one path component.
+fn tree_entries(data: &[u8], raw_len: usize) -> Option<Vec<RawEntry<'_>>> {
+    let mut entries = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        let space = rest.iter().position(|b| *b == b' ')?;
+        let (mode, after) = (&rest[..space], &rest[space + 1..]);
+        let nul = after.iter().position(|b| *b == 0)?;
+        let (name, after) = (&after[..nul], &after[nul + 1..]);
+        if mode.is_empty() || name.contains(&b'/') || after.len() < raw_len {
+            return None;
+        }
+        let (id, after) = after.split_at(raw_len);
+        entries.push(RawEntry {
+            mode,
+            name,
+            id: aterm_codec::hex::encode_lower(id),
+        });
+        rest = after;
+    }
+    Some(entries)
+}
+
+/// Refuse unless `sub` is the top of its own git checkout and holds commit `oid`.
+fn submodule_at(sub: &Path, oid: &str, path: &[u8]) -> Result<(), String> {
+    let shown = String::from_utf8_lossy(path);
+    let refuse = |why: &str| {
+        format!(
+            "the submodule {shown} is not fetched at {oid} ({why})\nfix:  git submodule update \
+             --init {shown}"
+        )
+    };
+    let top = git_text(
+        sub,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .map_err(|_| refuse("it is not checked out"))?;
+    let (Ok(top), Ok(here)) = (fs::canonicalize(top.trim()), fs::canonicalize(sub)) else {
+        return Err(refuse("it is not checked out"));
+    };
+    if top != here {
+        return Err(refuse("it is not checked out"));
+    }
+    git_bytes(sub, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
+        .map_err(|_| refuse("its repository does not hold that commit"))?;
+    Ok(())
+}
+
+/// Stream every entry's blob through one `git cat-file --batch` per repository
+/// into `sync`, each held to its tree entry's id.
+fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Result<(), String> {
+    for (index, dir) in repos.iter().enumerate() {
+        let mine: Vec<&TreeEntry> = entries.iter().filter(|e| e.repo == index).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let mut child = crate::ledger::object_git(dir)
+            .args(["cat-file", "--batch", "--buffer"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn git cat-file in {}: {e}", dir.display()))?;
+        let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+        let stdout = child.stdout.take().ok_or("git cat-file has no stdout")?;
+        let read = std::thread::scope(|scope| {
+            let requests: Vec<u8> = mine
+                .iter()
+                .flat_map(|e| e.oid.bytes().chain(std::iter::once(b'\n')))
+                .collect();
+            let writer = scope.spawn(move || {
+                let written = stdin.write_all(&requests);
+                drop(stdin);
+                written
+            });
+            let mut reader = BufReader::new(stdout);
+            let mut header = Vec::new();
+            let mut result = Ok(());
+            for entry in &mine {
+                header.clear();
+                if let Err(e) = reader.read_until(b'\n', &mut header) {
+                    result = Err(format!("read git cat-file: {e}"));
+                    break;
+                }
+                let line = String::from_utf8_lossy(&header);
+                let mut words = line.split_whitespace();
+                let (Some(oid), Some(kind), Some(size)) =
+                    (words.next(), words.next(), words.next())
+                else {
+                    result = Err(format!(
+                        "git cat-file in {} cannot read {} ({})",
+                        dir.display(),
+                        entry.oid,
+                        line.trim()
+                    ));
+                    break;
+                };
+                let Ok(size) = size.parse::<usize>() else {
+                    result = Err(format!("git cat-file answered a bad size: {}", line.trim()));
+                    break;
+                };
+                if oid != entry.oid || kind != "blob" {
+                    result = Err(format!(
+                        "git cat-file answered {oid} {kind} for the blob {}",
+                        entry.oid
+                    ));
+                    break;
+                }
+                let mut data = vec![0u8; size + 1];
+                if let Err(e) = reader.read_exact(&mut data) {
+                    result = Err(format!("read blob {}: {e}", entry.oid));
+                    break;
+                }
+                data.pop();
+                // The header echoes the id asked for, whatever bytes follow it: only
+                // the bytes' own hash says they are that object.
+                if object_id("blob", &data, entry.oid.len()).as_deref() != Some(&entry.oid) {
+                    result = Err(format!(
+                        "the object store of {} answered {} with bytes that are not that \
+                         object (a corrupted or substituted object): refusing {}",
+                        dir.display(),
+                        entry.oid,
+                        String::from_utf8_lossy(&entry.path)
+                    ));
+                    break;
+                }
+                if let Err(e) = sync.put(&os_path(&entry.path), &data, entry.exec) {
+                    result = Err(e);
+                    break;
+                }
+            }
+            // Drain what a refusal left unread, so the writer cannot block.
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            let written = writer
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("writer panicked")));
+            result.and_then(|()| written.map_err(|e| format!("feed git cat-file: {e}")))
+        });
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("wait for git cat-file: {e}"))?;
+        read?;
+        if !out.status.success() {
+            return Err(format!(
+                "git cat-file in {} failed ({}): {}",
+                dir.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn os_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn os_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
+/// A relative path of plain components only: no root, no `.`, no `..`, no empty
+/// component — what git itself allows in a tree, checked again before any write.
+fn check_relative(path: &[u8]) -> Result<(), String> {
+    let ok = !path.is_empty()
+        && path
+            .split(|b| *b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing the tree path {:?}: not a plain relative path",
+            String::from_utf8_lossy(path)
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the byte-wise sync
+// ---------------------------------------------------------------------------
+
+/// Writes a tree into `root` one path at a time, touching only what differs, then
+/// ([`Syncer::finish`]) removes every path it was not given.
+///
+/// EXACT ABOUT NAMES. A volume may find an entry under another spelling of its name:
+/// macOS's APFS ignores case and Unicode normalization by default (MEASURED on m3:
+/// `CARGO.TOML` and `src/Dir` both resolve there), so a commit that renames `src/dir`
+/// to `src/Dir` would see the old entry as the new one — kept, and a same-bytes file
+/// in it counted unchanged — and [`Syncer::finish`], which compares names byte for
+/// byte, would then delete it with everything just synced into it. So an entry is the
+/// one a path names only when its directory LISTS that exact name; one the volume finds
+/// under another spelling is removed before the path is written, and a tree that names
+/// two spellings the volume cannot hold apart is refused.
+pub struct Syncer {
+    root: PathBuf,
+    keep: BTreeSet<PathBuf>,
+    /// The names each directory the sync has looked in holds on disk, read once and
+    /// kept current by every write and removal here.
+    names: BTreeMap<PathBuf, BTreeSet<OsString>>,
+    report: SyncReport,
+}
+
+impl Syncer {
+    #[must_use]
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            keep: BTreeSet::new(),
+            names: BTreeMap::new(),
+            report: SyncReport::default(),
+        }
+    }
+
+    /// Make `rel` a regular file holding `data` (mode 0755 when `exec`, else 0644). A
+    /// file whose bytes and mode already match is left alone (its mtime with it);
+    /// anything else is written beside it and renamed over it, so a reader never sees
+    /// half a file.
+    pub fn put(&mut self, rel: &Path, data: &[u8], exec: bool) -> Result<(), String> {
+        let parts: Vec<&OsStr> = rel
+            .components()
+            .map(|c| match c {
+                Component::Normal(part) => Ok(part),
+                _ => Err(format!("refusing the take path {}", rel.display())),
+            })
+            .collect::<Result<_, _>>()?;
+        if parts.is_empty() {
+            return Err("refusing an empty take path".into());
+        }
+        let mut dir = PathBuf::new();
+        for part in &parts[..parts.len() - 1] {
+            dir.push(part);
+            self.ensure_dir(&dir)?;
+        }
+        let full = self.root.join(rel);
+        let existing = self.exact(rel)?;
+        let same = match &existing {
+            Some(meta) if meta.file_type().is_file() => {
+                meta.len() == data.len() as u64
+                    && fs::read(&full).map_err(|e| format!("read {}: {e}", full.display()))? == data
+                    && {
+                        set_mode(&full, meta, exec)?;
+                        true
+                    }
+            }
+            _ => false,
+        };
+        if same {
+            self.report.unchanged += 1;
+        } else {
+            if existing.as_ref().is_some_and(|m| m.file_type().is_dir()) {
+                fs::remove_dir_all(&full)
+                    .map_err(|e| format!("replace {}: {e}", full.display()))?;
+                self.forget(rel);
+            }
+            write_beside(&full, data, exec)?;
+            self.listed(rel);
+            self.report.written += 1;
+        }
+        self.keep.insert(rel.to_path_buf());
+        Ok(())
+    }
+
+    fn ensure_dir(&mut self, rel: &Path) -> Result<(), String> {
+        if self.keep.contains(rel) {
+            return Ok(());
+        }
+        let full = self.root.join(rel);
+        match self.exact(rel)? {
+            Some(meta) if meta.file_type().is_dir() => {}
+            Some(_) => {
+                fs::remove_file(&full).map_err(|e| format!("replace {}: {e}", full.display()))?;
+                fs::create_dir(&full).map_err(|e| format!("create {}: {e}", full.display()))?;
+                self.names.insert(rel.to_path_buf(), BTreeSet::new());
+            }
+            None => {
+                fs::create_dir(&full).map_err(|e| format!("create {}: {e}", full.display()))?;
+                self.listed(rel);
+                self.names.insert(rel.to_path_buf(), BTreeSet::new());
+            }
+        }
+        self.keep.insert(rel.to_path_buf());
+        Ok(())
+    }
+
+    /// What is at `rel` under exactly that name, or `None`: an entry the volume finds
+    /// there under another spelling is removed first, unless this sync wrote it — then
+    /// the tree names both spellings, and that is refused.
+    fn exact(&mut self, rel: &Path) -> Result<Option<fs::Metadata>, String> {
+        let full = self.root.join(rel);
+        let meta = match fs::symlink_metadata(&full) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("inspect {}: {e}", full.display())),
+        };
+        let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let name = rel
+            .file_name()
+            .ok_or_else(|| format!("refusing the take path {}", rel.display()))?;
+        if self.names_in(&parent)?.contains(name) {
+            return Ok(Some(meta));
+        }
+        let dir = self.root.join(&parent);
+        let other = self
+            .names_in(&parent)?
+            .iter()
+            .find(|listed| {
+                fs::symlink_metadata(dir.join(listed)).is_ok_and(|seen| same_entry(&seen, &meta))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} finds an entry that {} does not list",
+                    full.display(),
+                    dir.display()
+                )
+            })?;
+        let other_rel = parent.join(&other);
+        if self.keep.contains(&other_rel) {
+            return Err(format!(
+                "the take names both {} and {}, which this volume cannot hold apart (the \
+                 names differ only in case or Unicode normalization)",
+                other_rel.display(),
+                rel.display()
+            ));
+        }
+        let stale = dir.join(&other);
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(&stale)
+        } else {
+            fs::remove_file(&stale)
+        }
+        .map_err(|e| format!("remove {}: {e}", stale.display()))?;
+        self.names_in(&parent)?.remove(&other);
+        self.forget(&other_rel);
+        self.report.removed += 1;
+        Ok(None)
+    }
+
+    /// The names `rel` holds on disk, read the first time it is asked about.
+    fn names_in(&mut self, rel: &Path) -> Result<&mut BTreeSet<OsString>, String> {
+        if !self.names.contains_key(rel) {
+            let dir = self.root.join(rel);
+            let mut names = BTreeSet::new();
+            for entry in fs::read_dir(&dir).map_err(|e| format!("list {}: {e}", dir.display()))? {
+                let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
+                names.insert(entry.file_name());
+            }
+            self.names.insert(rel.to_path_buf(), names);
+        }
+        Ok(self
+            .names
+            .get_mut(rel)
+            .expect("the listing was just inserted"))
+    }
+
+    /// `rel` now exists under its own name.
+    fn listed(&mut self, rel: &Path) {
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        if let (Some(names), Some(name)) = (self.names.get_mut(parent), rel.file_name()) {
+            names.insert(name.to_os_string());
+        }
+    }
+
+    /// `rel` is gone, and every listing under it with it.
+    fn forget(&mut self, rel: &Path) {
+        self.names.retain(|dir, _| !dir.starts_with(rel));
+    }
+
+    /// Remove every path under the root that no [`Syncer::put`] named, and report.
+    pub fn finish(mut self) -> Result<SyncReport, String> {
+        let root = self.root.clone();
+        self.prune(&root, Path::new(""))?;
+        Ok(self.report)
+    }
+
+    fn prune(&mut self, dir: &Path, rel: &Path) -> Result<(), String> {
+        let entries = fs::read_dir(dir).map_err(|e| format!("list {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
+            let here = rel.join(entry.file_name());
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+            if !self.keep.contains(&here) {
+                if kind.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                }
+                .map_err(|e| format!("remove {}: {e}", path.display()))?;
+                self.report.removed += 1;
+            } else if kind.is_dir() {
+                self.prune(&path, &here)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether two inspections are of one directory entry.
+#[cfg(unix)]
+fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// Without inode identity, no other spelling is ever taken for this one: [`Syncer`]
+/// refuses rather than remove what it cannot name.
+#[cfg(not(unix))]
+fn same_entry(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, meta: &fs::Metadata, exec: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let want = if exec { 0o755 } else { 0o644 };
+    if meta.permissions().mode() & 0o7777 != want {
+        fs::set_permissions(path, fs::Permissions::from_mode(want))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _meta: &fs::Metadata, _exec: bool) -> Result<(), String> {
+    Ok(())
+}
+
+/// Write `data` to a temporary sibling of `full` and rename it into place.
+fn write_beside(full: &Path, data: &[u8], exec: bool) -> Result<(), String> {
+    let name = full
+        .file_name()
+        .ok_or_else(|| format!("no file name: {}", full.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".aterm-sync-{}", std::process::id()));
+    let tmp = full.with_file_name(tmp_name);
+    let _ = fs::remove_file(&tmp);
+    fs::write(&tmp, data).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let meta = fs::symlink_metadata(&tmp).map_err(|e| format!("inspect {}: {e}", tmp.display()))?;
+    set_mode(&tmp, &meta, exec)?;
+    fs::rename(&tmp, full).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("place {}: {e}", full.display())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// vendoring
+// ---------------------------------------------------------------------------
+
+/// One crates.io package the lockfile names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedCrate {
+    pub name: String,
+    pub version: String,
+    pub checksum: String,
+}
+
+impl LockedCrate {
+    /// `<name>-<version>`: its `.crate` file stem and its `--versioned-dirs` name.
+    #[must_use]
+    pub fn stem(&self) -> String {
+        format!("{}-{}", self.name, self.version)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LockFile {
+    #[serde(default)]
+    package: Vec<LockPackage>,
+}
+
+#[derive(serde::Deserialize)]
+struct LockPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+/// The crates.io packages `Cargo.lock` names, each with its checksum. A package
+/// from any other source, or a registry package with no checksum, is refused: the
+/// sealed config replaces crates.io alone, and a package it cannot check is one the
+/// release cannot vouch for.
+pub fn locked_crates(lock_text: &str) -> Result<Vec<LockedCrate>, String> {
+    let lock: LockFile =
+        aterm_toml::from_str(lock_text).map_err(|e| format!("Cargo.lock does not parse: {e}"))?;
+    let mut crates = Vec::new();
+    for package in lock.package {
+        match package.source.as_deref() {
+            None => {}
+            Some(CRATES_IO) => {
+                let checksum = package
+                    .checksum
+                    .filter(|c| aterm_codec::hex::is_lower(c, 64))
+                    .ok_or_else(|| {
+                        format!(
+                            "Cargo.lock names {} {} from crates.io without a SHA-256 checksum",
+                            package.name, package.version
+                        )
+                    })?;
+                crates.push(LockedCrate {
+                    name: package.name,
+                    version: package.version,
+                    checksum,
+                });
+            }
+            Some(other) => {
+                return Err(format!(
+                    "Cargo.lock takes {} {} from {other}: a release builds only crates.io and \
+                     path dependencies",
+                    package.name, package.version
+                ));
+            }
+        }
+    }
+    Ok(crates)
+}
+
+/// Every `<cargo_home>/registry/cache/*/<name>-<version>.crate` the lockfile names:
+/// which locked crate it is, where, and whether its SHA-256 is the lock's checksum.
+fn cached_archives<'a>(
+    locked: &'a [LockedCrate],
+    cargo_home: &Path,
+) -> Result<Vec<(&'a LockedCrate, PathBuf, bool)>, String> {
+    let cache = cargo_home.join("registry/cache");
+    let indexes = match fs::read_dir(&cache) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("list {}: {e}", cache.display())),
+    };
+    let mut found = Vec::new();
+    for index in indexes {
+        let index = index.map_err(|e| format!("list {}: {e}", cache.display()))?;
+        if !index.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        for krate in locked {
+            let archive = index.path().join(format!("{}.crate", krate.stem()));
+            match fs::read(&archive) {
+                Ok(bytes) => {
+                    let matches = sha256_hex(&bytes) == krate.checksum;
+                    found.push((krate, archive, matches));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("read {}: {e}", archive.display())),
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Hash every cached `.crate` the lockfile names against its checksum, and delete each
+/// one that differs — cargo trusts its cache, so a bad archive left there would be
+/// vendored as it is. Returns how many were deleted.
+pub fn verify_crate_cache(locked: &[LockedCrate], cargo_home: &Path) -> Result<usize, String> {
+    let mut deleted = 0;
+    for (_, archive, matches) in cached_archives(locked, cargo_home)? {
+        if !matches {
+            fs::remove_file(&archive).map_err(|e| format!("remove {}: {e}", archive.display()))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// After vendoring: every locked crate's archive is in the cache vendoring extracted it
+/// from, and every one there hashes to the lock's checksum. This, not
+/// `.cargo-checksum.json` (whose `package` cargo copies from the lock), is what ties
+/// the vendored bytes to `Cargo.lock`.
+pub fn check_crate_archives(locked: &[LockedCrate], cargo_home: &Path) -> Result<(), String> {
+    let found = cached_archives(locked, cargo_home)?;
+    if let Some((krate, archive, _)) = found.iter().find(|(_, _, matches)| !matches) {
+        return Err(format!(
+            "{} (vendored as {}) does not hash to its Cargo.lock checksum {}",
+            archive.display(),
+            krate.stem(),
+            krate.checksum
+        ));
+    }
+    if let Some(missing) = locked
+        .iter()
+        .find(|krate| !found.iter().any(|(seen, _, _)| seen.stem() == krate.stem()))
+    {
+        return Err(format!(
+            "vendoring left no archive of {} in {}: its vendored bytes come from nothing the \
+             lock's checksum was held to",
+            missing.stem(),
+            cargo_home.join("registry/cache").display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a Cargo config at the filesystem root. Every cargo the cutter starts runs
+/// from `/`, an inert cwd, and cargo reads `/.cargo/config.toml` (or `config`) from
+/// there whatever else is set — the one ambient config a scrubbed environment and a
+/// private `CARGO_HOME` leave.
+pub(crate) fn refuse_root_cargo_config() -> Result<(), String> {
+    for config in ["/.cargo/config.toml", "/.cargo/config"] {
+        match fs::symlink_metadata(config) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect root Cargo config {config}: {error}")),
+            Ok(_) => {
+                return Err(format!(
+                    "refusing ambient root Cargo config during sealed release build: {config}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove any Cargo config from the vendoring `CARGO_HOME`. The cutter writes none, and
+/// one that is there persists across cuts and is read by `targo vendor`: a
+/// `[source.crates-io] replace-with` a directory source would vendor bytes no archive
+/// was checked for.
+fn clear_cargo_home_config(cargo_home: &Path) -> Result<(), String> {
+    for name in ["config.toml", "config"] {
+        let path = cargo_home.join(name);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+        };
+        if meta.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        }
+        .map_err(|e| format!("remove {}: {e}", path.display()))?;
+        println!(
+            "    vendoring: removed {}: the cutter's CARGO_HOME holds no Cargo config",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CargoChecksum {
+    #[serde(default)]
+    package: Option<String>,
+}
+
+/// Hold the vendored tree to the lockfile: exactly one `<name>-<version>` directory
+/// per locked package and nothing else, each with a `.cargo-checksum.json` whose
+/// `package` is the lockfile's checksum.
+pub fn check_vendored(locked: &[LockedCrate], vendor: &Path) -> Result<(), String> {
+    let want: BTreeMap<String, &LockedCrate> = locked.iter().map(|c| (c.stem(), c)).collect();
+    let mut seen = BTreeSet::new();
+    let entries = fs::read_dir(vendor).map_err(|e| format!("list {}: {e}", vendor.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("list {}: {e}", vendor.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(krate) = want.get(&name) else {
+            return Err(format!(
+                "vendoring produced {name}, which Cargo.lock does not name"
+            ));
+        };
+        let json = entry.path().join(".cargo-checksum.json");
+        let text = fs::read(&json).map_err(|e| format!("read {}: {e}", json.display()))?;
+        let parsed: CargoChecksum = aterm_json::from_slice(&text)
+            .map_err(|e| format!("{} does not parse: {e}", json.display()))?;
+        if parsed.package.as_deref() != Some(krate.checksum.as_str()) {
+            return Err(format!(
+                "the vendored {name} checksums as {:?}, and Cargo.lock says {}",
+                parsed.package, krate.checksum
+            ));
+        }
+        seen.insert(name);
+    }
+    if let Some(missing) = want.keys().find(|k| !seen.contains(*k)) {
+        return Err(format!(
+            "vendoring left out {missing}, which Cargo.lock names"
+        ));
+    }
+    Ok(())
+}
+
+/// Vendor `src`'s locked crates.io packages into `sync`'s `vendor/`, checked.
+fn vendor_into(
+    src: &Path,
+    cache: &CacheRoot,
+    targo: &Path,
+    sync: &mut Syncer,
+) -> Result<usize, String> {
+    let lock_path = src.join("Cargo.lock");
+    let lock_text =
+        fs::read_to_string(&lock_path).map_err(|e| format!("read {}: {e}", lock_path.display()))?;
+    let locked = locked_crates(&lock_text)?;
+    refuse_root_cargo_config()?;
+    let cargo_home = cache.vendor_cargo_home();
+    private_dir(&cargo_home, "vendoring CARGO_HOME")?;
+    clear_cargo_home_config(&cargo_home)?;
+    let tmp = cache.tmp();
+    private_dir(&tmp, "release temporary directory")?;
+    let deleted = verify_crate_cache(&locked, &cargo_home)?;
+    if deleted > 0 {
+        println!(
+            "    vendoring: {deleted} cached .crate archive(s) differed from Cargo.lock and were \
+             removed; cargo fetches them again"
+        );
+    }
+    // Unpacked sources are re-extracted from the archives just checked, never reused.
+    match fs::remove_dir_all(cargo_home.join("registry/src")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("clear the unpacked registry sources: {e}")),
+    }
+    let out = tmp.join("vendor");
+    match fs::remove_dir_all(&out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("clear {}: {e}", out.display())),
+    }
+    let tool_dir = targo
+        .parent()
+        .ok_or_else(|| format!("targo has no directory: {}", targo.display()))?;
+    let mut path = tool_dir.as_os_str().to_owned();
+    path.push(":");
+    path.push(SYSTEM_PATH);
+    let home = std::env::var_os("HOME").ok_or("vendoring needs HOME")?;
+    let result = Command::new(targo)
+        .args(["vendor", "--locked", "--versioned-dirs", "--manifest-path"])
+        .arg(src.join("Cargo.toml"))
+        .arg(&out)
+        .current_dir("/")
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("CARGO_HOME", &cargo_home)
+        .env("TMPDIR", &tmp)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn {} vendor: {e}", targo.display()))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
+        return Err(format!(
+            "`targo vendor --locked` failed ({}):\n  {}",
+            result.status,
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n  ")
+        ));
+    }
+    if !out.is_dir() {
+        // Nothing to vendor: cargo writes no directory for an empty set.
+        fs::create_dir(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    }
+    check_vendored(&locked, &out)?;
+    check_crate_archives(&locked, &cargo_home)?;
+    put_tree(sync, &out, Path::new("vendor"))?;
+    fs::remove_dir_all(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
+    Ok(locked.len())
+}
+
+/// Hand every file under `from` to `sync`, at `prefix`. A symbolic link is refused, as
+/// it is in the tree ([`list_tree`]): `cargo vendor` copies files, so a link here is
+/// one vendoring did not make.
+fn put_tree(sync: &mut Syncer, from: &Path, prefix: &Path) -> Result<(), String> {
+    let mut dirs = vec![(from.to_path_buf(), prefix.to_path_buf())];
+    while let Some((dir, rel)) = dirs.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| format!("list {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let here = rel.join(entry.file_name());
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+            if meta.is_dir() {
+                dirs.push((path, here));
+            } else if meta.is_file() {
+                let data = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                sync.put(&here, &data, is_exec(&meta))?;
+            } else {
+                return Err(format!(
+                    "vendoring left {} at {}: a release builds from regular files only",
+                    if meta.file_type().is_symlink() {
+                        "a symbolic link"
+                    } else {
+                        "a special file"
+                    },
+                    here.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_exec(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_exec(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+// ---------------------------------------------------------------------------
+// the digest
+// ---------------------------------------------------------------------------
+
+/// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`. The sync
+/// writes no link, so one found here is something else's, recorded as
+/// `link\0-\0<target>` for [`Snapshot::verify`] to name. Directories are implied by
+/// their contents.
+fn listing(root: &Path) -> Result<Listing, String> {
+    let mut out = Listing::new();
+    let mut dirs = vec![(root.to_path_buf(), Vec::new())];
+    while let Some((dir, rel)) = dirs.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| format!("list {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let mut here = rel.clone();
+            if !here.is_empty() {
+                here.push(b'/');
+            }
+            here.extend_from_slice(&path_bytes(Path::new(&entry.file_name())));
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+            let line = if meta.is_dir() {
+                dirs.push((path, here));
+                continue;
+            } else if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path)
+                    .map_err(|e| format!("read link {}: {e}", path.display()))?;
+                let mut line = b"link\0-\0".to_vec();
+                line.extend_from_slice(&path_bytes(&target));
+                line
+            } else if meta.is_file() {
+                let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                let sha = sha256_hex(&bytes);
+                format!("file\0{:o}\0{sha}", file_mode(&meta)).into_bytes()
+            } else {
+                return Err(format!(
+                    "a special file is in the snapshot: {}",
+                    path.display()
+                ));
+            };
+            out.insert(here, line);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_meta: &fs::Metadata) -> u32 {
+    0o644
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
+}
+
+/// [`SCHEMA`], then each `path\0line\n` in path order, under one SHA-256.
+fn digest_of(listing: &Listing) -> String {
+    let mut hasher = aterm_digest::Sha256::new();
+    hasher.update(SCHEMA.as_bytes());
+    hasher.update(b"\n");
+    for (path, line) in listing {
+        hasher.update(path);
+        hasher.update(b"\0");
+        hasher.update(line);
+        hasher.update(b"\n");
+    }
+    aterm_codec::hex::encode_lower(&hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git with nothing of this machine's own configuration in it.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = crate::ledger::object_git(dir)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// The reader answers only with an object's own bytes: another commit's bytes
+    /// planted under a commit's id — which a plain `git cat-file` serves, the negative
+    /// control — are refused, and so are an object of another kind than the one asked
+    /// for and one the store lacks; a refusal closes the reader.
+    #[test]
+    fn the_object_reader_holds_every_answer_to_its_id_and_kind() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-objects-")
+            .tempdir()
+            .unwrap();
+        let repo = scratch.path();
+        git(repo, &["init", "-q"]);
+        fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "one"]);
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        let tree = git(repo, &["rev-parse", "HEAD^{tree}"]);
+        let other = git(repo, &["commit-tree", "-p", &head, "-m", "planted", &tree]);
+        let reader = || ObjectReader::spawn(repo).unwrap();
+
+        let mut good = reader();
+        let bytes = good.read(&head, "commit").unwrap();
+        assert_eq!(
+            commit_tree(&bytes, head.len()).as_deref(),
+            Some(tree.as_str())
+        );
+        let bytes = good.read(&tree, "tree").unwrap();
+        let entries = tree_entries(&bytes, head.len() / 2).unwrap();
+        let blob = git(repo, &["rev-parse", "HEAD:a.txt"]);
+        assert!(
+            matches!(&entries[..], [RawEntry { mode: b"100644", name: b"a.txt", id }] if *id == blob)
+        );
+        good.finish().unwrap();
+
+        let mut kind = reader();
+        let err = kind.read(&tree, "commit").unwrap_err();
+        assert!(
+            err.contains(&format!("answered {tree} tree for the commit {tree}")),
+            "{err}"
+        );
+        let err = kind.read(&head, "commit").unwrap_err();
+        assert!(err.contains("closed"), "{err}");
+        let err = reader().read(&"0".repeat(head.len()), "tree").unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+
+        let loose = |oid: &str| repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        fs::remove_file(loose(&head)).unwrap();
+        fs::copy(loose(&other), loose(&head)).unwrap();
+        assert!(
+            git(repo, &["cat-file", "commit", &head]).contains("planted"),
+            "the negative control: git serves the planted bytes under the commit's id"
+        );
+        let err = reader().read(&head, "commit").unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "answered the commit {head} with bytes that are not that object"
+            )),
+            "{err}"
+        );
+    }
+}

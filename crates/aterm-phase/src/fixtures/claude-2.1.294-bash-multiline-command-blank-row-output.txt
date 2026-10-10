@@ -1,0 +1,24 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · Claude Code in verbose output (`"verbose": true` in the scratch config): a Bash call whose command is a heredoc with a blank line (`sleep 3; python3 - <<'EOF'` …), its output's first line `Not logged in · Please run /login`, the reply after it EMPTY: the command's rows wrap at column 6, its blank line a blank row, and the output's first row is the first column-2 `⎿` row under the call
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Bash(sleep 3; python3 - <<'EOF'
+      print('Not logged in · Please run /login')
+
+      print('third line')
+      EOF)
+  ⎿  Not logged in · Please run /login
+     third line
+
+✻ Cogitated for 3s · done 7:51 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents                                                                               21457 tokens

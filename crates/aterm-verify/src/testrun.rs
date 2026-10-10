@@ -997,13 +997,14 @@ fn first_error(log: &str) -> String {
 /// print the slowest tests its `--report-time` verdicts timed
 /// ([`crate::libtest::slowest`]; nothing when none were timed).
 ///
-/// A binary whose code-signing and TLS tests returned early because macOS's
-/// `trustd` did not answer passed without checking them: the row stays what
-/// ran decided, and ONE named skip says what did not
-/// ([`crate::libtest::trustd_skip`]), which withholds the merge contract.
+/// A binary whose tests of a macOS service (`trustd`, the disk-image
+/// service) returned early because it did not answer passed without checking
+/// them: the row stays what ran decided, and ONE named skip per service says
+/// what did not ([`crate::libtest::host_skips`]), which withholds the merge
+/// contract.
 fn decide(r: &mut Report, run: &Run, label: &str) {
     r.decide_test_child(run, label);
-    if let Some(skip) = crate::libtest::trustd_skip(&run.output) {
+    for skip in crate::libtest::host_skips(&run.output) {
         r.skip(skip);
     }
     if let Some(table) = crate::libtest::slowest(&run.output, crate::stages::SLOWEST_TESTS_LISTED) {
@@ -1491,7 +1492,7 @@ mod tests {
         };
         let log = |skipped: bool| {
             let line = if skipped {
-                format!("{}\n", crate::libtest::trustd::SKIPPED)
+                format!("{}\n", crate::libtest::skipped::SKIPPED)
             } else {
                 String::new()
             };
@@ -1504,11 +1505,10 @@ mod tests {
         let (t, v) = judge(log(true));
         assert_eq!(
             t.skips,
-            [format!(
-                "{}1 test binary skipped its code-signing and TLS checks (aterm_uds unittests \
-                 src/lib.rs); rebooting the Mac clears a wedged trustd",
-                crate::libtest::TRUSTD_SKIPPED
-            )]
+            [
+                "tests: trustd did not answer — 1 test binary skipped its code-signing and TLS \
+                 checks (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged trustd"
+            ]
         );
         assert!(t.gate_failures.is_empty() && t.could_not_run.is_empty());
         assert_eq!(v.exit, crate::exit::PASS, "{}", v.text);
@@ -1530,6 +1530,28 @@ mod tests {
             v.text
         );
         // Its row names the reboot; no re-run here lifts it.
+        assert!(!v.text.contains("Before you land:"), "{}", v.text);
+
+        // A silent disk-image service is its own named skip, withheld alike.
+        let (t, v) = judge(log(true).replace(
+            crate::libtest::skipped::SKIPPED,
+            crate::libtest::skipped::DISK_IMAGE_SKIPPED,
+        ));
+        assert_eq!(
+            t.skips,
+            [
+                "tests: hdiutil did not answer — 1 test binary skipped its disk-image checks \
+                 (aterm_uds unittests src/lib.rs); rebooting the Mac clears a wedged disk-image \
+                 service"
+            ]
+        );
+        assert_eq!(v.exit, crate::exit::PASS, "{}", v.text);
+        assert!(!v.claims_merge_contract, "{}", v.text);
+        assert!(
+            !v.text.contains(crate::verdict::MERGE_CONTRACT_SENTENCE),
+            "{}",
+            v.text
+        );
         assert!(!v.text.contains("Before you land:"), "{}", v.text);
 
         let (t, v) = judge(log(false));

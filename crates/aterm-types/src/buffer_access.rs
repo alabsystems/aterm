@@ -14,8 +14,11 @@
 /// allowing navigation logic to operate on `dyn BufferAccess` without
 /// coupling to concrete types.
 ///
-/// Line coordinates use `i32` to support scrollback: negative values address
-/// scrollback history, zero is the first visible line.
+/// Line coordinates use `i32` to support scrollback. Line 0 is the top line
+/// of the live screen whatever [`display_offset`](Self::display_offset) is: a
+/// scrolled-back viewport does not move what a line names. Negative values
+/// count back into scrollback history from there (-1 is the newest history
+/// line).
 pub trait BufferAccess {
     /// Read the character at the given position.
     ///

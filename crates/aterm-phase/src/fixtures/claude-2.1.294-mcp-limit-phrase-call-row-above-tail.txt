@@ -1,0 +1,51 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (the review of H6-HARNESS-1 pass 4), `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP tool (verbose output) whose result has two content blocks, an issue's first line and a weekly limit's words, the reply after it empty: the inline renderer draws the call's row at row 9 and leaves the 31 rows under the footer blank, so a 40-row tail of the pane (rows 10-49) holds the limit's words and not the call
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ github - get_limit (MCP)(n: 7)
+  ⎿  Issue 7: the parser drops a row
+  ⎿  You've hit your weekly limit · resets Oct 30 at 7pm (America/Los_Angeles)
+
+✻ Brewed for 3s · done 2:15 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                             21584 tokens
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -92,6 +92,11 @@ impl Fixture {
             &homebrew.join("cargo"),
             &format!("#!/bin/sh\necho \"homebrew-style cargo: $*\"\nexit {FAKE_EXIT}\n"),
         );
+        // Its first exec, paid here: a freshly written file waits on `syspolicyd`'s
+        // assessment the first time it runs (seconds under load, `atpkg::reroute`'s tests),
+        // and the reroute's bounded `-vV` probe must not be the run that pays it.
+        let warmed = Command::new(homebrew.join("cargo")).output().unwrap();
+        assert_eq!(warmed.status.code(), Some(FAKE_EXIT), "{warmed:?}");
         Self {
             _root: root,
             home,
@@ -474,9 +479,11 @@ fn a_tty_session_whose_front_door_handed_no_agents_dir_still_leads_with_reroute(
 
 /// THE MESSAGE, END TO END. Inside aterm, after the hook, a bare `cargo build --x` in
 /// every POSIX shell installed here reaches the reroute stub ahead of the fake Homebrew
-/// cargo: stderr carries the signpost naming `targo --unverified build --x` and
-/// `targo trust build --x`, the fake then runs with the same arguments, and its exit code
-/// is the command's. `[reroute] announce = false` drops the line and nothing else. The
+/// cargo: stderr carries the signpost — naming what `cargo` resolved to (the fake answers
+/// `-vV` like no Rust tool, so it is an unidentified cargo, not known to be Trust) and
+/// `targo --unverified build --x` and `targo trust build --x` — the fake then runs with the
+/// same arguments, and its exit code is the command's; the `-vV` the name was resolved by
+/// never reaches stdout. `[reroute] announce = false` drops the line and nothing else. The
 /// negative control: outside aterm the same command runs the fake SILENTLY — the message
 /// comes from the order the hook sets, not from the fake or the fixture.
 #[test]
@@ -487,10 +494,20 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
     let atpkg::reroute::Policy::Signpost { lanes, .. } = row.policy else {
         panic!("cargo is a SIGNPOST row: {row:?}");
     };
-    let signpost = atpkg::reroute::signpost_message_in(row, lanes, &args, None, None);
+    // The lanes and the closing lines, as `atpkg::reroute` renders them for these args: the
+    // resolved first line and the file line come between them.
+    let signpost = atpkg::reroute::signpost_message_in(row, lanes, &args, None, None, None);
+    let (_, lanes_text) = signpost.split_once('\n').expect("a block");
+    let (lane_lines, closing) = lanes_text
+        .split_once("       `aterm help rust`")
+        .expect("the closing lines");
     for lane in ["targo --unverified build --x", "targo trust build --x"] {
-        assert!(signpost.contains(lane), "{signpost}");
+        assert!(lane_lines.contains(lane), "{signpost}");
     }
+    let first_line = format!(
+        "aterm: running 'cargo' -> an unidentified cargo ({} -vV exited {FAKE_EXIT}); not known to be Trust (no proof claim); on Trust the tool is 'targo':\n",
+        fx.homebrew.join("cargo").display()
+    );
     let script = ". \"$ATPKG_TEST_HOOK\"; cargo build --x";
     let upstream_ran = "homebrew-style cargo: build --x\n";
     for shell in posix_shells() {
@@ -514,8 +531,11 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
         };
         let (stdout, stderr, code) = cargo(&[("ATERM_CHILD", "1")]);
         assert!(
-            stderr.contains(&signpost),
-            "{who}: inside aterm a bare cargo is announced — stderr={stderr:?} stdout={stdout:?}"
+            stderr.starts_with(&first_line)
+                && stderr.contains(lane_lines)
+                && stderr.contains(closing),
+            "{who}: inside aterm a bare cargo is announced by what it resolved to — \
+             stderr={stderr:?} stdout={stdout:?}"
         );
         assert_eq!(
             stdout, upstream_ran,

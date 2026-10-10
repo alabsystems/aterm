@@ -31,7 +31,8 @@
 //!     General calls that add or remove multiple matches atomically are outside
 //!     this exact scalar abstraction; a boundary control below proves those
 //!     transitions are rejected rather than silently overclaimed. Their broader
-//!     invariants remain covered by local tests and Kani harnesses.
+//!     invariants remain covered by the engine's `verify_all_invariants`,
+//!     asserted throughout the streaming tests.
 //!
 //!   Negative controls: a forged observation MUST be rejected; a disabled model
 //!     action MUST correspond to a real engine no-op; multi-effect shipping calls
@@ -386,7 +387,7 @@ fn at_capacity_hit_counts_but_does_not_store() {
 /// added or removed match per ScanHit/Add/Invalidate action. The shipping
 /// methods accept broader text/ranges and may affect several matches in one
 /// atomic call. Prove those transitions are NOT accidentally admitted as unit
-/// actions; their invariants belong to the local/Kani suites instead.
+/// actions; their invariants belong to `verify_all_invariants` instead.
 #[test]
 fn multi_effect_calls_are_rejected_by_the_unit_effect_model() {
     let m = streaming_search_model();

@@ -30,8 +30,8 @@ mod term_mode;
 
 pub use dom_map::{encode_dom_key, map_dom_key};
 pub use encode::{
-    encode_key, encode_key_with_event, encode_key_with_layout, is_modifier_or_lock_key,
-    shifted_character,
+    encode_key, encode_key_with_event, encode_key_with_layout, encode_key_with_text,
+    is_modifier_or_lock_key, shifted_character, typed_character,
 };
 pub use key_types::{Key, KeyEventType, Modifiers, NamedKey};
 pub use mode::KeyboardMode;

@@ -25,9 +25,9 @@
 //!
 //! ## Properties of the policy mapping
 //!
-//! Pinned by the unit tests in `policy.rs` and `mode.rs` and re-checked by the
-//! opt-in Kani harnesses in `kani_proofs` (`scripts/verify-kani-proofs.sh`,
-//! trust-mc). They concern the data model, not OS enforcement:
+//! Pinned by the unit tests in `policy.rs` and `mode.rs`, which enumerate all
+//! four modes and every ordered pair. They concern the data model, not OS
+//! enforcement:
 //!
 //! - **`NonEscalation`**: mode never increases in capability
 //! - **`CapabilitiesMatchMode`**: capabilities always consistent with mode
@@ -69,8 +69,6 @@
 pub mod actuator;
 pub(crate) mod capability;
 pub mod consent;
-#[cfg(kani)]
-mod kani_proofs;
 pub(crate) mod mode;
 pub(crate) mod policy;
 pub mod sbpl;

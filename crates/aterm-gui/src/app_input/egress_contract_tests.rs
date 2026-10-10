@@ -523,6 +523,7 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
         key: aterm_types::keyboard::Key::Character('q'),
         mods: aterm_types::keyboard::Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: aterm_types::keyboard::KeyEventType::Press,
     };
     assert_eq!(app.input(wid, key, Source::Human), InputOutcome::Ok);

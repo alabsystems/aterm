@@ -1193,7 +1193,7 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
     let baseline = Identity {
         build: current_build,
         sha256: hash_file(&context.target)?,
-        version: aterm_types::version::APP_VERSION.into(),
+        version: aterm_types::version::app_version().into(),
         commit: String::new(),
         machine_id: None,
     };

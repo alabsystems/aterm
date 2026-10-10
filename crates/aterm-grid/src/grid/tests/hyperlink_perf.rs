@@ -75,7 +75,6 @@ fn correct_after_clear_rows() {
             .set_hyperlink(Some(url.clone()));
     }
 
-    // Clear rows 3..7
     extras.clear_rows(3..7);
 
     for row in 0..3 {
@@ -98,7 +97,6 @@ fn correct_after_shift_rows_up() {
     let url = test_url();
     let mut extras = CellExtras::new();
 
-    // Hyperlink on row 10
     extras
         .get_or_create(CellCoord::new(10, 0))
         .set_hyperlink(Some(url));
@@ -159,7 +157,6 @@ fn correct_across_mixed_mutations() {
         "non-hyperlink mutation should not change results"
     );
 
-    // Clear row 5
     extras.clear_row(5);
     let after_clear: Vec<bool> = (0..15).map(|r| extras.row_has_hyperlinks(r)).collect();
     assert!(!after_clear[5], "row 5 should be cleared");

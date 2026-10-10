@@ -299,7 +299,6 @@ fn reflow_shrink_wide_char_at_chunk_boundary() {
     grid.resize(5, 2);
     grid.assert_invariants();
 
-    // Row 0: 'A'
     assert_eq!(
         grid.row(0).unwrap().get(0).unwrap().char_data(),
         'A' as u16,
@@ -313,7 +312,6 @@ fn reflow_shrink_wide_char_at_chunk_boundary() {
         "row 1 col 0 should be WIDE (wide char deferred from chunk boundary)"
     );
 
-    // Row 2: 'B' and 'C'
     assert_eq!(
         grid.row(2).unwrap().get(0).unwrap().char_data(),
         'B' as u16,

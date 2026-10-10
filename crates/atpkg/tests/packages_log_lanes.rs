@@ -1,14 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE PACKAGE LOG AT THE REAL PROCESS EDGE (Phase 4, 2026-09-23): the dev `atpkg` binary,
+//! THE PACKAGE LOG AT THE REAL PROCESS EDGE: the dev `atpkg` binary,
 //! run the way each lane runs it, appends a `pass-start` and a `pass-end` naming that lane
 //! to `packages.log` in the log directory under its HOME — and a verb the store lock
 //! refused leaves one `pass-end` saying it did not run.
 //!
 //! NEVER THE REAL STORE OR THE REAL LOG. HOME, the config dir, the state dir and aterm's
 //! own state root (`ATERM_STATE_HOME`, which moves the log) are temp directories — set,
-//! never inherited, so a run from inside an isolated instance cannot write into its root; `<prefix>/declined` makes `seed` exit 0 with one sentence before any index
+//! never inherited, so a run from inside an isolated instance cannot write into its root.
+//! `<prefix>/declined` makes `seed` exit 0 with one sentence before any index
 //! work, so no network and no store mutation happen.
 
 #![cfg(unix)]
@@ -217,12 +218,10 @@ impl Drop for Reaped {
 /// TWO PROCESSES APPENDING AT ONCE interleave whole lines, never halves: every line in the
 /// file parses, and each process's count is all there.
 ///
-/// HERE, in its own test binary, and never among the library's unit tests (review of Phase
-/// 4, 2026-09-23): a child spawned while another test holds a store lock carries a copy of
-/// that lock's descriptor until its exec closes it, and exec'ing a whole test binary took
-/// long enough that `lock::tests::the_holder_record_names_a_person_only_while_one_holds_the_store`
-/// found its store still locked after its guard had dropped — two full runs in three.
-/// Cargo runs test binaries one after another, so no library test runs beside this one.
+/// HERE, in its own test binary, never among the library's unit tests: a child spawned
+/// while another test holds a store lock carries a copy of that lock's descriptor until its
+/// exec closes it, so a library test could find its store still locked after its guard
+/// dropped. Cargo runs test binaries one after another, so no library test runs beside it.
 #[test]
 fn two_processes_appending_at_once_interleave_whole_lines() {
     let scratch = aterm_tempfile::Builder::new()

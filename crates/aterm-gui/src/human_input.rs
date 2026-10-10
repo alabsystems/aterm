@@ -172,6 +172,7 @@ mod tests {
             key: Key::Named(NamedKey::ArrowDown),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type,
         }
     }

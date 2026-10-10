@@ -87,17 +87,15 @@ pub fn control_connection_admission_model() -> Model {
 /// which `NoIdleHold` rejects on purpose — a degraded mode, logged as an error.
 ///
 /// `Buggy=1` is seven defects at once, each caught by its own invariant:
-/// finishing a request keeps the idle connection on its lane — THE 2026-09-26
-/// DEFECT, where persistent drivers used up every lane and a fresh client was
-/// refused (`NoIdleHold`, `NoRefusalByIdleDriver`); admission ignores both
-/// bounds (`RequestLanesBounded`, and with no open-connection bound the parker
+/// finishing a request keeps the idle connection on its lane, so persistent
+/// drivers use up every lane and a fresh client is refused (`NoIdleHold`,
+/// `NoRefusalByIdleDriver`); admission ignores both bounds
+/// (`RequestLanesBounded`, and with no open-connection bound the parker
 /// overflows: `ParkBounded`); a wait takes a wait lane past the cap
 /// (`WaitLanesBounded`); a wait no wait lane can take is served on a request
-/// lane whatever the budget — the fallback as first shipped, where waits past
-/// the wait lanes took every request lane (`RequestLaneLeftForRequests`); a
-/// wait is kept on a request lane — served there, or answered busy — while a
-/// wait lane is free, as a wait with a request pipelined behind it was before
-/// its bytes moved with it, which turned the fifth `aterm drive --dial` relay
+/// lane whatever the budget, so waits past the wait lanes take every request
+/// lane (`RequestLaneLeftForRequests`); a wait is kept on a request lane —
+/// served there, or answered busy — while a wait lane is free, turning a relay
 /// away with most of the wait lanes free (`WaitLaneTakenFirst`); the parker
 /// closes a hung-up connection without ending its tenure
 /// (`EveryConnectionPlaced`).
@@ -2822,8 +2820,8 @@ pub fn composite_accessibility_route_model() -> Model {
 /// anchor version in one transition. Concurrent publication makes an older base
 /// stale; rejecting it is a no-op. The mutants accept the stale base, or publish a
 /// commit only to its author: the shared snapshot — the immutable projection
-/// cache `DocumentStore::transact` republishes beside the Surface commit since
-/// 3a30b2ed6 split the two — stays at the old text, and the other controller
+/// cache `DocumentStore::transact` republishes beside the Surface commit — stays
+/// at the old text, and the other controller
 /// misses it: Markdown its observed sequence, the Editor its observed sequence and
 /// the rebase of its selection anchor through the commit's deltas.
 #[must_use]
@@ -3228,9 +3226,9 @@ pub fn native_draft_journal_model() -> Model {
 /// Every mutant is its own action, dead at `Buggy = 0`, so the strict-vacuity
 /// audit credits each as an independently caught negative control: a taker
 /// returns before its claim is durable (`ReturnUnsynced`); a writer reuses the
-/// fixed temporary alias (`ReuseFixedTemporary`); and a taker takes the way
-/// `take_from` did before 3473ced57 (`HistoricalTakeA`, `HistoricalTakeB`) —
-/// with no lock, read the manifest, then remove it and return what it read.
+/// fixed temporary alias (`ReuseFixedTemporary`); and a taker takes with no
+/// lock (`HistoricalTakeA`, `HistoricalTakeB`): read the manifest, then remove
+/// it and return what it read.
 /// Between a taker's read and its remove the name is still visible
 /// (`ClaimRemovesVisibleName`), and a second taker that reads in that window
 /// returns the same manifest (`AtMostOneConsumer`).
@@ -3325,12 +3323,11 @@ pub fn restore_manifest_single_use_model() -> Model {
                 unique_temporary = 0;
                 lock_owner = 0;
             }
-            // Mutant: the writer publishes through the fixed `toml.tmp` alias
-            // the pre-3473ced57 `write_to` used.
+            // Mutant: the writer publishes through a fixed `toml.tmp` alias.
             action ReuseFixedTemporary when (Buggy == 1 && lock_owner == 3) {
                 fixed_alias_corrupted = 1;
             }
-            // Mutant: the pre-3473ced57 take, one action per taker, each firing
+            // Mutant: the unlocked take, one action per taker, each firing
             // its next step — `read_to_string(path)` with no lock held, then
             // `remove_file(path)` (its failure ignored) and return what was read.
             action HistoricalTakeA when (
@@ -3479,9 +3476,9 @@ pub fn native_close_plan_model() -> Model {
 /// reproducing both a false "Saved" publication and a wedged close/Quit plan.
 /// It also commits a close the moment it is armed, without waiting for the
 /// checkpoint to cover the frozen sequence — the check
-/// `document_close_plan_ready` makes through `DocumentStore::prepare_close`, the
-/// class of d74148b8a, where a window close detached a document no checkpoint
-/// had covered (`ClosedSequenceIsDurable`).
+/// `document_close_plan_ready` makes through `DocumentStore::prepare_close` — so
+/// a window close detaches a document no checkpoint covered
+/// (`ClosedSequenceIsDurable`).
 ///
 /// No law says `durable`, `target` or `requested` is never ahead of `head`: each
 /// is a captured past head (an acknowledged plan, a plan's snapshot seq,
@@ -3600,9 +3597,8 @@ pub fn native_save_intent_latch_model() -> Model {
 ///
 /// The two owners here are the two the shipping runtime mints: a view's
 /// external-open reply and the config service's patch. The instance- and
-/// document-owned kinds (and a service restart) had no shipping producer and
-/// were retired 2026-09-25, rather than kept as test-only router arms for this
-/// model to bind.
+/// document-owned kinds (and a service restart) have no shipping producer, so
+/// the model does not carry them.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_async_delivery_model() -> Model {

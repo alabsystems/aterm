@@ -197,9 +197,8 @@ fn a_thawed_worker_has_its_point_decided_again() {
 }
 
 /// The loop tells its host the stall it holds and that it lifted
-/// ([`IdleHost::stalled`]), so an agent exiting while one is held is
-/// relaunched on its conversation. Negative control: a worker that never
-/// stalls tells the host nothing.
+/// ([`IdleHost::stalled`]), a notice of what it saw. Negative control: a
+/// worker that never stalls tells the host nothing.
 #[test]
 fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
     #[derive(Debug, Default)]
@@ -237,20 +236,23 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
 
 /// The frozen mail names the worker's own conversation: under a host that read
 /// the agent's resume line ([`IdleHost::resume_command`], `claude --resume <its
-/// id>` from Claude Code's `sessions/<pid>.json`) and does not relaunch it, the
-/// mail's remedy ends with that line; under a host that would relaunch it
-/// ([`IdleHost::relaunches_on_exit`]) it says so and names no command. Never
-/// `claude --continue` (the directory's newest conversation, possibly a
-/// sibling tab's). Negative controls: with no host (`drive watch`) the restart
-/// stands alone; a host that restarts under `[harness] relaunch`
-/// ([`IdleHost::can_restart`]) but whose relaunch would refuse this launch (an
-/// unknown flag, a `--worktree`, a nushell tab) names the command.
+/// id>` from Claude Code's `sessions/<pid>.json`) and would not carry the
+/// explicit restart, the mail's remedy ends with that line; under a host that
+/// would ([`IdleHost::restart_offered`]) it names that restart, says the
+/// host relaunches it, and names no command — whatever `[harness] relaunch`
+/// says ([`IdleHost::can_restart`] false: ruling 1). Never `claude
+/// --continue` (the directory's newest conversation, possibly a sibling
+/// tab's). Negative controls: with no host (`drive watch`) the restart stands
+/// alone; a host that restarts but would not carry the act (its relaunch
+/// would refuse this launch: an unknown flag, a `--worktree`, a nushell tab)
+/// names the command; one that carries it but cannot promise the
+/// conversation (a Codex) names the restart alone.
 #[test]
 fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
     #[derive(Debug)]
     struct Host {
         restarts: bool,
-        plans: bool,
+        offered: Option<bool>,
     }
     impl IdleHost for Host {
         fn wants(&self) -> bool {
@@ -265,8 +267,8 @@ fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
         fn can_restart(&self) -> bool {
             self.restarts
         }
-        fn relaunches_on_exit(&self) -> bool {
-            self.restarts && self.plans
+        fn restart_offered(&self) -> Option<bool> {
+            self.offered
         }
         fn resume_command(&self) -> Option<String> {
             Some("claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string())
@@ -274,21 +276,25 @@ fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
     }
     let command = "signal term (signal kill if it survives), then claude --model opus --resume \
                    5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
-    for (restarts, plans, tail) in [
-        (false, false, command),
-        (
-            true,
-            true,
-            "signal term (signal kill if it survives); aterm relaunches it on its conversation",
-        ),
+    let carried = "restart if-stalled; aterm relaunches it on its conversation";
+    for (restarts, offered, tail) in [
+        (false, None, command),
+        // The host carries the act: the explicit restart, which ends a
+        // survivor itself.
+        (true, Some(true), carried),
+        // ...under `[harness] relaunch = false` too (ruling 1).
+        (false, Some(true), carried),
         // Restarts Claude Code, but its relaunch would refuse this launch.
-        (true, false, command),
+        (true, None, command),
+        // Carried, its conversation not promised: the restart alone.
+        (false, Some(false), "restart it: restart if-stalled"),
     ] {
-        let relaunches = (restarts, plans);
+        let relaunches = (restarts, offered);
         let mut m = box_that_sits();
         m.input_after = vec![(2, INPUT_STALLED)];
+        let host = Host { restarts, offered };
         let opts = SuperviseOpts {
-            idle_host: Some(Arc::new(Host { restarts, plans }) as Arc<dyn IdleHost>),
+            idle_host: Some(Arc::new(host) as Arc<dyn IdleHost>),
             ..auto(30, None)
         };
         let _ = watch_lines_with(&mut m, &opts, |s| {
@@ -301,7 +307,7 @@ fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
             .unwrap_or_else(|| panic!("the frozen mail: {acts:#?}"));
         assert!(
             mail.ends_with(tail),
-            "(restarts, plans)={relaunches:?}: {mail}"
+            "(restarts, offered)={relaunches:?}: {mail}"
         );
         assert!(!mail.contains("--continue"), "{mail}");
     }
@@ -1020,13 +1026,18 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
     }
 }
 
+/// The explicit restart the remedy sends under `stall_term = true` for the
+/// host's agent (pid 4242), within the default grace.
+const RESTART: &str = "restart pid=4242 if-stalled quiet=120";
+
 /// A worker frozen past the remedy's bound: eleven minutes.
 const INPUT_STALLED_LONG: &str = "input=stalled input_bytes=1 input_wait_ms=660000 fg_rss_mb=39731";
 
 /// A host that relaunches an agent the stall's remedy ends (the window's, under
 /// `[harness] relaunch`), or not, and keeps what it was told for a person
-/// ([`IdleHost::inform`]). Its third field is what follows the end: its
-/// relaunch would come ([`IdleHost::relaunches_on_exit`]), a resume line
+/// ([`IdleHost::inform`]). Its third field is what follows the end: the act
+/// carried and its relaunch promised, or carried alone
+/// ([`IdleHost::restart_offered`]), a resume line
 /// ([`IdleHost::resume_command`]), or neither.
 #[derive(Debug)]
 struct Relaunching(bool, Mutex<Vec<String>>, AfterRestart);
@@ -1044,8 +1055,15 @@ impl IdleHost for Relaunching {
     fn relaunches_after_stall(&self) -> bool {
         self.0
     }
-    fn relaunches_on_exit(&self) -> bool {
-        self.2 == AfterRestart::Relaunch
+    fn agent_pid(&self) -> Option<u32> {
+        Some(4242)
+    }
+    fn restart_offered(&self) -> Option<bool> {
+        match self.2 {
+            AfterRestart::Relaunch => Some(true),
+            AfterRestart::Act => Some(false),
+            AfterRestart::Unknown | AfterRestart::Command(_) => None,
+        }
     }
     fn resume_command(&self) -> Option<String> {
         match &self.2 {
@@ -1125,7 +1143,7 @@ fn remedy_run_as(
     let signals = m
         .requests
         .iter()
-        .filter(|r| r.starts_with("signal"))
+        .filter(|r| r.starts_with("signal") || r.starts_with("restart"))
         .cloned()
         .collect();
     let informed = host
@@ -1143,9 +1161,11 @@ fn remedy_run_as(
 /// size, how to end it, and that the host relaunches it, once per episode.
 /// The knob is [`a_worker_frozen_past_the_bound_is_ended_for_its_relaunch`]'s.
 /// Negative controls: where the strict remedy would not act (younger than the
-/// bound, the bound off, a person's hand) nothing is said; where the host's
-/// relaunch would not come (`relaunches_on_exit` false) the record promises
-/// none and names the resume line where the host read one.
+/// bound, the bound off, a person's hand) nothing is said; where the host
+/// would not carry the act (`restart_offered` none) the record promises no
+/// relaunch and names the resume line where the host read one; where it
+/// would but cannot promise the conversation (a Codex) it names the restart
+/// and promises nothing.
 #[test]
 fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     assert!(!SupervisorConfig::default().stall_term, "the default warns");
@@ -1172,8 +1192,9 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     );
     assert_eq!(informed.len(), 1, "one record for the person: {informed:?}");
     // The state is its first line (the record's title); the second says it
-    // is left running, the one command that ends it and its fallback, and
-    // that the host brings the conversation back.
+    // is left running, the one command that ends it — the explicit restart,
+    // which ends a survivor itself — and that the host brings the
+    // conversation back.
     let mut said = informed[0].lines();
     assert_eq!(
         said.next(),
@@ -1184,8 +1205,8 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     let act = said.next().unwrap_or_default();
     assert!(
         act.starts_with("aterm leaves it running")
-            && act.contains("signal term` ends it")
-            && act.contains("`signal kill` if it survives")
+            && act.contains(" restart pid=4242 if-stalled` ends it")
+            && !act.contains("signal")
             && act.ends_with(&format!(", and {}", crate::harness::resume::RELAUNCH_WORDS)),
         "{}",
         informed[0]
@@ -1218,6 +1239,10 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
         (
             AfterRestart::Unknown,
             "(`signal kill` if it survives)".to_string(),
+        ),
+        (
+            AfterRestart::Act,
+            " restart pid=4242 if-stalled` restarts it".to_string(),
         ),
     ] {
         let (_, _, informed) =
@@ -1258,9 +1283,10 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
 /// The stall's remedy when nobody is there (with `stall_term`): a worker frozen
 /// past `[harness] stall_term_after_s` (ten minutes by default), with no
 /// person's hand within the grace and no other hand on the session, under a
-/// relaunching host, gets `signal term` (said as `SIGNALLED … signal=term`),
-/// once: a program frozen on every later read gets no `signal kill` (that stays
-/// a person's). Negative controls, each with no signal: a stall younger than
+/// relaunching host, gets the explicit restart — `restart pid=<its agent>
+/// if-stalled quiet=<the grace>` (said as `RESTARTED …`) — once: a program
+/// frozen on every later read is not sent it again, and never a `signal kill`
+/// of the loop's (the act ends a survivor itself). Negative controls, each with no signal: a stall younger than
 /// the bound, a longer bound, the remedy off (`stall_term_after_s = 0`), a host
 /// that does not relaunch (`drive watch`, `relaunch = false`), a person's
 /// keystroke within the grace, a lease on the session, and a stopped job
@@ -1270,14 +1296,16 @@ fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
     let default = SupervisorConfig::default().stall_term_after_s;
     assert_eq!(default, 600, "ten minutes");
     let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |_| {});
-    assert_eq!(signals, ["signal term"], "never a kill: {lines:#?}");
+    assert_eq!(signals, [RESTART], "never a kill: {lines:#?}");
     let said: Vec<&String> = lines
         .iter()
-        .filter(|l| l.starts_with("SIGNALLED"))
+        .filter(|l| l.starts_with("RESTARTED"))
         .collect();
     assert_eq!(said.len(), 1, "{lines:#?}");
     assert!(
-        said[0].contains(" signal=term input=stalled wait_ms=660000 rss_mb=39731 reply=OK"),
+        said[0].contains(
+            " input=stalled wait_ms=660000 rss_mb=39731 reply=OK restarting pid 4242 cause=stall"
+        ),
         "{}",
         said[0]
     );
@@ -1340,18 +1368,88 @@ fn input_stopped(aged: bool) -> &'static str {
     }
 }
 
+/// THE REMEDY IS THE SERVER'S EXPLICIT RESTART, AND ITS REFUSALS DECIDE
+/// (design of 2026-10-08): under `stall_term = true` the loop sends `restart
+/// pid=<its agent> if-stalled quiet=<grace>`, and the server's own fences,
+/// read under the same request, answer. `ERR not-stalled` (the stall lifted
+/// between the loop's read and the act) is not counted: the next read that
+/// still finds the stall restarts it. `ERR restart unavailable: <why>` is
+/// counted, once, and the warning is said instead — naming what a person can
+/// do (`signal term`), never the restart the server refused. An older server
+/// that does not know the verb gets the bare `signal term` it knows — read by
+/// `ERR unknown verb` or, the verb aimed at a session, `ERR denied` (review
+/// of 3eaa8f83c: the fallback on `unknown verb` alone never fired).
+#[test]
+fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
+    let default = SupervisorConfig::default().stall_term_after_s;
+    let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |m| {
+        m.restart_replies.push_back(err("not-stalled"));
+    });
+    assert_eq!(signals, [RESTART, RESTART], "{lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("RESTART-REFUSED") && l.ends_with("reply=ERR not-stalled")),
+        "{lines:#?}"
+    );
+    let (signals, lines, informed) = remedy_run_as(
+        INPUT_STALLED_LONG,
+        true,
+        default,
+        true,
+        AfterRestart::Relaunch,
+        |m| {
+            m.restart_replies
+                .push_back(err("restart unavailable: not-supervised"))
+        },
+    );
+    assert_eq!(signals, [RESTART], "counted: once an episode: {lines:#?}");
+    let warned: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("STALL-WARNED"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{lines:#?}");
+    assert!(
+        warned[0].ends_with("ended=no (ERR restart unavailable: not-supervised)"),
+        "{}",
+        warned[0]
+    );
+    assert_eq!(informed.len(), 1, "{informed:?}");
+    assert!(
+        informed[0].contains("signal term") && !informed[0].contains("restart pid="),
+        "the warning names what a person can do: {}",
+        informed[0]
+    );
+    // An older server: `ERR unknown verb`, or — the verb aimed at a session,
+    // as the loop's is — `ERR denied` (an unknown verb has no op class).
+    for older in ["unknown verb (try: help)", "denied"] {
+        let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |m| {
+            m.restart_replies.push_back(err(older));
+        });
+        assert_eq!(signals, [RESTART, "signal term"], "{older}: {lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("SIGNALLED") && l.contains(" signal=term ")),
+            "{older}: {lines:#?}"
+        );
+    }
+}
+
 /// Tier-1 of `SupervisorStallRemedy` (aterm-spec
 /// `supervisor_stall_remedy_model`): the real loop over a worker the server says
 /// is not reading its input, in every configuration the model reaches with no
 /// term sent yet (frozen or stopped, past the bound or not, the bound off, a
-/// person's hand within the grace, a relaunching host or not), sends
-/// `signal term` exactly where the model's `Term` is enabled, and once; later
-/// reads still report the stall and nothing more is sent. An episode that
-/// thaws and freezes again gets its own term (the model's `Thaw`). Negative
-/// control: the `Buggy = 1` model terms under a person's hand and kills after
-/// the term, where the real loop sends nothing and one term. `Term` is the
-/// remedy under `stall_term = true`; the default warning takes the same gate
-/// and is checked in every configuration too.
+/// person's hand within the grace, a relaunching host or not), sends the
+/// explicit restart (`restart pid=<n> if-stalled quiet=<grace>`, the model's
+/// `Term`: the remedy's one act) exactly where the model's `Term` is enabled,
+/// and once; later reads still report the stall and nothing more is sent. An
+/// episode that thaws and freezes again gets its own (the model's `Thaw`).
+/// Negative control: the `Buggy = 1` model acts under a person's hand and
+/// kills after the act, where the real loop sends nothing and one restart
+/// (the act's own SIGKILL of a survivor is the server's, not the loop's).
+/// `Term` is the remedy under `stall_term = true`; the default warning takes
+/// the same gate and is checked in every configuration too.
 #[test]
 fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1398,7 +1496,7 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
                 mk.human_ms = Some(1_000);
             }
         });
-        let want: &[&str] = if term { &["signal term"] } else { &[] };
+        let want: &[&str] = if term { &[RESTART] } else { &[] };
         assert_eq!(
             signals, want,
             "stalled={stalled} aged={aged} off={off} hand={hand} host={host}: {lines:#?}"
@@ -1436,7 +1534,7 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
         ];
         mk.vanish_after = Some(8);
     });
-    assert_eq!(signals, ["signal term", "signal term"], "{lines:#?}");
+    assert_eq!(signals, [RESTART, RESTART], "{lines:#?}");
 
     // Negative controls: where the Buggy model signals, the real loop does not.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
@@ -1455,5 +1553,5 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     }
     assert!(buggy.action_enabled("Kill", &st) && buggy.action_enabled("TermAgain", &st));
     let (signals, _) = remedy_run(INPUT_STALLED_LONG, true, 600, |_| {});
-    assert_eq!(signals, ["signal term"], "one term, no kill");
+    assert_eq!(signals, [RESTART], "one restart, no kill of the loop's");
 }

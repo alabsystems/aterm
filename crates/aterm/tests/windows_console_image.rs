@@ -16,8 +16,8 @@
 //!   header, since the attribute lives in source and the fact lives in the
 //!   linked file);
 //! * a window flag the window's parser REFUSES is refused by the console image,
-//!   on its own stderr, exit 2 — handed to the sibling it printed into NUL and
-//!   the console image exited 0 with no window (review 2026-09-27);
+//!   on its own stderr, exit 2 (handed to the sibling, it would print into NUL
+//!   and the console image would exit 0 with no window);
 //! * a window flag the parser answers by PRINTING still prints through the
 //!   console image.
 //!

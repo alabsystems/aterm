@@ -4121,6 +4121,7 @@ mod tests {
             key,
             mods,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         }
     }

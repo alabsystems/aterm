@@ -778,10 +778,8 @@ fn disk_backed_push_with_line_limit_keeps_the_newest_lines() {
 // DiskBacked push_str + get_line round-trip over generated lines (#2603)
 // =========================================================================
 //
-// Kani cannot verify DiskBacked directly because the constructor requires
-// file I/O, and the cold tier uses Zstd compression (FFI to C library).
-// This covers the full pipeline Kani cannot reach: push_str → Line →
-// serialize → compress → disk → decompress → deserialize → get_line.
+// The full pipeline: push_str → Line → serialize → compress → disk →
+// decompress → deserialize → get_line.
 
 /// Terminal-like line content across the serialization paths: plain ASCII,
 /// short (inline storage), long (heap storage) and multi-byte Unicode.

@@ -9,7 +9,7 @@ use crate::grapheme_iter::GraphemeClusters;
 use crate::tables::width as unicode_tables;
 use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use crate::types::GraphemeType;
 use crate::types::{Grapheme, GraphemeInfo};
 
@@ -188,14 +188,14 @@ pub fn is_emoji_char(c: char) -> bool {
 }
 
 /// Zero Width Joiner (ZWJ) character.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub const ZWJ: char = '\u{200D}';
 
 /// Check if a grapheme contains a ZWJ sequence.
 ///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns `true` iff `grapheme` contains U+200D.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[inline]
 pub fn has_zwj(grapheme: &str) -> bool {
     grapheme.contains(ZWJ)
@@ -267,7 +267,7 @@ pub fn is_emoji_modifier_base(c: char) -> bool {
 ///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns `true` iff at least one codepoint is in `U+1F3FB..=U+1F3FF`.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn has_skin_tone(grapheme: &str) -> bool {
     grapheme.chars().any(is_skin_tone_modifier)
 }
@@ -284,7 +284,7 @@ pub fn is_regional_indicator(c: char) -> bool {
 ///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns `true` iff `grapheme` has exactly two regional-indicator codepoints.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn is_flag_emoji(grapheme: &str) -> bool {
     let chars: Vec<char> = grapheme.chars().collect();
     chars.len() == 2 && chars.iter().all(|&c| is_regional_indicator(c))
@@ -294,7 +294,7 @@ pub fn is_flag_emoji(grapheme: &str) -> bool {
 ///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns `GraphemeType::Control` for empty input; otherwise returns one deterministic classification.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn classify_grapheme(grapheme: &str) -> GraphemeType {
     if grapheme.is_empty() {
         return GraphemeType::Control;

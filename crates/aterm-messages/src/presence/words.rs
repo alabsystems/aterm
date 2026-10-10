@@ -404,14 +404,23 @@ pub fn prompt_band_word(detail: Option<&str>) -> String {
 /// stopped 41s · input queued           stopped with input queued for 41s; resume it
 /// ```
 ///
+/// Where the host would carry the restart (`restart`, [`Host::stall_restart`])
+/// the spoken remedy names it, the survivor's too — `…; restart it with aterm
+/// ctl @<sid> restart pid=<leader> if-stalled` — since the host's act ends a
+/// survivor itself and relaunches it, where the bare signal's exit reads as
+/// the program's own.
+///
 /// It takes the slot AHEAD of typed attention: an "answer this box" over a
 /// program that reads no input asks for an answer it cannot take. The
 /// duration counts from the oldest unread byte (`since`).
+///
+/// [`Host::stall_restart`]: super::Host::stall_restart
 #[must_use]
 pub(crate) fn stall_words(
     since: Instant,
     stopped: bool,
     survived: bool,
+    restart: Option<&str>,
     now: Instant,
 ) -> (String, Vec<String>, String) {
     let dur = fmt_dur(now.saturating_duration_since(since));
@@ -422,18 +431,25 @@ pub(crate) fn stall_words(
             format!("stopped with input queued for {dur}; resume it"),
         );
     }
+    let carried = |cmd: &str| format!("restart it with {cmd}");
     if survived {
         // The program lived through its restart signal.
         return (
             "frozen".to_string(),
             vec![dur, "survived its restart".to_string()],
-            "frozen, still running after its restart signal; end it with signal kill".to_string(),
+            format!(
+                "frozen, still running after its restart signal; {}",
+                restart.map_or_else(|| "end it with signal kill".to_string(), carried)
+            ),
         );
     }
     (
         "frozen".to_string(),
         vec![dur.clone(), "not reading input".to_string()],
-        format!("frozen, not reading input for {dur}; restart it"),
+        format!(
+            "frozen, not reading input for {dur}; {}",
+            restart.map_or_else(|| "restart it".to_string(), carried)
+        ),
     )
 }
 
@@ -478,6 +494,7 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
             V::stall_since(fact),
             V::stall_stopped(fact),
             V::stall_survived(fact),
+            V::stall_restart(fact),
             now,
         )
     } else if let Some(text) = slot

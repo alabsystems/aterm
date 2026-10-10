@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's portable clock: exactly `std::time` on every target that has one (a re-export, byte-identical), a performance.now()/Date.now() shim on wasm32-unknown-unknown where std's clock panics."
+description = "aterm's portable clock: `std::time` where it exists, a performance.now()/Date.now() shim on wasm32-unknown-unknown."
 
 # Native has no dependencies: the crate is `pub use std::time::…` there.
 [dependencies]

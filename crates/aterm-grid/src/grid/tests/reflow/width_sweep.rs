@@ -58,7 +58,7 @@ fn feed(grid: &mut Grid) {
 
 /// Filler history, one long wrapped logical line at the bottom of the viewport,
 /// then a prompt row. Returns the long line.
-fn build_audit_grid(grid: &mut Grid) -> String {
+fn build_sweep_grid(grid: &mut Grid) -> String {
     // Distinct filler lines, most scrolling into history.
     for i in 0..8u16 {
         type_line(grid, &format!("filler-{i}"));
@@ -72,7 +72,7 @@ fn build_audit_grid(grid: &mut Grid) -> String {
     long
 }
 
-/// The audit's rapid width sweep, ending where it began.
+/// A rapid width sweep, ending where it began.
 const SWEEP: [u16; 6] = [24, 16, 9, 13, 21, 30];
 
 /// Run [`SWEEP`] through the synchronous resize, checking invariants each step.
@@ -99,10 +99,10 @@ fn offloaded_resize(grid: &mut Grid, w: u16) {
     grid.assert_invariants();
 }
 
-/// Build the audit shape in `grid`, [`sweep`] it, and require the exact
+/// Build the sweep shape in `grid`, [`sweep`] it, and require the exact
 /// pre-sweep physical topology back.
 fn assert_sweep_restores_wrap_topology(mut grid: Grid) {
-    let long = build_audit_grid(&mut grid);
+    let long = build_sweep_grid(&mut grid);
 
     let before = physical_snapshot(&grid);
     assert!(
@@ -123,7 +123,7 @@ fn assert_sweep_restores_wrap_topology(mut grid: Grid) {
     );
 }
 
-/// THE AUDIT SWEEP: rapid width shrink then return to the original width.
+/// Rapid width shrink then return to the original width.
 /// Every physical row (history AND viewport) must match the pre-sweep
 /// snapshot: identical text, identical wrapped flags — logical-line identity
 /// restored, no permanent split at the history/viewport boundary, no blank
@@ -165,7 +165,7 @@ fn width_sweep_preserves_spaces_at_chunk_boundaries() {
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_offloaded() {
     let mut grid = tiered_grid();
-    let long = build_audit_grid(&mut grid);
+    let long = build_sweep_grid(&mut grid);
 
     let before = physical_snapshot(&grid);
 
@@ -201,7 +201,7 @@ fn settled_content(grid: &Grid) -> Vec<(String, bool)> {
 fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     let build = || {
         let mut grid = tiered_grid();
-        build_audit_grid(&mut grid);
+        build_sweep_grid(&mut grid);
         grid
     };
 
@@ -274,7 +274,7 @@ fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
 #[test]
 fn clear_mid_flight_does_not_resurrect_history_offloaded() {
     let mut grid = tiered_grid();
-    build_audit_grid(&mut grid);
+    build_sweep_grid(&mut grid);
 
     // Open the reflow window on a width change (arms the fill target).
     let job = grid
@@ -415,7 +415,7 @@ fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
 #[test]
 fn width_sweep_keeps_prompt_anchored_to_content() {
     let mut grid = Grid::with_scrollback(6, 30, 1000);
-    build_audit_grid(&mut grid);
+    build_sweep_grid(&mut grid);
 
     let prompt_row_before = (0..grid.rows())
         .rev()

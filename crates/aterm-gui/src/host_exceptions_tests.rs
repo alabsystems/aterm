@@ -77,6 +77,25 @@ fn roster() -> Vec<Entry> {
         }
     }
     all.push(mr::disk_low_entry(7, 20, &[]));
+    // The foreign tools atpkg leaves alone, each look's: one, and more than the
+    // entry shows.
+    let foreign = |n: usize| {
+        (0..n)
+            .map(|i| crate::toolchain_words::Foreign {
+                name: "trust".to_string(),
+                path: format!("/Users//someone/.rustup/toolchains/trust-{i}"),
+                fix: atpkg::seam::DETACH_FIX.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    for scope in [atpkg::cli::FOREIGN_SEAM, atpkg::cli::FOREIGN_PATH] {
+        for n in [1, 5] {
+            all.push(crate::toolchain_words::foreign_tools_entry(
+                scope,
+                &foreign(n),
+            ));
+        }
+    }
     all.push(mr::disk_low_cleanup_off_entry(2, 10));
     all.push(mr::disk_low_cleanup_off_entry(
         u64::MAX >> 30,
@@ -94,6 +113,8 @@ fn roster() -> Vec<Entry> {
         &std::iter::repeat_n(note, 5).collect::<Vec<_>>(),
     ));
     all.push(mr::upgrade_cannot_run_entry("busy:state-unwritable", None));
+    // The developer root's one: the measured Spotlight line.
+    all.push(mr::devroot_indexed_entry());
     // The accounts': one signed out, three, the most a roster lists at the
     // longest a label can be, the longest label the action names and the first
     // it does not, and the roster that is refused.
@@ -252,6 +273,7 @@ fn the_host_families_speak_by_event() {
         Family::Supervisor,
         Family::Accounts,
         Family::Disk,
+        Family::DevRoot,
         Family::UpgradeHost,
         Family::Render,
     ] {
@@ -652,6 +674,55 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
     assert!(app.messages.digest().is_empty());
     // Plenty with nothing told is nothing.
     app.note_harness_host(HostNote::DiskPlenty);
+}
+
+/// THE DEVELOPER ROOT'S ONE LINE (`atpkg::devroot`) is decided by the MEASUREMENT
+/// alone: the probe found raises at most one classified entry, whose one press opens
+/// Search Privacy; a probe that stayed out ends it; an unmeasured look leaves it as it
+/// was. Checkouts outside the root raise nothing here (the doctors' `devroot:` row says
+/// them). It never marks a tab, seats a band row or re-grids a window.
+#[test]
+fn the_developer_root_is_one_line_and_the_measurement_decides_it() {
+    let mut app = App::headless_for_test();
+    let regrids = message_regrids();
+    let keys = |app: &App| -> Vec<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+    for _ in 0..2 {
+        app.note_harness_host(HostNote::DevRoot {
+            indexed: Some(true),
+        });
+    }
+    assert_eq!(
+        keys(&app),
+        [mr::DEVROOT_INDEXED_KEY],
+        "one line, however often it is told"
+    );
+    let indexed = app.messages.digest().entries[0].clone();
+    assert!(
+        indexed.actions.iter().any(|a| matches!(
+            a,
+            aterm_messages::Intent::OpenSystemPane { pane }
+                if pane == mr::PANE_SPOTLIGHT_SEARCH_PRIVACY
+        )),
+        "the one press opens Search Privacy: {:?}",
+        indexed.actions
+    );
+    // Unmeasured: the line stands as the last measurement left it.
+    app.note_harness_host(HostNote::DevRoot { indexed: None });
+    assert_eq!(keys(&app), [mr::DEVROOT_INDEXED_KEY]);
+    // Measured skipped: it ends.
+    app.note_harness_host(HostNote::DevRoot {
+        indexed: Some(false),
+    });
+    assert!(app.messages.digest().is_empty());
+    assert_eq!(app.message_band_rows, 0, "never a band row");
+    assert_eq!(message_regrids(), regrids, "no re-grid");
 }
 
 /// A `[disk]` SETTING ATERM CANNOT READ, WHICH TURNED ITS CLEANUP OFF, IS ONE
@@ -1835,4 +1906,90 @@ fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
         1,
         "the second regression is news after a verified grant"
     );
+}
+
+/// FOREIGN TOOLS REACH THE OWNER (audit 2026-10-09: a foreign rustup `trust` link
+/// and a managed tool shadowed on PATH were prose 30-odd passes printed — `atpkg said:
+/// … not aterm's link; left untouched (fix: …)`, `trust: managed 9192 — SHADOWED by
+/// ~/.local/bin/trustdoc` — logged at INFO, in neither messages.log nor `aterm
+/// exceptions`). atpkg's `foreign:` lines go through the stdout parser into ONE
+/// digest entry per look carrying atpkg's fix, re-said by every pass as the same
+/// entry, and ended by that look's first report that sees nothing — the other look's
+/// entry untouched. NEGATIVE CONTROL: a scope this build cannot read changes nothing.
+#[test]
+fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none() {
+    use atpkg::cli::{FOREIGN_MARKER, FOREIGN_NONE, FOREIGN_PATH, FOREIGN_SEAM};
+    let mut app = App::headless_for_test();
+    let key = |scope: &str| crate::toolchain_words::foreign_tools_entry(scope, &[]).key();
+    assert_eq!(key(FOREIGN_SEAM), "toolchain.seam.foreign");
+    assert_eq!(key(FOREIGN_PATH), "toolchain.path.foreign");
+    let feed = |app: &mut App, line: &str| match crate::parse_seed_line(line) {
+        Some(crate::Wake::PkgForeign(body)) => app.note_foreign_tools(&body),
+        other => panic!("{line}: {other:?}"),
+    };
+    let entry = |app: &App, scope: &str| {
+        app.messages
+            .digest()
+            .entries
+            .into_iter()
+            .find(|e| e.key == key(scope))
+    };
+    let seam = format!(
+        "atpkg: {FOREIGN_MARKER}{FOREIGN_SEAM} trust /u/.rustup/toolchains/trust \u{2014} {}",
+        atpkg::seam::DETACH_FIX
+    );
+    let path = format!(
+        "atpkg: {FOREIGN_MARKER}{FOREIGN_PATH} trust /u/.local/bin/trustdoc \u{2014} type \
+         alab-trustdoc for the managed one"
+    );
+    let none = |scope: &str| format!("atpkg: {FOREIGN_MARKER}{scope} {FOREIGN_NONE}");
+    feed(&mut app, &seam);
+    let open = entry(&app, FOREIGN_SEAM).expect("the seam's entry");
+    assert_eq!(open.title, "Rustup's toolchain link is not aterm's");
+    assert!(
+        open.detail
+            .iter()
+            .any(|l| l.contains(atpkg::seam::DETACH_FIX)
+                && l.contains("/u/.rustup/toolchains/trust")),
+        "atpkg's fix, whole: {:?}",
+        open.detail
+    );
+    feed(&mut app, &path);
+    let open = entry(&app, FOREIGN_PATH).expect("the PATH look's entry");
+    assert!(
+        open.detail.iter().any(|l| l
+            == "/u/.local/bin/trustdoc runs before the managed trust: type alab-trustdoc for \
+                the managed one"),
+        "{:?}",
+        open.detail
+    );
+    assert_eq!(app.messages.digest().len(), 2, "one per look");
+    // The next pass says the same: the same entries, nothing new.
+    let revision = app.messages.digest_revision();
+    feed(&mut app, &seam);
+    feed(&mut app, &path);
+    assert_eq!(app.messages.digest_revision(), revision, "no news");
+    // NEGATIVE CONTROL: a scope this build cannot read changes nothing.
+    feed(
+        &mut app,
+        &format!("atpkg: {FOREIGN_MARKER}elsewhere {FOREIGN_NONE}"),
+    );
+    assert_eq!(app.messages.digest().len(), 2);
+    // The seam fixed: its look's first report that sees nothing ends its entry, and
+    // only its own.
+    feed(&mut app, &none(FOREIGN_SEAM));
+    assert!(!app.owes_exception(&key(FOREIGN_SEAM)), "ended");
+    assert!(
+        app.owes_exception(&key(FOREIGN_PATH)),
+        "the other look's stands"
+    );
+    feed(&mut app, &none(FOREIGN_PATH));
+    assert!(app.messages.digest().is_empty());
+    // An item naming no fix is no exception (review of 2026-10-09): the entry's step
+    // says to fix each line as it says, and that line would name nothing.
+    feed(
+        &mut app,
+        &format!("atpkg: {FOREIGN_MARKER}{FOREIGN_PATH} gh /u/.local/bin/gh"),
+    );
+    assert!(app.messages.digest().is_empty(), "no fix, no entry");
 }

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The native_update_* scan / admission / worker family — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! The native_update_* scan / admission / worker family. Every constructor
+//! keeps its `crate::derive` path via the `pub use` re-exports in `derive.rs`.
 
 use super::*;
 
@@ -57,9 +55,9 @@ pub fn native_update_control_socket_handoff_model() -> Model {
 /// attested (its birth witness still matches, so a recycled pid fails).
 ///
 /// The three environment actions are the ways a listener can fail to be the
-/// parent. `PresentClaimUidOnly` (dead at `Buggy = 0`) is the shape that shipped
-/// until 2026-09-27: the uid gate alone, which any same-uid process listening at
-/// the published path passed. Tier-1 (`handoff_rendezvous`'s
+/// parent. `PresentClaimUidOnly` (dead at `Buggy = 0`) is the uid gate alone,
+/// which any same-uid process listening at the published path passes. Tier-1
+/// (`handoff_rendezvous`'s
 /// `claim_presentation_conformance`) drives the real gate over every fact
 /// combination with real attested processes.
 #[must_use]
@@ -96,8 +94,8 @@ pub fn native_update_rendezvous_claim_model() -> Model {
     }
 }
 
-/// The OUTGOING side of the same rendezvous (round eight of the update audit,
-/// U36): no descriptor leaves toward a dialer a same-uid process could stand in
+/// The OUTGOING side of the same rendezvous: no descriptor leaves toward a dialer a
+/// same-uid process could stand in
 /// for, nothing is committed to a dialer LaunchServices disowns, a code check
 /// macOS did not answer turns no successor away, and a refusal is filed by its
 /// cause.
@@ -115,7 +113,7 @@ pub fn native_update_rendezvous_claim_model() -> Model {
 /// dialer lives.
 ///
 /// The code check waits on macOS's code-signing service (`trustd`), which can
-/// stop answering (U36's review): an unanswered check is neither a pass nor a
+/// stop answering: an unanswered check is neither a pass nor a
 /// refusal. The gate HOLDS that dialer and checks again until it is answered or
 /// the dial deadline ends the wait; closing it would end the attempt for the
 /// machine's moment, since the successor exits at the end of file. And a
@@ -134,13 +132,12 @@ pub fn native_update_rendezvous_claim_model() -> Model {
 /// 2 as a death nobody explained.
 ///
 /// Mutants, each its own action and dead at `Buggy = 0`: `GrantOnSecretAlone`
-/// is the launched lane from 2026-09-14 to 2026-10-02 (the secret was the one
-/// gate before the grant), `CommitOverDisowning` its corroboration from
-/// 2026-09-29 (an "exited before it checked in" answer read, like any error, as
-/// corroborating the attested dialer), `RefuseUnanswered` the first code gate of
-/// 2026-10-02 (a check `trustd` did not answer closed the connection at once),
-/// and `FileAsUnexplainedDeath` its filing (the turned-away successor's exit
-/// read as a death before its dial, `ChildDied` with nothing observed). Tier-1
+/// (the secret as the one gate before the grant), `CommitOverDisowning` (an
+/// "exited before it checked in" answer read, like any error, as corroborating
+/// the attested dialer), `RefuseUnanswered` (a check `trustd` did not answer
+/// closes the connection at once), and `FileAsUnexplainedDeath` (the
+/// turned-away successor's exit read as a death before its dial, `ChildDied`
+/// with nothing observed). Tier-1
 /// (`aterm-gui`'s `launched_dialer_admission_conformance`) drives the real gate
 /// with real dialer processes, a hold through a `trustd` gate made overdue, the
 /// real corroboration with live, dead and unreaped dialers, and the real filing.
@@ -232,9 +229,9 @@ pub fn native_update_rendezvous_admission_model() -> Model {
 /// compiles out, so on macOS the exec follows `classify`'s word alone.
 ///
 /// Each `Buggy=1` mutant is its own action, dead at `Buggy=0`, so none can mask
-/// another: `BlockForegroundDespiteSeamless` is the v0.53 regression (a foreground
-/// terminal job treated as a close-preflight blocker even when seamless adoption is
-/// available); `HandoffWithoutAdoptingForeground` replaces the process without
+/// another: `BlockForegroundDespiteSeamless` treats a foreground terminal job as
+/// a close-preflight blocker even when seamless adoption is available;
+/// `HandoffWithoutAdoptingForeground` replaces the process without
 /// carrying the job's PTY; `ReexecColdOverLiveSessions` is the release macOS lane
 /// with `classify`'s live-session check dropped — the destructive re-exec runs on
 /// the classification, with nothing after it to refuse; `ClassifySeamlessOverUncertifiedState`
@@ -525,19 +522,16 @@ pub fn native_update_auto_intent_model() -> Model {
             var target = 0;
             var stale_wake_seen = 0;
             var quiet = 0;
-            // THE PARK IS NO LONGER THE ATTEMPT (2026-09-19, the late park), and
-            // this variable is the park. `Attempt` used to set it, because the
-            // park WAS the first thing an attempt did; on the launched lane the
-            // attempt now starts by LAUNCHING the successor, which costs the user
-            // nothing — every reader stays live through its swap, second start
-            // and boot check — and the park happens later, when `ParkReaders`
-            // finds a moment for it.
+            // THE PARK IS NOT THE ATTEMPT, and this variable is the park. On
+            // the launched lane the attempt starts by LAUNCHING the successor,
+            // which costs the user nothing — every reader stays live through
+            // its swap, second start and boot check — and the park happens
+            // later, when `ParkReaders` finds a moment for it.
             //
-            // The invariant below is unchanged and its meaning is unchanged: the
-            // readers are stopped only at a quiet-or-past-grace moment. What
-            // changed is that it now binds the instant the terminal really
-            // freezes instead of the instant the attempt was authorized — which
-            // are, under the late park, a second and a half to two minutes apart.
+            // The invariant below says the readers are stopped only at a
+            // quiet-or-past-grace moment. It binds the instant the terminal
+            // really freezes, not the instant the attempt was authorized —
+            // under the late park, a second and a half to two minutes apart.
             // The LAUNCH keeps its own gate: `Attempt`'s guard, which the
             // conformance test binds to the real poll policy.
             var parked = 0;
@@ -799,13 +793,13 @@ pub fn native_update_auto_intent_model() -> Model {
 /// `automatic_park_refusal`, which Tier-1 (`aterm-gui`'s
 /// `native_updater_conformance`) binds to this guard fact by fact.
 ///
-/// The mutant is the 2026-09-20 incident: past `Hold` ticks of a busy terminal
+/// The mutant (`StandDown`): past `Hold` ticks of a busy terminal
 /// it stands the lane down to manual-only, after which nothing is enabled — the
 /// run WEDGES before landing, which is the terminal that never updated. It also
 /// parks without the rule. `ActivityNeverLatchesManualOnly` catches the first;
 /// `ParkedOnlyWhenTheLadderAdmits` catches the second.
 ///
-/// Two more mutants from the 2026-09-21 audit of the landed ladder. A park that
+/// Two more mutants. A park that
 /// MISSED its freeze budget (`ParkMissed`: readers back, nothing granted, the
 /// machine was busy) is a fact about the moment and keeps the lane where it is;
 /// the mutant files it as a physical failure and latches (`ParkMissLatches`,
@@ -817,20 +811,20 @@ pub fn native_update_auto_intent_model() -> Model {
 /// caught by `TheLadderNeverRestarts`, a high-water mark the phase may never
 /// fall below.
 ///
-/// `WarmupStarts`/`WarmupEnds` (2026-09-23) are the user's consent warm-up,
+/// `WarmupStarts`/`WarmupEnds` are the user's consent warm-up,
 /// the one hold no phase relaxes: `Land` included, or a landing could arrive
 /// while the macOS dialog the user asked for is on screen.
 /// Every admitted park (`Park`, `ParkMissed`, `PhysicalFailure`, and the
 /// capture-refusal pair below) requires it ended, and `ParkedOnlyWhenTheLadderAdmits` records it; `WarmupEnds` is
 /// always enabled while it holds (the shipping hold is capped), so the ladder
-/// still always lands. Since round four (plan item 7) `warmup` stands for
+/// still always lands. `warmup` stands for
 /// either of the two holds of that kind the shipping facts name: the consent
 /// warm-up, and a cold restore's agents still being relaunched
 /// (`ActivityFacts::harness_restored_pending`, capped by the host's
 /// `RESTORED_HOLD` from its first relaunch, once per process) — the Tier-1
 /// bind projects their disjunction onto it.
 ///
-/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3): a park that fails
+/// A park that fails
 /// DETERMINISTICALLY. `DeskRefuses` is the environment putting a session into
 /// a state the capture cannot carry as it stands (a NUL in a reported cwd, a
 /// grid over the per-grid cap, a parser left mid-string) and `DeskChanges` is
@@ -839,7 +833,7 @@ pub fn native_update_auto_intent_model() -> Model {
 /// answered for it: `CaptureRefused` carries the refusing session at a
 /// degraded rung (`degraded`; the producer is total over content). The mutant
 /// `CaptureRefusedAsActivity` files the refusal as the machine being busy
-/// instead — the v0.91 shape, where the same deterministic refusal was
+/// instead — the shape where the same deterministic refusal was
 /// re-parked on the freeze ladder, stood down as `ActivityRevoked` and retried
 /// every fifteen minutes forever while `update status` said nothing was wrong.
 /// It is caught by `RefusalNeverRetriesAsActivity` (`refusals` counts refusals
@@ -850,14 +844,14 @@ pub fn native_update_auto_intent_model() -> Model {
 /// `BundleSwap` is the failed candidate having already boot-applied the bundle:
 /// the next reconcile retires the download for the installed-bundle activation
 /// of the SAME update, and the healthy lane re-keys the latch, deadline and all.
-/// The mutant `BundleSwapClearsLatch` is what v0.87–v0.91 shipped: the retire
-/// arm cleared the latch, the activation armed 500 ms later, and a structural
-/// failure's "confirming retry, ten minutes out" ran 1.4 s after the first
-/// failure — then converged the lane for a day. `NoEarlyRelease` catches it:
+/// The mutant `BundleSwapClearsLatch` is a retire arm that clears the latch:
+/// the activation arms 500 ms later, and a structural failure's "confirming
+/// retry, ten minutes out" runs 1.4 s after the first failure — then
+/// converges the lane for a day. `NoEarlyRelease` catches it:
 /// once a failure latched the lane, an unlatched lane means the deadline came.
 ///
-/// AND A CONVERGED LATCH ON THE ACTIVATION IS NOT A DEAD END (round three of the
-/// 2026-09 update robustness work). `Converge` is the structural verdict on the
+/// AND A CONVERGED LATCH ON THE ACTIVATION IS NOT A DEAD END. `Converge` is the
+/// structural verdict on the
 /// swapped bundle's activation with its one re-sample spent or held: no deadline
 /// will come, so `Due` never fires again. `NewerRelease` is a verified newer
 /// build staged behind it, and the healthy lane's look at it is `Supersede`:
@@ -865,28 +859,26 @@ pub fn native_update_auto_intent_model() -> Model {
 /// disarmed without a launch, and the newer build is armed as a new artifact on
 /// a ladder of its own — which is why the phase starts over there and only
 /// there. Two mutants, each its own dead action: `NewerReleaseIgnored`, the
-/// look that keeps the latch (every release before gap 14, and gap 14 wherever
-/// the activation's trial had no room), and `NewerReleaseRetriesTheActivation`,
-/// gap 14's own answer — the latch opens for one more attempt at the activation,
+/// look that keeps the latch, and `NewerReleaseRetriesTheActivation` — the
+/// latch opens for one more attempt at the activation,
 /// whose successor refuses to boot-apply past itself, so what lands is the
 /// build that failed. `ANewerReleaseClearsAConvergedLatch` catches both at the
 /// look; `NeverLandsTheSupersededActivation` catches the second at its landing,
 /// and `NoEarlyRelease` there too.
 ///
-/// AND THE RETIRE CAN BE REFUSED (round three review). `Supersede` is the look
+/// AND THE RETIRE CAN BE REFUSED. `Supersede` is the look
 /// whose retire LANDS; `SupersedeRefused` is the environment refusing it —
 /// the verification's budget run out on a captive-portal network, the apply
 /// lock held past its wait, a stage being replaced, or a disk the retire
 /// cannot undo — with nothing moved. The healthy lane does not spend the
 /// release on a refusal: it waits out a retry deadline (`retry`, cleared by
 /// `SupersedeRetryDue`) and offers it again. The mutant
-/// `RefusedRetireSpendsTheRelease` is what round three first shipped — the
-/// refused release spent for good, so the machine waited for a still newer
+/// `RefusedRetireSpendsTheRelease` is the refused release spent for good, so the machine
+/// waited for a still newer
 /// build or a person — and it is caught at the look it spent
 /// (`ANewerReleaseClearsAConvergedLatch`) and, as a livelock, by the liveness.
 ///
-/// AND A PASSING MOMENT IS NEVER A VERDICT (round four of the 2026-09 update
-/// robustness work, plan item 2). `PassingFailure` is an admitted attempt that
+/// AND A PASSING MOMENT IS NEVER A VERDICT. `PassingFailure` is an admitted attempt that
 /// failed on a fact that changes by itself — the pre-park check's `codesign` ran
 /// out of the apply budget, a sibling held the apply lock past its wait, the
 /// kernel would not start a helper just then, or the successor's boot swap was
@@ -900,17 +892,16 @@ pub fn native_update_auto_intent_model() -> Model {
 /// The liveness below cannot: a converged latch with nothing newer is Law 2's
 /// rest, which is exactly why the verdict must never be minted from a moment.
 ///
-/// AND LAW 1 ITSELF IS CHECKED, not only its safety proxies (round three, plan
-/// P1-7): [`native_update_apply_ladder_liveness`] states "the staged build
+/// AND LAW 1 ITSELF IS CHECKED, not only its safety proxies:
+/// [`native_update_apply_ladder_liveness`] states "the staged build
 /// lands" as a liveness property over whole behaviours. Every invariant above
 /// is a bad STATE, and the deadlock check sees only a state with no way out.
 /// A lane that keeps retrying the same refusal, or keeps waiting behind a latch
 /// no deadline will lift, has neither: the terminal keeps producing output and
-/// every step is legal. The round-one audit found exactly that shape, green
-/// under every check this model had. `CaptureRefusedAsActivity` and
-/// `NewerReleaseIgnored` are now genuine livelocks rather than one-step
-/// detours: the healthy answer is no longer available after the mutant's step,
-/// so the historical "retried forever" and "waited forever" are what the
+/// every step is legal; that shape passes every safety check.
+/// `CaptureRefusedAsActivity` and `NewerReleaseIgnored` are genuine livelocks
+/// rather than one-step detours: the healthy answer is unavailable after the
+/// mutant's step, so "retried forever" and "waited forever" are what the
 /// mutants do.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -937,19 +928,19 @@ pub fn native_update_apply_ladder_model() -> Model {
             var parked_focused = 0;
             var warmup = 0;
             var parked_warmup = 0;
-            // THE DESK (2026-09-22/23 audit, plan P0-3): whether some session is
+            // THE DESK: whether some session is
             // in a state the capture cannot carry as it stands, whether this
             // attempt's capture has already answered for it at a degraded rung,
             // and how many refusals were re-filed as activity (the mutant).
             var refusing = 0;
             var degraded = 0;
             var refusals = 0;
-            // THE LATCH'S DEADLINE (plan P0-6): whether a physical latch's
+            // THE LATCH'S DEADLINE: whether a physical latch's
             // `retry_at` has passed, and whether the failed candidate's bundle
             // swap has retired the download for its activation.
             var due = 0;
             var swapped = 0;
-            // THE CONVERGED LATCH (round three): the structural verdict on the
+            // THE CONVERGED LATCH: the structural verdict on the
             // activation with no deadline left, a verified newer release behind
             // it, whether the lane has looked at that release, whether the
             // newer build took the activation's place, and whether a landing
@@ -960,10 +951,10 @@ pub fn native_update_apply_ladder_model() -> Model {
             var superseded = 0;
             var parked_newer = 0;
             // A refused retire's release waits out its retry deadline before
-            // the lane offers it again (round three review).
+            // the lane offers it again.
             var retry = 0;
-            // THE FAILURE THAT LATCHED WAS A PASSING MOMENT (round four, plan
-            // item 2): a check that did not finish, a lock held past its wait,
+            // THE FAILURE THAT LATCHED WAS A PASSING MOMENT: a check that did not
+            // finish, a lock held past its wait,
             // a successor that exited 75 because its swap was deferred.
             var passing = 0;
             // The wall clock. Not guarded on the latch: the anchor keeps
@@ -1024,7 +1015,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 manual_only = 1;
             }
             // A refusing desk parks only once the capture has answered for it:
-            // the refusing session travels at a degraded rung (plan P0-1), so
+            // the refusing session travels at a degraded rung, so
             // the park that lands is not the one that refused.
             action Park when (
                 landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
@@ -1063,7 +1054,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             // changes, never on the activity spacing.
             //
             // `refusals == 0` is always true in the healthy lane, which never
-            // re-files a refusal. It is what makes the v0.91 mutant below a
+            // re-files a refusal. It is what makes the mutant below a
             // LOOP rather than a detour: a lane that has filed a refusal as
             // activity is the lane whose classifier sends every refusal there
             // (every capture `Err` was a park miss), so it has no refusal lane
@@ -1078,7 +1069,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 degraded = 1;
             }
-            // THE 2026-09-22/23 MUTANT (v0.91): the same refusal filed as a
+            // THE MUTANT: the same refusal filed as a
             // park miss — the terminal reads as busy, the desk is never
             // answered for, and the same refusal comes back every fifteen
             // minutes forever. Its own dead action, so the closure can credit
@@ -1112,7 +1103,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 latched = 1;
                 failures = 1;
             }
-            // A PASSING FAILURE of an admitted park (round four, plan item 2):
+            // A PASSING FAILURE of an admitted park:
             // the verification ran out of its budget, the apply lock was held
             // past its wait, a helper could not be started just then, or the
             // successor's swap was deferred for one of those (exit 75). The
@@ -1130,7 +1121,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 failures = 1;
                 passing = 1;
             }
-            // THE MUTANT THAT SHIPPED until round four: the cached verdict of
+            // THE MUTANT: the cached verdict of
             // that moment booked STRUCTURAL (or as the installed copy's), so the
             // latch converges with no ordinary deadline left — a healthy build
             // held for the day's re-sample, or until a person reinstalls an app
@@ -1155,7 +1146,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 latched = 0;
             }
-            // THE FAILED CANDIDATE HAD ALREADY SWAPPED THE BUNDLE (plan P0-6):
+            // THE FAILED CANDIDATE HAD ALREADY SWAPPED THE BUNDLE:
             // the download retires for the activation of the same update, and
             // the latch is re-keyed to it — its deadline untouched. Once, to
             // keep the space finite.
@@ -1164,7 +1155,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 swapped = 1;
             }
-            // THE v0.87–v0.91 MUTANT: the retire arm CLEARS the latch, and the
+            // THE MUTANT: the retire arm CLEARS the latch, and the
             // activation arms half a second after the failure. Its own dead
             // action, so the closure credits it as an independent control.
             action BundleSwapClearsLatch when (
@@ -1174,7 +1165,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 swapped = 1;
                 latched = 0;
             }
-            // THE STRUCTURAL CONVERGENCE ON THE ACTIVATION (round three): the
+            // THE STRUCTURAL CONVERGENCE ON THE ACTIVATION: the
             // latch the bundle swap re-keyed stands with no deadline left.
             action Converge when (
                 landed == 0 && manual_only == 0 && latched == 1 && swapped == 1 &&
@@ -1197,8 +1188,8 @@ pub fn native_update_apply_ladder_model() -> Model {
             // release (`AutoApplyStructuralVerdict::newer_spent`), and the
             // healthy look sets `looked` and `superseded` together, so this
             // changes nothing there; it is what makes a look that KEPT the
-            // latch final, as it was in every release before gap 14 — the
-            // newer release waited forever. `retry == 0`: a release waiting out
+            // latch final — the newer release would wait forever. `retry == 0`: a
+            // release waiting out
             // a refusal's retry deadline is offered only once it passes.
             action Supersede when (
                 landed == 0 && manual_only == 0 && converged == 1 && newer == 1 &&
@@ -1253,7 +1244,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 looked = 1;
             }
-            // THE 2026-09-21 MUTANTS. A park miss filed as a physical failure
+            // THE MUTANTS. A park miss filed as a physical failure
             // with a two-attempt lifetime: the lane latches.
             action ParkMissLatches when (
                 Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
@@ -1288,9 +1279,9 @@ pub fn native_update_apply_ladder_model() -> Model {
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
             invariant TheLadderNeverRestarts: reached <= phase;
             // A refusal the capture made is never retried as the machine being
-            // busy (2026-09-22/23 audit, plan P0-3).
+            // busy.
             invariant RefusalNeverRetriesAsActivity: refusals == 0;
-            // A latch is released only once its deadline has come (plan P0-6):
+            // A latch is released only once its deadline has come:
             // after a physical failure, an unlatched lane is a due one.
             invariant NoEarlyRelease:
                 if failures == 1 && latched == 0 {
@@ -1298,12 +1289,12 @@ pub fn native_update_apply_ladder_model() -> Model {
                 } else {
                     due <= 1
                 };
-            // A passing moment is never a verdict (round four, plan item 2):
+            // A passing moment is never a verdict:
             // the latch it booked always has a deadline coming.
             invariant APassingFailureNeverConverges:
                 if passing == 1 { converged == 0 } else { converged <= 1 };
             // A newer release behind a converged latch takes the activation's
-            // place at the look (round three): the look that sees it clears the
+            // place at the look: the look that sees it clears the
             // latch by superseding, never by keeping it or retrying — and a
             // refused retire leaves it unspent, to be offered again.
             invariant ANewerReleaseClearsAConvergedLatch:
@@ -1341,19 +1332,19 @@ pub fn native_update_apply_ladder_model() -> Model {
 ///
 /// THE ENVIRONMENT IS NOT FAIR. Output, keystrokes, focus, the consent
 /// warm-up's start, the desk refusing or changing, a park missing its freeze
-/// budget, a physical failure, a passing one (round four), the bundle swap, the
+/// budget, a physical failure, a passing one, the bundle swap, the
 /// convergence verdict and a newer release are the world's: any of them may
 /// happen or not, forever, and every state may stutter. What the verdict ASSUMES, and nothing more:
 ///
 /// * `Advance`, weakly fair — the wall clock moves while the Mac is awake;
 /// * `WarmupEnds`, weakly fair — the consent warm-up hold is capped
 ///   (`[privacy] warmup_hold_ms`), and so is the restored agents' hold it
-///   also stands for (round four, plan item 7: `harness_host::RESTORED_HOLD`);
+///   also stands for (`harness_host::RESTORED_HOLD`);
 /// * `Due`, weakly fair — a latch's `retry_at` comes;
 /// * `Lapse`, weakly fair — the lane acts on a due latch; nothing the
 ///   environment does disables it once it is enabled;
 /// * `SupersedeRetryDue`, weakly fair — a refused retire's retry deadline
-///   comes (round three review);
+///   comes;
 /// * `Park`, `CaptureRefused` and `Supersede`, STRONGLY fair — the lane's poll
 ///   re-reads its gate at every instant, so a gate the terminal keeps
 ///   re-opening is caught open; and the lane offers a refused release again at
@@ -1368,14 +1359,14 @@ pub fn native_update_apply_ladder_model() -> Model {
 ///   each refusal said in `update status` (and the disk's on glass). Those are
 ///   physical facts the law cannot promise past.
 ///
-/// The mutants that break it, each alone on the healthy lane: the 2026-09-20
+/// The mutants that break it, each alone on the healthy lane: the
 /// stand-down (`StandDown`) and the park miss filed as a failure
-/// (`ParkMissLatches`) — wedges, which the deadlock check also sees; the v0.91
+/// (`ParkMissLatches`) — wedges, which the deadlock check also sees; the
 /// refusal re-filed as activity forever (`CaptureRefusedAsActivity`), the
 /// newer release left waiting behind a converged latch (`NewerReleaseIgnored`)
 /// and a refused retire that spent the release for good
 /// (`RefusedRetireSpendsTheRelease`) — livelocks, which only this property
-/// sees. Not `PassingFailureConverges` (round four): the latch it converges
+/// sees. Not `PassingFailureConverges`: the latch it converges
 /// with nothing newer staged IS the goal's rest, so this property is blind to it
 /// by construction, and `APassingFailureNeverConverges` carries its catch.
 #[must_use]
@@ -1639,9 +1630,9 @@ pub fn native_update_attempt_identity_model() -> Model {
 /// FIFO-occupancy or processing-duration claim.
 ///
 /// Each `Buggy=1` mutant is its own action, dead at `Buggy=0`, so none masks
-/// another (they used to share one `Buggy` world, where the dropped latch left no
-/// pending request for the dropped drain edge to strand): `DropApplyLatchWhenFull`
-/// is the historical "Full means success but retain nothing"; `DrainWithoutRetryEdge`
+/// another (in one shared `Buggy` world the dropped latch leaves no pending
+/// request for the dropped drain edge to strand): `DropApplyLatchWhenFull` is
+/// "Full means success but retain nothing"; `DrainWithoutRetryEdge`
 /// dequeues without the edge that releases the latch; `ParkIdleMaterializingProxy`
 /// is the unconditional proxy clone (a CFRunLoop wake plus a warning) on every idle
 /// park; `ReportUnavailableKeepingLatch` reports Unavailable but leaves the latch
@@ -2118,8 +2109,8 @@ pub fn native_update_status_reconciliation_model() -> Model {
 ///   after the backoff writer runs with deadline D, `suppresses` holds iff
 ///   `now < D` — the reader's comparison direction, bound both ways. The one
 ///   writer sets D from a verdict's schedule or, for a staging MOMENT, from the
-///   gentler one (round eight of the update audit, #62: a first moment's D is
-///   its own `now`); both are the same timed memo, so this action binds both,
+///   gentler one (a first moment's D is its own `now`); both are the same timed memo, so
+///   this action binds both,
 ///   and the Tier-1 sweep drives both schedules.
 /// * `QuarantineVerdictLandsInTheQuarantineField` is the writer half alone:
 ///   the verdict must be recorded in the field the reader consults.
@@ -2399,8 +2390,7 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
             // Any mutable pre-Commit admission fact that turned false: a changed
             // session set or layout, a moved activity epoch, revoked native
             // safety, a dead PTY peer, a lost Commit channel, a resident operator
-            // busy or unfenced at the Commit (round eight, #70 — once a
-            // precondition beside the admission, now two of its facts). They
+            // busy or unfenced at the Commit. They
             // differ in the string they log and in whether automatic mode may
             // retry; they do not differ in what they do to ownership, which is
             // what this model is about.
@@ -2669,8 +2659,7 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 
 /// What a STRUCTURAL convergence of the automatic apply lane may still do: the
 /// latch the lane took on build N's bytes after two handoffs that the bytes
-/// answered for (gap 14, 2026-09-26; round three of the 2026-09 update
-/// robustness work).
+/// answered for.
 ///
 /// THE STRAND THIS MACHINE EXISTS FOR. A launched-lane candidate installs its
 /// bundle before it dials, so a structural failure lands on the installed
@@ -2698,9 +2687,9 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   that has not yet been offered the install path. `Decide` starts the
 ///   retire (`superseding`), whatever the trial's `room`: it launches nothing.
 ///   It lands (`Supersede`: the latch goes with N's bytes) or is refused
-///   (`SupersedeRefused`: nothing moved). A refusal does NOT spend the release
-///   (round three review): the verification's budget running out on a
-///   captive-portal network, the apply lock held a moment too long or a stage
+///   (`SupersedeRefused`: nothing moved). A refusal does NOT spend the
+///   release: the verification's budget running out on a captive-portal
+///   network, the apply lock held a moment too long or a stage
 ///   being replaced are all refusals, and the release that met one is offered
 ///   again once its retry deadline passes (`backoff`, cleared by `RetryDue`).
 ///   While it waits, it still outranks the day — N is not launched while a
@@ -2714,12 +2703,12 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   two of them the next launch of N is the one `check_boot_health` reverts
 ///   on, and an automatic attempt must never be the thing that spends it.
 ///   Without room the re-sample is HELD and SAID (`said`), never taken
-///   silently. The first count is itself a look (gap 14 review, 2026-09-26):
+///   silently. The first count is itself a look:
 ///   convergence PROMISES the day's re-sample before any count is read, and a
 ///   count that rules it out withdraws the promise at once, said.
 ///
-/// * `TrialUnreadable` — the installed facts stop reporting N (round six,
-///   finding 55: a channel floor raised above N yanks it, and the facts worker
+/// * `TrialUnreadable` — the installed facts stop reporting N (a channel floor raised
+///   above N yanks it, and the facts worker
 ///   drops a yanked bundle newer than the running build), so no count can be
 ///   read and `room` is no reading at all (`TrialReadAgain` undoes it). A due
 ///   look then asks for another observation and COUNTS (`looks`); at
@@ -2730,11 +2719,11 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   look); `structural_latch` itself answers `Unmeasured`.
 ///
 /// * `TrialUnproven` — the latest facts read could not PROVE the installed
-///   bundle at all (round eight, #80: `spctl` past its ceiling on a captive
+///   bundle at all (`spctl` past its ceiling on a captive
 ///   portal, a passing refusal), so it observed nothing about whether the facts
 ///   still name N; `room` is no reading then either (`unread = 2`). Such a read
 ///   is no evidence the count is gone, so it spends none of `looks`; it has a
-///   bound of its own (#80's review): a due look over one asks for another
+///   bound of its own: a due look over one asks for another
 ///   observation and counts (`doubts`), and at `UnprovenLooks` the re-sample
 ///   MOVES TO THE NEXT DAY (`day` cleared, still `owed`) — retried (L4), and
 ///   never re-promised every 75 s while nothing can be proven (L5). The move is
@@ -2759,7 +2748,7 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   behind it (`NeverBootsTheOlderActivation`) — and without room it holds,
 ///   says so, and spends the release: the newer release waits for the Version
 ///   menu (`ANewerReleaseClearsTheLatch`);
-/// * THE REFUSAL THAT SPENT THE RELEASE (round three as first shipped), in the
+/// * THE REFUSAL THAT SPENT THE RELEASE, in the
 ///   runs where the newer release is looked at after the day: the look starts
 ///   the retire like the healthy lane, and a refusal keeps the release spent
 ///   and schedules no retry, so it is never offered again
@@ -2777,12 +2766,12 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 /// * a digest-keyed latch, where a re-publish of N escapes it — which also
 ///   releases the latch with no event (`SameBuildStaysLatched`,
 ///   `ReleasedOnlyByAnEvent`);
-/// * where the count cannot be read, THE PROMISE KEPT FOREVER (before round
-///   six): the look at the bound clears its count and keeps the re-sample
+/// * where the count cannot be read, THE PROMISE KEPT FOREVER: the look at the bound
+///   clears its count and keeps the re-sample
 ///   owed, asking for nothing — the notice goes on promising a re-sample no
 ///   reading will earn (`NoRetryPromisedPastTheBound`);
-/// * where nothing can be proven, THE RE-PROMISE WITH NO BOUND (round eight #80
-///   as first landed): the look at the bound keeps the day due and asks again,
+/// * where nothing can be proven, THE RE-PROMISE WITH NO BOUND: the look at the bound
+///   keeps the day due and asks again,
 ///   as every look before it — the re-sample promised every 75 s for as long as
 ///   the installed bundle cannot be checked (`UnprovenLooksAreBounded`).
 ///
@@ -2810,9 +2799,9 @@ pub fn native_update_structural_latch_model() -> Model {
             // threshold (the sentinel's count, measured).
             var room = 0;
             // The count can no longer be read: 1 = the installed facts stopped
-            // reporting N (a channel floor above it yanked it; round six,
-            // finding 55); 2 = the latest read could not PROVE the installed
-            // bundle at all (round eight, #80). `room` is then no reading at all.
+            // reporting N (a channel floor above it yanked it); 2 = the latest
+            // read could not PROVE the installed bundle at all. `room` is then
+            // no reading at all.
             var unread = 0;
             // Due looks in a row that found the count unreadable (`unread == 1`),
             // each asking for an observation to read it.
@@ -2954,7 +2943,7 @@ pub fn native_update_structural_latch_model() -> Model {
                 };
                 // Every look without room says so while there is something to
                 // say: the promised re-sample withdrawn, or a due one held —
-                // and gap 14 said its hold of the newer release too. A count
+                // and its hold of the newer release too. A count
                 // that stayed unreadable to the bound is said as such.
                 said = if (Buggy == 0 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
                         owed == 1 && unread == 0 && room == 0) ||
@@ -2969,8 +2958,8 @@ pub fn native_update_structural_latch_model() -> Model {
                 // Counted while the re-sample is due, nothing newer is coming
                 // and no count can be read; kept by a look that is not due;
                 // cleared by a reading, and by the bound's decision. `Buggy`'s
-                // look at the bound (THE PROMISE KEPT FOREVER, round six,
-                // finding 55): it clears the count and keeps the re-sample
+                // look at the bound (THE PROMISE KEPT FOREVER): it clears the count and
+                // keeps the re-sample
                 // owed — the notice goes on promising it, and nothing asks.
                 looks = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
                     unread == 1 && looks <= UnreadLooks - 1 {
@@ -2982,7 +2971,7 @@ pub fn native_update_structural_latch_model() -> Model {
                 } else {
                     0
                 };
-                // An unproven read's own count (round eight, #80's review): kept by
+                // An unproven read's own count: kept by
                 // a look that is not due, cleared by any proven read, and at the
                 // bound the day's re-sample moves to the next day — still owed,
                 // nothing asked. `Buggy`'s look at the bound (THE RE-PROMISE WITH
@@ -3083,8 +3072,8 @@ pub fn native_update_structural_latch_model() -> Model {
                 } else {
                     owed <= 1
                 };
-            // A count that cannot be read is decided within the bound (round
-            // six, finding 55): once the lane has looked with the day due and
+            // A count that cannot be read is decided within the bound: once the lane has
+            // looked with the day due and
             // nothing newer coming, no re-sample is promised that no reading
             // will ever earn — it is held, and said (`Decide`'s bound arm).
             invariant NoRetryPromisedPastTheBound:
@@ -3095,7 +3084,7 @@ pub fn native_update_structural_latch_model() -> Model {
                     owed <= 1
                 };
             // A re-sample over reads that cannot prove the installed bundle is
-            // retried within a bound (round eight, #80's review): at
+            // retried within a bound: at
             // `UnprovenLooks` due looks it moves to the next day, so no look
             // past the bound promises it again (L5) — and none drops it (L4).
             invariant UnprovenLooksAreBounded: doubts <= UnprovenLooks;

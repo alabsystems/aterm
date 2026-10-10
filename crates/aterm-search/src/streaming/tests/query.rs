@@ -234,12 +234,10 @@ fn set_filter_mode_restarts_cleanly_during_long_scan() {
     assert!(search.results().iter().all(|m| m.row % 12 == 0));
 }
 
-// ============== Regression: O(M×G) → O(G + M·log G) (#5672) ==============
+// ============== Multi-match column mapping (#5672) ==============
 
 /// Searching for a single char on a CJK line with many matches must produce
-/// correct column offsets. Before #5672, this path called byte_to_column()
-/// (O(G)) per match, yielding O(M×G) total. After the fix, ColumnMap is
-/// built once per line and lookups are O(log G).
+/// correct column offsets from the per-line ColumnMap (O(G + M·log G)).
 #[test]
 fn multi_match_cjk_line_column_offsets_correct() {
     let mut search = StreamingSearch::with_config(StreamingSearchConfig {
@@ -291,7 +289,7 @@ fn case_insensitive_multi_match_casefold_byte_shrink() {
     assert_eq!(search.results()[2].end_col, 7);
 }
 
-// ============== Error Path Tests (Part of #2097) ==============
+// ============== Error Path Tests ==============
 
 /// update_pattern returns InvalidState when search is Idle (not started).
 #[test]

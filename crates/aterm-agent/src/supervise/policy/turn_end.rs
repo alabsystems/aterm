@@ -60,8 +60,30 @@
 //! * **server failure** (status, overload) — [`TurnEndTiming::retry_backoff`]
 //!   from each appearance.
 //!
-//! Each act quotes the vendor's own line to the worker ([`wall_retry_text`])
-//! rather than the rote continuation, and a retry that led to real work
+//! Each act names the wall's kind to the worker in aterm's own words
+//! ([`wall_retry_text`]: `Claude Code reported an API error (overloaded)`)
+//! rather than the rote continuation — never the screen's words. Ruling
+//! 2026-10-08 (H6-HARNESS-1): the act QUOTED the rows the reader took for the
+//! wall, and a tool's output read as the vendor's row (an MCP result, a `!`
+//! command's) was typed back as a USER turn, untrusted text carrying the
+//! person's authority — and `/login`, `/compact`, a wait for a reset or an
+//! account move followed from it. So no act types screen text whatever the
+//! reader says, and THIS DECIDER IS HANDED ONLY A CONFIRMED WALL: the screen's
+//! reader reads for recall ([`aterm_phase::wall`]: it cannot tell an MCP
+//! result's second block from a wall under the call), and the loop keeps a
+//! Claude Code wall in the reading only where the session's own transcript
+//! ends on Claude Code's notice row of that kind (`supervise/wall_confirm.rs`,
+//! before the reading reaches [`decide_turn_end`], which stays pure); a wall
+//! it does not confirm is journaled and the point decided as an ordinary turn
+//! end. With no transcript to read, a wall read under a tool's call
+//! ([`aterm_phase::Wall::under_call`], the whole screen's rows walked) is
+//! refused the same way, and any other is the screen's to decide, as on
+//! main — which did act on walls under MCP and `!` calls (it did not know
+//! them as calls): a loss of recall where no transcript can be found,
+//! ruled 2026-10-08 to refuse the MCP and hook spoofs there
+//! (`supervise/wall_confirm.rs`). The check runs at the reads a point is
+//! decided on; the loop's re-reads of a decided point for its own books
+//! keep that decision's verdict. A retry that led to real work
 //! ([`TurnEndTiming::progress`]) ends the episode: the next wall starts its
 //! ladder again. A usage window or a spend limit: waited out, handled and
 //! nobody told, when the vendor says it goes on by itself (`continuing
@@ -92,9 +114,8 @@
 //! · …`, which the reader reads as the same wall — see [`aterm_phase::wall`]'s
 //! table — so the wall's track and its attempts stand through the failure). A
 //! lost login — `Not logged in · …` under the gutter, or Claude
-//! Code 2.1.281's `⏺ Login expired · Please run /login` error row (the
-//! incident of 2026-09-27, read idle with no wall until then and continued
-//! for nine hours): `/login` ONCE, then the ONE irreducible escalation —
+//! Code 2.1.281's `⏺ Login expired · Please run /login` error row (read as
+//! idle, it would be continued for hours): `/login` ONCE, then the ONE irreducible escalation —
 //! "finish sign-in in the browser" — said as it is typed; then nothing more
 //! until the screen says the login is back (`⎿  Login successful`) or the
 //! worker works — never a continuation into it, never a draft sent into it
@@ -110,8 +131,8 @@
 //! **ANOTHER ACCOUNT** (`docs/DESIGN-claude-accounts-2026-10-01.md` §6;
 //! `[harness] accounts`). A host that keeps a roster of the owner's Claude
 //! Code accounts ADVISES at each point ([`TurnEndReading::account`] — data on
-//! the reading, so this decider reads no roster and stays pure), and with no
-//! advice every decision here is the one made before accounts existed. At a
+//! the reading, so this decider reads no roster and stays pure); with no
+//! advice, accounts change no decision here. At a
 //! session or weekly limit, and at a model bucket BEFORE its fallback, advice
 //! to move is a relaunch under that account ([`Restart::Account`],
 //! [`RULE_ACCOUNT`]) with the wall's own answer as what the point gets where
@@ -144,7 +165,7 @@
 //! at every state of it this decider, fed the roster's advice through
 //! [`AccountAdvice::of_roster_at`], asks for the move the model makes, waits
 //! where it holds the session, continues it at the notice of a wall the owner
-//! lifted (the model's `Resume…`), and otherwise gives today's action; the
+//! lifted (the model's `Resume…`), and otherwise acts as with no advice; the
 //! three bounds, which that model does not have, are bound there around every
 //! ask.
 //! BUILT AGAINST STAND-INS: no session has been relaunched under a second
@@ -164,8 +185,7 @@
 //! seen since pay it. While it is owed the host is asked nothing about the
 //! session's account and no probe is made. A reset that cleared the account's
 //! walls is that clearing answered: the host's advice to resume for it types
-//! nothing more. With nothing told, every decision here is the one made
-//! before resets existed.
+//! nothing more. With nothing told, resets change no decision here.
 //!
 //! **CODEX: SAVE THEN WAIT** ([`WindDown`], the owner, 2026-09-28: the
 //! supervisor "should only use gpt-6-luna switch like that for codex to git
@@ -318,28 +338,62 @@ fn sign_in_how(program: Program) -> &'static str {
     }
 }
 
-/// Text typed at an API wall's act: the vendor's line quoted, plus what
-/// follows from it. `rule` is the act's; `cause` the wall's; `program` the
-/// one whose screen drew the line.
+/// Text typed at an API wall's act: the wall's kind named in aterm's own
+/// words ([`api_wall_words`]), plus what follows from it. `rule` is the
+/// act's; `kind` the wall's; `program` the one whose screen drew it.
+///
+/// Never a row of the screen (module header, ruling 2026-10-08): what
+/// [`TurnEndReading::wall_message`] holds is whatever the reader took for
+/// the wall, and text typed here is submitted as the person's own turn.
 #[must_use]
-pub fn wall_retry_text(rule: &str, cause: ApiCause, message: &str, program: Program) -> String {
-    let said = message.trim();
+pub fn wall_retry_text(rule: &str, kind: WallKind, program: Program) -> String {
     let who = if program == Program::Codex {
         "Codex"
     } else {
         "Claude Code"
     };
+    let what = api_wall_words(kind);
+    let cause = match kind {
+        WallKind::ApiError { cause, .. } => cause,
+        _ => ApiCause::Server,
+    };
     match (rule, cause) {
         (RULE_API_BACK, _) => {
-            format!("{who} reported \"{said}\", and the API is reachable again now. {CARRY_ON}")
+            format!("{who} reported {what}, and the API is reachable again now. {CARRY_ON}")
         }
         (_, ApiCause::CutOff) => {
-            format!("{who} reported \"{said}\", so your last reply may be incomplete. {CARRY_ON}")
+            format!("{who} reported {what}, so your last reply may be incomplete. {CARRY_ON}")
         }
         (_, ApiCause::Unreachable | ApiCause::Config) => {
-            format!("{who} reported \"{said}\"; trying again. {CARRY_ON}")
+            format!("{who} reported {what}; trying again. {CARRY_ON}")
         }
-        (_, ApiCause::Server) => format!("{who} reported \"{said}\". {CARRY_ON}"),
+        (_, ApiCause::Server) => format!("{who} reported {what}. {CARRY_ON}"),
+    }
+}
+
+/// An API wall in aterm's words, from its kind alone: `an API error
+/// (overloaded)`, `an API error (500)`, `an API error (the API could not be
+/// reached)`. The status is the reader's number, never its text.
+#[must_use]
+pub fn api_wall_words(kind: WallKind) -> String {
+    let (code, why) = match kind {
+        WallKind::Overloaded => (None, Some("overloaded")),
+        WallKind::ApiError { code, cause, .. } => (
+            code,
+            match cause {
+                ApiCause::Server => None,
+                ApiCause::Unreachable => Some("the API could not be reached"),
+                ApiCause::CutOff => Some("the reply was cut off"),
+                ApiCause::Config => Some("a certificate or proxy refusal"),
+            },
+        ),
+        other => return format!("a {} wall", other.name()),
+    };
+    match (code, why) {
+        (Some(code), Some(why)) => format!("an API error ({code}, {why})"),
+        (Some(code), None) => format!("an API error ({code})"),
+        (None, Some(why)) => format!("an API error ({why})"),
+        (None, None) => "an API error".to_string(),
     }
 }
 
@@ -611,7 +665,7 @@ pub enum Restart {
 /// WHERE an account move is asked ([`Restart::Account`]). One variant would
 /// not do: the loop decides by it whether a relaunch the host cannot make
 /// yet (`wait:changed` while the agent's own jobs run) HOLDS the point, and
-/// the two moves need opposite answers (the feasibility review, finding 1).
+/// the two moves need opposite answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountAt {
     /// The turn ended on a limit: nothing typed there is answered, so the
@@ -1301,7 +1355,9 @@ pub struct TurnEndReading {
     pub survey: bool,
     /// The wall the turn ended on.
     pub wall: Option<WallKind>,
-    /// The wall's notice as said (for the model a bucket names).
+    /// The wall's notice as said (for the model a bucket names, and the
+    /// escalations a person reads). SCREEN TEXT: never typed into the worker
+    /// ([`wall_retry_text`]).
     pub wall_message: String,
     /// The wall's reset as the loop's clock (the loop resolves the notice's
     /// `reset=` text with its zone and clock).
@@ -2830,10 +2886,10 @@ impl TurnEndState {
     /// the latch and of the move not answered is then THIS point's. The fold
     /// is what opens a finished task again (someone's turn, with work, is the
     /// task theirs) and what ends a latch with its wall; read before it, a
-    /// finished session a person gave new work to was not asked about at the
-    /// limit that work ended on, and a session whose refused move's wall had
-    /// ended was passed over for one more point — a whole second wall, where
-    /// the work ended on the limit again (the reviews of 2026-10-01).
+    /// finished session a person gave new work to would not be asked about at
+    /// the limit that work ends on, and a session whose refused move's wall
+    /// has ended would be passed over for one more point — a whole second
+    /// wall.
     ///
     /// Nor at a usage limit while the wall's resume is owed
     /// ([`Self::account_resume`]): that notice is the account's the session
@@ -5558,9 +5614,8 @@ fn wall_own_act(
             };
             let ups = track.map_or(0, |t| t.ups);
             let t = &state.timing;
-            let act = |rule: &'static str| {
-                type_as(rule, &wall_retry_text(rule, cause, msg, reading.program))
-            };
+            let act =
+                |rule: &'static str| type_as(rule, &wall_retry_text(rule, kind, reading.program));
             let wait_then = |due: Instant, why: String, act: TurnEndAction| {
                 if now < due {
                     TurnEndAction::WaitUntil { until: due, why }

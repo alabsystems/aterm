@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Integration tests for the public `input::KeyCode` <-> `keyboard::Key` bridge.
-//!
-//! Part of #5681: closes the remaining bridge coverage gaps after the initial
-//! `TryFrom` implementation landed in `input.rs`.
 
 use aterm_types::input::KeyCode;
 use aterm_types::keyboard::{Key, NamedKey};

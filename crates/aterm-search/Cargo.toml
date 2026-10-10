@@ -15,8 +15,8 @@ description = "Search primitives for aterm terminal content"
 
 [features]
 default = []
-# TRUST_NATIVE_TLA: compile the streaming-search `#[refines]` anchors and the
-# kani `proof_anchor!`s as part of the LIBRARY so a downstream test binary (the
+# TRUST_NATIVE_TLA: compile the streaming-search `#[refines]` anchors as part
+# of the LIBRARY so a downstream test binary (the
 # `spec_xref_closure` gate in aterm-gui) can collect them via `inventory`. OFF by
 # default: the production build is byte-identical (no aterm-spec in the closure).
 spec-anchors = ["dep:aterm-spec"]

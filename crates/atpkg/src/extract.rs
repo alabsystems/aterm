@@ -33,10 +33,14 @@
 //!   `trustc`↔`rustc`, shared dylibs), and the materialized alias hashes into `tree_root`
 //!   exactly like a regular file; an escaping, absolute, or forward-referencing link
 //!   aborts the whole stage;
-//! * a regular file is created `O_EXCL` unless this extraction wrote that exact path
+//! * every NAME a folding extraction lays — a file, a link, and each directory on the
+//!   way to it — is created exclusively unless this extraction laid that exact name
 //!   before, so a member the FILESYSTEM names the same as another's (`bin/tool` and
-//!   `BIN/TOOL` on case-insensitive APFS or NTFS, NFC and NFD spellings on APFS) is
-//!   refused instead of silently replacing it ([`ExtractReject::Occupied`]);
+//!   `BIN/TOOL`, or `Dir/f` and `dir/g`, on case-insensitive APFS or NTFS; NFC and NFD
+//!   spellings on APFS) is refused instead of silently replacing it or moving into its
+//!   directory ([`ExtractReject::Occupied`]); and a name the filesystem stores under
+//!   other bytes than it was given (HFS+ decomposing Unicode, Win32 dropping a trailing
+//!   dot) is refused when the stage reads its names back ([`ExtractReject::Respelled`]);
 //! * the validated path is re-joined to the root and confirmed to still be under it
 //!   (defence in depth against any normalization surprise).
 //!
@@ -83,12 +87,20 @@ pub enum ExtractReject {
     /// archive: the bytes would land somewhere other than the path the digest records.
     ThroughSymlink,
     /// A symlink entry names a path something already occupies, a file/directory entry
-    /// names a path an earlier symlink occupies, or a file entry names a path the
-    /// filesystem resolves to ANOTHER member's file (a case-insensitive or
-    /// normalization-insensitive spelling of it). No honest archiver produces any of them
-    /// for the filesystem it is unpacked on; each would make the on-disk tree disagree
-    /// with the folded digest.
+    /// names a path an earlier symlink occupies, or an entry names a file, or passes
+    /// through a directory, that the filesystem resolves to a name ANOTHER member laid
+    /// under different bytes (a case-insensitive or normalization-insensitive spelling of
+    /// it). No honest archiver produces any of them for the filesystem it is unpacked on;
+    /// each would make the on-disk tree disagree with the folded digest.
     Occupied,
+    /// The filesystem stored a name the extraction laid under OTHER bytes, or laid nothing
+    /// for it: HFS+ decomposes an NFC name to NFD, Win32 drops a trailing `.` or space,
+    /// and a device name such as `nul` writes no file. Nothing collided (that is
+    /// [`Self::Occupied`]); the one name came back changed or not at all, so the walk of
+    /// the staged tree would never find the line the fold recorded. Found when the stage
+    /// reads its names back (`TreeAccumulator::require_spelled_back`); the path is the
+    /// first recorded name the disk does not hold under those bytes.
+    Respelled,
 }
 
 /// The kind of an archive entry, as the reader classifies it.
@@ -443,8 +455,15 @@ impl std::fmt::Display for ExtractError {
             },
             ExtractError::Rejected(ExtractReject::Occupied, p) => write!(
                 f,
-                "rejected entry {p:?}: path already taken by an earlier entry (same name, \
-                 or one differing only in case or Unicode form)"
+                "rejected entry {p:?}: path already taken by an earlier entry (the entry, or \
+                 a directory on its way, has an earlier entry's name or one differing only in \
+                 case or Unicode form)"
+            ),
+            ExtractError::Rejected(ExtractReject::Respelled, p) => write!(
+                f,
+                "rejected entry {p:?}: the filesystem did not store the name as laid (it \
+                 rewrites names, e.g. HFS+ decomposing Unicode or Windows dropping a \
+                 trailing dot), so the installed tree could never match its recorded root"
             ),
             ExtractError::Rejected(r, p) => write!(f, "rejected entry {p:?}: {r:?}"),
             ExtractError::TooLarge(r) => std::fmt::Display::fmt(r, f),
@@ -672,11 +691,33 @@ enum Node {
 /// place to be approximately right. A path that is a SYMLINK is never re-opened: the
 /// [`Layer`] refuses any entry landing on, or passing through, a link it laid
 /// ([`ExtractReject::Occupied`] / [`ExtractReject::ThroughSymlink`]), which is what
-/// keeps this model exact without modelling link resolution. Nor is a file under a name
-/// the FILESYSTEM equates with another member's — `bin/tool` then `BIN/TOOL` on
-/// case-insensitive APFS: "the same path" is the filesystem's question, not the bytes',
-/// so the second is created `O_EXCL` and refused ([`TreeAccumulator::wrote_file`]) rather
-/// than recorded as a second file while it replaced the first.
+/// keeps this model exact without modelling link resolution.
+///
+/// # Names are the archive's bytes, so the disk must spell them the same
+///
+/// A line's relpath is the member's own bytes; the walk's is the names the directory
+/// listing hands back. They agree only while every name the extraction lays is one the
+/// filesystem stores apart from every other — and "the same name" is the filesystem's
+/// question, not the bytes': `bin/tool` and `BIN/TOOL`, or `Dir/f` and `dir/g`, are one
+/// path on case-insensitive APFS (the macOS default) and NTFS, and so are the NFC and
+/// NFD spellings of `café` on APFS. So a folding extraction lays every name — a file
+/// ([`TreeAccumulator::wrote_file`]), a link, and each directory on the way to either
+/// ([`make_dir_exact`], which keeps the directories it made in `dirs`) — exclusively,
+/// unless it laid that exact name before, and refuses one the filesystem already holds
+/// ([`ExtractReject::Occupied`]). The rule is the bytes, not a case or Unicode fold of
+/// them, so it is the same answer on every filesystem.
+///
+/// That refuses two names the filesystem takes for one. It cannot see ONE name the
+/// filesystem stores under other bytes, which collides with nothing: HFS+ decomposes an
+/// NFC `café` to NFD, Win32 drops a trailing `.` or space and lays no file at all for a
+/// device name such as `nul`. Staged onto HFS+, an NFC `café/f` extracted cleanly and
+/// recorded a root the walk never reproduces. So the stage reads the names back once
+/// before it hands out the root ([`Self::require_spelled_back`]: directory listings only,
+/// no content) and refuses a tree the disk does not spell as the fold does
+/// ([`ExtractReject::Respelled`]). A filesystem that keeps every name it is given (APFS,
+/// ext4) never meets that refusal, and NTFS meets it only for a name the Win32 layer
+/// rewrites. On any filesystem, wherever a stage succeeds, the fold is the archive's and
+/// the disk spells it back.
 #[derive(Debug)]
 pub(crate) struct TreeAccumulator {
     /// relpath bytes → index into `nodes`: WHICH node that path currently names.
@@ -685,14 +726,40 @@ pub(crate) struct TreeAccumulator {
     paths: std::collections::BTreeMap<Vec<u8>, usize>,
     /// One entry per distinct node laid down.
     nodes: Vec<Node>,
+    /// The directories this extraction made, as a tree of exact names: `dirs[i]` maps the
+    /// name bytes of each child directory of directory `i` to the child's own index, and
+    /// `dirs[0]` is the root. A tree of components, not a set of whole relpaths, so a deep
+    /// member costs its name bytes once, never once per ancestor: the memory is linear in
+    /// the member names read, which the structure allowance already bounds.
+    dirs: Vec<std::collections::BTreeMap<Vec<u8>, usize>>,
 }
 
 impl TreeAccumulator {
+    /// An empty fold over a root that exists and is empty — the staging contract
+    /// ([`require_empty_destination`]).
     pub(crate) fn new() -> Self {
         Self {
             paths: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
+            dirs: vec![std::collections::BTreeMap::new()],
         }
+    }
+
+    /// The index of the directory this extraction made as `name` inside directory
+    /// `parent`, under exactly those bytes.
+    fn child_dir(&self, parent: usize, name: &[u8]) -> Option<usize> {
+        self.dirs.get(parent)?.get(name).copied()
+    }
+
+    /// Record that this extraction made directory `name` inside directory `parent`, and
+    /// return its index.
+    fn record_dir(&mut self, parent: usize, name: Vec<u8>) -> usize {
+        let child = self.dirs.len();
+        self.dirs.push(std::collections::BTreeMap::new());
+        if let Some(children) = self.dirs.get_mut(parent) {
+            children.insert(name, child);
+        }
+        child
     }
 
     /// Record a regular file written at `rel`. A path written twice re-uses its node —
@@ -731,12 +798,10 @@ impl TreeAccumulator {
     /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`.
     ///
     /// Fails CLOSED when the target is not one of the regular files this extraction
-    /// wrote: the caller has already proved a regular file exists at that path on disk
-    /// AND that no component of the path is a link it laid ([`Layer::guard_ancestors`]),
-    /// so the only way to reach here is a `dest_root` that was not empty when extraction
-    /// started — which the staging contract forbids (`verify_and_stage` sweeps and
-    /// re-creates it, and `require_empty_destination` enforces it). Guessing a digest
-    /// for a file we did not write is precisely what this digest is supposed to refuse.
+    /// wrote under exactly these bytes. [`Layer::hardlink`] asks [`Self::wrote_file`]
+    /// before it links, so this never fires there; it stays a refusal rather than a
+    /// guess, because guessing a digest for a file we did not write is precisely what
+    /// this digest is supposed to refuse.
     fn record_alias(&mut self, rel: Vec<u8>, target_rel: &[u8]) -> bool {
         let Some(&node) = self.paths.get(target_rel) else {
             return false;
@@ -771,6 +836,31 @@ impl TreeAccumulator {
             }
         }
         modes
+    }
+
+    /// Refuse a staged tree the disk does not spell as this fold does: the recorded paths
+    /// must be exactly the names a listing of `dest` returns ([`crate::tree::line_names`]),
+    /// or the root folded here is one the walk of `dest` — the one `aterm pkg verify`
+    /// takes — never reproduces (see the type's docs). A stage asks this once, after its
+    /// last name is laid and before it hands out the root.
+    ///
+    /// # Errors
+    /// [`ExtractReject::Respelled`] naming the first recorded path the listing lacks (else
+    /// the first listed path the fold lacks), and the listing's I/O errors.
+    pub(crate) fn require_spelled_back(&self, dest: &Path) -> Result<(), ExtractError> {
+        let listed = crate::tree::line_names(dest).map_err(|e| io_at(e, "read_dir", dest))?;
+        if listed.iter().eq(self.paths.keys()) {
+            return Ok(());
+        }
+        let blamed = self
+            .paths
+            .keys()
+            .find(|rel| listed.binary_search(rel).is_err())
+            .or_else(|| listed.iter().find(|rel| !self.paths.contains_key(*rel)))
+            .map_or_else(PathBuf::new, |rel| {
+                PathBuf::from(String::from_utf8_lossy(rel).into_owned())
+            });
+        Err(ExtractError::Rejected(ExtractReject::Respelled, blamed))
     }
 
     /// Fold every recorded path into the tree root, through the SAME formatters and the
@@ -808,6 +898,60 @@ pub(crate) fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, Extra
         .strip_prefix(root)
         .map_err(|_| ExtractError::Rejected(ExtractReject::RootEscape, path.to_path_buf()))?;
     Ok(crate::tree::rel_line_bytes(rel))
+}
+
+/// Make directory `dir` and every missing ancestor of it below `root`, ONE component at a
+/// time, for an extraction folding into `tree`; `raw` is the member blamed on refusal.
+///
+/// A component `tree` already holds under exactly these bytes is this extraction's own
+/// directory and costs nothing. Any other is created with a plain `mkdir`, which is
+/// exclusive: it fails `EEXIST` when the name already resolves, and in a root that started
+/// empty everything there was laid by this extraction under OTHER bytes — `dir` after
+/// `Dir` on case-insensitive APFS or NTFS, the NFD spelling of a name after its NFC one on
+/// APFS, or a file or link of that name. The member would then land under the earlier
+/// spelling on disk while the fold recorded its own, a line the walk never finds, so it is
+/// refused as [`ExtractReject::Occupied`] (see [`TreeAccumulator`]). `create_dir_all` asks
+/// "is there a directory here?", which a folding filesystem answers yes to for the wrong
+/// name; this asks "did WE make this name?", which only the bytes answer.
+///
+/// The file and link creates make the same decision for the last component
+/// ([`Layer::regular`], [`Layer::symlink`], [`Layer::hardlink`]); this is the one maker of
+/// directories for every folding lane and for the links a stage adds afterwards.
+pub(crate) fn make_dir_exact(
+    root: &Path,
+    dir: &Path,
+    raw: &Path,
+    tree: &mut TreeAccumulator,
+) -> Result<(), ExtractError> {
+    let rejected = |r| ExtractError::Rejected(r, raw.to_path_buf());
+    let rel = dir
+        .strip_prefix(root)
+        .map_err(|_| rejected(ExtractReject::RootEscape))?;
+    let mut parent = 0;
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        // A vetted destination is `Normal` components only; anything else would make
+        // `cur` name a path the component tree does not, so it is refused, not followed.
+        let Component::Normal(name) = comp else {
+            return Err(rejected(ExtractReject::RootEscape));
+        };
+        cur.push(name);
+        let name = crate::platform::os_str_bytes(name);
+        parent = match tree.child_dir(parent, name) {
+            Some(made) => made,
+            None => {
+                std::fs::create_dir(&cur).map_err(|e| {
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        rejected(ExtractReject::Occupied)
+                    } else {
+                        io_at(e, "create_dir", &cur)
+                    }
+                })?;
+                tree.record_dir(parent, name.to_vec())
+            }
+        };
+    }
+    Ok(())
 }
 
 /// THE precondition the folded digest stands on, ENFORCED rather than assumed.
@@ -892,6 +1036,9 @@ impl<'a> Layer<'a> {
     ) -> Result<Self, ExtractError> {
         if fold {
             require_empty_destination(root)?;
+            // The fold's directory tree starts AT the root ([`TreeAccumulator::new`]), so
+            // the root is made here — the one directory whose own name is in no line.
+            std::fs::create_dir_all(root).map_err(|e| io_at(e, "create_dir_all", root))?;
         }
         Ok(Self {
             root,
@@ -977,11 +1124,11 @@ impl<'a> Layer<'a> {
     /// Make sure `dest`'s parent directory exists, remembering the last one so a RUN of
     /// entries in the same directory pays for it once.
     ///
-    /// The `create_dir_all` stays — an archive may omit directory members entirely, and
-    /// a file whose parent has no member of its own still has to land. What goes is
-    /// repeating it per FILE: on a parent that already exists `create_dir_all` is not
-    /// free, it is a `mkdir` that fails `EEXIST` plus an `is_dir` `stat`, each
-    /// re-resolving a path as deep as
+    /// The make stays ([`Self::ensure_dir`]) — an archive may omit directory members
+    /// entirely, and a file whose parent has no member of its own still has to land.
+    /// What goes is repeating it per FILE: on a parent that already exists
+    /// `create_dir_all` is not free, it is a `mkdir` that fails `EEXIST` plus an `is_dir`
+    /// `stat`, each re-resolving a path as deep as
     /// `<prefix>/store/trust/<build>.incoming-<pid>/lib/rustlib/...`. The shipped
     /// `trust` sysroot lays 4114 regular files across 918 directories, so 4114 of those
     /// pairs where 918 say the same thing. Tar (and zip) members arrive grouped by
@@ -991,17 +1138,30 @@ impl<'a> Layer<'a> {
     /// Skipping is sound because nothing can turn a directory this extraction already
     /// made into something else: [`Layer::symlink`] refuses any path anything occupies
     /// ([`ExtractReject::Occupied`]), and no method here removes a directory. The memo
-    /// therefore only ever elides a call that would have been a no-op.
-    fn ensure_parent(&mut self, dest: &Path) -> Result<(), ExtractError> {
+    /// compares paths byte for byte, so it only ever elides a call for the exact name
+    /// that call already answered, and would have been a no-op.
+    fn ensure_parent(&mut self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         let Some(parent) = dest.parent() else {
             return Ok(());
         };
         if self.last_parent.as_deref() == Some(parent) {
             return Ok(());
         }
-        std::fs::create_dir_all(parent).map_err(|e| io_at(e, "create_dir_all", parent))?;
+        self.ensure_dir(parent, raw)?;
         self.last_parent = Some(parent.to_path_buf());
         Ok(())
+    }
+
+    /// Make directory `dir` and its missing ancestors. A folding lane makes each
+    /// component under its exact name or refuses it ([`make_dir_exact`]): its root began
+    /// empty, so a name already there that it did not make is a filesystem fold. The
+    /// write-only lane folds nothing and may land in a populated tree, so an existing
+    /// directory is simply used, as tar uses it.
+    fn ensure_dir(&mut self, dir: &Path, raw: &Path) -> Result<(), ExtractError> {
+        match self.tree.as_mut() {
+            Some(tree) => make_dir_exact(self.root, dir, raw, tree),
+            None => std::fs::create_dir_all(dir).map_err(|e| io_at(e, "create_dir_all", dir)),
+        }
     }
 
     /// Lay down a directory entry. `declared_size` is the entry's EFFECTIVE body size
@@ -1035,7 +1195,7 @@ impl<'a> Layer<'a> {
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
-        std::fs::create_dir_all(&dest).map_err(|e| io_at(e, "create_dir_all", &dest))?;
+        self.ensure_dir(&dest, raw)?;
         crate::platform::set_mode(&dest, safe_mode(mode, true))
             .map_err(|e| io_at(e, "set_mode", &dest))?;
         // A directory member is normally followed by its own files: record it as known
@@ -1057,16 +1217,18 @@ impl<'a> Layer<'a> {
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
-        self.ensure_parent(&dest)?;
-        // THE CREATE. A folding lane starts from an empty root, so a name that already
-        // resolves here is one of two things. This exact path, written earlier: a
-        // duplicate member, re-opened and truncated as tar does, which the fold models by
-        // reusing its node. Or a name the filesystem FOLDS onto another member's file —
-        // `bin/tool` and `BIN/TOOL` on case-insensitive APFS or NTFS, the NFC and NFD
-        // spellings of one name on APFS: its bytes would replace that member's while the
-        // fold kept both, so the root would describe a file that is not on disk. That is
-        // refused, as a link landing on an occupied name is. `O_EXCL` asks the
-        // filesystem's own name equality, at no cost to the create it replaces.
+        self.ensure_parent(&dest, raw)?;
+        // THE CREATE. A folding lane starts from an empty root, and `ensure_parent` has
+        // just proved every directory on the way is one it made under exactly these
+        // bytes, so a name that already resolves here is one of two things. This exact
+        // path, written earlier: a duplicate member, re-opened and truncated as tar does,
+        // which the fold models by reusing its node. Or a name the filesystem FOLDS onto
+        // another member's file — `bin/tool` and `bin/TOOL` on case-insensitive APFS or
+        // NTFS, the NFC and NFD spellings of one name on APFS: its bytes would replace
+        // that member's while the fold kept both, so the root would describe a file that
+        // is not on disk. That is refused, as a link landing on an occupied name is.
+        // `O_EXCL` asks the filesystem's own name equality, at no cost to the create it
+        // replaces.
         let rel = match self.tree {
             Some(_) => Some(rel_bytes_under(self.root, &dest)?),
             None => None,
@@ -1157,30 +1319,46 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             ));
         }
-        self.ensure_parent(&dest)?;
+        // A folding lane also asks the FOLD, before the link exists: the target must be a
+        // file this extraction wrote under exactly these bytes. The `lstat` above is
+        // answered by the filesystem's own name equality, so on case-insensitive APFS a
+        // target spelled `DIR/F` passes it for a written `dir/f` — a name no line carries,
+        // which only the bytes can refuse.
+        let rels = match self.tree.as_ref() {
+            Some(tree) => {
+                let target_rel = rel_bytes_under(self.root, &target_abs)?;
+                if !tree.wrote_file(&target_rel) {
+                    return Err(ExtractError::Rejected(
+                        ExtractReject::HardlinkTargetMissing,
+                        raw.to_path_buf(),
+                    ));
+                }
+                Some((rel_bytes_under(self.root, &dest)?, target_rel))
+            }
+            None => None,
+        };
+        self.ensure_parent(&dest, raw)?;
         // A same-inode alias of already-counted bytes: no content stream, no
         // size-cap charge (a body-carrying alias was refused on the header
-        // above); the entry COUNT cap still applies.
-        std::fs::hard_link(&target_abs, &dest).map_err(|e| io_at(e, "hard_link", &dest))?;
+        // above); the entry COUNT cap still applies. `link(2)` never replaces, so a
+        // name already there — this one, or one the filesystem folds it onto — is
+        // occupied, as it is for a file or a symlink.
+        std::fs::hard_link(&target_abs, &dest).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                ExtractError::Rejected(ExtractReject::Occupied, raw.to_path_buf())
+            } else {
+                io_at(e, "hard_link", &dest)
+            }
+        })?;
         // …and, for the digest, a same-NODE alias: it reuses the target's already
         // computed (mode, content sha) instead of re-hashing the same inode through
         // a second name, which is what the on-disk walk had to do.
-        let aliased = match self.tree.as_mut() {
-            Some(tree) => {
-                let dest_rel = rel_bytes_under(self.root, &dest)?;
-                let target_rel = rel_bytes_under(self.root, &target_abs)?;
-                tree.record_alias(dest_rel, &target_rel)
-            }
-            None => true,
-        };
-        if !aliased {
-            // Unreachable for a bundle extracted into the empty scratch dir the
-            // staging contract provides: every ancestor of the target was just proved
-            // to be a real directory and the target itself a regular file, so the path
-            // names a file THIS extraction wrote. What is left is a `dest_root` that
-            // was not empty when extraction began, which `require_empty_destination`
-            // refuses for every folding lane. Fail closed rather than invent a digest
-            // for bytes we did not write.
+        if let (Some(tree), Some((dest_rel, target_rel))) = (self.tree.as_mut(), rels)
+            && !tree.record_alias(dest_rel, &target_rel)
+        {
+            // Unreachable: the fold answered for this very target above, and nothing
+            // in between removes a file. Fail closed rather than invent a digest for
+            // bytes we did not write.
             return Err(ExtractError::Rejected(
                 ExtractReject::HardlinkTargetMissing,
                 raw.to_path_buf(),
@@ -1224,7 +1402,7 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             ));
         }
-        self.ensure_parent(&dest)?;
+        self.ensure_parent(&dest, raw)?;
         create_symlink(target, &dest).map_err(|e| io_at(e, "symlink", &dest))?;
         if let Some(tree) = self.tree.as_mut() {
             let rel = rel_bytes_under(self.root, &dest)?;
@@ -2182,6 +2360,10 @@ mod tests {
     /// signed). ONE call shape for every parity site, so the Windows fix is exercised
     /// by the same tests that pin the Unix contract.
     fn fused_and_walked(tree: TreeAccumulator, root: &Path) -> (String, String) {
+        // Every parity site is also a tree the stage's name check must pass: a refusal
+        // here would be a false one, on a filesystem that kept every name.
+        tree.require_spelled_back(root)
+            .expect("the disk spells back every name the fold records");
         let walked = crate::tree::tree_root_declared(root, &tree.declared_modes()).unwrap();
         (tree.root(), walked)
     }
@@ -2783,7 +2965,10 @@ mod tests {
     #[test]
     fn a_member_the_filesystem_names_like_another_never_replaces_it_unseen() {
         let d = dest("fs-folded-names");
-        for (first, second) in [("bin/tool", "BIN/TOOL"), ("caf\u{e9}", "cafe\u{301}")] {
+        // `bin/TOOL`, not `BIN/TOOL`: the pair shares its directory under one spelling, so
+        // what refuses it is the FILE's exclusive create; a folded directory is the test
+        // below's.
+        for (first, second) in [("bin/tool", "bin/TOOL"), ("caf\u{e9}", "cafe\u{301}")] {
             let tar = tar_bytes(&[
                 (first, b'0', "", b"benign", 0o755),
                 (second, b'0', "", b"other!", 0o755),
@@ -2830,6 +3015,182 @@ mod tests {
                     }
                     Err(e) => panic!("{lane} {second:?}: {e:?}"),
                 }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The DIRECTORY half of the test above. Two members whose directory components
+    /// differ in bytes but name ONE directory on the filesystem being unpacked onto —
+    /// `Dir` and `dir` on case-insensitive APFS or NTFS, the NFC and NFD spellings of
+    /// `café` on APFS, at the top or below a shared parent. Made with `create_dir_all`,
+    /// the second member's directory silently WAS the first's: its file, link or alias
+    /// landed in `Dir/` on disk while the fold recorded it under `dir/`, so the root
+    /// described a path the walk never finds and `aterm pkg verify` called an untampered
+    /// install drifted. A component this extraction did not make under those exact bytes
+    /// is created exclusively and refused as `Occupied` when the filesystem already has
+    /// it; where the filesystem keeps both spellings apart (case- and normalization-
+    /// sensitive), both are laid and the fold equals the walk. The same two members with
+    /// the directory spelled ONE way always extract, so the refusal is the spelling's,
+    /// not the member kind's. Every kind (a link only where the platform lays links),
+    /// through the tar lane and the zip lane (which has no hardlinks), which share the
+    /// writer.
+    #[test]
+    fn a_directory_the_filesystem_names_like_another_never_merges_unseen() {
+        let d = dest("fs-folded-dirs");
+        let spellings = [
+            ("Dir", "dir"),
+            ("caf\u{e9}", "cafe\u{301}"),
+            ("a/Sub", "a/sub"),
+        ];
+        for (pair, (first_dir, folded_dir)) in spellings.into_iter().enumerate() {
+            let first = format!("{first_dir}/f");
+            // (kind, tar typeflag, leaf under the second spelling, link name, zip mode)
+            let kinds = [
+                ("file", b'0', "g", "", 0o100_644),
+                ("dir", b'5', "sub/", "", 0o040_755),
+                ("symlink", b'2', "l", "f", 0o120_777),
+                ("hardlink", b'1', "h", first.as_str(), 0),
+            ];
+            // `create_symlink` lays links on Unix only; elsewhere the lane refuses them.
+            let kinds = kinds
+                .into_iter()
+                .filter(|(kind, ..)| cfg!(unix) || *kind != "symlink");
+            for (kind, flag, leaf, link, zip_mode) in kinds {
+                for (spelled, second_dir) in [("exact", first_dir), ("folded", folded_dir)] {
+                    let second = format!("{second_dir}/{leaf}");
+                    let body: &[u8] = if flag == b'0' { b"other!" } else { b"" };
+                    let tar = tar_bytes(&[
+                        (first.as_str(), b'0', "", b"benign", 0o644),
+                        (second.as_str(), flag, link, body, 0o644),
+                    ]);
+                    let label = format!("{pair}-{kind}-{spelled}");
+                    let mut lanes = vec!["tar"];
+                    let gz = d.join(format!("{label}.tar.gz"));
+                    std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+                    let zip = d.join(format!("{label}.zip"));
+                    if flag != b'1' {
+                        let member = |name, mode, data| ZipMember {
+                            name,
+                            mode,
+                            data,
+                            deflate: false,
+                        };
+                        let data = if flag == b'2' { link.as_bytes() } else { body };
+                        let members = [
+                            member(first.as_str(), 0o100_644, b"benign"),
+                            member(second.as_str(), zip_mode, data),
+                        ];
+                        std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
+                        lanes.push("zip");
+                    }
+                    for lane in lanes {
+                        let root = d.join(format!("{lane}-{label}"));
+                        let got = if lane == "tar" {
+                            extract_tar_gz_tree(&gz, &root, 1 << 20, 10, vendor(0))
+                        } else {
+                            extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0))
+                        };
+                        match got {
+                            Ok(tree) => {
+                                let (fused, walked) = fused_and_walked(tree, &root);
+                                assert_eq!(
+                                    fused, walked,
+                                    "{lane} {kind} {second:?}: the fold must describe the disk"
+                                );
+                            }
+                            Err(ExtractError::Rejected(ExtractReject::Occupied, p))
+                                if spelled == "folded" =>
+                            {
+                                assert_eq!(p, Path::new(&second), "{lane} {kind}: the second");
+                                assert_eq!(
+                                    std::fs::read(root.join(&first)).unwrap(),
+                                    b"benign",
+                                    "{lane} {kind} {second:?}: the first member is left as it was"
+                                );
+                            }
+                            Err(e) => panic!("{lane} {kind} {second:?}: {e:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The case the two tests above cannot see: ONE name the filesystem stores under
+    /// other bytes, or lays nothing for, collides with nothing. Staged onto HFS+, an
+    /// archive holding only an NFC `café/f` extracted cleanly, the disk held the NFD
+    /// spelling, and the root the stage recorded was one the walk never reproduces, so
+    /// `aterm pkg verify` called the untampered install drifted (Win32 dropping a
+    /// trailing dot, and a device name such as `nul` that lays no file, are the same
+    /// class). The stage reads its names back and refuses the tree as `Respelled`.
+    ///
+    /// APFS and ext4 keep both spellings as given, so the filesystem's part is played
+    /// by a rename to exactly the bytes HFS+ stores, and by a removal for the name that
+    /// lays nothing; as laid, the same tree passes. Through every archive lane.
+    #[test]
+    fn a_name_the_filesystem_stores_under_other_bytes_is_refused() {
+        let d = dest("fs-respelled");
+        let tar = tar_bytes(&[
+            ("caf\u{e9}/f", b'0', "", b"one", 0o644),
+            ("bin/tool", b'0', "", b"two", 0o755),
+        ]);
+        let zst = d.join("one.tar.zst");
+        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
+        let gz = d.join("one.tar.gz");
+        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+        let zip = d.join("one.zip");
+        let member = |name, mode, data| ZipMember {
+            name,
+            mode,
+            data,
+            deflate: false,
+        };
+        let members = [
+            member("caf\u{e9}/f", 0o100_644, b"one"),
+            member("bin/tool", 0o100_755, b"two"),
+        ];
+        std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
+        type Respell = fn(&Path);
+        let respellings: [(&str, Respell, &str); 2] = [
+            (
+                "nfd",
+                |root| {
+                    std::fs::rename(root.join("caf\u{e9}"), root.join("cafe\u{301}")).unwrap();
+                },
+                "caf\u{e9}/f",
+            ),
+            (
+                "vanished",
+                |root| std::fs::remove_file(root.join("bin/tool")).unwrap(),
+                "bin/tool",
+            ),
+        ];
+        for lane in ["tar-zst", "tar-gz", "zip"] {
+            for (how, respell, blamed) in respellings {
+                let root = d.join(format!("{lane}-{how}"));
+                let tree = match lane {
+                    "tar-zst" => extract_tar_zst_tree(&zst, &root, 1 << 20, 10, vendor(0)),
+                    "tar-gz" => extract_tar_gz_tree(&gz, &root, 1 << 20, 10, vendor(0)),
+                    _ => extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0)),
+                }
+                .unwrap();
+                tree.require_spelled_back(&root)
+                    .unwrap_or_else(|e| panic!("{lane} {how}: as laid, the names pass: {e:?}"));
+                respell(&root);
+                match tree.require_spelled_back(&root) {
+                    Err(ExtractError::Rejected(ExtractReject::Respelled, p)) => {
+                        assert_eq!(p, Path::new(blamed), "{lane} {how}: the recorded name");
+                    }
+                    other => panic!("{lane} {how}: must be refused, got {other:?}"),
+                }
+                // What the refusal stands in front of: this fold's root is not the disk's.
+                assert_ne!(
+                    tree.root(),
+                    crate::tree::tree_root(&root).unwrap(),
+                    "{lane} {how}: the fold no longer describes the disk"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&d);
@@ -4030,53 +4391,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// ONE `create_dir_all` per run of entries in a directory, not one per entry.
+    /// ONE directory create per directory, not one per entry.
     ///
     /// `Layer` used to ask for the parent on every file it laid, and on a parent that
     /// already exists that is a `mkdir` failing `EEXIST` plus an `is_dir` `stat` — 4114
     /// times for the 918 directories of the shipped `trust` sysroot, each re-resolving
     /// a deep `<build>.incoming-<pid>/lib/rustlib/...` path under the store lock.
-    /// Removing the directory behind the extractor's back is the witness that the
-    /// second file of a run no longer re-asks for it; nothing under the staging
-    /// contract can do that (the scratch root is this process's alone, under the store
-    /// lock), which is exactly why the call being skipped could only have been a no-op.
+    /// Removing the directory behind the extractor's back is the witness that a later
+    /// file no longer re-asks for it; nothing under the staging contract can do that
+    /// (the scratch root is this process's alone, under the store lock), which is
+    /// exactly why the call being skipped could only have been a no-op.
+    ///
+    /// A folding lane remembers EVERY directory it made, by exact name
+    /// ([`make_dir_exact`] — it must, to tell its own directory from one the filesystem
+    /// folds onto it), so a directory is created once however the archive interleaves
+    /// them. The write-only lane remembers the last parent only.
     #[test]
     fn a_run_of_files_in_one_directory_creates_it_once() {
         let d = dest("parent-memo");
-        let root = d.join("staging");
-        let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
-        let mut layer = Layer::open(
-            &root,
-            1 << 20,
-            100,
-            true,
-            ExtractOptions::default(),
-            Rc::clone(&budget),
-        )
-        .unwrap();
-        layer.regular(Path::new("lib/a"), 0o644, &b"a"[..]).unwrap();
-        assert!(root.join("lib/a").is_file());
-
-        std::fs::remove_dir_all(root.join("lib")).unwrap();
-        let err = layer
-            .regular(Path::new("lib/b"), 0o644, &b"b"[..])
-            .unwrap_err();
-        let ExtractError::Io { op, .. } = &err else {
-            panic!("want Io, got {err:?}");
-        };
-        assert_eq!(
-            *op, "open",
-            "the parent must not be asked for a second time"
-        );
-
-        // ...and exactly ONE directory is remembered: a different parent is created as
-        // before, and switching back re-issues the call for the first one.
-        layer
-            .regular(Path::new("other/c"), 0o644, &b"c"[..])
+        for fold in [true, false] {
+            let root = d.join(format!("staging-{fold}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+            let mut layer = Layer::open(
+                &root,
+                1 << 20,
+                100,
+                fold,
+                ExtractOptions::default(),
+                Rc::clone(&budget),
+            )
             .unwrap();
-        layer.regular(Path::new("lib/d"), 0o644, &b"d"[..]).unwrap();
-        assert!(root.join("other/c").is_file());
-        assert!(root.join("lib/d").is_file());
+            layer.regular(Path::new("lib/a"), 0o644, &b"a"[..]).unwrap();
+            assert!(root.join("lib/a").is_file());
+
+            std::fs::remove_dir_all(root.join("lib")).unwrap();
+            let err = layer
+                .regular(Path::new("lib/b"), 0o644, &b"b"[..])
+                .unwrap_err();
+            let ExtractError::Io { op, .. } = &err else {
+                panic!("fold={fold}: want Io, got {err:?}");
+            };
+            assert_eq!(
+                *op, "open",
+                "fold={fold}: the parent must not be asked for a second time"
+            );
+
+            // A different parent is created as before; switching back to the first asks
+            // for it again only where one directory is remembered.
+            layer
+                .regular(Path::new("other/c"), 0o644, &b"c"[..])
+                .unwrap();
+            assert!(root.join("other/c").is_file());
+            let back = layer.regular(Path::new("lib/d"), 0o644, &b"d"[..]);
+            if fold {
+                let Err(ExtractError::Io { op, .. }) = &back else {
+                    panic!("fold: want Io, got {back:?}");
+                };
+                assert_eq!(*op, "open", "fold: every directory made is remembered");
+            } else {
+                back.unwrap();
+                assert!(root.join("lib/d").is_file());
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

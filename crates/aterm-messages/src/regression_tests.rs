@@ -10,17 +10,20 @@ use crate::center::{EchoKind, MessageCenter, Outcome};
 use crate::glass::{Links, Presentation, RowKind, RowSpec, layout_row, layout_row_with};
 use crate::log::{LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 use crate::model::{
-    Amount, Glyph, Hold, Intent, Loads, Message, MessageId, Origin, Restatement, Severity, Tag,
-    Unit, WallStamp, tags,
+    Amount, Glyph, Hold, Intent, Load, Loads, Message, MessageId, Meter, Origin, Restatement,
+    Severity, Tag, Unit, UpgradeWord, WallStamp, tags,
 };
-use crate::page::{MessageView, description};
+use crate::page::{Host, MessageView, MessagesState, description};
 use crate::presence::View;
 use crate::progress::{Eta, ProgressTrack};
 use crate::text::{char_width, shape_detail, truncate};
 use crate::waits::{WaitEnd, lines_words, paste_row, rewrap_row, rewrap_stats};
 use crate::wire::{NoticeRequest, ReadQuery, message_rows, parse_read_args};
 use crate::words::{day_heading, local_day};
-use crate::{Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE, SHRINK_QUIET, STALE_TAILED};
+use crate::{
+    Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE, SHRINK_QUIET, STALE_STRAIN,
+    STALE_TAILED, STRAIN_KEY,
+};
 
 fn t0() -> Instant {
     Instant::now()
@@ -1375,5 +1378,205 @@ fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
         two.retired(),
         Some(&Retired::Stale),
         "record 2 was still open when aterm stopped: {two:?}"
+    );
+}
+
+/// Ruling 259 (a count a determinate row shows and its fill agree) and
+/// ruling 441 (a): the band FLOORS a fill to its percent and `count_span`
+/// ROUNDS each count's permille, so a fill measured finer than its count is
+/// held one permille under the PERCENT the next count paints, never at it:
+/// `3 of 10 programs` at 45 % paints `39%`, not `4 of 10`'s `40%`; `9 of 10`
+/// never fills the whole bar while one is left; `1 of 3` stops at `65%`,
+/// because `2 of 3` paints `66%` (667). Every count of every total up to
+/// twelve, wherever the two counts' own percents differ at all.
+#[test]
+fn a_measured_fill_never_paints_the_next_counts_percent() {
+    let fill = |fill: u16, stats: &str, amount: bool| {
+        Meter {
+            fill_permille: Some(fill),
+            stats: stats.into(),
+            amount: amount.then_some(Amount {
+                series: 1,
+                done: u64::from(fill),
+                total: 1000,
+                unit: Unit::Steps,
+            }),
+            ..Meter::default()
+        }
+        .normalized()
+        .fill_permille
+        .unwrap()
+    };
+    let mut reached = Vec::new();
+    for total in 1u64..=12 {
+        for done in 0..total {
+            let this = fill(0, &format!("{done} of {total} programs"), false);
+            let next = fill(0, &format!("{} of {total} programs", done + 1), false);
+            let top = fill(1000, &format!("{done} of {total} programs"), true);
+            if next / 10 > this / 10 && top / 10 >= next / 10 {
+                reached.push(format!(
+                    "`{done} of {total}` at {}% — `{} of {total}`'s",
+                    top / 10,
+                    done + 1
+                ));
+            }
+        }
+    }
+    assert!(reached.is_empty(), "{reached:#?}");
+}
+
+/// Ruling 175 (`load=` only while the row shows its load words) and ruling
+/// 246 (the work's own primary load shows only while other work is
+/// measurably slowed) are one rule for the band and the `messages` line
+/// (ruling 441 (b), `Live::said_load`): a download row whose `network busy`
+/// the band does not paint must not print `load=network`.
+#[test]
+fn messages_prints_load_only_where_the_glass_says_it() {
+    let now = t0();
+    let mut c = fresh(now);
+    let msg = Message::new(tags::PACKAGES, Severity::Info, "Installing ALab tools")
+        .meter(Meter {
+            fill_permille: Some(300),
+            stats: "3 of 10 programs".into(),
+            load: Some(Load::Network),
+            ..Meter::default()
+        })
+        .hold(Hold::Live {
+            stale_after: STALE_TAILED,
+        })
+        .loads([Load::Network, Load::Disk, Load::Cpu])
+        .primary_load(Load::Network);
+    c.post(msg, stamp(1), now);
+    c.commit_rows(now, 3);
+    let glass = c.presentation(120, &char_width, None, Links::Painted);
+    assert_eq!(
+        glass.rows[0].load, None,
+        "premise: the band paints no load words for the work's own load"
+    );
+    let enc = |s: &str| s.to_string();
+    let rows = message_rows(&c, &ReadQuery::default(), 2, &enc);
+    assert_eq!(rows.len(), 1, "one record: {rows:?}");
+    let line = &rows[0];
+    assert!(
+        !line.contains(" load="),
+        "the wire says a load the glass does not: {line}"
+    );
+    // Slowed: both name it.
+    c.set_slowing(true);
+    let glass = c.presentation(120, &char_width, None, Links::Painted);
+    assert!(glass.rows[0].load.is_some(), "slowed: the band says it");
+    let rows = message_rows(&c, &ReadQuery::default(), 2, &enc);
+    assert!(
+        rows[0].contains(" load=network"),
+        "slowed: the wire says it too: {}",
+        rows[0]
+    );
+}
+
+/// A page host with nothing staged, no files and no upgrades.
+struct Plain;
+
+impl Host for Plain {
+    fn now_unix_ms(&self) -> u64 {
+        60_000
+    }
+    fn log_folder(&self) -> Option<String> {
+        None
+    }
+    fn saved(&self) -> bool {
+        true
+    }
+    fn utc_offset_s(&self) -> i64 {
+        0
+    }
+    fn staged_build(&self) -> Option<u64> {
+        None
+    }
+    fn is_regular_file(&self, _path: &str) -> bool {
+        false
+    }
+    fn upgrade_takes(&self, _tab: &str, _to: &str, _word: UpgradeWord) -> bool {
+        false
+    }
+    fn upgrade_stands(&self, _tab: &str) -> bool {
+        false
+    }
+    fn performs_navigation(&self) -> bool {
+        true
+    }
+    fn sentence_lines(&self, _key: Option<&str>, _detail: &[String]) -> usize {
+        1
+    }
+}
+
+/// Ruling 267 keeps `still open when aterm stopped` for a record replayed
+/// open from a process that was killed or crashed. A seamless handoff is a
+/// graceful end of the parent: the rows its carry did not take (an
+/// unrevealed row, the strain level) are closed by the parent at Commit
+/// (`MessageCenter::close_uncarried`, ruling 441 (d)), never read in the
+/// successor as cut off by a crash.
+#[test]
+fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
+    let now = t0();
+    let mut parent = fresh(now);
+    let pass = parent
+        .post(
+            Message::new(tags::PACKAGES, Severity::Info, "Checking ALab tools")
+                .in_flight()
+                .key("toolchain.pass")
+                .hold(Hold::Live {
+                    stale_after: STALE_TAILED,
+                })
+                .reveal_after(PROGRESS_GRACE),
+            stamp(1),
+            now,
+        )
+        .id;
+    let strain = parent
+        .post(
+            Message::new(tags::SYSTEM, Severity::Info, "Typing slowed by 'yes'")
+                .key(STRAIN_KEY)
+                .hold(Hold::Live {
+                    stale_after: STALE_STRAIN,
+                })
+                .meter(Meter::level(700, "5.6 of 8 cores"))
+                .no_excerpt(),
+            stamp(2),
+            now,
+        )
+        .id;
+    parent.commit_rows(now, 3);
+    let carry = parent.carried();
+    assert!(
+        carry
+            .live
+            .iter()
+            .all(|m| m.id != pass.raw() && m.id != strain.raw()),
+        "premise: neither row is carried: {:?}",
+        carry.live.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    // The parent's Commit: what the carry did not take ends with it, right
+    // before its last write.
+    let carried: Vec<u64> = carry.live.iter().map(|m| m.id).collect();
+    assert_eq!(parent.close_uncarried(&carried, now), 2);
+    // The parent's file, as it flushed it before handing off.
+    let mut disk = MessageLog::empty();
+    disk.replay_all(drained(&mut parent));
+    let mut c = MessageCenter::new(disk.clone(), now);
+    c.seed_carried(&carry, stamp(3), now);
+    c.merge_reloaded_log(&disk);
+    let page = MessagesState::of(&c, &Plain);
+    let crashed: Vec<String> = [pass, strain]
+        .into_iter()
+        .filter_map(|id| {
+            let view = page.entry(id.raw()).expect("the record is in the ring");
+            (view.state_words() == "still open when aterm stopped"
+                || c.log().get(id).and_then(|r| r.retired()) == Some(&Retired::Stale))
+            .then(|| format!("{} ({}): state={}", id.raw(), view.title, view.state))
+        })
+        .collect();
+    assert!(
+        crashed.is_empty(),
+        "records read as a crash's (\"still open when aterm stopped\") after a graceful handoff: {crashed:?}"
     );
 }

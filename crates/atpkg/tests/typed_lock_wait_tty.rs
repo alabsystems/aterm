@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A PERSON'S VERB WAITS FOR THE STORE (2026-09-23), at the real process edge.
+//! A PERSON'S VERB WAITS FOR THE STORE, at the real process edge.
 //!
 //! `store_lock_wait.rs` pins the verbs nobody watches: a typed verb whose stdin is not a
 //! terminal still refuses at once with exit 75. This is the other half. A verb whose
@@ -20,7 +20,9 @@
 use std::io::Read as _;
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+// `spawnfd`'s: the waiter holds its terminal and nothing else of this process,
+// not a pipe another test thread had open unflagged at the spawn.
+use aterm_uds::spawnfd::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -239,12 +241,10 @@ fn the_same_verb_off_a_terminal_still_refuses_at_once() {
         "{:?}",
         text(&screen)
     );
-    // The regression is a TEN-MINUTE wait, so the bound is two minutes: it was
-    // the grace plus 8 s, and that interval also holds the spawn and the first
-    // exec of a freshly linked dev binary, which macOS assesses before it runs —
-    // 0.2-3.5 s under a loaded gate, 26 s measured once (the load-sensitive test
-    // audit of 2026-09-27). The refusal's own promptness is the no-spinner
-    // assert below, which no clock can flake.
+    // The regression is a TEN-MINUTE wait, so the bound is two minutes: the interval
+    // also holds the spawn and first exec of a freshly linked dev binary, which macOS
+    // assesses before it runs (26 s measured once under load). The refusal's own
+    // promptness is the no-spinner assert below, which no clock can flake.
     assert!(
         started.elapsed() < Duration::from_secs(120),
         "no ten-minute wait"

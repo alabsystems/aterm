@@ -558,6 +558,8 @@ fn synthetic(
             strip_components: 0,
             links: BTreeMap::new(),
             vendor: spec.vendor.to_string(),
+            // A vendor-direct row is the vendor's bytes: no compiler of ours built it.
+            provenance: None,
         },
     }
 }

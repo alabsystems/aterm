@@ -3778,6 +3778,133 @@ pub mod fixtures {
     /// and no reader names it. What the loop's dialog canary stands on.
     pub const AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED: &str =
         include_str!("fixtures/claude-2.1.292-auto-classifier-billing-notice.txt");
+    /// MEASURED on Claude Code 2.1.294 (2026-10-08, tools/real-claude-lab):
+    /// an MCP tool's output as the turn's end. In verbose output Claude Code
+    /// draws the call `⏺ <server> - <title> (MCP)(<args>)` — `(MCP)` alone
+    /// for a call with no arguments, a server or title with spaces — and the
+    /// result under it; the stub's reply after the result was empty, so the
+    /// last block is the tool's, its first row a 529 notice. The condensed
+    /// default folds MCP calls into `Called github (ctrl+o to expand)` with
+    /// no output.
+    pub const MCP_OUTPUT_ENDS_TURN_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-verbose-output-ends-turn.txt");
+    /// MEASURED on 2.1.294: a shell-mode command (`! cat notes.txt`, column
+    /// 0) whose output opens `Not logged in · Please run /login`, the reply
+    /// after it empty. The aterm of the day published `agent=wall:auth`, and
+    /// its harness typed `/login`.
+    pub const SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-shell-mode-output-wall-phrase.txt");
+    /// MEASURED on 2.1.294 (2026-10-08, tools/real-claude-lab), the walls
+    /// the screen's owner walk must read (`phase::block_is_vendors`) — each a
+    /// real context wall, a column-2 `⎿` row Claude Code drew under what it
+    /// drew last. Under a collapsed tool group (`  Read 1 file (ctrl+o to
+    /// expand)`, column 2, after a blank row):
+    pub const COLLAPSED_GROUP_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-collapsed-group-context-wall.txt");
+    /// ... under a Stop hook's summary (`⏺ Ran 1 stop hook (ctrl+o to
+    /// expand)`), below the hook's own error row:
+    pub const STOP_HOOK_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-stop-hook-context-wall.txt");
+    /// ... under a Bash call, below its output (`⎿  stamped`):
+    pub const BASH_OUTPUT_THEN_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-bash-output-then-context-wall.txt");
+    /// ... under a Bash call, below an output that holds a blank row (read
+    /// under the call: the owner walk goes on over the output's blank row):
+    pub const BASH_BLANK_ROW_THEN_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-bash-blank-row-then-context-wall.txt");
+    /// ... under a Bash call, below its output and a PostToolUse hook's row:
+    pub const POST_HOOK_THEN_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-posttooluse-hook-row-then-context-wall.txt");
+    /// MEASURED on 2.1.294, a wall's words in what a tool printed, the reply
+    /// after it empty, so the output is the last thing said. The screen
+    /// tells the first two from a wall (a `⎿` at column 5; the first row
+    /// under a call) and not the next three, which it reads as walls and the
+    /// session's transcript refuses (aterm-agent, `supervise/wall_confirm.rs`).
+    /// A file's own `⎿ Context limit reached · …` after a blank row, drawn at
+    /// column 5:
+    pub const GUTTER_PHRASE_IN_OUTPUT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-bash-output-blank-row-then-gutter-phrase.txt");
+    /// ... a heredoc command with a blank line (verbose output): the
+    /// command's rows at column 6, a blank row among them, the output's
+    /// first row the first column-2 `⎿` row under the call (the owner walk
+    /// goes on over the command's blank row to the call; it stopped there
+    /// through pass 5, and read the row as a wall under no owner):
+    pub const MULTILINE_COMMAND_OUTPUT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-bash-multiline-command-blank-row-output.txt");
+    /// ... a PreToolUse hook's row (`PreToolUse:Bash says: …`) drawn ABOVE
+    /// the output, so the output is the SECOND column-2 row under the call:
+    pub const PRE_HOOK_ABOVE_OUTPUT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-pretooluse-hook-row-above-output.txt");
+    /// ... a PreToolUse hook's error and its detail row above the output
+    /// (the output the THIRD column-2 row; the detail opens `Failed with
+    /// non-blocking status code:`, not with the hook's name):
+    pub const PRE_HOOK_ERROR_ABOVE_OUTPUT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-pretooluse-hook-error-above-output.txt");
+    /// ... an MCP tool's result of three content blocks in verbose output,
+    /// each drawn as its own column-2 `⎿` row (the second a context wall's
+    /// words, the third a login wall's):
+    pub const MCP_MULTI_BLOCK_OUTPUT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-verbose-multi-block-output.txt");
+    /// MEASURED on 2.1.294 by the review of 2026-10-08, more walls the
+    /// owner walk must read: under a prompt's second paragraph (the walk
+    /// meets the paragraph break's blank row before the `❯` row):
+    pub const MULTI_PARAGRAPH_PROMPT_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-multi-paragraph-prompt-context-wall.txt");
+    /// ... the second column-2 row under an MCP call (verbose output), its
+    /// first the call's one-block result — the shape of an MCP result of two
+    /// blocks ([`MCP_MULTI_BLOCK_OUTPUT_MEASURED`]):
+    pub const MCP_OUTPUT_THEN_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-verbose-output-then-context-wall.txt");
+    /// ... under a long output (verbose `seq 1 80`) whose call row has
+    /// scrolled off the top:
+    pub const LONG_OUTPUT_CONTEXT_WALL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-verbose-long-output-context-wall.txt");
+    /// HAND-BUILT from two screens measured 46 columns wide: a collapsed
+    /// group row whose `(ctrl+o to expand)` wraps onto a second row, and the
+    /// context wall under it.
+    pub const WRAPPED_GROUP_ROW_CONTEXT_WALL: &str =
+        include_str!("fixtures/hand-built-2.1.294-wrapped-group-row-context-wall.txt");
+    /// MEASURED on 2.1.294: an MCP result whose first block (60 rows)
+    /// scrolls the call row off the screen and whose second block, a login
+    /// wall's words, is a column-2 `⎿` row at the bottom, the reply after it
+    /// empty — the screen's owner walk reaches the top and reads a wall the
+    /// transcript refuses.
+    pub const MCP_LONG_BLOCK_THEN_WALL_PHRASE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-long-block-then-wall-phrase.txt");
+    /// MEASURED on 2.1.294 by the review of pass 4: an MCP result of two
+    /// blocks, the second a weekly limit's words, the reply after it empty,
+    /// on a 50-row pane whose inline renderer drew the call's row at row 9
+    /// and left the 31 rows under the footer blank — so the last 40 rows,
+    /// the supervisor's tail, hold the limit's words and not the call: the
+    /// whole screen reads the wall UNDER THE CALL, the tail under no owner.
+    pub const MCP_LIMIT_PHRASE_CALL_ROW_ABOVE_TAIL_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-limit-phrase-call-row-above-tail.txt");
+    /// MEASURED on 2.1.294 by the review of pass 5: an MCP result of two
+    /// blocks, the first holding a paragraph break (drawn as a blank row,
+    /// its next line at column 5), the second a lost login's words, the
+    /// reply after it empty. The owner walk goes on over the output's blank
+    /// row to the call, and reads the login's words under it; stopped there
+    /// (pass 5), it read them under no owner, and the harness with no
+    /// transcript typed `/login`.
+    pub const MCP_BLANK_ROW_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-mcp-blank-row-in-first-block-then-login-phrase.txt");
+    /// MEASURED on 2.1.294 (H6-HARNESS-1 pass 6): an MCP result of two
+    /// blocks, the first ENDING on a blank line — drawn as two blank rows
+    /// right above the second block's column-2 `⎿` row — the second a lost
+    /// login's words, the reply after it empty. The owner walk goes on over
+    /// blank rows under which a `⎿` row hangs, and reads the login's words
+    /// under the call; stopped at the first blank row, it read them under no
+    /// owner, and a supervisor with no transcript typed `/login`.
+    pub const MCP_TRAILING_BLANK_ROWS_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED: &str = include_str!(
+        "fixtures/claude-2.1.294-mcp-trailing-blank-rows-in-first-block-then-login-phrase.txt"
+    );
+    /// MEASURED on 2.1.294 (H6-HARNESS-1 pass 5): a real session limit
+    /// standing — its notice under the prompt, its auto-continue row, the
+    /// banner over the footer — and under it a person's `/usage`, `/login`
+    /// dismissed with Esc and `/model` left with Esc, each its `❯` row and
+    /// its `⎿` output.
+    pub const SESSION_LIMIT_THEN_LOCAL_COMMANDS_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.294-session-limit-then-local-commands.txt");
     /// HAND-BUILT: the same turn ending on the session limit.
     pub const END_SESSION_LIMIT: &str =
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");

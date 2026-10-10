@@ -3,30 +3,24 @@
 
 //! THE CUT PUBLISHES ONCE, AND OWNS `latest` — proved against a fake GitHub.
 //!
-//! `pub publish` creates aterm's vX.Y.0 release on the public channel first, as a
-//! SOURCE release, and the cut's `publish` step ADOPTS it and puts the app on it — the
-//! one release object of the version (since 2026-09-26 there is no second, private
-//! one, flipped and verified first and then mirrored here).
-//! Every credential-less updater finds the channel head with one request,
-//! `releases/latest/download/aterm-appcast.toml`, so whichever release GitHub calls
-//! `latest` IS the channel head. Until 2026-09-23 two things were wrong at once:
+//! `pub publish` creates aterm's vX.Y.0 release on the public channel as a SOURCE
+//! prerelease (never `latest`); the cut's `publish` step ADOPTS it — the one release
+//! object of the version. Every credential-less updater finds the channel head with
+//! one request, `releases/latest/download/aterm-appcast.toml`, so whichever release
+//! GitHub calls `latest` IS the channel head. Two bugs this replays: a source release
+//! created as a full release took `latest` before it carried any appcast, so every
+//! updater was sent to a release with nothing to install (v0.79.0 .. v0.91.0), and an adopt path that sent no
+//! `make_latest` passed its pointer gate only because of that steal.
 //!
-//! * the source release was created as a full release, so GitHub made it `latest`
-//!   about twenty minutes before it carried any appcast — every updater 302'd to a
-//!   release with nothing to install (v0.79.0 .. v0.91.0);
-//! * the adopt path sent no `make_latest` at all, and passed its pointer gate only
-//!   BECAUSE of that steal.
-//!
-//! The engine now creates the source release as a prerelease (never `latest`), and
 //! [`channel::publish_on_channel`] sends one guarded head PATCH ([`channel::HEAD_PATCH`]:
 //! `draft=false`, `prerelease=false`, `make_latest=true`) on every path, after the
-//! appcast pair is up and the release's exact asset set is proved. The fake below
-//! models the three GitHub rules that decide
-//! `latest` — a newly published full release takes it, a prerelease never can,
-//! `make_latest=true` on a full release takes it — applies exactly the PATCH fields
-//! the cutter's own table sends, and records every moment at which `latest` named a
-//! release a client could not install from. The pointer verdict is the cutter's own
-//! gate, [`publish::prove_pointer_serves`], fed from the fake.
+//! appcast pair is up and the release's exact asset set is proved. The fake models
+//! the three GitHub rules that decide `latest` — a newly published full release takes
+//! it, a prerelease never can, `make_latest=true` on a full release takes it — applies
+//! exactly the PATCH fields the cutter's own table sends, and records every moment at
+//! which `latest` named a release a client could not install from. The pointer
+//! verdict is the cutter's own gate, [`publish::prove_pointer_serves`], fed from the
+//! fake.
 
 use crate::{channel, ledger, manifest_out, publish, verify};
 
@@ -899,7 +893,7 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
         location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
     };
 
-    let lag = 12; // past the ten-probe budget this gate used to share
+    let lag = 12; // past a ten-probe budget
     let (mut asked, mut slept) = (0, Vec::new());
     publish::prove_pointer_serves(
         SLUG,
@@ -943,8 +937,7 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
 
 /// NEGATIVE CONTROL — the adopt path as it was: no head PATCH. The prerelease stays
 /// a prerelease, the pointer stays on the previous release, and the cutter's gate
-/// refuses. (This is also the break the 2026-09-10 decision to stop the steal would
-/// have caused on its own: the adopt path passed only because of the steal.)
+/// refuses: the adopt path passed only because of the steal.
 #[test]
 fn without_the_head_patch_the_pointer_gate_refuses() {
     let mut github = FakeGithub::with_previous_release();

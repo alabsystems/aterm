@@ -3,12 +3,6 @@
 
 //! Laying EXECUTABLES — the `bin/` shims, their `agents/` twins and `alab-` aliases, the
 //! pending stubs, the reroute stubs, the tombstones: [`write_in_process`], the one lay path.
-//!
-//! A file a provenance-tracked process writes carries `com.apple.provenance`, and a tagged
-//! `#!/bin/sh` shim tracks the tool it execs (law m21, [`crate::provenance`]). That is not
-//! answered here: every store-changing door ends with [`crate::provenance::heal_store`],
-//! which clears the tag in place. Until 2026-09-24 a tracked process laid these through an
-//! untracked launchd job instead; that lane was deleted once the heal made it redundant.
 
 use std::ffi::OsStr;
 use std::io;

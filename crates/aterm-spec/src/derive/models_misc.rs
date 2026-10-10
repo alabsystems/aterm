@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Later-wave models: audio trails, input pairing, maintenance lanes, search, capture, prewarm, budgets — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! Models for audio trails, input pairing, maintenance lanes, search, capture,
+//! prewarm and budgets. Each constructor keeps its `crate::derive` path via the
+//! `pub use` re-exports in `derive.rs`.
 
 use super::*;
 
@@ -27,9 +26,7 @@ use super::*;
 /// threshold. It also carries one slip per remaining law:
 /// * the idle pause keeps its housekeeping timeout armed — the loop choosing
 ///   `recv_timeout` on `output.is_some()` instead of `is_running()`, so a
-///   paused worker polls forever (`RunningOwnsOneDeadline`; the event-loop
-///   frame-tick housekeeping that `4b7e0efc0` moved onto this worker was the
-///   same wake);
+///   paused worker polls forever (`RunningOwnsOneDeadline`);
 /// * exhaustion latches `STATE_FAILED` but the loop does not `return`, so its
 ///   receiver stays alive: ingress stays open and the next cue reopens the
 ///   device (`StartFailureIsExplicitAndTerminal`). Both guards read
@@ -42,8 +39,8 @@ use super::*;
 ///   more). The Tier-1 `shipping_ingress_conforms_to_bounded_drop_newest_model`
 ///   fills the real 64 slots and sees the 65th dropped, not queued.
 ///
-/// THE REOPEN LADDER IS A SIBLING MACHINE. Since D5 (2026-09-22) the shipping
-/// worker no longer treats one device fault as terminal: a failed open, a
+/// THE REOPEN LADDER IS A SIBLING MACHINE. The shipping worker does not treat
+/// one device fault as terminal: a failed open, a
 /// failed start/enqueue, a faulted callback, a stalled one or a queue
 /// AudioToolbox stopped under us (the `kAudioQueueProperty_IsRunning`
 /// listener, which feeds the same fault verdict) spends one of
@@ -365,8 +362,8 @@ pub fn trail_audio_start_latency_model() -> Model {
 /// conformance binds.
 ///
 /// `Buggy=1` combines three defects, each on its own action so none masks
-/// another: the ORIGINAL D1/D2 law (`TickDarkMotion` closes the seam, as the
-/// zero-amplitude return did unconditionally before 2026-09-22), the naive
+/// another: the original law (`TickDarkMotion` closes the seam, as an
+/// unconditional zero-amplitude return did), the naive
 /// over-correction (`TickDarkUnfocused` opens it — `sound_live = true` on
 /// every dark return), and the verb's pre-fix read of `trail_on` as
 /// `GlowConfig::enabled` alone, which reports a user-dimmed aurora as
@@ -1033,13 +1030,11 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor
                 };
-                // SELECTION CUSTODY Phase 4: the non-archival regimes no longer clear
-                // unconditionally. An interior or margined scroll damages only ITS
-                // rows, so a selection disjoint from them survives — which is the
-                // whole reported bug (a status bar repaint destroying a highlight up
-                // in scrollback). An OVERLAPPING selection still clears in both
-                // variants: over-clearing is safe, a stale highlight over replaced
-                // content is not.
+                // An interior or margined scroll damages only ITS rows, so a
+                // selection disjoint from them survives (a status-bar repaint must
+                // not destroy a highlight in scrollback). An OVERLAPPING selection
+                // still clears in both variants: over-clearing is safe, a stale
+                // highlight over replaced content is not.
                 selection_alive = if top == 0 && full_width == 1 && history_enabled == 1 {
                     if Buggy == 1 { 0 } else { selection_alive }
                 } else if selection_disjoint == 1 {
@@ -1050,13 +1045,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 // The remap is what a splice does to rows ABOVE its boundary — i.e.
                 // to a selection the scrolled region actually covers. A selection
                 // BELOW the region does not move, archival regime or not, so
-                // `selection_disjoint` governs here too. Without the second
-                // conjunct this said that every archival scroll shifts the
-                // selection by one, which is false of `adjust_for_row_splice` for a
-                // selection under the boundary — and unwitnessable: the only real
-                // grid transition the old invariant admitted for
-                // `ChooseArchivalDisjoint` was one whose region DID cover the
-                // selection, i.e. the overlapping shape wearing the disjoint label.
+                // `selection_disjoint` governs here too: `adjust_for_row_splice`
+                // does not shift a selection under the boundary.
                 selection_region_row = if top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
                     if Buggy == 1 { selection_region_row } else { selection_region_row - 1 }
@@ -1083,12 +1073,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor == 0
                 };
-            // SELECTION CUSTODY Phase 4 restated this. It used to assert
-            // `selection_alive == 0` for EVERY settled non-archival regime — i.e. it
-            // PROVED that an interior or margined region scroll must kill the
-            // selection, which is exactly the defect. Now it says: a selection
-            // survives iff it was piecewise-remapped (the archival regime) OR it was
-            // disjoint from the damage.
+            // A selection survives iff it was piecewise-remapped (the archival
+            // regime) OR it was disjoint from the damage.
             invariant EligibleSelectionUsesPiecewiseRemap:
                 if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1
                     && selection_disjoint == 0 {
@@ -1593,13 +1579,11 @@ pub fn focus_modifier_cache_model() -> Model {
 /// (`post_process`'s fail-closed arms) are their own actions under the same tag and
 /// the same law as a damaging take, and a user gesture back TOWARD live that is not
 /// typing (End, a downward scroll, the ⌘-V / IME snaps) is `SnapToLive` /
-/// `UserScrollTowardLive`: it moves the view down and keeps the highlight
-/// (closed 2026-09-25; each was a KNOWN GAP of the Tier-1 conformance).
+/// `UserScrollTowardLive`: it moves the view down and keeps the highlight.
 ///
-/// Scope: this is the PRESS-PATH half of custody (design Phase 1) plus the output
-/// repin it must not fight. The alt-screen round-trip, scrollback eviction and
-/// reflow anchoring are Phase 3 and are deliberately absent rather than asserted
-/// against code that does not yet implement them.
+/// Scope: this is the PRESS-PATH half of custody plus the output repin it must
+/// not fight. Eviction and wholesale invalidation are [`selection_custody_model`]'s;
+/// the alt-screen round-trip is [`alt_selection_park_model`]'s.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn press_custody_model() -> Model {
@@ -1673,7 +1657,7 @@ pub fn press_custody_model() -> Model {
                 offset = 0;
                 last_event = 5;
             }
-            // Output that REPLACED the selected rows (Phase 4's overlapping
+            // Output that REPLACED the selected rows (an overlapping
             // `SelectionDamage`). It is a separate event kind because the shipped
             // engine really does destroy a selection here — a highlight left over
             // replaced text makes ⌘-C return something the user never selected —
@@ -1681,18 +1665,12 @@ pub fn press_custody_model() -> Model {
             // What it still may not do is take the reading position: the repin
             // rides the new lines exactly as for undamaged output.
             //
-            // BOTH OWNERSHIPS. The guard used to read `owner == 1`, which disabled
-            // the action outright at live — and at live is where its commonest real
-            // instance happens: a status line or progress bar repainting the rows a
-            // highlight sits on, which is the shipped defect this design came from.
-            // The engine records that shape unconditionally, so the narrow guard
-            // meant the dominant instance of one of the eleven actions was a step the
-            // spec could not admit, while the gate called the machine 11/11 bound.
-            // The OFFSET clause carries the ownership split instead of the guard: the
+            // BOTH OWNERSHIPS: the commonest real instance is at live (a status
+            // line repainting the rows a highlight sits on), so the guard must not
+            // read `owner == 1`. The OFFSET clause carries the ownership split: the
             // repin rides the arriving lines only for a reader, and at live the view
-            // was already at live and stays there. The `Buggy = 1` member survives
-            // unchanged — at `owner == 1` it still snaps the reader to live, which is
-            // what `OutputNeverTakesCustody` catches.
+            // stays at live. The `Buggy = 1` member at `owner == 1` snaps the reader
+            // to live, which `OutputNeverTakesCustody` catches.
             action OutputDamagesTheSelectedRows
                 when (selection == 1 && offset <= MaxOffset - 1)
             {
@@ -1856,12 +1834,11 @@ pub fn press_custody_model() -> Model {
                 } else {
                     last_event <= 8
                 };
-            // Output never takes the reading position — the half of the old
-            // `OutputNeverTakesCustodyOrSelection` that is TRUE of the shipped
-            // system. It covers BOTH output kinds: damaging the selected rows is
-            // not a licence to snap. `prev_offset <= offset` rather than equality,
-            // because the repin RAISES the offset by the lines that arrived; what
-            // it may never do is move the view back toward live.
+            // Output never takes the reading position. It covers BOTH output
+            // kinds: damaging the selected rows is not a licence to snap.
+            // `prev_offset <= offset` rather than equality, because the repin
+            // RAISES the offset by the lines that arrived; what it may never do
+            // is move the view back toward live.
             invariant OutputNeverTakesCustody:
                 if last_event == 5 {
                     owner == prev_owner && prev_offset <= offset
@@ -1872,11 +1849,10 @@ pub fn press_custody_model() -> Model {
                         last_event <= 8
                     }
                 };
-            // …and the selection half, narrowed to the case where it holds. The
-            // old form asserted this of ALL output and was false of the system
-            // that shipped: Phase 4 clears a selection whose rows the output
-            // replaced (event 6), and `post_process`'s fail-closed arm clears one
-            // it cannot place. WHICH damage may clear is `selection_custody_model`'s
+            // …and the selection half, only where it holds: output that replaced
+            // the selected rows (event 6) clears the selection, and
+            // `post_process`'s fail-closed arm clears one it cannot place. WHICH
+            // damage may clear is `selection_custody_model`'s
             // `OverlapDamageClears`; here the claim is only that output which did
             // not touch the selected rows leaves the highlight alone.
             invariant OutputSparesAnUndamagedSelection:
@@ -1967,7 +1943,7 @@ pub fn press_custody_model() -> Model {
 ///
 /// Which of the two spellings a site uses is a question about HOST COORDINATES, not
 /// about the selection, and this model is deliberately blind to it: ED 3 evicts
-/// history without moving a live coordinate (2026-09-10 — see
+/// history without moving a live coordinate (see
 /// `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`) while a Kitty
 /// unscroll renumbers retained rows and does. Both destroy the selection identically,
 /// which is the only thing `WholesaleInvalidate` claims.
@@ -1978,7 +1954,7 @@ pub fn press_custody_model() -> Model {
 ///
 /// * `RegionDamageLow` clears whatever it hit — the literal shipping sentinel,
 ///   caught by `DisjointDamagePreserves`.
-/// * `RegionDamageHigh` never clears — the inverse hole Phase 4 closed, where a
+/// * `RegionDamageHigh` never clears — the inverse hole, where a
 ///   highlight survives over replaced text and the copy returns something the user
 ///   never selected. Caught by `OverlapDamageClears`.
 /// * `InertPress` and `UniformScroll` each destroy the selection — the two user
@@ -2039,8 +2015,8 @@ pub fn selection_custody_model() -> Model {
             // A one-row selection on the oldest retained row. It exists so the
             // BOTH-ENDPOINTS-GONE arm of eviction is reachable at all: with only
             // `SelectLow` and `SelectHigh` every live selection has `sel_hi > 0`,
-            // so `Evict`'s clear branch was dead and the law "a selection whose
-            // whole interval fell off the back is gone" went unmodelled.
+            // so `Evict`'s clear branch would be dead and the law "a selection
+            // whose whole interval fell off the back is gone" unmodelled.
             action SelectOldest when (floor == 0) {
                 prev_alive = alive;
                 prev_sel_lo = sel_lo;
@@ -2694,7 +2670,7 @@ pub fn input_release_pairing_model() -> Model {
 ///
 /// The parent parks its readers, a readerless child paints and proves the exact
 /// adoption/layout/session set, the parent rechecks every mutable admission fact
-/// (the resident operator's quiesce among them since round eight's #70), and one
+/// (the resident operator's quiesce among them), and one
 /// atomic Commit+exit grants ownership. The child releases its prebuilt
 /// reader gate directly from Commit; the later UI wake is diagnostic only. Every
 /// pre-Commit failure signals the candidate's entire process group and then reaps
@@ -2710,8 +2686,7 @@ pub fn input_release_pairing_model() -> Model {
 /// (`arbiter == 1`) is the parent's: what the claim answers before the write
 /// (a live `video` request, the messages flush) can take real time, so the
 /// Commit drains that input through one more dispatch fence before it writes,
-/// or, undrained, gives the claim to the rejection (round eight of the update
-/// audit, #18).
+/// or, undrained, gives the claim to the rejection.
 ///
 /// `Buggy=1` admits the regression family: partial/stale proof Commit, reader
 /// release on ProofReady, legacy ACK for ambiguous/scrolled state, parent resume
@@ -2722,7 +2697,7 @@ pub fn input_release_pairing_model() -> Model {
 /// reaches only the leader — `kill(pid)` where `kill(-pgid)` was meant, the mirror
 /// of 4a660aded's group-only sweep that missed a candidate outside its own group;
 /// and a Commit written over input queued to the parent after its claim, which
-/// dies with the parent's `_exit` (round eight of the update audit, #18).
+/// dies with the parent's `_exit`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_overlap_handoff_model() -> Model {
@@ -2752,24 +2727,22 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var layout_exact = 1;
             var epoch_exact = 1;
             var teardown_allows = 1;
-            // SEAMLESS (2026-07): sessions_alive is the fail-closed core of the
-            // retired ptys_quiet fact — session DEATH (HUP/ERR) still rejects,
-            // while queued readable output (pty_output_queued below) is now
-            // tolerated: post-park bytes wait gap-free in the kernel and replay
-            // through the child's fresh parser after Commit.
+            // Session DEATH (HUP/ERR) rejects, while queued readable output
+            // (pty_output_queued below) is tolerated: post-park bytes wait
+            // gap-free in the kernel and replay through the child's fresh parser
+            // after Commit.
             var sessions_alive = 1;
             var pty_output_queued = 0;
             // Queued-but-undispatched hardware input DEFERS Commit (it must be
             // drained through the live input path into the persistent masters
-            // before `_exit` can be allowed to run) but is no longer a failure.
+            // before `_exit` can be allowed to run) but is not a failure.
             var input_queue_quiet = 1;
             var native_safe = 1;
             var commit_channel = 1;
-            // THE RESIDENT OPERATOR IS FENCED FOR THE REPLACEMENT (round eight
-            // of the update audit, #70): its quiesce is one of the admission's
-            // facts, not a precondition kept beside them. A transaction in
-            // flight at the Commit refuses it — as activity, retried — and the
-            // rollback is the one every other refusal takes.
+            // THE RESIDENT OPERATOR IS FENCED FOR THE REPLACEMENT: its quiesce is
+            // one of the admission's facts, not a precondition kept beside them.
+            // A transaction in flight at the Commit refuses it — as activity,
+            // retried — and the rollback is the one every other refusal takes.
             var operator_quiesced = 1;
             // Shared atomic linearization point after ProofReady:
             // 0 Waiting, 1 Committing, 2 Rejecting, 3 Committed.
@@ -2790,7 +2763,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var legacy_strict_newer = 1;
             var legacy_ack = 0;
             var diagnostic_wake = 1;
-            // THE LATE PARK (2026-09-19). On the launched lane the successor
+            // THE LATE PARK. On the launched lane the successor
             // exists BEFORE the parent parks: launched, booted and dialled with
             // every reader live, holding NOTHING until the post-park grant's
             // first descriptor message (`granted`; a grant of more than 62
@@ -2984,12 +2957,12 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 sessions_alive = 0;
                 failure = 1;
             }
-            // Hardware input queued in the OS is no longer a failure — it
+            // Hardware input queued in the OS is not a failure — it
             // parks Commit (the admission guard requires the queue drained)
             // until the run loop delivers it to the persistent masters.
             // Input queues to the parent until it exits: while the Commit is
             // admitted too, and while its claim is held (`arbiter == 1`), since
-            // what the claim answers before the write takes real time (#18).
+            // what the claim answers before the write takes real time.
             action QueueHardwareInput when (
                 phase == 3 && input_queue_quiet == 1 && arbiter <= 1
             ) {
@@ -3096,7 +3069,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
             }
             // The write waits for the input queued under the claim to drain
             // into the masters: the dispatch fence the held claim goes through
-            // (`App::finish_proven_handoff`, `HeldCommit`; #18).
+            // (`App::finish_proven_handoff`, `HeldCommit`).
             action CommitModern when (
                 protocol == 0 && phase == 3 && child_live == 1 &&
                 arbiter == 1 && commit_admission_exact == 1 && input_queue_quiet == 1
@@ -3175,7 +3148,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 parent_exited = 1;
                 commit_write_failed = 1;
             }
-            // Round eight's #18 as it stood: the Commit written at once after
+            // The historical defect: the Commit written at once after
             // what its claim answered, over the input queued to the parent
             // meanwhile, which then dies with the `_exit`.
             action BuggyCommitOverQueuedInput when (
@@ -3450,12 +3423,7 @@ pub fn native_update_overlap_handoff_model() -> Model {
 /// continuation or a delimiter retracts the highlight but keeps the episode
 /// (`HarmlessAndSettledAreInactive`); and the completing `k` mints a fresh
 /// episode instead of continuing the prefix's, so `fuck` cues twice
-/// (`CompletionCreatesExactlyOneEpisode`). The second is the restart the
-/// predictive design had to engineer away rather than something it shipped:
-/// its `fuc` borrowed `fuck`'s form identity precisely so the `k` would
-/// continue one episode, the retired `LiveFucPrefix` model's mutant replayed
-/// the restart ("a fresh episode when the final `k` arrives"), and its Tier-1
-/// asserted `restarts == 0` until `28481bac6` removed the prefix preview.
+/// (`CompletionCreatesExactlyOneEpisode`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exact_profanity_completion_model() -> Model {
@@ -5174,11 +5142,10 @@ pub fn anchored_artifact_transaction_model() -> Model {
 /// immediate release needs a valid ACK (`ImmediateReleaseRequiresValidAck`), a
 /// committed reply never takes the abort path (`CommitRequiresWirePreparation`),
 /// and a quarantined guard is held (`OwnedThroughClassifiedExitRetainsGuard`)
-/// until the delay has run (`QuarantineReleaseRequiresExpiry`). Flags a law
-/// could only restate are gone: "quarantined" and "expired" were phases 7 and
-/// 8/11 under other names. The verdicts `ack_failed`/`write_error` stay as the
-/// ACK wait's and writer's observations, which the Tier-1 binds compare step by
-/// step.
+/// until the delay has run (`QuarantineReleaseRequiresExpiry`). Quarantined is
+/// phase 7 and expired is phases 8/11; the verdicts `ack_failed`/`write_error`
+/// are the ACK wait's and writer's observations, which the Tier-1 binds compare
+/// step by step.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn artifact_reply_publication_model() -> Model {
@@ -5685,10 +5652,9 @@ pub fn video_batch_publication_durability_model() -> Model {
 ///   (`video_retention`) the last release has taken. `join_video_artifact_state`
 ///   refuses every reader of such an entry, replacement or not.
 ///
-/// `Buggy=1` enables six dead negative controls. Three were there already: a
-/// sweep started before the last release, an acquisition during the sweep, and
-/// a replaced recording joining the lease group. Three are one line of the
-/// registry written wrong:
+/// `Buggy=1` enables six dead negative controls: a sweep started before the
+/// last release, an acquisition during the sweep, a replaced recording joining
+/// the lease group, and three that are one line of the registry written wrong:
 /// * `BuggyArmedReleaseDropsEntry` — `ArtifactPathLease::drop` removing an armed
 ///   entry at count zero instead of sweeping it: the `video_sweep_requested`
 ///   case folded into the `else { held.remove(&key) }` branch, or the `_ =>` arm
@@ -6994,10 +6960,8 @@ pub fn session_chrome_expiry_model() -> Model {
 
 /// STREAMING SEARCH — the memory-bounded incremental search lifecycle: the
 /// drift-free twin of `aterm-search::streaming::StreamingSearch`
-/// (`crates/aterm-search/src/streaming/engine/`). SUPERSEDES the never-committed
-/// hand `StreamingSearch.tla` the module docs used to reference — this derived
-/// model is the spec of record; a hand `.tla` never joins the checked set beside
-/// it.
+/// (`crates/aterm-search/src/streaming/engine/`). This derived model is the spec
+/// of record; a hand `.tla` never joins the checked set beside it.
 ///
 /// Variable encoding (all scalar; projections are the engine's public accessors):
 ///   * `state`  — 0 Idle, 1 Searching, 2 HasResults, 3 NoResults
@@ -7011,13 +6975,13 @@ pub fn session_chrome_expiry_model() -> Model {
 /// `Invalidate` likewise represent exactly one added or removed stored match.
 /// A general engine call may affect multiple matches atomically; those calls are
 /// intentionally outside this exact scalar transition abstraction and remain
-/// covered by local/Kani invariants. `Rows`/`MaxTotal` are trace-window bounds
+/// covered by the engine's `verify_all_invariants`. `Rows`/`MaxTotal` are trace-window bounds
 /// (the offload `produced <= W - 1` idiom), NOT engine claims; `MaxResults`
 /// mirrors the engine's memory bound (at capacity a hit COUNTS but does not
 /// STORE). `Buggy = 1` is one slip per law, each in a branch the engine
 /// really has:
-/// * the invalidation clamp is dropped — the pre-#7472/#7244
-///   index-out-of-range class (`CurrentIndexValid`);
+/// * the invalidation clamp is dropped — the index-out-of-range class
+///   (`CurrentIndexValid`);
 /// * the capacity test reads `results.len() > max_results` for `>=`, so the
 ///   hit at capacity STORES one past the bound (`MemoryBounded` — the
 ///   store-past-capacity variant `at_capacity_hit_counts_but_does_not_store`
@@ -7033,9 +6997,9 @@ pub fn session_chrome_expiry_model() -> Model {
 /// (INV-SEARCH-5), `TotalMatchesConsistent` (INV-SEARCH-6), plus the
 /// state/emptiness shape (`TerminalShape` — HasResults ⇒ stored ≥ 1 ∧ cur ≥ 1,
 /// NoResults ⇒ empty). INV-SEARCH-2 (positions valid) and INV-SEARCH-4 (no
-/// duplicates) are not scalar-expressible — they stay Kani-owned bounded-local
-/// properties, ledger-joined via `proof_anchor!` in
-/// `aterm-search/src/streaming/spec_proof_anchors.rs`.
+/// duplicates) are not scalar-expressible — the engine's
+/// `verify_all_invariants` checks them over the real results, and the
+/// aterm-search streaming tests assert it after every operation.
 ///
 /// Tier-1 binding: `aterm-search/tests/conformance_streaming.rs` (bounded
 /// unit-effect lockstep against the real engine, with explicit multi-effect
@@ -7505,8 +7469,6 @@ pub fn budgeted_search_resume_model() -> Model {
 /// of the extra set so the bound is proven over the WHOLE set, not one entry.
 /// PROVES `Bounded` + `NeverAllowRefused` at `Buggy=0`; at `Buggy=1` the
 /// unbounded grow and the never-allow admission each yield a counterexample.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn hyperlink_scheme_cap_model() -> Model {
     crate::ty_model! {
@@ -7545,7 +7507,7 @@ pub fn hyperlink_scheme_cap_model() -> Model {
     }
 }
 
-/// Module-wide scrollback budget sharing (audit E1, Codex-required global cap):
+/// Module-wide scrollback budget sharing (one global cap):
 /// N panes in one memory space each apply `min(configured, global / live)` at
 /// their own touch points, so the applied budgets sum within the ONE global cap
 /// at every quiescent point — panes cannot multiply the per-pane budget into an
@@ -7559,8 +7521,6 @@ pub fn hyperlink_scheme_cap_model() -> Model {
 /// `Buggy=1` two fresh live panes overrun the global (counterexample required).
 /// Tier-1: `aterm-core/tests/conformance_shared_budget.rs` drives the real
 /// `ScrollbackBudgetShare` registry (and real `Terminal` eviction) in lockstep.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn shared_budget_model() -> Model {

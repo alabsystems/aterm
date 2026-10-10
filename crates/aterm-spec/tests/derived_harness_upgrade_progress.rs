@@ -8,14 +8,10 @@ use aterm_spec::derive::{
 use aterm_spec::{interp, verify};
 
 /// MAIN TODAY: the committed machine at `Buggy = 0`, its gap latch clear —
-/// what aterm-agent's Tier-1 binds drive main's code against. Until
-/// 2026-09-29 main was this machine with `keep` set (`RecordedWordStands`:
-/// the watch recorded only a read that waits; its read says what holds the
-/// point of an act since, `upgrade::held_point`, and the watch records it,
-/// else `upgrade::NEXT_POINT`). Its sibling `forever` (`LimitRecordForEver`:
-/// a limit a record at any age) went with the tab mark it belonged to; the
-/// record keeps the limit's end (`St::limit_until`, `Row::limit_passed`), and
-/// the classifier's test carries that claim.
+/// what aterm-agent's Tier-1 binds drive main's code against. With `keep`
+/// set (`RecordedWordStands`) the watch recorded only a read that waits; now
+/// its read says what holds the point of an act (`upgrade::held_point`, else
+/// `upgrade::NEXT_POINT`) and the watch records it.
 fn main_today(model: &Model) -> Model {
     interp::with_buggy(model, 0)
 }
@@ -87,15 +83,13 @@ fn is(v: &'static str, n: i64) -> Expr {
 /// (`NoHandsOffAPoint`), every look leaves a cause that holds the move now
 /// (`NoStaleLook` — the look the session needs no point for among them: a
 /// wake that reads nothing leaves a stale one) and the restart never ends
-/// running work (`NeverEndsRunningWork`). (The tab-mark invariants of main's
-/// version, `LimitIsARecord` and `StickyPastTheMove`, went with the mark:
-/// the classifier's own law is bound in aterm-agent.) Each invariant is
+/// running work (`NeverEndsRunningWork`). Each invariant is
 /// caught by its own `Buggy` member, and each dead action ALONE by an invariant
 /// (`verify::audit_dead_negative_controls`, the audit aterm-gui's
 /// `spec_xref_closure` runs). Each ghost is written by the HEALTHY action
 /// from what it did, so each invariant bounds the lane's own steps too:
-/// NEGATIVE CONTROLS below edit a healthy step (the review of 2026-09-29 —
-/// written only by the mutants, the ghosts limited nothing the lane did).
+/// NEGATIVE CONTROLS below edit a healthy step (written only by the mutants,
+/// the ghosts would limit nothing the lane did).
 /// The law's yardstick (`T`, `harness_upgrade_progress_truth`) is the healthy
 /// look's own record, over every state. Tier-1 against the real code is in
 /// aterm-agent's `harness::upgrade_drive` progress and watch tests.
@@ -108,9 +102,7 @@ fn the_upgrade_progress_keeps_every_safety_law() {
             .any(|registered| registered.name == model.name)
     );
     verify::prove_and_catch_scalar(&model, "harness upgrade progress");
-    // The committed space's fired set is walked once, not once per action
-    // (2026-09-30: it was 29 walks of the same 6,564 states; this test
-    // 4.5 s -> 2.5 s).
+    // The committed space's fired set is walked once, not once per action.
     let fired = interp::fired_actions(&interp::with_buggy(&model, 0));
     let dead: Vec<&str> = model
         .actions
@@ -187,7 +179,7 @@ fn the_upgrade_progress_keeps_every_safety_law() {
 /// fairness (the watch's timer, aterm's own code — nothing of the world's,
 /// nor the points' steps), and each named mutant breaks it ALONE: no look
 /// without a point (`NoLookWithoutAPoint`) and a stale word left by a read
-/// that would act (`RecordedWordStands`, main until 2026-09-29).
+/// that would act (`RecordedWordStands`, main before the fix).
 #[test]
 fn the_upgrade_moves_or_its_record_names_what_holds_it_under_fairness() {
     let model = harness_upgrade_progress_model();
@@ -206,9 +198,8 @@ fn the_upgrade_moves_or_its_record_names_what_holds_it_under_fairness() {
 
 /// Each livelock the test above catches is the cycle its mutant names — the
 /// interpreter's own cycles, read apart from the tiered proof so they are
-/// found while its `ty` runs rather than after them (2026-09-30: they were the
-/// last 0.9 s of that test, the binary's wall — 14.2 s -> 13.2 s, three runs
-/// each).
+/// found while its `ty` runs rather than after them (they were the last of
+/// that test's wall, and so the binary's).
 #[test]
 fn each_livelock_is_the_cycle_its_mutant_names() {
     let model = harness_upgrade_progress_model();
@@ -227,9 +218,9 @@ fn each_livelock_is_the_cycle_its_mutant_names() {
     );
 }
 
-/// THE GAP IS CLOSED ON MAIN (the assessment of 2026-09-29 found two, each a
-/// genuine path on which the record or the owner's tell failed; both closed
-/// that day): main's machine ([`main_today`], the latch clear) keeps the law,
+/// THE GAP IS CLOSED ON MAIN (an assessment found two, each a genuine path on
+/// which the record or the owner's tell failed): main's machine
+/// ([`main_today`], the latch clear) keeps the law,
 /// and the gap replayed alone ([`latched`]) still breaks it exactly where it
 /// did — the NEGATIVE CONTROL. (The other, a limit a record for ever, is the
 /// classifier's: closed by `St::limit_until` and `Row::limit_passed`, pinned
@@ -282,7 +273,7 @@ fn derived_harness_upgrade_progress_gaps_are_closed_on_main() {
         }
     }
     assert!(acted_at_idle > 0, "a stale word at an idle point, reached");
-    // NEGATIVE CONTROL: main until 2026-09-29 — the `keep` latch alone —
+    // NEGATIVE CONTROL: main before the fix — the `keep` latch alone —
     // breaks the law by a record that keeps a stale cause the look leaves.
     let keep = latched(&model, "keep");
     let cycle = interp::nonprogress_under(&keep, &live).expect("the gap alone, before");
@@ -320,12 +311,12 @@ fn derived_harness_upgrade_progress_gaps_are_closed_on_main() {
 }
 
 /// THE SETTLED BREAK IS A RE-DECISION OF THE YARDSTICK, NOT A CHANGE OF CODE
-/// (the review of 2026-09-29, of `RecordedWordStands`' closing). Until that
-/// day the law's truth `T` at a settled break of the agent's own background
-/// work was aterm's own class wherever the ask flow's step there would act
-/// (`StepAtBreak`: its notice, give-up or re-arm, withheld by the loop's
-/// guard), and the watch's dry read — which knows no break — recorded the
-/// agent's own work there (`not-idle:busy`): half the gap. The code did not
+/// (a review of `RecordedWordStands`' closing). Before it the law's truth `T`
+/// at a settled break of the agent's own background work was aterm's own
+/// class wherever the ask flow's step there would act (`StepAtBreak`: its
+/// notice, give-up or re-arm, withheld by the loop's guard), and the watch's
+/// dry read — which knows no break — recorded the agent's own work there
+/// (`not-idle:busy`): half the gap. The code did not
 /// change for that half; `T` did (`posture <= 1` is the agent's own work).
 /// This pins what that re-decision is, over every state main's machine
 /// reaches where the watch looks: the two yardsticks differ at a settled
@@ -338,7 +329,7 @@ fn derived_harness_upgrade_progress_gaps_are_closed_on_main() {
 fn derived_harness_upgrade_progress_break_is_a_redecision() {
     let model = harness_upgrade_progress_model();
     let today = main_today(&model);
-    // The yardstick until 2026-09-29: a break's step that would act was
+    // The old yardstick: a break's step that would act was
     // aterm's own class, as at an idle point.
     let before = |s: &interp::State| {
         if s["posture"] == 1 {

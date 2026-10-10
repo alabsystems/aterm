@@ -1169,11 +1169,13 @@ fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengt
 /// from a shell prompt on the LAST row of a 56-row grid (1049 saves that
 /// cursor into the main DECSC slot), then the "update staged" status bar
 /// takes one row of chrome and every session is 55 rows when the park runs.
-/// The engine leaves the slot raw, as xterm does, so the checkpoint carries
-/// `saved_cursor_main.cursor_row == rows` — honest state — and the whole
-/// set used to be refused as `meta out of bounds`. The wire now bounds a
-/// DECSC slot by the engine's ceiling rather than the grid, the slot
-/// travels raw, and the digest commits.
+/// Then the engine left the slot untouched, one row past the grid, and the
+/// whole set was refused as `meta out of bounds`. The shrink demotes the saved
+/// primary's top row into history, and the slot now follows the prompt up
+/// with it (xterm's `AdjustSavedCursor`; `Grid::lend_saved_cursor`), so this
+/// desk carries it on row 54, under `$ claude`, and the set commits. The slot
+/// a shrink still leaves past the grid, and the wire must still admit, is the
+/// next test's.
 #[test]
 fn a_saved_cursor_on_the_old_bottom_row_survives_the_status_bars_one_row_shrink() {
     let mut t = aterm_core::terminal::Terminal::new(56, 149);
@@ -1190,9 +1192,54 @@ fn a_saved_cursor_on_the_old_bottom_row_survives_the_status_bars_one_row_shrink(
     let meta = CheckpointMeta::from_checkpoint(&checkpoint);
     assert_eq!(meta.rows, 55);
     assert_eq!(
-        meta.saved_cursor_main.map(|saved| saved.cursor_row),
-        Some(55),
-        "the wire carries the slot RAW, on a row the grid no longer has"
+        meta.saved_cursor_main
+            .map(|saved| (saved.cursor_row, saved.cursor_col)),
+        Some((54, 8)),
+        "the slot followed the prompt up the row the demote took, after `$ claude`"
+    );
+    assert_eq!(checkpoint_meta_bound_violation(&meta), None);
+    assert!(checkpoint_meta_is_bounded(&meta));
+    assert!(
+        screen_digest(&[(0, checkpoint)]).is_ok(),
+        "the visible checkpoint set commits canonically"
+    );
+}
+
+/// A DECSC slot on a row the shrink TRIMS (a blank row below the cursor)
+/// names no text, so the engine leaves it where it was saved, past the grid,
+/// and clamps it only when DECRC or the 1049 exit reads it (xterm's
+/// `CursorRestore`). That honest state is what refused the 2026-09-22 updates
+/// (`saved_cursor_main.cursor_row == rows`): the wire bounds a DECSC slot by
+/// the engine's ceiling rather than the grid, carries it as the engine holds
+/// it, and the set commits.
+#[test]
+fn a_saved_cursor_on_a_row_the_shrink_trimmed_crosses_past_the_grid() {
+    let mut t = aterm_core::terminal::Terminal::new(56, 149);
+    for i in 0..60 {
+        t.process(format!("$ command {i}\r\n").as_bytes());
+    }
+    // DECSC on the blank last row, then back up onto the last line of output.
+    t.process(b"\x1b7\x1b[A");
+    assert_eq!(
+        t.cursor().row,
+        54,
+        "PRECONDITION: a blank row below the cursor"
+    );
+    t.resize(55, 149);
+    let checkpoint = t
+        .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+        .expect("Ground");
+    let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+    assert_eq!(meta.rows, 55);
+    let saved = meta.saved_cursor_main.expect("DECSC saved the cursor");
+    assert_eq!(
+        (saved.cursor_row, saved.cursor_col),
+        (55, 0),
+        "the shrink trimmed the slot's row and left the slot where it was saved"
+    );
+    assert!(
+        saved.cursor_row >= meta.rows,
+        "the slot names a row the grid no longer has"
     );
     assert_eq!(checkpoint_meta_bound_violation(&meta), None);
     assert!(checkpoint_meta_is_bounded(&meta));

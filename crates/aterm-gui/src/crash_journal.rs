@@ -344,7 +344,7 @@ impl JournalHeader {
             pid,
             build: format!(
                 "{} ({})",
-                aterm_types::version::APP_VERSION,
+                crate::build_info::version(),
                 crate::build_info::build_number()
             ),
             written_unix_ms: aterm_time::unix_millis().unwrap_or(0),
@@ -3132,6 +3132,8 @@ pub(crate) mod tests {
                 session: None,
                 cwd: gone_str.to_owned(),
                 version: None,
+                home: None,
+                login: None,
                 codex: None,
             }));
         }
@@ -3232,6 +3234,8 @@ pub(crate) mod tests {
             session: session.map(str::to_string),
             cwd: "/work/b".into(),
             version: Some("2.1.283".into()),
+            home: None,
+            login: None,
             codex: None,
         };
         let agent_in = |tab: u32| super::LeafProgram {
@@ -3578,6 +3582,8 @@ pub(crate) mod tests {
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
             cwd: "/work/b".into(),
             version: Some("2.1.283".into()),
+            home: None,
+            login: None,
             codex: None,
         };
         let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
@@ -4645,6 +4651,8 @@ pub(crate) mod tests {
             session: Some(session.into()),
             cwd: "/b".into(),
             version: Some("2.1.283".into()),
+            home: None,
+            login: None,
             codex: None,
         };
         let successor = || {

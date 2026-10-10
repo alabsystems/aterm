@@ -110,7 +110,7 @@ pub struct DirectedFind {
 }
 
 /// Search result iterator (internal).
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub(super) enum SearchResult {
     None,
     All(std::ops::Range<u32>),
@@ -118,7 +118,7 @@ pub(super) enum SearchResult {
     Bitmap(Box<crate::bitmap::SparseBitmapIntoIter>),
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl Iterator for SearchResult {
     type Item = u32;
 

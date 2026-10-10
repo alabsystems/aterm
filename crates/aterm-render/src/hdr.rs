@@ -13,16 +13,16 @@
 //! float twin here, so the two laws the feature pins are machine-checkable
 //! without a GPU:
 //!
-//! # Invariants (proven)
+//! # Invariants (checked)
 //!
 //! * **Grid clamp law** — the non-additive (blit) stream never exceeds 1.0 in
 //!   the float pipeline: [`hdr_grid_encode`] maps every byte into `[0, 1]`
 //!   (exhaustive 256-byte sweep below; the WGSL twin adds the same clamp).
 //! * **Additive clamp law** — the additive stream's fragment output is bounded
 //!   by the queried EDR headroom at encode: [`clamp_add`] lands in
-//!   `[0, max(headroom, 0)]` for EVERY `f32` input including NaN/∞ (trust-mc
-//!   `#[kani::proof]` harnesses below — bit-precise, no transcendentals), and
-//!   [`sanitize_edr_max`] keeps `headroom = edr_max − 1 ≥ 0`. Together with the
+//!   `[0, max(headroom, 0)]` for every `f32` input including NaN/∞ (the
+//!   lattice tests below, over the special values that decide `min`/`max`),
+//!   and [`sanitize_edr_max`] keeps `headroom = edr_max − 1 ≥ 0`. Together with the
 //!   grid law the presented pixel is `≤ 1.0 + headroom = edr_max` under the
 //!   One/One additive blend.
 //!
@@ -58,7 +58,7 @@ pub fn srgb_channel_to_linear(c: f32) -> f32 {
 /// GRID (non-additive) HDR encode: what the present blit writes for one stored
 /// offscreen byte on the `Rgba16Float` extended-linear swapchain.
 ///
-/// # Invariant (proven)
+/// # Invariant (checked)
 /// `0.0 <= hdr_grid_encode(b) <= 1.0` for every byte, with
 /// `hdr_grid_encode(255) == 1.0` — SDR reference white maps EXACTLY to EDR
 /// reference white, so the grid renders identically to the SDR path and only
@@ -104,9 +104,9 @@ pub fn scrgb_present_channel(b: u8, sdr_white_scale: f32) -> f32 {
 /// non-finite or `< 1.0` (including the unset per-window default `0.0`) means NO
 /// headroom → `1.0`; a corrupt huge value is capped at [`EDR_MAX_CAP`].
 ///
-/// # Invariant (proven)
-/// `1.0 <= sanitize_edr_max(v) <= EDR_MAX_CAP` for EVERY `f32` (trust-mc
-/// harness `edr_sanitize_total`).
+/// # Invariant (checked)
+/// `1.0 <= sanitize_edr_max(v) <= EDR_MAX_CAP` for every `f32`
+/// (`sanitize_edr_boundaries`: NaN, ±∞, ±0, subnormal, the extremes).
 #[must_use]
 pub fn sanitize_edr_max(v: f32) -> f32 {
     if v.is_finite() && v >= 1.0 {
@@ -119,7 +119,7 @@ pub fn sanitize_edr_max(v: f32) -> f32 {
 /// The additive HEADROOM above SDR reference white: `sanitize(edr_max) - 1.0`.
 /// `0.0` on an SDR panel (the boost pass then adds nothing and is skipped).
 ///
-/// # Invariant (proven)
+/// # Invariant (checked)
 /// `0.0 <= additive_headroom(v) <= EDR_MAX_CAP - 1.0` for every `f32`.
 #[must_use]
 pub fn additive_headroom(edr_max: f32) -> f32 {
@@ -129,13 +129,18 @@ pub fn additive_headroom(edr_max: f32) -> f32 {
 /// The additive clamp CORE: bound an (arbitrary) boosted linear emission `x`
 /// to `[0, max(headroom, 0)]`. This is the exact op the EDR glow fragment
 /// performs after its `s2l(colour) * boost` — factored transcendental-free so
-/// trust-mc discharges it over the ENTIRE f32 space (NaN and ±∞ included:
+/// the bound holds whatever the decode produced (NaN and ±∞ included:
 /// `f32::min`/`max` return the other operand for NaN, so a NaN emission lands
 /// on the headroom bound and a NaN headroom degrades to 0).
 ///
-/// # Invariant (proven)
-/// `0.0 <= clamp_add(x, h) <= max(h, 0)` for ALL `f32` pairs (trust-mc harness
-/// `additive_clamp_bounded`); hence, over the One/One blend, presented pixel
+/// # Invariant (checked)
+/// `0.0 <= clamp_add(x, h) <= max(h, 0)` for every pair, emission and
+/// headroom alike, from the values that decide `f32::min`/`max`: NaN, ±∞,
+/// ±0, ± the smallest subnormal, the smallest normal, ±1, ±`f32::MAX` and
+/// ordinary values (`clamp_add_bounded_over_the_special_value_lattice`); and
+/// through the encode for every channel byte
+/// (`additive_encode_bounded_by_edr_lattice`, `additive_clamp_is_load_bearing`);
+/// hence, over the One/One blend, presented pixel
 /// `<= hdr_grid_encode(byte) + clamp_add(..) <= 1.0 + headroom = edr_max`.
 #[must_use]
 pub fn clamp_add(x: f32, headroom: f32) -> f32 {
@@ -281,8 +286,7 @@ mod tests {
     /// ADDITIVE CLAMP LAW over a deliberate lattice: all 256 channel bytes ×
     /// boosts (incl. 0 and a corrupt huge one) × edr_max values (SDR 1.0, real
     /// panel 1.6/16.0, corrupt 0.0/-3.0/NaN/∞): the encode never exceeds the
-    /// sanitized headroom, so blit(≤1) + additive ≤ sanitize(edr_max). The
-    /// trust-mc harnesses extend the core clamp to ALL f32s bit-precisely.
+    /// sanitized headroom, so blit(≤1) + additive ≤ sanitize(edr_max).
     #[test]
     fn additive_encode_bounded_by_edr_lattice() {
         let boosts = [0.0f32, 0.5, HDR_GLOW_BOOST, 4.0, 1.0e30];
@@ -321,6 +325,48 @@ mod tests {
         }
     }
 
+    /// THE ADDITIVE CLAMP CORE over the values that decide `f32::min`/`max`,
+    /// every pair as emission and as headroom: the result is a number in
+    /// `[0, max(h, 0)]` — a NaN or infinite emission lands on a bound, and a
+    /// NaN, negative or `-inf` headroom lets nothing through.
+    #[test]
+    fn clamp_add_bounded_over_the_special_value_lattice() {
+        let subnormal = f32::from_bits(1);
+        let lattice = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            subnormal,
+            -subnormal,
+            f32::MIN_POSITIVE,
+            1.0,
+            -1.0,
+            f32::MAX,
+            f32::MIN,
+            0.5,
+            3.0,
+            -2.5,
+        ];
+        for x in lattice {
+            for h in lattice {
+                let v = clamp_add(x, h);
+                // `f32::max` returns the other operand for NaN: a NaN
+                // headroom's bound is 0.
+                let bound = h.max(0.0);
+                assert!(
+                    v >= 0.0 && v <= bound,
+                    "clamp_add({x:e}, {h:e}) = {v:e} outside [0, {bound:e}]"
+                );
+            }
+        }
+        // The NaN-headroom clause by name: whatever the emission, nothing.
+        for x in lattice {
+            assert_eq!(clamp_add(x, f32::NAN), 0.0, "clamp_add({x:e}, NaN)");
+        }
+    }
+
     /// NON-VACUITY for the additive law: with real headroom the boost genuinely
     /// emits above zero AND is genuinely cut by the clamp when it would blow
     /// past the headroom — the bound is load-bearing, not trivially slack.
@@ -340,9 +386,9 @@ mod tests {
         assert_eq!(hdr_additive_encode(1.0, 50.0, additive_headroom(1.0)), 0.0);
     }
 
-    /// `sanitize_edr_max` totality on the interesting boundary values (the
-    /// trust-mc harness covers ALL f32s): unset/corrupt → 1.0, real → itself,
-    /// huge → capped.
+    /// `sanitize_edr_max` totality on the boundary values that decide its
+    /// `is_finite`/`>=`/`min`: unset/corrupt → 1.0, real → itself, huge →
+    /// capped, and every special float inside `[1, EDR_MAX_CAP]`.
     #[test]
     fn sanitize_edr_boundaries() {
         assert_eq!(sanitize_edr_max(0.0), 1.0, "unset per-window default");
@@ -357,6 +403,25 @@ mod tests {
             EDR_MAX_CAP,
             "corrupt huge → capped"
         );
+        // The values a float's min/max/is_finite decide on: signed zeros, the
+        // smallest normal, a subnormal, the extremes, and both infinities.
+        for v in [
+            -0.0f32,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            f32::MIN,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            let s = sanitize_edr_max(v);
+            assert!((1.0..=EDR_MAX_CAP).contains(&s), "{v:e} → {s}");
+            let h = additive_headroom(v);
+            assert!(
+                (0.0..=EDR_MAX_CAP - 1.0).contains(&h),
+                "{v:e} → headroom {h}"
+            );
+        }
     }
 
     /// SDR GLOW BUDGET LAW over a hostile lattice: the swapchain-side SDR crown's
@@ -411,59 +476,5 @@ mod tests {
         assert_eq!(packed_luma(0x000000), 0.0);
         assert_eq!(packed_luma(0xFFFFFF), 1.0);
         assert!(packed_luma(0x1e1e1e) < 0.2, "dark editor bg reads dark");
-    }
-}
-
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the EDR clamp laws.
-/// CONFIG-FREE (no `#[kani::unwind]`/stub/solver) so the default lane
-/// (`KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`) picks them up.
-/// They state the laws over the ENTIRE `f32` space — NaN, ±∞, subnormals —
-/// which the lattice tests above cannot; the transcendental decode is factored
-/// OUT of the proved core (`clamp_add`), so the bound holds no matter what the
-/// sRGB decode/boost arithmetic produces.
-///
-/// STATUS (honest): today's trust-mc reports all three INCONCLUSIVE (its f32
-/// min/max/is_finite modelling frontier — sound, fail-closed, counted as a
-/// model gap, not a failure, by the lane). The ALWAYS-ON proof of these laws
-/// is therefore the exhaustive/lattice `tests` module above (plain cargo) plus
-/// the on-GPU aterm-gpu `hdr_gate` suite; these harnesses are the deeper
-/// redundant layer that discharges automatically once trust-mc closes the
-/// float gap. (A ty encoding is impossible: the derive Expr language is
-/// integer-only with no multiplication — see the verification map.)
-#[cfg(kani)]
-mod kani_proofs {
-    use super::{EDR_MAX_CAP, additive_headroom, clamp_add, sanitize_edr_max};
-
-    /// A sanitized EDR max is ALWAYS a usable bound: in `[1, EDR_MAX_CAP]` for
-    /// every possible query result (NaN/∞/negative/subnormal included).
-    #[kani::proof]
-    fn edr_sanitize_total() {
-        let v: f32 = kani::any();
-        let s = sanitize_edr_max(v);
-        kani::assert(s >= 1.0, "sanitized EDR max must be >= 1.0");
-        kani::assert(s <= EDR_MAX_CAP, "sanitized EDR max must be capped");
-    }
-
-    /// The headroom fed to the additive clamp is ALWAYS non-negative and finite.
-    #[kani::proof]
-    fn headroom_nonneg_total() {
-        let v: f32 = kani::any();
-        let h = additive_headroom(v);
-        kani::assert(h >= 0.0, "headroom must be non-negative");
-        kani::assert(h <= EDR_MAX_CAP - 1.0, "headroom must be capped");
-    }
-
-    /// ADDITIVE CLAMP LAW, bit-precise over ALL f32 pairs: the EDR glow
-    /// fragment's output channel is bounded by `[0, max(headroom, 0)]` no
-    /// matter what emission the decode/boost produced (NaN emission lands on
-    /// the bound; NaN headroom degrades to 0 — never above).
-    #[kani::proof]
-    fn additive_clamp_bounded() {
-        let x: f32 = kani::any();
-        let h: f32 = kani::any();
-        let v = clamp_add(x, h);
-        kani::assert(v >= 0.0, "additive emission must be non-negative");
-        let bound = if h > 0.0 { h } else { 0.0 };
-        kani::assert(v <= bound, "additive emission must not exceed the headroom");
     }
 }

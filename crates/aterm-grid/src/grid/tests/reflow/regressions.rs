@@ -143,7 +143,6 @@ fn reflow_shrink_hyperlink_moves_to_new_row() {
             .has_extras(),
         "remapped destination cell should keep the HAS_EXTRAS flag"
     );
-    // Old position should be gone.
     assert!(grid.extras().get(CellCoord::new(0, 7)).is_none());
 }
 
@@ -510,7 +509,6 @@ fn adjust_row_count_height_decrease_preserves_scrollback_content() {
         }
     }
 
-    // Verify we have some scrollback lines before resize.
     let scrollback_before = grid.scrollback_lines();
     assert!(
         scrollback_before > 0,

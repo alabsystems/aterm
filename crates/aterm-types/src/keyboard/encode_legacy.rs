@@ -115,7 +115,7 @@ pub(super) fn encode_named_legacy(
         return encoded;
     }
 
-    if let Some(encoded) = encode_function_named_legacy(key, modifiers, has_modifiers) {
+    if let Some(encoded) = encode_function_named_legacy(key, vt52, modifiers, has_modifiers) {
         return encoded;
     }
 
@@ -189,22 +189,25 @@ fn encode_control_named_legacy(
                 0x7f
             };
             let ctrl_bksp = if bksp == 0x08 { 0x7f } else { 0x08 };
-            if modifiers.contains(Modifiers::CTRL) {
-                vec![ctrl_bksp]
-            } else if modifiers.contains(Modifiers::ALT) {
-                vec![0x1b, bksp]
+            // Ctrl picks the byte; Alt ESC-prefixes whichever it is, so
+            // Ctrl+Alt+Backspace is `ESC ^H` (readline's M-C-h,
+            // backward-kill-word), as kitty's legacy C0 table and xterm's
+            // altSendsEscape send it — not a bare Ctrl+Backspace.
+            let byte = if modifiers.contains(Modifiers::CTRL) {
+                ctrl_bksp
             } else {
-                vec![bksp]
-            }
+                bksp
+            };
+            alt_prefixed(modifiers, byte)
         }
         NamedKey::Space => {
-            if modifiers.contains(Modifiers::CTRL) {
-                vec![0x00]
-            } else if modifiers.contains(Modifiers::ALT) {
-                vec![0x1b, 0x20]
+            // Ctrl+Alt+Space is `ESC NUL` (emacs C-M-SPC), as above.
+            let byte = if modifiers.contains(Modifiers::CTRL) {
+                0x00
             } else {
-                vec![0x20]
-            }
+                0x20
+            };
+            alt_prefixed(modifiers, byte)
         }
         _ => return None,
     })
@@ -231,10 +234,10 @@ fn encode_navigation_named_legacy(
             encode_arrow(b'D', app_cursor, vt52, modifiers, has_modifiers)
         }
         NamedKey::Home | NamedKey::NumpadHome => {
-            encode_home_end(b'H', app_cursor, modifiers, has_modifiers)
+            encode_home_end(b'H', app_cursor, vt52, modifiers, has_modifiers)
         }
         NamedKey::End | NamedKey::NumpadEnd => {
-            encode_home_end(b'F', app_cursor, modifiers, has_modifiers)
+            encode_home_end(b'F', app_cursor, vt52, modifiers, has_modifiers)
         }
         NamedKey::PageUp | NamedKey::NumpadPageUp => encode_tilde_key(5, modifiers, has_modifiers),
         NamedKey::PageDown | NamedKey::NumpadPageDown => {
@@ -246,16 +249,26 @@ fn encode_navigation_named_legacy(
     })
 }
 
+/// `byte`, ESC-prefixed when Alt is held.
+fn alt_prefixed(modifiers: Modifiers, byte: u8) -> Vec<u8> {
+    if modifiers.contains(Modifiers::ALT) {
+        vec![0x1b, byte]
+    } else {
+        vec![byte]
+    }
+}
+
 fn encode_function_named_legacy(
     key: NamedKey,
+    vt52: bool,
     modifiers: Modifiers,
     has_modifiers: bool,
 ) -> Option<Vec<u8>> {
     Some(match key {
-        NamedKey::F1 => encode_f1_f4(b'P', modifiers, has_modifiers),
-        NamedKey::F2 => encode_f1_f4(b'Q', modifiers, has_modifiers),
-        NamedKey::F3 => encode_f1_f4(b'R', modifiers, has_modifiers),
-        NamedKey::F4 => encode_f1_f4(b'S', modifiers, has_modifiers),
+        NamedKey::F1 => encode_f1_f4(b'P', vt52, modifiers, has_modifiers),
+        NamedKey::F2 => encode_f1_f4(b'Q', vt52, modifiers, has_modifiers),
+        NamedKey::F3 => encode_f1_f4(b'R', vt52, modifiers, has_modifiers),
+        NamedKey::F4 => encode_f1_f4(b'S', vt52, modifiers, has_modifiers),
         NamedKey::F5 => encode_tilde_key(15, modifiers, has_modifiers),
         NamedKey::F6 => encode_tilde_key(17, modifiers, has_modifiers),
         NamedKey::F7 => encode_tilde_key(18, modifiers, has_modifiers),
@@ -390,7 +403,9 @@ pub(super) fn ctrl_character(c: char) -> Option<u8> {
             '[' | '3' => Some(0x1b),
             '\\' | '4' => Some(0x1c),
             ']' | '5' => Some(0x1d),
-            '^' | '6' => Some(0x1e),
+            // `~` is Shift+` on US keyboards: Ctrl+~ is RS, kitty's legacy
+            // ctrl table ("~ -> 30") and xterm's control alias.
+            '^' | '6' | '~' => Some(0x1e),
             '_' | '/' | '7' => Some(0x1f),
             '?' | '8' => Some(0x7f),
             _ => None,
@@ -424,9 +439,15 @@ fn encode_arrow(
 fn encode_home_end(
     suffix: u8,
     app_cursor: bool,
+    vt52: bool,
     modifiers: Modifiers,
     has_modifiers: bool,
 ) -> Vec<u8> {
+    // VT52 (DECANM reset): `ESC H` / `ESC F`, modifiers ignored, as the
+    // arrows' VT52 arm sends them (xterm's VT52_CURSOR_KEYS).
+    if vt52 {
+        return vec![0x1b, suffix];
+    }
     if has_modifiers {
         let mut buf = vec![0x1b, b'[', b'1', b';'];
         super::write_u8(&mut buf, modifiers.xterm_encoded());
@@ -453,7 +474,12 @@ fn encode_tilde_key(num: u8, modifiers: Modifiers, has_modifiers: bool) -> Vec<u
     buf
 }
 
-fn encode_f1_f4(suffix: u8, modifiers: Modifiers, has_modifiers: bool) -> Vec<u8> {
+fn encode_f1_f4(suffix: u8, vt52: bool, modifiers: Modifiers, has_modifiers: bool) -> Vec<u8> {
+    // VT52: PF1-PF4 are `ESC P`..`ESC S` (xterm applies VT52_CURSOR_KEYS to
+    // the SS3 reply), modifiers ignored.
+    if vt52 {
+        return vec![0x1b, suffix];
+    }
     if has_modifiers {
         let mut buf = vec![0x1b, b'[', b'1', b';'];
         super::write_u8(&mut buf, modifiers.xterm_encoded());

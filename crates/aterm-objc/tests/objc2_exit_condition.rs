@@ -242,7 +242,7 @@ fn the_code_rule_sees_a_renaming_import() {
         "use objc2::{rc::Retained, runtime::AnyObject};",
         "    let x = objc2::rc::autoreleasepool(|_| ());",
         "use objc2::rc::Retained as R;",
-        // The three the rule could not see until pass 14.
+        // Renamed imports.
         "use objc2 as oc;",
         "use objc2_app_kit as ak;",
         "extern crate objc2 as oc;",

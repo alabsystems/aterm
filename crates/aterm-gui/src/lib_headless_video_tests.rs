@@ -46,6 +46,7 @@ fn controller_key_with_mods(key: Key, mods: Modifiers, event_type: KeyEventType)
         key,
         mods,
         base_layout: None,
+        layout_text: None,
         event_type,
     }
 }

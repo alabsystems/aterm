@@ -62,7 +62,7 @@ impl Scene {
             s.tick(100);
         }
         // A local row hop still exercises legacy landing ownership. A
-        // screen-wide cursor relocation now moves the base home immediately,
+        // screen-wide cursor relocation moves the base home immediately,
         // so it deliberately cannot strand a long flight across the pane.
         s.term.process(b"\x1b[9;43H");
         for _ in 0..80 {

@@ -11,13 +11,13 @@
 //! invocation (`targo` refuses a bare verb so a gate cannot be quietly
 //! unverified).
 
-use crate::exec::{self, Capture, Cmd};
+use crate::exec::{self, Cmd};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{Lane, StageId, StageSpec, lane_dir};
 use crate::scope::Scope;
 #[cfg(unix)]
 use crate::smoke_stages;
-use crate::{Ctx, have_on_path, is_executable_file};
+use crate::{Ctx, is_executable_file};
 
 /// Dispatch one stage.
 #[must_use]
@@ -50,7 +50,6 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::FreezeGate => freeze_gate(ctx, &mut r),
         StageId::DriverBuilds => driver_builds(ctx, &mut r),
         StageId::TailDriverBuilds => tail_driver_builds(ctx, &mut r),
-        StageId::ConformanceRelease => conformance_release(ctx, &mut r),
         #[cfg(unix)]
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
         #[cfg(unix)]
@@ -65,7 +64,6 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ObjcDrives => objc_drives(ctx, &mut r),
         StageId::ForegroundHandback => foreground_handback(ctx, &mut r),
         StageId::RenderDesync => render_desync(ctx, &mut r),
-        StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
         StageId::Forge => forge_gate(ctx, &mut r),
         StageId::ForeignCells => foreign_cells(ctx, &mut r),
@@ -147,9 +145,10 @@ pub const SLOWEST_TESTS_LISTED: usize = 25;
 /// carries its test's wall time (`test x ... ok <1.234s>`), and the stage prints
 /// the slowest ([`crate::libtest::slowest`]).
 ///
-/// The one `--tests` target without libtest's harness (`aterm-objc`'s
-/// `main_thread_bound_drive`) parses these flags itself; every other
-/// `harness = false` target is a `[[bench]]`, which `--tests` does not select.
+/// The `--tests` targets without libtest's harness, `aterm-objc`'s
+/// `main_thread_bound_drive` and `aterm-gui`'s `headless_event_loop` (each needs
+/// the main thread, which libtest never gives a test), parse these flags
+/// themselves.
 /// `crate::libtest` matches verdicts by their leading word, so the suffix
 /// changes nothing it decides. Under `-Z` libtest also reads some environment
 /// variables; the gate removes them from every child
@@ -275,26 +274,6 @@ pub fn atpkg_build_args() -> Vec<String> {
         .into_iter()
         .map(String::from)
         .collect()
-}
-
-/// `targo --unverified build --locked --release -p aterm` — the release artifact
-/// the paint and spin suites judge. Their helper
-/// (`crates/aterm-conformance/tests/support/mod.rs`, `release_bin`) builds none:
-/// it takes the binary named in `ATERM_PAINT_BIN` / `ATERM_SPIN_BIN`, which the
-/// gate hands it ([`conformance_release_binary`]).
-#[must_use]
-pub fn conformance_release_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "--locked",
-        "--release",
-        "-p",
-        "aterm",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
 }
 
 /// `<tippy> <scope> --all-targets --keep-going -- -D warnings --cfg clean_islands`
@@ -487,62 +466,6 @@ pub fn freeze_gate_args() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
-}
-
-/// The crates carrying a Kani BMC floor, in the order the stage runs them. The
-/// script routes host units (e.g. `serde` build scripts) to a host sysroot (its
-/// THE HOST SYSROOT note).
-pub const KANI_CRATES: [&str; 4] = [
-    "aterm-parser",
-    "aterm-render",
-    "aterm-uds",
-    "aterm-containment",
-];
-
-/// The exact command one Kani floor run spawns. `KANI_CRATE` selects which
-/// crate's proofs the script drives; without it every iteration runs the same
-/// default crate. `TRUST_MC_SYSROOT` / `AY_BIN_DIR` carry what this process
-/// resolved ([`trust_mc_sysroot`], [`ay_bin_dir`]), so the script and the
-/// availability decision agree on which trust-mc runs.
-fn kani_cmd(
-    gate: &std::path::Path,
-    krate: &str,
-    mc_root: &std::path::Path,
-    ay_dir: &std::path::Path,
-) -> Cmd {
-    Cmd::new(gate)
-        .env("KANI_CRATE", krate)
-        .env("TRUST_MC_SYSROOT", mc_root)
-        .env("AY_BIN_DIR", ay_dir)
-        .capture(Capture::Emit)
-}
-
-/// Where trust-mc lives, in `scripts/verify-kani-proofs.sh`'s order:
-/// `$TRUST_MC_SYSROOT` (an explicit location, never fallen back from), else
-/// `<atpkg prefix>/store/trust-mc/current` (what `aterm pkg install trust-mc`
-/// lays down), reported even when absent so the availability check names the
-/// place the remedy fills. The store bundle ships no `cargo-trust-mc` name; the
-/// script derives that symlink outside the immutable store.
-///
-/// The store's `current` is resolved when present: `aterm pkg update` re-points
-/// it, and the Kani stage runs the script once per crate in [`KANI_CRATES`] with
-/// this value, so an unresolved link could split the floor across two builds.
-#[must_use]
-pub fn trust_mc_sysroot(env: &crate::EnvSnapshot) -> std::path::PathBuf {
-    env.trust_mc_sysroot.clone().unwrap_or_else(|| {
-        let live = crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
-            .join("store/trust-mc/current");
-        std::fs::canonicalize(&live).unwrap_or(live)
-    })
-}
-
-/// Where the `ay` solver lives, in the script's order: `$AY_BIN_DIR`, else the
-/// atpkg shim dir (`<prefix>/bin`, where `aterm pkg install ay` shims it).
-#[must_use]
-pub fn ay_bin_dir(env: &crate::EnvSnapshot) -> std::path::PathBuf {
-    env.ay_bin_dir.clone().unwrap_or_else(|| {
-        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref()).join("bin")
-    })
 }
 
 /// The redraw harness's target name — the `[[bin]]`, the built file and the
@@ -831,14 +754,12 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 /// `CARGO_BUILD_JOBS` for a side lane, `None` where cargo's default stays. The
 /// side lanes overlap the build, and uncapped each would claim every core; tune
 /// from the rows' `  time  ` lines. Cargo does not fingerprint the job count, so a
-/// cap never causes a rebuild. `ConformanceRelease` sits between the four-job
-/// verb lanes (it is one long release compile) and the driver lane, whose
-/// binaries gate the exclusive smokes.
+/// cap never causes a rebuild. The driver lane, whose binaries gate the
+/// exclusive smokes, gets twice the verb lanes'.
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
         Lane::XtaskTarget | Lane::TrustTarget => Some(4),
-        Lane::ConformanceRelease => Some(6),
         Lane::DriverTarget => Some(8),
         _ => None,
     }
@@ -1148,24 +1069,17 @@ fn test(ctx: &Ctx, r: &mut Report) {
 //    package selection, narrowed to the targets that hold the list and filtered
 //    to it; never demoted, since the paint and spin rows launch the aterm they
 //    judge. Planned only when the crate is selected (`plan.rs`).
-//      * Measuring tests ([`MEASURING_TESTS`]): MEASURE tier. The first child
-//        is the release build ([`conformance_release_cmd`]); the suites run only
-//        if it succeeded, handed that artifact.
+//      * Measuring tests ([`MEASURING_TESTS`]): MEASURE tier. The suites are
+//        handed the release bundle the run was given (`--measure <APP>`): the
+//        bytes the release signs, built once by the release, never by the gate.
 // ---------------------------------------------------------------------------
 
 /// The paint and spin suites' prebuilt-artifact overrides. Keep each name at
 /// its child-environment writer so the source guard can distinguish this
-/// handoff from an ambient read. The gate sets both to the same artifact.
+/// handoff from an ambient read. The gate sets both to the same artifact: the
+/// handed bundle's `Contents/MacOS/aterm` ([`crate::MeasureArtifact::bin`]).
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
-
-/// The release `aterm` [`conformance_release_cmd`] leaves: `<lane>/release/aterm`.
-#[must_use]
-pub fn conformance_release_binary(ctx: &Ctx) -> std::path::PathBuf {
-    lane_dir(ctx, Lane::ConformanceRelease)
-        .unwrap_or_else(|| ctx.root.join("target/conformance-release"))
-        .join("release/aterm")
-}
 
 /// A filtered stage's test child — [`filtered_test_args`] over the run's scope,
 /// with trustdoc bound the way the test run binds it so both see one
@@ -1183,10 +1097,10 @@ fn filtered_test_cmd(ctx: &Ctx, targets: &[&str], filters: &[&str], bind: bool) 
 }
 
 /// The measuring stage's test child: [`measuring_args`], handed the release
-/// artifact through both child-environment overrides.
-fn measuring_cmd(ctx: &Ctx, bind: bool) -> (String, Cmd) {
+/// bundle's `aterm` through both child-environment overrides.
+fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, bind: bool) -> (String, Cmd) {
     let (label, cmd) = filtered_test_cmd(ctx, &MEASURING_TARGETS, &MEASURING_TESTS, bind);
-    let bin = conformance_release_binary(ctx);
+    let bin = artifact.bin("aterm");
     let cmd = cmd
         .env(RELEASE_PAINT_BIN, bin.as_os_str())
         .env(RELEASE_SPIN_BIN, bin.as_os_str());
@@ -1198,21 +1112,14 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
         r.skip("measuring tests (no targo)");
         return;
     }
-    let (label, cmd) = measuring_cmd(ctx, test_doc_binding(ctx).1);
-    if run_labeled(
-        ctx,
-        r,
-        CONFORMANCE_RELEASE_LABEL,
-        &conformance_release_cmd(ctx),
-    ) {
-        run_tests_labeled(ctx, r, &label, &cmd);
-    } else {
-        // Not a skip: the build's FAIL above is the decision. Running the suites
-        // anyway would judge a stale release artifact.
-        r.raw(format!(
-            "  not run: {label} — the release build above failed, so paint and spin have no fresh artifact to judge"
-        ));
-    }
+    // A MEASURE run always names its bundle (`cli`); one without it judged
+    // nothing, and says so rather than measuring a binary of its own choosing.
+    let Some(artifact) = &ctx.measure_artifact else {
+        r.cannot_run("measuring tests: no release bundle was handed to judge (--measure <APP>)");
+        return;
+    };
+    let (label, cmd) = measuring_cmd(ctx, artifact, test_doc_binding(ctx).1);
+    run_tests_labeled(ctx, r, &label, &cmd);
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,7 +1346,7 @@ fn guard_ran_to_end(name: &str) -> crate::differential::RanToEnd {
 pub const EXPORT_CONTENT_SCRIPT: &str = "export-content-scan.py";
 
 /// The scan's not-run code: no publication engine checkout (`$PUBLICATION_ENGINE`,
-/// else `~/publication`) or no `gitleaks`. Read like the Codex lane's `77`
+/// else `~/Developer/publication` (`~/publication` until it moves there)) or no `gitleaks`. Read like the Codex lane's `77`
 /// ([`export_content_outcome`]).
 pub const EXPORT_CONTENT_NOT_RUN: i32 = 77;
 
@@ -1579,16 +1486,10 @@ fn export_content(ctx: &Ctx, r: &mut Report) {
 /// * `test-publish-export.sh`: publish/manifest.txt and publish/transforms.sh as
 ///   the publication engine runs them, the only check that the export's
 ///   rewrites stay narrow; config.sh's `aterm MAJOR.MINOR.0` version shape.
-/// * `test-release-preflight.sh`: tools/release-preflight.sh against a fixture
-///   checkout and a stub engine.
-/// * `test-after-cut.sh`: publish/after-cut over site-sync.py's download
-///   election; a release that fails the shape check never reaches the site.
 /// * `test-install-guard.sh`: install.sh's whole-file execution guard and its
 ///   `--dry-run` zero-mutation contract, under stubbed `curl`/`gh`.
 /// * `test-cargo-pin.sh`: `tools/dev-app.sh` and install.sh build only under the
 ///   cargo that honours rust-toolchain.toml.
-/// * `test-check-release-shape.sh`: tools/check-release-shape.sh over inline
-///   release JSON (lean and fat shapes).
 /// * `test-site-sync.sh`: publish/post-promote over a local bare repo and stub
 ///   `gh`, `curl`, `firebase` and site scripts (about a minute).
 /// * `test-dev-sign-id.sh`: tools/dev-sign-id.sh through its `--keychain` seam,
@@ -1618,21 +1519,19 @@ fn export_content(ctx: &Ctx, r: &mut Report) {
 /// * `test-atpkg-pack-toolchain.sh`: the packers resolve the store's `targo`,
 ///   and a sysroot bundle signs the version of what it packs.
 /// * `test-bootstrap-publisher.sh`: tools/bootstrap-publisher.sh's toolchain
-///   walk (tools/lib-trust-order.sh) and rustup link. Passes with 0 checks off
-///   macOS or without Rosetta.
+///   walk (tools/lib-trust-order.sh) and rustup link, its install of
+///   publish/config.sh's stock wasm32 pin by name (a rustup it installs has
+///   auto-install off), and `--from-source` building Trust from the pinned Trust
+///   seed (`--require-seed`; never a genesis fallback or a stock stage0) and
+///   sealing it. Passes with 0 checks off macOS or without Rosetta.
 /// * `test-export-content-scan.sh`: tools/export-content-scan.py against the
 ///   engine's code over fixture trees; without the engine and gitleaks it runs
 ///   its not-run cases only and says so.
-/// * `test-release.sh`: tools/release.sh's step logic over stubs, under
-///   /bin/bash 3.2 and a bash 5 when installed.
 /// * `test-linux-bootstrap.py`: tools/linux_release_verify.py over signed
 ///   synthetic fixtures; install.sh's embedded copy is byte-identical to it,
 ///   and its `MASTER_PUBKEYS` equal `pins.rs`'s `PAPER_MASTER_PUBKEYS`. Needs
 ///   Python 3.11+ and an OpenSSL 3 (first on PATH, or an installed Homebrew
 ///   `openssl@3`), and says so when either is missing.
-/// * `artifact_source_fingerprint_test.py`, `proof_snapshot_test.py`: the
-///   source fingerprint and proof snapshot aterm-release's build plan runs
-///   (`buildplan.rs`), over scratch cargo fixtures.
 /// * `test_atpkg_trust_closure.py`, `test_atpkg_pack_bundle.py`: the frozen
 ///   rustc closure and the bundle hygiene phase of tools/atpkg-pack-bundle.sh,
 ///   over a promoter-shaped seal fixture.
@@ -1641,15 +1540,13 @@ fn export_content(ctx: &Ctx, r: &mut Report) {
 ///
 /// The atpkg suites lay their own stub `atpkg` shims; only [`ATPKG_DRIVEN_SUITE`]
 /// drives a real one. `test-atpkg-pack-arch-gate.sh` is run by aterm-release's
-/// `pack_arch_gate` test.
-pub const DELIVERY_SUITES: [&str; 28] = [
+/// `pack_arch_gate` test; the release command's own steps and checks
+/// (`targo --unverified ship release`) are aterm-release's tests.
+pub const DELIVERY_SUITES: [&str; 22] = [
     "test-install-channel.sh",
     "test-publish-export.sh",
-    "test-release-preflight.sh",
-    "test-after-cut.sh",
     "test-install-guard.sh",
     "test-cargo-pin.sh",
-    "test-check-release-shape.sh",
     "test-site-sync.sh",
     "test-dev-sign-id.sh",
     "test-agent-fabric-demo.py",
@@ -1665,10 +1562,7 @@ pub const DELIVERY_SUITES: [&str; 28] = [
     "test-atpkg-pack-toolchain.sh",
     "test-bootstrap-publisher.sh",
     "test-export-content-scan.sh",
-    "test-release.sh",
     "test-linux-bootstrap.py",
-    "artifact_source_fingerprint_test.py",
-    "proof_snapshot_test.py",
     "test_atpkg_trust_closure.py",
     "test_atpkg_pack_bundle.py",
 ];
@@ -1703,7 +1597,7 @@ pub fn delivery_alone(name: &str) -> Option<&'static str> {
 
 /// How many delivery suites run at once on a machine of `cores`: one per four
 /// cores, between one and four. Each suite is about one busy core, and the stage
-/// runs at t0 beside the test compile, the lint and the trust lane. Four at most
+/// runs at t0 beside the test compile and the lint. Four at most
 /// because past that the longest suite alone sets the stage's wall.
 #[must_use]
 pub fn delivery_jobs(cores: u32) -> usize {
@@ -2749,50 +2643,6 @@ fn run_driver_builds(ctx: &Ctx, r: &mut Report, row: &str, cmds: Vec<(String, Cm
 }
 
 // ---------------------------------------------------------------------------
-// 5b) Conformance release artifact: the release `aterm` that paint and spin
-//    judge, a fat-LTO build. This row builds it at t0 in its own lane; the
-//    exclusive measuring stage runs the same command first (a fingerprint check
-//    by then) and hands the suites the artifact through both overrides, so none
-//    builds or judges a stale one inside the measured stage. MEASURE tier
-//    (`plan::MEASURE_TIER`): `--measure` and `--full` build it, the merge
-//    contract does not.
-// ---------------------------------------------------------------------------
-
-/// The ladder label of the release build — the prime's one child, and the
-/// measuring stage's first.
-pub const CONFORMANCE_RELEASE_LABEL: &str =
-    "targo build --locked --release -p aterm (the artifact paint/spin judge)";
-
-/// The exact command the prime spawns and the measuring stage re-runs:
-/// [`conformance_release_args`] in [`Lane::ConformanceRelease`], from `<root>`
-/// ([`exec::ExecEnv`]), with the lane's job cap ([`lane_build_jobs`]).
-/// [`Cmd::demoted`] because this child only compiles.
-#[must_use]
-pub fn conformance_release_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(
-        ctx,
-        Lane::ConformanceRelease,
-        targo(ctx, conformance_release_args()),
-    )
-    .demoted()
-}
-
-/// A failing prime is a FAIL, never a skip: the artifact paint and spin judge
-/// could not be built. `run_labeled` decides it like every other build child.
-fn conformance_release(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("conformance release artifact (no targo)");
-        return;
-    }
-    run_labeled(
-        ctx,
-        r,
-        CONFORMANCE_RELEASE_LABEL,
-        &conformance_release_cmd(ctx),
-    );
-}
-
-// ---------------------------------------------------------------------------
 // 5c) Control redraw conformance: the one check that can see a control-socket
 //    `select` repaint a window. `EventLoop` construction panics off the main
 //    thread and libtest runs tests on spawned threads, so aterm-gui's unit tests
@@ -3194,14 +3044,6 @@ fn live_aterm_stage(ctx: &Ctx, r: &mut Report, name: &str) {
     r.record_child(&out, outcome, label);
 }
 
-// ---------------------------------------------------------------------------
-// 6b) `--full` only: trust-mc / Kani BMC floor.
-//
-//    The driver is `cargo trust-mc --config-free --harness <name>` via
-//    scripts/verify-kani-proofs.sh (there is no `trust-mc verify`; stock
-//    cargo-kani/CBMC is banned). An unavailable toolchain is reported
-//    prominently and skipped, never described as discharged.
-// ---------------------------------------------------------------------------
 /// The sentence `xtask gate cells` prints when it ran but one or more cells were
 /// never compiled. Defined once: `crates/xtask/src/gate.rs` formats it,
 /// [`cells_outcome`] matches it.
@@ -3323,98 +3165,6 @@ fn forge_gate(ctx: &Ctx, r: &mut Report) {
         "gate forge",
         &xtask_cmd(ctx, xtask_gate_args("forge")),
     );
-}
-
-fn kani_floor(ctx: &Ctx, r: &mut Report) {
-    let gate = ctx.root.join("scripts/verify-kani-proofs.sh");
-    let mc_root = trust_mc_sysroot(&ctx.env);
-    let ay_dir = ay_bin_dir(&ctx.env);
-
-    if !is_executable_file(&gate) {
-        r.cannot_run(format!(
-            "verify-kani-proofs.sh missing or not executable ({})",
-            gate.display()
-        ));
-        return;
-    }
-    if !is_executable_file(&mc_root.join("bin/cargo-trust-mc"))
-        && !is_executable_file(&mc_root.join("bin/trust-mc-driver"))
-    {
-        r.raw("  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: trust-mc is unavailable");
-        r.raw(format!(
-            "          at {} (the embedded + ty tiers still ran).",
-            mc_root.display()
-        ));
-        r.raw("          fix: `aterm pkg install trust-mc` (`aterm pkg doctor --verbose` names the store);");
-        r.raw("          or set TRUST_MC_SYSROOT at a from-source build-trust-mc sysroot.");
-        r.skip("trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)");
-        return;
-    }
-    if !is_executable_file(&ay_dir.join("ay")) && !have_on_path("ay", &ctx.path_env) {
-        r.raw("  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: ay is unavailable");
-        r.raw(format!(
-            "          at {} and on PATH (the embedded + ty tiers still ran).",
-            ay_dir.display()
-        ));
-        r.raw(
-            "          fix: `aterm pkg install ay`; or set AY_BIN_DIR at a from-source ay build.",
-        );
-        r.skip("trust-mc / Kani BMC floor (solver unavailable; `aterm pkg install ay`)");
-        return;
-    }
-    for krate in KANI_CRATES {
-        // Not `run_labeled`: the script exits 0 both when it discharged proofs
-        // and when it discharged none (an all-inconclusive run is a trust-mc
-        // modelling limitation, not an aterm defect). Its last line says which;
-        // a zero-proof run is a named skip, which forfeits the merge-contract
-        // claim.
-        let out = exec::run(&kani_cmd(&gate, krate, &mc_root, &ay_dir), ctx.exec_env());
-        r.raw(out.output.as_str());
-        if r.child_could_not_run(&out, &format!("verify-kani-proofs.sh ({krate})")) {
-            continue;
-        }
-        let (outcome, why) = kani_floor_outcome(out.ok, out.code, &out.output);
-        r.record_child(
-            &out,
-            outcome,
-            format!("verify-kani-proofs.sh ({krate}){why}"),
-        );
-    }
-}
-
-/// Read `scripts/verify-kani-proofs.sh` from its verdict line, not its status:
-/// an all-inconclusive run also exits 0. `PASS: N config-free Kani proof(s)
-/// discharged` is a pass; `NOT PROVED (… NOTHING discharged)` or anything else
-/// at exit 0 (a rewritten script, a truncated run) is a skip, which the tally
-/// names and the verdict subtracts from the claim.
-///
-/// Nonzero is a finding, except the script's own exit 3: the machine could not
-/// run the lane (a tool, a derived directory, or no host sysroot for build
-/// scripts), so COULD NOT RUN.
-fn kani_floor_outcome(ok: bool, code: Option<i32>, output: &str) -> (Outcome, &'static str) {
-    if code == Some(3) {
-        return (
-            Outcome::Fail(Severity::CouldNotRun),
-            " — exit 3, the machine not the tree (the script says why above)",
-        );
-    }
-    if !ok {
-        return (Outcome::Fail(Severity::GateFailed), "");
-    }
-    let said = |marker: &str| output.lines().any(|l| l.starts_with(marker));
-    if said("PASS:") {
-        (Outcome::Ok, "")
-    } else if said("NOT PROVED") {
-        (
-            Outcome::Skip,
-            " (0 proofs discharged; nothing verified here)",
-        )
-    } else {
-        (
-            Outcome::Skip,
-            " (exited 0 without a proof-count verdict line; nothing claimed)",
-        )
-    }
 }
 
 #[cfg(test)]
@@ -4289,66 +4039,38 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
         );
     }
 
-    /// A prime that cannot build is a FAIL, not a skip: paint and spin need that
-    /// artifact, so skipping would narrow the verdict for a real failure.
+    /// The measuring stage judges the bundle the run was HANDED (2026-10-09,
+    /// build once): `ATERM_PAINT_BIN` and `ATERM_SPIN_BIN` are its
+    /// `Contents/MacOS/aterm`, and no child of the stage builds a release
+    /// `aterm`. A run handed no bundle judged nothing: COULD NOT RUN, never a
+    /// skip and never a binary of the gate's choosing. The suites' own sources
+    /// read those names (checked from the tree, so a rename fails here).
     #[test]
-    fn a_failed_conformance_prime_is_a_finding_and_a_missing_targo_is_a_skip() {
+    fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
         let c = ctx(Scope::workspace());
-        assert!(!c.tools.have_targo());
-        let mut r = Report::new("prime");
-        conformance_release(&c, &mut r);
-        let (outcome, label) = r.outcomes().next().expect("a decision");
-        assert_eq!(outcome, crate::Outcome::Skip, "{label}");
-        assert!(label.contains("no targo"), "{label}");
-
-        // With a driver that exits non-zero, the same stage fails — the
-        // ordinary `decide_child` verdict, no vocabulary of its own.
-        let mut c = ctx(Scope::workspace());
-        c.root = std::env::temp_dir();
-        c.scratch = std::env::temp_dir();
-        c.tools.targo = PathBuf::from("/usr/bin/false");
-        c.tools.refused = None;
-        assert!(
-            c.tools.have_targo(),
-            "the stand-in driver must be reachable"
-        );
-        let mut r = Report::new("prime");
-        conformance_release(&c, &mut r);
-        let (outcome, label) = r.outcomes().next().expect("a decision");
-        assert_eq!(
-            outcome,
-            crate::Outcome::Fail(crate::Severity::GateFailed),
-            "{label}"
-        );
-        assert!(label.contains(CONFORMANCE_RELEASE_LABEL), "{label}");
-    }
-
-    /// The measuring stage judges the artifact its own first child leaves: it
-    /// runs the prime's build (a fingerprint check by then) and hands
-    /// `ATERM_PAINT_BIN` and `ATERM_SPIN_BIN` that build's `release/aterm` in the
-    /// prime's lane; a failed build runs no suite (one FAIL, and a `not run:`
-    /// line). The suites' own sources read those names (checked from the tree,
-    /// so a rename fails here).
-    #[test]
-    fn the_measuring_stage_hands_paint_and_spin_the_artifact_its_own_build_leaves() {
-        let c = ctx(Scope::workspace());
-        let lane = lane_dir(&c, Lane::ConformanceRelease).expect("a cargo lane");
-        let bin = conformance_release_binary(&c);
-        assert_eq!(bin, lane.join("release").join("aterm"));
+        let artifact = crate::MeasureArtifact {
+            app: PathBuf::from("/release/aterm.app"),
+            macho_sha256: "a".repeat(64),
+        };
         let env_of = |cmd: &Cmd, key: &str| {
             cmd.envs
                 .iter()
                 .find(|(k, _)| k.to_str() == Some(key))
                 .map(|(_, v)| PathBuf::from(v))
         };
-        assert_eq!(
-            env_of(&conformance_release_cmd(&c), "CARGO_TARGET_DIR"),
-            Some(lane)
-        );
-        let (_, run) = measuring_cmd(&c, false);
+        let (_, run) = measuring_cmd(&c, &artifact, false);
         for var in ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"] {
-            assert_eq!(env_of(&run, var), Some(bin.clone()), "{var}");
+            assert_eq!(
+                env_of(&run, var),
+                Some(PathBuf::from("/release/aterm.app/Contents/MacOS/aterm")),
+                "{var}"
+            );
         }
+        assert!(
+            !run.argv().iter().any(|a| a == "build"),
+            "the stage runs the suites and builds nothing: {:?}",
+            run.argv()
+        );
         let tests =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-conformance/tests");
         for (file, needle) in [
@@ -4363,25 +4085,19 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
             assert!(text.contains(needle), "{file}: {needle}");
         }
 
-        // A failed build runs no suite: exactly one FAIL, the build's.
+        // No bundle: COULD NOT RUN, with the flag that hands one.
         let mut c = ctx(Scope::workspace());
-        c.root = std::env::temp_dir();
-        c.scratch = std::env::temp_dir();
         c.tools.targo = PathBuf::from("/usr/bin/false");
         c.tools.refused = None;
         let mut r = Report::new("measuring");
         measuring_tests(&c, &mut r);
-        let rendered = r.render();
-        let t = crate::ladder::tally(std::slice::from_ref(&r));
-        assert_eq!(t.gate_failures.len(), 1, "{rendered}");
-        assert!(
-            t.gate_failures[0].contains(CONFORMANCE_RELEASE_LABEL),
-            "{rendered}"
+        let (outcome, label) = r.outcomes().next().expect("a decision");
+        assert_eq!(
+            outcome,
+            crate::Outcome::Fail(crate::Severity::CouldNotRun),
+            "{label}"
         );
-        assert!(
-            rendered.contains("  not run: targo test --workspace --test paint --test spin"),
-            "{rendered}"
-        );
+        assert!(label.contains("--measure <APP>"), "{label}");
     }
 
     #[test]
@@ -4859,17 +4575,17 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
             assert!(!run.demoted, "targo test --tests runs code");
             assert_eq!(compile.argv()[1..], test_compile_args(&c.scope)[..]);
             assert_eq!(run.argv()[1..], test_run_args(&c.scope)[..]);
-            let (_, measuring) = measuring_cmd(&c, bind);
+            let artifact = crate::MeasureArtifact {
+                app: PathBuf::from("/release/aterm.app"),
+                macho_sha256: "a".repeat(64),
+            };
+            let (_, measuring) = measuring_cmd(&c, &artifact, bind);
             assert!(
                 !measuring.demoted,
                 "the measuring tests run the paint and spin guards"
             );
             assert_eq!(measuring.argv()[1..], measuring_args(&c.scope)[..]);
         }
-        assert!(
-            conformance_release_cmd(&c).demoted,
-            "the release artifact is only compiled here"
-        );
         assert!(
             tippy_cmd(
                 &c,
@@ -5021,86 +4737,6 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
     }
 
     #[test]
-    fn every_kani_crate_gets_its_own_selector() {
-        // One script, one run per crate, distinguished only by `KANI_CRATE`;
-        // without it every iteration proves the same crate.
-        let gate = std::path::Path::new("/repo/tools/verify-kani-proofs.sh");
-        let mc = std::path::Path::new("/store/trust-mc/current");
-        let ay = std::path::Path::new("/store/bin");
-        let selectors: Vec<String> = KANI_CRATES
-            .iter()
-            .map(|k| {
-                let cmd = kani_cmd(gate, k, mc, ay);
-                assert_eq!(
-                    env_names(&cmd),
-                    ["KANI_CRATE", "TRUST_MC_SYSROOT", "AY_BIN_DIR"]
-                );
-                assert_eq!(
-                    cmd.envs[1].1.as_os_str(),
-                    mc.as_os_str(),
-                    "the script drives THIS trust-mc"
-                );
-                assert_eq!(cmd.envs[2].1.as_os_str(), ay.as_os_str(), "and THIS ay");
-                cmd.envs[0].1.to_string_lossy().into_owned()
-            })
-            .collect();
-        assert_eq!(selectors, KANI_CRATES);
-        assert_eq!(
-            selectors
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            KANI_CRATES.len(),
-            "each run must select a DIFFERENT crate"
-        );
-    }
-
-    #[test]
-    fn trust_mc_and_ay_resolve_env_then_store_and_never_a_build_tree() {
-        // The script's order, decided in one place so the availability check
-        // and the run agree: explicit env wins, else the store, even with a
-        // from-source checkout under home.
-        let home = crate::mktemp_dir("atv-kani").expect("mktemp");
-        let prefix = crate::toolchain::default_atpkg_prefix(&home);
-        for dev in [
-            "trust/first-party/trust-mc/target/trust-mc/bin",
-            "trust/first-party/ay/target/release",
-        ] {
-            std::fs::create_dir_all(home.join(dev)).expect("mkdir");
-        }
-        let env = EnvSnapshot {
-            home: home.clone(),
-            ..EnvSnapshot::default()
-        };
-        assert_eq!(
-            trust_mc_sysroot(&env),
-            prefix.join("store/trust-mc/current")
-        );
-        assert_eq!(ay_bin_dir(&env), prefix.join("bin"));
-        // A present store answers its build-numbered directory, which no
-        // `aterm pkg update` can re-point mid-floor.
-        #[cfg(unix)]
-        {
-            std::fs::create_dir_all(prefix.join("store/trust-mc/41/bin")).expect("mkdir");
-            std::os::unix::fs::symlink("41", prefix.join("store/trust-mc/current")).expect("ln");
-            assert_eq!(
-                trust_mc_sysroot(&env),
-                std::fs::canonicalize(prefix.join("store/trust-mc/41")).expect("real"),
-                "the live link is resolved once, not handed to the script as `current`"
-            );
-        }
-
-        let env = EnvSnapshot {
-            trust_mc_sysroot: Some(PathBuf::from("/explicit/sysroot")),
-            ay_bin_dir: Some(PathBuf::from("/explicit/ay")),
-            ..env
-        };
-        assert_eq!(trust_mc_sysroot(&env), PathBuf::from("/explicit/sysroot"));
-        assert_eq!(ay_bin_dir(&env), PathBuf::from("/explicit/ay"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
     fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         let c = ctx(Scope::workspace());
         assert!(!c.tools.have_targo());
@@ -5111,8 +4747,8 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
         assert_eq!(outcome, crate::Outcome::Fail(crate::Severity::CouldNotRun));
         assert!(label.starts_with("targo not found"), "{label}");
         assert!(
-            label.contains("x.py build --stage 2"),
-            "the diagnostic says how to fix it"
+            label.contains("scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed"),
+            "the diagnostic says how to fix it, from the pinned Trust seed: {label}"
         );
 
         // The dependent stages then skip — honestly, and named, so the verdict
@@ -5133,115 +4769,6 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
                 assert!(label.contains("no targo"), "{label}");
             }
         }
-    }
-
-    /// The Kani floor's exit codes: the script's 3 (the machine, e.g. build
-    /// scripts against trust-mc's panic=abort sysroot) is COULD NOT RUN; 1 and 2
-    /// are findings; only a `PASS:` line is `ok`.
-    #[test]
-    fn the_kani_floor_reads_exit_three_as_could_not_run_and_never_a_pass() {
-        use crate::{Outcome, Severity};
-        let cases: [(bool, Option<i32>, &str, Outcome); 7] = [
-            (
-                false,
-                Some(3),
-                "COULD NOT RUN: `cargo trust-mc list` exited 1",
-                Outcome::Fail(Severity::CouldNotRun),
-            ),
-            (
-                false,
-                Some(2),
-                "FAIL: `cargo trust-mc list` exited 1",
-                Outcome::Fail(Severity::GateFailed),
-            ),
-            (
-                false,
-                Some(1),
-                "FAIL: genuine counterexample(s): x",
-                Outcome::Fail(Severity::GateFailed),
-            ),
-            (false, None, "", Outcome::Fail(Severity::GateFailed)),
-            (
-                true,
-                Some(0),
-                "PASS: 3 Kani proof(s) discharged",
-                Outcome::Ok,
-            ),
-            (
-                true,
-                Some(0),
-                "NOT PROVED (no violations found, and NOTHING discharged)",
-                Outcome::Skip,
-            ),
-            (true, Some(0), "", Outcome::Skip),
-        ];
-        for (ok, code, output, want) in cases {
-            assert_eq!(
-                kani_floor_outcome(ok, code, output).0,
-                want,
-                "{code:?} {output:?}"
-            );
-        }
-        assert!(
-            kani_floor_outcome(false, Some(3), "")
-                .1
-                .contains("exit 3, the machine not the tree"),
-            "the row names what happened"
-        );
-    }
-
-    /// An unavailable prover is said prominently and never described as
-    /// discharged (`--full`'s trust-mc / Kani floor): a NOTICE naming what did
-    /// not run and its repair, one named skip, and so no merge-contract claim.
-    #[cfg(unix)]
-    #[test]
-    fn an_unavailable_prover_is_a_named_skip_that_forfeits_the_claim() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = crate::mktemp_dir("atv-kani-absent").expect("mktemp");
-        let script = tmp.join("scripts/verify-kani-proofs.sh");
-        std::fs::create_dir_all(tmp.join("scripts")).expect("mkdir");
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let mut c = ctx(Scope::workspace());
-        c.root = tmp.clone();
-        c.env.trust_mc_sysroot = Some(tmp.join("no-trust-mc"));
-        c.env.ay_bin_dir = Some(tmp.join("no-ay"));
-        let r = run_stage(
-            &c,
-            &StageSpec {
-                id: StageId::KaniFloor,
-                title: "trust-mc / Kani BMC floor".into(),
-                lane: Lane::MainTarget,
-                exclusive: false,
-                after_lanes: Vec::new(),
-                after_stages: Vec::new(),
-            },
-        );
-        let text = r.render();
-        assert!(
-            text.contains(
-                "  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: trust-mc is unavailable"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "  skip  trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)"
-            ),
-            "the skip names the repair: {text}"
-        );
-        assert!(
-            !text.contains("verify-kani-proofs.sh (aterm-parser)"),
-            "never described as discharged: {text}"
-        );
-        let t = crate::ladder::tally(std::slice::from_ref(&r));
-        assert_eq!(t.skipped(), 1, "{text}");
-        assert!(!crate::verdict::discharges_merge_contract(
-            crate::Mode::Full,
-            &Scope::workspace(),
-            &t
-        ));
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -5488,7 +5015,7 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
         }
 
         suite("test-publish-export.sh", "echo widened >&2; exit 1");
-        std::fs::remove_file(tools.join("test-release-preflight.sh")).expect("rm");
+        std::fs::remove_file(tools.join("test-install-guard.sh")).expect("rm");
         let mixed = decide(&c);
         assert_eq!(mixed.len(), DELIVERY_SUITES.len(), "{mixed:?}");
         assert_eq!(
@@ -5506,7 +5033,7 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
         assert!(
             mixed[2]
                 .1
-                .starts_with("test-release-preflight.sh missing or not executable"),
+                .starts_with("test-install-guard.sh missing or not executable"),
             "{mixed:?}"
         );
         // …and every suite after them still ran: one red row never hides the
@@ -6266,11 +5793,6 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
         }
         assert_eq!(drivers_dir(&c), PathBuf::from("/repo/target-drivers"));
         assert_eq!(
-            env(&conformance_release_cmd(&c)),
-            lane("/repo/target/conformance-release", Some("6")),
-            "the prime names the helper's dir, never the caller's"
-        );
-        assert_eq!(
             env(&freeze_gate_cmd(&c)),
             lane("/repo/tools/freeze-safety-gate/target", None),
             "the L0 gate names the dir cargo used when nothing was exported"
@@ -6480,8 +6002,8 @@ VERDICT: NARROWED BY MEMORY — not verified on this host (8 GiB RAM, verifier c
     /// a failure, zero a pass" would get half right and one reading "only 1 is
     /// a failure" would pass. The handback lane's `2` is COULD NOT RUN; the
     /// Codex lane's `77`, in the `--full` tier it lives in, is a NAMED SKIP with
-    /// the lane's own reason (counted, and forfeiting the run's contract claim,
-    /// as the trust-mc floor's absent prover is). Each code only for the lane
+    /// the lane's own reason (counted, and forfeiting the run's contract claim).
+    /// Each code only for the lane
     /// that declares it: the other lane's code is a finding.
     #[test]
     fn a_live_lanes_not_run_code_is_never_a_pass_and_quotes_the_lanes_reason() {

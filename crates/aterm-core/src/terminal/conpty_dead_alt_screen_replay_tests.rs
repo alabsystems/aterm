@@ -108,10 +108,18 @@ fn history(n: usize) -> String {
     format!("clean history {n}")
 }
 
+/// A session behind a console host: the posture aterm-gui applies to a ConPTY
+/// session (`spawn::apply_pty_keyboard_posture`).
+fn conpty_term() -> Terminal {
+    let mut term = Terminal::new(24, 80);
+    term.set_win32_input_enabled(true);
+    term
+}
+
 /// Replay through the shell's prompt on the dead pager's screen — the read
 /// whose `133;A` makes the engine leave that screen — and check the recovery.
 fn recovered(fixture: &str) -> (Terminal, std::vec::IntoIter<Vec<u8>>) {
-    let mut term = Terminal::new(24, 80);
+    let mut term = conpty_term();
     let mut reads = reads(fixture);
     replay_through(&mut term, &mut reads, "133;D;-1");
     assert!(
@@ -165,16 +173,16 @@ fn the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row
 
 #[test]
 fn the_same_reads_without_conhosts_mode_request_lose_the_rows_typed_after_the_kill() {
-    // Negative control, so the pass above is not vacuous: drop `?9001h` from
-    // the first read and nothing tells the engine a console host sits in
-    // between, so the recovery lays the screen out the unix way and conhost's
+    // Negative control, so the pass above is not vacuous: the same ConPTY
+    // session, with `?9001h` dropped from the first read, so conhost never
+    // asked and the recovery lays the screen out the unix way; conhost's
     // blank repaint ahead of the second pager's `?1049h` erases the rows.
     let mut reads = reads(KILLED_THEN_SECOND_PAGER);
     assert_eq!(
         reads.next().as_deref(),
         Some(&b"\x1b[?9001h\x1b[?1004h"[..])
     );
-    let mut term = Terminal::new(24, 80);
+    let mut term = conpty_term();
     term.process(b"\x1b[?1004h");
     replay_rest(&mut term, reads);
     let all = all_rows(&term);

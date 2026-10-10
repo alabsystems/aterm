@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scrubbing back and forth by word never damages the band (owner, 2026-09-14).
+//! Scrubbing back and forth by word never damages the band.
 //!
 //! Driven at the host seam: a real `aterm_core::terminal::Terminal` driven
 //! byte for byte, its rows sampled as `app_render.rs`'s frame hold samples

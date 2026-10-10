@@ -700,10 +700,9 @@ pub(crate) struct Config {
     /// the one-time access card, the folder warm-up and the protected-root set
     /// shared with Containment. See [`PrivacyConfig`].
     pub(crate) privacy: Option<PrivacyConfig>,
-    /// macOS host settings (`[machine]`): Universal Control off and cargo build
-    /// output hidden from Spotlight. Applied by `atpkg` (`aterm pkg machine
-    /// apply`); the GUI only displays and edits it. Absent means both on. See
-    /// [`MachineConfig`].
+    /// macOS host settings (`[machine]`): Universal Control off. Applied by
+    /// `atpkg` (`aterm pkg machine apply`); the GUI only displays and edits it.
+    /// Absent means on. See [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
     /// PTY keeper (`[keeper]`, `docs/DESIGN-pty-keeper-2026-09-26.md`): register
     /// every terminal's master with the keeper so a crash or kill does not hang
@@ -2330,9 +2329,6 @@ pub(crate) struct MachineConfig {
     /// `"off"` (default) writes `com.apple.universalcontrol Disable`/`DisableMagicEdges`
     /// for the current host when they are not already set; `"leave"` never touches them.
     pub(crate) universal_control: Option<String>,
-    /// Rename every cargo target dir the doctor's scan finds under `$HOME` to its
-    /// `.noindex` form, leaving a `target` symlink so cargo keeps working. Default `true`.
-    pub(crate) spotlight_noindex: Option<bool>,
 }
 
 /// The `[net]` table: the inbound listener and the outbound `[[net.connections]]`
@@ -4184,14 +4180,6 @@ impl Config {
             None | Some("") | Some("off") => atpkg::config::UniversalControlPolicy::Off,
             Some(_) => atpkg::config::UniversalControlPolicy::Leave,
         }
-    }
-
-    /// `[machine] spotlight_noindex`, resolved (default TRUE).
-    pub(crate) fn machine_spotlight_noindex(&self) -> bool {
-        self.machine
-            .as_ref()
-            .and_then(|m| m.spotlight_noindex)
-            .unwrap_or(true)
     }
 
     /// The `[privacy]` master bit (default true). Off, every consent field reads
@@ -14601,8 +14589,7 @@ mod matrix_rain_cfg_tests {
         assert_eq!(super::update_required_team_id(&config), Some("ABCDE12345"));
     }
 
-    /// `[machine]` defaults: Universal Control off and cargo output hidden from
-    /// Spotlight.
+    /// `[machine]` defaults: Universal Control off.
     #[test]
     fn machine_absent_section_resolves_documented_defaults() {
         let c = Config::default();
@@ -14610,7 +14597,6 @@ mod matrix_rain_cfg_tests {
             c.machine_universal_control(),
             atpkg::config::UniversalControlPolicy::Off
         );
-        assert!(c.machine_spotlight_noindex());
         assert!(c.machine.is_none());
     }
 
@@ -14625,10 +14611,6 @@ mod matrix_rain_cfg_tests {
             empty.machine_universal_control(),
             absent.machine_universal_control()
         );
-        assert_eq!(
-            empty.machine_spotlight_noindex(),
-            absent.machine_spotlight_noindex()
-        );
     }
 
     /// Explicit values win over the defaults; an unrecognised policy spelling
@@ -14638,14 +14620,12 @@ mod matrix_rain_cfg_tests {
         let c = aterm_toml::from_str::<Config>(concat!(
             "[machine]\n",
             "universal_control = \"leave\"\n",
-            "spotlight_noindex = false\n",
         ))
         .unwrap();
         assert_eq!(
             c.machine_universal_control(),
             atpkg::config::UniversalControlPolicy::Leave
         );
-        assert!(!c.machine_spotlight_noindex());
         let off =
             aterm_toml::from_str::<Config>("[machine]\nuniversal_control = \"off\"\n").unwrap();
         assert_eq!(
@@ -14668,10 +14648,9 @@ mod matrix_rain_cfg_tests {
         let gui = Config::default();
         let pkg = atpkg::config::MachineConfig::default();
         assert_eq!(gui.machine_universal_control(), pkg.universal_control());
-        assert_eq!(gui.machine_spotlight_noindex(), pkg.spotlight_noindex());
         for text in [
-            "[machine]\nuniversal_control = \"leave\"\nspotlight_noindex = false\n",
-            "[machine]\nuniversal_control = \"off\"\nspotlight_noindex = true\n",
+            "[machine]\nuniversal_control = \"leave\"\n",
+            "[machine]\nuniversal_control = \"off\"\n",
             "[machine]\nuniversal_control = \"\"\n",
             "[machine]\n",
             "",
@@ -14681,11 +14660,6 @@ mod matrix_rain_cfg_tests {
             assert_eq!(
                 gui.machine_universal_control(),
                 pkg.universal_control(),
-                "{text:?}"
-            );
-            assert_eq!(
-                gui.machine_spotlight_noindex(),
-                pkg.spotlight_noindex(),
                 "{text:?}"
             );
         }

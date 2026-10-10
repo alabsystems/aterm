@@ -9,27 +9,17 @@
 //! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
 //!   vocabulary [`usage`] and `harness limits` print.
 //! * [`usage`] — the transcript's usage rows, read into one view; the HUD
-//!   line and the `harness usage --json` shape (design §5.2). Its statusLine
-//!   reader, which had no live producer once the `harness statusline` bridge
-//!   retired (decision B), was deleted 2026-09-27 with the window view it
-//!   filled: `"windows"` stays an empty object in the JSON, as every live
-//!   `harness usage` already printed it, and `--utc-offset` (which placed
-//!   their resets) went with it; and the `/usage` panel's painted windows
-//!   `harness limits` prints beside
-//!   the wall the engine's own reader names (`aterm_phase::wall`, the one
-//!   wall classifier). The second classifier that used to live here
-//!   (`limits`: hook values, a pair rule, a banner table that disagreed with
-//!   aterm-phase's) was deleted 2026-09-25; its recovery ladder had gone
-//!   with its only driver, `harness watch`.
+//!   line and the `harness usage --json` shape (design §5.2; `"windows"`
+//!   stays an empty object there); and the `/usage` panel's painted windows
+//!   `harness limits` prints beside the wall the engine's own reader names
+//!   (`aterm_phase::wall`, the one wall classifier).
 //! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
 //!   and the stale targets, each row carrying the WITNESS that makes it safe
 //!   to remove. Report-only is the shape of the function, not a flag.
-//! * [`align`] — the bounded child runner [`disk`] reads `df` through. It
-//!   was the packaging contract and the alignment verdict; that part is
-//!   deleted (the module doc says why) and the name stays for its caller.
+//! * [`align`] — the bounded child runner [`disk`] reads `df` through.
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
-//!   from the files Claude Code already keeps (owner direction, 2026-09-24).
+//!   from the files Claude Code already keeps.
 //! * [`session_usage`] — THIS session's usage, one implementation for the
 //!   footer and `harness usage`: its tokens per model, folded incrementally
 //!   from its own transcript and its subagents' (live), and the limit wall
@@ -71,7 +61,7 @@
 //!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
 //!   the host's per-session back-off.
 //! * [`resume`] — THE RESUME COMMAND a person is told to run for a frozen
-//!   Claude Code (2026-09-26): `claude --resume <this process's own
+//!   Claude Code: `claude --resume <this process's own
 //!   conversation>` with its launch flags carried, read from Claude Code's
 //!   own `sessions/<pid>.json` — never `claude --continue`, which resumes the
 //!   directory's newest conversation, a sibling tab's where two share it.
@@ -85,24 +75,11 @@
 //!   wrote (`accounts.toml`), what this machine has seen of each account,
 //!   the condition that follows, the advice a session gets at a turn end
 //!   (`Stay | Probe | Move | Wait`), and the store for its state and ledger.
-//!   It touches no session and reads no credential. (The module of this
-//!   name deleted on 2026-09-23, below, chose a Claude home per account;
-//!   this one chooses a login and leaves the home alone.)
+//!   It touches no session and reads no credential; it chooses a login and
+//!   leaves the Claude home alone.
 //!
-//! # What was deleted, 2026-09-23
-//!
-//! The SECOND harness stack: `watch` (the loop), `wire` (its control-socket
-//! adapter), `mark` (the four-state presence mark), `observe` (the grid
-//! spine), `ring` (the JSONL ledger ring), `profile` (the per-program serving
-//! table), `accounts` (the roster and rotation), `config` (the watcher's own
-//! `config.toml`), most of `align`, and the `status|mark|enable|disable|
-//! align|caps|accounts|liveness|recover|nudge|switch|watch|config` verbs. In
-//! its whole life none of its acts landed — its own turn lease blocked its
-//! `turn`, `appnotice` was denied before the badge went out, its escalation
-//! `post` was malformed, it woke on every repaint, and it labelled every
-//! finished turn `api-stalled` (measured by the 2026-09-23 harness audit) —
-//! and it duplicated the engine in [`crate::supervise`], which is the one
-//! supervisor now. Design §0.4 is the record.
+//! [`crate::supervise`] is the one supervisor; the second harness stack this
+//! module once held is gone (design §0.4 is the record).
 //!
 //! STATUS (docs/README.md honesty ratchet): unit-tested; these bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
@@ -169,19 +146,18 @@
 //! and
 //! `harness_codex_daemon_update_model` ([`upgrade_codex::daemon_step`] over
 //! every reachable state, in [`upgrade_codex`]'s tests). The Codex branch
-//! has run end to end against a REAL Codex (0.157.0 → 0.157.1, a private
-//! headless aterm, network denied) through the window's OWN HOST, no sweep
-//! (`tools/test-codex-live-upgrade.sh`, 2026-09-26): a background terminal
-//! held a daemon-mode tab and its daemon until it was stopped; an embedded
-//! session got its notice at that break and no `/exit` until the terminal
-//! was stopped; then the daemon moved, each TUI was exited, relaunched,
-//! adopted and carried on, and so was an inline TUI at a two-row prompt. One
-//! of three full runs had the embedded session's carry-on still owed ten
-//! minutes after its adoption (the cause was not captured; the script now
-//! dumps the host's log and journals on a failure). Nothing here has run
-//! against a REAL exhausted
-//! window: the `/usage` panel reader is exercised against captured and
-//! hand-built fixtures.
+//! has run end to end against a REAL Codex (a private headless aterm,
+//! network denied) through the window's OWN HOST, no sweep
+//! (`tools/test-codex-live-upgrade.sh`): a background terminal held a
+//! daemon-mode tab and its daemon until it was stopped; an embedded session
+//! got its notice at that break and no `/exit` until the terminal was
+//! stopped; then the daemon moved, each TUI was exited, relaunched, adopted
+//! and carried on, and so was an inline TUI at a two-row prompt. One of three
+//! full runs left the embedded session's carry-on owed ten minutes after its
+//! adoption (cause not captured; the script dumps the host's log and
+//! journals on a failure). Nothing here has run against a REAL exhausted window: the
+//! `/usage` panel reader is exercised against captured and hand-built
+//! fixtures.
 
 /// The harness's mark as a literal ([`upgrade::HARNESS_MARK`] is this), for
 /// the texts `concat!` builds on it: every turn the harness types into an
@@ -201,6 +177,7 @@ pub mod goal_hold;
 pub mod lights;
 pub mod netwatch;
 pub mod relaunch;
+pub mod restart_stamp;
 pub mod resume;
 pub mod session_usage;
 pub mod source;

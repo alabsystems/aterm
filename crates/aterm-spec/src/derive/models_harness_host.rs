@@ -277,7 +277,7 @@ pub fn harness_restored_carry_model() -> Model {
 /// session: its agent, its worker, the mark a Commit leaves on the session
 /// (`Kept::commit`), the mark of an exit no worker was handed
 /// (`Kept::unwatched`), through one Commit that fails and rolls back, then
-/// the next park.
+/// the next park — or a quit.
 ///
 /// `agent` — 1 runs in its tab, 0 crashed (relaunched once read); `worker` —
 /// 0 none, 1 supervising (no exit handed), 2 handed the exit (`left`) and
@@ -301,10 +301,12 @@ pub fn harness_restored_carry_model() -> Model {
 /// decide: of an agent a landing started that nothing read, its own start
 /// having swept the record the exit before it left and the host's follow
 /// having forgotten the snapshot as it held the tab (only `SettleGone`
-/// marks one).
+/// marks one); `closed` — the host shut down (a quit) and its restored
+/// queue is closed: nothing more is queued, stepped or handed, and the quit
+/// layout carries what the queue and the sessions still owe.
 ///
-/// * `Crash` — the agent crashes, whatever the phase, while a worker or the
-///   host's mark holds it; `Back` — an agent runs in the tab again (the
+/// * `Crash` — the agent crashes, whatever the phase (before a quit), while
+///   a worker or the host's mark holds it; `Back` — an agent runs in the tab again (the
 ///   relaunch's own, or one someone started) and the host reads it: in the
 ///   tab of a worker handed its exit, and no stop since, it is the host's
 ///   until its own worker starts (`Worker::back` marks it); `Settle` — that
@@ -323,8 +325,10 @@ pub fn harness_restored_carry_model() -> Model {
 /// * `Suspend` — the Commit's stop: every live worker stopped and marked;
 ///   `Decide` — a stopped worker owing the relaunch decides on the mark,
 ///   however late (round eleven): `Stopped` leaves it stranded, `TakenUp`
-///   queues it; `EndUnhanded` — a stopped worker handed nothing ends, leaving
-///   the exit to the host: one the Commit stopped (round thirteen), or one
+///   queues it — or, the queue closed by a quit, leaves it stranded for the
+///   quit layout (round sixteen); `EndUnhanded` — a stopped worker handed
+///   nothing ends, leaving the exit to the host: one the Commit stopped
+///   (round thirteen), or one
 ///   handed over (round fourteen), which the Commit's stop does not mark.
 /// * `Resume`, `Rollback` — the Commit failed: the host supervises again, then
 ///   a stranded relaunch is queued and a mark not decided becomes `TakenUp`;
@@ -337,6 +341,11 @@ pub fn harness_restored_carry_model() -> Model {
 ///   next park captures the queue for the tab; `Commit` — its Commit
 ///   re-captures it and goes ahead only where the two captures agree (a
 ///   relaunch queued in between refuses it, as activity).
+/// * `Quit` — the host shuts down after the rollback told a worker not
+///   decided yet to take its relaunch up (`TakenUp`), closing the queue.
+///   The machine's quit is that one: a crash after it, and a worker in an
+///   ordinary back-off at it, are the quit layout's to carry from the agent
+///   the tab ran (the host's published snapshot), which is not modelled.
 ///
 /// * `NoOwedRelaunchLost` — past the rollback a crashed agent is relaunched,
 ///   queued, carried, or held by someone who will: a live worker, the
@@ -372,7 +381,10 @@ pub fn harness_restored_carry_model() -> Model {
 /// `nothing-recorded`, or the record swept and read as a graceful exit —
 /// `NoOwedRelaunchLost`; the model encoded that path as a landing's `Settle`
 /// while its Tier-1's seams answered a follow of another process `Agent`
-/// and read a snapshot at a bare shell, as no live seam does)
+/// and read a snapshot at a bare shell, as no live seam does),
+/// `DecideClosedDrops` (until round sixteen a worker told `TakenUp` that
+/// decided after a quit closed the queue had its relaunch refused and owed
+/// it no more: nothing held it for the quit layout — `NoOwedRelaunchLost`)
 /// and `ParkFirstFound` (round twelve's
 /// captures read the first relaunch queued for the tab, the overtaken one —
 /// ONE reader, so the mutant sets `firstfound` and the Commit's re-capture,
@@ -411,9 +423,11 @@ pub fn harness_commit_owed_model() -> Model {
             var dropped = 0;
             var firstfound = 0;
             var blind = 0;
+            var closed = 0;
 
             action Crash when (
                 agent == 1 && (worker > 0 || unwatched == 1) && done == 0 && queued == 0
+                    && closed == 0
             ) {
                 agent = 0;
             }
@@ -469,8 +483,14 @@ pub fn harness_commit_owed_model() -> Model {
             }
             action Decide when (worker == 3 && stop == 1) {
                 worker = 0;
-                commit = if (commit == 1) { 2 } else { 0 };
-                queued = if (commit == 3) { 1 } else { queued };
+                commit = if (commit == 1 || (commit == 3 && closed == 1)) { 2 } else { 0 };
+                queued = if (commit == 3 && closed == 0) { 1 } else { queued };
+            }
+            action DecideClosedDrops when (
+                Buggy == 1 && worker == 3 && stop == 1 && commit == 3 && closed == 1
+            ) {
+                worker = 0;
+                commit = 0;
             }
             action DecideByPark when (Buggy == 1 && worker == 3 && stop == 1 && phase == 3) {
                 worker = 0;
@@ -502,6 +522,7 @@ pub fn harness_commit_owed_model() -> Model {
             }
             action HandUnwatched when (
                 worker == 0 && agent == 0 && unwatched == 1 && (phase == 0 || phase > 1)
+                    && closed == 0
             ) {
                 worker = if (blind == 1) { 0 } else { 2 };
                 stop = 0;
@@ -510,7 +531,9 @@ pub fn harness_commit_owed_model() -> Model {
                 unwatched = 0;
                 blind = 0;
             }
-            action Start when (worker == 0 && agent == 1 && (phase == 0 || phase > 1)) {
+            action Start when (
+                worker == 0 && agent == 1 && (phase == 0 || phase > 1) && closed == 0
+            ) {
                 worker = 1;
                 stop = 0;
                 handover = 0;
@@ -518,7 +541,7 @@ pub fn harness_commit_owed_model() -> Model {
                 unwatched = 0;
                 blind = 0;
             }
-            action QueueSteps when (queued == 1 && phase == 3) {
+            action QueueSteps when (queued == 1 && phase == 3 && closed == 0) {
                 queued = 0;
                 agent = 1;
                 done = 1;
@@ -526,14 +549,17 @@ pub fn harness_commit_owed_model() -> Model {
             action Overtook when (phase == 0 && stale == 0) {
                 stale = 1;
             }
-            action Park when (phase == 3) {
+            action Park when (phase == 3 && closed == 0) {
                 phase = 4;
                 captured = queued;
             }
-            action ParkFirstFound when (Buggy == 1 && phase == 3) {
+            action ParkFirstFound when (Buggy == 1 && phase == 3 && closed == 0) {
                 phase = 4;
                 captured = if (stale == 1) { 0 } else { queued };
                 firstfound = 1;
+            }
+            action Quit when (phase == 3 && commit == 3 && closed == 0) {
+                closed = 1;
             }
             action Commit when (
                 phase == 4
@@ -1504,5 +1530,296 @@ pub fn harness_upgrade_age_model() -> Model {
 
             invariant AgeIsThisProcess: alarm == 0 || rec == proc + 1;
         }
+    }
+}
+
+/// THE EXPLICIT RESTART (design of 2026-10-08, `docs/HANDOFF-robustness-rounds-2026-10-08.md`
+/// §4): `aterm ctl @<sid> restart [pid=<n>] [if-stalled]` — "restart this
+/// agent in place" — writes ITS RECORD BEFORE ITS SIGNAL, as every other
+/// in-place restart of the harness does (the live upgrade, the memory, model
+/// and account restarts), and the exit is recognised by LOOKUP, never by
+/// inference. Until then the stall's remedy was the one restart whose record
+/// came after its exit (round fourteen's `RemedySent`, kept in the instance's
+/// memory and spent by a new stall episode), and four review rounds each found
+/// an interleaving where the inference was wrong.
+///
+/// For ONE process `P` holding one tab, and ANY NUMBER OF ACTS on it, one at
+/// a time (`restart_act::ACTING`): `alive` — `P` runs; `stamped` — a stamp
+/// naming `P` (pid and kernel start) is on disk (`<harness
+/// state>/upgrade/asked-<tab>.json`, written atomically); `inflight` — an act
+/// has stamped and not yet signalled or given up; `fresh` — that act WROTE
+/// the stamp (none naming `P` stood when it read; else it joined the one that
+/// did); `termed` — an act's `SIGTERM` was sent; `esc` — how many escalation
+/// watches run on `P` in the instance that made the act: one at most, an act
+/// that finds one running giving it its stamp's time instead of starting its
+/// own (`restart_act::watch`, ruling 19 of 2026-10-09); `committed` — a seamless
+/// update's Commit handed the session to a successor (the outgoing
+/// instance's threads, an act's request among them, end with it; the stamp,
+/// on disk, does not); `ended` — who ended `P` (0 nobody yet, 1 an act: its
+/// `TERM`, its `KILL` or the carrier's, 2 anyone else: a person's `/exit`, a
+/// crash, a shell's `kill`); `at_end` — the stamp stood when `P` ended;
+/// `read` — the exit's reader (the worker that reads it, the exit-only
+/// worker, a successor's after a Commit): 0 not yet, 1 relaunched as the
+/// act's (`ExitCause::Asked`/`Stall`, a person's keystroke before it not read
+/// as their `/exit`), 2 read by the other rules (a graceful exit is left);
+/// `hand` — ANOTHER HAND holds the session (a hold, another driver's lease or
+/// named turn, another supervisor's claim: what the exit's reader leaves to
+/// its holder, `restart_act::another_hand`); `held_kill` — an act's `KILL`
+/// was sent while another hand held the session (review of 1a733ed60).
+///
+/// * `Stamp` — an act's first half (`restart_act::begin`), while `P` leads
+///   and no other hand holds the session (its fences): the stamp written —
+///   or, one naming `P` standing, JOINED (`fresh` 0).
+/// * `Term` — its second half: the discard and `killpg(SIGTERM)`, while `P`
+///   still leads (step 1d's re-read), and the one watch on `P` started — or,
+///   one running (a joined act's), kept. `SendsNothing` — the re-read found `P`
+///   gone (or `killpg` refused): nothing sent, and the stamp the act WROTE
+///   taken back (`restart_act::take_back`); a joined one is kept.
+/// * `Hears` — `P` runs its `SIGTERM` handler and exits; a deaf `P` (its
+///   JS thread spinning, `trap '' TERM`) never does.
+/// * `Escalate` — an act's thread, `P` still leading after the grace and no
+///   other hand on the session (re-read right before the discard and the
+///   `killpg`, ruling 11): `killpg(SIGKILL)`, its `held_kill` the hand it was
+///   sent under. `EscalationSeesExit` — its wait on `NOTE_EXIT` ends.
+/// * `EndsOtherwise` — anyone ends `P`, at any point.
+/// * `HandOn` / `HandOff` — another hand lands on the session, or leaves
+///   it, at any point (a fleet halt, the bridge-lost auto-hold, the owner's
+///   local hold, a driver's lease or named turn, `drive watch`'s claim).
+/// * `Commit` — at any point; `CarrierFinishes` — the successor's carrier
+///   finds a stamp naming a live leader past the act's 30 s and finishes the
+///   `KILL` (it holds the master now), no other hand on the session (its
+///   `held_kill` as `Escalate`'s).
+/// * `Read` — the exit is read, by whichever reader, and the stamp it finds
+///   naming `P` is consumed: once `P` has ENDED — an exit whose program still
+///   runs (stopped away from its tab, its shell in front) is nobody's yet,
+///   decided at its end as an exit's first read is, the stamp looked up and
+///   another supervisor's claim asked again there (rulings 15 and 17) — and
+///   with no other hand on the session, its guard says: an exit read while
+///   another hand holds it is that holder's, the reader's documented rule
+///   (`relaunch::on_exit`'s `Held`), and not this model's.
+///
+/// Invariants: `TheActsEndIsRelaunched` — an end an act made is relaunched
+/// whoever reads it, however many acts there were; `OnlyAStampedEndIsTheActs`
+/// — nothing is relaunched as the act's unless the stamp stood at its end;
+/// `TheActEndsItsProgram` — a `P` an act signalled is never left alive with
+/// nobody to end it (its thread, or after a Commit the carrier);
+/// `TheKillWaitsOutAnotherHand` — no act's `KILL` lands while another hand
+/// holds the session (the halt contract; under the act's old `KILL` the
+/// reader then left the agent the act had killed at a bare shell);
+/// `OneWatchPerProcess` — however many acts there were, one watch ends `P`
+/// (bug hunt 7: every joined act's thread held a kqueue of its own, a
+/// descriptor per request against the window's 256). Liveness
+/// ([`harness_restart_stamp_liveness`]): a stamped `P` ends, once every
+/// other hand is released.
+///
+/// NOT MODELLED, said: the stamp's clock. The act's watch lets a program go
+/// once its stamp no longer stands (`STALE_S`: stopped away from its tab,
+/// ruling 8, or held by another hand that outlasts it, ruling 11), and no
+/// `KILL` — the watch's or a carrier's — is ever sent for a stamp that no
+/// longer stands (ruling 12), nor in its last half minute, when its exit
+/// would be read after it went stale (ruling 16); an act that JOINS a stamp
+/// renews its time once its own `TERM` is sent, so its `KILL` has the
+/// stamp's whole life (ruling 18); and an end that comes after the stamp
+/// went stale is the program's own, its stamp looked up again at the end
+/// (ruling 17). Saying it needs a stale flag threaded through every end, a
+/// relaunch invariant weakened to admit the documented heard-after-stale
+/// residual, and a record of a `KILL` apart from the program's own end: a
+/// rework, not an action; the Tier-1s
+/// `a_stamped_program_stopped_inside_its_grace_is_ended_once_it_leads_again`,
+/// `a_stamp_that_no_longer_stands_is_no_acts_to_finish`,
+/// `a_restart_that_joins_a_stamp_near_its_end_renews_it_and_ends_its_program`
+/// and `a_stopped_programs_end_after_its_stamp_went_stale_is_its_own` pin it
+/// on the real code. Nor a STOPPED `P` as a state of its own: `alive` covers it,
+/// and `Read`'s `alive == 0` is what the reader must wait for (ruling 15).
+///
+/// `Buggy=1` adds eight mutants, each caught alone: `SignalBeforeStamp`
+/// (the signal sent first: a reader of the exit before the stamp lands reads
+/// a graceful exit — `TheActsEndIsRelaunched`), `CommitForgetsStamp` (the
+/// record in the instance's memory, `RemedySent`'s, lost across a Commit —
+/// `TheActsEndIsRelaunched`), `TermOnly` (no escalation: a program that lives
+/// through `TERM` survives the act, and a person's later `/exit` would be
+/// relaunched as the act's — `TheActEndsItsProgram`, and the liveness),
+/// `StampAfterEnd` (a stamp written for a process that already ended — the
+/// re-read of step 1d missing — makes a person's exit the act's —
+/// `OnlyAStampedEndIsTheActs`), `TakeBackAlways` (an act that sent nothing
+/// takes back the stamp whatever wrote it — 3eaa8f83c's second act, which
+/// replaced the first's stamp, found `P` gone and removed the only stamp the
+/// first act's exit had — `TheActsEndIsRelaunched`), `KillUnderHand`
+/// (1a733ed60's `KILL`, which re-read only the leader: a hold that landed in
+/// the grace did not stop it — `TheKillWaitsOutAnotherHand`) and
+/// `DecidedWhileRunning` (the reader settles an exit whose program still
+/// runs — 1a733ed60's `not-exited` read as left, and the review's second
+/// round's `Held` under a hand that came and went while `P` was stopped —
+/// and the end the act makes after `fg` is nobody's to relaunch —
+/// `TheActsEndIsRelaunched`) and `WatchPerAct` (an act whose `SIGTERM` is
+/// sent starts a watch of its own beside the one running — the act before
+/// bug hunt 7 — `OneWatchPerProcess`). Tier-1 (`aterm-gui`'s `harness_host` tests
+/// `the_real_restart_act_conforms_to_its_model`,
+/// `a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp`,
+/// `the_restart_acts_kill_waits_out_another_hand`, for `Read`'s
+/// `alive == 0`
+/// `a_stamped_program_read_as_gone_while_stopped_is_relaunched_once_the_act_ends_it`,
+/// and for its `hand == 0` at a stopped program's end
+/// `a_stopped_programs_end_under_another_supervisors_claim_is_that_supervisors`,
+/// and for `esc`'s one watch `many_restarts_of_one_program_run_one_watch`)
+/// drives the real `restart` verb and its two halves over a real pty and a
+/// real stand-in, the real stamp, a real hold, and the real reader chain.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_restart_stamp_model() -> Model {
+    crate::ty_model! {
+        HarnessRestartStamp {
+            const Buggy = 0;
+            var alive = 1;
+            var stamped = 0;
+            var inflight = 0;
+            var fresh = 0;
+            var termed = 0;
+            var esc = 0;
+            var committed = 0;
+            var ended = 0;
+            var at_end = 0;
+            var read = 0;
+            var hand = 0;
+            var held_kill = 0;
+
+            action Stamp when (alive == 1 && inflight == 0 && committed == 0 && hand == 0) {
+                inflight = 1;
+                fresh = if (stamped == 1) { 0 } else { 1 };
+                stamped = 1;
+            }
+            action Term when (inflight == 1 && alive == 1) {
+                inflight = 0;
+                fresh = 0;
+                termed = 1;
+                esc = 1;
+            }
+            action SendsNothing when (inflight == 1) {
+                inflight = 0;
+                fresh = 0;
+                stamped = if (fresh == 1) { 0 } else { stamped };
+            }
+            action Hears when (alive == 1 && termed == 1) {
+                alive = 0;
+                ended = 1;
+                at_end = stamped;
+            }
+            action Escalate when (esc == 1 && alive == 1 && hand == 0) {
+                alive = 0;
+                ended = 1;
+                at_end = stamped;
+                esc = 0;
+                held_kill = hand;
+            }
+            action EscalationSeesExit when (esc == 1 && alive == 0) {
+                esc = 0;
+            }
+            action EndsOtherwise when (alive == 1) {
+                alive = 0;
+                ended = 2;
+                at_end = stamped;
+            }
+            action HandOn when (hand == 0) {
+                hand = 1;
+            }
+            action HandOff when (hand == 1) {
+                hand = 0;
+            }
+            action Commit when (committed == 0) {
+                committed = 1;
+                esc = 0;
+                inflight = 0;
+                fresh = 0;
+            }
+            action CarrierFinishes when (
+                committed == 1 && stamped == 1 && alive == 1 && esc == 0 && hand == 0
+            ) {
+                alive = 0;
+                ended = 1;
+                at_end = 1;
+                held_kill = hand;
+            }
+            action Read when (alive == 0 && read == 0 && hand == 0) {
+                read = if (stamped == 1) { 1 } else { 2 };
+                stamped = 0;
+            }
+            action SignalBeforeStamp when (
+                Buggy == 1 && alive == 1 && stamped == 0 && termed == 0 && committed == 0
+            ) {
+                termed = 1;
+                esc = 1;
+            }
+            action CommitForgetsStamp when (Buggy == 1 && committed == 0) {
+                committed = 1;
+                esc = 0;
+                inflight = 0;
+                fresh = 0;
+                stamped = 0;
+            }
+            action TermOnly when (Buggy == 1 && esc == 1 && alive == 1) {
+                esc = 0;
+            }
+            action StampAfterEnd when (Buggy == 1 && alive == 0 && stamped == 0 && read == 0) {
+                stamped = 1;
+            }
+            action TakeBackAlways when (Buggy == 1 && inflight == 1) {
+                inflight = 0;
+                fresh = 0;
+                stamped = 0;
+            }
+            action KillUnderHand when (Buggy == 1 && esc == 1 && alive == 1 && hand == 1) {
+                alive = 0;
+                ended = 1;
+                at_end = stamped;
+                esc = 0;
+                held_kill = hand;
+            }
+            action DecidedWhileRunning when (
+                Buggy == 1 && alive == 1 && stamped == 1 && read == 0
+            ) {
+                read = 2;
+            }
+            action WatchPerAct when (Buggy == 1 && inflight == 1 && alive == 1 && esc == 1) {
+                inflight = 0;
+                fresh = 0;
+                termed = 1;
+                esc = 2;
+            }
+
+            invariant TheActsEndIsRelaunched: read <= 1 || ended == 0 || ended == 2;
+            invariant OnlyAStampedEndIsTheActs: read == 0 || read == 2 || at_end == 1;
+            invariant TheActEndsItsProgram: alive == 0 || termed == 0 || esc > 0
+                || committed == 1;
+            invariant TheKillWaitsOutAnotherHand: held_kill == 0;
+            invariant OneWatchPerProcess: esc <= 1;
+        }
+    }
+}
+
+/// THE RESTART ENDS ITS PROGRAM ([`harness_restart_stamp_model`]): from any
+/// state in which the stamp names a live `P`, `P` ends — `[]<>(stamped == 0 ||
+/// alive == 0)`, and `P` never comes back once it ended — under the weak
+/// fairness of the act's own steps (`Term`: its signal follows its stamp in
+/// the same request) and of another hand's release (`HandOff`: every hold,
+/// lease, turn and claim is lifted at last — one that outlasts the stamp
+/// lets the program go, ruling 11, which this model has no clock to say),
+/// and the STRONG fairness of the escalation (`Escalate`: the thread's timer
+/// fires, and its watch looks again every second while another hand holds
+/// it off) and of the carrier's finish (`CarrierFinishes`: a successor whose
+/// Commit cut the act inside its grace finishes the `KILL`, waiting a hand
+/// out the same way). Neither the program's handler (`Hears`), nor a person
+/// (`EndsOtherwise`), nor a Commit is assumed. The mutant that breaks it
+/// alone: `TermOnly`, the act with no escalation, whose deaf program
+/// survives.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_restart_stamp_liveness() -> super::Liveness {
+    use super::{eq, int, or_, var};
+    super::Liveness {
+        name: "TheRestartEndsItsProgram",
+        goal: or_(eq(var("stamped"), int(0)), eq(var("alive"), int(0))),
+        weak: vec!["Term", "HandOff"],
+        strong: vec!["Escalate", "CarrierFinishes"],
+        mutants: vec!["TermOnly"],
     }
 }

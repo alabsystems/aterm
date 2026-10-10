@@ -270,7 +270,7 @@ impl BloomFilter {
     }
 
     /// Get the number of items inserted (test-only alias for `item_count`).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn count(&self) -> usize {
         self.count
@@ -408,105 +408,6 @@ impl Default for BloomFilter {
     }
 }
 
-#[cfg(kani)]
-mod proofs {
-    use super::*;
-
-    /// Bloom filters must not produce false negatives after insertion.
-    ///
-    /// Reduced from 8 to 4 max bytes to keep CBMC tractable: the hash_pair
-    /// loop over symbolic bytes creates branching per byte, and K=7 hash
-    /// functions multiply that for both insert and query.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn no_false_negatives_after_insert_symbolic_bytes() {
-        const MAX_INPUT_LEN: usize = 4;
-        let bytes: [u8; MAX_INPUT_LEN] = kani::any();
-        let len: usize = kani::any();
-        kani::assume(len <= MAX_INPUT_LEN);
-
-        let mut bloom = BloomFilter::with_size(128);
-        let needle = &bytes[..len];
-        bloom.insert_bytes(needle);
-
-        kani::assert(
-            bloom.might_contain_bytes(needle),
-            "inserted bytes must always be reported as present",
-        );
-    }
-
-    /// Hash-derived bit indices must always stay within bit-vector bounds.
-    ///
-    /// Uses concrete filter size to avoid CBMC explosion from symbolic Vec
-    /// allocation. Keeps hash inputs fully symbolic — the modulo arithmetic
-    /// correctness is independent of filter size.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn bit_indices_always_within_storage_bounds() {
-        const MAX_INPUT_LEN: usize = 4;
-        let bytes: [u8; MAX_INPUT_LEN] = kani::any();
-        let len: usize = kani::any();
-        kani::assume(len <= MAX_INPUT_LEN);
-
-        let bloom = BloomFilter::with_size(128);
-        let (h1, h2) = BloomFilter::hash_pair(&bytes[..len]);
-
-        for i in 0..K {
-            let bit_idx = bloom.get_bit_index(h1, h2, i);
-            kani::assert(bit_idx < bloom.num_bits, "bit index must be < num_bits");
-            kani::assert(
-                bit_idx / 64 < bloom.bits.len(),
-                "bit index must map to a valid backing word",
-            );
-        }
-    }
-
-    /// Capacity constructor must keep storage geometry and counters consistent.
-    ///
-    /// Verifies the production sizing helpers symbolically, then checks a
-    /// representative constructor call to ensure the initialized state matches
-    /// the computed layout without reintroducing symbolic-allocation blowups.
-    #[kani::proof]
-    fn with_capacity_initializes_consistent_storage() {
-        let expected_items: usize = kani::any();
-        kani::assume(expected_items <= 1000);
-
-        let requested_bits = BloomFilter::requested_bits_for_capacity(expected_items);
-        let (num_u64s, final_num_bits) = BloomFilter::storage_layout(requested_bits);
-
-        kani::assert(
-            final_num_bits >= requested_bits,
-            "capacity sizing must not shrink",
-        );
-        kani::assert(
-            final_num_bits % 64 == 0,
-            "num_bits must align with u64 word boundaries",
-        );
-        kani::assert(
-            num_u64s * 64 == final_num_bits,
-            "bit-vector length must match num_bits exactly",
-        );
-
-        let bloom = BloomFilter::with_capacity(7);
-        let requested_bits = BloomFilter::requested_bits_for_capacity(7);
-        let (num_u64s, final_num_bits) = BloomFilter::storage_layout(requested_bits);
-
-        kani::assert(
-            bloom.num_bits == final_num_bits,
-            "constructor must use computed bit layout",
-        );
-        kani::assert(
-            bloom.bits.len() == num_u64s,
-            "constructor must allocate one word per computed chunk",
-        );
-        kani::assert(bloom.count == 0, "new filter must start with zero inserts");
-    }
-}
-
 #[cfg(test)]
 #[path = "bloom_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "bloom_kani_proofs.rs"]
-mod kani_proofs;

@@ -41,10 +41,11 @@
 //!
 //! The merge gate's test run skips every `measuring::…` test
 //! (`aterm_verify::stages::MEASURING_TESTS`); they are the MEASURE tier
-//! (`tools/verify.sh --measure`, `--full`), run alone in the exclusive
-//! `measuring tests` stage, and a release cut requires them green. A probe
+//! (`tools/verify.sh --measure <APP>`, `--full <APP>`), run alone in the
+//! exclusive `measuring tests` stage over the release bundle the release built
+//! once, and a release signs only bytes they measured green. A probe
 //! that decides nothing (exit 2) is recorded as COULD NOT RUN. The binary is
-//! release profile, from `ATERM_SPIN_BIN` (or `ATERM_PAINT_BIN`); without
+//! the release bundle's, from `ATERM_SPIN_BIN` (or `ATERM_PAINT_BIN`); without
 //! either a row says `not measured` (`support::release_bin`).
 //!
 //! Unix only: the probe drives a POSIX shell sandbox (`mktemp -d`, `/bin/sh`,

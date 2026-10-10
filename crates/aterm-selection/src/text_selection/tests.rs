@@ -170,6 +170,31 @@ fn test_anchor_ordering() {
     assert!(a1 < a2);
     assert!(a2 < a3);
     assert!(a3 < a4);
+
+    // The whole order: row first, then column, then side (Left before Right),
+    // over every anchor with row -2..=2 and col 0..=2 — every pair (reflexive,
+    // antisymmetric, the priority) and every triple (transitive).
+    let anchors: Vec<SelectionAnchor> = (-2..=2)
+        .flat_map(|row| {
+            (0..=2).flat_map(move |col| {
+                [SelectionSide::Left, SelectionSide::Right]
+                    .map(|side| SelectionAnchor::new(row, col, side))
+            })
+        })
+        .collect();
+    let key = |a: &SelectionAnchor| (a.row, a.col, u8::from(a.side == SelectionSide::Right));
+    for a in &anchors {
+        for b in &anchors {
+            assert_eq!(a.cmp(b), key(a).cmp(&key(b)), "{a:?} vs {b:?}");
+            assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a:?} vs {b:?}");
+            assert_eq!(a == b, key(a) == key(b), "{a:?} vs {b:?}");
+            for c in &anchors {
+                if a <= b && b <= c {
+                    assert!(a <= c, "{a:?} <= {b:?} <= {c:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1390,4 +1415,143 @@ fn a_shrink_spares_a_span_that_crosses_the_cut() {
     assert_eq!(across.start().row, -7);
     assert_eq!(across.end().row, -2);
     assert!(across.start().row <= across.end().row, "order again");
+}
+
+/// `expand_semantic` and `expand_lines` act only on an in-progress selection of
+/// their own type, and then cover the whole span: for every selection type,
+/// in progress and complete, and every column pair 0..=4 — the expansion lands
+/// on exactly those columns, Left to Right (`expand_lines` from column 0 to the
+/// width), and anything else leaves the anchors as they were.
+#[test]
+fn expansion_acts_only_on_an_in_progress_selection_of_its_type() {
+    let types = [
+        SelectionType::Simple,
+        SelectionType::Block,
+        SelectionType::Semantic,
+        SelectionType::Lines,
+    ];
+    for kind in types {
+        for complete in [false, true] {
+            for start_col in 0..=4u16 {
+                for end_col in 0..=4u16 {
+                    let fresh = || {
+                        let mut sel = TextSelection::new();
+                        sel.start_selection(1, 2, SelectionSide::Right, kind);
+                        sel.update_selection(1, 3, SelectionSide::Left);
+                        if complete {
+                            sel.complete_selection();
+                        }
+                        sel
+                    };
+                    let at = format!("{kind:?} complete={complete} {start_col}..{end_col}");
+
+                    let mut sel = fresh();
+                    sel.expand_semantic(start_col, end_col);
+                    if !complete && kind == SelectionType::Semantic {
+                        assert_eq!(
+                            (sel.start, sel.end),
+                            (
+                                SelectionAnchor::new(1, start_col, SelectionSide::Left),
+                                SelectionAnchor::new(1, end_col, SelectionSide::Right)
+                            ),
+                            "{at}"
+                        );
+                    } else {
+                        assert_eq!(sel, fresh(), "{at}: expand_semantic must not act");
+                    }
+
+                    let mut sel = fresh();
+                    sel.expand_lines(end_col);
+                    if !complete && kind == SelectionType::Lines {
+                        assert_eq!(
+                            (sel.start, sel.end),
+                            (
+                                SelectionAnchor::new(1, 0, SelectionSide::Left),
+                                SelectionAnchor::new(1, end_col, SelectionSide::Right)
+                            ),
+                            "{at}"
+                        );
+                    } else {
+                        assert_eq!(sel, fresh(), "{at}: expand_lines must not act");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `truncate_to_floor` over every small span, Simple and Block: every pair of
+/// endpoint rows -6..=3 (either drag direction), columns 0 and 2, and a history
+/// floor of 0..=6 rows. The outcomes are exhaustive: nothing evicted leaves the
+/// rows untouched and reports nothing; both endpoints evicted, or no history
+/// to clamp onto, clears; one endpoint evicted clamps it onto the floor row —
+/// keeping the other row exactly, reporting the loss and leaving the state
+/// machine where it was, and for a Block moving the ROW only — unless the
+/// clamp leaves nothing selectable, which clears.
+#[test]
+fn truncate_to_floor_over_every_small_span() {
+    let oldest_abs = 1000u64;
+    for kind in [SelectionType::Simple, SelectionType::Block] {
+        for r1 in -6..=3i32 {
+            for r2 in -6..=3i32 {
+                for (c1, c2) in [(0, 0), (0, 2), (2, 0), (2, 2)] {
+                    for floor in 0..=6u64 {
+                        let mut sel = TextSelection::new();
+                        sel.start_selection(r1, c1, SelectionSide::Left, kind);
+                        sel.update_selection(r2, c2, SelectionSide::Right);
+                        sel.complete_selection();
+                        let min_row = -i32::try_from(floor).unwrap();
+                        let (lo, hi) = (r1.min(r2), r1.max(r2));
+                        let at = format!("{kind:?} ({r1},{c1})..({r2},{c2}) floor {floor}");
+
+                        let survived = sel.truncate_to_floor(oldest_abs, oldest_abs + floor);
+                        if lo >= min_row {
+                            assert!(survived && !sel.truncated(), "{at}");
+                            assert_eq!((sel.start().row, sel.end().row), (r1, r2), "{at}");
+                        } else if hi < min_row || min_row == 0 {
+                            assert!(!survived, "{at}");
+                            assert_eq!(sel.state(), SelectionState::None, "{at}");
+                            assert!(!sel.truncated(), "{at}");
+                        } else if survived {
+                            assert!(sel.truncated(), "{at}");
+                            assert_eq!(sel.state(), SelectionState::Complete, "{at}");
+                            assert_eq!(sel.normalized_start().row, min_row, "{at}");
+                            assert_eq!(sel.normalized_end().row, hi, "{at}");
+                            if kind == SelectionType::Block {
+                                assert_eq!((sel.start().col, sel.end().col), (c1, c2), "{at}");
+                            }
+                        } else {
+                            assert_eq!(sel.state(), SelectionState::None, "{at}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `is_empty` is "no selection, or both anchors on the same point": right
+/// after a press, after a drag to every point of a 2 x 4 patch on both sides
+/// (empty exactly when the drag lands back on the press), after the release,
+/// and after a clear.
+#[test]
+fn is_empty_iff_none_or_the_anchors_coincide() {
+    let press = SelectionAnchor::new(0, 1, SelectionSide::Left);
+    for row in 0..=1 {
+        for col in 0..=3u16 {
+            for side in [SelectionSide::Left, SelectionSide::Right] {
+                let mut sel = TextSelection::new();
+                assert!(sel.is_empty());
+                sel.start_selection(press.row, press.col, press.side, SelectionType::Simple);
+                assert!(sel.is_empty(), "right after the press");
+                let drag = SelectionAnchor::new(row, col, side);
+                sel.update_selection(row, col, side);
+                assert_eq!(sel.is_empty(), drag == press, "drag to {drag:?}");
+                sel.complete_selection();
+                assert_eq!(sel.is_empty(), drag == press, "released at {drag:?}");
+                sel.clear();
+                assert!(sel.is_empty(), "cleared");
+            }
+        }
+    }
 }

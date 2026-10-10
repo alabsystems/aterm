@@ -7,8 +7,8 @@
 //!
 //! Phases 0-2 enforce the four bidirectional obligations of §2.2 *in Rust*, inside
 //! aterm's own [`crate::xref::check_closure`]. Phase 3 hands the same models,
-//! anchors, waivers, and proof names to `trust-ir spec-link` for an independent
-//! structural check (S0/S1, Ob.1/Ob.4, L1/L2). The text artifact has source
+//! anchors and waivers to `trust-ir spec-link` for an independent structural
+//! check (S0/S1, Ob.1/Ob.4, L2). The text artifact has source
 //! labels but no compiler-owned `FuncId`s, so it explicitly uses
 //! `enforcement design-only`; it must never be described as a certifying Linked
 //! report. This module is the producer half for that byte-conforming artifact.
@@ -47,7 +47,7 @@
 use std::collections::BTreeSet;
 
 use crate::derive::Model;
-use crate::xref::{ProofAnchor, ProofKind, RefinementAnchor, SpecModule, Waiver, machine_matches};
+use crate::xref::{RefinementAnchor, SpecModule, Waiver, machine_matches};
 
 /// Render a free-form string as a `trust-ir` text-format quoted token: Rust `{:?}`
 /// escaping (`"`→`\"`, `\`→`\\`, newline→`\n`, tab→`\t`), matching the escaping
@@ -142,7 +142,6 @@ fn lower_module_block(
     module: &SpecModule,
     anchors: &[&RefinementAnchor],
     waivers: &[&Waiver],
-    proofs: &[&ProofAnchor],
 ) -> String {
     let name = module.name();
     let mut s = String::new();
@@ -200,24 +199,6 @@ fn lower_module_block(
             q(w.reason),
         ));
     }
-    // Proofs (TRUST_VACUITY_GATE §2.1 / finding 1b): each `proof_anchor!`'d kani
-    // harness lowers to a `proof machine "m" action "a" name "h" kind "kani"` line —
-    // the IR analogue of `proof_anchor!`. trust-ir's L1 resolves `name` against the
-    // supplied `--harness-manifest`; Ob.1/Ob.4 hold on `machine`/`action` like an
-    // anchor. `kind` is the lowercase tag the text grammar expects (`"kani"`).
-    for p in proofs {
-        let kind = match p.kind {
-            ProofKind::Kani => "kani",
-        };
-        s.push_str(&format!(
-            "  proof machine {} action {} name {} kind {}\n",
-            q(name),
-            q(p.action),
-            q(p.proof_name),
-            q(kind),
-        ));
-    }
-
     s.push_str("}\n");
     s
 }
@@ -245,7 +226,7 @@ fn emit_embedded_vars(s: &mut String, m: &Model) {
 /// The output is byte-for-byte valid trust-ir text. Every block is explicitly
 /// `enforcement design-only`: the standalone artifact has no compiler-owned
 /// `FuncId` or typed projection target, so `trust-ir spec-link` checks its
-/// structural identity, action/machine resolution, proof manifest, and nonblank
+/// structural identity, action/machine resolution and nonblank
 /// projection fields but intentionally returns a non-certifying report. Coverage
 /// remains fail-closed in aterm's [`crate::xref::check_closure`].
 ///
@@ -267,7 +248,6 @@ pub fn lower_to_ir(
     modules: &[SpecModule],
     refinements: &[&RefinementAnchor],
     waivers: &[&Waiver],
-    proofs: &[&ProofAnchor],
 ) -> String {
     let mut out = String::new();
     out.push_str("; TrustIr text format v1\n");
@@ -288,21 +268,8 @@ pub fn lower_to_ir(
                 !w.machine.is_empty() && !w.action.is_empty() && machine_matches(w.machine, canon)
             })
             .collect();
-        // Proof anchors whose `machine` resolves to THIS module (canonicalized like
-        // anchors). A proof naming no registered machine is dropped — aterm's own gate
-        // reports the dangling machine as an Ob.4 violation before we ever assemble.
-        let my_proofs: Vec<&ProofAnchor> = proofs
-            .iter()
-            .copied()
-            .filter(|p| machine_matches(p.machine, canon))
-            .collect();
         out.push('\n');
-        out.push_str(&lower_module_block(
-            module,
-            &my_anchors,
-            &my_waivers,
-            &my_proofs,
-        ));
+        out.push_str(&lower_module_block(module, &my_anchors, &my_waivers));
     }
 
     out
@@ -398,19 +365,9 @@ mod tests {
         }
     }
 
-    fn proof(machine: &'static str, action: &'static str, name: &'static str) -> ProofAnchor {
-        ProofAnchor {
-            machine,
-            action,
-            proof_name: name,
-            kind: ProofKind::Kani,
-            location: "test:1",
-        }
-    }
-
     #[test]
     fn header_is_v1_canonical() {
-        let txt = lower_to_ir("aterm_spec_xref", &[], &[], &[], &[]);
+        let txt = lower_to_ir("aterm_spec_xref", &[], &[], &[]);
         assert!(
             txt.starts_with("; TrustIr text format v1\nmodule \"aterm_spec_xref\"\n"),
             "{txt}"
@@ -429,7 +386,7 @@ mod tests {
             "Ring::project",
         );
         let w = waiver("ring", "Push", "test waiver");
-        let txt = lower_to_ir("m", &modules, &[&a], &[&w], &[]);
+        let txt = lower_to_ir("m", &modules, &[&a], &[&w]);
         // Canonical name "Ring" used everywhere in the block.
         assert!(txt.contains("spec_module \"Ring\" {\n"), "{txt}");
         assert!(txt.contains("  origin embedded\n"), "{txt}");
@@ -456,7 +413,7 @@ mod tests {
     fn anchor_without_project_omits_project_clause() {
         let modules = vec![SpecModule::Embedded(ring_model())];
         let a = anchor("ring", "Push", "r::push", "r.rs:1:1", ""); // empty project
-        let txt = lower_to_ir("m", &modules, &[&a], &[], &[]);
+        let txt = lower_to_ir("m", &modules, &[&a], &[]);
         assert!(
             txt.contains(
                 "  anchor machine \"Ring\" action \"Push\" rust \"r::push\" span \"r.rs:1:1\" target none\n"
@@ -485,8 +442,8 @@ mod tests {
         );
         let no_projection = anchor("ring", "Push", "aterm_buffer::Ring::push", "0.rs:1:1", "");
 
-        let forward = lower_to_ir("m", &modules, &[&later, &no_projection, &chosen], &[], &[]);
-        let reversed = lower_to_ir("m", &modules, &[&chosen, &no_projection, &later], &[], &[]);
+        let forward = lower_to_ir("m", &modules, &[&later, &no_projection, &chosen], &[]);
+        let reversed = lower_to_ir("m", &modules, &[&chosen, &no_projection, &later], &[]);
 
         assert_eq!(
             fallback_anchor_deduplication_count(&modules, &[&later, &no_projection, &chosen]),
@@ -516,35 +473,12 @@ mod tests {
         let modules = vec![SpecModule::Embedded(ring_model())];
         let dangling = anchor("no_such_machine", "X", "r", "r:1", "");
         let bare = waiver("", "", "bypass-setter"); // empty machine
-        let txt = lower_to_ir("m", &modules, &[&dangling], &[&bare], &[]);
+        let txt = lower_to_ir("m", &modules, &[&dangling], &[&bare]);
         assert!(
             !txt.contains("no_such_machine"),
             "dangling anchor dropped: {txt}"
         );
         assert!(!txt.contains("bypass-setter"), "bare waiver dropped: {txt}");
-    }
-
-    #[test]
-    fn proof_anchor_lowers_to_a_proof_line_canonicalized() {
-        let modules = vec![SpecModule::Embedded(ring_model())];
-        // Proof uses the lower convention "ring"; Model::name is "Ring".
-        let p = proof("ring", "Push", "ring_push_refines");
-        let txt = lower_to_ir("m", &modules, &[], &[], &[&p]);
-        assert!(
-            txt.contains("  proof machine \"Ring\" action \"Push\" name \"ring_push_refines\" kind \"kani\"\n"),
-            "proof line (canonicalized machine + lowercase kani kind): {txt}"
-        );
-    }
-
-    #[test]
-    fn proof_for_unresolved_machine_is_dropped() {
-        let modules = vec![SpecModule::Embedded(ring_model())];
-        let p = proof("no_such_machine", "Push", "ghost_harness");
-        let txt = lower_to_ir("m", &modules, &[], &[], &[&p]);
-        assert!(
-            !txt.contains("ghost_harness"),
-            "proof for a dangling machine is dropped: {txt}"
-        );
     }
 
     #[test]

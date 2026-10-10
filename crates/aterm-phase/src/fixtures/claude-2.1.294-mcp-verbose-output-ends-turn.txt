@@ -1,0 +1,45 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP tool's call row and its output as the turn's end, Claude Code in verbose output (`"verbose": true` in the scratch config; the condensed default folds every MCP call into `Called github (ctrl+o to expand)` and draws no output): a stdio server `github` (user-scope `mcpServers`) whose `get_issue` returns three rows opening with a 529 notice, the stub's reply after the result EMPTY, so the `⏺ github - get_issue (MCP)(owner: "acme", issue_number: 7)` block is the last thing said, over the done row; the server published `agent=wall:overloaded` here (the harness was off: `[harness] enabled = false`)
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ toolstart
+
+⏺ github - get_issue (MCP)(owner: "acme", issue_number: 7)
+  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.
+     second row of the result
+     third row
+
+⏺ github - ping (MCP)
+  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.
+     second row of the result
+     third row
+
+⏺ ticket desk - get_issue (MCP)(owner: "acme", issue_number: 8)
+  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.
+     second row of the result
+     third row
+
+⏺ github - Fetch Page (MCP)(url: "http://example.invalid/x")
+  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.
+     second row of the result
+     third row
+
+⏺ Tool call done.
+
+✻ Sautéed for 16s · done 5:47 AM
+
+❯ toolstart
+
+⏺ github - get_issue (MCP)(owner: "acme", issue_number: 7)
+  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.
+     second row of the result
+     third row
+
+✻ Worked for 4s · done 5:47 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                             22071 tokens

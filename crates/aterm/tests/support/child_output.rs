@@ -7,9 +7,8 @@
 //! A pipe reads end-of-file only once every copy of its write end is closed,
 //! and a sibling thread's spawn can take a copy: on macOS std marks a new pipe
 //! close-on-exec in a second step (there is no `pipe2`), and a child forked
-//! between the two keeps the write end for its whole life. In the merge gate of
-//! 2026-09-29 a 20 ms `aterm ctl who` in `fences_live_headless` read for 150 s
-//! that way: the `await` spawned beside it held the copy until its own timeout.
+//! between the two keeps the write end for its whole life (a 20 ms `aterm ctl
+//! who` once read for 150 s while an `await` spawned beside it held the copy).
 //! Once the child has exited, everything it wrote is already in the pipe, so
 //! this reads what is there and stops.
 

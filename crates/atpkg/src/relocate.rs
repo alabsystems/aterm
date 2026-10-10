@@ -3,8 +3,20 @@
 
 //! Pack-time relocation (§10.1 "self-contained" bundle path) — make a staged
 //! sysroot/toolchain payload run on a machine that lacks the BUILDER's layout
-//! (`~/.rustup`, `/opt/homebrew`, `/home/<builder>`), so a `trust`/`trust-mc`
-//! bundle can be installed with NO rustup and NO Developer ID on the user side.
+//! (`/Users/<builder>`, `/home/<builder>`, a declared donor toolchain), so a
+//! `trust`/`trust-mc` bundle can be installed with NO rustup and NO Developer ID on
+//! the user side.
+//!
+//! WHAT MAY BE VENDORED (owner order 2026-09-29, "NO STOCK RUST IN THE TOOLCHAIN FOR
+//! TRUST"; audit TP-7). This pass used to copy whatever a payload loaded from
+//! `~/.rustup` or `~/.cargo` into `lib/atpkg-vendored` — its stated design, and exactly
+//! how rustup's stock nightly `librustc_driver` became part of the signed trust-mc
+//! 20065. Now a library is vendored only from inside a DECLARED donor root
+//! (`--donor-root <toolchain>`, which the CLI admits as a Trust toolchain with
+//! [`crate::lineage::check_compiler`]), its copy must be byte-identical to the donor
+//! file before the re-sign, and each copy is recorded in `lib/atpkg-vendored/VENDORED`
+//! inside the signed tree. A library under rustup's directory, `~/.cargo` or Homebrew
+//! is never vendored: that is a hard error, whatever the donor roots say.
 //!
 //! This is the producer counterpart to the consumer's install-time
 //! [`crate::sysroot`] wiring. The design fixes relocation at PACK time, not install
@@ -34,16 +46,21 @@ use std::path::{Path, PathBuf};
 /// stage root. Kept distinct from any real `lib/` content the toolchain ships.
 pub const VENDOR_REL: &str = "lib/atpkg-vendored";
 
+/// The record of what was vendored, inside [`VENDOR_REL`]: one line per copy,
+/// `<sha256 of the donor file> <file name> <path inside its donor root>`.
+pub const VENDORED_RECORD: &str = "VENDORED";
+
 /// A path that hard-codes THIS build machine's layout — the thing relocation
-/// must eliminate from a self-contained bundle. `/home/` covers a Linux
-/// builder's `~/.rustup`; `/Users/` + `/opt/homebrew` cover macOS.
+/// must eliminate from a self-contained bundle: a home directory (`/Users/`,
+/// `/home/`) or any stock toolchain location ([`crate::lineage::stock_location`]:
+/// rustup's directory or a system `RUSTUP_HOME`'s toolchains, `~/.cargo`, Homebrew).
+/// A load from a stock location therefore reaches `vendor_file`, which refuses it,
+/// instead of shipping as an absolute path into the builder's toolchain.
 #[must_use]
 pub fn is_machine_local(path: &str) -> bool {
-    path.starts_with("/opt/homebrew")
-        || path.starts_with("/Users/")
+    path.starts_with("/Users/")
         || path.starts_with("/home/")
-        || path.contains("/.rustup/")
-        || path.contains("/.cargo/")
+        || crate::lineage::stock_location(Path::new(path)).is_some()
 }
 
 /// The load-command view of one native object, produced by a [`Backend`].
@@ -89,11 +106,24 @@ pub trait Backend {
     fn origin_token(&self) -> &'static str;
 }
 
+/// One vendored copy: what it is and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vendored {
+    /// The file name under `lib/atpkg-vendored/`.
+    pub name: String,
+    /// sha256 of the donor file — and of the copy, before its re-sign.
+    pub sha256: String,
+    /// The donor file's path inside its donor root.
+    pub donor_rel: String,
+}
+
 /// Outcome of relocating one staged payload.
 #[derive(Debug, Default)]
 pub struct Report {
     /// Basenames vendored into `lib/atpkg-vendored/`.
     pub vendored: Vec<String>,
+    /// Each vendored copy's provenance (written to [`VENDORED_RECORD`]).
+    pub vendored_from: Vec<Vendored>,
     /// Objects whose load commands were rewritten.
     pub rewritten: usize,
     /// Machine-local references that could NOT be resolved — for a self-contained
@@ -138,29 +168,42 @@ pub fn backend_for_host() -> Result<Box<dyn Backend>, String> {
     }
 }
 
-/// Relocate a staged payload in place. Vendors every machine-local dependency
-/// (transitively) into `lib/atpkg-vendored/`, rewrites objects to reference them
-/// through a relative-origin rpath, deletes machine-local rpaths, and re-signs.
-/// A hard-link group (one inode under several names) is rewritten and signed once
-/// and its names are re-linked onto the result, so it leaves as one file.
+/// Relocate a staged payload in place. Vendors every builder-path dependency
+/// (transitively) into `lib/atpkg-vendored/` — from inside `donor_roots` only —,
+/// rewrites objects to reference them through a relative-origin rpath, deletes
+/// builder rpaths, and re-signs. A hard-link group (one inode under several names) is
+/// rewritten and signed once and its names are re-linked onto the result, so it leaves
+/// as one file.
+///
+/// A BUILDER PATH is a machine-local one ([`is_machine_local`]) or one inside a donor
+/// root: both name the build box's layout, and neither may survive in the bundle.
 ///
 /// # Errors
-/// I/O, a missing relocation tool, or a rewrite failure. Unresolved machine-local
-/// refs are returned in the [`Report`] (not an error here) so the caller decides
-/// self-contained (hard fail) vs advisory.
-pub fn relocate_stage(stage: &Path, sign_id: Option<&str>) -> Result<Report, String> {
+/// I/O, a missing relocation tool, a rewrite failure, or a library that would be
+/// vendored from a stock toolchain (rustup's directory, `~/.cargo`, Homebrew).
+/// Unresolved builder refs — including a library outside every donor root — are
+/// returned in the [`Report`] (not an error here) so the caller decides self-contained
+/// (hard fail) vs advisory.
+pub fn relocate_stage(
+    stage: &Path,
+    sign_id: Option<&str>,
+    donor_roots: &[PathBuf],
+) -> Result<Report, String> {
     let backend = backend_for_host()?;
-    relocate_with(stage, backend.as_ref(), sign_id)
+    relocate_with(stage, backend.as_ref(), sign_id, donor_roots)
 }
 
 /// [`relocate_stage`] against an explicit backend (the seam unit tests drive).
+/// `donor_roots` must already be canonical (the CLI canonicalizes and admits them).
 pub fn relocate_with(
     stage: &Path,
     backend: &dyn Backend,
     sign_id: Option<&str>,
+    donor_roots: &[PathBuf],
 ) -> Result<Report, String> {
     let mut report = Report::default();
     let vendored = stage.join(VENDOR_REL);
+    let builder = |p: &str| is_machine_local(p) || in_donor_root(p, donor_roots).is_some();
 
     // ONE recursive traversal of the stage feeds BOTH passes below. The stage is a
     // multi-GB toolchain payload, so walking it twice was a second full `read_dir` +
@@ -216,7 +259,7 @@ pub fn relocate_with(
             }
             let refs = backend.read_refs(&p)?;
             for r in &refs.rpaths {
-                if is_machine_local(r) {
+                if builder(r) {
                     donors.insert(PathBuf::from(r));
                 }
             }
@@ -247,7 +290,7 @@ pub fn relocate_with(
 
         // 1. A machine-local install-id → the portable form.
         if let Some(id) = &refs.id
-            && is_machine_local(id)
+            && builder(id)
         {
             backend.set_id_portable(&obj, &basename(id))?;
             changed = true;
@@ -255,10 +298,20 @@ pub fn relocate_with(
 
         // 2. Dependencies.
         for dep in &refs.needed {
-            if is_machine_local(dep) {
-                // Absolute machine-local load (Mach-O) → vendor + repoint.
+            if builder(dep) {
+                // Absolute builder-path load (Mach-O) → vendor + repoint.
                 let base = basename(dep);
-                if vendor_file(Path::new(dep), &vendored, &base, &mut have, &mut report)? {
+                if vendor_file(
+                    Path::new(dep),
+                    &VendorTo {
+                        dir: &vendored,
+                        backend,
+                        donor_roots,
+                    },
+                    &base,
+                    &mut have,
+                    &mut report,
+                )? {
                     let dest = vendored.join(&base);
                     prescanned.remove(&dest); // freshly copied + re-id'd: never stale-serve it
                     queue.push(dest);
@@ -278,7 +331,17 @@ pub fn relocate_with(
                     && !have.contains(&base)
                     && let Some(src) = find_in_donors(&base, &donors)
                 {
-                    if vendor_file(&src, &vendored, &base, &mut have, &mut report)? {
+                    if vendor_file(
+                        &src,
+                        &VendorTo {
+                            dir: &vendored,
+                            backend,
+                            donor_roots,
+                        },
+                        &base,
+                        &mut have,
+                        &mut report,
+                    )? {
                         let dest = vendored.join(&base);
                         prescanned.remove(&dest); // freshly copied + re-id'd (see above)
                         queue.push(dest);
@@ -290,23 +353,16 @@ pub fn relocate_with(
 
         // 3./4. Point the object at the vendored dir via a relative rpath and drop
         // machine-local rpaths.
-        let ml_rpaths: Vec<String> = refs
-            .rpaths
-            .iter()
-            .filter(|r| is_machine_local(r))
-            .cloned()
-            .collect();
+        let ml_rpaths: Vec<String> = refs.rpaths.iter().filter(|r| builder(r)).cloned().collect();
         let mut keep: Vec<String> = refs
             .rpaths
             .iter()
-            .filter(|r| !is_machine_local(r))
+            .filter(|r| !builder(r))
             .cloned()
             .collect();
         let needs_vendor = vendored.is_dir()
             && refs.needed.iter().any(|n| {
-                n.starts_with("@rpath/")
-                    || is_machine_local(n)
-                    || is_shared_lib_basename(&basename(n))
+                n.starts_with("@rpath/") || builder(n) || is_shared_lib_basename(&basename(n))
             });
         if needs_vendor || !ml_rpaths.is_empty() {
             // One origin-relative rpath per DIRECTORY the object is reachable from. A
@@ -353,15 +409,67 @@ pub fn relocate_with(
 
     report.vendored.sort();
     report.vendored.dedup();
+    write_vendored_record(&vendored, &report)?;
     Ok(report)
 }
 
-/// Copy `src` → `vendored/<base>` once, make its own id portable, and re-sign
-/// ad-hoc. Returns whether a NEW file was vendored (so the caller chases ITS
-/// deps). Records an unresolved entry when the source is missing.
+/// The canonical donor root `path` lies inside, if any. The path is canonicalized when
+/// it exists (a linker records `/var/…` where the root is `/private/var/…`).
+fn in_donor_root<'r>(path: &str, donor_roots: &'r [PathBuf]) -> Option<&'r PathBuf> {
+    if donor_roots.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    donor_roots.iter().find(|r| p.starts_with(r))
+}
+
+/// Write [`VENDORED_RECORD`] when anything was vendored.
+fn write_vendored_record(vendored: &Path, report: &Report) -> Result<(), String> {
+    if report.vendored_from.is_empty() {
+        return Ok(());
+    }
+    let mut rows: Vec<&Vendored> = report.vendored_from.iter().collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut text = String::from(
+        "# VENDORED: each library `atpkg relocate` copied into this directory, as\n\
+         # <sha256 of the donor file> <file name> <path inside its declared donor root>.\n\
+         # The copy was byte-identical to the donor before its re-sign.\n",
+    );
+    for v in rows {
+        text.push_str(&format!("{} {} {}\n", v.sha256, v.name, v.donor_rel));
+    }
+    let dest = vendored.join(VENDORED_RECORD);
+    std::fs::write(&dest, text).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
+/// Where [`vendor_file`] copies to, and what may be copied.
+struct VendorTo<'a> {
+    dir: &'a Path,
+    backend: &'a dyn Backend,
+    donor_roots: &'a [PathBuf],
+}
+
+/// The refusal for a library that would be vendored out of a stock toolchain.
+fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
+    format!(
+        "{base}: a stock toolchain library cannot be vendored — {} resolves into {place}. A \
+         bundle vendors only from a Trust toolchain named with --donor-root; build what \
+         loads it against one",
+        src.display()
+    )
+}
+
+/// Copy `src` → `<to.dir>/<base>` once — from inside a donor root only, byte-identical
+/// before the re-sign, recorded — make its own id portable, and re-sign ad-hoc. Returns
+/// whether a NEW file was vendored (so the caller chases ITS deps). Records an
+/// unresolved entry when the source is missing or outside every donor root.
+///
+/// # Errors
+/// A stock toolchain's library (checked on the path as named AND as resolved, before
+/// anything is read or written), or a copy that differs from its donor.
 fn vendor_file(
     src: &Path,
-    vendored: &Path,
+    to: &VendorTo<'_>,
     base: &str,
     have: &mut BTreeSet<String>,
     report: &mut Report,
@@ -369,18 +477,53 @@ fn vendor_file(
     if have.contains(base) {
         return Ok(false);
     }
+    if let Some(place) = crate::lineage::stock_location(src) {
+        return Err(stock_vendor_refusal(base, src, place));
+    }
     if !src.is_file() {
         report
             .unresolved
             .push(format!("{}: source not found to vendor", src.display()));
         return Ok(false);
     }
-    std::fs::create_dir_all(vendored).map_err(|e| format!("create vendored dir: {e}"))?;
-    let dest = vendored.join(base);
-    std::fs::copy(src, &dest).map_err(|e| format!("vendor {}: {e}", src.display()))?;
-    let backend = backend_for_host()?;
-    backend.set_id_portable(&dest, base)?;
-    backend.resign(&dest, None)?;
+    let canonical =
+        std::fs::canonicalize(src).map_err(|e| format!("resolve {}: {e}", src.display()))?;
+    if let Some(place) = crate::lineage::stock_location(&canonical) {
+        return Err(stock_vendor_refusal(base, &canonical, place));
+    }
+    let Some(root) = to.donor_roots.iter().find(|r| canonical.starts_with(r)) else {
+        report.unresolved.push(format!(
+            "{base}: {} is not inside a declared donor root — relocate vendors only from a \
+             Trust toolchain named with --donor-root",
+            canonical.display()
+        ));
+        return Ok(false);
+    };
+    std::fs::create_dir_all(to.dir).map_err(|e| format!("create vendored dir: {e}"))?;
+    let dest = to.dir.join(base);
+    std::fs::copy(&canonical, &dest).map_err(|e| format!("vendor {}: {e}", src.display()))?;
+    let donor_sha = crate::tree::sha256_file(&canonical)
+        .map_err(|e| format!("hash {}: {e}", canonical.display()))?;
+    let copy_sha =
+        crate::tree::sha256_file(&dest).map_err(|e| format!("hash {}: {e}", dest.display()))?;
+    if donor_sha != copy_sha {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "{base}: the vendored copy ({copy_sha}) is not byte-identical to its donor {} \
+             ({donor_sha}) — the donor changed while it was copied",
+            canonical.display()
+        ));
+    }
+    report.vendored_from.push(Vendored {
+        name: base.to_string(),
+        sha256: donor_sha,
+        donor_rel: canonical
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    });
+    to.backend.set_id_portable(&dest, base)?;
+    to.backend.resign(&dest, None)?;
     have.insert(base.to_string());
     report.vendored.push(base.to_string());
     Ok(true)
@@ -534,8 +677,12 @@ fn run(tool: &str, args: &[&str], file: &Path) -> Result<std::process::Output, S
 }
 
 // ---------------------------------------------------------------------------
-// macOS / Mach-O backend (proven end-to-end: trust-mc's librustc_driver vendored,
-// `trust-mc-compiler --version` runs with HOME hidden).
+// macOS / Mach-O backend. Proven end to end 2026-09-29 with a Trust seal as the donor:
+// a cc-built tool loading `@rpath/librustc_driver-<hash>.dylib` through an rpath into
+// ~/toolchains/trust-7d5533b2/lib was relocated with `--donor-root` that seal, the
+// 470 MB driver vendored byte-identical to the seal's before its ad-hoc re-sign, and the
+// tool ran with HOME hidden. (The earlier proof vendored trust-mc's STOCK nightly
+// driver out of rustup — the case this pass now refuses.)
 // ---------------------------------------------------------------------------
 pub mod macho {
     #[cfg(any(target_os = "macos", test))]
@@ -860,6 +1007,13 @@ mod tests {
         assert!(is_machine_local("/Users//example/.rustup/x/lib"));
         assert!(is_machine_local("/home/builder/.rustup/toolchains/n/lib"));
         assert!(is_machine_local("/root/.cargo/registry/x"));
+        // A system RUSTUP_HOME and an Intel Mac's Homebrew hard-code the builder too.
+        assert!(is_machine_local(
+            "/usr/local/rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/libstd.so"
+        ));
+        assert!(is_machine_local(
+            "/usr/local/Cellar/zstd/1.5.7/lib/libzstd.1.dylib"
+        ));
         assert!(!is_machine_local("@rpath/libx.dylib"));
         assert!(!is_machine_local("$ORIGIN/../lib"));
         assert!(!is_machine_local("/usr/lib/libSystem.B.dylib"));
@@ -931,9 +1085,9 @@ mod tests {
         assert!(macho::is_macho_magic(&[0xcf, 0xfa, 0xed, 0xfe]));
         assert!(macho::is_macho_magic(&[0xca, 0xfe, 0xba, 0xbe]));
         assert!(!macho::is_macho_magic(&[0x7f, b'E', b'L', b'F']));
-        let text = "          cmd LC_ID_DYLIB\n         name /Users//b/deps/libkani.dylib (offset 24)\n          cmd LC_LOAD_DYLIB\n         name @rpath/librustc_driver.dylib (offset 24)\n          cmd LC_RPATH\n         path /Users//b/.rustup/x/lib (offset 12)\n          cmd LC_RPATH\n         path @loader_path/../toolchain/lib (offset 12)\n";
+        let text = "          cmd LC_ID_DYLIB\n         name /Users//b/deps/libchecker.dylib (offset 24)\n          cmd LC_LOAD_DYLIB\n         name @rpath/librustc_driver.dylib (offset 24)\n          cmd LC_RPATH\n         path /Users//b/.rustup/x/lib (offset 12)\n          cmd LC_RPATH\n         path @loader_path/../toolchain/lib (offset 12)\n";
         let r = macho::parse_otool(text);
-        assert_eq!(r.id.as_deref(), Some("/Users//b/deps/libkani.dylib"));
+        assert_eq!(r.id.as_deref(), Some("/Users//b/deps/libchecker.dylib"));
         assert_eq!(r.needed, vec!["@rpath/librustc_driver.dylib"]);
         assert_eq!(
             r.rpaths,
@@ -1034,6 +1188,277 @@ mod tests {
         }
     }
 
+    /// A backend over fake objects (files starting `OBJ`) whose load commands are
+    /// scripted per path; a re-sign appends `|sig`, so a test can tell the donor's bytes
+    /// from what the signature pass added.
+    #[cfg(unix)]
+    struct ScriptedBackend {
+        refs: BTreeMap<PathBuf, ObjectRefs>,
+    }
+
+    #[cfg(unix)]
+    impl Backend for ScriptedBackend {
+        fn is_native_object(&self, path: &Path) -> bool {
+            std::fs::read(path).is_ok_and(|b| b.starts_with(b"OBJ"))
+        }
+        fn read_refs(&self, path: &Path) -> Result<ObjectRefs, String> {
+            Ok(self
+                .refs
+                .get(path)
+                .map_or_else(ObjectRefs::default, |r| ObjectRefs {
+                    id: r.id.clone(),
+                    needed: r.needed.clone(),
+                    rpaths: r.rpaths.clone(),
+                }))
+        }
+        fn set_id_portable(&self, _path: &Path, _basename: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn repoint_dep(&self, _path: &Path, _from: &str, _basename: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn fix_rpaths(&self, _: &Path, _: &str, _: &[String], _: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+        fn resign(&self, path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
+            let mut bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            bytes.extend_from_slice(b"|sig");
+            std::fs::write(path, bytes).map_err(|e| e.to_string())
+        }
+        fn origin_token(&self) -> &'static str {
+            "@loader_path"
+        }
+    }
+
+    /// A scratch dir holding `stage/bin` ([`crate::testdir`]: removed on drop), and its
+    /// canonical path.
+    #[cfg(unix)]
+    fn scratch(label: &str) -> (crate::testdir::Dir, PathBuf) {
+        let dir = crate::testdir::dir(&format!("atpkg-reloc-{label}-"));
+        std::fs::create_dir_all(dir.join("stage/bin")).unwrap();
+        let path = std::fs::canonicalize(&*dir).unwrap();
+        (dir, path)
+    }
+
+    /// trust-mc 20065's shape: a tool loading rustup's nightly `librustc_driver`, by
+    /// absolute path or through an rpath into rustup's directory. Refused before a byte
+    /// is copied — and declaring that directory a donor root does not launder it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stock_toolchain_library_is_never_vendored() {
+        let (_dir, d) = scratch("stock");
+        let stage = d.join("stage");
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let absolute = "/Users//x/.rustup/toolchains/nightly-2025-12-03-aarch64-apple-darwin/lib/librustc_driver-3136bc78c25198f1.dylib";
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool.clone(),
+                ObjectRefs {
+                    needed: vec![absolute.to_string()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let err = relocate_with(&stage, &backend, None, &[]).expect_err("stock by absolute path");
+        assert!(
+            err.contains("a stock toolchain library cannot be vendored"),
+            "{err}"
+        );
+        assert!(
+            !stage.join(VENDOR_REL).exists(),
+            "nothing may be written to {VENDOR_REL}"
+        );
+
+        // A Linux builder's system rustup (/usr/local/rustup), declared as a donor: its
+        // tree is refused the same way, never laundered by the declaration.
+        let system = d.join("usr/local/rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib");
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("libstd-0123456789abcdef.so"), b"OBJ stock std").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool.clone(),
+                ObjectRefs {
+                    needed: vec![
+                        system
+                            .join("libstd-0123456789abcdef.so")
+                            .display()
+                            .to_string(),
+                    ],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let err = relocate_with(&stage, &backend, None, std::slice::from_ref(&system))
+            .expect_err("a system rustup's library, even as a declared donor");
+        assert!(
+            err.contains("a stock toolchain library cannot be vendored"),
+            "{err}"
+        );
+        assert!(
+            !stage.join(VENDOR_REL).exists(),
+            "nothing may be written to {VENDOR_REL}"
+        );
+
+        let nightly = d.join("fake/.rustup/toolchains/nightly-2025-12-03-aarch64-apple-darwin/lib");
+        std::fs::create_dir_all(&nightly).unwrap();
+        std::fs::write(
+            nightly.join("librustc_driver-3136bc78c25198f1.dylib"),
+            b"OBJ stock driver",
+        )
+        .unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool.clone(),
+                ObjectRefs {
+                    needed: vec!["@rpath/librustc_driver-3136bc78c25198f1.dylib".to_string()],
+                    rpaths: vec![nightly.display().to_string()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let err = relocate_with(&stage, &backend, None, std::slice::from_ref(&nightly))
+            .expect_err("stock through an rpath, even as a declared donor");
+        assert!(
+            err.contains("a stock toolchain library cannot be vendored"),
+            "{err}"
+        );
+        assert!(
+            !stage.join(VENDOR_REL).exists(),
+            "nothing may be written to {VENDOR_REL}"
+        );
+    }
+
+    /// The Trust shape: the library comes from inside a declared donor root, is copied
+    /// byte-identical (the only later change is the re-sign), and the copy is recorded.
+    /// (A library outside every donor root: the next test.)
+    #[cfg(unix)]
+    #[test]
+    fn a_donor_root_library_is_vendored_byte_identical_and_recorded() {
+        let (_dir, d) = scratch("donor");
+        let stage = d.join("stage");
+        let seal = d.join("seal");
+        std::fs::create_dir_all(seal.join("lib")).unwrap();
+        let donor = seal.join("lib/librustc_driver-0123456789abcdef.dylib");
+        std::fs::write(&donor, b"OBJ trust driver").unwrap();
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool.clone(),
+                ObjectRefs {
+                    needed: vec![donor.display().to_string()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let report =
+            relocate_with(&stage, &backend, None, std::slice::from_ref(&seal)).expect("relocate");
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+        assert_eq!(
+            report.vendored,
+            vec!["librustc_driver-0123456789abcdef.dylib"]
+        );
+        let want = crate::tree::sha256_file(&donor).unwrap();
+        assert_eq!(
+            report.vendored_from,
+            vec![Vendored {
+                name: "librustc_driver-0123456789abcdef.dylib".to_string(),
+                sha256: want.clone(),
+                donor_rel: "lib/librustc_driver-0123456789abcdef.dylib".to_string(),
+            }]
+        );
+        let copy = std::fs::read(
+            stage
+                .join(VENDOR_REL)
+                .join("librustc_driver-0123456789abcdef.dylib"),
+        )
+        .unwrap();
+        assert_eq!(
+            copy, b"OBJ trust driver|sig",
+            "byte-identical to the donor before the re-sign"
+        );
+        let record = std::fs::read_to_string(stage.join(VENDOR_REL).join(VENDORED_RECORD)).unwrap();
+        assert!(
+            record.contains(&format!("{want} librustc_driver-0123456789abcdef.dylib lib/librustc_driver-0123456789abcdef.dylib")),
+            "{record}"
+        );
+    }
+
+    /// A library that EXISTS but lies outside every declared donor root is never
+    /// vendored: it is left unresolved (so the self-contained audit fails the pack) and
+    /// not one byte is copied. The file is real on purpose: a missing one is unresolved
+    /// as "source not found" whether or not the donor-root rule exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_library_outside_every_donor_root_is_never_vendored() {
+        let (_dir, d) = scratch("undeclared");
+        let stage = d.join("stage");
+        let seal = d.join("seal");
+        std::fs::create_dir_all(seal.join("lib")).unwrap();
+        let outside = d.join("elsewhere/libfoo.dylib");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"OBJ builder-local foo").unwrap();
+        let vendored = stage.join(VENDOR_REL);
+        let undeclared = |report: &Report| {
+            report.unresolved.len() == 1
+                && report.unresolved[0].starts_with("libfoo.dylib: ")
+                && report.unresolved[0].contains("is not inside a declared donor root")
+        };
+
+        // The rule itself, called directly: through relocate a path outside every donor
+        // root reaches it only when it is machine-local (/Users/, /home/), and a scratch
+        // dir is neither.
+        let backend = ScriptedBackend {
+            refs: BTreeMap::new(),
+        };
+        let mut have = BTreeSet::new();
+        let mut report = Report::default();
+        let copied = vendor_file(
+            &outside,
+            &VendorTo {
+                dir: &vendored,
+                backend: &backend,
+                donor_roots: std::slice::from_ref(&seal),
+            },
+            "libfoo.dylib",
+            &mut have,
+            &mut report,
+        )
+        .expect("an undeclared library is unresolved, never an error");
+        assert!(!copied, "a library outside every donor root was vendored");
+        assert!(undeclared(&report), "{:?}", report.unresolved);
+        assert!(report.vendored.is_empty() && report.vendored_from.is_empty());
+        assert!(have.is_empty());
+        assert!(!vendored.exists(), "nothing may be written to {VENDOR_REL}");
+
+        // Through relocate: an @rpath load whose rpath IS the donor root's lib/, where
+        // the library is a symlink out of the root. The rpath names the donor; the bytes
+        // are not the donor's, so they are not vendored.
+        std::os::unix::fs::symlink(&outside, seal.join("lib/libfoo.dylib")).unwrap();
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool,
+                ObjectRefs {
+                    needed: vec!["@rpath/libfoo.dylib".to_string()],
+                    rpaths: vec![seal.join("lib").display().to_string()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let report =
+            relocate_with(&stage, &backend, None, std::slice::from_ref(&seal)).expect("relocate");
+        assert!(report.vendored.is_empty(), "{:?}", report.vendored);
+        assert!(undeclared(&report), "{:?}", report.unresolved);
+        assert!(report.require_self_contained().is_err());
+        assert!(
+            !vendored.join("libfoo.dylib").exists(),
+            "nothing may be written to {VENDOR_REL}"
+        );
+    }
+
     /// A hard-link group leaves relocation as ONE file: rewritten and signed once, under
     /// its first name, with the other names re-linked onto the result. Relocating name
     /// by name — what this pass did — severed the group, because the real tools replace
@@ -1062,7 +1487,7 @@ mod tests {
         let backend = ReplacingBackend {
             log: std::cell::RefCell::default(),
         };
-        let report = relocate_with(&stage, &backend, None).unwrap();
+        let report = relocate_with(&stage, &backend, None, &[]).unwrap();
         assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
         assert_eq!(report.rewritten, 3, "one rewrite per object, not per name");
 

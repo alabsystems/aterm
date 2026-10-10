@@ -478,6 +478,7 @@ impl App {
                 || self
                     .strain_seam_window()
                     .and_then(|wid| self.windows.get(&wid))
+                    .map(Box::as_ref)
                     .is_some_and(band_on_screen),
         }
     }
@@ -532,6 +533,34 @@ impl App {
             && let Some(proxy) = self.proxy.as_ref()
         {
             self.strain.request(proxy, now);
+        }
+    }
+
+    /// The row's silence ends its episode (ruling 441 (u)). The loop settles
+    /// the band before [`Self::strain_tick`] (`new_events`, `about_to_wait`),
+    /// and the row's staleness cap runs from its last restatement, so it falls
+    /// before the engine's lapse and the band's own `stale_at` wakes the loop
+    /// for it: the row retired Stale (`⚠ … stopped`, counted in Problems) and
+    /// the lapse then posted the episode's record beside it. The band's settle
+    /// calls this first ([`Self::settle_messages`]): an episode whose row
+    /// would go stale now ends where sampling stopped, as its lapse would, and
+    /// the row becomes its record (ruling 209: one entry per episode).
+    pub(crate) fn strain_end_before_stale(&mut self, now: Instant) {
+        if !self.strain.enabled() || self.strain.calm() {
+            return;
+        }
+        let stale = self
+            .strain
+            .row
+            .and_then(|id| self.messages.live(id))
+            .and_then(|row| row.stale_at)
+            .is_some_and(|at| now >= at);
+        if !stale {
+            return;
+        }
+        let out = self.strain.engine.end_where_sampling_stopped();
+        if out != StrainOut::None {
+            self.perform_strain(out);
         }
     }
 
@@ -704,10 +733,12 @@ impl App {
     }
 
     /// Do what the engine said. A fold withdraws the row (a Vanish, never ✓)
-    /// and its log entry becomes the episode's record (`withdraw_as`: one
-    /// entry per episode on Settings ▸ Messages). A record with no live row
-    /// (it faded or never showed) is posted as its own, never under a live
-    /// row's key, which it would silently supersede.
+    /// and its log entry becomes the episode's record, its words and its mark
+    /// (`withdraw_as_record`: one entry per episode on Settings ▸ Messages,
+    /// ruling 209; an episode that saw critical memory reads Warn whatever
+    /// its row last said, ruling 441 (c)). A record with no live row (it faded
+    /// or never showed) is posted as its own, never under a live row's key,
+    /// which it would silently supersede.
     pub(crate) fn perform_strain(&mut self, out: StrainOut) {
         match out {
             StrainOut::None => {}
@@ -731,9 +762,7 @@ impl App {
                 let row = self.strain.row.take();
                 let became = match (row, record.as_ref()) {
                     (Some(id), Some(rec)) => {
-                        let done =
-                            self.messages
-                                .withdraw_as(id, &rec.title, &rec.detail, Instant::now());
+                        let done = self.messages.withdraw_as_record(id, rec, Instant::now());
                         if done {
                             self.sync_messages();
                         }
@@ -762,8 +791,8 @@ impl App {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use aterm_messages::STRAIN_KEY;
-    use aterm_messages::strain::Reading;
+    use aterm_messages::strain::{Reading, StrainOut};
+    use aterm_messages::{Glyph, STRAIN_KEY, Severity};
 
     use super::REMOTE_PROGRAMS;
     use crate::input::{InputEvent, Source};
@@ -1183,6 +1212,73 @@ mod tests {
             .find(|l| l.starts_with("shown for "))
             .expect("the shown-for line");
         assert!(glass.ends_with(" s"), "seconds, not the hour away: {glass}");
+    }
+
+    /// The same episode under the loop's real order (ruling 441 (u)): the
+    /// band settles (`new_events`, `about_to_wait`) before `strain_tick`, and
+    /// the row's own `stale_at` falls before the engine's lapse. The episode
+    /// still leaves ONE entry, the withdrawn record (ruling 209), never a
+    /// Stale ⚠ row beside a second record.
+    #[test]
+    fn an_unfocused_episode_leaves_one_entry_under_the_loops_order() {
+        let mut app = on_screen_app();
+        let t0 = Instant::now();
+        drive(&mut app, t0, 12);
+        assert_eq!(app.strain.engine.state_word(), "open");
+        app.windows.get_mut(&WID).unwrap().focused = false;
+        let away = t0 + Duration::from_secs(12 + 3600);
+        app.settle_messages(away);
+        app.strain_tick(away);
+        assert_eq!(app.strain.engine.state_word(), "calm");
+        let entries = strain_entries(&app);
+        let warned: Vec<String> = app
+            .messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(STRAIN_KEY) && r.severity == Severity::Warn)
+            .map(|r| r.title.clone())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one episode, one entry: {entries:?} (warn: {warned:?})"
+        );
+        assert_eq!(entries[0].2, Some("withdrawn"), "{entries:?}");
+        assert!(warned.is_empty(), "a false problem: {warned:?}");
+    }
+
+    /// The host's fold makes the episode's one entry its record WHOLE, the
+    /// mark with it (ruling 441 (c)): an episode that saw critical memory
+    /// records Warn though a calmer reading restated its row Info.
+    #[test]
+    fn the_hosts_fold_gives_the_entry_the_records_mark() {
+        let mut app = on_screen_app();
+        drive(&mut app, Instant::now(), 12);
+        let id = app.strain.row.expect("premise: the row is up");
+        let mut record = app.messages.live(id).expect("the row").msg.clone();
+        assert_eq!(
+            record.severity,
+            Severity::Info,
+            "premise: the row says Info"
+        );
+        record.title = "Typing was slow".to_string();
+        record.severity = Severity::Warn;
+        record.glyph = Glyph::or_fallback('\u{26a0}');
+        app.perform_strain(StrainOut::Fold {
+            record: Some(record),
+        });
+        let entry = app
+            .messages
+            .log()
+            .get(id)
+            .expect("the row became the entry");
+        assert_eq!(entry.title, "Typing was slow", "{entry:?}");
+        assert_eq!(
+            entry.severity,
+            Severity::Warn,
+            "the entry reads the row's last mark, not the record's: {entry:?}"
+        );
+        assert_eq!(strain_entries(&app).len(), 1, "one entry per episode");
     }
 
     /// Without the dev seam, keys to an unfocused window are never samples,

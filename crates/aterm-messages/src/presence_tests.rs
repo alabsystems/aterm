@@ -17,8 +17,8 @@ use crate::presence::{
 use crate::{Duration, Instant};
 
 /// A test host: its walls are a usage window and a full context, its stall
-/// is `(since, stopped, survived)`, its harness is `harness@1`, and its
-/// percent codec spells a space `%20`.
+/// is `(since, stopped, survived, restart)`, its harness is `harness@1`, and
+/// its percent codec spells a space `%20`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestHost {}
 
@@ -36,6 +36,7 @@ pub(crate) struct TestStall {
     since: Instant,
     stopped: bool,
     survived: bool,
+    restart: Option<String>,
 }
 
 impl Host for TestHost {
@@ -72,6 +73,10 @@ impl Host for TestHost {
 
     fn stall_survived(s: &TestStall) -> bool {
         s.survived
+    }
+
+    fn stall_restart(s: &TestStall) -> Option<&str> {
+        s.restart.as_deref()
     }
 
     fn is_aterms_holder(h: &str) -> bool {
@@ -179,6 +184,7 @@ fn levels_rank_as_the_design_table_and_the_window_shows_less() {
         since: now,
         stopped: false,
         survived: false,
+        restart: None,
     };
     assert_eq!(
         at(TFacts {
@@ -557,36 +563,61 @@ fn fp_is_zero_on_a_quiet_view() {
 
 /// The phase slot for a published input stall: `frozen <dur> · not reading
 /// input` and its spoken remedy, the survivor's `end it with signal kill`,
-/// and `stopped <dur> · input queued` for a stopped job. The duration counts
-/// from the oldest unread byte. (Moved from the host's `input_stall`, where
-/// a seam test still drives a real published stall through the row.)
+/// and `stopped <dur> · input queued` for a stopped job. Where the host
+/// would carry the restart ([`Host::stall_restart`]) both frozen remedies
+/// name it instead, the printed slot unchanged; a stopped job's stays
+/// `resume it`. The duration counts from the oldest unread byte. (Moved from
+/// the host's `input_stall`, where a seam test still drives a real published
+/// stall through the row.)
 #[test]
 fn the_stall_says_frozen_or_stopped_with_the_age_and_the_remedy() {
     let now = Instant::now();
-    assert_eq!(
-        stall_words(now, false, false, now + Duration::from_secs(9660)),
+    let later = now + Duration::from_secs(9660);
+    let act = "aterm ctl @s-1 restart pid=4242 if-stalled";
+    let frozen = |spoken: &str| {
         (
             "frozen".to_string(),
             vec!["2h41m".to_string(), "not reading input".to_string()],
-            "frozen, not reading input for 2h41m; restart it".to_string(),
+            spoken.to_string(),
         )
-    );
-    assert_eq!(
-        stall_words(now, false, true, now + Duration::from_secs(9660)),
+    };
+    let survived = |spoken: &str| {
         (
             "frozen".to_string(),
             vec!["2h41m".to_string(), "survived its restart".to_string()],
-            "frozen, still running after its restart signal; end it with signal kill".to_string(),
+            spoken.to_string(),
         )
+    };
+    assert_eq!(
+        stall_words(now, false, false, None, later),
+        frozen("frozen, not reading input for 2h41m; restart it")
     );
     assert_eq!(
-        stall_words(now, true, false, now + Duration::from_secs(12)),
-        (
-            "stopped".to_string(),
-            vec!["12s".to_string(), "input queued".to_string()],
-            "stopped with input queued for 12s; resume it".to_string(),
-        )
+        stall_words(now, false, false, Some(act), later),
+        frozen(&format!(
+            "frozen, not reading input for 2h41m; restart it with {act}"
+        ))
     );
+    assert_eq!(
+        stall_words(now, false, true, None, later),
+        survived("frozen, still running after its restart signal; end it with signal kill")
+    );
+    assert_eq!(
+        stall_words(now, false, true, Some(act), later),
+        survived(&format!(
+            "frozen, still running after its restart signal; restart it with {act}"
+        ))
+    );
+    for restart in [None, Some(act)] {
+        assert_eq!(
+            stall_words(now, true, false, restart, now + Duration::from_secs(12)),
+            (
+                "stopped".to_string(),
+                vec!["12s".to_string(), "input queued".to_string()],
+                "stopped with input queued for 12s; resume it".to_string(),
+            )
+        );
+    }
 }
 
 /// Which `since` clauses print SECONDS (and so tick every second): a token
@@ -913,6 +944,7 @@ fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
         since: now,
         stopped: false,
         survived: false,
+        restart: None,
     };
     let facts = |stall: Option<TestStall>| TFacts {
         attention: Some("answer this box: 4. Chat about this".into()),
@@ -993,6 +1025,7 @@ fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
                 since: now,
                 stopped: false,
                 survived: false,
+                restart: None,
             }))
         },
         now,

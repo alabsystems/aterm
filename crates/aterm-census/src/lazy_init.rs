@@ -90,7 +90,7 @@ pub const LAZY_INIT_PRECISION_NOTE: &str =
         at tools/temporal-extract/src/main.rs. This crate's own sources are
         excluded as well, because its red fixtures quote whole Rust programs.
         Within the scanned set,
-        with `#[cfg(test)]` / `#[cfg(kani)]` items blanked: test-only code
+        with `#[cfg(test)]` items blanked: test-only code
         never ships, and a deadlock in a test is a stopped suite, not a frozen
         terminal. Cells declared INSIDE a fn body are covered (the shipped bug
         was one).
@@ -397,7 +397,7 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
 /// The derivation proper, over `(repo-relative path, masked text)` pairs — the
 /// seam the unit tests drive with synthetic sources.
 fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
-    // Test-only and kani-only items never ship: a deadlock there stops a
+    // Test-only items never ship: a deadlock there stops a
     // suite, which is loud, not a terminal, which is silent.
     let sources: Vec<(String, String)> = raw_sources
         .iter()

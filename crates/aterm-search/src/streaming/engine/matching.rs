@@ -4,8 +4,6 @@
 
 use super::super::types::{FilterMode, StreamingMatch};
 use super::StreamingSearch;
-#[cfg(kani)]
-use crate::grapheme::map_lower_byte_to_original;
 use crate::grapheme::{
     ColumnMap, LowerByteMap, LowerNeed, display_columns, lower_fold, lower_need,
 };
@@ -33,7 +31,9 @@ impl<'a> MatchColumns<'a> {
     fn resolve(&mut self, abs_pos: usize, match_len: usize) -> (usize, usize) {
         let (col_map, lower_map) = self.maps.get_or_insert_with(|| {
             (
-                ColumnMap::new(self.text),
+                // The streaming engine is fed by no terminal, so it keeps the
+                // default policy.
+                ColumnMap::new(self.text, aterm_types::text_shaping::AmbiguousWidth::Single),
                 (self.lowered && !self.text.is_ascii()).then(|| LowerByteMap::new(self.text)),
             )
         });
@@ -120,21 +120,6 @@ impl StreamingSearch {
     ) -> Vec<StreamingMatch> {
         let mut columns = MatchColumns::new(text, !self.config.case_sensitive);
 
-        #[cfg(kani)]
-        {
-            let mut matches = Vec::new();
-            for abs_pos in find_overlapping_substring_positions(search_text, search_pattern) {
-                let (start_col, end_col) = columns.resolve(abs_pos, search_pattern.len());
-                let m = StreamingMatch::new(row, start_col, end_col);
-                // Filter zero-display-width matches (INV-SEARCH-2c).
-                if m.match_len > 0 {
-                    matches.push(m);
-                }
-            }
-            matches
-        }
-
-        #[cfg(not(kani))]
         literal_find_matches(search_text, search_pattern, row, &mut columns)
     }
 
@@ -158,9 +143,8 @@ impl StreamingSearch {
 
     /// Find matches in a single row.
     ///
-    /// Literal mode has two code paths (#2688): `#[cfg(kani)]` uses an explicit
-    /// byte-level scanner that Kani can unroll; production uses `str::find()`.
-    /// Both produce identical results for valid UTF-8.
+    /// Literal mode scans with `str::find()`, advancing one character past
+    /// each hit so overlapping matches are found (#2688).
     pub(crate) fn find_matches_in_row(&self, row: usize, text: &str) -> Vec<StreamingMatch> {
         if self.pattern.is_empty() {
             return Vec::new();
@@ -232,197 +216,6 @@ fn case_fold(text: &str) -> Cow<'_, str> {
 // Gap coverage: map_lower_byte_to_original monotonicity/identity
 // Part of #2875
 // ========================================================================
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::map_lower_byte_to_original;
-
-    /// map_lower_byte_to_original monotonicity: a <= b implies
-    /// map(s, a) <= map(s, b) for ASCII input where lowering preserves
-    /// byte lengths.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn map_lower_byte_monotonic() {
-        let original = "Hello World";
-        let lowered = original.to_lowercase();
-        let a: usize = kani::any();
-        let b: usize = kani::any();
-        kani::assume(a <= b);
-        kani::assume(b <= lowered.len());
-
-        let mapped_a = map_lower_byte_to_original(original, a);
-        let mapped_b = map_lower_byte_to_original(original, b);
-
-        kani::assert(
-            mapped_a <= mapped_b,
-            "map_lower_byte_to_original must be monotonic",
-        );
-    }
-
-    /// For all-lowercase ASCII input, map_lower_byte_to_original(s, n) == n.
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn map_lower_byte_ascii_identity() {
-        let original = "abcdefghij";
-        let n: usize = kani::any();
-        kani::assume(n <= original.len());
-
-        let mapped = map_lower_byte_to_original(original, n);
-
-        kani::assert(
-            mapped == n,
-            "lowercase ASCII identity: mapped offset must equal input",
-        );
-    }
-
-    /// map_lower_byte_to_original(s, n) <= s.len() for any offset n.
-    /// The mapped offset must always be a valid position within (or at the
-    /// end of) the original string.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn map_lower_byte_bounded_by_original_len() {
-        let original = "Hello World";
-        let n: usize = kani::any();
-        // "Hello World" lowercased = "hello world", same byte length (11)
-        kani::assume(n <= 12);
-
-        let mapped = map_lower_byte_to_original(original, n);
-
-        kani::assert(
-            mapped <= original.len(),
-            "mapped offset must not exceed original string length",
-        );
-    }
-
-    /// fuzzy_match: positive subsequence cases.
-    /// If pattern characters appear in text in order, fuzzy_match returns true.
-    ///
-    /// Symbolic over test case selection: proves all positive subsequence
-    /// relationships hold by exploring each case through symbolic branching.
-    /// Also proves prefix truncation of a matching pattern still matches.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn fuzzy_match_positive_subsequences() {
-        use super::StreamingSearch;
-
-        let case: u8 = kani::any();
-        kani::assume(case <= 4);
-
-        match case {
-            // "hlo" is a subsequence of "hello" (h..l..o)
-            0 => kani::assert(
-                StreamingSearch::fuzzy_match("hello", "hlo"),
-                "hlo is a subsequence of hello",
-            ),
-            // Full string matches itself
-            1 => kani::assert(
-                StreamingSearch::fuzzy_match("abc", "abc"),
-                "exact match is a valid subsequence",
-            ),
-            // Empty pattern matches everything
-            2 => kani::assert(
-                StreamingSearch::fuzzy_match("hello", ""),
-                "empty pattern matches any text",
-            ),
-            3 => kani::assert(
-                StreamingSearch::fuzzy_match("", ""),
-                "empty pattern matches empty text",
-            ),
-            // Prefix closure: any prefix of "hlo" also matches "hello"
-            _ => {
-                let prefix_len: usize = kani::any();
-                kani::assume(prefix_len <= 3);
-                let prefix = &"hlo"[..prefix_len];
-                kani::assert(
-                    StreamingSearch::fuzzy_match("hello", prefix),
-                    "any prefix of a matching subsequence must also match",
-                );
-            }
-        }
-    }
-
-    /// fuzzy_match: negative cases.
-    /// If pattern characters do NOT appear in text in order, returns false.
-    ///
-    /// Symbolic over test case selection: proves all negative subsequence
-    /// relationships hold by exploring each case through symbolic branching.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn fuzzy_match_negative_cases() {
-        use super::StreamingSearch;
-
-        let case: u8 = kani::any();
-        kani::assume(case <= 3);
-
-        match case {
-            // Reversed order: not a subsequence
-            0 => kani::assert(
-                !StreamingSearch::fuzzy_match("hello", "olleh"),
-                "reversed pattern is not a subsequence",
-            ),
-            // Character not present
-            1 => kani::assert(
-                !StreamingSearch::fuzzy_match("hello", "xyz"),
-                "absent characters are not a subsequence",
-            ),
-            // Pattern longer than text: any suffix of "abc" beyond length of "ab" fails
-            2 => {
-                let pat_len: usize = kani::any();
-                kani::assume(pat_len >= 3 && pat_len <= 3);
-                let pattern = &"abc"[..pat_len];
-                kani::assert(
-                    !StreamingSearch::fuzzy_match("ab", pattern),
-                    "pattern longer than text cannot be a subsequence",
-                );
-            }
-            // Non-empty pattern on empty text: any non-empty prefix of "abc" fails
-            _ => {
-                let pat_len: usize = kani::any();
-                kani::assume(pat_len >= 1 && pat_len <= 3);
-                let pattern = &"abc"[..pat_len];
-                kani::assert(
-                    !StreamingSearch::fuzzy_match("", pattern),
-                    "non-empty pattern does not match empty text",
-                );
-            }
-        }
-    }
-
-    /// fuzzy_match structural property: if fuzzy_match(text, pattern) is true,
-    /// then fuzzy_match(text, prefix_of_pattern) is also true (prefix closure).
-    ///
-    /// Symbolic over prefix length: for known-matching patterns "ace" and "bde",
-    /// proves that any prefix (length 0 to full) also matches. This is the
-    /// core prefix closure property of subsequence matching.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn fuzzy_match_prefix_closure() {
-        use super::StreamingSearch;
-
-        let text = "abcde";
-
-        // Choose which matching pattern to test prefix closure on
-        let use_second: bool = kani::any();
-        let full_pattern = if use_second { "bde" } else { "ace" };
-        let full_len = full_pattern.len(); // 3 for both
-
-        // Verify the full pattern matches first
-        kani::assert(
-            StreamingSearch::fuzzy_match(text, full_pattern),
-            "full pattern must be a subsequence of text",
-        );
-
-        // Symbolic prefix length: any prefix of the matching pattern must also match
-        let prefix_len: usize = kani::any();
-        kani::assume(prefix_len <= full_len);
-        let prefix = &full_pattern[..prefix_len];
-
-        kani::assert(
-            StreamingSearch::fuzzy_match(text, prefix),
-            "any prefix of a matching subsequence must also match (prefix closure)",
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -742,36 +535,4 @@ mod tests {
         assert_eq!(engine.state(), SearchState::HasResults);
         assert_eq!(engine.result_count(), 3);
     }
-}
-
-/// Kani-only byte-level substring scanner. Equivalent to the production
-/// `str::find()` loop for valid UTF-8 inputs but expressed in terms Kani
-/// can unroll and verify. See #2688 for the dual-path rationale.
-#[cfg(kani)]
-fn find_overlapping_substring_positions(haystack: &str, needle: &str) -> Vec<usize> {
-    let mut positions = Vec::new();
-    if needle.is_empty() {
-        return positions;
-    }
-
-    let haystack_bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-
-    if needle_bytes.len() > haystack_bytes.len() {
-        return positions;
-    }
-
-    let mut i = 0usize;
-    while i + needle_bytes.len() <= haystack_bytes.len() {
-        let mut j = 0usize;
-        while j < needle_bytes.len() && haystack_bytes[i + j] == needle_bytes[j] {
-            j += 1;
-        }
-        if j == needle_bytes.len() {
-            positions.push(i);
-        }
-        i += 1;
-    }
-
-    positions
 }

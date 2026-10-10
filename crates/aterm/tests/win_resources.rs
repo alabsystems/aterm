@@ -7,8 +7,7 @@
 //! (`assets/aterm.manifest` and aterm-gui's `.ico`), a macOS-only contributor can
 //! break them just as easily as a Windows one, and the failure they guard against
 //! is invisible until someone launches the built binary on Windows and looks at
-//! the title bar — which is exactly how the missing icon shipped for months in the
-//! first place.
+//! the title bar.
 //!
 //! What they cannot check: that a resource compiler was actually present and the
 //! `.rsrc` section really landed. That is a property of the built PE, not of the
@@ -142,8 +141,7 @@ fn manifest_leaves_dpi_awareness_to_winit() {
     );
 }
 
-/// THE SECOND TRAP, and the expensive one — this shipped once, in a build that
-/// looked completely fixed.
+/// THE SECOND TRAP.
 ///
 /// `VS_VERSION_INFO` and `RT_MANIFEST` are MACROS from the Windows SDK headers.
 /// `build.rs` deliberately includes no SDK header (so a box with `rc.exe` but no
@@ -156,9 +154,7 @@ fn manifest_leaves_dpi_awareness_to_winit() {
 /// block at all. Measured, not theorised.
 ///
 /// So the resource script must spell both as numbers. This is a source-text guard
-/// because the property it protects only exists in a linked PE — it cannot be
-/// asserted from a unit test, and by the time anyone notices on glass the symptom
-/// is identical to the bug this whole change set fixes.
+/// because the property it protects only exists in a linked PE.
 #[test]
 fn resource_script_uses_numeric_ids_not_sdk_macros() {
     let src = std::fs::read_to_string(crate_dir().join("build.rs")).expect("build.rs is readable");

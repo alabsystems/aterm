@@ -6,12 +6,9 @@
 
 use super::types::*;
 
-#[cfg(kani)]
-type SeenPositions = Vec<(usize, usize)>;
-#[cfg(not(kani))]
 type SeenPositions = std::collections::HashSet<(usize, usize)>;
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 mod invariants;
 mod matching;
 mod operations;
@@ -95,7 +92,7 @@ impl StreamingSearch {
 
     /// Get the current pattern.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -189,60 +186,8 @@ impl StreamingSearch {
     }
 
     fn record_seen_position(&mut self, pos_key: (usize, usize)) {
-        #[cfg(kani)]
-        {
-            self.seen_positions.push(pos_key);
-        }
-
-        #[cfg(not(kani))]
         {
             self.seen_positions.insert(pos_key);
         }
-    }
-
-    /// Seed a valid terminal search state without exercising the full
-    /// match-finding pipeline. Kani operation proofs use this to focus on
-    /// post-search transitions like invalidation and pattern updates.
-    ///
-    /// The caller is responsible for providing unique, positive-width results
-    /// and a valid 1-based `current_index`. Re-running `verify_all_invariants`
-    /// here doubles the proof cost for the `proofs_gaps` harnesses and pushes
-    /// CBMC into watchdog kills on otherwise concrete states (#6119).
-    #[cfg(kani)]
-    #[doc(hidden)]
-    pub(crate) fn kani_seed_results(
-        &mut self,
-        pattern: &str,
-        current_index: usize,
-        results: &[(usize, usize, usize)],
-    ) {
-        self.pattern = pattern.to_string();
-        self.filter_mode = FilterMode::Literal;
-        self.state = if results.is_empty() {
-            SearchState::NoResults
-        } else {
-            SearchState::HasResults
-        };
-        self.results.clear();
-        self.seen_positions.clear();
-        self.scan_progress = -1;
-        self.total_matches = results.len();
-
-        self.compiled_regex = None;
-
-        for &(row, start_col, end_col) in results {
-            self.record_seen_position((row, start_col));
-            self.results
-                .push(StreamingMatch::new(row, start_col, end_col));
-        }
-
-        self.current_index = current_index;
-        debug_assert!(
-            (self.results.is_empty() && self.current_index == 0)
-                || (!self.results.is_empty()
-                    && self.current_index >= 1
-                    && self.current_index <= self.results.len()),
-            "kani_seed_results requires a valid current_index",
-        );
     }
 }

@@ -7,10 +7,9 @@
 // container must NEVER panic on adversarial input — a panic is a
 // denial-of-service. The single highest-value internal overflow site is
 // `Rle::checked_run_length_sum`, whose saturation must never fire: summed run
-// lengths never exceed `u32::MAX` (historically enforced by an `.expect()`
-// panic at the same site). This fuzz proves that invariant holds across every
-// public mutator, including starting states seeded near the `u32::MAX`
-// boundary via `with_value`, where overflow would be most likely to surface.
+// lengths never exceed `u32::MAX`. This fuzz proves that invariant across every
+// public mutator, including starting states seeded near the `u32::MAX` boundary
+// via `with_value`, where overflow would be most likely to surface.
 
 use aterm_rle::{Rle, Run};
 

@@ -4,13 +4,11 @@
 //! The crash marker's lifecycle across REAL aterm processes sharing one log
 //! dir (`aterm-gui`'s `crash_signal::markers`).
 //!
-//! THE DEFECT (measured 2026-09-24 on the owner's Mac, 0.93.0): every GUI-mode
-//! start swept every empty crash marker in the log dir, owner alive or not. A
-//! stray start (pid 87172) unlinked the running daily driver's marker 20 ms
-//! after arming its own, so a SIGSEGV of the daily driver would have left no
-//! artifact; and because a clean run never removed its own marker, a SIGKILL
-//! looked exactly like a clean quit. What this pins, one scratch `$HOME`, three
-//! headless instances:
+//! THE DEFECT: every GUI-mode start swept every empty crash marker in the log
+//! dir, owner alive or not, so a stray start unlinked the running daily
+//! driver's marker (a SIGSEGV of it would have left no artifact); and a clean
+//! run never removed its own marker, so a SIGKILL looked like a clean quit.
+//! What this pins, one scratch `$HOME`, three headless instances:
 //!
 //! 1. B starting does NOT remove A's marker (A is alive, holding its lock);
 //! 2. B SIGKILLed leaves its marker; C starting removes it (B is gone and B was
@@ -27,7 +25,7 @@
 //! (`support/launch_isolation.rs`). A headless instance opens no window; one
 //! that cannot start FAILS the test (`support/headless_boot.rs` `await_ready`),
 //! SKIP only on an environment refusal named there (scratch, log, spawn, a
-//! refused bind, AppKit's refused WindowServer connection).
+//! refused bind).
 
 #![cfg(unix)]
 

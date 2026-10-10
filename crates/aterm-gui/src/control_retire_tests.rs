@@ -72,8 +72,9 @@ impl LaneService for MainThreadVerbs {
         &self,
         line: String,
         _scope: Scope,
-        stream: &CtlStream,
+        _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
+        out: &mut Vec<u8>,
     ) -> Option<ServeDisposition> {
         if line == "hold" {
             let mut hold = self.hold.lock().unwrap_or_else(PoisonError::into_inner);
@@ -86,10 +87,8 @@ impl LaneService for MainThreadVerbs {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
-        (&*stream)
-            .write_all(format!("OK {line}\n").as_bytes())
-            .is_err()
-            .then_some(ServeDisposition::Close)
+        out.extend_from_slice(format!("OK {line}\n").as_bytes());
+        None
     }
 
     fn is_wait(&self, _line: &str, _scope: Scope) -> bool {

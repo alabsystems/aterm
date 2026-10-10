@@ -413,8 +413,8 @@ pub fn ligature_gate_model() -> Model {
 /// `tests/hdr_gate.rs` exhaustive 2^3 enumeration of BOTH shipping functions
 /// chained Attach→Present, asserting THESE invariants (a complete proof — the
 /// domain is finite booleans). The float clamp laws the gate FEEDS (grid ≤ 1.0,
-/// additive ≤ EDR headroom) are proven separately in `aterm_render::hdr`
-/// (exhaustive sweeps + trust-mc harnesses) — ty carries the boolean policy,
+/// additive ≤ EDR headroom) are checked separately in `aterm_render::hdr`
+/// (exhaustive sweeps and the special-float boundaries) — ty carries the boolean policy,
 /// per the derive-layer division of labour.
 ///
 /// Scalar projection `<<hdr_glow, supports_f16, glow, attached, is_f16,
@@ -889,7 +889,7 @@ pub fn chrome_face_gate_model() -> Model {
     }
 }
 
-/// MOTION POLICY (W11) — reduced-motion totality: the abstract twin of the
+/// MOTION POLICY — reduced-motion totality: the abstract twin of the
 /// pure `aterm_effects::motion::MotionPolicy::resolve` + `amplitude` (the
 /// Tier-1 binding is that module's `reduced_motion_totality` test, which
 /// enumerates the SAME 3×2×2 input domain × the full governed-effect set over
@@ -898,10 +898,7 @@ pub fn chrome_face_gate_model() -> Model {
 /// The model abstracts the amplitude as ONE scalar over the whole governed set
 /// (the per-effect arm is a constant 0 under Reduced), so a NEW governed effect
 /// joins the proof through `MotionEffect::ALL` + the exhaustive `amplitude`
-/// match, not through an edit here — and a RETIRED one leaves the same way
-/// (`MotionEffect::PkgProgressCard`, the floating progress card's
-/// rainbow/sparkle/cat trim, went with the card on 2026-08-26; the status bars
-/// that replaced it carry no time-driven decoration to govern).
+/// match, not through an edit here — and a retired one leaves the same way.
 ///
 /// Scalar projection `<<mode, sys, focused, resolved, policy, amp>>`: `Observe`
 /// nondeterministically picks the three motion facts (`mode ∈ 0..2` =
@@ -910,9 +907,8 @@ pub fn chrome_face_gate_model() -> Model {
 /// and the animation amplitude (`amp ∈ {0,1}`, the integer twin of the f32
 /// scalar every effect consumes) in the same step.
 ///
-/// `Buggy` gates the PRE-W11 defect: the OS reduce-motion flag was never
-/// queried (app_config.rs literally said "OS reduced-motion query is a future
-/// refinement"), so with `Buggy = 1` the amplitude ignores `sys` under auto —
+/// `Buggy` gates the unqueried OS reduce-motion flag: with `Buggy = 1` the
+/// amplitude ignores `sys` under auto —
 /// a focused auto-mode window keeps animating (`amp = 1`) while the policy is
 /// Reduced, violating `ReducedImpliesZeroAmplitude`. `ty` PROVES the invariant
 /// at Buggy=0 and CATCHES that regression at Buggy=1.
@@ -1021,7 +1017,7 @@ pub fn motion_policy_model() -> Model {
         ],
         invariants: vec![
             Invariant {
-                // THE W11 PROVE bullet: a Reduced policy has EXACTLY zero
+                // A Reduced policy has EXACTLY zero
                 // animation amplitude — resolved /\ policy = 0 => amp = 0.
                 name: "ReducedImpliesZeroAmplitude",
                 expr: or_(
@@ -1183,8 +1179,8 @@ pub fn serious_mode_model() -> Model {
 /// What it does NOT claim: how much work a repeat does. A repeat over the
 /// materialized hit vector is `SearchState::step`'s modular arithmetic, and no
 /// shipping counter records work a bind could read, so a "work <= 1" law here
-/// could never fail on a linear-scan regression. It was deleted, with the twin
-/// model that stated it alone; query construction keeps its own engine counters.
+/// could never fail on a linear-scan regression; query construction keeps its
+/// own engine counters.
 ///
 /// `Buggy=1` is the regression family, one member per design law: opening leaks
 /// a byte to the PTY (`NoPtyLeak`); a forward repeat steps past the final
@@ -1335,7 +1331,7 @@ pub fn emacs_search_navigation_model() -> Model {
     }
 }
 
-/// SCROLL-GLIDE CONVERGENCE + POLICY SETTLEMENT (M1/W11) — the smooth-scroll
+/// SCROLL-GLIDE CONVERGENCE + POLICY SETTLEMENT — the smooth-scroll
 /// wheel glide's lifecycle discipline. Under Full motion, an armed glide makes
 /// strict progress toward its target on every wake, disarms EXACTLY when it
 /// lands there, and therefore wakes a BOUNDED number of times per arm (no
@@ -1377,8 +1373,8 @@ pub fn emacs_search_navigation_model() -> Model {
 /// content (`TargetIsAnchored`). With `Buggy = 1`, `SetReduced` retains the
 /// intermediate position and armed deadline — the old whole-row sampling
 /// behavior — so `ReducedSettled` yields a counterexample; and `Output` re-pins
-/// the viewport but leaves the target where it was — the pre-2026-09-22 tick that
-/// scrolled the reader back toward live by `lines_added` on every wake — so
+/// the viewport but leaves the target where it was — a tick that scrolls the
+/// reader back toward live by `lines_added` on every wake — so
 /// `TargetIsAnchored` yields one. Thus `ty` proves ordinary convergence,
 /// immediate Reduced settlement and anchoring under output, and catches both
 /// mutants.
@@ -1496,8 +1492,8 @@ pub fn scroll_glide_model() -> Model {
                 // (`Glide::shift`) — so the remaining distance and the wake
                 // budget are unchanged. `aim` captures the person's target the
                 // first time the machine moves it (until then it IS `target`).
-                // Buggy re-pins the viewport but leaves the target behind: the
-                // pre-2026-09-22 tick that scrolled the reader back toward live.
+                // Buggy re-pins the viewport but leaves the target behind, so
+                // each tick scrolls the reader back toward live.
                 name: "Output",
                 guard: Some(and_(
                     and_(gt(var("armed"), int(0)), le(var("reduced"), int(0))),
@@ -1557,7 +1553,7 @@ pub fn scroll_glide_model() -> Model {
             Action {
                 // Full→Reduced accessibility edge. Committed code lands and
                 // disarms atomically. Buggy retains both the intermediate row and
-                // its armed deadline, matching the audited scheduler defect.
+                // its armed deadline.
                 name: "SetReduced",
                 guard: Some(le(var("reduced"), int(0))),
                 updates: vec![
@@ -1682,7 +1678,7 @@ pub fn grid_translate_model() -> Model {
     }
 }
 
-/// DECORATION BAND CONTAINMENT (cross-cutting theorem (c), W7) — the ordering
+/// DECORATION BAND CONTAINMENT (cross-cutting theorem (c)) — the ordering
 /// policy behind `aterm_render::deco::clamp_band` and every decoration WRITE
 /// emitter (`underline_rects_into`, `strike_rect`, `overline_rect`): a decoration band never
 /// leaves its cell. The band `(top, thickness)` is clamped in a SPECIFIC ORDER —
@@ -1869,7 +1865,7 @@ pub fn deco_band_containment_model() -> Model {
 /// gate facts (the full 2^5 fan-out) and marks the decision stale; `Resolve`
 /// runs the gate once over the observed facts — `fade` = 1 iff the config is
 /// on AND no bypass (keystroke echo in flight / alternate screen /
-/// scrolled-back viewport / W11 Reduced motion) holds.
+/// scrolled-back viewport / Reduced motion) holds.
 ///
 /// `Buggy` gates the taste defect the gate exists to prevent: with `Buggy = 1`
 /// the `input_hot` fact is ignored, so a keystroke's echo fades in — typed
@@ -2009,7 +2005,7 @@ pub fn stream_fade_gate_model() -> Model {
                 expr: instant_when(le(var("scrolled_back"), int(0))),
             },
             Invariant {
-                // W11: resolved ∧ reduced-motion ⇒ fade = 0.
+                // resolved ∧ reduced-motion ⇒ fade = 0.
                 name: "InstantUnderReducedMotion",
                 expr: instant_when(le(var("reduced"), int(0))),
             },
@@ -2250,7 +2246,7 @@ pub fn shade_phase_model() -> Model {
     }
 }
 
-/// W6 STYLED-RUN FACE — the abstract twin of the pure styled-face policy
+/// STYLED-RUN FACE — the abstract twin of the pure styled-face policy
 /// `aterm_render::resolve_styled_face` on the LIGATURE-RUN seam (the real code
 /// seam is `Renderer::run_face_pick` / `row_glyph_plan`'s shaping closure /
 /// `rasterize`'s MonoGid arm; Tier-1 is aterm-render's
@@ -2340,7 +2336,7 @@ pub fn styled_run_face_model() -> Model {
     }
 }
 
-/// W6 FALLBACK-CHAIN PRECEDENCE — the abstract twin of the pure ordering law
+/// FALLBACK-CHAIN PRECEDENCE — the abstract twin of the pure ordering law
 /// `aterm_render::fallback_chain_order` (the real code seam is the
 /// `set_config_fallback_fonts` / `set_config_symbol_font` /
 /// `set_config_emoji_font` candidate-list builders, whose loaders take the
@@ -2352,8 +2348,7 @@ pub fn styled_run_face_model() -> Model {
 /// fonts used to be configurable ONLY via `$ATERM_FALLBACK_FONT`-family env
 /// vars, and the TOML keys (`fallback_fonts` / `symbol_font` / `emoji_font`)
 /// that replaced them must STRICTLY OUTRANK built-in discovery (discovery always
-/// exists — the built-in candidate list is non-empty). The env tier that sat
-/// between the two was deleted on 2026-09-24, so the law is two classes.
+/// exists — the built-in candidate list is non-empty). There are two classes.
 ///
 /// Scalar projection `<<cfg_present, winner>>`: presence of a config entry, and
 /// `winner` = the class of the chain's FIRST candidate (1 = config,
@@ -2414,7 +2409,7 @@ pub fn fallback_precedence_model() -> Model {
     }
 }
 
-/// W2 TEXT-BLEND GATE — the abstract twin of the texel-level policy
+/// TEXT-BLEND GATE — the abstract twin of the texel-level policy
 /// `aterm_render::correction_applies` (the real code seam; Tier-1 lives in
 /// `aterm-render/tests/text_blending.rs`, which enumerates the gate's COMPLETE
 /// `bool × u8 × bool` domain and binds it to the shipping byte-level
@@ -2541,7 +2536,7 @@ pub fn text_blend_gate_model() -> Model {
     }
 }
 
-/// W5b MINIMUM-CONTRAST FLOOR — the abstract twin of
+/// MINIMUM-CONTRAST FLOOR — the abstract twin of
 /// `aterm_render::floor_fg_contrast`'s delivery bound (the real code seam;
 /// Tier-1 lives in `aterm-render/tests/contrast_floor.rs`, which checks the
 /// same bound against an independent WCAG oracle, exhaustively over grayscale
@@ -2801,7 +2796,7 @@ pub fn vibrancy_contrast_model() -> Model {
     }
 }
 
-/// W1 COMPOSITOR-STRETCH FIX — the abstract twin of the window-fit + padding-
+/// COMPOSITOR-STRETCH FIX — the abstract twin of the window-fit + padding-
 /// absorption policy `aterm_render::pad_split` (the real code seam; Tier-1 lives
 /// in `aterm-render/tests/pad_absorption.rs`, which drives THIS model's own
 /// interpreter against the shipping function point-for-point over the model's
@@ -2817,8 +2812,8 @@ pub fn vibrancy_contrast_model() -> Model {
 /// The `ty` expression language has no `*`/`/`, so the model builds `cols*cell`
 /// by REPEATED ADDITION (`FitColumn` accumulates `acc += cell` while it fits;
 /// maximality is the `Settle` guard) and computes `rem/2` by a bounded case
-/// split (`rem <= 3` on this lattice). The full-bit-width arithmetic twin lives
-/// in `aterm-render`'s `pad_split_kani` trust-mc harnesses.
+/// split (`rem <= 3` on this lattice). The wider arithmetic lattice lives in
+/// `aterm-render`'s `tests/pad_absorption.rs`.
 ///
 /// `Buggy` gates the defect class the near-even law exists to forbid: with
 /// `Buggy = 1` the WHOLE remainder lands on the trailing edge (`pad_lo` keeps
@@ -3014,11 +3009,11 @@ pub fn pad_absorption_model() -> Model {
 /// * the cache gate keys dimensions/content only, so a moved origin HITS a
 ///   stale frame (`LayoutChangeForcesFullRepaint`);
 /// * the gate compares a size the stored frame never has, so it never holds and
-///   every present falls back to a full repaint — `d8a744d24`'s scissored
-///   present, whose `offscreen_holds_prev` sized the gate UNPADDED against a
-///   PADDED offscreen and so was always false at `pad > 0`, which is every
-///   point of this lattice (`IdenticalLayoutMayReuseCache`; the Tier-1
-///   identical-layout arm is the real renderer gate-hitting instead).
+///   every present falls back to a full repaint — a scissored present's
+///   `offscreen_holds_prev` gate sized UNPADDED against a PADDED offscreen is
+///   always false at `pad > 0`, which is every point of this lattice
+///   (`IdenticalLayoutMayReuseCache`; the Tier-1 identical-layout arm is the
+///   real renderer gate-hitting instead).
 ///
 /// The two gate faults are alternatives, not one implementation, and so are the
 /// two changed-top faults, so `Buggy=1` picks one of each per layout in
@@ -3119,7 +3114,7 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 init: 0,
             },
             // Which gate fault a `Buggy=1` layout carries: 0 the
-            // dimension-only key, 1 the always-false `d8a744d24` gate. Always 0
+            // dimension-only key, 1 the always-false padded-size gate. Always 0
             // at `Buggy=0`, where no fault exists to choose.
             StateVar {
                 name: "gate_fault",
@@ -3255,7 +3250,7 @@ pub fn asymmetric_pad_layout_model() -> Model {
                 )),
                 updates: vec![
                     // Buggy's gate ignores the origin: the dimension-only key
-                    // always hits, the `d8a744d24` gate never does.
+                    // always hits, the padded-size gate never does.
                     Update {
                         var: "cache_hit",
                         expr: if_(
@@ -3560,14 +3555,14 @@ pub fn visible_pad_crop_model() -> Model {
     }
 }
 
-/// W3 CT FRACTIONAL BEARING — the abstract twin of the CoreText sub-pixel
+/// CT FRACTIONAL BEARING — the abstract twin of the CoreText sub-pixel
 /// placement policy `aterm_render::ct_pen_and_bearing` (the real code seam is
 /// `CtFont::rasterize`; Tier-1 lives in
 /// `aterm-render/tests/ct_fractional_bearing.rs`, which sweeps the pure fn over
 /// a dense dyadic lattice AND drives THIS model's own interpreter against it
 /// point-for-point, plus the FFI binding test in aterm-render's lib tests).
 ///
-/// The sin (audit sin 10): `CtFont::rasterize` pinned each ink box to an
+/// The defect: `CtFont::rasterize` pinned each ink box to an
 /// integer bitmap origin (pen `= -b`) and reported `round(b)` bearings, so
 /// every glyph sat up to 0.5px off its designed position per axis, error
 /// varying glyph-to-glyph. The fix splits the padded ink-box origin `b` into
@@ -3725,7 +3720,7 @@ pub fn ct_frac_bearing_model() -> Model {
     }
 }
 
-/// W4 CURSOR-CUT-OUT CLIP — the abstract twin of the block-cursor cut-out's
+/// CURSOR-CUT-OUT CLIP — the abstract twin of the block-cursor cut-out's
 /// x-clip window (the real code seam is `aterm_render::clip_span`, which every
 /// cut-out blit routes through, and `glyph_quad`'s x-clip on the GPU; Tier-1
 /// lives in `aterm-render/tests/cursor_ink.rs`, whose exhaustive lattice tests
@@ -3733,7 +3728,7 @@ pub fn ct_frac_bearing_model() -> Model {
 /// sweep enforces it end-to-end: the complement of the cursor rect is
 /// byte-identical to the no-cursor frame).
 ///
-/// The sin (audit sin 3): the cut-out re-blitted the ENTIRE glyph in cell-bg
+/// The defect: the cut-out re-blitted the ENTIRE glyph in cell-bg
 /// with no horizontal clip, so a cursor on the '>' of a '=>' ligature painted
 /// bg over the arrow's lead-cell ink, and on a wide CJK lead the full-glyph
 /// re-blit erased the ideograph's right half. The fix clips every cut-out
@@ -3853,7 +3848,7 @@ pub fn cursor_cutout_clip_model() -> Model {
             },
             Action {
                 // The clip: middle slice = extent ∩ window (committed), or the
-                // whole unclipped extent (Buggy — the pre-W4 cut-out).
+                // whole unclipped extent (Buggy).
                 name: "Slice",
                 guard: Some(eq(var("phase"), int(3))),
                 updates: vec![

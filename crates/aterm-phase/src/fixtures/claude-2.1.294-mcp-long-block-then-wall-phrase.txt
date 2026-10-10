@@ -1,0 +1,50 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP tool (verbose output) whose result is a first block of 60 rows and a second block opening with a login-wall phrase, the reply after it EMPTY: the call row and the first block's head have scrolled off, the second block a column-2 row under the first block's rows
+     issue line 20
+     issue line 21
+     issue line 22
+     issue line 23
+     issue line 24
+     issue line 25
+     issue line 26
+     issue line 27
+     issue line 28
+     issue line 29
+     issue line 30
+     issue line 31
+     issue line 32
+     issue line 33
+     issue line 34
+     issue line 35
+     issue line 36
+     issue line 37
+     issue line 38
+     issue line 39
+     issue line 40
+     issue line 41
+     issue line 42
+     issue line 43
+     issue line 44
+     issue line 45
+     issue line 46
+     issue line 47
+     issue line 48
+     issue line 49
+     issue line 50
+     issue line 51
+     issue line 52
+     issue line 53
+     issue line 54
+     issue line 55
+     issue line 56
+     issue line 57
+     issue line 58
+     issue line 59
+     issue line 60
+  ⎿  Not logged in · Please run /login
+
+✻ Churned for 3s · done 10:00 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                             21724 tokens

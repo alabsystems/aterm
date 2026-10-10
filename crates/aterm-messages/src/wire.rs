@@ -3,7 +3,7 @@
 
 //! The wire grammars: the `messages` read query and its row, the
 //! byte-identical `appstatus` compatibility face, and the `notice` verb —
-//! `post`, `progress`, `done`, `dismiss`, `act` — with its verdicts, caps,
+//! `post`, `progress`, `done`, `ask`, `dismiss`, `act` — with its verdicts, caps,
 //! budgets, key namespace and paint pacing (design rulings 163–198). The
 //! percent-encoder is INJECTED (`aterm_control::wire::pct_encode` in the
 //! host) — the grammar lives beside the state, the bytes stay the host's,
@@ -181,13 +181,16 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
 /// encoding; `actions=` the FULL capsule labels joined by `,`. A live row
 /// with a fill says `progress=` (a measured level, the strain row, says
 /// `level=` instead), a busy one `busy=1`, and `load=` only while
-/// the row SHOWS its load words; no ETA, elapsed or frame state ever reaches
-/// the line — motion is the glass's (design ruling 175).
+/// the row SAYS its load words on the glass — the band's own rule, so the
+/// work's own primary load only while other work is `slowing` (ruling 246;
+/// [`Live::said_load`], ruling 441 (b)); no ETA, elapsed or frame state ever
+/// reaches the line — motion is the glass's (design ruling 175).
 #[must_use]
 pub(crate) fn message_row(
     rec: &LogRecord,
     live: Option<&Live>,
     glass_row: Option<usize>,
+    slowing: bool,
     now_unix_ms: u64,
     enc: &dyn Fn(&str) -> String,
 ) -> String {
@@ -244,7 +247,7 @@ pub(crate) fn message_row(
         } else if l.is_busy() {
             row.push_str(" busy=1");
         }
-        if let Some(load) = l.shown_load() {
+        if let Some(load) = l.said_load(slowing) {
             row.push_str(" load=");
             row.push_str(load.word());
         }
@@ -307,10 +310,10 @@ pub fn message_rows(
                 now_words.detail = e.detail;
                 now_words.actions = e.actions;
                 now_words.repeats = e.repeats;
-                return message_row(&now_words, None, None, now_unix_ms, enc);
+                return message_row(&now_words, None, None, center.slowing(), now_unix_ms, enc);
             }
             let glass = live.and_then(|_| center.glass_position(rec.id));
-            message_row(rec, live, glass, now_unix_ms, enc)
+            message_row(rec, live, glass, center.slowing(), now_unix_ms, enc)
         })
         .collect()
 }
@@ -390,11 +393,14 @@ pub fn activity_rows_compat(
 // ---------------------------------------------------------------------------
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
-pub(crate) const NOTICE_USAGE: &str = "usage: notice <post|progress|done|dismiss|act> \u{2026}";
+pub(crate) const NOTICE_USAGE: &str = "usage: notice <post|progress|done|ask|dismiss|act> \u{2026}";
 /// The `notice progress` usage line.
 pub(crate) const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]";
 /// The `notice done` usage line.
 pub(crate) const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw] [<words>]";
+/// The `notice ask` usage line.
+pub(crate) const ASK_USAGE: &str =
+    "usage: notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>";
 /// The `notice dismiss` usage line.
 pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id|review>";
 /// The `notice act` usage line.
@@ -920,6 +926,110 @@ impl DoneRequest {
     }
 }
 
+/// `notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>`: THE OWNER IS
+/// NEEDED NOW, for a reason only he can close — Apple's developer agreement lapsed,
+/// a credential only he types — said once by a tool that is not aterm (`targo
+/// --unverified ship release` on an open owner gap). It is the classified standing
+/// row `Message::now(Ask::standing(StandingWhy::OnlyYou(reason), Then::step(step)))`
+/// a reporter writes, keyed, so it stays until the tool resolves it (`notice done
+/// <key> ok`) or the owner reads it — and, read, is not raised again for a day. It
+/// carries NO button: the socket authors none (ruling 172), so the one action is the
+/// step, in words. The door's own word rules hold (`need::Reason::fault`,
+/// `need::Step::fault`): a reason that only says something is pending, a snooze or
+/// two actions are refused here, before any wake. Owner-only, as every `notice`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskRequest {
+    /// The FULL key, `wire.<key>`.
+    pub key: String,
+    /// `script` by default; never aterm's own families.
+    pub tag: Tag,
+    /// The glass title form.
+    pub title: String,
+    /// Why only the owner can close it, ≤ [`crate::need::REASON_CAP`].
+    pub reason: String,
+    /// The one step that closes it, ≤ [`crate::need::STEP_CAP`].
+    pub step: String,
+}
+
+impl AskRequest {
+    /// Parse the words after `notice ask`.
+    ///
+    /// # Errors
+    /// [`ASK_USAGE`] for a missing key, title, reason or step, or a bad option;
+    /// [`KEY_REFUSAL`]; [`OWN_TAG_REFUSAL`]; `notice: <fault>` for a title out of
+    /// form, a reason that only says something is pending, or a step that is a
+    /// snooze or two actions.
+    pub fn parse(rest: &str) -> Result<Self, &'static str> {
+        let (key, rest) = first_word(rest);
+        if key.is_empty() {
+            return Err(ASK_USAGE);
+        }
+        let key = wire_key(key)?;
+        let mut tag = tags::SCRIPT;
+        let rest = options(rest, |word| match word.strip_prefix("tag=") {
+            Some(v) => {
+                tag = wire_tag(v, ASK_USAGE)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        })?;
+        let (title, tail) = split_title(rest);
+        let (reason, step) = split_title(tail);
+        let title = clip_words(title, TITLE_CAP);
+        let reason = clip_words(reason, crate::need::REASON_CAP);
+        let step = clip_words(step, crate::need::STEP_CAP);
+        if title.is_empty() || reason.is_empty() || step.is_empty() {
+            return Err(ASK_USAGE);
+        }
+        title_form(&title, true)?;
+        let ask = Self::ask_of(&reason, &step);
+        if let Some(fault) = ask.fault() {
+            return Err(ask_refusal(fault));
+        }
+        Ok(Self {
+            key,
+            tag,
+            title,
+            reason,
+            step,
+        })
+    }
+
+    fn ask_of(reason: &str, step: &str) -> crate::need::Ask {
+        crate::need::Ask::standing(
+            crate::need::StandingWhy::OnlyYou(crate::need::Reason::new(reason)),
+            crate::need::Then::step(step),
+        )
+    }
+
+    /// The row: Warn, `Origin::Wire`, keyed, classified now and standing.
+    #[must_use]
+    pub(crate) fn into_message(self) -> Message {
+        let ask = Self::ask_of(&self.reason, &self.step);
+        Message::new(self.tag, Severity::Warn, self.title)
+            .key(&self.key)
+            .origin(Origin::Wire)
+            .now(ask)
+    }
+}
+
+/// The refusal for an ask the door would not stand (`need::Ask::fault`), in the
+/// script author's words.
+fn ask_refusal(fault: &'static str) -> &'static str {
+    match fault {
+        "a reason that only says something is pending" => {
+            "notice: the reason only says something is pending; say why only the owner can close it"
+        }
+        "a snooze is not an action" => {
+            "notice: a snooze is not an action; name the step that closes it"
+        }
+        "two actions in one sentence" => {
+            "notice: two actions in one step; name the one that closes it"
+        }
+        _ => ASK_USAGE,
+    }
+}
+
 /// Which capsule `notice act` presses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Press {
@@ -940,6 +1050,8 @@ pub enum NoticeRequest {
     Progress(ProgressRequest),
     /// Its finish.
     Done(DoneRequest),
+    /// The owner is needed now: a standing ask.
+    Ask(AskRequest),
     /// Take a row down as a person could.
     Dismiss(MessageId),
     /// File every open exception into the log (`notice dismiss review`).
@@ -982,6 +1094,7 @@ impl NoticeRequest {
             "post" => PostRequest::parse(rest).map(Self::Post),
             "progress" => ProgressRequest::parse(rest).map(Self::Progress),
             "done" => DoneRequest::parse(rest).map(Self::Done),
+            "ask" => AskRequest::parse(rest).map(Self::Ask),
             "dismiss" if rest.trim() == "review" => Ok(Self::DismissReview),
             "dismiss" => {
                 let mut words = rest.split_whitespace();
@@ -1264,6 +1377,7 @@ pub fn apply(
         NoticeRequest::Post(p) => apply_post(center, gate, p, stamp, now),
         NoticeRequest::Progress(p) => apply_progress(center, gate, &p, stamp, now),
         NoticeRequest::Done(d) => apply_done(center, gate, d, now),
+        NoticeRequest::Ask(a) => post_row(center, gate, a.into_message().normalized(), stamp, now),
         NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, stamp, now),
         NoticeRequest::DismissReview => {
             let n = center.file_digest(stamp, now);
@@ -1306,12 +1420,29 @@ fn apply_post(
             }
         };
     }
+    post_row(center, gate, msg, stamp, now)
+}
+
+/// Post a ROW from the wire (a `post` at warn or error, an `ask`): the duplicate,
+/// the live-row cap and the mint budget, then the post and its paint.
+fn post_row(
+    center: &mut MessageCenter,
+    gate: &mut WireGate,
+    msg: Message,
+    stamp: WallStamp,
+    now: Instant,
+) -> Applied {
+    let under_key = msg
+        .key
+        .as_deref()
+        .and_then(|k| center.live_by_key(k))
+        .map(|l| l.id);
     let duplicate = center.live_rows().any(|l| l.duplicates(&msg));
     if !duplicate {
         if under_key.is_none() && live_wire(center) >= WIRE_LIVE_CAP {
             return cap_refusal();
         }
-        if let Err(busy) = gate.try_mint(now, bytes) {
+        if let Err(busy) = gate.try_mint(now, words_bytes(&msg)) {
             return busy_refusal(busy);
         }
     }
@@ -1766,7 +1897,7 @@ mod tests {
                 .unwrap()
         };
         for now_unix_ms in [10_000, 10_150, 10_300, 10_301, 12_345, 99_999] {
-            let row = message_row(rec, None, None, now_unix_ms, &pct_encode);
+            let row = message_row(rec, None, None, false, now_unix_ms, &pct_encode);
             let (ago, since) = (field(&row, "ago_ms="), field(&row, "since_ms="));
             assert_eq!(ago, now_unix_ms - 10_000, "{row}");
             assert!(since <= ago, "{row}");
@@ -1805,7 +1936,7 @@ mod tests {
         let rec = child.log().get(p.id).unwrap();
         assert!(rec.retired_at.is_some(), "{rec:?}");
         assert_eq!(rec.retired_unix_ms, Some(71_000));
-        let row = message_row(rec, None, None, 71_050, &pct_encode);
+        let row = message_row(rec, None, None, false, 71_050, &pct_encode);
         assert!(row.contains(" ago_ms=61050 "), "{row}");
         assert!(row.ends_with(" since_ms=50"), "{row}");
     }
@@ -1831,7 +1962,7 @@ mod tests {
         );
         c.commit_rows(now, 3);
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, c.live(p.id), Some(0), 6_500, &pct_encode);
+        let row = message_row(rec, c.live(p.id), Some(0), false, 6_500, &pct_encode);
         assert_eq!(
             row,
             "message 1 at=5000 ago_ms=1500 tag=privacy sev=info origin=host state=held glass=0 rep=1 key=privacy.fda title=File%20access%20not%20confirmed detail=Full%20Disk%20Access%20may%20already%20be%20enabled%0Asecond%20line actions=Open%20Settings,Not%20now"
@@ -1850,7 +1981,7 @@ mod tests {
             now,
         );
         let rec = c.log().get(m.id).unwrap();
-        let row = message_row(rec, c.live(m.id), None, 5_100, &pct_encode);
+        let row = message_row(rec, c.live(m.id), None, false, 5_100, &pct_encode);
         assert!(
             row.ends_with(" key=- title=Installing detail= actions=- progress=42/100"),
             "{row}"
@@ -1858,7 +1989,7 @@ mod tests {
         assert!(row.contains(" state=live glass=- "), "{row}");
         c.dismiss(p.id, now + Duration::from_millis(250));
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, None, None, 9_000, &pct_encode);
+        let row = message_row(rec, None, None, false, 9_000, &pct_encode);
         assert!(row.contains(" state=dismissed glass=- "), "{row}");
         // Retired at 5 000 + 250 on the wall; read at 9 000.
         assert!(row.contains(" ago_ms=4000 "), "{row}");
@@ -2762,6 +2893,75 @@ mod tests {
             "OK done=- how=gone",
             "a set -e script does not die because its row went stale"
         );
+    }
+
+    #[test]
+    fn an_ask_is_a_classified_standing_row_the_tool_resolves() {
+        let now = t0();
+        let (mut c, mut g) = fresh(now);
+        let line = "ask release.notary tag=release Apple agreement blocks the release -- \
+                    Apple's developer agreement for team X lapsed, so notarization answers 403 \
+                    -- Accept the current agreements at developer.apple.com/account";
+        let Ok(NoticeRequest::Ask(req)) = NoticeRequest::parse(line) else {
+            panic!("{line}");
+        };
+        assert_eq!(req.key, "wire.release.notary");
+        assert_eq!(req.tag.as_str(), "release");
+        assert_eq!(req.title, "Apple agreement blocks the release");
+        let a = notice(&mut c, &mut g, line, now);
+        assert_eq!((a.reply.as_str(), a.note), ("OK message=1", true));
+        let row = c.live(id_of(&a)).expect("a live row");
+        assert!(row.msg.persists(), "standing: {:?}", row.msg.hold);
+        assert!(row.msg.actions.is_empty(), "the socket authors no button");
+        let crate::need::Need::Now(ask) = row.msg.need() else {
+            panic!("classified now: {:?}", row.msg.need());
+        };
+        assert!(ask.is_standing());
+        assert_eq!(
+            ask.then().words(),
+            "Accept the current agreements at developer.apple.com/account"
+        );
+        assert_eq!(c.demotions(), 0, "the door keeps it");
+        // said again: the same row, no second mint
+        let again = notice(&mut c, &mut g, line, now);
+        assert_eq!(again.reply, "OK message=1");
+        assert_eq!(c.live_rows().count(), 1);
+        // the tool resolves it when the gap closes
+        let done = notice(&mut c, &mut g, "done release.notary ok", now);
+        assert_eq!(done.reply, "OK done=1 how=resolved-ok");
+        assert_eq!(c.live_rows().count(), 0);
+    }
+
+    #[test]
+    fn an_ask_the_door_would_not_stand_is_refused() {
+        for (line, want) in [
+            ("ask", ASK_USAGE),
+            ("ask k", ASK_USAGE),
+            ("ask k Title only", ASK_USAGE),
+            ("ask k Title -- a reason only", ASK_USAGE),
+            ("ask k Title -- -- a step", ASK_USAGE),
+            ("ask K Title -- why -- Do it", KEY_REFUSAL),
+            ("ask k tag=update Title -- why -- Do it", OWN_TAG_REFUSAL),
+            ("ask k tag=Bad Title -- why -- Do it", ASK_USAGE),
+            (
+                "ask k Title: with a clause -- why -- Do it",
+                "notice: title has a clause (\u{2014}, ;, :); put it after --",
+            ),
+            (
+                "ask k Release blocked -- it is waiting for Apple -- Accept it",
+                "notice: the reason only says something is pending; say why only the owner can close it",
+            ),
+            (
+                "ask k Release blocked -- Apple refuses it -- Wait for Apple",
+                "notice: a snooze is not an action; name the step that closes it",
+            ),
+            (
+                "ask k Release blocked -- Apple refuses it -- Accept it or renew it",
+                "notice: two actions in one step; name the one that closes it",
+            ),
+        ] {
+            assert_eq!(NoticeRequest::parse(line).err(), Some(want), "{line}");
+        }
     }
 
     #[test]

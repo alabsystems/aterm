@@ -40,9 +40,7 @@ fn one_supervisor_per_session_across_restarts_and_reloads() {
     assert!(!eager.check_invariant("OneSupervisor", &two));
 
     // The budget: Budget failures restart in place unbadged; the next one
-    // is badged — and STILL restarted (the philosophy review of 2026-09-25:
-    // it was turned off until the policy changed), the badge going as the
-    // restart runs.
+    // is badged — and STILL restarted, the badge going as the restart runs.
     let mut s = model.init_state();
     assert!(model.fire("Arrive", &mut s) && model.fire("Start", &mut s));
     for _ in 0..model.consts.iter().find(|c| c.0 == "Budget").unwrap().1 {
@@ -240,7 +238,7 @@ fn an_external_supervisor_keeps_its_session_across_the_handoff() {
     }
 }
 
-/// THE HOST HANDS A WORKER ITS AGENT'S EXIT ONLY FOR AN EXIT (2026-09-28): a
+/// THE HOST HANDS A WORKER ITS AGENT'S EXIT ONLY FOR AN EXIT: a
 /// roster pass that cannot name an agent which still holds its tab keeps its
 /// worker, and looks again — an exit during the misread that nothing rings
 /// for (the model's conservative case) is handed by that look; the upgrade's

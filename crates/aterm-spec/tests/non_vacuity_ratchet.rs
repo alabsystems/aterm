@@ -26,10 +26,7 @@
 //! Anything else uncaught is a GHOST — a design claim that asserts nothing — and
 //! fails this test: give it a real mutant (a `Buggy` branch reproducing a
 //! plausible defect the invariant catches) or, if it only restates a guard or
-//! another invariant, delete it. There is no third list. Ghosts measured on
-//! 2026-09-16 were carried as debt in an `UNCAUGHT` table while they were paid
-//! down; the last of them went on 2026-09-26, and the table went with them, so
-//! nothing can be parked there again.
+//! another invariant, delete it. There is no third list.
 //!
 //! **The assertion is TWO-SIDED, which is the whole point.** The uncaught set
 //! must EQUAL `SPACE_GUARDS`: a new ghost fails, and so does a listed guard some
@@ -199,7 +196,7 @@ const SPACE_GUARDS: &[(&str, &[&str])] = &[
         "TitleSummarySocketOwnerRetry",
         &["RetryBudgetIsBounded", "Bounds"],
     ),
-    // The release/updater batch (2026-09-25): each bound below is the model's
+    // The release/updater batch: each bound below is the model's
     // explored box and nothing more; every design claim beside it has its own
     // mutant, and the laws that only restated a guard or another law are gone.
     ("ReleaseDurablePostIntent", &["DurableIntentStateBounded"]),

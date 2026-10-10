@@ -572,6 +572,15 @@ impl Live {
     pub(crate) fn shown_load(&self) -> Option<Load> {
         self.load.filter(|_| self.load_shown).map(|(l, _)| l)
     }
+
+    /// The load words the row SAYS on the glass (ruling 246): its shown
+    /// load, unless that is the work's own primary load and nothing is
+    /// `slowing`. The band's layout and the wire's `load=` both read this
+    /// one rule (ruling 441 (b)).
+    pub(crate) fn said_load(&self, slowing: bool) -> Option<Load> {
+        self.shown_load()
+            .filter(|l| slowing || self.msg.primary != Some(*l))
+    }
 }
 
 /// The hold a restatement may give a row of class `need` that holds `current`
@@ -797,8 +806,7 @@ impl MessageCenter {
     /// The load words row `row` says on the glass: its shown load, unless
     /// that is the work's own primary load and nothing is slowed.
     fn said_load(&self, row: &Live) -> Option<Load> {
-        row.shown_load()
-            .filter(|l| self.slowing || row.msg.primary != Some(*l))
+        row.said_load(self.slowing)
     }
 
     /// The display's frame period: a glide and an echo are read on it while in
@@ -1522,6 +1530,31 @@ impl MessageCenter {
         true
     }
 
+    /// [`Self::withdraw_as`] whose log entry becomes `record` WHOLE: its
+    /// words and its MARK. An episode's record is the one entry the episode
+    /// leaves (ruling 209), and its mark is the episode's, not the row's last
+    /// one (ruling 441 (c)): a strain episode that reached critical memory
+    /// records Warn (`record_severity`) though a calmer reading restated its
+    /// row Info before the fold, exactly as the same episode does when its
+    /// row faded first and the record is posted whole. `false` when no such
+    /// live row.
+    pub fn withdraw_as_record(&mut self, id: MessageId, record: &Message, now: Instant) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        let record = record.clone().normalized();
+        // The glass sees the row it showed: its echo is taken first.
+        self.record_echo(i, EchoKind::Vanish, now);
+        let row = &mut self.live[i];
+        row.msg.title = record.title;
+        row.msg.detail = record.detail;
+        row.msg.severity = record.severity;
+        row.msg.glyph = record.glyph;
+        self.retire_at_with(i, Retired::Withdrawn, None, now);
+        self.rebalance(now);
+        true
+    }
+
     /// The person answered the row with a word its reporter confirmed was
     /// taken: it retires `Answered { label }`, as a `NotNow` press does, with
     /// no echo (the word is the ending, not delivered work and not a fix). For
@@ -2230,6 +2263,16 @@ impl MessageCenter {
         self.revision
     }
 
+    /// A center that REPLACES another (the web's `messages_restore`, which
+    /// builds a fresh center over the kept log) moves its revision past the
+    /// one it replaces: the log is an observable change, and a reader gating
+    /// on the revision (the page's `rev=`, ruling 388 (5)) would otherwise
+    /// read the same number over a log that went from nothing to N records
+    /// (ruling 441 (e)).
+    pub fn follow_revision(&mut self, replaced: u64) {
+        self.revision = self.revision.max(replaced.saturating_add(1));
+    }
+
     /// The gate a page reads to know it is out of date: the center's
     /// [`Self::revision`] plus the digest's ([`Self::digest_revision`]), which
     /// moves for an exception and for nothing the band draws. Both only grow,
@@ -2667,6 +2710,35 @@ impl MessageCenter {
             next_id: self.log.next_id().raw(),
             live,
         }
+    }
+
+    /// The rows a handoff did not carry end with the parent (ruling 441 (d)):
+    /// at Commit, right before its last write, the parent retires every live
+    /// row whose id is not in `carried`, the ids of the carry it handed over
+    /// at the park ([`Self::carried`]): an unrevealed row (its work ends with
+    /// this process), the measured level (the successor measures for itself
+    /// and starts calm), a row posted after the park. Each retires
+    /// [`Retired::Withdrawn`] with no echo (no frame follows), so its record
+    /// reads as ended, never in the successor as a record replayed open from
+    /// a process that died without an ending (`still open when aterm
+    /// stopped`, ruling 267), nor as a phantom beside the reporter's re-post
+    /// there. A row the carry took stays open: it is the successor's now.
+    /// Returns how many rows it closed.
+    pub fn close_uncarried(&mut self, carried: &[u64], now: Instant) -> usize {
+        let mut closed = 0;
+        let mut i = 0;
+        while i < self.live.len() {
+            if carried.contains(&self.live[i].id.raw()) {
+                i += 1;
+            } else {
+                self.retire_at_with(i, Retired::Withdrawn, None, now);
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            self.rebalance(now);
+        }
+        closed
     }
 
     /// Never mint an id below `raw` from now on (ids only rise; a `raw` at or
@@ -3268,8 +3340,36 @@ impl MessageCenter {
         stamp: WallStamp,
         now: Instant,
     ) -> DigestSync {
+        self.sync_digest_keeping(prefix, desired, &[], stamp, now)
+    }
+
+    /// [`Self::sync_digest`], where the pass also NAMES `kept`: keys of facts
+    /// that still hold whose new words the host's door refused
+    /// ([`crate::exceptions::Entry::message`]). An open entry under one
+    /// stands in the words it was last shown in, and no clock starts for it:
+    /// a wording fault is the reporter's to fix, and never the end of a fact
+    /// that still holds (2026-10-08: twelve refused restatements in a day, and
+    /// each one's pass would have filed the open entry `Resolved` ten minutes
+    /// on while its cause stood). A kept key with nothing open opens nothing.
+    pub fn sync_digest_keeping(
+        &mut self,
+        prefix: &str,
+        desired: Vec<Message>,
+        kept: &[String],
+        stamp: WallStamp,
+        now: Instant,
+    ) -> DigestSync {
         let mut out = DigestSync::default();
-        let mut named: Vec<String> = Vec::new();
+        let mut named: Vec<String> = kept
+            .iter()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in &named {
+            if let Some(i) = self.digest.find_key(key) {
+                self.digest.get_mut(i).missed_at = None;
+            }
+        }
         for msg in desired {
             let key = msg.key.clone().unwrap_or_default();
             let ours = matches!(msg.need, Need::Later(_)) && key.starts_with(prefix);

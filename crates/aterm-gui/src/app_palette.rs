@@ -212,9 +212,9 @@ impl App {
             // same predicate Settings ▸ Wallpaper's button asks, and stay grey
             // wherever the dialog genuinely cannot open. HEADLESS is one such
             // place, folded here rather than in the platform predicate: a
-            // headless instance has no glass to hang the panel on, and since
-            // its launch posture is `Prohibited` (see `launch_posture`) AppKit
-            // could not present the modal at all — `invoke OpenMarkdown` must
+            // headless instance has no glass to hang the panel on and no
+            // application object to present it from (on macOS its display-free
+            // loop builds no `NSApplication`) — `invoke OpenMarkdown` must
             // answer "disabled", never park the main thread in a modal nothing
             // can dismiss.
             local_file_picker_available: !self.headless
@@ -1094,9 +1094,9 @@ mod tests {
         }
     }
 
-    /// A headless instance has no glass to hang a file picker on — and since
-    /// its launch posture is `Prohibited` it could not even present the
-    /// `NSOpenPanel` — so the two local-file rows read disabled there, and
+    /// A headless instance has no glass to hang a file picker on — and no
+    /// application object to present the `NSOpenPanel` from — so the two
+    /// local-file rows read disabled there, and
     /// `invoke OpenMarkdown` answers "disabled" instead of parking the main
     /// thread in a modal nothing can dismiss. Windowed, the platform predicate
     /// decides as before.

@@ -136,21 +136,13 @@ impl CursorStateHandler<'_> {
             b'e' => self.grid.line_position_relative(n), // VPR - clamps to screen edge, not margin
             b'C' | b'a' => {
                 // Cursor Forward / HPR — respects right margin (DECLRMM)
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_forward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_forward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_forward_margin(n, self.modes.left_right_margin_mode);
             }
             b'D' => {
                 // Cursor Backward — respects left margin (DECLRMM)
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_backward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_backward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_backward_margin(n, self.modes.left_right_margin_mode);
             }
             b'E' => {
                 // Cursor Next Line - respects bottom margin
@@ -200,98 +192,6 @@ impl CursorStateHandler<'_> {
             // csi_dispatch_no_intermediates for performance. Not dispatched here.
             _ => {}
         }
-    }
-
-    /// Move the cursor forward by n grapheme clusters (mode 2027), skipping
-    /// WIDE_CONTINUATION spacers; the COMPLEX flag does not affect movement.
-    ///
-    /// WIDE_CONTINUATION and PROTECTED share bit 10 in CellFlags; a true
-    /// continuation is identified by a WIDE cell to its left.
-    pub(super) fn cursor_forward_graphemes(&mut self, n: u16) {
-        use crate::grid::CellFlags;
-
-        let row = self.grid.cursor_row();
-        let mut col = self.grid.cursor_col();
-        // When DECLRMM is active and cursor is within margins, clamp to right margin.
-        let max_col = if self.modes.left_right_margin_mode {
-            let margins = self.grid.horizontal_margins();
-            let grid_max = self.grid.cols().saturating_sub(1);
-            if col >= margins.left && col <= margins.right {
-                margins.right.min(grid_max)
-            } else {
-                grid_max
-            }
-        } else {
-            self.grid.cols().saturating_sub(1)
-        };
-        let mut graphemes_passed = 0u16;
-
-        // Move forward, counting graphemes (non-continuation cells)
-        while graphemes_passed < n && col < max_col {
-            col += 1;
-            // A true wide continuation (not just PROTECTED, which shares bit 10)
-            // has a WIDE cell to its left.
-            if let Some(cell) = self.grid.cell(row, col) {
-                let is_continuation = cell.flags().contains(CellFlags::WIDE_CONTINUATION)
-                    && col > 0
-                    && self
-                        .grid
-                        .cell(row, col - 1)
-                        .is_some_and(|prev| prev.flags().contains(CellFlags::WIDE));
-                if !is_continuation {
-                    graphemes_passed += 1;
-                }
-            } else {
-                // Past end of row content - count as grapheme boundary
-                graphemes_passed += 1;
-            }
-        }
-
-        self.grid.set_cursor(row, col);
-    }
-
-    /// Move the cursor backward by n grapheme clusters (mode 2027), skipping
-    /// WIDE_CONTINUATION cells (see `cursor_forward_graphemes` for the
-    /// PROTECTED disambiguation).
-    pub(super) fn cursor_backward_graphemes(&mut self, n: u16) {
-        use crate::grid::CellFlags;
-
-        let row = self.grid.cursor_row();
-        let mut col = self.grid.cursor_col();
-        // When DECLRMM is active and cursor is within margins, clamp to left margin.
-        let min_col = if self.modes.left_right_margin_mode {
-            let margins = self.grid.horizontal_margins();
-            if col >= margins.left && col <= margins.right {
-                margins.left
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let mut graphemes_passed = 0u16;
-
-        // Move backward, counting graphemes (non-continuation cells).
-        while graphemes_passed < n && col > min_col {
-            col -= 1;
-            // Check if this is a true wide continuation cell (not just PROTECTED).
-            if let Some(cell) = self.grid.cell(row, col) {
-                let is_continuation = cell.flags().contains(CellFlags::WIDE_CONTINUATION)
-                    && col > 0
-                    && self
-                        .grid
-                        .cell(row, col - 1)
-                        .is_some_and(|prev| prev.flags().contains(CellFlags::WIDE));
-                if !is_continuation {
-                    graphemes_passed += 1;
-                }
-            } else {
-                // Empty cell counts as grapheme boundary
-                graphemes_passed += 1;
-            }
-        }
-
-        self.grid.set_cursor(row, col);
     }
 
     /// Handle erase CSI sequences, first updating the BCE cursor template from
@@ -845,5 +745,58 @@ mod erase_pending_wrap_tests {
         term.process(b"\x1b[1;80H!\x1b[?47hZ");
         assert!(term.is_alternate_screen());
         assert_eq!(glyph(&term, 1, 0), 'Z', "the carried wrap moves Z to row 1");
+    }
+}
+
+/// CUF, CUB, HPR and BS count columns, never grapheme clusters, whatever mode
+/// 2027 says. The mode's definition (contour's terminal-unicode-core) leaves
+/// "cursor movement semantics of the terminal ... unchanged", and Ghostty's
+/// `cursorRight`/`cursorLeft` never read it. Neovim 0.11+ moves along a row
+/// with `cuf1`/`cub1` (BS) and `CSI n C`/`CSI n D`, counting cells.
+#[cfg(test)]
+mod motion_counts_columns_tests {
+    use crate::terminal::Terminal;
+
+    /// Three ways a terminal can come to hold mode 2027: never asked, asked
+    /// over the wire (`CSI ? 2027 h`), or a mode flag carried in from a
+    /// checkpoint an older build wrote while the mode was on.
+    fn terminals() -> [(&'static str, Terminal); 3] {
+        let plain = Terminal::new(2, 20);
+        let mut asked = Terminal::new(2, 20);
+        asked.process(b"\x1b[?2027h");
+        let mut carried = Terminal::new(2, 20);
+        carried.modes_mut().grapheme_cluster_mode = true;
+        [("plain", plain), ("?2027h", asked), ("carried", carried)]
+    }
+
+    #[test]
+    fn cuf_cub_hpr_and_bs_move_by_columns_over_wide_text() {
+        // `中文ab`: 中 in columns 0-1, 文 in 2-3, a in 4, b in 5.
+        let moves: [(&str, &[u8], u16); 5] = [
+            ("CR CUF CUF", b"\r\x1b[C\x1b[C", 2),
+            ("CR CUF 3", b"\r\x1b[3C", 3),
+            ("CR HPR 2", b"\r\x1b[2a", 2),
+            ("col 5, BS x3", b"\x1b[6G\x08\x08\x08", 2),
+            ("col 5, CUB 3", b"\x1b[6G\x1b[3D", 2),
+        ];
+        for (label, mut term) in terminals() {
+            term.process("中文ab".as_bytes());
+            for (what, bytes, col) in moves {
+                term.process(bytes);
+                assert_eq!(term.cursor().col, col, "{label}: {what}");
+            }
+            // The program's next glyph lands where it counted: on 文's first
+            // half, which erases 文, as xterm draws `中X ab`.
+            term.process(b"\r\x1b[C\x1b[CX");
+            let grid = term.grid();
+            let row: Vec<char> = (0..6)
+                .map(|col| grid.cell(0, col).map_or('?', |c| c.char()))
+                .collect();
+            assert_eq!(row[0], '中', "{label}");
+            assert_eq!(row[2], 'X', "{label}: X written at column 2");
+            assert_eq!(row[3], ' ', "{label}: 文's second half is blanked");
+            assert_eq!((row[4], row[5]), ('a', 'b'), "{label}");
+            assert_eq!(term.cursor().col, 3, "{label}");
+        }
     }
 }

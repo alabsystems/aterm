@@ -17,7 +17,10 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+// `spawnfd`'s: the probe holds its stdio and nothing else of this process. A
+// std child under the pinned seal keeps any descriptor another test thread had
+// open unflagged at the spawn, for as long as the child lives.
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 

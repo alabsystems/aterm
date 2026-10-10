@@ -10,65 +10,6 @@ use crate::state::State;
 use crate::{MAX_INTERMEDIATES, MAX_PARAMS};
 
 impl Parser {
-    /// The TLA+ `TypeInvariant` as a pure boolean predicate.
-    ///
-    /// Identical conditions to [`Parser::assert_invariants`], but returns a
-    /// `bool` so it can serve as the `requires`/`ensures` predicate of the
-    /// `process_byte_inner` function contract verified by Kani/trust-mc. Keeping
-    /// it side-effect-free is what lets the model checker reason about it.
-    #[cfg(kani)]
-    #[must_use]
-    pub(crate) fn type_invariant(&self) -> bool {
-        use crate::state::State;
-        use crate::{MAX_INTERMEDIATES, MAX_PARAMS};
-
-        // StateValid: state is a valid enum discriminant.
-        (self.state as usize) < State::COUNT
-            // ParamsBounded / IntermediatesBounded.
-            && self.params.len() <= MAX_PARAMS
-            && self.intermediates.len() <= MAX_INTERMEDIATES
-            // Utf8BufferValid / Utf8ExpectedValid / Utf8ProgressValid.
-            && self.utf8_len <= 4
-            && self.utf8_expected <= 4
-            && self.utf8_len <= self.utf8_expected
-            // DcsApcExclusive.
-            && !(self.dcs_active && self.apc_active)
-            // FlagStateConsistent: the `dcs_active`/`apc_active` flags are coupled
-            // to the state, which is what makes the invariant INDUCTIVE under
-            // `process_byte_inner`. Without these couplings the model checker can
-            // assume an UNREACHABLE start state from which a single byte
-            // legitimately breaks the weaker invariant (e.g. `OscString` with
-            // `dcs_active`, or `DcsPassthrough` with `dcs_active == false`), so the
-            // contract VC is a real counterexample rather than a proof.
-            //
-            // `dcs_active` is a BICONDITIONAL with `DcsPassthrough`: it is set
-            // only by `DcsHook` (the sole action transitioning INTO
-            // `DcsPassthrough`, table/dcs_osc.rs) and cleared whenever the machine
-            // LEAVES `DcsPassthrough` (dispatch.rs), and `DcsPassthrough` is
-            // reached by no other action — so `dcs_active <=> state ==
-            // DcsPassthrough`.
-            //
-            // `apc_active` is only a ONE-WAY implication: `SosPmApcString` is also
-            // entered by SOS (0x98) / PM (0x9E) with `ActionType::None` (no
-            // `apc_active`), so the state does not imply the flag — only
-            // `apc_active => state == SosPmApcString` holds.
-            && (self.dcs_active == (self.state as usize == State::DcsPassthrough as usize))
-            && (!self.apc_active || self.state as usize == State::SosPmApcString as usize)
-            // NOTE: a further `Utf8StateConsistent` coupling
-            // (`state != Ground => utf8_len == 0 && utf8_expected == 0`, which
-            // holds at runtime — UTF-8 accumulation is gated on `Ground` in
-            // dispatch.rs) is ALSO needed for full inductiveness, but adding it
-            // makes the bounded-model-checker VC blow up ay's memory ceiling
-            // (>24 GB) — pending a solver-side fix. The flag couplings above
-            // already eliminate the GENUINE counterexamples (state↔flag
-            // inconsistency); the residual is an `EncodingGap`-classified
-            // (non-genuine) CEX. (#contract-inductive-invariant)
-            // SubparamMaskValid: meaningful bits (excluding bit 0) only set for
-            // indices < params.len().
-            && (self.params.len() >= 32
-                || (self.subparam_mask & !1u32 & !((1u32 << self.params.len()) - 1)) == 0)
-    }
-
     /// Assert that all TLA+ TypeInvariant properties hold.
     ///
     /// This function verifies the parser state matches the formal specification
@@ -183,9 +124,11 @@ impl Parser {
                 "TLA+ DcsApcExclusive violated: both dcs_active and apc_active are true"
             );
 
-            // Invariant: FlagStateConsistent (mirrors `type_invariant`).
-            // `dcs_active` is a biconditional with `DcsPassthrough`; `apc_active`
-            // implies `SosPmApcString` (SOS/PM enter that state without the flag).
+            // Invariant: FlagStateConsistent. `dcs_active` is a biconditional
+            // with `DcsPassthrough`: it is set only by `DcsHook` (the sole action
+            // into that state) and cleared whenever the machine leaves it.
+            // `apc_active` only implies `SosPmApcString`: SOS and PM enter that
+            // state without the flag.
             assert_eq!(
                 self.dcs_active,
                 self.state == State::DcsPassthrough,
@@ -199,10 +142,7 @@ impl Parser {
                 self.state
             );
 
-            // Utf8StateConsistent also holds at runtime (UTF-8 accumulation is
-            // gated on `Ground`), so we assert it for regression protection even
-            // though it is omitted from the Kani `type_invariant` for now (it
-            // overflows the model checker's memory — see invariants.rs note).
+            // Utf8StateConsistent: UTF-8 accumulation is gated on `Ground`.
             assert!(
                 self.state == State::Ground || (self.utf8_len == 0 && self.utf8_expected == 0),
                 "TLA+ Utf8StateConsistent violated: utf8_len={} utf8_expected={} but state={:?}",
@@ -210,6 +150,25 @@ impl Parser {
                 self.utf8_expected,
                 self.state
             );
+
+            // Utf8DecoderConsistent: an empty buffer expects nothing; a partial
+            // character is a 2-, 3- or 4-byte one begun by a lead byte.
+            if self.utf8_len == 0 {
+                assert_eq!(
+                    self.utf8_expected, 0,
+                    "Utf8DecoderConsistent violated: an empty buffer expects {} bytes",
+                    self.utf8_expected
+                );
+            } else {
+                assert!(
+                    (2..=4).contains(&self.utf8_expected)
+                        && (0xC0..=0xF7).contains(&self.utf8_buffer[0]),
+                    "Utf8DecoderConsistent violated: utf8_buffer={:02x?} utf8_len={} utf8_expected={}",
+                    self.utf8_buffer,
+                    self.utf8_len,
+                    self.utf8_expected
+                );
+            }
 
             // A string payload's UTF-8 head is held only in the three strings
             // whose 8-bit ST it decides (dispatch.rs drops it as one ends).
@@ -232,9 +191,7 @@ impl Parser {
             // assert_invariants_after_subparams`, which reaches Ground with
             // `last_was_colon == true`). Their only invariant is `subparam_mask`'s
             // bound vs `params.len()` (the `SubparamMaskValid` conjunct above),
-            // which is state-independent. So the remaining contract-VC CEXes that
-            // set these fields are NOT fixable by a state coupling — consistent
-            // with trust-mc classifying the residual as a non-genuine EncodingGap.
+            // which is state-independent.
         }
     }
 }

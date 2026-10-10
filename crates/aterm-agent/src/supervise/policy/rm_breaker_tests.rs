@@ -1067,7 +1067,7 @@ fn an_assignment_in_front_of_a_declaring_builtin_is_unknown_after_it() {
     // The two shells' readings, with `echo`: each form lands on `/etc` in
     // at least one of them.
     let run = |shell: &str, line: &str| -> Option<String> {
-        let out = std::process::Command::new(shell)
+        let out = aterm_uds::spawnfd::command(shell)
             .args(no_startup(shell, line))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -1251,7 +1251,7 @@ fn every_name_whose_assignment_does_not_read_back_is_kept() {
         if !Path::new(shell).exists() {
             continue;
         }
-        let out = std::process::Command::new(shell)
+        let out = aterm_uds::spawnfd::command(shell)
             .args(no_startup(shell, probe))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -1291,12 +1291,12 @@ fn in_shell(shell: &str, line: &str) -> Option<String> {
         return None;
     }
     let t = TempTree::new("shell");
-    let out = std::process::Command::new(shell)
+    let out = aterm_uds::spawnfd::command(shell)
         .args(no_startup(shell, line))
         .current_dir(t.0.path())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -2165,12 +2165,12 @@ fn an_extended_glob_word_moves_the_words_the_rule_reads() {
         for f in files {
             std::fs::write(t.0.path().join(f), "").expect("a probe file");
         }
-        let out = std::process::Command::new("/bin/zsh")
+        let out = aterm_uds::spawnfd::command("/bin/zsh")
             .args(no_startup("/bin/zsh", probe))
             .current_dir(t.0.path())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .stdin(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
             .output()
             .expect("zsh runs");
         assert_eq!(
@@ -2329,12 +2329,12 @@ fn in_shell_both(shell: &str, line: &str) -> Option<(String, String)> {
         return None;
     }
     let t = TempTree::new("shell");
-    let out = std::process::Command::new(shell)
+    let out = aterm_uds::spawnfd::command(shell)
         .args(no_startup(shell, line))
         .current_dir(t.0.path())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     Some((

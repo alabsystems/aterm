@@ -66,7 +66,9 @@
 //!   written, colours included. The facts are drawn QUIET (owner,
 //!   2026-09-30): `Script::Sub` — smaller and set low in the rule's cells,
 //!   below the vivid rail of the cursor trail under the composer row above
-//!   (`aterm_render::SUB_CEILING`) — in the rule's own gray
+//!   (`aterm_render::SUB_CEILING`) — and EASY TO READ (owner, 2026-10-08):
+//!   bold, values in the rule's gray lifted toward the pane's ink, each
+//!   fact's letters nudged to [`FACT_PITCH`] instead of a cell apart
 //!   (`compose_rule`). `[claude_footer] usage = false` hides `Σ` (shown by
 //!   default), applied here and in the repaint key. The Claude lights
 //!   (`crate::claude_lights`) go in the same rule, left of the facts, rule
@@ -1205,10 +1207,14 @@ fn rule_mask(
 /// distinct from other text and less emphasized" — and lower than the
 /// cursor trail that runs under the composer row above: the trail's vivid
 /// rail ends above `aterm_render::SUB_CEILING`, only its faint bed lobe at
-/// the caret reaching lower): drawn `Script::Sub`,
-/// smaller and set low in the rule's cells, values in Claude's own rule gray
-/// (`rule.fg`), marks in `mark_fg` mixed halfway toward it, on the pane's
-/// ground. The light chips stay full-size: they are pointed at and clicked.
+/// the caret reaching lower), yet easy to read (owner, 2026-10-08: "the
+/// kerning is too wide, and it needs a bit more"): drawn `Script::Sub`,
+/// smaller and set low in the rule's cells, and bold, so the small strokes
+/// keep their ink; set tight ([`set_tight`]); values in Claude's own rule
+/// gray (`rule.fg`) lifted [`VALUE_LIFT`] toward the pane's ink
+/// (`blank.fg`), marks in `mark_fg` mixed halfway toward the rule's gray, on
+/// the pane's ground. The light chips stay full-size: they are pointed at
+/// and clicked.
 /// The chips' place depends on nothing a title or the facts change: a chip
 /// stays under the pointer while its title comes and goes.
 fn compose_rule(
@@ -1241,18 +1247,19 @@ fn compose_rule(
     if !fit.segments.is_empty() {
         let quiet = |fg: [u8; 3]| RenderCell {
             fg,
-            script: aterm_core::terminal::Script::Sub,
+            bold: true,
+            script: aterm_core::terminal::Script::Sub { nudge: 0 },
             ..blank
         };
-        let mark = quiet(std::array::from_fn(|i| {
-            ((u16::from(mark_fg[i]) + u16::from(rule.fg[i])) / 2) as u8
-        }));
-        let value = quiet(rule.fg);
+        let mark = quiet(mix(mark_fg, rule.fg, 0.5));
+        let value = quiet(mix(rule.fg, blank.fg, VALUE_LIFT));
+        let mut spans = Vec::with_capacity(fit.segments.len());
         facts.push(blank);
         for (i, seg) in fit.segments.iter().enumerate() {
             if i > 0 {
                 facts.extend(std::iter::repeat_n(blank, footer::GAP));
             }
+            let start = facts.len();
             push_text(&mut facts, mark, [seg.mark]);
             facts.push(blank);
             // The wall's `♻` (for "resets") is a mark inside its value.
@@ -1264,8 +1271,10 @@ fn compose_rule(
                 };
                 push_text(&mut facts, ink, [ch]);
             }
+            spans.push(start..facts.len());
         }
         facts.push(blank);
+        set_tight(&mut facts, &spans);
     }
     if !out.is_empty() {
         let glyphs = room.saturating_sub(out.len() + facts.len());
@@ -1273,6 +1282,81 @@ fn compose_rule(
     }
     out.extend(facts);
     (out, lights_at)
+}
+
+/// The pitch the facts are set at, in cells. A fact glyph is drawn at
+/// `aterm_render::SCRIPT_SCALE` (0.7) of its cell, so one centred per cell
+/// its letters stand far apart and read one by one (owner, 2026-10-08: "the
+/// kerning is too wide"). Four fifths of a cell is the scaled face's own
+/// pitch (0.7) and a little air, as text this small wants: the letters of a
+/// word close up, and a space still reads as one.
+const FACT_PITCH: f32 = 0.8;
+
+/// How far the values' ink is lifted from Claude's rule gray toward the
+/// pane's text colour: a third of the way, so the small, low facts read
+/// without effort and still stand below the conversation's text.
+const VALUE_LIFT: f32 = 1.0 / 3.0;
+
+/// `a` moved `t` of the way toward `b`, per channel.
+fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|i| {
+        (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8
+    })
+}
+
+/// Set the facts' segments (`spans`, ranges of `facts`) at [`FACT_PITCH`],
+/// one character still per cell: each fact glyph is nudged from the middle
+/// of its cell to its place (`Script::Sub`'s `nudge`). The facts keep their
+/// ends — the first segment's first glyph and the last segment's last glyph
+/// stay where they stood, so the rule meets them as before — and the room
+/// the tighter pitch frees goes evenly into the gaps between segments; a
+/// lone segment keeps its middle. A pitch that would nudge some glyph
+/// further than a nudge reaches (a very long path) is loosened just enough.
+fn set_tight(facts: &mut [RenderCell], spans: &[std::ops::Range<usize>]) {
+    // A glyph's move is (1 - pitch) cells times its LEAN: the moves are
+    // affine in the pitch and nothing at a pitch of one cell.
+    let mut lean = vec![0.0f32; facts.len()];
+    let steps = |span: &std::ops::Range<usize>| span.len().saturating_sub(1) as f32;
+    match spans {
+        [] => return,
+        [span] => {
+            let mid = steps(span) / 2.0;
+            for (i, c) in span.clone().enumerate() {
+                lean[c] = mid - i as f32;
+            }
+        }
+        _ => {
+            // What each gap between segments gains, in units of (1 - pitch).
+            let extra = spans.iter().map(steps).sum::<f32>() / (spans.len() - 1) as f32;
+            let mut first = 0.0;
+            for span in spans {
+                for (i, c) in span.clone().enumerate() {
+                    lean[c] = first - i as f32;
+                }
+                first += extra - steps(span);
+            }
+        }
+    }
+    // A wide glyph spans its lead and continuation cells: it moves as their
+    // middle does.
+    for c in 0..facts.len().saturating_sub(1) {
+        if facts[c + 1].wide {
+            lean[c] = (lean[c] + lean[c + 1]) / 2.0;
+        }
+    }
+    let per_cell = f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL);
+    let reach = f32::from(i8::MAX) / per_cell;
+    let most = lean.iter().fold(0.0f32, |m, l| m.max(l.abs()));
+    let pitch = if most > 0.0 {
+        FACT_PITCH.max(1.0 - reach / most)
+    } else {
+        FACT_PITCH
+    };
+    for (cell, lean) in facts.iter_mut().zip(lean) {
+        if let aterm_core::terminal::Script::Sub { nudge } = &mut cell.script {
+            *nudge = (lean * (1.0 - pitch) * per_cell).round() as i8;
+        }
+    }
 }
 
 /// Append `text` in `ink`'s colours and rendition, one cell per column: a
@@ -2393,6 +2477,17 @@ mod tests {
         row.iter().map(|c| c.ch).collect()
     }
 
+    /// A cell's ink and rendition, without where its glyph is nudged to.
+    fn unplaced(cell: RenderCell) -> RenderCell {
+        match cell.script {
+            aterm_core::terminal::Script::Sub { .. } => RenderCell {
+                script: aterm_core::terminal::Script::Sub { nudge: 0 },
+                ..cell
+            },
+            aterm_core::terminal::Script::Normal => cell,
+        }
+    }
+
     fn facts() -> FooterFacts {
         FooterFacts {
             model: Some("Opus 5.5".into()),
@@ -2432,8 +2527,9 @@ mod tests {
     /// side, three cells between values, the rule's last glyph kept — the
     /// way Claude writes its top-effort tag, one space either side and a `─`
     /// after it, into the rule above. The facts are set apart and quiet:
-    /// small and low (`Script::Sub`), values in the rule's own gray, marks in
-    /// the accent mixed halfway toward it.
+    /// small, low and bold (`Script::Sub`), values in the rule's gray lifted
+    /// a third of the way toward the pane's ink, marks in the accent mixed
+    /// halfway toward the rule's gray.
     #[test]
     fn the_rule_carries_the_owners_footer() {
         let blank = cell(' ', [200, 200, 200]);
@@ -2447,15 +2543,18 @@ mod tests {
         );
         assert_eq!(
             cells[1].fg,
-            [30, 94, 157],
+            [30, 94, 158],
             "the mark: the accent, toward the rule"
         );
-        assert_eq!(cells[3].fg, rule.fg, "the value takes the rule's gray");
+        assert_eq!(
+            cells[3].fg,
+            [107, 107, 107],
+            "the value: the rule's gray, a third of the way to the pane's ink"
+        );
         assert!(
-            [1, 3]
-                .iter()
-                .all(|&c| cells[c].script == aterm_core::terminal::Script::Sub),
-            "the facts are drawn small and low"
+            [1, 3].iter().all(|&c| cells[c].bold
+                && matches!(cells[c].script, aterm_core::terminal::Script::Sub { .. })),
+            "the facts are drawn small, low and bold"
         );
         assert_eq!(cells[0].script, aterm_core::terminal::Script::Normal);
         assert_eq!(cells.len(), footer::segments_width(&fit.segments) + 2);
@@ -2465,6 +2564,98 @@ mod tests {
             compose_rule(&none, None, rule, blank, [1, 1, 1], 76)
                 .0
                 .is_empty()
+        );
+    }
+
+    /// THE FACTS ARE SET TIGHT (owner, 2026-10-08: "the kerning is too
+    /// wide"): one character per cell still, but each glyph nudged so the
+    /// letters of a fact stand [`FACT_PITCH`] apart, not a cell. The facts
+    /// keep their ends (the first and last glyph do not move), the gaps
+    /// between facts stay equal, and a lone fact keeps its middle. A path too
+    /// long for a nudge to reach at that pitch is set a little looser, every
+    /// letter alike. CONTROL: the glyphs' cells alone stand a cell apart.
+    #[test]
+    fn the_facts_are_set_tight() {
+        let blank = cell(' ', [200, 200, 200]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        let step = 1.0 / f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL);
+        // Where each glyph stands, in cells: its cell's middle plus its nudge.
+        let placed = |cells: &[RenderCell]| -> Vec<(char, f32)> {
+            cells
+                .iter()
+                .enumerate()
+                .filter_map(|(c, cell)| match cell.script {
+                    aterm_core::terminal::Script::Sub { nudge } if cell.ch != ' ' => {
+                        Some((cell.ch, c as f32 + 0.5 + f32::from(nudge) * step))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let at = |glyphs: &[(char, f32)], ch: char| glyphs.iter().position(|g| g.0 == ch).unwrap();
+        let fit = footer::fit_rule(&facts(), 76, None);
+        let (cells, _) = compose_rule(&fit, None, rule, blank, [0, 128, 255], 76);
+        let glyphs = placed(&cells);
+        let (first, last) = (glyphs[0], glyphs[glyphs.len() - 1]);
+        assert_eq!(
+            (first.0, first.1),
+            ('\u{25C6}', 1.5),
+            "the first glyph keeps its cell"
+        );
+        assert_eq!(
+            last.1,
+            cells.len() as f32 - 1.5,
+            "the last glyph keeps its cell"
+        );
+        let o = at(&glyphs, 'O');
+        for pair in glyphs[o..o + 4].windows(2) {
+            assert!(
+                (pair[1].1 - pair[0].1 - FACT_PITCH).abs() <= step,
+                "Opus: {:?} to {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // From the glyph before a fact's mark to the mark.
+        let gap = |mark: char| glyphs[at(&glyphs, mark)].1 - glyphs[at(&glyphs, mark) - 1].1;
+        let (g1, g2) = (gap('\u{2302}'), gap('\u{2387}'));
+        assert!(
+            g1 > 4.0 && (g1 - g2).abs() <= 2.0 * step,
+            "equal gaps: {g1} and {g2}"
+        );
+        // CONTROL: in the cells alone, the letters stand a cell apart.
+        let c = cells.iter().position(|cell| cell.ch == 'O').unwrap();
+        assert_eq!(text_of(&cells[c..c + 4]), "Opus");
+        // A lone fact keeps its middle.
+        let model = footer::fit_rule(&facts(), 22, None);
+        assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
+        let (lone, _) = compose_rule(&model, None, rule, blank, [0, 128, 255], 22);
+        let lone_glyphs = placed(&lone);
+        let mid = (lone_glyphs[0].1 + lone_glyphs[lone_glyphs.len() - 1].1) / 2.0;
+        assert!(
+            (mid - lone.len() as f32 / 2.0).abs() <= step,
+            "middle {mid} of {}",
+            lone.len()
+        );
+        // A path no nudge reaches at FACT_PITCH: set looser, evenly.
+        let long = FooterFacts {
+            path: Some(format!("~/{}", "deep/".repeat(30))),
+            ..facts()
+        };
+        let wide = footer::fit_rule(&long, 200, None);
+        let (cells, _) = compose_rule(&wide, None, rule, blank, [0, 128, 255], 200);
+        let glyphs = placed(&cells);
+        let d = at(&glyphs, 'd');
+        let pitches: Vec<f32> = glyphs[d..d + 40]
+            .windows(2)
+            .map(|p| p[1].1 - p[0].1)
+            .collect();
+        let (lo, hi) = pitches
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        assert!(
+            lo > FACT_PITCH && hi - lo <= 2.0 * step,
+            "looser, evenly: {lo}..{hi}"
         );
     }
 
@@ -2498,19 +2689,19 @@ mod tests {
             .position(|c| c.ch == footer::ACCOUNT_MARK)
             .expect("the account's mark");
         assert_eq!(
-            cells[at],
-            RenderCell {
+            unplaced(cells[at]),
+            unplaced(RenderCell {
                 ch: footer::ACCOUNT_MARK,
                 ..cells[1]
-            },
+            }),
             "the mark takes the marks' ink"
         );
         assert_eq!(
-            cells[at + 2],
-            RenderCell {
+            unplaced(cells[at + 2]),
+            unplaced(RenderCell {
                 ch: 'w',
                 ..cells[3]
-            },
+            }),
             "the label takes the values' ink"
         );
         // Whole or not at all, at every width, and nothing else moves for it.
@@ -2622,7 +2813,8 @@ mod tests {
         let room = 200;
         let fit = footer::fit_rule(&facts, room, None);
         let cells = compose_rule(&fit, None, rule, blank, [0, 128, 255], room).0;
-        let ink = |mark: char| cells[text_of(&cells).chars().position(|c| c == mark).unwrap()];
+        let ink =
+            |mark: char| unplaced(cells[text_of(&cells).chars().position(|c| c == mark).unwrap()]);
         for mark in ['\u{29D7}', footer::RESET_MARK, '\u{03A3}'] {
             assert_eq!(
                 ink(mark),
@@ -3585,14 +3777,17 @@ mod tests {
                 "{label}: right-aligned"
             );
             let glyph = *vendor[strip + bottom].last().unwrap();
+            let ink = app.windows[&wid].input_scratch.implicit_blank.fg;
             assert_eq!(
                 rule[at + 2].fg,
-                glyph.fg,
-                "{label}: the value, in the rule's gray"
+                mix(glyph.fg, ink, VALUE_LIFT),
+                "{label}: the value, in the rule's gray lifted toward the pane's ink"
             );
-            assert_eq!(
-                rule[at + 2].script,
-                aterm_core::terminal::Script::Sub,
+            assert!(
+                matches!(
+                    rule[at + 2].script,
+                    aterm_core::terminal::Script::Sub { .. }
+                ),
                 "{label}: small and low"
             );
             for (c, (was, now)) in vendor[strip + bottom].iter().zip(rule).enumerate() {

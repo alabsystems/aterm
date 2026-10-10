@@ -1195,7 +1195,7 @@ fn daemon_step_for(
                 continue;
             };
             // Holds and hands; a person is `attended` within that tab's grace
-            // (KEYS_GAP_S under a `--now`) (owner, 2026-09-28).
+            // (KEYS_GAP_S under a `--now`).
             facts.held |= held(&mut c, &tui.tab, 0);
             let scr = screen(&mut c, &tui.tab);
             let rung = if word == upgrade::Request::Now {
@@ -1962,7 +1962,7 @@ pub(super) fn visit(
     // The ladder: rung, person, and the repaint-proof settle (the reader's idle
     // verdict, look after look, so a redrawn goal counter or clock does not
     // restart it; [`super::ladder_look`], shared with Claude Code's look and
-    // the Tier-1 bind) (owner, 2026-09-28).
+    // the Tier-1 bind).
     let ladder = super::ladder_look(&mut st, "codex", &scr, tui.pid, opts.human_grace_s, now);
     // The reset the wall names ([`St::limit_until`]), in the zone this Codex
     // printed it in, kept as first placed while the words stand
@@ -2050,7 +2050,7 @@ pub(super) fn visit(
     };
     // Quiet upgrade: a wall left on screen an hour past the reset it names is
     // no limit, and the tab is an idle point. A reset to come, a wall naming
-    // none, and the ask flow keep the screen's word (owner, 2026-09-29).
+    // none, and the ask flow keep the screen's word.
     if facts.quiet
         && st.limit_until != 0
         && now >= st.limit_until.saturating_add(super::LIMIT_GRACE_S)
@@ -2126,7 +2126,7 @@ pub(super) fn visit(
     }
     // The goal pause (`cx::goal_step`): at the Land rung, a goal whose own turn
     // is all that holds the move is paused with `/goal pause` and resumed once
-    // the move is made or abandoned (owner, 2026-09-28).
+    // the move is made or abandoned.
     let mut goal_held = false;
     let pursued = aterm_phase::codex::goal_state(&scr.rows) == Some(CodexGoal::Pursuing);
     let goal_holds = pursued
@@ -3131,8 +3131,7 @@ pub(super) fn screen_turn(rows: &[String], rollout: Option<TurnState>) -> (&'sta
 }
 
 /// The words a Codex usage wall names its reset by: the `try again at <time>`
-/// of the limiting wall the last turn ended on ([`aterm_phase::codex::wall`])
-/// (owner, 2026-09-29).
+/// of the limiting wall the last turn ended on ([`aterm_phase::codex::wall`]).
 /// Walls that are no limit (context window, overload, server error) name no
 /// reset here. `None`: no such wall, or `try again later`.
 pub(super) fn wall_reset_text(rows: &[String]) -> Option<String> {
@@ -3411,6 +3410,7 @@ fn announce(
     }
     match type_under(c, &tui.tab, &text, None) {
         Ok(()) => {
+            st.spend_ask(asks, &marker);
             st.marker = marker;
             st.phase = Phase::Announced { at_s: now, asks };
             st.noticed_at = now;
@@ -3467,18 +3467,7 @@ fn plan_for(
     twin: &Path,
     k: &dyn CodexKernel,
 ) -> Result<Plan, NoPlan> {
-    let shell_name = k.args(shell).map(|a| a.exec_path).or_else(|| {
-        table()
-            .into_iter()
-            .find(|(p, _, _)| *p == shell)
-            .map(|(_, _, n)| n)
-    });
-    let Some(dialect) = shell_name
-        .as_deref()
-        .map(base_name)
-        .as_deref()
-        .and_then(Dialect::from_exe_name)
-    else {
+    let Some(dialect) = shell_dialect(shell, k, table) else {
         return Err(NoPlan::Wait("shell-dialect"));
     };
     let heal = atpkg::hooks::hook_file(&opts.home, dialect.hook_ext()).map(|(p, _)| p);
@@ -3499,6 +3488,33 @@ fn plan_for(
         dialect,
         line,
     })
+}
+
+/// The dialect of the shell `shell`, as its executable names it: the kernel's
+/// argv, else its name in the process table `read_table` gives (read only
+/// then). `None`, unread or a shell no relaunch line is written for (`sh`,
+/// tcsh, nushell…), is what [`plan_for`] waits on for ever
+/// (`wait:shell-dialect`). The run's [`snapshot`] reads it the same way, from
+/// the argv alone (as `relaunch::snapshot` reads a Claude Code's), so the
+/// explicit restart is carried only where this plan would write its line
+/// ([`super::super::relaunch::carries_restart`]).
+fn shell_dialect(
+    shell: u32,
+    k: &dyn CodexKernel,
+    read_table: impl FnOnce() -> Vec<(u32, u32, String)>,
+) -> Option<Dialect> {
+    k.args(shell)
+        .map(|a| a.exec_path)
+        .or_else(|| {
+            read_table()
+                .into_iter()
+                .find(|(p, _, _)| *p == shell)
+                .map(|(_, _, n)| n)
+        })
+        .as_deref()
+        .map(base_name)
+        .as_deref()
+        .and_then(Dialect::from_exe_name)
 }
 
 /// The exit: plan the relaunch, take the last look, write the state, type
@@ -3531,7 +3547,7 @@ fn exit(
     };
     // The last look before the irreversible keystroke: nobody's hand, and no
     // person within this rung's grace (`[harness] human_grace_s`, then
-    // KEYS_GAP_S from KeysOnly on and under `--now`) (owner, 2026-09-28).
+    // KEYS_GAP_S from KeysOnly on and under `--now`).
     let now = now_s();
     let rung = if st.request_for(&tui.tab) == upgrade::Request::Now {
         upgrade::Rung::Land
@@ -3980,7 +3996,7 @@ fn relaunch_held(
             return r;
         }
     }
-    st.phase = Phase::Relaunched { at_s: now_s() };
+    st.relaunched(now_s());
     ledger(
         opts,
         &said(r.clone(), "relaunched"),
@@ -4404,12 +4420,16 @@ pub(super) fn snapshot(
                 .ok()
                 .and_then(|mut c| running_block(&mut c, tab)),
         }),
-        // Not read for a Codex: the lane's plan reads the dialect at exit, and
-        // the frozen remedy ([`super::super::relaunch::resumes_on_exit`])
-        // promises no Codex relaunch.
-        dialect: None,
-        // Claude Code's variable: a Codex has no such login.
+        // As the lane's plan reads it ([`shell_dialect`]), from the shell's
+        // kernel argv alone: a shell it writes no line for waits for ever at
+        // exit, so the explicit restart is not carried there
+        // ([`super::super::relaunch::carries_restart`]). The plan reads it
+        // again at exit; the frozen remedy still promises no Codex its
+        // conversation ([`super::super::relaunch::resumes_on_exit`]).
+        dialect: shell_dialect(shell, k, Vec::new),
+        // Claude Code's variables: a Codex has no such login or home.
         login: None,
+        home: None,
     })
 }
 
@@ -4546,7 +4566,8 @@ fn daemon_thread(
 /// shell's word (`left`, or — none read as the exit was seen — the word of the
 /// block it ran in, read now) decides: its own exit or someone's signal is
 /// theirs (`ended:graceful-exit`), no word is left (`ended:exit-unwitnessed`), unless
-/// the stall remedy ended it ([`ExitCause::Stall`]) or aterm itself ended
+/// the explicit restart ended it ([`ExitCause::Stall`], [`ExitCause::Asked`]:
+/// its stamp, consumed as the relaunch is filed) or aterm itself ended
 /// ([`ExitCause::HostEnded`], `snap` naming the new tab and shell). A crash is
 /// relaunched on its thread (held, or its daemon's, [`daemon_thread`]; plain if
 /// none has a rollout) via [`relaunch`], on the managed build while `upgrade`
@@ -4560,7 +4581,9 @@ pub(super) fn after_exit(
     cause: ExitCause,
     k: &dyn CodexKernel,
 ) -> Report {
-    use super::super::relaunch::{CAUSE_EXIT, CAUSE_FRESH, CAUSE_HOST, CAUSE_STALL, ExitRecord};
+    use super::super::relaunch::{
+        CAUSE_ASKED, CAUSE_EXIT, CAUSE_FRESH, CAUSE_HOST, CAUSE_STALL, ExitRecord,
+    };
     let tab = snap.tab.clone();
     let session = key(&tab);
     let from = snap.version.clone().unwrap_or_else(|| "-".to_string());
@@ -4741,6 +4764,7 @@ pub(super) fn after_exit(
         cause: match (&conversation, cause) {
             (None, _) => CAUSE_FRESH,
             (Some(_), ExitCause::Stall) => CAUSE_STALL,
+            (Some(_), ExitCause::Asked) => CAUSE_ASKED,
             (Some(_), ExitCause::HostEnded) => CAUSE_HOST,
             (Some(_), ExitCause::Exit) => CAUSE_EXIT,
         }
@@ -4758,6 +4782,7 @@ pub(super) fn after_exit(
         prior.kept_by_restart(&tab, &mut st);
     }
     save(opts, &session, &st);
+    super::super::relaunch::consume_stamp(opts, snap, cause);
     ledger(
         opts,
         &said(r.clone(), "exited"),

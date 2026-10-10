@@ -59,7 +59,7 @@ const MID: &str = "abcdef";
 /// How the composer's repaint reaches the glass — the six shapes of
 /// `tests/midline_insert_band.rs`, byte for byte but for the readline
 /// shape's repaint, which writes from the insert point here
-/// ([`Host::repaint`], 2026-09-29).
+/// ([`Host::repaint`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
     /// `inkish.py`: hide, home, clear, the whole line | present | 30 ms |
@@ -557,18 +557,12 @@ struct Shared {
 
 /// The take of `(shape, back)`, replayed once per process.
 ///
-/// WHY (2026-10-05): the walk law, the hop law and the C2 law each replayed
-/// the same `take(shape, back, 150)` for their depths (6 shapes × 3 of them
-/// in all three), 60 replays for 24 distinct takes, all of it in the
-/// engine's tick. A take is a pure function of `(shape, back)`: its own
-/// terminal, engine and clock, every instant relative to its own start, and
-/// nothing else read. Checked byte for byte (every census, the hop's
-/// included, compared as `Debug`) between two replays of each of the 24 on
-/// different threads before sharing them. The hop continues the take's own
-/// host, so it is replayed here, right after it, and judged by its law.
-/// A take that panics leaves its cell empty, so every law that reads it
-/// replays it and fails on its own. The file, alone on one thread: 6.97 ->
-/// 3.38 CPU-s.
+/// The walk, hop and C2 laws read the same takes, so each is replayed once.
+/// A take is a pure function of `(shape, back)`: its own terminal, engine and
+/// clock, every instant relative to its own start. The hop continues the
+/// take's own host, so it is replayed here, right after it. A take that
+/// panics leaves its cell empty, so every law that reads it replays it and
+/// fails on its own.
 fn shared(shape: Shape, back: usize) -> &'static Shared {
     static TAKES: [OnceLock<Shared>; SHAPES.len() * BACKS.len()] =
         [const { OnceLock::new() }; SHAPES.len() * BACKS.len()];

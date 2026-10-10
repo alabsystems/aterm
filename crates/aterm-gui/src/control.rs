@@ -87,9 +87,11 @@ mod control_input;
 pub(crate) use control_input::{
     feed_bytes, no_such_tab, parse_ctrl, parse_key, parse_mouse, send_bytes,
 };
-// `input_stall`'s restart test sends `signal term` through the verb itself.
+// `input_stall`'s restart test sends `signal term` through the verb itself,
+// and the harness's restart tests drive `signal` and `restart` as the
+// dispatch runs them (`signal_verb`, `restart_verb`).
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) use control_input::cmd_signal;
+pub(crate) use control_input::{cmd_signal, restart_verb, signal_verb};
 // The press path's wiring test drives a `key`/`ctrl`/`paste` body through the
 // control fence and then the verb's own post, as `handle` does.
 #[cfg(test)]
@@ -2937,6 +2939,7 @@ impl control_lanes::LaneService for ControlWorkerContext {
             self.token.as_str(),
             &self.active,
             &control_denials::AUTH_DENIALS,
+            std::time::Instant::now() + AUTH_READ_TIMEOUT,
         )
     }
 
@@ -2946,14 +2949,14 @@ impl control_lanes::LaneService for ControlWorkerContext {
         scope: Scope,
         stream: &CtlStream,
         reader: &mut control_lanes::LaneReader<'_>,
+        out: &mut Vec<u8>,
     ) -> Option<ServeDisposition> {
-        let mut writer = stream;
         serve_request_line(
             line,
             scope,
             stream,
             reader,
-            &mut writer,
+            out,
             &self.active,
             &self.store,
             &self.subscribers,
@@ -2964,8 +2967,38 @@ impl control_lanes::LaneService for ControlWorkerContext {
         )
     }
 
-    fn is_wait(&self, line: &str, _scope: Scope) -> bool {
-        is_wait_request(line, &self.store)
+    fn frame_header(&self, line: &str, scope: Scope, out: &mut Vec<u8>) -> bool {
+        match binary_frame_verb(line) {
+            Some(verb @ "operator-propose-bin") => match parse_feed_bin(line, verb) {
+                FeedBinFrame::Ok(selector, n, _) => {
+                    let operator = self.operator.as_ref();
+                    match operator_proposal_refusal(selector.as_ref(), n, scope, operator) {
+                        Some(refusal) => {
+                            out.extend_from_slice(refusal.as_bytes());
+                            false
+                        }
+                        None => true,
+                    }
+                }
+                FeedBinFrame::Malformed | FeedBinFrame::TooLarge => true,
+            },
+            Some(verb) => {
+                let route = FeedBinRoute {
+                    active: &self.active,
+                    store: &self.store,
+                    scope,
+                };
+                let mut clear_license =
+                    |session| front_routed_license_clear(&self.proxy, session, false);
+                feed_bin_header(line, verb, route, &mut clear_license, out)
+            }
+            // A `post`'s body has no header to act on.
+            None => true,
+        }
+    }
+
+    fn is_wait(&self, line: &str, scope: Scope) -> bool {
+        is_wait_request(line, scope, &self.store)
     }
 
     fn subscribe(&self, line: String, scope: Scope, stream: CtlStream) {
@@ -3953,6 +3986,26 @@ fn resolve_sibling(sid: &SessionId, sock_dir: &std::path::Path) -> Option<String
     Some(sock_path)
 }
 
+/// The one session a `subscribe` names, read from its text alone (`rest` is the
+/// line after the verb): `Some((sid, tail))` for a single `@<sid>`, `tail` being
+/// the line after that selector; `None` for self (`@.`, `@`), a local id, a
+/// list, `@*` (this instance's live target set, never one session) or no
+/// selector. [`proxy_forward_plan`] relays only such a session and
+/// [`is_wait_request`] classes the same text, so whether a `subscribe` is
+/// relayed and which lane it takes cannot disagree.
+fn subscribe_session(rest: &str) -> Option<(SessionId, &str)> {
+    let rest = rest.trim_start();
+    let (token, tail) = rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len()));
+    let body = token.strip_prefix('@')?;
+    if body == "*" || body.contains(',') {
+        return None;
+    }
+    match Selector::parse(body) {
+        Selector::Sid(sid) => Some((sid, tail)),
+        Selector::SelfTok | Selector::Local(_) => None,
+    }
+}
+
 /// Decide whether `line` from `scope` must be forwarded to another instance,
 /// returning `(target_sock_path, first_line)`, else `None` (handle locally).
 /// Two hop kinds, in order:
@@ -3990,17 +4043,10 @@ fn proxy_forward_plan(
     };
 
     // `subscribe` takes its selector second (`subscribe @<sel> <streams> …`), so
-    // handle it here; only a single remote child forwards, a mixed list stays
-    // local.
+    // handle it here; only a single remote session forwards
+    // ([`subscribe_session`]), a list or `@*` stays local.
     if let Some(rest) = line.strip_prefix("subscribe ") {
-        let sel_tok = rest.split_whitespace().next()?;
-        let sel_body = sel_tok.strip_prefix('@')?;
-        if sel_body.contains(',') {
-            return None;
-        }
-        let Selector::Sid(sid) = Selector::parse(sel_body) else {
-            return None;
-        };
+        let (sid, tail) = subscribe_session(rest)?;
         if hosted(&sid) {
             return None;
         }
@@ -4008,7 +4054,7 @@ fn proxy_forward_plan(
         if let Some((entry, sock_path)) = resolve_proxy_child(&sid, sock_dir) {
             let tok = entry.token_for(op)?;
             // Rewrite the child's selector to `@.` while preserving the streams + flags.
-            let rewritten = format!("subscribe @.{}", &rest[sel_tok.len()..]);
+            let rewritten = format!("subscribe @.{tail}");
             return Some((
                 sock_path,
                 crate::proxy::ForwardLine::edge(tok.to_hex(), rewritten),
@@ -4660,6 +4706,7 @@ mod rekey_verb_tests {
     }
 
     fn leader() -> Leader {
+        use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::fd::{FromRawFd as _, OwnedFd};
         use std::os::unix::process::CommandExt as _;
         // Both ends are close-on-exec from birth, so the `sleep` holds its
@@ -4668,9 +4715,14 @@ mod rekey_verb_tests {
         // SAFETY: `slave` is a fresh fd this function alone owns.
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks.
+        // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks;
+        // the strip first, so the `sleep` holds its terminal and nothing else of this process.
         let mut cmd = std::process::Command::new("/bin/sleep");
-        cmd.arg("30").stdin(stdio()).stdout(stdio()).stderr(stdio());
+        cmd.inherit_nothing()
+            .arg("30")
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio());
         // SAFETY: in the forked child before exec: `setsid` and
         // `ioctl(TIOCSCTTY)` are async-signal-safe and touch nothing of the
         // parent's.
@@ -5063,7 +5115,7 @@ fn dispatch_before_session(
             // `appnotice <lane> <text>`: a pull-down row from outside the process;
             // app state, answered with no terminal.
             "appnotice" => Some(control_query::cmd_appnotice(proxy, rest)),
-            // `notice <post|progress|done|dismiss|act> …`: the message band's write
+            // `notice <post|progress|done|ask|dismiss|act> …`: the message band's write
             // face; app state, answered with no terminal.
             "notice" => Some(control_query::cmd_notice(proxy, rest)),
             // `fabric status|attach`: this process's bridge supervisor, answered
@@ -5616,12 +5668,27 @@ fn write_control_reply(
 )]
 fn artifact_reply_write_wire_anchor() {}
 
+/// Write `reply` where the connection's answers go: `writer`, a lane's outbox
+/// (delivered as the peer takes it, never waited for on the lane) or the
+/// bridge's socket. A GUARDED reply goes straight to `stream` instead, under its
+/// handoff deadline, its ERR fallback included: it must be on the wire before
+/// its ACK is awaited, and a lane's outbox holds nothing then (each answer is
+/// delivered before the next request is read).
 fn write_control_reply_to_stream(
     stream: &CtlStream,
     writer: &mut impl Write,
     reply: ControlReply,
 ) -> std::io::Result<Option<PendingArtifactAck>> {
-    write_control_reply_with_timeout_arm(writer, reply, ARTIFACT_HANDOFF_TIMEOUT, |timeout| {
+    if reply.retention.is_none() {
+        return write_control_reply_with_timeout_arm(
+            writer,
+            reply,
+            ARTIFACT_HANDOFF_TIMEOUT,
+            |_| Ok(()),
+        );
+    }
+    let mut direct = stream;
+    write_control_reply_with_timeout_arm(&mut direct, reply, ARTIFACT_HANDOFF_TIMEOUT, |timeout| {
         stream.set_write_timeout(timeout)
     })
 }
@@ -5632,7 +5699,7 @@ fn write_control_reply_with_timeout_arm(
     handoff_timeout: std::time::Duration,
     mut set_write_timeout: impl FnMut(Option<std::time::Duration>) -> std::io::Result<()>,
 ) -> std::io::Result<Option<PendingArtifactAck>> {
-    let mut handoff_deadline = reply
+    let handoff_deadline = reply
         .retention
         .is_some()
         .then(|| std::time::Instant::now() + handoff_timeout);
@@ -5645,10 +5712,11 @@ fn write_control_reply_with_timeout_arm(
     let mut nonce = if requires_ack {
         match aterm_uds::rand::hex_token::<16>() {
             Ok(nonce) => Some(nonce),
+            // The ERR keeps the handoff deadline: written straight to the
+            // socket, it must not wait on its peer without one.
             Err(error) => {
                 reply.body = format!("ERR artifact acknowledgement setup failed: {error}\n");
                 reply.retention = None;
-                handoff_deadline = None;
                 None
             }
         }
@@ -5663,7 +5731,6 @@ fn write_control_reply_with_timeout_arm(
         retention.prepare_failed_anchor();
         reply.body = format!("ERR artifact reply validation failed: {error}\n");
         reply.retention = None;
-        handoff_deadline = None;
         nonce = None;
     }
     // `reply` remains in scope through the complete write + flush; guarded
@@ -6135,9 +6202,14 @@ fn authenticate_connection(
     token: &str,
     active: &ActiveHandle,
     denials: &control_denials::AuthDenials,
+    deadline: std::time::Instant,
 ) -> Option<(Scope, Option<String>)> {
-    // Bound the unauthenticated phase so a silent peer cannot hold the lane
-    // before presenting a token; timeout drops the connection. The reader
+    // Bound the unauthenticated phase so a peer cannot hold the lane before
+    // presenting a token: the first line must be whole by `deadline` (the lane's
+    // pick-up plus [`AUTH_READ_TIMEOUT`]), re-armed before every refill so a
+    // dribbled byte buys nothing; expiry drops the connection. While a parker
+    // runs the line is whole before this is called (the parker holds the
+    // connection until it is); this bound is a lane's without one. The reader
     // borrows this stream rather than duplicating the fd (a duplicated AF_UNIX
     // fd's close can block on macOS). Cleared after authentication.
     if stream.set_read_timeout(Some(AUTH_READ_TIMEOUT)).is_err() {
@@ -6145,7 +6217,7 @@ fn authenticate_connection(
     }
     // An explicit `read_line` loop (not `lines()`) so `feed-bin <n>` can
     // `read_exact` its raw bytes from the same buffered stream.
-    let first = read_request_line(reader)?; // `None`: hung up before auth
+    let first = read_request_line_until(stream, reader, deadline)?; // `None`: hung up or too slow
     let active_ctx = || resolve_active(active).map(|(_, _, _, ctx)| ctx);
     let (scope, inline_verb) = match first_line_scope(&first, token, active_ctx) {
         Ok(authenticated) => authenticated,
@@ -6179,21 +6251,36 @@ fn authenticate_connection(
 
 /// Whether a request belongs on a wait lane (`control_lanes.rs`): it mostly
 /// waits for an event, or hands the connection to a relay. Only decides which
-/// lane's time it takes; an unlisted waiting verb costs a request lane.
-fn is_wait_request(line: &str, store: &Store) -> bool {
+/// lane's time it takes; an unlisted waiting verb costs a request lane, and a
+/// missed relay holds one for as long as the relay lives. So a line
+/// [`proxy_forward_plan`] relays is a wait here: its scope and selector tests,
+/// without its resolution (no graph read or connect probe per request).
+fn is_wait_request(line: &str, scope: Scope, store: &Store) -> bool {
     let (selector, verb, rest) = request_head(line);
+    // Only an Owner-class connection is relayed; an Edge's line naming another
+    // instance's session is refused here, at once.
+    let relayed = |sid: &SessionId| {
+        scope.is_owner_class()
+            && store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_sid(sid)
+                .is_none()
+    };
     // A session this instance does not host: `@<sid>` forwards the connection to
     // the child or sibling that does, and the relay then owns it.
     if let Some(Selector::Sid(sid)) = &selector
-        && store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(sid)
-            .is_none()
+        && relayed(sid)
     {
         return true;
     }
     match verb {
+        // `subscribe` carries its selector second: one session this instance
+        // does not host is relayed for the whole subscription. Self, a local
+        // id, a list or `@*` flips to push here at once: request-lane work.
+        "subscribe" if selector.is_none() => {
+            subscribe_session(rest).is_some_and(|(sid, _)| relayed(&sid))
+        }
         // Parks on an event, a settle, a prompt, or the bridge's landing.
         "await" | "ready" | "wait" | "turn" | "post" => true,
         // `inbox get @<off>` parks for the bridge's next drain; the listing and
@@ -6220,7 +6307,7 @@ fn serve_request_line(
     scope: Scope,
     stream: &CtlStream,
     reader: &mut control_lanes::LaneReader<'_>,
-    writer: &mut &CtlStream,
+    writer: &mut impl Write,
     active: &ActiveHandle,
     store: &Store,
     subscribers: &Subscribers,
@@ -6340,13 +6427,16 @@ fn serve_request_line(
 }
 
 /// Read one request line, stripping `\n` (and `\r`). `None` on EOF, a read
-/// error, or a line longer than [`MAX_REQUEST_LINE`].
+/// error, or a line longer than [`MAX_REQUEST_LINE`]. Test-only: a socket's
+/// first line is read under a deadline ([`read_request_line_until`]).
+#[cfg(test)]
 fn read_request_line(reader: &mut impl BufRead) -> Option<String> {
-    read_request_line_with_idle_retry(reader, false)
+    read_request_line_with_policy(reader, false, || Ok(()))
 }
 
 /// Read one line under one monotonic deadline, re-armed before every buffer
-/// refill, so a peer cannot hold a guarded artifact by dribbling bytes.
+/// refill, so a peer cannot hold a lane by dribbling bytes: the handshake's
+/// first line, and the ACK that releases a guarded artifact.
 ///
 /// A detached peer's queued bytes are still read: the one-shot `aterm ctl`
 /// writes `ACK <nonce>` and exits, and on Darwin `SO_RCVTIMEO` then fails with
@@ -6466,13 +6556,6 @@ fn wait_authenticated_readable(_stream: &CtlStream) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_request_line_with_idle_retry(
-    reader: &mut impl BufRead,
-    retry_idle_timeout: bool,
-) -> Option<String> {
-    read_request_line_with_policy(reader, retry_idle_timeout, || Ok(()))
-}
-
 fn read_request_line_with_policy(
     reader: &mut impl BufRead,
     retry_idle_timeout: bool,
@@ -6540,8 +6623,11 @@ fn handoff_subscription(
 /// separately); longer lines drop the connection.
 const MAX_REQUEST_LINE: usize = 64 * 1024;
 
-/// Read deadline for the unauthenticated phase (through the first line),
-/// bounding how long a silent peer holds its reserved lane.
+/// How long a fresh connection has to make its handshake line whole: one
+/// deadline from admission, not a timeout per read, so a peer that sends a byte
+/// now and then does not keep its connection for it. The parker holds the
+/// connection meanwhile (`control_lanes.rs`); a lane without one reads the line
+/// under it, from its pick-up.
 const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Receive timeout backstop for authenticated sockets (the liveness cadence
@@ -6641,6 +6727,22 @@ fn post_frame_len(line: &str) -> Option<Result<usize, String>> {
     crate::fabric::post_options(it)
         .find_map(|tok| tok.strip_prefix("len="))
         .map(crate::fabric::post_len)
+}
+
+/// The bytes of body a request `line` announces: what [`serve_request_line`]
+/// reads after the line before it answers — a `post … len=<n>`, `feed-bin <n>`,
+/// `paste-bin <n>` or `operator-propose-bin <n>` with a length it will read.
+/// Zero for every other line, and for a length it refuses unread (it answers
+/// and closes instead). The lanes serve a request only once this much has
+/// followed its line (`control_lanes::held`), so a lane never waits for a body.
+fn announced_body(line: &str) -> usize {
+    if let Some(len) = post_frame_len(line) {
+        return len.unwrap_or(0);
+    }
+    binary_frame_verb(line).map_or(0, |verb| match parse_feed_bin(line, verb) {
+        FeedBinFrame::Ok(_, n, _) => n,
+        FeedBinFrame::Malformed | FeedBinFrame::TooLarge => 0,
+    })
 }
 
 /// Resolve only the target-bearing prefix of a binary input header, independent
@@ -7361,6 +7463,32 @@ fn operator_input_error_summary(status: &str) -> Option<String> {
     }
 }
 
+/// Why an `operator-propose-bin <n>` frame is refused on its header alone, if
+/// it is. These failures make the announced frame unusable: refuse and CLOSE
+/// before touching its body — reading attacker-chosen bytes after an
+/// authority, routing, availability, or operator-specific size failure only
+/// holds them and contradicts the fail-closed framing contract. A lane asks it
+/// as soon as the header is whole (`LaneService::frame_header`), and again when
+/// the whole frame is served. The §5.3 halt is NOT asked here: the session this
+/// frame drives is the one its body names, so `run_operator_proposal` asks it
+/// once that sid is known.
+fn operator_proposal_refusal(
+    selector: Option<&Selector>,
+    n: usize,
+    scope: Scope,
+    operator: Option<&crate::operator_host::ControlHandle>,
+) -> Option<String> {
+    if let Some(refusal) = owner_only_refusal("operator-propose-bin", selector, scope) {
+        Some(refusal)
+    } else if operator.is_none() {
+        Some(operator_unavailable())
+    } else if n > MAX_OPERATOR_PROPOSAL {
+        Some("ERR operator proposal too large\n".to_string())
+    } else {
+        None
+    }
+}
+
 fn run_operator_proposal_bin<W: Write>(
     line: &str,
     reader: &mut impl BufRead,
@@ -7384,24 +7512,7 @@ fn run_operator_proposal_bin<W: Write>(
             return false;
         }
     };
-    // These failures make the announced frame unusable. Refuse and CLOSE before
-    // touching its body: reading attacker-chosen bytes after an authority,
-    // routing, availability, or operator-specific size failure needlessly parks
-    // a scarce control lane and contradicts the fail-closed framing contract.
-    // The §5.3 halt is NOT asked here: the session this frame drives is the one
-    // its body names, so `run_operator_proposal` asks it once that sid is known.
-    let pre_body_error = if let Some(refusal) =
-        owner_only_refusal("operator-propose-bin", selector.as_ref(), scope)
-    {
-        Some(refusal)
-    } else if operator.is_none() {
-        Some(operator_unavailable())
-    } else if n > MAX_OPERATOR_PROPOSAL {
-        Some("ERR operator proposal too large\n".to_string())
-    } else {
-        None
-    };
-    if let Some(error) = pre_body_error {
+    if let Some(error) = operator_proposal_refusal(selector.as_ref(), n, scope, operator) {
         let _ = writer.write_all(error.as_bytes());
         let _ = writer.flush();
         return false;
@@ -7555,33 +7666,28 @@ fn run_post_bin<W: Write>(
     writer.flush().is_ok()
 }
 
-#[derive(Clone, Copy)]
-struct FeedBinRoute<'a> {
-    active: &'a ActiveHandle,
-    store: &'a Store,
-    scope: Scope,
-}
-
-fn run_feed_bin_routed<W: Write, F, C>(
+/// The header of a `[@<sel>] feed-bin|paste-bin <n>` frame: the input boundary
+/// for its target, acted on before the payload is waited for. Resolve and
+/// authorize the header prefix first, so a slowly trickled frame cannot let
+/// unrelated child output borrow the old key-hint licence: an authorized
+/// target's licence is fenced here. A lane runs it as soon as the header is
+/// whole (`LaneService::frame_header`) and again when the whole frame is served
+/// ([`run_feed_bin_routed`]): the second fence is one more of the kind the
+/// payload gets anyway at its effect boundary, before egress.
+/// `false`: refused before the payload (an ambiguous target, a failed fence),
+/// the answer in `writer`; the stream is desynced, so the connection closes.
+fn feed_bin_header<W: Write, C>(
     line: &str,
     verb: &str,
-    reader: &mut impl BufRead,
     route: FeedBinRoute<'_>,
-    dispatch_front_input: &mut F,
     clear_license: &mut C,
     writer: &mut W,
 ) -> bool
 where
-    F: FnMut(InputEvent, Option<u64>) -> Result<InputOutcome, String>,
     C: FnMut(u64) -> String,
 {
-    // `paste-bin` goes through the paste seam (bracketing, sanitize, LF→CR under
-    // the target's lock); `feed-bin` writes raw. Everything else is shared.
-    let paste = verb == "paste-bin";
-    // Resolve and authorize the header prefix before waiting for the payload, so
-    // a slowly trickled frame cannot let unrelated child output borrow the old
-    // key-hint licence. Malformed and over-cap attempts follow the same rule;
-    // unknown or unauthorized targets never mutate UI state.
+    // Malformed and over-cap attempts follow the same rule; unknown or
+    // unauthorized targets never mutate UI state.
     let attempt_selector = binary_frame_attempt_selector(line, verb);
     let header_active_target = resolve_active(route.active);
     // An ambiguous id must not clear another instance's licence either; refuse
@@ -7618,6 +7724,35 @@ where
         }
     }
 
+    true
+}
+
+#[derive(Clone, Copy)]
+struct FeedBinRoute<'a> {
+    active: &'a ActiveHandle,
+    store: &'a Store,
+    scope: Scope,
+}
+
+fn run_feed_bin_routed<W: Write, F, C>(
+    line: &str,
+    verb: &str,
+    reader: &mut impl BufRead,
+    route: FeedBinRoute<'_>,
+    dispatch_front_input: &mut F,
+    clear_license: &mut C,
+    writer: &mut W,
+) -> bool
+where
+    F: FnMut(InputEvent, Option<u64>) -> Result<InputOutcome, String>,
+    C: FnMut(u64) -> String,
+{
+    // `paste-bin` goes through the paste seam (bracketing, sanitize, LF→CR under
+    // the target's lock); `feed-bin` writes raw. Everything else is shared.
+    let paste = verb == "paste-bin";
+    if !feed_bin_header(line, verb, route, clear_license, writer) {
+        return false;
+    }
     let (selector, n, idem_key) = match parse_feed_bin(line, verb) {
         FeedBinFrame::Ok(selector, n, idem) => (selector, n, idem),
         FeedBinFrame::Malformed => {
@@ -8894,13 +9029,15 @@ fn operator_input_if_epoch(
             key,
             mods,
             base_layout,
+            layout_text,
             event_type,
-        } => aterm_types::keyboard::encode_key_with_layout(
+        } => aterm_types::keyboard::encode_key_with_text(
             &key,
             mods,
             terminal.keyboard_mode(),
             event_type,
             base_layout,
+            layout_text,
         ),
         _ => return Delivery::BusyZero,
     };
@@ -10083,12 +10220,10 @@ fn handle(
             }
             Err(error) => error.to_string(),
         },
-        "signal" => control_input::cmd_signal(
-            master,
-            rest,
-            &ctx.sink,
-            ctx.human_input.ms_since(crate::metrics::now_us()),
-        ),
+        "signal" => control_input::signal_verb(master, rest, ctx),
+        // The explicit restart (`crate::restart_act`): its stamp before its
+        // signal, its escalation its own thread, so the lane is not held.
+        "restart" => control_input::restart_verb(master, rest, self_ctx),
         // The manual reset (`crate::manual_reset`), for a terminal the foreground
         // handback cannot reach. It runs on the target's PTY reader, touching no App UI
         // and writing no input, so self, front and background share one arm.
@@ -10583,6 +10718,9 @@ mod control_retire_tests;
 #[cfg(all(test, unix))]
 #[path = "control_socket_handoff_tests.rs"]
 mod control_socket_handoff_tests;
+#[cfg(all(test, unix))]
+#[path = "control_stall_tests.rs"]
+mod control_stall_tests;
 #[cfg(all(test, unix))]
 #[path = "publish_ordering_conformance.rs"]
 mod publish_ordering_conformance;

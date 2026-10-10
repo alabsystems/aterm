@@ -63,14 +63,8 @@ impl DiskColdTier {
             .saturating_add(cache_lines_mem)
     }
 
-    #[cfg(not(kani))]
     fn cache_bucket_count(cache: &HashMap<usize, CacheEntry>) -> usize {
         cache.capacity()
-    }
-
-    #[cfg(kani)]
-    fn cache_bucket_count(cache: &HashMap<usize, CacheEntry>) -> usize {
-        cache.len()
     }
 
     /// Decompress a page — from the mapped view when it covers the page, else
@@ -254,8 +248,8 @@ impl DiskColdTier {
     ///
     /// Bounds the cache by BOTH the page count (`cache_size`) and the byte budget
     /// (`cache_byte_limit`). A single page larger than the whole budget is refused
-    /// (a re-read re-decompresses, which is correct). This is the eviction the Kani
-    /// proof `cache_byte_limit_respected` models; keep the two in lockstep. Without
+    /// (a re-read re-decompresses, which is correct);
+    /// `disk_cold_cache_byte_limit_is_enforced` holds it to both. Without
     /// the byte bound a malicious `.dtrm` with a few pages near the 64 MiB
     /// decompression cap pins `cache_size × 64 MiB` resident (round-10).
     pub(super) fn cache_page(&self, page_idx: usize, lines: Vec<Line>) {

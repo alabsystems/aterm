@@ -80,7 +80,6 @@ fn reflow_grow_extreme_ratio_merges_continuations() {
     );
     assert!(ops > 0, "reflow grow should do some work");
 
-    // Content should be restored
     let row0_text = grid.row(0).unwrap().to_string();
     assert_eq!(
         row0_text, "ABCDEFGHIJ",
@@ -107,7 +106,6 @@ fn reflow_extreme_resize_preserves_cursor_on_last_row() {
     // Place cursor at col 3 ('L')
     grid.set_cursor(0, 3);
 
-    // Extreme shrink to 2 cols
     grid.resize(rows, 2);
     grid.assert_invariants();
 
@@ -118,7 +116,6 @@ fn reflow_extreme_resize_preserves_cursor_on_last_row() {
         "cursor col should be clamped to new_cols, got {cursor_col_after_shrink}"
     );
 
-    // Grow back to original
     grid.resize(rows, cols);
     grid.assert_invariants();
 

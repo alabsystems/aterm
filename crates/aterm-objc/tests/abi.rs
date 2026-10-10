@@ -66,7 +66,7 @@ unsafe impl Encode for B16 {
     const ENCODING: &'static str = "{B16=[2Q]}";
 }
 
-/// The judge's counterexample, verbatim: `struct __attribute__((packed)) { char
+/// `struct __attribute__((packed)) { char
 /// c; long q; }`. Nine bytes, so `size_of` alone says "registers"; the `q` sits
 /// at offset 1, so the System V x86-64 classification is MEMORY and clang sends
 /// it through `_objc_msgSend_stret`. MEASURED — see `returns_indirectly`'s
@@ -83,7 +83,7 @@ unsafe impl Encode for PackedCharLong {
     const HAS_UNALIGNED_FIELDS: bool = true;
 }
 
-/// The judge's THIRD-pass counterexample: a WRAPPER, not a packed struct.
+/// A WRAPPER around a packed struct, not a packed struct itself.
 ///
 /// `HAS_UNALIGNED_FIELDS` was documented non-transitively — "whether `Self`
 /// places any field at an offset that is not a multiple of that field's own

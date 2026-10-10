@@ -13,6 +13,8 @@
 //! that charges each cluster on its own disagrees with the grid. Every column
 //! measurer walks a line with one [`GridColumns`] instead.
 
+use aterm_types::text_shaping::AmbiguousWidth;
+
 use crate::emoji_presentation::is_vs16_emoji_capable;
 use crate::grapheme_iter::{GraphemeClusters, GraphemeIndices};
 use crate::tables::width as unicode_tables;
@@ -118,7 +120,9 @@ impl GridStep {
 /// The grid's layout of one line, fed a character at a time from the line's
 /// first column.
 ///
-/// Each printing character takes [`char_width`](crate::char_width) cells, except
+/// Each printing character takes [`char_width`](crate::char_width) cells
+/// ([`char_width_cjk`](crate::char_width_cjk) under
+/// [`AmbiguousWidth::Double`], the terminal's `ambiguous_width = "wide"`), except
 /// that
 ///
 /// * a zero-width character joins the cell before it, and VS16 widens that cell
@@ -146,15 +150,28 @@ pub struct GridColumns {
     cursor: usize,
     /// The cell a joining character lands in; `None` before the first one.
     cell: Option<Cell>,
+    /// How wide the grid draws an East Asian Ambiguous character: the
+    /// terminal's `ambiguous_width` policy the line was written under.
+    ambiguous: AmbiguousWidth,
 }
 
 impl GridColumns {
-    /// A walk from a line's first column.
+    /// A walk from a line's first column, East Asian Ambiguous characters one
+    /// cell wide (the terminal's default).
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_ambiguous_width(AmbiguousWidth::Single)
+    }
+
+    /// A walk from a line's first column, East Asian Ambiguous characters as
+    /// wide as `ambiguous` says: two cells under [`AmbiguousWidth::Double`],
+    /// as the grid writes them with `ambiguous_width = "wide"`.
+    #[must_use]
+    pub const fn with_ambiguous_width(ambiguous: AmbiguousWidth) -> Self {
         Self {
             cursor: 0,
             cell: None,
+            ambiguous,
         }
     }
 
@@ -166,7 +183,10 @@ impl GridColumns {
 
     /// Lay out `c` after everything fed so far.
     pub fn step(&mut self, c: char) -> GridStep {
-        let width = unicode_tables::char_width(c);
+        let width = match self.ambiguous {
+            AmbiguousWidth::Double => unicode_tables::char_width_cjk(c),
+            _ => unicode_tables::char_width(c),
+        };
         match self.cell.as_mut() {
             Some(cell) if width == 0 => {
                 cell.store(c);
@@ -215,7 +235,13 @@ impl GridColumns {
 /// cluster the grid paints in three cells (`न्`, `द`, `ी`).
 #[must_use]
 pub fn str_grid_columns(s: &str) -> usize {
-    GridColumns::new().advance_str(s)
+    str_grid_columns_with(s, AmbiguousWidth::Single)
+}
+
+/// [`str_grid_columns`] under the terminal's `ambiguous_width` policy.
+#[must_use]
+pub fn str_grid_columns_with(s: &str, ambiguous: AmbiguousWidth) -> usize {
+    GridColumns::with_ambiguous_width(ambiguous).advance_str(s)
 }
 
 /// One grapheme cluster and the grid columns it is drawn in (see
@@ -276,8 +302,16 @@ impl<'a> Iterator for GridGraphemes<'a> {
 /// drawn in the cell it joined.
 #[must_use]
 pub fn grid_graphemes(s: &str) -> GridGraphemes<'_> {
+    grid_graphemes_with(s, AmbiguousWidth::Single)
+}
+
+/// [`grid_graphemes`] under the terminal's `ambiguous_width` policy: with
+/// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`,
+/// `°`) is drawn in two columns, as the grid writes it.
+#[must_use]
+pub fn grid_graphemes_with(s: &str, ambiguous: AmbiguousWidth) -> GridGraphemes<'_> {
     GridGraphemes {
         clusters: s.grapheme_indices(),
-        grid: GridColumns::new(),
+        grid: GridColumns::with_ambiguous_width(ambiguous),
     }
 }

@@ -3458,6 +3458,7 @@ impl App {
             InputEvent::Key {
                 key,
                 mods,
+                layout_text,
                 event_type: KeyEventType::Press | KeyEventType::Repeat,
                 ..
             } => {
@@ -3604,6 +3605,9 @@ impl App {
                         Key::Character('y' | 'Y') if command => {
                             Some(AppEvent::TextInput(TextInputEvent::Redo))
                         }
+                        // The text press types the character the terminal would:
+                        // `key` is the layout's UNSHIFTED key, so Shift+a used to
+                        // commit 'a' and German Shift+2 '2'.
                         Key::Character(character)
                             if !mods.intersects(
                                 Modifiers::CTRL
@@ -3614,7 +3618,8 @@ impl App {
                             ) =>
                         {
                             Some(AppEvent::TextInput(TextInputEvent::Commit(
-                                character.to_string(),
+                                crate::input::typed_glyph(*character, *mods, *layout_text)
+                                    .to_string(),
                             )))
                         }
                         Key::Named(NamedKey::Space)
@@ -4105,15 +4110,37 @@ impl App {
                     }
                 }
             }
-            AppEffect::OpenLogFolder => {
+            AppEffect::OpenLogFolder { reply } => {
                 // The host's own log directory — never a path from the view — opened
-                // through NSWorkspace like Open Log: no shell, no Terminal.
-                match crate::logging::log_dir() {
-                    Some(dir) if crate::menu::open_file_in_workspace(&dir) => {}
+                // through NSWorkspace like Open Log: no shell, no Terminal. The page
+                // is told how it went (ruling 441 (t)), as `OpenExternal` tells it.
+                let outcome = match crate::logging::log_dir() {
+                    Some(dir) if crate::menu::open_file_in_workspace(&dir) => {
+                        ExternalOpenOutcome::Opened
+                    }
                     Some(dir) => {
                         aterm_log::warn!("could not open the log folder {}", dir.display());
+                        ExternalOpenOutcome::Denied {
+                            message: "the log folder did not open".to_string(),
+                        }
                     }
-                    None => aterm_log::warn!("the log folder has no directory to live in"),
+                    None => {
+                        aterm_log::warn!("the log folder has no directory to live in");
+                        ExternalOpenOutcome::Denied {
+                            message: "the log folder has no directory".to_string(),
+                        }
+                    }
+                };
+                if self.native_runtime.completion_is_current(&reply) {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::ExternalOpenFinished {
+                            operation: reply.operation,
+                            outcome,
+                        },
+                    )?;
                 }
             }
             AppEffect::OpenPackagesLog => {
@@ -5851,10 +5878,7 @@ impl App {
                 self.config.packages_auto_install(),
                 self.package_update_loop_running,
             )
-            .with_machine_config(
-                self.config.machine_universal_control(),
-                self.config.machine_spotlight_noindex(),
-            )
+            .with_machine_config(self.config.machine_universal_control())
             .with_retired_switch_note(self.config.packages_retired_switch_note());
         if !self
             .native_runtime
@@ -11383,8 +11407,8 @@ pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(
 ///
 /// Under a private state root
 /// ([`aterm_types::dirs::runs_under_private_state_root`]), Apply Now is refused: the
-/// `[machine]` settings are the Mac's (Universal Control for the account's host,
-/// Spotlight renames under the account's `$HOME`). The page's button applies nothing,
+/// `[machine]` settings are the Mac's (Universal Control for the account's host). The
+/// page's button applies nothing,
 /// the launch's daily apply stands aside
 /// ([`atpkg::machine::LaunchApply::PrivateStateRoot`]) and a pass carries no
 /// `[machine]` edit; `aterm pkg machine apply` in a terminal is the one way left.

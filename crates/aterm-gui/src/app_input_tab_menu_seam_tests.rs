@@ -23,6 +23,7 @@ fn key(named: ENamed, mods: Modifiers) -> InputEvent {
         key: EKey::Named(named),
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }

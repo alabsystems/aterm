@@ -241,6 +241,10 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         Outcome::Cannot("state-unwritable".to_string())
     );
     assert_eq!(outcome("busy:another-sweep"), Outcome::Busy);
+    // An exit a standing stamp names, its process stopped away from its tab:
+    // owed, looked at again uncounted (ruling 13 of 2026-10-08) — never the
+    // bare `not-exited` above, which is left.
+    assert_eq!(outcome(WAIT_ACT_ENDS), Outcome::Busy);
     for step in [
         "wait:shell-prompt",
         "wait:resume",
@@ -366,6 +370,7 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
         codex: None,
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
+        home: None,
     };
     let known = snap(&["/opt/claude", "--model", "opus"]);
     assert!(resumes_on_exit(&known), "a launch the relaunch carries");
@@ -444,6 +449,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
         codex: None,
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
+        home: None,
     };
     let record = |session: &str, at: &str| {
         std::fs::write(
@@ -1372,6 +1378,95 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
     );
 }
 
+/// THE CLAUDE HOME IS ON THE LINE TOO ([`required_env`]): a process started
+/// with `CLAUDE_CONFIG_DIR` (on its own command line, or by a wrapper: the
+/// tab's shell never had it) is relaunched with exactly that value, ahead of
+/// the login and the survey switch, in every shell's form — dropped, the new
+/// process reads another `.claude.json` (measured 2026-10-09 in the
+/// real-claude lab: the first-run theme picker, the conversation never held)
+/// and, with no login variable, signs in by another keychain item. A home no
+/// line can hold refuses the line, and no relaunch is promised for it.
+/// NEGATIVE CONTROL: no home, the line is byte for byte what it was.
+#[test]
+fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
+    const HOME: &str = "/tmp/lab home/.claude";
+    let tail = format!("'/opt/claude' '--verbose' '--resume' '{LOGIN_ID}'");
+    let survey = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1";
+    let argv = ["claude", "--verbose"];
+    let home = r"CLAUDE_CONFIG_DIR='/tmp/lab home/.claude'";
+    assert_eq!(
+        required_env(Some(HOME), None),
+        [(accounts::HOME_ENV, HOME)],
+        "the home alone"
+    );
+    for dialect in [Dialect::Zsh, Dialect::Bash] {
+        assert_eq!(
+            login_line(dialect, None, &argv, &required_env(Some(HOME), None)).as_deref(),
+            Ok(format!(" {home} {survey} {tail}").as_str()),
+            "{dialect:?}"
+        );
+    }
+    assert_eq!(
+        login_line(Dialect::Fish, None, &argv, &required_env(Some(HOME), None)).as_deref(),
+        Ok(format!(" env {home} {survey} {tail}").as_str())
+    );
+    // The home first, then the login: both carried.
+    let posix = r"CLAUDE_SECURESTORAGE_CONFIG_DIR='/tmp/aterm state/logins/owner'\''s work-2'";
+    assert_eq!(
+        login_line(
+            Dialect::Zsh,
+            None,
+            &argv,
+            &required_env(Some(HOME), Some(LOGIN_DIR))
+        )
+        .as_deref(),
+        Ok(format!(" {home} {posix} {survey} {tail}").as_str())
+    );
+    // NEGATIVE CONTROL: no home — the login's line, and with neither the
+    // line as it always was.
+    assert_eq!(
+        required_env(None, Some(LOGIN_DIR)),
+        login_env(Some(LOGIN_DIR))
+    );
+    assert!(required_env(None, None).is_empty());
+    assert_eq!(
+        login_line(Dialect::Zsh, None, &argv, &required_env(None, None)).as_deref(),
+        Ok(format!(" {survey} {tail}").as_str())
+    );
+    // Whether an exit is promised a relaunch asks the same line, home and all.
+    let snap = |home: Option<String>| Snapshot {
+        tab: "s-1".to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude"),
+        argv: words(&["/opt/claude", "--verbose"]),
+        session: Some(LOGIN_ID.to_string()),
+        cwd: "/w".to_string(),
+        version: Some("2.1.295".to_string()),
+        codex: None,
+        dialect: Some(Dialect::Zsh),
+        login: None,
+        home,
+    };
+    assert!(resumes_on_exit(&snap(None)));
+    assert!(resumes_on_exit(&snap(Some(HOME.to_string()))));
+    assert!(!resumes_on_exit(&snap(Some(format!(
+        "/tmp/{}",
+        "d".repeat(5000)
+    )))));
+    // A control character in the value refuses the line, never a cut value.
+    assert_eq!(
+        login_line(
+            Dialect::Zsh,
+            None,
+            &argv,
+            &required_env(Some("/tmp/a\nb"), None)
+        ),
+        Err("line".to_string())
+    );
+}
+
 /// THE SURVEY SWITCH IS DROPPED BEFORE THE LOGIN IS, AND THE LOGIN NEVER: a
 /// line that fits only without the switch is typed with the login alone, and
 /// one that cannot hold the login is REFUSED (`refused:line`) — never typed
@@ -1434,6 +1529,7 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
         codex: None,
         dialect: Some(Dialect::Zsh),
         login,
+        home: None,
     };
     assert!(resumes_on_exit(&snap(None)));
     assert!(resumes_on_exit(&snap(Some(String::new()))));
@@ -1476,6 +1572,7 @@ fn a_label_is_a_login_only_through_the_roster() {
         codex: None,
         dialect: None,
         login: login.map(str::to_string),
+        home: None,
     };
     assert!(runs_under(&on(None), &roster, "main"));
     assert!(runs_under(&on(Some("")), &roster, "main"));

@@ -3,8 +3,8 @@
 
 //! Asset-level quality gates for the cursor cat's high-visibility glyphs.
 //!
-//! These tests intentionally read the TOML sources rather than the generated
-//! drawlist. That keeps the art-review loop useful before codegen is committed.
+//! They read the TOML sources, not the generated drawlist, so art review
+//! works before codegen is committed.
 
 use std::path::PathBuf;
 

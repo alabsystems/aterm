@@ -480,7 +480,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access, running instances and past crashes; exits 1 only when the shell cannot start.",
+        "Check the shell, macOS access, where code lives and whether Spotlight skips it, running instances and past crashes; exits 1 only when the shell cannot start.",
     ),
     ("list-fonts", "List available font families (one per line)."),
     ("show-face", "Show a font family's file and cell metrics."),
@@ -532,7 +532,10 @@ fn show_config_report() -> String {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let or = |s: String, dflt: &str| if s.is_empty() { dflt.to_string() } else { s };
     let mut out = String::new();
-    out.push_str(&format!("version={}\n", aterm_types::version::APP_VERSION));
+    out.push_str(&format!(
+        "version={}\n",
+        aterm_types::version::app_version()
+    ));
     // Shell: `$SHELL` on Unix. On Windows the spawn reads neither `$SHELL` nor
     // `%COMSPEC%`, so the row is this tab's shell when there is one
     // (`shell_origin=tab`), else the one a new window's tab spawns, from the
@@ -634,28 +637,18 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
      \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
-     \x20 spotlight_noindex       true (default) renames the cargo target dirs the scan\n\
-     \x20                         reaches under $HOME to target.noindex, so Spotlight never\n\
-     \x20                         indexes build output. Cargo keeps working either way: a\n\
-     \x20                         `target` symlink in a git checkout, a `[build] target-dir`\n\
-     \x20                         line in .cargo/config.toml elsewhere. Documents, Desktop,\n\
-     \x20                         Downloads, Pictures, Movies, Music and Library are never\n\
-     \x20                         walked: macOS asks a human before a program reads those.\n\
-     \x20 Both are applied by `aterm pkg machine apply`, which aterm runs once a day at the\n\
+     \x20 It is applied by `aterm pkg machine apply`, which aterm runs once a day at the\n\
      \x20 first window or interactive terminal session, and by a package pass (update,\n\
-     \x20 seed, install) when the [machine] table changed since\n\
-     \x20 they were last applied; `aterm pkg machine` reads the measured state, and\n\
-     \x20 Settings ▸ Security shows it with the two switches and an Apply now button. A\n\
-     \x20 saved change lands on the next package pass, or on Apply now. `defaults` writes\n\
+     \x20 seed, install) when the [machine] table changed since it was last applied;\n\
+     \x20 `aterm pkg machine` reads the measured state, and Settings ▸ Security shows it\n\
+     \x20 with the switch and an Apply now button. A saved change lands on the next\n\
+     \x20 package pass, or on Apply now. `defaults` writes\n\
      \x20 the ACCOUNT's per-host domain regardless of $HOME, so an apply under a redirected\n\
      \x20 HOME is refused and says so, as is one whose aterm.toml does not parse (fix it\n\
      \x20 with `aterm --window --validate-config`). Undo Universal Control with the\n\
      \x20 revert line `aterm pkg machine` prints (`defaults -currentHost delete\n\
      \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND set\n\
-     \x20 universal_control = \"leave\", or the next apply disables it again. Undo a rename in\n\
-     \x20 a git checkout by removing the `target` symlink and renaming target.noindex back;\n\
-     \x20 elsewhere the apply left no symlink and pointed cargo with a `[build] target-dir`\n\
-     \x20 line in .cargo/config.toml, so delete that line as well.\n";
+     \x20 universal_control = \"leave\", or the next apply disables it again.\n";
 
 /// The `[privacy]` paragraph of `explain-config` (design §4).
 ///
@@ -1444,6 +1437,7 @@ fn doctor_report() -> (String, i32) {
     let instances = aterm_ctl::census::window_census();
     let recovery = recovery_facts();
     let exceptions = exceptions_facts();
+    let devroot = devroot_facts();
     // Unix: the program this passthrough session spawns.
     #[cfg(not(windows))]
     {
@@ -1458,6 +1452,7 @@ fn doctor_report() -> (String, i32) {
             &instances,
             &recovery,
             &exceptions,
+            &devroot,
         )
     }
     // Windows: this tab's shell inside an aterm tab, else the one a new
@@ -1474,8 +1469,90 @@ fn doctor_report() -> (String, i32) {
             &instances,
             &recovery,
             &exceptions,
+            &devroot,
         )
     }
+}
+
+/// The developer root as `doctor` reads it ([`atpkg::devroot`]): the survey of
+/// `$HOME`'s checkouts, and whether Spotlight skips `~/Developer` as MEASURED for
+/// this report. `survey` is `None` where there is no such arrangement (off macOS)
+/// or no home to survey.
+struct DevrootFacts {
+    survey: Option<atpkg::devroot::Survey>,
+    spotlight: atpkg::devroot::Spotlight,
+}
+
+impl DevrootFacts {
+    /// Facts that measured nothing, for `why`.
+    fn not_measured(why: &str) -> Self {
+        Self {
+            survey: None,
+            spotlight: atpkg::devroot::Spotlight::NotMeasured(why.to_string()),
+        }
+    }
+
+    /// No developer root here (off macOS): no row at all.
+    fn absent() -> Self {
+        Self {
+            survey: None,
+            spotlight: atpkg::devroot::Spotlight::Measured(atpkg::noindex::Verdict::NotApplicable),
+        }
+    }
+}
+
+/// Survey `$HOME` and MEASURE the root: a probe planted in `~/Developer` and a later
+/// control beside it, removed whatever the answer (up to
+/// [`atpkg::noindex::Timing::worst_case`], announced on stderr first so the wait never
+/// reads as a hang). A test binary plants nothing in a real home: it surveys and says
+/// it did not measure.
+fn devroot_facts() -> DevrootFacts {
+    if !atpkg::noindex::SUPPORTED {
+        return DevrootFacts::absent();
+    }
+    let Some(home) = aterm_types::dirs::home_dir().filter(|h| !h.as_os_str().is_empty()) else {
+        return DevrootFacts::not_measured("no home folder");
+    };
+    let survey = Some(atpkg::devroot::survey(&home));
+    let spotlight = if cfg!(test) {
+        atpkg::devroot::Spotlight::NotMeasured("a test binary plants nothing in a real home".into())
+    } else {
+        if let (root, atpkg::devroot::RootIs::Folder) = atpkg::devroot::root_at(&home) {
+            eprintln!(
+                "aterm doctor: measuring whether Spotlight skips {} (up to {}s)…",
+                root.display(),
+                atpkg::noindex::Timing::DEFAULT.worst_case().as_secs()
+            );
+        }
+        atpkg::devroot::spotlight(&home)
+    };
+    DevrootFacts { survey, spotlight }
+}
+
+/// The `devroot:` and `spotlight:` rows, pure over the facts: atpkg's words, never a
+/// failure (a warning reads `note` here: nothing in it stops a shell from starting).
+fn devroot_rows(facts: &DevrootFacts) -> Vec<DoctorRow> {
+    let mark = |level| match level {
+        atpkg::devroot::Level::Ok => Mark::Ok,
+        atpkg::devroot::Level::Warn | atpkg::devroot::Level::Note => Mark::Note,
+    };
+    let mut rows = Vec::new();
+    if let Some(survey) = &facts.survey {
+        let row = atpkg::devroot::devroot_row(survey);
+        rows.push(DoctorRow {
+            label: "devroot:",
+            mark: mark(row.level),
+            fact: row.text,
+        });
+    }
+    if let Some(row) = atpkg::devroot::spotlight_row(&facts.spotlight) {
+        rows.push(DoctorRow {
+            label: "spotlight:",
+            mark: mark(row.level),
+            fact: row.text,
+        });
+    }
+    rows
 }
 
 /// The recovery ledger as `doctor` reads it: its rows and its path, or `None` when
@@ -1578,6 +1655,7 @@ fn doctor_checks(
         instances,
         recovery,
         exceptions,
+        &DevrootFacts::absent(),
     )
 }
 
@@ -1612,6 +1690,7 @@ fn doctor_checks_with_origin(
     instances: &Result<aterm_ctl::census::Census, String>,
     recovery: &RecoveryFacts,
     exceptions: &ExceptionsFacts,
+    devroot: &DevrootFacts,
 ) -> (String, i32) {
     let (shell_ok, shell_fact) = match (shell, shell_check) {
         ("", _) => (false, "$SHELL is empty".to_string()),
@@ -1645,6 +1724,7 @@ fn doctor_checks_with_origin(
             fact,
         });
     }
+    checks.extend(devroot_rows(devroot));
     let (instances_mark, instances_fact) = instances_row(instances);
     let (recovery_mark, recovery_fact) = recovery_row(recovery);
     let (exceptions_mark, exceptions_fact) = exceptions_row(exceptions);
@@ -1689,7 +1769,7 @@ fn doctor_checks_with_origin(
     }
     out.push_str(&format!(
         "version: {}\n\n",
-        aterm_types::version::APP_VERSION
+        aterm_types::version::app_version()
     ));
     if all_ok {
         out.push_str("health: OK\n");
@@ -1892,7 +1972,7 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// * `aterm <version>`, the identity line `tools/install.sh` greps (`^aterm `);
 /// * `build: <N>`, the monotonic build number the updater orders by (the
 ///   pre-swap start probe requires it to name the build being installed);
-///   omitted when the launcher published none ([`set_running_build`]);
+///   omitted when the binary installed no stamp, or build `0` (no git);
 /// * which copy runs (`docs/DESIGN-which-copy-runs-2026-08-27.md`):
 ///   `running: <path>` and `another copy: <path> (<version>) — …` lines as
 ///   spelled by `aterm_update::which_copy`; identity only with no executable
@@ -1905,7 +1985,7 @@ pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> Strin
     // then build number, which copy runs, and trust roots.
     let mut out = format!(
         "aterm {}\n{}\n",
-        aterm_types::version::APP_VERSION,
+        aterm_types::version::app_version(),
         aterm_types::identity::ORIGIN_LINE
     );
     if let Some(build) = running_build() {
@@ -1921,20 +2001,14 @@ pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> Strin
     out
 }
 
-/// The running build number, published by the one-binary launcher
-/// (`crates/aterm/src/main.rs`); this crate has no build stamp of its own.
-/// First call wins; `0` (an unstamped dev build) publishes nothing.
-static RUNNING_BUILD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-/// Publish the running build number for [`version_text`]. See [`RUNNING_BUILD`].
-pub fn set_running_build(build: u64) {
-    if build > 0 {
-        let _ = RUNNING_BUILD.set(build);
-    }
-}
-
+/// The running build number from the binary's installed stamp
+/// (`aterm_types::version`); `None` without one, or for build `0` (no git).
 fn running_build() -> Option<u64> {
-    RUNNING_BUILD.get().copied()
+    let build = aterm_types::version::installed()?
+        .build_number
+        .parse::<u64>()
+        .ok()?;
+    (build > 0).then_some(build)
 }
 
 /// Hook run when the session's shell first writes output. The launcher
@@ -2403,7 +2477,7 @@ pub fn session_main(quiet: bool) -> ! {
         if !quiet && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
             eprintln!(
                 "aterm {} — session started · start with `aterm help` · `-q` hides this line",
-                aterm_types::version::APP_VERSION
+                aterm_types::version::app_version()
             );
         }
     }
@@ -2530,10 +2604,10 @@ pub fn session_main(quiet: bool) -> ! {
 mod tests {
     use super::{
         AGENTS_DIR_ENV, CliAction, DEBUGGER_ACCESS_REVERT, DIAG_COMMANDS, DebuggerFacts,
-        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, DrClass, ExceptionsFacts,
-        FdaState, HOOK_AGENTS_ENV, Mark, PASSTHROUGH_ENV, PrivacyFacts, ProbeLabel,
-        REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck, VERB_BLURB_COLUMN, Verb,
-        agents_dir_mode, decide_args, diag_report, doctor_checks, doctor_checks_with_origin,
+        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, DevrootFacts, DrClass,
+        ExceptionsFacts, FdaState, HOOK_AGENTS_ENV, Mark, PASSTHROUGH_ENV, PrivacyFacts,
+        ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck, VERB_BLURB_COLUMN,
+        Verb, agents_dir_mode, decide_args, diag_report, doctor_checks, doctor_checks_with_origin,
         doctor_report, exceptions_report_at, explain_config_report, help_text, is_tool_candidate,
         list_fonts_report, list_themes_report, managed_agents_dir, parse_zone_offset, prepend_path,
         read_exceptions_log, reroute_dir_from_values, session_limits, session_path_env,
@@ -4178,6 +4252,7 @@ mod tests {
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &DevrootFacts::absent(),
         );
         assert_eq!(code, 0, "{r}");
         assert!(
@@ -4249,6 +4324,7 @@ mod tests {
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &DevrootFacts::absent(),
         );
         assert_eq!(plain, unlabelled, "no label, no change");
 
@@ -4261,6 +4337,7 @@ mod tests {
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &DevrootFacts::absent(),
         );
         assert_eq!(code, 0);
         assert_eq!(mark_of(&labelled, "shell:"), "ok", "{labelled}");
@@ -4282,6 +4359,7 @@ mod tests {
             &no_census(),
             &no_recovery(),
             &no_exceptions(),
+            &DevrootFacts::absent(),
         );
         assert_eq!(code, 1);
         assert_eq!(mark_of(&failed, "shell:"), "FAIL", "{failed}");
@@ -4652,6 +4730,85 @@ mod tests {
             r.contains("debugger:   note  not measured ("),
             "a test binary must never report a measured debugger rule\n{r}"
         );
+        // And the Spotlight probe: a test binary plants nothing in a real home.
+        assert!(
+            r.contains("spotlight:  note  not measured (a test binary plants nothing"),
+            "a test binary must never probe the real ~/Developer\n{r}"
+        );
+        assert!(r.contains("devroot:"), "the survey only reads: {r}");
+    }
+
+    /// The `devroot:` and `spotlight:` rows say what atpkg surveyed and MEASURED, in
+    /// atpkg's words: a checkout outside `~/Developer` and an indexed root are each a
+    /// `note` naming the one thing to do, a skipped root is `ok`, an unmeasured one
+    /// says so — and none of them moves the exit code.
+    #[test]
+    fn the_devroot_rows_say_what_atpkg_measured_and_never_fail() {
+        use atpkg::devroot::{Checkout, Spotlight, Survey};
+        use atpkg::noindex::{Unmeasured, Verdict};
+        let home = std::path::PathBuf::from("/Users//u");
+        let outside = Survey {
+            home: home.clone(),
+            root: atpkg::devroot::root(&home),
+            root_is: atpkg::devroot::RootIs::Folder,
+            outside: vec![Checkout {
+                path: home.join("proj"),
+                common: home.join("proj/.git"),
+                linked: false,
+            }],
+            inside: Vec::new(),
+        };
+        let report = |survey: Option<Survey>, spotlight: Spotlight| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &DevrootFacts { survey, spotlight },
+            )
+        };
+        let (r, code) = report(Some(outside.clone()), Spotlight::Measured(Verdict::Indexed));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "devroot:"), "note", "{r}");
+        assert!(
+            r.contains("1 git checkout outside ~/Developer (~/proj)"),
+            "{r}"
+        );
+        assert!(r.contains("`aterm pkg devroot move --all`"), "{r}");
+        assert_eq!(mark_of(&r, "spotlight:"), "note", "{r}");
+        assert!(
+            r.contains("Spotlight indexes ~/Developer (measured: the probe was found)"),
+            "{r}"
+        );
+        assert!(
+            r.contains(
+                "add ~/Developer to System Settings \u{25b8} Spotlight \u{25b8} Search Privacy"
+            ),
+            "{r}"
+        );
+        let inside = Survey {
+            inside: outside.outside.clone(),
+            outside: Vec::new(),
+            ..outside
+        };
+        let (r, code) = report(Some(inside), Spotlight::Measured(Verdict::Excluded));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "devroot:"), "ok", "{r}");
+        assert_eq!(mark_of(&r, "spotlight:"), "ok", "{r}");
+        let unknown = Verdict::Unknown(Unmeasured::ControlNeverIndexed { waited_secs: 20 });
+        let (r, _) = report(None, Spotlight::Measured(unknown));
+        assert!(!r.contains("devroot:"), "no survey, no row: {r}");
+        assert_eq!(mark_of(&r, "spotlight:"), "note", "{r}");
+        assert!(
+            !r.contains("indexes ~/Developer"),
+            "unknown is never a verdict: {r}"
+        );
+        let (r, _) = report(None, Spotlight::Measured(Verdict::NotApplicable));
+        assert!(!r.contains("spotlight:"), "no Spotlight, no row: {r}");
     }
 
     /// §4.6 of the debugger-access design: the `debugger:` row shares
@@ -4895,7 +5052,7 @@ mod tests {
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
         let identity = format!(
             "aterm {}\n{}\n",
-            aterm_types::version::APP_VERSION,
+            aterm_types::version::app_version(),
             aterm_types::identity::ORIGIN_LINE
         );
         assert!(identity.contains("by Andrew Yates") && identity.contains("alab.systems"));
@@ -4904,16 +5061,15 @@ mod tests {
             anchors.starts_with("trusts: master=") && !anchors.contains("channel="),
             "{anchors}"
         );
-        // The build line follows the identity once published; the start probe
-        // greps the number. Set for the whole test binary.
-        super::set_running_build(1789432052);
-        super::set_running_build(7);
+        // The build line follows the identity once the binary installs its
+        // stamp; the start probe greps the number. Installed for the whole test
+        // binary, with UNSTAMPED's version so no other test's read moves.
+        aterm_types::version::install(aterm_types::version::BuildStamp {
+            build_number: "1789432052",
+            ..aterm_types::version::BuildStamp::UNSTAMPED
+        });
         let build = "build: 1789432052\n";
         assert_eq!(version_text(None), format!("{identity}{build}{anchors}"));
-        assert!(
-            version_text(None).contains("1789432052"),
-            "the first publication stands, and the probe finds it"
-        );
         let copy = WhichCopy {
             running: std::path::PathBuf::from("/Applications/aterm.app"),
             kind: Running::InstalledApp,

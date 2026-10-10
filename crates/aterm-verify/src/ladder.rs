@@ -256,7 +256,7 @@ impl Report {
     /// wider than the code (corrected 2026-09-21). Every stage that decides a
     /// row from a child's EXIT STATUS comes through here or
     /// [`Report::child_could_not_run`]: the script stages, the libc oracle,
-    /// the cells and kani gates, and the drive binaries, whose own exit
+    /// the cells gates, and the drive binaries, whose own exit
     /// contracts cannot see a full disk — `libc-oracle/run.sh` maps a cargo
     /// child that died of ENOSPC (exit 101, since targo never answers 3) onto
     /// a plain failure, which arrived here as a FINDING about the tree until
@@ -653,14 +653,14 @@ mod tests {
 
     #[test]
     fn raw_entries_interleave_where_the_stage_put_them() {
-        let mut r = Report::new("trust-mc / Kani BMC floor (config-free parser harnesses)");
-        r.raw("  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN\n");
-        r.skip("trust-mc / Kani BMC floor (tool unavailable; pending build)");
+        let mut r = Report::new("cross-cell type-check");
+        r.raw("  NOTICE: the win cell has no installed std here\n");
+        r.skip("gate cells (no installed std)");
         assert_eq!(
             r.render(),
-            "\n=== trust-mc / Kani BMC floor (config-free parser harnesses) ===\n\
-             \x20 NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN\n\
-             \x20 skip  trust-mc / Kani BMC floor (tool unavailable; pending build)\n"
+            "\n=== cross-cell type-check ===\n\
+             \x20 NOTICE: the win cell has no installed std here\n\
+             \x20 skip  gate cells (no installed std)\n"
         );
     }
 

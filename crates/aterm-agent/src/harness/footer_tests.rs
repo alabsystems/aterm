@@ -2721,8 +2721,7 @@ fn the_path_shows_home_as_a_tilde() {
 
 /// A LIMIT WALL goes FIRST and the tokens LAST: a narrow row drops values
 /// from the back, so it gives up the tokens first and the wall last. The
-/// tokens are ONE total, every model summed and none named (owner,
-/// 2026-09-30: "I just can't have so many different model stats"). Both
+/// tokens are ONE total, every model summed and none named. Both
 /// are absent, not empty, when nothing is known; each mark takes one
 /// cell, as the painter lays it out.
 #[test]
@@ -3695,8 +3694,8 @@ fn a_narrow_pane_cuts_the_hint_between_words_and_the_row_is_still_the_mode_row()
         "the cut row is still the mode row: the lights read its mode"
     );
     assert_eq!(live_repl_row(&screen), Some(3), "and the REPL is live");
-    // Control: the rule as it stood before the port (a hint after the
-    // pill must be closed) finds no mode row in that pane.
+    // Control: a rule that requires a hint after the pill to be closed
+    // finds no mode row in that pane.
     let closed_only = |row: &str| {
         row.strip_prefix("  ").is_some_and(|rest| {
             PILLS.iter().any(|pill| {
@@ -4009,10 +4008,9 @@ fn a_lights_reason_never_takes_a_limit_walls_room() {
     }
 }
 
-/// THE LIVE UPGRADE'S NOTE LEADS THE RULE AND GIVES WAY AS A REASON DOES
-/// (the owner, 2026-09-30: the agent answered READY, the restart waited
-/// on the owner at the tab, and nothing on the screen said so). Over the
-/// owner's facts with a limit wall and the session's tokens, at every
+/// THE LIVE UPGRADE'S NOTE LEADS THE RULE AND GIVES WAY AS A REASON DOES:
+/// a restart that waits on the owner at the tab must say so on the screen.
+/// Over the owner's facts with a limit wall and the session's tokens, at every
 /// width: the note, where drawn, is first; whole beside the whole facts,
 /// then short; it takes the tokens', the branch's and the path's room,
 /// never the wall's or the model's; and where even the short note does
@@ -4104,8 +4102,8 @@ fn the_upgrade_note_leads_and_gives_way_as_a_reason_does() {
     }
 }
 
-/// THE ORDER OF GIVING WAY ([`fit_rule`]; the owner decided only that
-/// the facts go into the rule and fit at any width): a light's transient
+/// THE ORDER OF GIVING WAY ([`fit_rule`]; the owner fixed only that the
+/// facts go into the rule and fit at any width, not this order): a light's transient
 /// title first (whole, then short, then none), then the path is cut to
 /// `…/<dir>`, the branch goes, the path, the effort, then the chips; the
 /// model last. A light's REASON outranks the branch and the path — after

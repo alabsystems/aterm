@@ -141,7 +141,7 @@ fn settled_console_resident_offers_a_consumption_tick_for_pending_notes() {
     pet.brain.note_petted(pet.now);
     pet.assert_prompt_wake();
     pet.tick(16);
-    // The offer is the contract. A console resident no longer parks the pet
+    // The offer is the contract. A console resident does not park the pet
     // at the escort's station, so handing it back for affection can leave a
     // gap between the perch and the caret (here a row hop back to the
     // prompt). Stimulus consumption sits below every caret-travel intent

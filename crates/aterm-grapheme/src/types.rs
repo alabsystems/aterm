@@ -21,7 +21,7 @@ pub struct Grapheme<'a> {
     pub has_combining: bool,
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl Grapheme<'_> {
     /// Check if this grapheme is a single ASCII character.
     ///
@@ -74,7 +74,7 @@ pub struct GraphemeInfo {
 }
 
 /// Classify the type of a grapheme for rendering decisions.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphemeType {
     /// Simple ASCII character

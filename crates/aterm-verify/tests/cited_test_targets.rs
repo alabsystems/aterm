@@ -5,25 +5,21 @@
 //!
 //! The crates here turn `autotests` off and mount their `tests/*.rs` files as
 //! modules of one suite binary, so a file's name stops being a `--test` name
-//! the day it becomes a module, and nothing compiles a comment. Found
-//! 2026-10-02: the live-class auditor's header cited aterm-objc's
-//! `objc_suite` (no such target; `winit_seam` is its own), the render
-//! corpus's bless line a target named for its own file (a module of
-//! `render_suite`), and four of this crate's docs an atpkg `index_probe` that
-//! never existed. Each answers `no test target named` to whoever copies it,
-//! and none failed anything. It is asserted here, where the gate's own tests
-//! run on every merge.
+//! the day it becomes a module, and nothing compiles a comment. A stale
+//! citation answers `no test target named` to whoever copies it and fails
+//! nothing else, so it is asserted here, where the gate's own tests run on
+//! every merge.
 //!
-//! WHAT IS READ: the tree the gate measures — git's tracked files and its
-//! untracked, non-ignored ones ([`tree_files`]) — minus `vendor/` (other
-//! projects' sources and the astream submodule). Build output, ignored scratch
-//! and a gate snapshot's lane target dirs are never read, so no file outside
-//! the tree can invent a finding or, as a shadow manifest, hide one. In it:
-//! full-line comments (`//`, `///`, `//!` in `.rs`; `#` in `.toml`, `.sh`,
-//! `.py`) and the whole of each `.md`. Consecutive comment lines are one text,
-//! so a command wrapped across lines reads whole. Dated records keep what they
-//! recorded: a path carrying a `YYYY-MM-DD`, everything under
-//! `docs/measured/`, and `CHANGELOG.md`.
+//! WHAT IS READ: the tree the gate measures — git's tracked files and the
+//! untracked ones no tracked `.gitignore` ignores ([`tree_files`]) — minus
+//! `vendor/` (other projects' sources and the astream submodule). Build
+//! output, ignored scratch and a gate snapshot's lane target dirs are never
+//! read, so no file outside the tree can invent a finding or, as a shadow
+//! manifest, hide one. In it: full-line comments (`//`, `///`, `//!` in
+//! `.rs`; `#` in `.toml`, `.sh`, `.py`) and the whole of each `.md`.
+//! Consecutive comment lines are one text, so a command wrapped across lines
+//! reads whole. Dated records keep what they recorded: a path carrying a
+//! `YYYY-MM-DD`, everything under `docs/measured/`, and `CHANGELOG.md`.
 //!
 //! WHAT IS JUDGED: a `--test <name>` whose command — the text after the
 //! nearest backtick, `targo` or `cargo` before it, at most 240 bytes back —
@@ -41,9 +37,8 @@
 //!
 //! A package's test targets are read from its manifest the way cargo reads
 //! them: every `[[test]]` name, plus, unless `autotests = false`, each
-//! `tests/<n>.rs` and `tests/<n>/main.rs`. On 2026-10-02 that agreed with
-//! `targo metadata --no-deps` for all 95 packages: the workspace's 87 members
-//! and 8 more from seven standalone manifests. No manifest parser: this crate
+//! `tests/<n>.rs` and `tests/<n>/main.rs`, which agreed with `targo metadata
+//! --no-deps` for every package when measured. No manifest parser: this crate
 //! has no dependencies on purpose (see its Cargo.toml).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,9 +48,9 @@ use std::path::{Path, PathBuf};
 use aterm_verify::identity;
 
 /// The tree the gate measures, by the listing that decides it
-/// ([`identity`]): tracked files plus untracked, non-ignored ones, sorted,
-/// never under `vendor/`. Panics when git cannot list `root`: a census of
-/// nothing would pass.
+/// ([`identity`]): tracked files plus the untracked ones no tracked
+/// `.gitignore` ignores, sorted, never under `vendor/`. Panics when git cannot
+/// list `root`: a census of nothing would pass.
 fn tree_files(root: &Path) -> Vec<PathBuf> {
     let path_env = std::env::var_os("PATH").unwrap_or_default();
     let out = identity::git(root, &path_env)
@@ -410,7 +405,7 @@ fn every_cited_test_target_is_declared() {
     );
     // A reader that judges nothing passes everything. So does a manifest
     // reader that finds no package; one that loses a package's targets turns
-    // its citations into findings instead. 60 judged on 2026-10-02.
+    // its citations into findings instead. 60 were judged when this was set.
     assert!(
         judged >= 20,
         "only {judged} citations judged across {} files and {} packages: the reader is blind",

@@ -5,19 +5,18 @@
 //! publisher is alive, dead, or unprovable — and a `--resume` may take the
 //! fence back only under proof of death.
 //!
-//! Before this, every refusal was the same unactionable sentence and an
-//! interrupted resume wedged the pipeline behind a hand-assembled
-//! `ship recover vX.Y.Z <40-char-sha> --old-publisher-stopped`. These tests pin
-//! both halves of the fix: the recorded identity survives a real push/fetch
+//! These tests pin both halves: the recorded identity survives a real push/fetch
 //! between two clones, and the verdict is biased toward "alive" everywhere it
 //! cannot prove otherwise.
 
 use crate::{cli, ledger, publish};
 
+// `spawnfd`'s: every child here (the survivor that outlives its publisher
+// above all) holds its stdio and nothing else of this process — not a pipe
+// another test thread had open unflagged at the spawn.
+use aterm_uds::spawnfd::Command;
 use std::collections::HashMap;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ledger::testing::Git;
@@ -485,8 +484,7 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
              fence-boot: boot-session-7\n",
         ),
         // The refuted shape: the pid is gone, and a format-1 fence cannot say
-        // whether the `gh`/`curl` it spawned is. Every fence written before
-        // 2026-09-18 looks like this once its publisher dies.
+        // whether the `gh`/`curl` it spawned is.
         (
             "no process group recorded (a format-1 fence)",
             "fence-format: 1\nfence-pid: 4242\nfence-host: publisher-host\n\

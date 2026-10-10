@@ -188,6 +188,12 @@ fn xtversion_reports_the_shared_application_identity() {
     terminal.process(b"\x1b[>0q");
     assert_eq!(
         terminal.take_response().as_deref(),
-        Some(format!("\x1bP>|aterm({})\x1b\\", aterm_types::version::APP_VERSION).as_bytes())
+        Some(
+            format!(
+                "\x1bP>|aterm({})\x1b\\",
+                aterm_types::version::app_version()
+            )
+            .as_bytes()
+        )
     );
 }

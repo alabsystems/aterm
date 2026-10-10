@@ -4,10 +4,11 @@
 
 //! Vi mode cursor: position tracking and basic motion execution.
 //!
-//! The cursor applies "simple" motions (up/down/left/right, H/M/L, 0/$)
-//! that only need grid dimensions. Complex motions (word, bracket,
-//! paragraph, search) require grid content and are dispatched by
-//! [`super::ViMode`] through [`BufferAccess`](aterm_types::BufferAccess).
+//! The cursor applies "simple" motions (up/down/left/right, 0/$) that only
+//! need grid dimensions. Motions that need the grid (word, bracket,
+//! paragraph, search, and H/M/L, which name the rows the viewport shows) are
+//! dispatched by [`super::ViMode`] through
+//! [`BufferAccess`](aterm_types::BufferAccess).
 
 use super::types::{ViBoundary, ViMotion, ViPoint};
 
@@ -27,17 +28,15 @@ impl ViModeCursor {
 
     /// Execute a basic motion.
     ///
-    /// `visible_rows` and `cols` are the grid's visible dimensions.
-    /// `topmost_line` is the smallest valid line value (negative =
-    /// scrollback). `bottommost_line` is the largest valid line.
+    /// `cols` is the grid's width, `topmost_line` the smallest valid line
+    /// (negative = scrollback) and `bottommost_line` the largest.
     ///
-    /// Returns the updated cursor. Complex motions (word/bracket/
-    /// paragraph/search/mark) are no-ops here — they must be handled
-    /// by the caller with grid access.
+    /// Returns the updated cursor. Motions that need the grid (word/bracket/
+    /// paragraph/search/mark, and H/M/L, which need the display offset) are
+    /// no-ops here — they must be handled by the caller with grid access.
     #[must_use]
     pub fn motion(
         mut self,
-        visible_rows: u16,
         cols: u16,
         topmost_line: i32,
         bottommost_line: i32,
@@ -83,20 +82,13 @@ impl ViModeCursor {
             ViMotion::Last => {
                 self.point.col = last_col;
             }
-            ViMotion::High => {
-                // Top of visible area (line 0, not scrollback).
-                self.point.line = 0;
-            }
-            ViMotion::Middle => {
-                self.point.line = i32::from(visible_rows) / 2;
-            }
-            ViMotion::Low => {
-                // saturating_sub is exact: `i32::from(u16)` is >= 0.
-                self.point.line = i32::from(visible_rows).saturating_sub(1);
-            }
 
-            // Complex motions — require grid content. No-op here.
-            ViMotion::FirstOccupied
+            // Motions that need the grid: its content, or (H/M/L) the
+            // viewport's display offset. No-op here.
+            ViMotion::High
+            | ViMotion::Middle
+            | ViMotion::Low
+            | ViMotion::FirstOccupied
             | ViMotion::SemanticLeft
             | ViMotion::SemanticRight
             | ViMotion::SemanticLeftEnd
@@ -121,12 +113,9 @@ impl ViModeCursor {
         self
     }
 
-    /// Scroll the cursor position by `delta` lines.
-    ///
-    /// Positive = content scrolls up (cursor line increases),
-    /// negative = content scrolls down (cursor line decreases).
+    /// Move the cursor `delta` lines (negative is up, toward history),
+    /// clamped to `topmost_line..=bottommost_line`.
     #[must_use]
-    #[cfg(test)]
     pub fn scroll(mut self, topmost_line: i32, bottommost_line: i32, delta: i32) -> Self {
         // saturating_add: identical for every real grid (line and delta are
         // bounded by grid/scrollback sizes, nowhere near i32 limits); on the
@@ -154,90 +143,77 @@ mod tests {
     }
 
     // Typical 24×80 terminal: lines 0..23, cols 0..79.
-    const ROWS: u16 = 24;
     const COLS: u16 = 80;
     const TOP: i32 = 0;
     const BOT: i32 = 23;
 
     #[test]
     fn motion_up() {
-        let c = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Up, ViBoundary::Grid);
+        let c = cursor_at(5, 10).motion(COLS, TOP, BOT, ViMotion::Up, ViBoundary::Grid);
         assert_eq!(c.point, ViPoint::new(4, 10));
     }
 
     #[test]
     fn motion_down() {
-        let c = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Down, ViBoundary::Grid);
+        let c = cursor_at(5, 10).motion(COLS, TOP, BOT, ViMotion::Down, ViBoundary::Grid);
         assert_eq!(c.point, ViPoint::new(6, 10));
     }
 
     #[test]
     fn motion_left() {
-        let c = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Left, ViBoundary::Grid);
+        let c = cursor_at(5, 10).motion(COLS, TOP, BOT, ViMotion::Left, ViBoundary::Grid);
         assert_eq!(c.point, ViPoint::new(5, 9));
     }
 
     #[test]
     fn motion_right() {
-        let c = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Right, ViBoundary::Grid);
+        let c = cursor_at(5, 10).motion(COLS, TOP, BOT, ViMotion::Right, ViBoundary::Grid);
         assert_eq!(c.point, ViPoint::new(5, 11));
     }
 
     #[test]
     fn motion_first_last() {
-        let c = cursor_at(5, 40).motion(ROWS, COLS, TOP, BOT, ViMotion::First, ViBoundary::Grid);
+        let c = cursor_at(5, 40).motion(COLS, TOP, BOT, ViMotion::First, ViBoundary::Grid);
         assert_eq!(c.point.col, 0);
 
-        let c = cursor_at(5, 40).motion(ROWS, COLS, TOP, BOT, ViMotion::Last, ViBoundary::Grid);
+        let c = cursor_at(5, 40).motion(COLS, TOP, BOT, ViMotion::Last, ViBoundary::Grid);
         assert_eq!(c.point.col, 79);
     }
 
     #[test]
-    fn motion_high_middle_low() {
-        let h = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::High, ViBoundary::Grid);
-        assert_eq!(h.point.line, 0);
-
-        let m = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Middle, ViBoundary::Grid);
-        assert_eq!(m.point.line, 12); // 24 / 2
-
-        let l = cursor_at(5, 10).motion(ROWS, COLS, TOP, BOT, ViMotion::Low, ViBoundary::Grid);
-        assert_eq!(l.point.line, 23);
-    }
-
-    #[test]
     fn motion_up_at_top_clamped() {
-        let c = cursor_at(0, 5).motion(ROWS, COLS, TOP, BOT, ViMotion::Up, ViBoundary::Grid);
+        let c = cursor_at(0, 5).motion(COLS, TOP, BOT, ViMotion::Up, ViBoundary::Grid);
         assert_eq!(c.point.line, 0);
     }
 
     #[test]
     fn motion_down_at_bottom_clamped() {
-        let c = cursor_at(23, 5).motion(ROWS, COLS, TOP, BOT, ViMotion::Down, ViBoundary::Grid);
+        let c = cursor_at(23, 5).motion(COLS, TOP, BOT, ViMotion::Down, ViBoundary::Grid);
         assert_eq!(c.point.line, 23);
     }
 
     #[test]
     fn motion_left_at_edge_grid_boundary() {
-        let c = cursor_at(5, 0).motion(ROWS, COLS, TOP, BOT, ViMotion::Left, ViBoundary::Grid);
+        let c = cursor_at(5, 0).motion(COLS, TOP, BOT, ViMotion::Left, ViBoundary::Grid);
         assert_eq!(c.point, ViPoint::new(5, 0));
     }
 
     #[test]
     fn motion_left_at_edge_wraps_no_boundary() {
-        let c = cursor_at(5, 0).motion(ROWS, COLS, TOP, BOT, ViMotion::Left, ViBoundary::None);
+        let c = cursor_at(5, 0).motion(COLS, TOP, BOT, ViMotion::Left, ViBoundary::None);
         assert_eq!(c.point, ViPoint::new(4, 79));
     }
 
     #[test]
     fn motion_right_at_edge_wraps_no_boundary() {
-        let c = cursor_at(5, 79).motion(ROWS, COLS, TOP, BOT, ViMotion::Right, ViBoundary::None);
+        let c = cursor_at(5, 79).motion(COLS, TOP, BOT, ViMotion::Right, ViBoundary::None);
         assert_eq!(c.point, ViPoint::new(6, 0));
     }
 
     #[test]
     fn motion_with_scrollback() {
         // Scrollback extends to line -100.
-        let c = cursor_at(0, 5).motion(ROWS, COLS, -100, BOT, ViMotion::Up, ViBoundary::Grid);
+        let c = cursor_at(0, 5).motion(COLS, -100, BOT, ViMotion::Up, ViBoundary::Grid);
         assert_eq!(c.point.line, -1);
     }
 

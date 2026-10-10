@@ -164,8 +164,10 @@ pub const CELLS_WARM_GROWTH_BYTES: u64 = 2 * GIB;
 ///
 /// `targo trust` gives every check a fresh session nonce in the rustflags of
 /// EVERY unit, and cargo's `-C extra-filename` hashes a unit's raw rustflags
-/// (targo `compilation_files.rs`, `unit_id`; on seal 321aaeda7 and on trust
-/// main alike), so nothing one check builds is found by the next: each check
+/// (targo `compilation_files.rs`, `unit_id`, on seal 321aaeda7; Trust main
+/// keeps a verification-off unit's unit_id across sessions since cc85c888ece
+/// (2026-09-30), and that reaches aterm with the next seal), so nothing one
+/// check builds is found by the next: each check
 /// re-builds its library's whole dependency graph under new file names. So the
 /// slots under `target-trust/` are scratch — `tools/trust-gate-all.sh` empties
 /// them before a run and removes them after it. A kept slot only grew: two runs

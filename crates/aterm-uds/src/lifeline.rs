@@ -603,16 +603,19 @@ mod tests {
             }
         }
         let dir = scratch("killed");
-        let mut launcher = Command::new(std::env::current_exe().expect("the test binary"))
-            .arg("a_sigkilled_launcher_cuts_its_process_lifeline")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(STAGE_ENV, &dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("re-exec this test binary as the launcher");
+        // `spawnfd`'s: the launcher holds its stdio and nothing else of this
+        // process, not another test thread's pipe for as long as it lives.
+        let mut launcher =
+            crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                .arg("a_sigkilled_launcher_cuts_its_process_lifeline")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(STAGE_ENV, &dir)
+                .stdin(crate::spawnfd::Stdio::null())
+                .stdout(crate::spawnfd::Stdio::null())
+                .stderr(crate::spawnfd::Stdio::null())
+                .spawn()
+                .expect("re-exec this test binary as the launcher");
         // A hang detector; each wait below ends at its event.
         let ceiling = Duration::from_secs(60);
         let deadline = std::time::Instant::now() + ceiling;

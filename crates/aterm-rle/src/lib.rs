@@ -540,13 +540,3 @@ mod mutations;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod proofs;
-
-#[cfg(kani)]
-mod proofs_saturation;
-
-#[cfg(kani)]
-#[path = "compact_proofs_tests.rs"]
-mod proofs_compact;

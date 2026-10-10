@@ -42,8 +42,8 @@ use super::Model;
 /// a `Take, RegridUnderTheHand` alone is the `lease acquire` that resized the
 /// tab.
 ///
-/// THE SPLIT REFRESH (2026-09-28). `Regrid` is a refresh that reads the lease
-/// and commits the row in one step; the real one reads the facts first
+/// THE SPLIT REFRESH. `Regrid` is a refresh that reads the lease and commits
+/// the row in one step; the real one reads the facts first
 /// (`Sense`: `sensed`, the lease it saw `snap`, the row those words want
 /// `snap_want`) and commits later (`Commit`), and the control thread's
 /// `lease release` — or a `turn`'s end of input and its release, back to
@@ -74,9 +74,9 @@ use super::Model;
 /// no wake, breaks it; [`driver_geometry_liveness`] is the progress half it
 /// is the safety half of, and `DropNoWake` is that property's mutant too.
 ///
-/// A PROJECTION A HOLD TURNS AWAY IS GONE (review of the integration,
-/// 2026-09-29). The real commit is attempted by the projection that formed
-/// the want, and a held one does not wait: `Turned` drops it (`sensed = 0`).
+/// A PROJECTION A HOLD TURNS AWAY IS GONE. The real commit is attempted by
+/// the projection that formed the want, and a held one does not wait:
+/// `Turned` drops it (`sensed = 0`).
 /// Nothing re-projects the window for the row but a wake whose facts MOVED —
 /// the drive module's `refresh_session` projects nothing on a sense that
 /// changed nothing. A second session the window shows (a background tab, a

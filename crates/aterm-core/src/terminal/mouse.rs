@@ -10,7 +10,54 @@ use super::Terminal;
 use super::types::{MouseEncoding, MouseMode};
 use aterm_types::mouse::encode_mouse;
 
+/// What the last mouse report the host encoded for a terminal carried: its
+/// coordinates as the report wrote them (cells, or pixels under DEC 1016), and
+/// the tracking mode and encoding it was produced under. See
+/// [`Terminal::note_mouse_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MouseReportMemo {
+    mode: MouseMode,
+    encoding: MouseEncoding,
+    x: u16,
+    y: u16,
+}
+
 impl Terminal {
+    /// Whether a MOTION report carrying `(x, y)` would only repeat the position
+    /// the last mouse report carried, and so is not to be sent.
+    ///
+    /// xterm ctlseqs, button-event tracking (DEC 1002): "Motion events are
+    /// reported only if the mouse pointer has moved to a different character
+    /// cell"; any-event tracking (1003) is the same with buttonless motion added.
+    /// xterm keeps one `mouse_row`/`mouse_col` memo, set by every press, release
+    /// and reported motion, and kitty and Alacritty gate on the same cell change.
+    /// `(x, y)` are the coordinates the report would carry, so under DEC 1016
+    /// (SGR-pixel) a sub-cell move is a new position, as kitty treats it. A memo
+    /// written under another tracking mode or encoding never matches: a program
+    /// that changed either has not seen a report in the new terms.
+    #[must_use]
+    pub fn mouse_motion_repeats_last_report(&self, x: u16, y: u16) -> bool {
+        self.mouse_report_memo == Some(self.mouse_report_at(x, y))
+    }
+
+    /// Record that the host just produced a mouse report carrying `(x, y)` for
+    /// this terminal: a press, a release, a wheel notch or a motion report. Read
+    /// back by [`Self::mouse_motion_repeats_last_report`]. Host bookkeeping kept
+    /// beside the mode it is judged under, like the text selection; the input
+    /// seam writes it under this terminal's lock.
+    pub fn note_mouse_report(&mut self, x: u16, y: u16) {
+        self.mouse_report_memo = Some(self.mouse_report_at(x, y));
+    }
+
+    fn mouse_report_at(&self, x: u16, y: u16) -> MouseReportMemo {
+        MouseReportMemo {
+            mode: self.modes.mouse_mode,
+            encoding: self.modes.mouse_encoding,
+            x,
+            y,
+        }
+    }
+
     // =========================================================================
     // Mouse event encoding — delegates to aterm_types::mouse for byte encoding
     // =========================================================================
@@ -219,5 +266,33 @@ mod tests {
         ] {
             assert_eq!(t.encode_mouse_wheel(dir, 10, 5, 0), None, "{dir:?}");
         }
+    }
+
+    /// The report memo repeats only the position last recorded, under the mode
+    /// and encoding it was recorded in: a new position, a new tracking mode or a
+    /// new encoding (cells to DEC 1016 pixels) is a fresh report.
+    #[test]
+    fn the_report_memo_repeats_only_the_same_position_in_the_same_terms() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b[?1003h\x1b[?1006h");
+        assert!(
+            !t.mouse_motion_repeats_last_report(7, 4),
+            "nothing reported yet"
+        );
+        t.note_mouse_report(7, 4);
+        assert!(t.mouse_motion_repeats_last_report(7, 4));
+        assert!(!t.mouse_motion_repeats_last_report(8, 4));
+        assert!(!t.mouse_motion_repeats_last_report(7, 5));
+        t.process(b"\x1b[?1002h");
+        assert!(
+            !t.mouse_motion_repeats_last_report(7, 4),
+            "a mode change starts a new conversation"
+        );
+        t.note_mouse_report(7, 4);
+        t.process(b"\x1b[?1016h");
+        assert!(
+            !t.mouse_motion_repeats_last_report(7, 4),
+            "cell and pixel coordinates are never the same position"
+        );
     }
 }

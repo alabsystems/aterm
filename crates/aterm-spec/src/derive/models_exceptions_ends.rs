@@ -20,7 +20,7 @@ use super::{Expr, Liveness, Model, eq, int, or_, var};
 /// reporter sends a look only when its rows CHANGE, so a row that left in one
 /// change produced one empty look and no second one, ever. Every state of that
 /// run was legal and had a successor, and the entry stood for ever with the
-/// menu-bar dot lit (2026-09-29 review, F1). `AnUnnamedEntryEnds` says that
+/// menu-bar dot lit. `AnUnnamedEntryEnds` says that
 /// once a look has missed an entry, the entry is named again or ended, under
 /// nothing but time passing and the loop taking its wake. Nothing is assumed of
 /// the reporter: `Miss` and `Name` are not fair.

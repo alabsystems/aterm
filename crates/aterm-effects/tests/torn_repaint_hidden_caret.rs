@@ -37,12 +37,11 @@
 //! Under the old contract the take still reproduces the gap, so the fixed
 //! take cannot pass vacuously.
 //!
-//! REVIEW ROUND 1: the first fix fed `motion_caret` the MODE level
-//! (`synchronized_output()`), which the terminal force-clears when a bracket
-//! outlives `sync_timeout_ms` (1 s) — with the program still mid-frame and
-//! its hidden write cursor still parked in the transcript. A bracket held
-//! past 1 s with keys typed late in it gapped again under that reading
-//! ([`Contract::ModeLevel`], kept as the negative control of
+//! The MODE level (`synchronized_output()`) is not enough: the terminal
+//! force-clears it when a bracket outlives `sync_timeout_ms` (1 s), with the
+//! program still mid-frame and its hidden write cursor still in the
+//! transcript, so keys typed late in such a bracket gap again
+//! ([`Contract::ModeLevel`], the negative control of
 //! [`a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole`]).
 
 use aterm_core::render::GlowQuad;

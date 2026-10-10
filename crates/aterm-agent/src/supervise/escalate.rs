@@ -346,11 +346,10 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::escalate`]). It is called only where the loop hands a NEW
     /// point over — a later look at the same point posts nothing: the box
     /// redrawn, re-wrapped, its focus moved, its countdown ticking, the
-    /// transcript reflowed above it ([`Session::review_key`]; FIX 3, the
-    /// re-alert at seq 94641/95788 of 2026-09-25) — so the same box back
+    /// transcript reflowed above it ([`Session::review_key`]) — so the same box back
     /// after the worker worked (or after an outage) is a new point, a new
-    /// `EVENT prompt` AND a new ask (main's round-25 fix, fed20fadf: deduping
-    /// on the box's key alone left a cleared badge gone), and so is another
+    /// `EVENT prompt` AND a new ask (deduping
+    /// on the box's key alone leaves a cleared badge gone), and so is another
     /// box drawn over it with no read between (another command, another diff
     /// on the same path).
     /// The one exception is the point a previous watcher's badge was

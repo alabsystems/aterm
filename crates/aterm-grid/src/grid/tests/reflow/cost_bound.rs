@@ -67,8 +67,7 @@ fn naive_width_resize_rewraps_whole_history_synchronously() {
     assert!(
         sync >= sb,
         "naive Grid::resize rewraps the whole history synchronously \
-         (sync={sync}, scrollback={sb}) — this is the bounded-cost violation the \
-         offload fixes"
+         (sync={sync}, scrollback={sb})"
     );
     grid.assert_invariants();
 }
@@ -331,7 +330,7 @@ fn offload_window_height_shrink_keeps_ring_scrollback() {
     grid.assert_invariants();
 }
 
-/// Audit #5: if the reflow worker panics (or its thread dies) mid-rewrap it never
+/// If the reflow worker panics (or its thread dies) mid-rewrap it never
 /// re-attaches, so `abort_reflow_offload` must close the detach window — otherwise
 /// `scrollback_detached_for_reflow` stays true forever, every scroll-off stages into
 /// an un-drainable lazy buffer (unbounded leak) and all tiered history is invisible.
@@ -385,7 +384,7 @@ fn offload_window_scroll_to_bottom_not_clobbered() {
         grid.display_offset(),
         0,
         "a reader who scrolled to the live bottom during the window must stay there, \
-         not be yanked back up to the stale deep position (audit #7)"
+         not be yanked back up to the stale deep position"
     );
     grid.assert_invariants();
 }
@@ -671,7 +670,7 @@ fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
         grid.display_offset(),
         0,
         "a reader who moved the viewport during the window and ended at the live \
-         bottom chose it — do not yank them back into history (audit #7)"
+         bottom chose it — do not yank them back into history"
     );
     grid.assert_invariants();
 }
@@ -845,7 +844,7 @@ fn offload_window_end_after_scrolling_over_window_output_is_honored() {
         grid.display_offset(),
         0,
         "an End that moved the viewport 50 rows is the reader choosing the live \
-         bottom, whatever the detach had left behind (audit #7)"
+         bottom, whatever the detach had left behind"
     );
     grid.assert_invariants();
 }
@@ -887,7 +886,7 @@ fn redetach_window_end_after_scrolling_over_window_output_is_honored() {
         grid.display_offset(),
         0,
         "the converging window carries its own gesture baseline, so the reader's \
-         End is honored there too (audit #7)"
+         End is honored there too"
     );
     grid.assert_invariants();
 }

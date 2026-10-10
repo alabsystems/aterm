@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// W2 second pass, part three: the nine findings, each armed with the judge's
-// own counterexample.
+// Adversarial tests, each running a recorded counterexample.
 //
 // | finding | the counterexample this file runs                                  |
 // |---------|--------------------------------------------------------------------|
@@ -67,11 +66,9 @@ fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
 
 declare_class! {
     /// FOURTEEN colons — 16 parameters counting `self` and `_cmd`, the new
-    /// ceiling of [`aterm_objc::MsgFn`]. Before this wave `MsgFn` stopped at
-    /// twelve parameters, so this method would have DECLARED, REGISTERED and
-    /// dispatched from Objective-C while `msg()` refused to build a prototype
-    /// for it (`E0277`) — a method the runtime can reach and Rust cannot. That
-    /// is D1's arity trap one level up.
+    /// ceiling of [`aterm_objc::MsgFn`]. A narrower `MsgFn` would let this
+    /// method register and dispatch from Objective-C while `msg()` refused to
+    /// build its prototype (`E0277`): reachable from the runtime, not from Rust.
     ///
     /// Note also that no `#[allow(clippy::too_many_arguments)]` appears at this
     /// call site or at the top of this file: the macro emits it, which is F9.
@@ -320,7 +317,7 @@ fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
 // ---------------------------------------------------------------------------
 
 declare_class! {
-    /// The shapes that used to be the SAME Rust type, side by side.
+    /// Pointer shapes that must encode differently, side by side.
     ///
     /// `observeValueForKeyPath:ofObject:change:context:` is KVO's callback, the
     /// method W2 needs for winit. Its last argument is spelled `void *` — NOT
@@ -328,12 +325,9 @@ declare_class! {
     /// `context:(nullable void *)context`), in `objc2-foundation`'s generated
     /// binding (`context: *mut c_void`) and in
     /// `vendor/winit/src/platform_impl/macos/window_delegate.rs:456`
-    /// (`_context: *mut c_void`). THE THIRD PASS MOVED IT TO THAT SPELLING:
-    /// this arming used to write `*const c_void`, which mapped to `"^v"` and
-    /// was green while the `*mut` spelling every live site uses still mapped to
-    /// `"@"` — an OBJECT, which invites `NSInvocation` and forwarding to retain
-    /// a pointer the caller owns. A guard armed against a shape nobody will
-    /// ever port is not a guard.
+    /// (`_context: *mut c_void`), so it is armed with the `*mut` spelling the
+    /// live sites use: encoding it as `"@"` (an OBJECT) would invite
+    /// `NSInvocation` and forwarding to retain a pointer the caller owns.
     ///
     /// `control:textView:doCommandBySelector:` is the one place in the tree
     /// that really does take a `SEL`; `takeConstContext:` keeps the `const`
@@ -425,8 +419,8 @@ fn a_context_pointer_and_a_selector_no_longer_encode_the_same() {
 /// No `Default`, deliberately, and no way to add one that would matter: this is
 /// the shape of every real block return that is not `()` — an owned handle.
 ///
-/// It DOES implement [`Encode`], which is new in the third pass: `RcBlock`'s
-/// constructors now carry the same `Encode` bound `msg` carries on its return
+/// It DOES implement [`Encode`]: `RcBlock`'s
+/// constructors carry the same `Encode` bound `msg` carries on its return
 /// type, so a block's arguments and return state their C ABI like everything
 /// else that crosses a boundary in this crate. That bound is orthogonal to F8's
 /// point — F8 is about `Default`, which is still absent, and the constructor
@@ -448,9 +442,8 @@ unsafe impl aterm_objc::InertZero for NoDefault {}
 
 #[test]
 fn a_block_may_return_a_type_that_has_no_default_impl() {
-    // Before this wave the bound `R: Default` on every `RcBlock::newN` made
-    // this line `E0277`, for a bound the body never used: the caught-panic arm
-    // lands on `abort_on_unwind`, which is `!` and coerces to any `R`.
+    // No `R: Default` bound is needed: the caught-panic arm lands on
+    // `abort_on_unwind`, which is `!` and coerces to any `R`.
     // SAFETY: the closure's prototype is exactly what `invoke` is typed as, and
     // the block is invoked below through that same prototype.
     let block = unsafe { RcBlock::new0(|| NoDefault(0xFEED)) }.expect("_Block_copy");

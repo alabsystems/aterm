@@ -121,10 +121,8 @@ fn uppercase_only_shift_is_caught_by_the_spec() {
 
 /// `write_u32` renders every magnitude, zero and `u32::MAX` included.
 ///
-/// Regression (bug #2775): values >= 2,000,000,000 must not infinite-loop or
-/// produce incorrect output. The original implementation used `u32` for the
-/// divisor. When val >= 2B, `divisor * 10` overflowed u32, causing an infinite
-/// loop in the digit-extraction while loop. Fix: use u64 for divisor.
+/// Regression (#2775): from 2,000,000,000 up, a `u32` divisor overflowed at
+/// `divisor * 10` and the digit loop never ended.
 #[test]
 fn write_u32_renders_every_magnitude() {
     for (val, want) in [
@@ -155,8 +153,7 @@ fn write_u32_renders_every_magnitude() {
 //
 // A genuine PROOF, not a sample: KeyboardMode defines 15 flag bits, so the whole
 // 2^15 = 32768-point mode space is enumerated below. For a finite, fully-enumerated
-// input space, exhaustive checking is sound AND complete (the same guarantee the
-// symbolic trust-mc/Kani gate gives, here under stock `cargo test`). It has teeth:
+// input space, exhaustive checking is sound AND complete. It has teeth:
 // it FAILS on the pre-policy encoder (legacy Enter == legacy Shift+Enter == CR).
 // =========================================================================
 
@@ -193,14 +190,10 @@ fn shift_enter_distinct_from_enter_in_every_mode() {
 //
 // THE property (kitty spec): a key RELEASE is reported ONLY when the app
 // negotiated REPORT_EVENT_TYPES (progressive flag 0b10). No other enhancement
-// flag opts into releases. The pre-fix encoder violated this: under
-// DISAMBIGUATE-only — and likewise
-// under REPORT_ALL_KEYS_AS_ESC without event types — a release was routed
-// through the CSI-u encoder, which (correctly) only emits the `:3` event-type
-// subfield when REPORT_EVENT_TYPES is on. The release therefore came out as a
-// press-meaning CSI-u report (`ESC[97u` for releasing 'a', `ESC[13u` for
-// releasing Enter), and the app received every keystroke TWICE — once from the
-// real press bytes, once from the phantom release. Both the aterm GUI keyup
+// flag opts into releases. The CSI-u encoder emits the `:3` event-type
+// subfield only under REPORT_EVENT_TYPES, so a release routed there under any
+// other flag reads as a press (`ESC[97u` for releasing 'a') and the app gets
+// every keystroke twice. Both the aterm GUI keyup
 // path (app_input.rs) and Orca's helper-textarea keyup path forward releases
 // unconditionally, relying on THIS contract: "the engine emits nothing for a
 // release outside kitty event-type reporting".
@@ -363,12 +356,14 @@ fn ungated_release_would_collide_with_a_press_report() {
         mode,
         KeyEventType::Release,
         None,
+        None,
     );
     let press_report = encode_kitty(
         &Key::Character('a'),
         Modifiers::empty(),
         mode,
         KeyEventType::Press,
+        None,
         None,
     );
     assert_eq!(ungated_release, b"\x1b[97u");
@@ -802,7 +797,7 @@ fn main_block_twin_table() {
     }
 }
 
-/// A physical KP_5 reaches the encoder as `Numpad5` now (the winit seam keeps
+/// A physical KP_5 reaches the encoder as `Numpad5` (the winit seam keeps
 /// the keypad identity). Under a kitty mode that has NOT asked to tell the
 /// keypad apart it is the `5` kitty sends — a text press AND a text repeat —
 /// where the unfolded key reported a dedicated `CSI 57404;1:2 u` repeat no
@@ -882,11 +877,8 @@ fn kitty_legacy_fold_yields_to_application_keypad_mode() {
 }
 
 /// `REPORT_ASSOCIATED_TEXT` answers "what did this press put on the screen",
-/// and a keypad glyph key puts its glyph there. The keypad used to arrive from
-/// the hosts as `Key::Character` and reported it; since the winit seam resolves
-/// the physical keypad it arrives as `Key::Named(Numpad5)`, whose `Named` arm
-/// answered `None` — the text vanished from the report while the dedicated
-/// `57404` code stayed. The twin supplies the text; the CODE is still the
+/// and a keypad glyph key puts its glyph there. The keypad arrives as
+/// `Key::Named(Numpad5)`, so its twin supplies the text; the CODE is still the
 /// keypad's own.
 #[test]
 fn kitty_associated_text_carries_the_keypad_glyph() {
@@ -1097,8 +1089,7 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
     );
 
     // CTRL on the keypad is the engine's documented keypad rule (#7480: the
-    // keypad encoder ignores it), now the SAME rule in every mode rather than
-    // the control byte with a kitty flag and the glyph without.
+    // keypad encoder ignores it), the same in every mode.
     assert_eq!(
         encode_key(&Key::Named(N::NumpadDivide), Modifiers::CTRL, events_only),
         b"/"
@@ -1558,8 +1549,7 @@ fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
     // the physical key, VK_OEM_4 / scan 0x1A, with the ESC char a Windows
     // keyboard gives it. Measured: `Oem4 MODS=Control CHAR=0x1B`, which vim
     // (Git's, through the MSYS console reader) takes as ESC — and which
-    // PSReadLine's Windows mode, with nothing bound to Ctrl+[, inserts as `^[`
-    // (it used to revert the line when conhost read the lone ESC as Escape).
+    // PSReadLine's Windows mode, with nothing bound to Ctrl+[, inserts as `^[`.
     let bracket = Key::Character('[');
     assert_eq!(
         encode_key_with_layout(

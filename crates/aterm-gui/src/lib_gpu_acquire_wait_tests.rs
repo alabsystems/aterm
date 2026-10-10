@@ -226,6 +226,7 @@ fn gpu_acquire_wait_survives_real_input_rearming_and_later_input() {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     app.windows

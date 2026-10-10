@@ -22,7 +22,7 @@
 use crate::harness;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 
 use aterm_spec::derive::notify_follow_checkpoint_model;
 use harness::{until, Fleet, FLEET};
@@ -130,9 +130,9 @@ impl Watch {
         let out = std::fs::File::create(self.state.join("follow.out")).expect("stdio");
         let err = out.try_clone().expect("stdio clone");
         Follower(Some(
-            Command::new(harness::link_to_launch())
+            aterm_uds::spawnfd::command(harness::link_to_launch())
                 .args(self.argv(on, exec, extra))
-                .stdin(Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
                 .stdout(out)
                 .stderr(err)
                 .spawn()
@@ -169,7 +169,9 @@ impl Watch {
 }
 
 /// A follow-mode notifier that is killed when the test leaves, panic included.
-struct Follower(Option<Child>);
+/// Started by `spawnfd`: it holds its stdio and nothing else of this process,
+/// not another test thread's pipe for as long as it follows.
+struct Follower(Option<aterm_uds::spawnfd::Child>);
 
 impl Follower {
     fn kill(&mut self) {

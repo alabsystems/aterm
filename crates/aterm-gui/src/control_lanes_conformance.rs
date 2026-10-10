@@ -143,8 +143,9 @@ impl LaneService for Stub {
         &self,
         line: String,
         _scope: Scope,
-        stream: &CtlStream,
+        _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
+        out: &mut Vec<u8>,
     ) -> Option<ServeDisposition> {
         let reply = match line.as_str() {
             "quit" => return Some(ServeDisposition::Close),
@@ -160,11 +161,8 @@ impl LaneService for Stub {
             }
             other => format!("OK {other}"),
         };
-        let mut writer = stream;
-        writer
-            .write_all(format!("{reply}\n").as_bytes())
-            .is_err()
-            .then_some(ServeDisposition::Close)
+        out.extend_from_slice(format!("{reply}\n").as_bytes());
+        None
     }
 
     fn is_wait(&self, line: &str, _scope: Scope) -> bool {

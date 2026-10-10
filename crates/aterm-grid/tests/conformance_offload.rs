@@ -229,15 +229,12 @@ fn project_replacement_history(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// ty-as-judge: strictly validate one projected transition against the spec's Next
-// (the `conformance_eventlog.rs` method: open Init, the trace's step 0 is `prev`).
-// ---------------------------------------------------------------------------
+// ty-as-judge: validate one projected transition against the spec's Next.
 
-/// TIERED per-transition conformance (see [`verify::validate_transition_tiered`]):
+/// Tiered per-transition conformance (see [`verify::validate_transition_tiered`]):
 /// the interpreter's `Next`-admission check always runs; `ty trace validate`
-/// additionally validates the two-step trace wherever installed (verdicts must
-/// agree). The trace's step 0 is `prev`; the cfg carries the real regime overrides.
+/// also validates the two-step trace wherever installed (verdicts must agree).
+/// The trace's step 0 is `prev`; the cfg carries the real regime overrides.
 fn validate_transition(
     m: &Model,
     prev: &BTreeMap<&'static str, i64>,

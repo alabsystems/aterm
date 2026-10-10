@@ -50,6 +50,17 @@
 //!   `rust-toolchain.toml` pins a STOCK channel says so under the lanes: that pin
 //!   moves only rustup's proxies, never `targo` ([`Pin`]).
 //!
+//!   WHAT RUNS IS NAMED BY WHAT IT IS (2026-09-29). `cargo` and `rustc` are resolved
+//!   before a word is said ([`crate::upstream_identity`]): through rustup when the copy
+//!   on PATH is its proxy, then by the resolved file's `-vV`. The first line says `->
+//!   Trust 7d5533b2, via rustup trust (the rustup default)` or `-> STOCK rustc 1.97.1
+//!   (8bab26f4f), via rustup 1.97.1-aarch64-apple-darwin (pinned by …); not Trust (no
+//!   proof claim)`, and one line under the lanes names the file. Measured that day after
+//!   `rustup default trust`: a bare `rustc -vV` ran the Trust seal under "running upstream
+//!   'rustc' (no proof claim)", the words it printed over stock 1.97.1 — the owner: "fix
+//!   that naming so that there is NO CONFUSION NOW". `tlc` is not resolved: it has no
+//!   Trust build to be confused with.
+//!
 //!   ANNOUNCE, DO NOT PREVENT. This row used to refuse (exit
 //!   [`REFUSAL_EXIT`]) on the reading that "the friction is the feature". The
 //!   owner's instruction of 2026-09-08 decides otherwise, verbatim: *"We don't
@@ -67,6 +78,26 @@
 //!   development". `ATERM_REROUTE_QUIET` is gone, and so is `ATERM_REROUTE_STRICT`,
 //!   the opposite knob that restored the refusal: a second policy lane nobody in the
 //!   tree set.
+//!
+//!   ONE EXCEPTION, A TRUST SOURCE CHECKOUT (2026-09-29). Inside one — `x.py` beside a
+//!   `src/stage0` whose `compiler_dist_channel=trust`
+//!   ([`crate::upstream_identity::trust_checkout`]) — a `cargo`/`rustc` that resolves to
+//!   anything but Trust (stock, or not known) does not run: exit [`REFUSAL_EXIT`], naming
+//!   what it resolved to, the checkout, the Trust spelling, and how to run it anyway,
+//!   `aterm --no-reroute` — [`trust_checkout_refusal`]. There a stock compiler would build
+//!   part of Trust: the owner's direction, "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST",
+//!   decides the refusal, as `[reroute] strict` refuses z3. `[reroute] announce = false`
+//!   does not silence it: a refusal is not an announcement.
+//!
+//!   WHAT IS JUDGED IS A NAME LOOKED UP ON PATH, wherever it is looked up: typed, spawned
+//!   by a tool, or spawned beneath a command the reroute itself ran — that one carries
+//!   [`ANNOUNCED_ENV`], which keeps its tree's by-name spawns quiet and still judged
+//!   (2026-10-01: it carried the escape, and a stock `rustc +1.97.1` beneath an allowed
+//!   Trust cargo ran unjudged), with no store resolving or with atpkg unreachable alike. A
+//!   cargo started by its path (or by `rustup run`) runs `rustc` by name, and that rustc
+//!   is judged. NOT JUDGED, because no name is looked up: a compiler run by its own path,
+//!   one handed to cargo as `RUSTC`, `RUSTC_WRAPPER` or `build.rustc` (cargo then runs that
+//!   path), and everything in a session started with `aterm --no-reroute`.
 //! * **ORACLE** (`z3`): `ay`'s differential oracle. Announce, naming `ay`, then run
 //!   upstream z3 — as a SIGNPOST does. It used to refuse (exit 2) on the reading that
 //!   running the wrong oracle manufactures a false proof claim; the owner's ruling of
@@ -84,7 +115,9 @@
 //! PATH for the upstream tool in `sh`, as the escape does, with one line. Exit 127 is
 //! left only where nothing exists to run. `[reroute] announce = false` silences these
 //! lines like any upstream-runs line; `[reroute] strict = true`
-//! ([`crate::config::RerouteConfig::strict`]) restores every refusal as it was.
+//! ([`crate::config::RerouteConfig::strict`]) restores every refusal as it was. One
+//! exception came the same day, and no setting lifts it: inside a Trust source checkout a
+//! `cargo`/`rustc` that is not Trust does not run ([`trust_checkout_refusal`], above).
 //!
 //! # Escapes, all of them
 //!
@@ -92,9 +125,11 @@
 //!   internal [`PASSTHROUGH_ENV`] marker on that session (the front door clears an
 //!   inherited one otherwise, so it is protocol, not a knob). The stub itself walks
 //!   PATH past its own directory and execs the first upstream copy — in `sh`, so the
-//!   escape works even when atpkg is unreachable. The Rust side stamps the same marker
-//!   on any upstream child it execs, so cargo's own `rustc`/`rustdoc` spawns are never
-//!   re-announced or refused.
+//!   escape works even when atpkg is unreachable. Nothing else stamps it: an upstream
+//!   child the reroute execs carries [`ANNOUNCED_ENV`] instead, so cargo's own
+//!   `rustc`/`rustdoc` spawns are never re-announced, and a `cargo`/`rustc` among them is
+//!   refused only where the same name typed alone would be — inside a Trust source
+//!   checkout, when it is not Trust.
 //! * `<tool> +<toolchain>` naming a non-Trust toolchain is the user naming
 //!   upstream deliberately: it runs as named, after [`stock_channel_signpost`] —
 //!   the Trust spelling of the same command, silenced like any signpost by the
@@ -105,24 +140,32 @@
 //!   directive it was given, and a DIRECT row's branded tool never does ([`plan`]).
 //! * `rustup run <tc> cargo` never reaches these stubs (rustup resolves the
 //!   toolchain's own binaries), and neither does an absolute path — which is why
-//!   the compiler's own bootstrap, which drives stage0 by absolute path, stays
-//!   silent. That is the intended boundary: the reroute answers a NAME looked up
-//!   on PATH, nothing else.
-//! * The `rustc` and `rustdoc` such a cargo spawns DO meet a stub, carrying no marker:
-//!   cargo looks both up by name unless it can skip past rustup's proxies, and it skips
-//!   only when the `rustc` on PATH is the size of `rustup` — never a stub's. rustup puts
+//!   the compiler's own bootstrap, which drives stage0 by absolute path (and hands
+//!   cargo `RUSTC`), stays silent. That is the intended boundary: the reroute answers
+//!   a NAME looked up on PATH, nothing else. A compiler named by path in a variable —
+//!   `RUSTC=/path/to/rustc` for cargo — is a path, and is not judged.
+//! * What such a command spawns BY NAME does meet a stub. cargo looks `rustc` and
+//!   `rustdoc` up by name unless it can skip past rustup's proxies, and it skips only when
+//!   the `rustc` on PATH is the size of `rustup` — never a stub's. rustup puts
 //!   `~/.cargo/bin` ahead only when it is absent from PATH, and Homebrew's cargo or a
-//!   toolchain's own has no proxies to skip to. What they carry instead is cargo's own
-//!   mark, [`CARGO_CRATE_ENV`], set on every compile it spawns for a crate, and those
-//!   two stubs pass it in `sh`, as the marker is passed ([`CARGO_COMPILERS`]). Until
-//!   2026-10-02 they did not: `rustup run stable cargo test --doc`, `~/.cargo/bin/cargo
-//!   doc` and `/opt/homebrew/bin/cargo doc` ran Trust's trustdoc over crates stock rustc
-//!   had just built (E0514) and announced every `rustc`, while the same command typed
-//!   bare, through the cargo stub, passed. Trust's own cargo marks its compile twice
-//!   ([`TARGO_CRATE_ENV`]) and is answered as a typed name is: its store build has
-//!   `trustdoc` and no `rustdoc` beside it, so passed upstream, the `rustdoc` it spawns by
-//!   name was stock Rust's over trustc's crates (E0514) or, with no stock Rust installed,
-//!   none — `<sysroot>/bin/cargo doc` exit 127 (the 2026-10-02 review).
+//!   toolchain's own has no proxies to skip to. Its `rustc -vV` probe carries no mark and
+//!   is answered as a typed name: announced, and inside a Trust source checkout refused
+//!   when it is not Trust (measured 2026-09-30: `rustup run 1.97.1 cargo build` there
+//!   failed at cargo's `rustc -vV`). Its compiles carry cargo's own mark,
+//!   [`CARGO_CRATE_ENV`], set on every compile it spawns for a crate, and those two stubs
+//!   ([`CARGO_COMPILERS`]) take it as they take [`ANNOUNCED_ENV`]: not announced again,
+//!   run as the cargo chose, and a `rustc` still judged inside a Trust source checkout —
+//!   so a cached `rustc -vV` (cargo keeps one per target dir) lets no stock compile
+//!   through there. Until 2026-10-02 they did not: `rustup run stable cargo test --doc`,
+//!   `~/.cargo/bin/cargo doc` and `/opt/homebrew/bin/cargo doc` ran Trust's trustdoc over
+//!   crates stock rustc had just built (E0514) and announced every `rustc`, while the same
+//!   command typed bare, through the cargo stub, passed. Trust's own cargo marks its
+//!   compile twice ([`TARGO_CRATE_ENV`]) and is answered as a typed name is: its store
+//!   build has `trustdoc` and no `rustdoc` beside it, so passed upstream, the `rustdoc` it
+//!   spawns by name was stock Rust's over trustc's crates (E0514) or, with no stock Rust
+//!   installed, none — `<sysroot>/bin/cargo doc` exit 127 (the 2026-10-02 review).
+//!   Only `aterm --no-reroute` carries a whole command tree past the stubs: what a
+//!   reroute-run command spawns by name meets them too ([`ANNOUNCED_ENV`]).
 //!
 //! # What a stub is not
 //!
@@ -142,6 +185,7 @@ use std::process::ExitCode;
 use aterm_types::rust_lane;
 
 use crate::store::Layout;
+use crate::upstream_identity::Resolved;
 
 /// Exported by the spawn seams: the absolute reroute directory of THIS session,
 /// so the shell integration can re-assert it first after rc files ran.
@@ -161,8 +205,9 @@ pub const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 /// INTERNAL PROTOCOL, not a setting: the marker of a session with every upstream tool
 /// restored. `aterm --no-reroute` stamps it on its session (and the front door CLEARS
 /// an inherited one on every other launch, so exporting it by hand does not make a
-/// session), the stub and [`run`] read it, and [`exec_upstream`] stamps it on the
-/// upstream child it execs so that child's own spawns pass silently. It was the user
+/// session), and the stub and [`run`] read it. Nothing else sets it: an upstream child
+/// [`exec_upstream`] runs, and one a stub that cannot reach atpkg runs, carry
+/// [`ANNOUNCED_ENV`] instead (2026-10-01). It was the user
 /// knob `ATERM_NO_REROUTE` until 2026-09-23; the flag is the one spelling now (owner,
 /// 2026-09-22: "NOT ENV VARS those are for development").
 ///
@@ -177,7 +222,8 @@ pub const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 /// or document a crate (and so inherited by what those run — a proc macro's children, a
 /// doctest), and on nothing else cargo starts: not a build script, a `cargo run` binary, a
 /// test binary, nor its own `rustc -vV` probes (measured 2026-10-02 on cargo 1.96). A
-/// [`CARGO_COMPILERS`] stub passes it as it passes [`PASSTHROUGH_ENV`] — unless
+/// [`CARGO_COMPILERS`] stub takes it as it takes [`ANNOUNCED_ENV`] — said nothing, run as
+/// the cargo chose, a `rustc` judged inside a Trust source checkout — unless
 /// [`TARGO_CRATE_ENV`] says the cargo is Trust's. Read, never set.
 pub const CARGO_CRATE_ENV: &str = "CARGO_CRATE_NAME";
 /// Trust's cargo's second mark of its own compile, beside [`CARGO_CRATE_ENV`] on exactly
@@ -186,20 +232,43 @@ pub const CARGO_CRATE_ENV: &str = "CARGO_CRATE_NAME";
 /// store build carries `trustdoc` and no `rustdoc`, so the `rustdoc` its `cargo` spawns by
 /// name is the DIRECT row's — upstream it was stock Rust's (E0514) or none at all (127).
 pub const TARGO_CRATE_ENV: &str = "TARGO_CRATE_NAME";
-/// The rows cargo spawns for a crate, the stubs that pass a stock cargo's
-/// [`CARGO_CRATE_ENV`]: their copy is the one the cargo chose, as a stub-started cargo's
-/// is. The row's announcement and a DIRECT row's Trust tool are for a name a PERSON typed
-/// — one that carries no such mark — and for Trust's own cargo ([`TARGO_CRATE_ENV`]).
+/// The rows cargo spawns for a crate, the stubs that take a stock cargo's
+/// [`CARGO_CRATE_ENV`] as [`ANNOUNCED_ENV`]: their copy is the one the cargo chose, as a
+/// stub-started cargo's is. The row's announcement and a DIRECT row's Trust tool are for a
+/// name a PERSON typed — one that carries no such mark — and for Trust's own cargo
+/// ([`TARGO_CRATE_ENV`]).
 pub const CARGO_COMPILERS: &[&str] = &["rustc", "rustdoc"];
+/// INTERNAL PROTOCOL, not a setting: the marker [`exec_upstream`] stamps on every upstream
+/// copy the reroute runs — a command already announced (or deliberately not, under
+/// `[reroute] announce = false`). What that command spawns BY NAME is not announced again,
+/// and runs upstream as typed — but it is still JUDGED: a `cargo`/`rustc` inside a Trust
+/// source checkout that is not Trust does not run ([`trust_checkout_refusal`]). A stock
+/// cargo's own compile ([`CARGO_CRATE_ENV`]) is taken as this marker by the
+/// [`CARGO_COMPILERS`] stubs, which stamp it on the child.
+///
+/// WHY NOT THE ESCAPE (2026-10-01 review, reproduced): [`exec_upstream`] stamped
+/// [`PASSTHROUGH_ENV`], so inside a Trust checkout the Trust cargo the reroute allowed —
+/// `-> Trust 7d5533b2` on its line — carried the ESCAPE to its whole tree, and a `cargo
+/// demo` whose subcommand ran `rustc +1.97.1 -V` by name ran stock there with no line at
+/// all, while the same `rustc +1.97.1` typed alone was refused. A cargo subcommand,
+/// `cargo run -p xtask`, a build script that spawns `cargo +nightly`, and Trust's own
+/// `src/tools/miri/miri-script` (`rustc +miri`, `cargo +miri`) are that shape. The escape
+/// says "judge nothing"; this says "say nothing again". The `cargo`/`rustc` stubs ask
+/// atpkg under it only where the directory may be a Rust source checkout — an `x.py`
+/// beside a `src/stage0` up the tree ([`sh_source_checkout_test`]) — so a cargo build
+/// anywhere else costs its by-name `rustc` spawns a few `stat`s, not an atpkg each.
+pub const ANNOUNCED_ENV: &str = "__ATERM_REROUTE_ANNOUNCED";
 /// Line 2 of every stub — the ONLY thing that makes a file ours to rewrite or
 /// remove. Version-suffixed so a changed body can be told from an old one.
 pub const STUB_MARKER: &str = "# atpkg reroute stub v1";
 /// The hidden verb a stub execs: `atpkg __reroute <upstream> [args…]`.
 pub const HIDDEN_VERB: &str = "__reroute";
 /// A refusal under `[reroute] strict = true` — the ORACLE row, and the fail-closed answer
-/// when atpkg itself cannot be reached — and a `__reroute` usage error: a usage-shaped
-/// exit — the command did not run because the caller has to choose, not because
-/// anything broke. By default nothing a stub could run is refused (2026-09-29).
+/// when atpkg itself cannot be reached — a `cargo`/`rustc` that is not Trust inside a
+/// Trust source checkout ([`trust_checkout_refusal`]), and a `__reroute` usage error: a
+/// usage-shaped exit — the command did not run because the caller has to choose, not
+/// because anything broke. Elsewhere, by default, nothing a stub could run is refused
+/// (2026-09-29).
 pub const REFUSAL_EXIT: u8 = 2;
 /// The directory under the manager prefix (`<prefix>/reroute`).
 pub const DIR_NAME: &str = "reroute";
@@ -473,18 +542,18 @@ fn escape_clause(upstream: &str) -> String {
 /// The setting that silences a SIGNPOST row's announcement, as the line spells it.
 pub const ANNOUNCE_SETTING: &str = "[reroute] announce = false";
 
-/// The last lines of a SIGNPOST message: the page that answers which toolchain this
-/// directory gets, and the setting that silences the line, because a line printed on
-/// every build must say how to stop printing it. What is about to happen (upstream
-/// runs) is the message's FIRST line, in each arm.
+/// The page that answers which toolchain this directory gets — named on every signpost
+/// and every refusal (owner, 2026-09-08: the Trust default is to be "very strongly
+/// encouraged by the aterm system itself"): a reader about to run stock cargo anyway is
+/// told, in the same breath, the one command that measures it.
+const MEASURING_LINE: &str = "       `aterm help rust` shows which toolchain this directory gets; the default here is Trust.";
+
+/// The last lines of a SIGNPOST message: [`MEASURING_LINE`], and the setting that silences
+/// the line, because a line printed on every build must say how to stop printing it. What
+/// is about to happen (what runs) is the message's FIRST line, in each arm.
 fn signpost_closing() -> String {
-    // The measuring page is named on every signpost (owner, 2026-09-08: the
-    // Trust default is to be "very strongly encouraged by the aterm system
-    // itself"): a reader who is about to run stock cargo anyway is told, in
-    // the same breath, the one command that answers which toolchain this
-    // directory actually gets — instead of guessing from the lines above.
     format!(
-        "       `aterm help rust` shows which toolchain this directory gets; the default here is Trust.\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
+        "{MEASURING_LINE}\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
     )
 }
 
@@ -521,7 +590,8 @@ pub fn direct_announcement(upstream: &str, branded: &str, upstream_found: bool) 
     line
 }
 
-/// The SIGNPOST announcement, the caller's arguments filled into every lane:
+/// The SIGNPOST announcement, the caller's arguments filled into every lane — unresolved,
+/// the form `tlc` prints, and the frame every Rust row's resolved form shares:
 ///
 /// ```text
 /// aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':
@@ -531,12 +601,24 @@ pub fn direct_announcement(upstream: &str, branded: &str, upstream_found: bool) 
 ///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
 /// ```
 ///
-/// `toolchain` is the caller's `+trust…` directive, which runs as typed: rustup's view of
-/// that toolchain, whose `cargo`/`rustc` are Trust's own (`crate::seam::STOCK_NAMES`), so
-/// the first line names it and says no "no proof claim" of it —
+/// `toolchain` is the caller's `+trust…` directive, which runs as typed:
 /// `aterm: running 'cargo +trust' (rustup's trust toolchain); on Trust the tool is 'targo':`.
 ///
-/// `pin` is the directory's [`Pin`], when it has one — named under the lanes.
+/// `pin` is the directory's [`Pin`], when it has one — named under the lanes — and
+/// `resolved` is what the name RESOLVED to ([`crate::upstream_identity::resolve`]), which
+/// [`plan`] asks for `cargo` and `rustc`: the first line then names what runs by what it
+/// is, and one line under the lanes names the file (2026-09-29). Measured before that day:
+/// after `rustup default trust`, a bare `rustc -vV` ran the Trust seal 7d5533b2 under
+/// "running upstream 'rustc' (no proof claim)" — the same words it printed over stock
+/// 1.97.1 in a pinned directory.
+///
+/// ```text
+/// aterm: running 'rustc' -> Trust 7d5533b2, via rustup trust (the rustup default); Trust's own spelling is 'trustc':
+///          trustc main.rs                      VERIFIED   — proves as it compiles
+///          trustc -Ztrust-verify=off main.rs   UNVERIFIED — compiles as vanilla Rust
+///        ('rustc' here is /Users//me/toolchains/trust-7d5533b2/bin/rustc.)
+/// aterm: running 'rustc' -> STOCK rustc 1.97.1 (8bab26f4f), via rustup 1.97.1-aarch64-apple-darwin (pinned by /r/rust-toolchain.toml); not Trust (no proof claim); on Trust the tool is 'trustc':
+/// ```
 ///
 /// Every spelling of a Rust row is [`rust_lane::trust_spelling`]'s — the vocabulary
 /// `aterm pkg lane` and `aterm help rust` share — so a cargo verb gets the lane targo
@@ -551,9 +633,10 @@ pub fn signpost_message_in(
     args: &[String],
     toolchain: Option<&str>,
     pin: Option<&Pin>,
+    resolved: Option<&Resolved>,
 ) -> String {
     let head = toolchain.map_or(Head::Upstream, Head::Toolchain);
-    signpost_block(row, lanes, args, head, pin)
+    signpost_block(row, lanes, args, head, pin, resolved, None)
 }
 
 /// A SIGNPOST row with no upstream copy on PATH: nothing ran, so the first line says
@@ -567,7 +650,7 @@ pub fn signpost_message_in(
 /// ```
 #[must_use]
 pub fn no_upstream_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
-    signpost_block(row, lanes, args, Head::NotOnPath, None)
+    signpost_block(row, lanes, args, Head::NotOnPath, None, None, None)
 }
 
 /// The signpost for `<upstream> +<stock channel> …` on any Rust row — a STOCK toolchain
@@ -583,20 +666,82 @@ pub fn no_upstream_message(row: &Row, lanes: &[Lane], args: &[String]) -> String
 /// silences it like any signpost, and it says so.
 ///
 /// ```text
-/// aterm: running upstream 'cargo +1.97.1' (no proof claim); on Trust the tool is 'targo':
+/// aterm: running 'cargo +1.97.1' -> STOCK cargo 1.97.1 (c980f4866), via rustup 1.97.1-aarch64-apple-darwin (named on the command line); not Trust (no proof claim); on Trust the tool is 'targo':
 ///          targo trust test -p x          VERIFIED   — emits a proof claim
 ///          targo --unverified test -p x   UNVERIFIED — no proof claim
+///        ('cargo' here is /Users//me/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo.)
 ///        A stock channel, named here or pinned, moves only rustup's proxies, never targo.
 ///        `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
 ///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
 /// ```
+///
+/// `resolved` is what the name resolved to ([`signpost_message_in`]) — `cargo` and `rustc`
+/// only; a DIRECT row (`rustfmt +1.97.1`) says "running upstream" of the channel it named.
 #[must_use]
-pub fn stock_channel_signpost(row: &Row, toolchain: &str, args: &[String]) -> String {
-    let lanes = match row.policy {
+pub fn stock_channel_signpost(
+    row: &Row,
+    toolchain: &str,
+    args: &[String],
+    resolved: Option<&Resolved>,
+) -> String {
+    signpost_block(
+        row,
+        lanes_of(row),
+        args,
+        Head::Stock(toolchain),
+        None,
+        resolved,
+        None,
+    )
+}
+
+/// A SIGNPOST row's lanes; none for any other row.
+fn lanes_of(row: &Row) -> &'static [Lane] {
+    match row.policy {
         Policy::Signpost { lanes, .. } => lanes,
         Policy::Direct { .. } | Policy::Oracle { .. } => &[],
+    }
+}
+
+/// THE REFUSAL INSIDE A TRUST SOURCE CHECKOUT (2026-09-29): `cargo`/`rustc` resolved to
+/// something that is not Trust ([`crate::upstream_identity::trust_checkout`] found the
+/// checkout at `root`), so nothing ran. What it resolved to leads, the checkout and why
+/// follow, then the Trust spelling of the very command, the file it resolved to, and how
+/// to run that copy anyway: `aterm --no-reroute`. Its own path is not named: run by path,
+/// a `cargo` spawns `rustc` by name, which is refused here in turn (measured 2026-09-30,
+/// `error: process didn't exit successfully: `rustc -vV` (exit status: 2)`) — a promise
+/// the refusal made and cargo did not keep:
+///
+/// ```text
+/// aterm: 'cargo' did not run -> STOCK cargo 1.97.1 (c980f4866), via rustup 1.97.1-aarch64-apple-darwin (pinned by /t/rust-toolchain.toml); not Trust,
+///        and /t is a Trust source checkout (its src/stage0 says compiler_dist_channel=trust), where a compiler not known to be Trust would build part of Trust; on Trust the tool is 'targo':
+///          targo trust build          VERIFIED   — emits a proof claim
+///          targo --unverified build   UNVERIFIED — no proof claim
+///        ('cargo' here is /Users//me/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo; `aterm --no-reroute` runs it as named.)
+///        `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
+/// ```
+#[must_use]
+pub fn trust_checkout_refusal(
+    row: &Row,
+    args: &[String],
+    toolchain: Option<&str>,
+    resolved: &Resolved,
+    root: &Path,
+) -> String {
+    let head = match toolchain {
+        Some(tc) if rust_lane::is_trust_channel(tc) => Head::Toolchain(tc),
+        Some(tc) => Head::Stock(tc),
+        None => Head::Upstream,
     };
-    signpost_block(row, lanes, args, Head::Stock(toolchain), None)
+    signpost_block(
+        row,
+        lanes_of(row),
+        args,
+        head,
+        None,
+        Some(resolved),
+        Some(root),
+    )
 }
 
 /// What the first line of a SIGNPOST block says of the run.
@@ -613,33 +758,61 @@ enum Head<'a> {
     NotOnPath,
 }
 
-/// [`signpost_message_in`], [`no_upstream_message`] and [`stock_channel_signpost`].
+/// [`signpost_message_in`], [`no_upstream_message`], [`stock_channel_signpost`] and
+/// [`trust_checkout_refusal`] (`refused_in`, the checkout's root: nothing runs).
 fn signpost_block(
     row: &Row,
     lanes: &[Lane],
     args: &[String],
     head: Head<'_>,
     pin: Option<&Pin>,
+    resolved: Option<&Resolved>,
+    refused_in: Option<&Path>,
 ) -> String {
     let upstream = row.upstream;
     let branded = branded_of(row);
-    // The first line's state: what runs, or that there is nothing to run. `verb` is a
-    // one-spelling cargo verb's (`cargo clippy`, `cargo run`); `claim` is said only of
-    // upstream.
-    let head_line = |verb: &str, claim: &str| match head {
-        Head::Upstream => format!(
-            "aterm: running upstream '{}'{claim}",
-            join_command(upstream, verb)
-        ),
-        Head::Stock(toolchain) => format!(
-            "aterm: running upstream '{}'{claim}",
-            join_command(&format!("{upstream} +{toolchain}"), verb)
-        ),
-        Head::Toolchain(toolchain) => format!(
-            "aterm: running '{}' (rustup's {toolchain} toolchain)",
-            join_command(&format!("{upstream} +{toolchain}"), verb)
-        ),
-        Head::NotOnPath => format!("aterm: upstream '{upstream}' is not on PATH"),
+    // The first line's state: what runs — by what it IS, once resolved — or that nothing
+    // does. `verb` is a one-spelling cargo verb's (`cargo clippy`, `cargo run`); `claim` is
+    // said only of what is not known to be Trust, and never of a command that did not run.
+    let head_line = |verb: &str, claim: &str| {
+        let typed = match head {
+            Head::Upstream | Head::NotOnPath => join_command(upstream, verb),
+            Head::Stock(toolchain) | Head::Toolchain(toolchain) => {
+                join_command(&format!("{upstream} +{toolchain}"), verb)
+            }
+        };
+        match (head, resolved, refused_in) {
+            (Head::NotOnPath, ..) => format!("aterm: upstream '{upstream}' is not on PATH"),
+            (_, Some(what), Some(root)) => format!(
+                "aterm: '{typed}' did not run -> {},\n       and {} is a Trust source checkout (its src/stage0 says compiler_dist_channel=trust), where a compiler not known to be Trust would build part of Trust",
+                what.verdict(upstream),
+                root.display()
+            ),
+            (_, Some(what), None) if what.is_trust() => {
+                format!("aterm: running '{typed}' -> {}", what.verdict(upstream))
+            }
+            (_, Some(what), None) => {
+                format!(
+                    "aterm: running '{typed}' -> {}{claim}",
+                    what.verdict(upstream)
+                )
+            }
+            (Head::Upstream | Head::Stock(_), None, _) => {
+                format!("aterm: running upstream '{typed}'{claim}")
+            }
+            (Head::Toolchain(toolchain), None, _) => {
+                format!("aterm: running '{typed}' (rustup's {toolchain} toolchain)")
+            }
+        }
+    };
+    // Where the Trust tool is named after the first line: what resolved to Trust is already
+    // Trust, so its lanes are Trust's own spelling, not a replacement.
+    let intro = |tool: &str| {
+        if resolved.is_some_and(Resolved::is_trust) && refused_in.is_none() {
+            format!("; Trust's own spelling is '{tool}':\n")
+        } else {
+            format!("; on Trust the tool is '{tool}':\n")
+        }
     };
     let mut out = String::new();
     let mut trust_tool = branded.to_string();
@@ -673,17 +846,17 @@ fn signpost_block(
                     one.command.split(' ').next().unwrap_or(branded).to_string()
                 };
                 out.push_str(&head_line(verb, ""));
-                out.push_str(&format!("; on Trust the tool is '{trust_tool}':\n"));
+                out.push_str(&intro(&trust_tool));
             }
             // One lane only: `cargo run`/`doc`/`install`… have no verified lane, which the
             // lane's own note says.
             [_] => {
                 out.push_str(&head_line(verb, " (no proof claim)"));
-                out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+                out.push_str(&intro(branded));
             }
             _ => {
                 out.push_str(&head_line("", " (no proof claim)"));
-                out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+                out.push_str(&intro(branded));
             }
         }
         out.push_str(&rust_lane::render_spellings(&spellings, "         "));
@@ -698,7 +871,7 @@ fn signpost_block(
         ));
     } else {
         out.push_str(&head_line("", " (no proof claim)"));
-        out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+        out.push_str(&intro(branded));
         let rest = args.join(" ");
         let rendered: Vec<rust_lane::Spelling> = lanes
             .iter()
@@ -709,6 +882,16 @@ fn signpost_block(
             })
             .collect();
         out.push_str(&rust_lane::render_spellings(&rendered, "         "));
+    }
+    // The file the name resolved to, under the lanes — and, refused, how to run it anyway.
+    if let Some(what) = resolved {
+        let real = what.real.display();
+        match refused_in {
+            Some(_) => out.push_str(&format!(
+                "       ('{upstream}' here is {real}; `aterm --no-reroute` runs it as named.)\n"
+            )),
+            None => out.push_str(&format!("       ('{upstream}' here is {real}.)\n")),
+        }
     }
     if let Head::Stock(_) = head {
         let tool = trust_tool.split(' ').next().unwrap_or(branded);
@@ -721,6 +904,9 @@ fn signpost_block(
     }
     if head == Head::NotOnPath {
         out.pop();
+    } else if refused_in.is_some() {
+        // A refusal is never silenced, so the setting that silences a signpost is not named.
+        out.push_str(MEASURING_LINE);
     } else {
         out.push_str(&signpost_closing());
     }
@@ -893,13 +1079,39 @@ pub fn unreachable_not_on_path_message(upstream: &str) -> String {
     )
 }
 
-/// `atpkg __reroute` with no resolvable store (no `HOME`, an `env -i` wrapper) and an
-/// upstream copy on PATH: it runs, after this line (the default since 2026-09-29).
+/// Printed by a `cargo`/`rustc` stub ([`names_what_runs`]) when atpkg is unreachable and
+/// the directory is inside a Trust source checkout, as far as `sh` can tell
+/// ([`sh_source_checkout_test`], then a `src/stage0` line naming the `trust` channel):
+/// nothing can be resolved, so nothing is known to be Trust, and there that does not run
+/// ([`trust_checkout_refusal`]'s rule, 2026-10-01). Exit [`REFUSAL_EXIT`].
 #[must_use]
-pub fn storeless_message(upstream: &str) -> String {
+pub fn unreachable_in_checkout_message(upstream: &str) -> String {
     format!(
-        "aterm: running upstream '{upstream}' — no package store resolves here, so its Trust tool was not looked up."
+        "aterm: '{upstream}' did not run — aterm's package manager is not reachable, so what '{upstream}' runs here cannot be named, and this is a Trust source checkout (its src/stage0 names the trust channel), where only Trust may build. `aterm pkg repair` re-lays this stub; `aterm --no-reroute` runs upstream '{upstream}'."
     )
+}
+
+/// `atpkg __reroute` with no resolvable store (no `HOME`, an `env -i` wrapper) and an
+/// upstream copy on PATH: it runs, after this line (the default since 2026-09-29) —
+/// named by what it resolved to for `cargo`/`rustc` (`resolved`, [`Resolved::verdict`]),
+/// as every signpost names it: `aterm: running 'rustc' -> Trust 7d5533b2, via rustup trust
+/// (the rustup default) — no package store resolves here, …`.
+#[must_use]
+pub fn storeless_message(upstream: &str, args: &[String], resolved: Option<&Resolved>) -> String {
+    let tail = "no package store resolves here, so its Trust tool was not looked up.";
+    match resolved {
+        Some(what) => {
+            let command = match explicit_toolchain(args) {
+                Some(tc) => format!("{upstream} +{tc}"),
+                None => upstream.to_string(),
+            };
+            format!(
+                "aterm: running '{command}' -> {} — {tail}",
+                what.verdict(upstream)
+            )
+        }
+        None => format!("aterm: running upstream '{upstream}' — {tail}"),
+    }
 }
 
 /// `atpkg __reroute` with no resolvable store under `[reroute] strict = true`: nothing
@@ -991,7 +1203,17 @@ pub fn policy_summary(row: &Row, upstream_found: bool, strict: bool) -> String {
                 s.push_str(&verbs.join(", "));
             }
             s.push_str(&stock_channel("names the same Trust spelling"));
+            // The line names the resolved copy only where there is one to resolve.
+            let resolves = names_what_runs(row) && upstream_found;
+            if resolves {
+                s.push_str(&format!(
+                    "; the line names what '{upstream}' resolves to (by its `-vV`: Trust, STOCK, or not known to be Trust)"
+                ));
+            }
             s.push_str(&then_run);
+            if resolves {
+                s.push_str(" — inside a Trust source checkout, only when that is Trust");
+            }
             s.push_str(&escape);
             s
         }
@@ -1100,6 +1322,58 @@ pub(crate) fn sh_path_walk(
     s
 }
 
+/// How many directories up [`sh_source_checkout_test`] walks before it stops and counts the
+/// directory as one that may be a checkout: deeper than any real tree, so a cwd whose
+/// parents cannot be read (a removed directory) is judged rather than missed.
+const SH_WALK_DEPTH: u32 = 64;
+
+/// Lines of `sh`, at `indent`, setting `__aterm_src` to the nearest directory up the tree
+/// holding an `x.py` and a `src/stage0` — a Rust source checkout, Trust's or upstream's —
+/// and to nothing when there is none. Only atpkg tells the two apart
+/// ([`crate::upstream_identity::trust_checkout`]); this decides whether to ask it, and must
+/// never miss one atpkg would find.
+///
+/// PHYSICAL, AS ATPKG WALKS: by `.`, `..`, `../..`, which the kernel resolves through the
+/// real parent, never through `$PWD` — a logical path through a symlink into a checkout
+/// has ancestors outside it. Root is where `..` is the same directory (`-ef`); past
+/// [`SH_WALK_DEPTH`] levels the walk stops and counts where it stopped. Builtins only, no
+/// subshell: it runs before every by-name `cargo`/`rustc` a reroute-run command spawns.
+fn sh_source_checkout_test(indent: &str) -> String {
+    let lines = [
+        "__aterm_src=; __aterm_up=.; __aterm_n=0".to_string(),
+        "while :; do".to_string(),
+        "  if [ -f \"$__aterm_up/x.py\" ] && [ -f \"$__aterm_up/src/stage0\" ]; then __aterm_src=$__aterm_up; break; fi".to_string(),
+        "  [ \"$__aterm_up\" -ef \"$__aterm_up/..\" ] && break".to_string(),
+        "  __aterm_n=$((__aterm_n + 1))".to_string(),
+        format!("  if [ \"$__aterm_n\" -ge {SH_WALK_DEPTH} ]; then __aterm_src=$__aterm_up; break; fi"),
+        "  __aterm_up=$__aterm_up/..".to_string(),
+        "done".to_string(),
+    ];
+    lines
+        .iter()
+        .map(|line| format!("{indent}{line}\n"))
+        .collect()
+}
+
+/// Lines of `sh`, at `indent`, after [`sh_source_checkout_test`]: `__aterm_trust` is set
+/// when that directory's `src/stage0` has a line naming `compiler_dist_channel` and `trust`
+/// — a loose reading of [`crate::upstream_identity::trust_checkout`]'s, so it refuses
+/// wherever atpkg would and never lets through what atpkg would refuse.
+fn sh_stage0_names_trust(indent: &str) -> String {
+    let lines = [
+        "__aterm_trust=",
+        "if [ -n \"$__aterm_src\" ] && [ -r \"$__aterm_src/src/stage0\" ]; then",
+        "  while IFS= read -r __aterm_l || [ -n \"$__aterm_l\" ]; do",
+        "    case $__aterm_l in *compiler_dist_channel*=*trust*) __aterm_trust=1; break;; esac",
+        "  done < \"$__aterm_src/src/stage0\"",
+        "fi",
+    ];
+    lines
+        .iter()
+        .map(|line| format!("{indent}{line}\n"))
+        .collect()
+}
+
 /// The POSIX stub for `upstream`. Its shape is load-bearing:
 ///
 /// * line 2 is [`STUB_MARKER`] (recognition);
@@ -1112,17 +1386,25 @@ pub(crate) fn sh_path_walk(
 ///   beside it and would exec a stub forever; known by its content,
 ///   [`sh_skip_a_stub`]) for the first absolute-entry executable of the same
 ///   name — the escape works with no atpkg at all;
-/// * a [`CARGO_COMPILERS`] stub takes that same walk for a stock cargo's own compile,
-///   known by [`CARGO_CRATE_ENV`] without [`TARGO_CRATE_ENV`] (module doc, "Escapes"):
-///   decided before atpkg, so no arm below it — strict, an unreachable atpkg, no store —
-///   can tell a `rustup run` cargo's compiles from a stub-started one's;
+/// * under [`ANNOUNCED_ENV`] (a child of a command the reroute ran) — or, in a
+///   [`CARGO_COMPILERS`] stub, a stock cargo's own compile, known by [`CARGO_CRATE_ENV`]
+///   without [`TARGO_CRATE_ENV`] (module doc, "Escapes"), which is stamped with that
+///   marker — it runs upstream by the same walk, saying nothing; except a `cargo`/`rustc`
+///   stub ([`names_what_runs`]) in a directory that may be inside a Rust source checkout
+///   ([`sh_source_checkout_test`]), which asks atpkg, so a stock compiler spawned by name
+///   under an allowed Trust cargo, or by a stock cargo started by its path, is judged as
+///   the same name typed alone (2026-10-01). Decided before atpkg, so no arm below it —
+///   strict, an unreachable atpkg, no store — can tell a `rustup run` cargo's compiles
+///   from a stub-started one's;
 /// * with atpkg unreachable it RUNS UPSTREAM by the same walk ([`sh_upstream_walk`]),
 ///   after one line ([`unreachable_fallback_message`]) and with the escape's marker
 ///   stamped on the child, so a `cargo` it runs spawns `rustc` without a second line
 ///   (2026-09-29, the owner's "warnings not hard limits"); 127 and one line only when no
 ///   upstream copy is on PATH. A `strict` stub (`[reroute] strict = true`, carried in
 ///   its bytes because the stub cannot read aterm.toml) fails closed as before: the
-///   escape named, exit 2, never quietly running upstream.
+///   escape named, exit 2, never quietly running upstream. A `cargo`/`rustc` stub inside
+///   a Trust source checkout fails closed too, in either mode
+///   ([`unreachable_in_checkout_message`]): nothing resolved is nothing known to be Trust.
 ///
 /// `atpkg` is the one [`crate::stub::Embedder`] settled on; the EMPTY path names none
 /// (`ATPKG=''`, which the `[ -x ]` refuses), and the stub goes straight to the first
@@ -1130,6 +1412,9 @@ pub(crate) fn sh_path_walk(
 #[must_use]
 pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path, strict: bool) -> String {
     let name = crate::stub::sh_single_quote(upstream);
+    let judged = row_for(upstream).is_some_and(names_what_runs);
+    let engaged =
+        |marker: &str| format!("[ -n \"${{{marker}:-}}\" ] && [ \"${{{marker}:-}}\" != \"0\" ]");
     let mut s = String::from("#!/bin/sh\n");
     s.push_str(STUB_MARKER);
     s.push_str("\n# Rerouting inside an aterm session (aterm help reroute). Not a managed tool:\n");
@@ -1140,29 +1425,56 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path, strict: bo
     ));
     s.push_str("\n__aterm_name=");
     s.push_str(&name);
-    s.push_str("\nif { [ -n \"${");
-    s.push_str(PASSTHROUGH_ENV);
-    s.push_str(":-}\" ] && [ \"${");
-    s.push_str(PASSTHROUGH_ENV);
-    s.push_str(":-}\" != \"0\" ]; }");
-    if CARGO_COMPILERS.contains(&upstream) {
-        s.push_str(" || { [ -n \"${");
-        s.push_str(CARGO_CRATE_ENV);
-        s.push_str(":-}\" ] && [ -z \"${");
-        s.push_str(TARGO_CRATE_ENV);
-        s.push_str(":-}\" ]; }");
+    s.push('\n');
+    // A stock cargo's own compile — cargo's mark without Trust's — is a child of a command
+    // as an announced one is (module doc, "Escapes"), whichever way the cargo started.
+    let compile = if CARGO_COMPILERS.contains(&upstream) {
+        format!(
+            " || {{ [ -n \"${{{CARGO_CRATE_ENV}:-}}\" ] && [ -z \"${{{TARGO_CRATE_ENV}:-}}\" ]; }}"
+        )
+    } else {
+        String::new()
+    };
+    let mark = format!("{ANNOUNCED_ENV}=1; export {ANNOUNCED_ENV}");
+    // The escape — and, for a name that is never judged, a child of a command the reroute
+    // ran: upstream, silently, with no atpkg; that child's own spawns marked as its.
+    s.push_str("if ");
+    s.push_str(&engaged(PASSTHROUGH_ENV));
+    if !judged {
+        s.push_str(" || { ");
+        s.push_str(&engaged(ANNOUNCED_ENV));
+        s.push_str("; }");
+        s.push_str(&compile);
     }
     s.push_str("; then\n");
-    // Marked, as every upstream child the reroute runs is ([`exec_upstream`]): what a
-    // compile runs passes the stubs as a stub-started cargo's compile does.
-    s.push_str(&sh_upstream_walk(
-        "  ",
-        &[format!("{PASSTHROUGH_ENV}=1; export {PASSTHROUGH_ENV}")],
-    ));
+    let escape_marks: &[String] = if judged {
+        &[]
+    } else {
+        std::slice::from_ref(&mark)
+    };
+    s.push_str(&sh_upstream_walk("  ", escape_marks));
     s.push_str("  printf '%s\\n' \"");
     s.push_str(&not_on_path_message("$__aterm_name"));
     s.push_str("\" 1>&2\n");
     s.push_str("  exit 127\nfi\n");
+    if judged {
+        // A child of a command the reroute ran, or a stock cargo's compile: marked as one,
+        // and silently upstream, unless the directory may be inside a Rust source checkout —
+        // there atpkg judges it, quietly, as the marker tells it.
+        s.push_str("if ");
+        s.push_str(&engaged(ANNOUNCED_ENV));
+        s.push_str(&compile);
+        s.push_str("; then\n  ");
+        s.push_str(&mark);
+        s.push('\n');
+        s.push_str(&sh_source_checkout_test("  "));
+        s.push_str("  if [ -z \"$__aterm_src\" ]; then\n");
+        s.push_str(&sh_upstream_walk("    ", &[]));
+        s.push_str("    printf '%s\\n' \"");
+        s.push_str(&not_on_path_message("$__aterm_name"));
+        s.push_str("\" 1>&2\n");
+        s.push_str("    exit 127\n  fi\nfi\n");
+    }
     s.push_str("ATPKG=");
     s.push_str(&crate::stub::sh_single_quote(&atpkg.to_string_lossy()));
     s.push_str("\nif [ -x \"$ATPKG\" ]; then exec \"$ATPKG\" ");
@@ -1187,13 +1499,25 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path, strict: bo
         s.push('\n');
         return s;
     }
-    // Upstream, as the escape reaches it — announced, and marked so its own spawns
-    // (cargo's `rustc`) pass through without a line each.
+    if judged {
+        // Nothing can be resolved, so nothing is known to be Trust: inside a Trust source
+        // checkout that does not run.
+        s.push_str(&sh_source_checkout_test(""));
+        s.push_str(&sh_stage0_names_trust(""));
+        s.push_str("if [ -n \"$__aterm_trust\" ]; then\n  ");
+        s.push_str(&say(unreachable_in_checkout_message(upstream)));
+        s.push_str("\n  exit ");
+        s.push_str(&REFUSAL_EXIT.to_string());
+        s.push_str("\nfi\n");
+    }
+    // Upstream, as the escape reaches it — announced, and marked as every upstream the
+    // reroute runs is ([`ANNOUNCED_ENV`]), so its own spawns (cargo's `rustc`) pass without
+    // a line each and are still judged; never the escape, which judges nothing.
     s.push_str(&sh_upstream_walk(
         "",
         &[
             say(unreachable_fallback_message(upstream)),
-            format!("{PASSTHROUGH_ENV}=1; export {PASSTHROUGH_ENV}"),
+            format!("{ANNOUNCED_ENV}=1; export {ANNOUNCED_ENV}"),
         ],
     ));
     s.push_str(&say(unreachable_not_on_path_message(upstream)));
@@ -1544,8 +1868,7 @@ fn wanted_stubs(
 /// spawn and `repair` call this.
 ///
 /// A FILE IS WRITTEN ONLY WHEN ITS BYTES DIFFER (Phase 3, 2026-09-22): a pass or a spawn
-/// changes only what is wrong in content. A macOS tag is cleared in place by the store heal
-/// every door ends with ([`crate::provenance::heal_store`]), never by re-laying bytes.
+/// changes only what is wrong in content.
 ///
 /// THE ATPKG A STUB NAMES IS NOT SIMPLY THIS PROCESS'S (2026-09-25, the end-to-end run's
 /// D1): a copy of aterm started from a scratch directory re-laid all eight stubs naming
@@ -1666,7 +1989,8 @@ pub fn remove_all(layout: &Layout) {
 /// `atpkg __reroute <upstream> [args…]` — what a stub execs once the `sh`-side
 /// escape hatch has NOT fired. Applies the row's policy; the exit code is the
 /// exec'd tool's, 127 when nothing exists to run, and [`REFUSAL_EXIT`] only for a
-/// refusal `[reroute] strict = true` asked for (and a name that is not a row).
+/// refusal `[reroute] strict = true` asked for, a compiler that is not Trust inside a
+/// Trust source checkout (below), and a name that is not a row.
 ///
 /// A SIGNPOST row announces (unless `[reroute] announce = false`) and then execs
 /// UPSTREAM, so its exit code is the upstream tool's. So does ORACLE since 2026-09-29,
@@ -1682,18 +2006,35 @@ pub fn remove_all(layout: &Layout) {
 /// ([`crate::lane`]) reads one command line, and a guard the owner wires calls it
 /// (an agent's `PreToolUse` hook, say). aterm installs nothing into an agent
 /// (decision "B", 2026-09-23), so it wires no such guard itself.
+///
+/// ONE PLACE REFUSES A NAME (2026-09-29): inside a Trust source checkout, a `cargo` or
+/// `rustc` that resolves to anything but Trust exits [`REFUSAL_EXIT`] naming what it
+/// resolved to ([`trust_checkout_refusal`]) — there a stock compiler would build part of
+/// Trust, and a by-name spawn is exactly how a stock one would get in: so a by-name spawn
+/// beneath a command this ran ([`ANNOUNCED_ENV`]) is judged the same, only not announced
+/// again. Everywhere else a SIGNPOST stays a signpost.
 pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
     let Some(row) = row_for(upstream) else {
         eprintln!("atpkg {HIDDEN_VERB}: '{upstream}' is not a rerouted name");
         return ExitCode::from(REFUSAL_EXIT);
     };
     let path_var = std::env::var_os("PATH");
+    let cwd = std::env::current_dir().ok();
+    let env_toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    let rustup_home = crate::seam::rustup_home_with(
+        std::env::var_os("RUSTUP_HOME").as_deref(),
+        aterm_types::dirs::home_dir().as_deref(),
+    );
+    let identity_cache = layout.prefix.join(crate::upstream_identity::CACHE_FILE);
     let machine = Machine {
         // Belt and braces: the stub decides this first, but `aterm <upstream>` and a
         // direct `atpkg __reroute` call arrive here without it. A stock cargo's compile
-        // ([`CARGO_CRATE_ENV`]) is the stub's alone to decide: no stub hands one here; a
+        // ([`CARGO_CRATE_ENV`]) is the stub's to decide: a `rustc` stub hands one here only
+        // inside what may be a source checkout, and marked [`ANNOUNCED_ENV`] first; a
         // Trust cargo's ([`TARGO_CRATE_ENV`]) arrives, and is answered as a typed name.
         passthrough: engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()),
+        // A child of a command the reroute ran: said once, judged still.
+        announced: engaged(std::env::var(ANNOUNCED_ENV).ok().as_deref()),
         // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `[reroute] announce = false`
         // (the owner's "suppressed with a flag", a setting since 2026-09-23) drops
         // the line but never the run.
@@ -1704,11 +2045,22 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         upstream: &|| upstream_on_path(layout, upstream, path_var.as_deref()),
         branded: &|branded, program| installed(layout, branded, program),
         // Read only where a signpost names it: a few `stat`s walking up.
-        pin: &|| {
-            Pin::for_dir(
-                std::env::current_dir().ok().as_deref(),
-                std::env::var("RUSTUP_TOOLCHAIN").ok().as_deref(),
-            )
+        pin: &|| Pin::for_dir(cwd.as_deref(), env_toolchain.as_deref()),
+        // Read only for `cargo`/`rustc`, and only where a line or the checkout needs it.
+        resolve: &|target, toolchain| {
+            crate::upstream_identity::resolve(&crate::upstream_identity::Ask {
+                name: upstream,
+                target,
+                toolchain,
+                cwd: cwd.as_deref(),
+                env_toolchain: env_toolchain.as_deref(),
+                rustup_home: rustup_home.as_deref(),
+                cache: Some(&identity_cache),
+            })
+        },
+        trust_checkout: &|| {
+            cwd.as_deref()
+                .and_then(crate::upstream_identity::trust_checkout)
         },
     };
     match plan(row, args, &machine) {
@@ -1746,6 +2098,8 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
 struct Machine<'a> {
     /// The [`PASSTHROUGH_ENV`] marker is engaged.
     passthrough: bool,
+    /// The [`ANNOUNCED_ENV`] marker is engaged: a child of a command the reroute ran.
+    announced: bool,
     /// `[reroute] announce` ([`crate::config::RerouteConfig`]).
     announce: &'a dyn Fn() -> bool,
     /// `[reroute] strict` ([`crate::config::RerouteConfig::strict`]).
@@ -1756,6 +2110,19 @@ struct Machine<'a> {
     branded: &'a dyn Fn(&str, &str) -> Install,
     /// The directory's pinned channel ([`Pin::for_dir`]), named under a signpost's lanes.
     pin: &'a dyn Fn() -> Option<Pin>,
+    /// What the upstream copy at the path given runs here, under the caller's
+    /// `+<toolchain>` ([`crate::upstream_identity::resolve`]) — asked of `cargo`/`rustc`.
+    resolve: &'a dyn Fn(&Path, Option<&str>) -> Resolved,
+    /// The root of the Trust source checkout the command runs in
+    /// ([`crate::upstream_identity::trust_checkout`]).
+    trust_checkout: &'a dyn Fn() -> Option<PathBuf>,
+}
+
+/// Whether `row` is one whose upstream copy is RESOLVED and named by what it is, and
+/// refused inside a Trust source checkout when that is not Trust: the two compilers'
+/// names, `cargo` and `rustc` — a SIGNPOST Rust row.
+fn names_what_runs(row: &Row) -> bool {
+    matches!(row.policy, Policy::Signpost { .. }) && is_rust_row(row)
 }
 
 /// Where a branded tool stands on this machine — the cases `atpkg run` tells apart.
@@ -1830,7 +2197,9 @@ enum Plan {
         copy: Managed,
         args: Vec<String>,
     },
-    /// Say `say` and exit [`REFUSAL_EXIT`]: the ORACLE row under `[reroute] strict`.
+    /// Say `say` and exit [`REFUSAL_EXIT`]: the ORACLE row under `[reroute] strict`, and a
+    /// `cargo`/`rustc` that is not Trust inside a Trust source checkout
+    /// ([`trust_checkout_refusal`]).
     Refuse { say: String },
     /// Exec a branded tool's `shim` that forwards to no build ([`Install::Shim`]),
     /// saying nothing: the shim's own line speaks.
@@ -1888,13 +2257,44 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
     } else {
         args
     };
+    // A child of a command the reroute ran ([`ANNOUNCED_ENV`]): upstream as typed, said
+    // nothing — as under the escape — but a `cargo`/`rustc` is judged in a Trust source
+    // checkout as the same name typed alone (2026-10-01).
+    if machine.announced {
+        if !names_what_runs(row) {
+            return run_upstream(&|| None);
+        }
+        return match (machine.upstream)() {
+            Some(target) => match judge(row, shown, toolchain, &target, false, machine) {
+                Err(refused) => refused,
+                Ok(_) => Plan::Upstream {
+                    say: None,
+                    target,
+                    args: args.to_vec(),
+                },
+            },
+            None => Plan::Missing {
+                say: not_on_path_message(upstream),
+            },
+        };
+    }
     // A STOCK toolchain named on any Rust row — `cargo +1.97.1 test`, `rustfmt +1.97.1
     // x.rs` — runs upstream as named, after the Trust spelling of the same command. Until
     // 2026-09-23 a DIRECT row handed `+1.97.1` to its branded tool as an argument
     // (`trustfmt: Error: file '+1.97.1' does not exist`, measured) — ledger item HOST-05.
     if let Some(stock) = toolchain.filter(|tc| !rust_lane::is_trust_channel(tc)) {
+        if names_what_runs(row) {
+            return match (machine.upstream)() {
+                Some(target) => {
+                    signpost_upstream(row, args, shown, Head::Stock(stock), target, None, machine)
+                }
+                None => Plan::Missing {
+                    say: not_on_path_message(upstream),
+                },
+            };
+        }
         return run_upstream(&|| {
-            (machine.announce)().then(|| stock_channel_signpost(row, stock, shown))
+            (machine.announce)().then(|| stock_channel_signpost(row, stock, shown, None))
         });
     }
     match row.policy {
@@ -1946,20 +2346,16 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
                 });
             }
             match (machine.upstream)() {
-                Some(target) => Plan::Upstream {
-                    say: (machine.announce)().then(|| {
-                        // A `+trust…` directive, not the directory's pin, decides what
-                        // upstream is.
-                        let pin = if toolchain.is_some() {
-                            None
-                        } else {
-                            (machine.pin)()
-                        };
-                        signpost_message_in(row, lanes, shown, toolchain, pin.as_ref())
-                    }),
+                // A `+trust…` directive, not the directory's pin, decides what upstream is.
+                Some(target) => signpost_upstream(
+                    row,
+                    args,
+                    shown,
+                    toolchain.map_or(Head::Upstream, Head::Toolchain),
                     target,
-                    args: args.to_vec(),
-                },
+                    toolchain.is_none().then_some(machine.pin),
+                    machine,
+                ),
                 None => Plan::Missing {
                     say: no_upstream_message(row, lanes, shown),
                 },
@@ -1986,6 +2382,80 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
                 },
             }
         }
+    }
+}
+
+/// A SIGNPOST row's upstream copy at `target` about to run as the caller typed it (`args`;
+/// `shown` is what the lanes spell, `head` what the first line says of the run, `pin` the
+/// directory's pin when one is named). For `cargo`/`rustc` ([`names_what_runs`]) the copy
+/// is RESOLVED first — only where a line will name it or a Trust source checkout must
+/// judge it, so `[reroute] announce = false` outside a checkout costs nothing — and inside
+/// a checkout anything but Trust is refused, whatever the setting: a refusal is not an
+/// announcement.
+fn signpost_upstream(
+    row: &Row,
+    args: &[String],
+    shown: &[String],
+    head: Head<'_>,
+    target: PathBuf,
+    pin: Option<&dyn Fn() -> Option<Pin>>,
+    machine: &Machine<'_>,
+) -> Plan {
+    let toolchain = match head {
+        Head::Toolchain(tc) | Head::Stock(tc) => Some(tc),
+        Head::Upstream | Head::NotOnPath => None,
+    };
+    let announce = (machine.announce)();
+    let resolved = match judge(row, shown, toolchain, &target, announce, machine) {
+        Ok(resolved) => resolved,
+        Err(refused) => return refused,
+    };
+    Plan::Upstream {
+        say: announce.then(|| {
+            let pin = pin.and_then(|pin| pin());
+            signpost_block(
+                row,
+                lanes_of(row),
+                shown,
+                head,
+                pin.as_ref(),
+                resolved.as_ref(),
+                None,
+            )
+        }),
+        target,
+        args: args.to_vec(),
+    }
+}
+
+/// THE ONE JUDGEMENT of an upstream copy about to run as `row` (`shown` and `toolchain`
+/// as the caller typed them; `target` the copy on PATH), for every door that runs one — a
+/// signpost, a child of a command the reroute ran, a call with no store: `Err` with the
+/// refusal when it is a `cargo`/`rustc` ([`names_what_runs`]) inside a Trust source
+/// checkout and not Trust ([`trust_checkout_refusal`]), else `Ok` with what it resolved
+/// to. Resolved only where that is needed — `named` (a line will name it) or a checkout to
+/// judge it in — so a run that says nothing outside a checkout costs nothing.
+fn judge(
+    row: &Row,
+    shown: &[String],
+    toolchain: Option<&str>,
+    target: &Path,
+    named: bool,
+    machine: &Machine<'_>,
+) -> Result<Option<Resolved>, Plan> {
+    if !names_what_runs(row) {
+        return Ok(None);
+    }
+    let checkout = (machine.trust_checkout)();
+    if !named && checkout.is_none() {
+        return Ok(None);
+    }
+    let resolved = (machine.resolve)(target, toolchain);
+    match checkout {
+        Some(root) if !resolved.is_trust() => Err(Plan::Refuse {
+            say: trust_checkout_refusal(row, shown, toolchain, &resolved, &root),
+        }),
+        _ => Ok(Some(resolved)),
     }
 }
 
@@ -2051,19 +2521,51 @@ fn upstream_on_path_in(
 /// has said why): nothing managed can be looked up, so the upstream copy on PATH runs,
 /// after one line — or, under `[reroute] strict = true`, nothing runs ([`REFUSAL_EXIT`]),
 /// the answer before 2026-09-29. 127 when no upstream copy is on PATH.
+///
+/// A `cargo`/`rustc` is still RESOLVED and JUDGED here ([`judge`]), with no cache: its line
+/// names what runs, and inside a Trust source checkout one that is not Trust does not run
+/// (2026-10-01 review, reproduced: under `env -i PATH=…` a stock `rustc` ran two levels
+/// inside a Trust checkout, under the very "running upstream 'rustc'" words MP-9 retired).
 pub fn run_storeless(upstream: &str, args: &[String]) -> ExitCode {
-    if row_for(upstream).is_none() {
+    let Some(row) = row_for(upstream) else {
         eprintln!("atpkg {HIDDEN_VERB}: '{upstream}' is not a rerouted name");
         return ExitCode::from(REFUSAL_EXIT);
-    }
+    };
+    let path_var = std::env::var_os("PATH");
+    let cwd = std::env::current_dir().ok();
+    let env_toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    let rustup_home = crate::seam::rustup_home_with(
+        std::env::var_os("RUSTUP_HOME").as_deref(),
+        aterm_types::dirs::home_dir().as_deref(),
+    );
     let reroute = crate::config::cached_reroute();
-    match storeless_plan(
-        upstream,
-        args,
-        reroute.strict(),
-        reroute.announce(),
-        upstream_on_path_in(None, upstream, std::env::var_os("PATH").as_deref()),
-    ) {
+    let machine = Machine {
+        passthrough: engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()),
+        announced: engaged(std::env::var(ANNOUNCED_ENV).ok().as_deref()),
+        announce: &|| reroute.announce(),
+        strict: &|| reroute.strict(),
+        upstream: &|| upstream_on_path_in(None, upstream, path_var.as_deref()),
+        // Nothing managed is looked up without a store.
+        branded: &|_, _| Install::Absent,
+        pin: &|| None,
+        resolve: &|target, toolchain| {
+            crate::upstream_identity::resolve(&crate::upstream_identity::Ask {
+                name: upstream,
+                target,
+                toolchain,
+                cwd: cwd.as_deref(),
+                env_toolchain: env_toolchain.as_deref(),
+                rustup_home: rustup_home.as_deref(),
+                // No prefix to keep it under: every probe runs.
+                cache: None,
+            })
+        },
+        trust_checkout: &|| {
+            cwd.as_deref()
+                .and_then(crate::upstream_identity::trust_checkout)
+        },
+    };
+    match storeless_plan(row, args, &machine) {
         Plan::Upstream { say, target, args } => {
             if let Some(say) = say {
                 eprintln!("{say}");
@@ -2084,39 +2586,56 @@ pub fn run_storeless(upstream: &str, args: &[String]) -> ExitCode {
     }
 }
 
-/// [`run_storeless`] without its effects.
-fn storeless_plan(
-    upstream: &str,
-    args: &[String],
-    strict: bool,
-    announce: bool,
-    found: Option<PathBuf>,
-) -> Plan {
-    if strict {
+/// [`run_storeless`] without its effects: the escape and a child of a command the reroute
+/// ran as in [`plan`], strict's refusal, then the upstream copy — judged, and named on its
+/// line when it is a `cargo`/`rustc`.
+fn storeless_plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
+    let upstream = row.upstream;
+    if !machine.passthrough && (machine.strict)() {
         return Plan::Refuse {
             say: storeless_refusal(upstream),
         };
     }
-    match found {
-        Some(target) => Plan::Upstream {
-            say: announce.then(|| storeless_message(upstream)),
+    let Some(target) = (machine.upstream)() else {
+        return Plan::Missing {
+            say: not_on_path_message(upstream),
+        };
+    };
+    if machine.passthrough {
+        return Plan::Upstream {
+            say: None,
             target,
             args: args.to_vec(),
-        },
-        None => Plan::Missing {
-            say: not_on_path_message(upstream),
+        };
+    }
+    let toolchain = is_rust_row(row).then(|| explicit_toolchain(args)).flatten();
+    let shown = if toolchain.is_some() {
+        &args[1..]
+    } else {
+        args
+    };
+    let announce = !machine.announced && (machine.announce)();
+    match judge(row, shown, toolchain, &target, announce, machine) {
+        Err(refused) => refused,
+        Ok(resolved) => Plan::Upstream {
+            say: announce.then(|| storeless_message(upstream, args, resolved.as_ref())),
+            target,
+            args: args.to_vec(),
         },
     }
 }
 
 /// The first upstream copy (`target`, from [`upstream_on_path`]), exec'd with
-/// [`PASSTHROUGH_ENV`] set so its own spawns pass silently.
+/// [`ANNOUNCED_ENV`] set so its own by-name spawns are not announced again — and are still
+/// judged ([`plan`]). Never with [`PASSTHROUGH_ENV`]: that is the escape, and an allowed
+/// Trust cargo handing it to its tree let a stock `rustc +1.97.1` beneath it run inside a
+/// Trust checkout unjudged (2026-10-01).
 fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
     // Raw: TRANSPARENT, so the caller's descriptors are the program's (B27's
     // allow-list). Its Windows console is decided here (`Console::Quiet`, B28).
     let mut command = std::process::Command::new(target);
     aterm_uds::spawn::set_flags(&mut command, aterm_uds::spawn::Console::Quiet, 0);
-    command.args(args).env(PASSTHROUGH_ENV, "1");
+    command.args(args).env(ANNOUNCED_ENV, "1");
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
     ExitCode::from(127)

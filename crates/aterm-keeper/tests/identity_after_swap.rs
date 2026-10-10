@@ -43,7 +43,11 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::ExitCode;
+// `spawnfd`'s: every child here (the keepers, `nc`, the verbs) holds its stdio
+// and nothing else of this process — not a pipe another test thread had open
+// unflagged at the spawn, held for as long as a keeper lives.
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use aterm_keeper::client::{KeeperClient, refused_identity};
@@ -84,13 +88,15 @@ fn play_role_if_asked() {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+                "test",
             );
             eprintln!("keeper role: serve returned {code:?}");
             aterm_uds::process::kill_self_now()
         }
         Ok("verb") => {
             let args = std::env::var(ARGS).expect("the test names the verb");
-            let code = aterm_keeper::cli::main_entry(args.lines().map(OsString::from).collect());
+            let code =
+                aterm_keeper::cli::main_entry(args.lines().map(OsString::from).collect(), "test");
             let _ = std::io::stdout().flush();
             std::process::exit(i32::from(code != ExitCode::SUCCESS))
         }
@@ -247,7 +253,8 @@ impl Scratch {
     /// own deadline names a hold.
     fn dial_as_this_build(&self) -> std::io::Result<String> {
         let own = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
-        let got = KeeperClient::connect(&self.sock(), &own, MUST_HAPPEN).and_then(|c| c.status());
+        let got =
+            KeeperClient::connect(&self.sock(), &own, MUST_HAPPEN).and_then(|c| c.status("test"));
         if let Err(e) = &got {
             if trustd_silent(&e.to_string()) {
                 panic!("{TRUSTD_SILENT}: {e}");

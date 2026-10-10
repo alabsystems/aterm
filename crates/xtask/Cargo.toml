@@ -7,15 +7,13 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "aterm build-graph tasks: harness-manifest, the merge gate's xtask verbs, perf, verify"
+description = "aterm build-graph tasks: the merge gate's xtask verbs, perf, verify"
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# `aterm_spec::harness_manifest`, behind the `harness-manifest` verb.
-aterm-spec = { workspace = true }
 # `aterm_log::env`, the binary's one env lock, for driver.rs's `$CARGO` handoff.
 # Not used as a logger.
 aterm-log = { workspace = true }

@@ -27,7 +27,11 @@
 
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+// `spawnfd`'s: every child here holds its stdio and nothing else of this
+// process — not a pipe another test thread had open unflagged at the spawn,
+// held for as long as a waiting child lives.
+use aterm_uds::spawnfd::{Child, Command, Stdio};
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -245,9 +249,8 @@ const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 /// Every stdout line a REFUSED pass may still carry.
 ///
 /// The `[machine]` settings are applied at the dispatch edge, ABOVE the store lock
-/// (they take none: `defaults` writes a per-host preference domain and the Spotlight
-/// migration renames directories under `$HOME`), so a pass the lock refuses has already
-/// reported what it did to the host — including, in this fixture, the synthetic-home
+/// (they take none: `defaults` writes a per-host preference domain), so a pass the lock
+/// refuses has already reported what it did to the host — including, in this fixture, the synthetic-home
 /// refusal, because the spawned child runs with a temp `HOME` and per-host preferences
 /// follow the ACCOUNT, not `HOME`. What must NOT be here is a PROGRESS marker: those
 /// are the window's channel, and a typed verb earns none.
@@ -256,7 +259,6 @@ fn no_progress_marker(stdout: &[String]) {
         assert!(
             line.starts_with("atpkg: machine")
                 || line.starts_with("atpkg machine:")
-                || line.starts_with("atpkg noindex:")
                 || line.starts_with("atpkg: Universal Control"),
             "a refused pass prints only what it did to the host: {line:?}"
         );

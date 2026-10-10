@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 
 use crate::cell::Cell;
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use super::Offset;
 use super::{PAGE_SIZE, Page, PageSlice};
 
@@ -106,21 +106,21 @@ impl PageStore {
     }
 
     /// Get pool statistics.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn stats(&self) -> PoolStats {
         self.stats
     }
 
     /// Number of active pages (holding allocations).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn active_pages(&self) -> usize {
         self.pages.len()
     }
 
     /// Number of free pages (available for reuse).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn free_pages(&self) -> usize {
         self.free_pages.len()
@@ -133,11 +133,19 @@ impl PageStore {
         self.page_used_bytes.len()
     }
 
-    /// Total memory used by all pages (active + free), in bytes.
+    /// Total memory used by all pages (active + free), in bytes. Saturating, as
+    /// in `Grid::memory_used`: exact whenever it fits, `usize::MAX` otherwise.
     #[must_use]
     pub(crate) fn total_memory(&self) -> usize {
-        (self.pages.len() + self.free_pages.len()) * PAGE_SIZE
-            + self.recycled_cells.capacity() * std::mem::size_of::<PageSlice<Cell>>()
+        self.pages
+            .len()
+            .saturating_add(self.free_pages.len())
+            .saturating_mul(PAGE_SIZE)
+            .saturating_add(
+                self.recycled_cells
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PageSlice<Cell>>()),
+            )
     }
 
     /// Release all free pages back to the system.
@@ -152,7 +160,7 @@ impl PageStore {
     /// # Safety
     ///
     /// Caller must ensure no `PageSlice` references are used after reset.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn reset(&mut self) {
         // These handles point into the pages reset is about to recycle.
         // Discard them before an allocation can overwrite their old ranges.
@@ -234,15 +242,15 @@ impl PageStore {
     }
 
     /// Allocate a typed slice within the page store. Exposed under
-    /// `feature = "testing"` for downstream property tests and Kani.
-    #[cfg(any(test, kani, feature = "testing"))]
+    /// `feature = "testing"` for downstream property tests.
+    #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::expect_used)]
     pub fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
     }
 
     /// Allocate a typed slice within the page store (crate-internal in production).
-    #[cfg(not(any(test, kani, feature = "testing")))]
+    #[cfg(not(any(test, feature = "testing")))]
     #[allow(clippy::expect_used)]
     pub(crate) fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
@@ -288,7 +296,7 @@ impl PageStore {
             ptr,
             len,
             page_id,
-            #[cfg(any(test, kani))]
+            #[cfg(test)]
             // offset bounded by PAGE_SIZE (64KB) — always fits in u32
             offset: Offset::new(u32::try_from(offset).unwrap_or(u32::MAX)),
         }

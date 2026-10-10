@@ -311,7 +311,7 @@ pub struct Candidate {
 
 /// The target rule: the newest candidate strictly newer than what runs, and
 /// on a version tie the managed one. `None` when nothing is newer: a session
-/// is never moved sideways or down (owner, 2026-09-10).
+/// is never moved sideways or down.
 #[must_use]
 pub fn choose_target(running: &Version, candidates: &[Candidate]) -> Option<Candidate> {
     let mut best: Option<&Candidate> = None;
@@ -524,9 +524,9 @@ const PERMISSION_FLAGS: &[&str] = &[
 /// resume line a person is told steps down to before the bare one, where
 /// every carried flag does not fit its budget (`resume::shorter`). A bare
 /// `claude --resume <id>` brings an orchestrator started with
-/// `--dangerously-skip-permissions` back in another permission mode (the
-/// safety review of 2026-09-29), and one started in `--permission-mode plan`
-/// out of it. An argv the rewrite refuses keeps `argv[0]` alone.
+/// `--dangerously-skip-permissions` back in another permission mode, and one
+/// started in `--permission-mode plan` out of it. An argv the rewrite refuses
+/// keeps `argv[0]` alone.
 #[must_use]
 pub(crate) fn permission_argv(argv: &[String]) -> Vec<String> {
     let mut out: Vec<String> = argv.first().cloned().into_iter().collect();
@@ -924,11 +924,10 @@ fn relaunch_line_on(
 /// one line typed while the shell holds the terminal, carries the heal. Only
 /// the path is typed, never the key ([`aterm_shell_integration::typed_rekey`]).
 ///
-/// The same line UPGRADES a shell whose integration predates loaders
-/// (2026-09-26), or whose loader no body pointer reaches (2026-10-01): the
-/// window names this build's script folder and the tab's
-/// body pointer in the file for such a shell — healthy too, with the key it
-/// already signs with — and the text
+/// The same line UPGRADES a shell whose integration predates loaders, or
+/// whose loader no body pointer reaches: the window names this build's script
+/// folder and the tab's body pointer in the file for such a shell — healthy
+/// too, with the key it already signs with — and the text
 /// ([`aterm_shell_integration::typed_rekey_with_loader`]) sources this build's
 /// loader when they are there. Where only the key-only text fits the bound,
 /// that one is typed.
@@ -1202,11 +1201,9 @@ pub fn held_list(held: &[Held]) -> String {
 /// ([`with_running_within`]).
 fn held_list_shaped(held: &[Held], named: usize, chars: usize) -> String {
     // OLDEST FIRST (design record 2026-09-28, §3.2 C7c): only the first
-    // [`HELD_NAMED`] are named, and they were named in the order the process
-    // table gave them. Tab #1 held 15 processes; its four-day watch loop,
-    // the one that held the restart, could fall among the counted ten while
-    // five shells a minute old were named. A stable sort, so processes of the
-    // same age keep their given order.
+    // [`HELD_NAMED`] are named, so the long-lived process likeliest to hold
+    // the restart is never among the merely counted. A stable sort, so
+    // processes of the same age keep their given order.
     let mut held: Vec<&Held> = held.iter().collect();
     held.sort_by_key(|h| std::cmp::Reverse(h.age_s));
     let mut out = String::new();
@@ -2603,7 +2600,7 @@ const _: () = {
     assert!(!opens_with_a_card_key(RELEASE_HEAD));
 };
 
-/// WHETHER A CONVERSATION HAS A TASK (D1 of the live E2E of 2026-09-26): a
+/// WHETHER A CONVERSATION HAS A TASK: a
 /// conversation nobody has asked anything — no turn from a PERSON or an
 /// ORCHESTRATOR (a control-socket client other than the harness) — is
 /// TASKLESS, however many turns the harness itself typed into it. Folded over
@@ -2633,14 +2630,13 @@ const _: () = {
 /// [`TYPED_WITHIN_MS`] of its `timestamp`): the ledger is the TAB's, kept
 /// across every conversation the tab has held, and read by its words alone
 /// a person who began a new conversation there with the loop's `keep going`
-/// made it taskless — the upgrade restarted it afresh, out of its tab (the
-/// audit of 2026-09-30). An unmarked row with no time, or with none of the
+/// made it taskless — the upgrade restarted it afresh, out of its tab. An
+/// unmarked row with no time, or with none of the
 /// loop's texts typed near it, is someone's: in doubt, the conversation is
 /// kept. The policy types those only where a task already stands, except
 /// where nobody could say (a record that could not be read yet, a Codex, a
 /// conversation not registered yet): there one `keep going` read as
-/// someone's would make the conversation tasked for good (the review of
-/// 2026-09-26).
+/// someone's would make the conversation tasked for good.
 ///
 /// The text and ledger are used rather than the vendor's fields because every
 /// terminal input reads `"promptSource":"typed"`, `"origin":{"kind":"human"}`;
@@ -3551,15 +3547,14 @@ pub fn hold_since(prior: (u64, u64), f: &Facts, now_s: u64) -> (u64, u64) {
 /// to be wrong. A draft on a second row is typed text whatever the cursor
 /// says.
 ///
-/// THE CURSOR CAN ONLY PROVE TYPED TEXT, NEVER PLACEHOLDER (the owner's tab of
-/// 2026-09-28: the engine's grid sat one row higher than Claude drew it after
-/// a net-zero re-grid, its cursor one row BELOW the composer, and the old rule
-/// — dim AND the cursor at column 2 of the caret row — read Claude's own dim
-/// suggestion as a person's draft for 51 minutes, with nobody at the tab): a
-/// cursor on the caret row anywhere but column 2 is inside typed text (a
-/// placeholder keeps it at column 2). Anywhere else — another row, none — it
-/// says nothing about the composer, and the dim cell decides. `cursor` is
-/// `(row, col)` in the same coordinates as `rows`.
+/// THE CURSOR CAN ONLY PROVE TYPED TEXT, NEVER PLACEHOLDER (after a net-zero
+/// re-grid the engine's grid can sit a row off Claude's drawing, its cursor
+/// below the composer, so requiring the cursor at column 2 read Claude's own
+/// dim suggestion as a person's draft): a cursor on the caret row anywhere but
+/// column 2 is inside typed text (a placeholder keeps it at column 2).
+/// Anywhere else — another row, none — it says nothing about the composer, and
+/// the dim cell decides. `cursor` is `(row, col)` in the same coordinates as
+/// `rows`.
 #[must_use]
 pub fn composer_is_empty(
     rows: &[String],
@@ -3672,37 +3667,33 @@ pub const REQUEUE_MAX: u32 = 2;
 /// it) rests before the upgrade starts a new one ([`Step::Rearm`]): one
 /// round's worth of asking, `MAX_ASKS × REASK_S` (two hours today).
 ///
-/// WHY THAT LONG AND NO LONGER (the owner, 2026-09-27: "you should NEVER have
-/// upgrades stalled" — a tab sat `failed:unanswered` for 1d22h, its agent's
-/// late READY voided under the background gate it always runs, and nothing
-/// would ever ask it again). A round asks for at most `MAX_ASKS × REASK_S`
-/// before it gives up; resting exactly as long again keeps the nagging to at
-/// most half of any stretch of time, one round on, one round off, however
-/// long the agent's work lasts. And it BOUNDS THE SILENCE, though not to one
-/// rest (the no-stall review of 2026-09-27). At an agent that can read, the
-/// stretch with no notice after a round's last one is the give-up's window,
-/// `REASK_S`, plus the rest: this, stretched up to
-/// `RETRY_S << RETRY_BACKOFF_MAX_SHIFT` for a stop that repeats
-/// ([`rest_extension`]). A late READY the gave-up round hears holds the new
-/// round back while the answer stands ([`retry_due`]: the round acts on it
-/// instead), and one the agent's own work outlives is voided [`DRAIN_S`]
-/// after it — the rest then begins again at the void, as long as the stop's
-/// streak makes it (round six, F27: a whole bare `RETRY_S` until then, which
-/// undid the back-off for exactly the stop that repeats most). So the longest
-/// silence is `REASK_S + rest + DRAIN_S + rest`, reached by a READY heard
-/// just before the rest runs out: five hours today after a first stop,
+/// WHY THAT LONG AND NO LONGER (an upgrade is never left stalled). A round
+/// asks for at most `MAX_ASKS × REASK_S` before it gives up; resting exactly
+/// as long again keeps the nagging to at most half of any stretch of time, one
+/// round on, one round off, however long the agent's work lasts. And it BOUNDS
+/// THE SILENCE, though not to one rest. At an agent that can read, the stretch
+/// with no notice after a round's last one is the give-up's window, `REASK_S`,
+/// plus the rest: this, stretched up to `RETRY_S << RETRY_BACKOFF_MAX_SHIFT`
+/// for a stop that repeats ([`rest_extension`]). A late READY the gave-up
+/// round hears holds the new round back while the answer stands
+/// ([`retry_due`]: the round acts on it instead), and one the agent's own work
+/// outlives is voided [`DRAIN_S`] after it — the rest then begins again at the
+/// void, as long as the stop's streak makes it (not a bare `RETRY_S`, which
+/// would undo the back-off for exactly the stop that repeats most). So the
+/// longest silence is `REASK_S + rest + DRAIN_S + rest`, reached by a READY
+/// heard just before the rest runs out: five hours today after a first stop,
 /// seventeen after one repeated to the cap (two and a half and eight and a
 /// half with no late READY) — a whole round the agent DECLINED rests by its
 /// own ladder ([`unanswered_rest_extension`]: 2 h, 4 h, 8 h, a day), the void
-/// beginning that rest again as it does any. Any other stop (a refused
-/// signal, a relaunch that never came up, a conversation resumed elsewhere)
-/// hears no late READY: its silence is its rest. Whatever else a late READY's restart waits on
-/// ends the stretch when it passes, with the restart or the void, never with
-/// a notice — the settle, a turn in progress, aterm's hold, a person's box or
-/// draft (voided [`HOLD_S`] into its hold): the agent's or a person's to end,
-/// not the upgrade's silence. The rest is not held at a usage limit: the
-/// round it starts types nothing there (a limited session is never asked),
-/// so no clock needs holding for it.
+/// beginning that rest again as it does any. Any other stop (a refused signal,
+/// a relaunch that never came up, a conversation resumed elsewhere) hears no
+/// late READY: its silence is its rest. Whatever else a late READY's restart
+/// waits on ends the stretch when it passes, with the restart or the void,
+/// never with a notice — the settle, a turn in progress, aterm's hold, a
+/// person's box or draft (voided [`HOLD_S`] into its hold): the agent's or a
+/// person's to end, not the upgrade's silence. The rest is not held at a usage
+/// limit: the round it starts types nothing there (a limited session is never
+/// asked), so no clock needs holding for it.
 pub const RETRY_S: u64 = MAX_ASKS as u64 * REASK_S;
 
 const _: () = assert!(RETRY_S >= REASK_S);
@@ -3752,7 +3743,7 @@ pub fn unanswered_rest_extension(streak: u32) -> u64 {
 /// OWN WORK may ask ([`Facts::work_ended`]): ten minutes. The ask at the end of
 /// the work was exempt from [`MAX_ASKS`] and from every clock, so an agent that
 /// answered "not yet" by starting a short job and idling was asked again at
-/// the end of each one (the safety review of 2026-09-29). Inside the floor the
+/// the end of each one. Inside the floor the
 /// ordinary clock decides, and the point goes to the loop as any does.
 pub const WORK_END_FLOOR_S: u64 = 10 * 60;
 
@@ -4065,7 +4056,7 @@ pub const NOTICE_SHOWN: &str = "notice-shown";
 /// step, which clears the recorded wait.
 pub const NEXT_POINT: &str = "next-point";
 
-/// THE QUIET UPGRADE'S STEP ([`Facts::quiet`], the default since 2026-09-29),
+/// THE QUIET UPGRADE'S STEP ([`Facts::quiet`], the default),
 /// or `None` where the phase is the ask-and-drain flow's to answer: a
 /// restart in flight, a finished move, a stopped round (its rest and re-arm,
 /// and a late READY a round that gave up still hears, are [`next_step`]'s as
@@ -4080,7 +4071,7 @@ pub const NEXT_POINT: &str = "next-point";
 /// asked; the owner is told before the move ([`Facts::unnoticed`],
 /// [`NOTICE_SHOWN`]).
 ///
-/// AN ANNOUNCED ROUND IS STILL BOUNDED (round eight, #4): its agent was told
+/// AN ANNOUNCED ROUND IS STILL BOUNDED: its agent was told
 /// to wind down — it may have answered READY and stopped, or "not yet" and
 /// stopped taking up long work — and the quiet flow asks it nothing again.
 /// Answered here with the restart's wait alone, a round an older aterm
@@ -4098,7 +4089,7 @@ pub const NEXT_POINT: &str = "next-point";
 /// is pending, and quiet. Inside the window the restart's wait stands, and a
 /// pending round — nothing asked of its agent — is never given up on.
 ///
-/// THE OWNER'S `--now` READS A STATUS THAT ONLY LAGS PAST (round eight, #5):
+/// THE OWNER'S `--now` READS A STATUS THAT ONLY LAGS PAST:
 /// Claude's own `busy`/`shell` over a screen its reader reads idle look
 /// after look ([`status_lags`]) holds the restart (`status-stale`), and
 /// under the ask flow the notice goes through the lag — its turn rewrites
@@ -4297,12 +4288,10 @@ pub fn release_prompt(agent: Agent) -> String {
 }
 
 /// [`release_prompt`] under the flow the next round runs in: `quiet`
-/// ([`Facts::quiet`], the default since 2026-09-29) makes no promise to ask
-/// first — the round after it moves the session at a genuinely idle point
-/// and asks nothing ([`quiet_step`]), so "nothing will restart this session
-/// without asking you again first" would be false there (round eight, #4:
-/// the quiet flow's own give-up of a round an older aterm announced owes
-/// this line). Both say the notice no longer applies, and to carry on.
+/// ([`Facts::quiet`], the default) makes no promise to ask first — the round
+/// after it moves the session at a genuinely idle point and asks nothing
+/// ([`quiet_step`]), so "nothing will restart this session without asking you
+/// again first" would be false there. Both say the notice no longer applies, and to carry on.
 #[must_use]
 pub fn release_prompt_as(agent: Agent, quiet: bool) -> String {
     if quiet {
@@ -4498,8 +4487,7 @@ impl Request {
     /// Whether this word keeps a session off the build `target` at `now_s`,
     /// whatever its round: a skip of THAT build, or a deferral not yet run
     /// out — what a relaunch of the conversation onto a newer build, or a
-    /// record that outlived the round the word was given in, keeps to
-    /// (round eight, #24).
+    /// record that outlived the round the word was given in, keeps to.
     #[must_use]
     pub fn holds_build(&self, target: &str, now_s: u64) -> bool {
         match self {

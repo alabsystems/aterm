@@ -150,6 +150,8 @@ impl Terminal {
         }
 
         let mut result = String::new();
+        // Where the logical line now being read starts in `result`.
+        let mut line_start = 0usize;
         for row in start_row..end_row {
             // Absolute row → history index relative to the oldest retained line.
             let rel = row.saturating_sub(oldest);
@@ -191,13 +193,19 @@ impl Terminal {
             // join these, so `blocktext` must too — else a long command line wrapping
             // across rows is chopped at the terminal width (an AI parsing the output
             // gets re-split tokens). Emit `\n` before a row only when it is not a
-            // continuation. A wrapped-out row fills its last column, so it has no
-            // trailing blanks to lose — trimming every row is safe.
+            // continuation. Both readers return the row as written, trailing blanks
+            // included, and a logical line is trimmed whole where it ends, as
+            // `copy` does: a row the next continues keeps its blanks (a space
+            // printed in its last column separates two words), and a line that
+            // ends in blanks across a wrap loses all of them.
             if row > start_row && !is_continuation {
+                result.truncate(line_start + result[line_start..].trim_end().len());
                 result.push('\n');
+                line_start = result.len();
             }
-            result.push_str(text.trim_end());
+            result.push_str(&text);
         }
+        result.truncate(line_start + result[line_start..].trim_end().len());
         BlockText::Text(result)
     }
 
@@ -481,5 +489,57 @@ mod eviction_tests {
             BlockText::Text(t) => assert!(t.contains("AAA\nBBB"), "hard newline preserved: {t:?}"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    /// A space the program printed in the last column of a wrapped row is text:
+    /// `blocktext` keeps it at the join, on screen and from history, while a
+    /// row that ends its line still loses its trailing blanks.
+    #[test]
+    fn block_output_keeps_a_space_printed_in_a_wrapped_rows_last_column() {
+        let mut term = TerminalBuilder::new()
+            .size(4, 10)
+            .ring_buffer_size(100)
+            .build();
+        // `abcdefghi ` fills row 0 (the space lands in the last column) and
+        // `jklmn` soft-wraps onto the next row; `pad   ` ends a line in blanks.
+        run_block(&mut term, "ls", &["abcdefghi jklmn", "pad   "]);
+        term.process(b"\x1b]133;A\x07");
+        let block = term.last_completed_block().cloned().expect("sealed block");
+        let want = BlockText::Text("abcdefghi jklmn\npad".to_string());
+        assert_eq!(term.block_output_text(&block), want, "on screen");
+
+        for i in 0..6 {
+            term.process(format!("more {i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            term.block_output_text(&block),
+            want,
+            "the same block read from history"
+        );
+    }
+
+    /// An output line that ends in blanks across a wrap is trimmed whole, as it
+    /// was before wrapped rows kept their blanks: a padded column wider than
+    /// the window reads as its text.
+    #[test]
+    fn block_output_trims_a_line_that_ends_in_blanks_across_a_wrap() {
+        let mut term = TerminalBuilder::new()
+            .size(4, 10)
+            .ring_buffer_size(100)
+            .build();
+        run_block(&mut term, "ls", &["foo            ", "bar"]);
+        term.process(b"\x1b]133;A\x07");
+        let block = term.last_completed_block().cloned().expect("sealed block");
+        let want = BlockText::Text("foo\nbar".to_string());
+        assert_eq!(term.block_output_text(&block), want, "on screen");
+
+        for i in 0..6 {
+            term.process(format!("more {i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            term.block_output_text(&block),
+            want,
+            "the same block read from history"
+        );
     }
 }

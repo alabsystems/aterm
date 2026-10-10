@@ -7,7 +7,7 @@
 //! Provides primitive types (`Rgb`, `CursorStyle`, `BiDiMode`, `ColorPalette`,
 //! `TerminalSize`) and cross-crate type definitions for domain, input,
 //! keyboard, mouse, selection, GPU views, text shaping, terminal hosting,
-//! perception, and verification.
+//! and perception.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -25,8 +25,6 @@ mod trust_fmt;
 
 // `dev_seam!` — the one reader of a development-only environment variable.
 pub mod dev_seam;
-
-pub mod verification;
 
 pub mod identity;
 pub mod version;

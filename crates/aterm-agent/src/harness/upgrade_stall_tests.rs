@@ -217,7 +217,7 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
     assert!(twice.release.is_empty());
     // A READY covers any version: a newer build for the same model, the
     // session still on the build the round began on, is taken in place: the
-    // round, its marker and nothing owed (owner, 2026-09-29).
+    // round, its marker and nothing owed.
     let target = Candidate {
         exe: PathBuf::from("/x/claude"),
         version: version("9.9.9"),
@@ -352,7 +352,7 @@ fn draft_screen() -> String {
 /// `st` filed for its conversation — the notice's fence naming it.
 #[cfg(unix)]
 struct Agent {
-    child: std::process::Child,
+    child: aterm_uds::spawnfd::Child,
     sf: SessionFile,
 }
 
@@ -365,9 +365,9 @@ impl Agent {
             .arg(PARK[0])
             .env(PARK_ENV, "1")
             .env("ATERM_PARENT_SESSION_ID", TAB)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("agent");
         wait_exec(child.id());
@@ -2547,8 +2547,8 @@ fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
     ));
 }
 
-/// A VOID BEGINS THE REST AGAIN BY THE LADDER THE STOP IS ON (round six, F27
-/// beside the cadence's ladder for a declined round): four rounds the agent
+/// A VOID BEGINS THE REST AGAIN BY THE LADDER THE STOP IS ON (F27, beside the
+/// cadence's ladder for a declined round): four rounds the agent
 /// declined rest a day ([`upgrade::unanswered_rest_extension`]); a late READY
 /// voided half an hour on begins that rest again at the void — the same
 /// ladder, never the `4 × RETRY_S` cap of a stop that repeats for another
@@ -2592,17 +2592,16 @@ fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     assert_eq!(refused.failed_at, T + 1_800 + 3 * upgrade::RETRY_S);
 }
 
-/// THE LONGEST SILENCE, through the real record and the real reducer (the
-/// no-stall review of 2026-09-27: `REASK_S + RETRY_S` was claimed as its
-/// bound, but a void begins the rest again). A round's last notice goes out;
+/// THE LONGEST SILENCE, through the real record and the real reducer (not
+/// `REASK_S + RETRY_S`: a void begins the rest again). A round's last notice goes out;
 /// its window runs out and it gives up; a late READY comes a second before
 /// its rest runs out and holds the rest where it is, at an idle point and at
 /// a break alike; the agent's own work outlives the answer, and the void
 /// comes `DRAIN_S` after it, beginning the rest again; the new round starts
-/// a rest after the void, as long as the streak makes it (round six, F27).
-/// Five hours today after a first stop, seventeen after one repeated to the
-/// cap, as `upgrade::RETRY_S` says — and without
-/// the late READY, two and a half and eight and a half.
+/// a rest after the void, as long as the streak makes it (F27). Five hours
+/// after a first stop, seventeen after one repeated to the cap, as
+/// `upgrade::RETRY_S` says — and without the late READY, two and a half and
+/// eight and a half.
 #[test]
 fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
     const H: u64 = 3_600;

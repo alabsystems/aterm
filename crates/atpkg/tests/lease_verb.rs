@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HOLDER VERB, run as a PROCESS (review, 2026-09-26).
+//! THE HOLDER VERB, run as a PROCESS.
 //!
 //! `aterm pkg lease <dir> -- <command…>` holds the build `<dir>` belongs to for exactly as
 //! long as the command runs. The packers `exec` into it, so the pid their caller holds —
@@ -12,7 +12,10 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+// `spawnfd`'s: the holder holds its stdio and nothing else of this process —
+// not a pipe another test thread had open unflagged at the spawn, which the
+// command it leases for would keep as long as it runs.
+use aterm_uds::spawnfd::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use atpkg::lease::{Holders, Subject};
@@ -67,9 +70,8 @@ fn alive(pid: libc::pid_t) -> bool {
 }
 
 /// A SIGTERM TO THE HOLDER ENDS THE COMMAND, NOT JUST THE HOLDER: it is passed on, the
-/// holder waits for the command to end, lets the lease go, and leaves by the same signal.
-/// Before, the holder died of it at once: the lease was gone and the command ran on
-/// unleased, orphaned, while its caller read the run as over.
+/// holder waits for the command to end, lets the lease go, and leaves by the same signal
+/// — never dies at once, leaving the command running unleased and orphaned.
 #[test]
 fn a_sigterm_to_the_holder_ends_the_command_it_holds_for() {
     use std::os::unix::process::ExitStatusExt as _;

@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A saved cursor below the last row survives a checkpoint.
+//! A saved cursor survives a checkpoint where the engine holds it.
 //!
 //! An app that enters the alternate screen (1049 saves the cursor into the
 //! main DECSC slot) from a prompt on the last row, followed by a one-row
-//! shrink, leaves the slot one row past the grid. Like xterm, the engine never
-//! touches the slot on resize and clamps only when DECRC or the 1049 exit
-//! reads it (`Grid::set_cursor`). So the checkpoint carries the slot raw, and
-//! the handoff wire bounds a DECSC slot by the engine's ceiling
+//! shrink: the shrink demotes the saved primary screen's top row, and the slot
+//! follows the prompt up a row, as xterm (`AdjustSavedCursor`), Alacritty,
+//! kitty, Ghostty and WezTerm move it (`Grid::lend_saved_cursor`). A slot only
+//! moves with its text: one whose row a shrink trims away (a blank row below
+//! the cursor) names no text and stays past the grid, clamped only when DECRC
+//! or the 1049 exit reads it (`Grid::set_cursor`). So the checkpoint carries
+//! the slot as the engine holds it, unclamped, and the handoff wire bounds a
+//! DECSC slot by the engine's ceiling
 //! (`seamless::checkpoint_meta_bound_violation`), not by the grid.
 //!
-//! Clamping at capture would be lossy: a successor that grows back would
-//! restore the cursor one row above the live engine's. The tests pin the raw
-//! carry, same-size parity and grow-back parity.
+//! The parity tests compare where the cursor lands by the text under it: a
+//! successor restored from the wire carries no history behind the saved
+//! primary, so a grow back appends a row where the live engine reveals the
+//! demoted one, and the same prompt sits one row higher there.
 
 use aterm_core::terminal::Terminal;
 
@@ -34,11 +39,19 @@ fn prompt_on_the_last_row() -> Terminal {
     t
 }
 
-/// 1049 from the last row, then a one-row shrink: the checkpoint carries the
-/// slot as the engine holds it, on a row the grid no longer has, and the wire
-/// admits it.
+/// The text of the row the cursor is on, and its column.
+fn under_cursor(t: &Terminal) -> (String, u16) {
+    let cursor = t.cursor();
+    (
+        t.grid().row_text(cursor.row).expect("cursor row"),
+        cursor.col,
+    )
+}
+
+/// 1049 from the last row, then a one-row shrink: the slot follows the prompt
+/// up the row the demote moved it, and the checkpoint carries it there.
 #[test]
-fn a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_raw() {
+fn a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_with_its_line() {
     let mut t = prompt_on_the_last_row();
     t.process(b"\x1b[?1049h");
     t.resize(ROWS - 1, COLS);
@@ -47,16 +60,42 @@ fn a_shrink_after_entering_the_alternate_screen_carries_the_saved_cursor_raw() {
     let saved = cp
         .saved_cursor_main
         .expect("1049 saved the main-screen cursor");
-    assert_eq!(saved.cursor_row, ROWS - 1, "raw: the row it was saved on");
-    assert!(
-        saved.cursor_row >= cp.rows,
-        "honest state one row past the shrunken grid"
+    assert_eq!(
+        saved.cursor_row,
+        ROWS - 2,
+        "the prompt's row after the demote"
     );
+    assert_eq!(saved.cursor_col, 8, "after `$ claude`");
 }
 
-/// The same shape sideways: a prompt at the last column, then a narrowing.
+/// A slot whose row a shrink trims (a blank row below the cursor) names no
+/// text: it stays past the shrunken grid, and the wire admits and carries it
+/// as the engine holds it. Grown back, both engines restore it onto its row.
 #[test]
-fn a_narrowing_after_entering_the_alternate_screen_carries_the_saved_column_raw() {
+fn a_slot_on_a_trimmed_row_is_carried_past_the_grid() {
+    let mut live = Terminal::new(ROWS, COLS);
+    live.process(format!("\x1b[{ROWS};5H\x1b7\x1b[H").as_bytes());
+    live.resize(ROWS - 1, COLS);
+    let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
+    let saved = cp.saved_cursor_main.expect("DECSC saved the cursor");
+    assert_eq!((saved.cursor_row, saved.cursor_col), (ROWS - 1, 4));
+    assert!(
+        saved.cursor_row >= cp.rows,
+        "one row past the shrunken grid"
+    );
+    let mut restored = Terminal::from_checkpoint(&cp);
+    for t in [&mut live, &mut restored] {
+        t.resize(ROWS, COLS);
+        t.process(b"\x1b8");
+    }
+    assert_eq!(live.cursor().row, ROWS - 1);
+    assert_eq!(restored.cursor(), live.cursor());
+}
+
+/// The same shape sideways: a prompt at the last column, then a narrowing. The
+/// slot follows its cell through the rewrap, onto the continuation row.
+#[test]
+fn a_narrowing_after_entering_the_alternate_screen_carries_the_saved_cell_through_the_rewrap() {
     let mut t = Terminal::new(ROWS, COLS);
     let fill: String = "x".repeat(usize::from(COLS) - 1);
     t.process(fill.as_bytes());
@@ -72,18 +111,23 @@ fn a_narrowing_after_entering_the_alternate_screen_carries_the_saved_column_raw(
         .saved_cursor_main
         .expect("1049 saved the main-screen cursor");
     assert_eq!(
-        saved.cursor_col,
-        COLS - 1,
-        "raw: the column it was saved on"
+        (saved.cursor_row, saved.cursor_col),
+        (1, 9),
+        "the cell after the 148th `x`, rewrapped at 139 columns"
     );
-    assert!(saved.cursor_col >= cp.cols);
+    t.process(b"\x1b[?1049lZ");
+    assert_eq!(
+        t.grid().row_text(1).as_deref(),
+        Some("xxxxxxxxxZ"),
+        "the next glyph follows the line"
+    );
 }
 
 /// The alternate screen has a DECSC slot of its own, projected by the same
 /// function: a full-screen app that saved its cursor on the last row, then
-/// lost a row, carries that slot raw too.
+/// lost a row, keeps the slot on the row the demote moved up.
 #[test]
-fn a_shrink_carries_the_alternate_screen_saved_cursor_raw() {
+fn a_shrink_carries_the_alternate_screen_saved_cursor_with_its_row() {
     let mut t = Terminal::new(ROWS, COLS);
     t.process(b"\x1b[?1049h");
     t.process(format!("\x1b[{ROWS};1H\x1b7").as_bytes());
@@ -92,12 +136,11 @@ fn a_shrink_carries_the_alternate_screen_saved_cursor_raw() {
     let saved = cp
         .saved_cursor_alt
         .expect("DECSC on the alternate screen saved into the alt slot");
-    assert_eq!(saved.cursor_row, ROWS - 1);
+    assert_eq!(saved.cursor_row, ROWS - 2);
 }
 
-/// Same-size parity. Read at the shrunken size, the raw slot is clamped by
-/// the 1049 exit on both engines: the live one and one restored from the
-/// checkpoint land on the same cell, the new last row.
+/// Same-size parity: the live engine and one restored from the checkpoint
+/// leave the alternate screen onto the same cell, after the prompt.
 #[test]
 fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_same_size() {
     let mut live = prompt_on_the_last_row();
@@ -111,14 +154,16 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_sam
     }
     assert_eq!(restored.cursor(), live.cursor());
     assert_eq!(live.cursor().row, ROWS - 2);
+    assert_eq!(under_cursor(&live), ("$ claude".to_string(), 8));
 }
 
-/// grow-back parity — the production sequence. The outgoing process parks at
+/// Grow-back parity — the production sequence. The outgoing process parks at
 /// 55 rows; the successor restores at 55, its "finishing" bar folds seconds
 /// later and every session grows back to 56; the user quits the full-screen
-/// app. The slot was saved on row 55 and the grid has row 55 again, so the
-/// cursor belongs on row 55 — on the live engine, on xterm, and on the
-/// restored engine. A slot clamped at capture would land on 54.
+/// app. On the live engine the grow reveals the demoted row and the prompt is
+/// back on row 55; the restored one has no history behind the saved primary,
+/// appends a row and keeps the prompt on row 54. Both slots followed their
+/// prompt, so both land after `$ claude`.
 #[test]
 fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_growing_back() {
     let mut live = prompt_on_the_last_row();
@@ -131,8 +176,9 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_grow
         t.resize(ROWS, COLS);
         t.process(b"\x1b[?1049l");
     }
-    assert_eq!(live.cursor().row, ROWS - 1, "the row the slot was saved on");
-    assert_eq!(restored.cursor(), live.cursor());
+    assert_eq!(live.cursor().row, ROWS - 1, "the row the prompt is back on");
+    assert_eq!(under_cursor(&live), ("$ claude".to_string(), 8));
+    assert_eq!(under_cursor(&restored), under_cursor(&live));
 }
 
 /// The same parity for a bare DECRC on the main screen, at the shrunken size
@@ -152,9 +198,18 @@ fn a_restored_terminal_restores_a_bare_decrc_onto_the_same_cell_as_the_live_one(
             }
             t.process(b"\x1b[1;1H\x1b8");
         }
-        assert_eq!(restored.cursor(), live.cursor(), "grow_back={grow_back}");
         let expected = if grow_back { ROWS - 1 } else { ROWS - 2 };
         assert_eq!(live.cursor().row, expected, "grow_back={grow_back}");
+        assert_eq!(
+            under_cursor(&live),
+            ("$ claude".to_string(), 8),
+            "grow_back={grow_back}"
+        );
+        assert_eq!(
+            under_cursor(&restored),
+            under_cursor(&live),
+            "grow_back={grow_back}"
+        );
     }
 }
 

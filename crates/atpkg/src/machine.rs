@@ -5,7 +5,7 @@
 //! owner decisions 2026-09-10; a pass applies them only after an edit to the `[machine]`
 //! table since Phase 3, [`changed_since_applied`]): the POLICY half — what to do given what `defaults`
 //! answered — kept pure and behind a port so no test ever touches the real
-//! `com.apple.universalcontrol` domain. The Spotlight half is [`crate::noindex::apply`].
+//! `com.apple.universalcontrol` domain.
 //!
 //! Universal Control is macOS's cursor/keyboard roaming between Macs and iPads signed
 //! into the same Apple account. The owner runs with it disabled (`Disable = 1`), and a
@@ -372,83 +372,6 @@ impl HomePosture {
     }
 }
 
-/// The exposed cargo target dirs an apply leaves open, counted by why: one `atpkg machine`
-/// prints and the window's card renders through the same [`OpenSplit::words`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct OpenSplit {
-    /// Not beside a Cargo.toml: only `aterm pkg noindex apply <dir>` by name moves one.
-    pub free_standing: usize,
-    /// Held by a running build: the next apply retries it.
-    pub busy: usize,
-    /// Refused otherwise (a destination in the way, a config that cannot be pointed).
-    pub refused: usize,
-}
-
-impl OpenSplit {
-    /// Sort one apply outcome into its bucket; `Planned`, `AlreadyExcluded`, a `Restored`
-    /// link (its directory hidden again) and a `Repaired` one count in none.
-    pub fn count(&mut self, outcome: &crate::noindex::Applied) {
-        use crate::noindex::Applied;
-        match outcome {
-            o if o.free_standing() => self.free_standing += 1,
-            o if o.held_by_build() => self.busy += 1,
-            Applied::Skipped { .. } | Applied::Failed { .. } => self.refused += 1,
-            Applied::Planned { .. }
-            | Applied::Migrated { .. }
-            | Applied::Restored { .. }
-            | Applied::Repaired { .. }
-            | Applied::AlreadyExcluded(_) => {}
-        }
-    }
-
-    /// The non-zero parts, `, `-joined: `2 free-standing (`aterm pkg noindex apply <dir>`),
-    /// 1 in a running build (the next apply retries it), …`. Empty when all are zero.
-    #[must_use]
-    pub fn words(self) -> String {
-        let mut parts = Vec::new();
-        if self.free_standing > 0 {
-            parts.push(format!(
-                "{} free-standing (`aterm pkg noindex apply <dir>` by name)",
-                self.free_standing
-            ));
-        }
-        if self.busy > 0 {
-            parts.push(format!(
-                "{} in a running build (the next apply retries it)",
-                self.busy
-            ));
-        }
-        if self.refused > 0 {
-            parts.push(format!(
-                "{} refused (`aterm pkg noindex apply <dir>` says why)",
-                self.refused
-            ));
-        }
-        parts.join(", ")
-    }
-}
-
-/// The verdict when the exposed dirs left are ones no apply hides: `stuck` of them, and why
-/// (`None` from a record written before the split was carried). `atpkg machine` prints it and
-/// the window's card shows it, so the two read the same.
-#[must_use]
-pub fn stay_open_verdict(stuck: usize, open: Option<OpenSplit>) -> String {
-    let words = open.map(OpenSplit::words).unwrap_or_default();
-    let now = if open.is_some_and(|o| o.busy > 0) {
-        " now"
-    } else {
-        ""
-    };
-    let head = format!(
-        "nothing an apply can do{now} — {stuck} cargo target dir(s) stay open to Spotlight"
-    );
-    if words.is_empty() {
-        head
-    } else {
-        format!("{head}: {words}")
-    }
-}
-
 /// What bare `atpkg machine` measured — the whole of it, as one record. Printed as the
 /// [`MACHINE_STATE_MARKER`](crate::cli::MACHINE_STATE_MARKER) line and parsed back by
 /// the window through [`parse_machine_state`], so the two cannot disagree about a
@@ -459,83 +382,27 @@ pub struct MachineState {
     pub universal_control: UcPosture,
     /// `[machine] universal_control`, resolved.
     pub policy: UniversalControlPolicy,
-    /// `[machine] spotlight_noindex`, resolved.
-    pub spotlight_noindex: bool,
-    /// Cargo target dirs under the home whose NAME leaves them open to Spotlight.
-    pub exposed: usize,
-    /// Cargo target dirs already hidden by name.
-    pub hidden: usize,
-    /// Of the exposed, how many a pass WOULD migrate (a dry-run apply: beside a
-    /// `Cargo.toml`, no live build, nothing in the way). The rest need
-    /// `aterm pkg noindex apply <dir>` by name, and a count that could never fall to
-    /// zero is the trap the doctor records — so this is the number the verdict uses.
-    pub would_migrate: usize,
-    /// `false` when the scan hit its budget, so a report says "at least".
-    pub scan_complete: bool,
     /// The synthetic-home rule's answer.
     pub home: HomePosture,
-    /// The config file exists and does not parse, so neither opt-out could be read and
+    /// The config file exists and does not parse, so the opt-out could not be read and
     /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]).
     ///
-    /// OPTIONAL IN THE RECORD, and `false` when absent, so a reader from before this key
-    /// existed keeps working and a record written by one still parses here.
+    /// OPTIONAL IN THE RECORD, and `false` when absent.
     pub config_unreadable: bool,
-    /// Of the exposed, the ones an apply leaves open, by why ([`OpenSplit`]).
-    ///
-    /// OPTIONAL IN THE RECORD: `None` when a record from before these keys omits them.
-    pub open: Option<OpenSplit>,
-}
-
-/// What is left for an apply to do, if anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MachineNext {
-    /// Universal Control is not yet fully disabled and the policy says disable it.
-    pub universal_control: bool,
-    /// Target dirs a pass would rename now.
-    pub spotlight: usize,
-}
-
-/// THE verdict: `None` when an apply would change nothing — the CLI then says so and
-/// the window's Apply button is disabled — else what it would do. Pure over its inputs
-/// so the two surfaces cannot drift, and so the half-state and the "counts but cannot
-/// migrate" cases are pinned by a table rather than by prose.
-///
-/// The home posture is NOT an input: a mismatched home means nothing is applied at
-/// all, and that is the caller's line to print before it asks what is left.
-#[must_use]
-pub fn machine_next(
-    uc: UcPosture,
-    policy: UniversalControlPolicy,
-    spotlight_noindex: bool,
-    would_migrate: usize,
-) -> Option<MachineNext> {
-    let universal_control =
-        policy == UniversalControlPolicy::Off && !matches!(uc, UcPosture::Disabled);
-    let spotlight = if spotlight_noindex { would_migrate } else { 0 };
-    if !universal_control && spotlight == 0 {
-        return None;
-    }
-    Some(MachineNext {
-        universal_control,
-        spotlight,
-    })
 }
 
 impl MachineState {
-    /// What an apply would still do on this machine.
+    /// THE verdict: whether an apply would change this machine — the CLI's `next —` line
+    /// and the window's Apply button both read it, so the two surfaces cannot drift.
+    /// Nothing is next when nothing may be applied (a synthetic home, or a config whose
+    /// opt-out could not be read), when the policy says leave, or when Universal Control
+    /// is already off; an unreadable posture is applied again, never skipped.
     #[must_use]
-    pub fn next(&self) -> Option<MachineNext> {
-        // Nothing is next when nothing may be applied: a synthetic home, or a config
-        // whose opt-outs could not be read.
-        if self.home != HomePosture::Account || self.config_unreadable {
-            return None;
-        }
-        machine_next(
-            self.universal_control,
-            self.policy,
-            self.spotlight_noindex,
-            self.would_migrate,
-        )
+    pub fn next(&self) -> bool {
+        self.home == HomePosture::Account
+            && !self.config_unreadable
+            && self.policy == UniversalControlPolicy::Off
+            && !matches!(self.universal_control, UcPosture::Disabled)
     }
 }
 
@@ -544,33 +411,14 @@ impl MachineState {
 #[must_use]
 pub fn machine_state_line(s: &MachineState) -> String {
     format!(
-        "universal-control={}; policy={}; noindex={}; spotlight-exposed={}; \
-         spotlight-hidden={}; spotlight-migratable={}; scan={}; home={}",
+        "universal-control={}; policy={}; home={}",
         s.universal_control.as_str(),
         match s.policy {
             UniversalControlPolicy::Off => "off",
             UniversalControlPolicy::Leave => "leave",
         },
-        s.spotlight_noindex,
-        s.exposed,
-        s.hidden,
-        s.would_migrate,
-        if s.scan_complete {
-            "complete"
-        } else {
-            "partial"
-        },
         s.home.as_str(),
-    ) + &s.open.map_or(String::new(), |o| {
-        // APPENDED like `config=` below: a reader that predates these keys ignores them.
-        format!(
-            "; spotlight-free-standing={}; spotlight-busy={}; spotlight-refused={}",
-            o.free_standing, o.busy, o.refused
-        )
-    }) + if s.config_unreadable {
-        // APPENDED, NEVER INSERTED: every key before this one keeps its place, so a
-        // reader that predates the key sees the record it has always seen and this one
-        // is simply ignored by it (`parse_machine_state` skips unknown keys).
+    ) + if s.config_unreadable {
         "; config=unreadable"
     } else {
         ""
@@ -585,14 +433,8 @@ pub fn machine_state_line(s: &MachineState) -> String {
 pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut uc = None;
     let mut policy = None;
-    let mut noindex = None;
-    let mut exposed = None;
-    let mut hidden = None;
-    let mut migratable = None;
-    let mut scan = None;
     let mut home = None;
     let mut config_unreadable = false;
-    let (mut free_standing, mut busy, mut refused) = (None, None, None);
     for pair in body.split(';') {
         let Some((k, v)) = pair.trim().split_once('=') else {
             continue;
@@ -607,46 +449,17 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
                     _ => None,
                 }
             }
-            "noindex" => noindex = v.parse::<bool>().ok(),
-            "spotlight-exposed" => exposed = v.parse::<usize>().ok(),
-            "spotlight-hidden" => hidden = v.parse::<usize>().ok(),
-            "spotlight-migratable" => migratable = v.parse::<usize>().ok(),
-            "scan" => {
-                scan = match v {
-                    "complete" => Some(true),
-                    "partial" => Some(false),
-                    _ => None,
-                }
-            }
             "home" => home = HomePosture::parse(v),
-            // Optional: absent means readable, which is what every record written
-            // before this key existed means.
+            // Optional: absent means readable.
             "config" => config_unreadable = v == "unreadable",
-            // Optional, all three or none.
-            "spotlight-free-standing" => free_standing = v.parse::<usize>().ok(),
-            "spotlight-busy" => busy = v.parse::<usize>().ok(),
-            "spotlight-refused" => refused = v.parse::<usize>().ok(),
             _ => {}
         }
     }
     Some(MachineState {
         universal_control: uc?,
         policy: policy?,
-        spotlight_noindex: noindex?,
-        exposed: exposed?,
-        hidden: hidden?,
-        would_migrate: migratable?,
-        scan_complete: scan?,
         home: home?,
         config_unreadable,
-        open: match (free_standing, busy, refused) {
-            (Some(free_standing), Some(busy), Some(refused)) => Some(OpenSplit {
-                free_standing,
-                busy,
-                refused,
-            }),
-            _ => None,
-        },
     })
 }
 
@@ -656,9 +469,8 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
 #[must_use]
 pub fn applied_fingerprint(cfg: &crate::config::MachineConfig) -> String {
     format!(
-        "atpkg-machine-applied v1\nspotlight_noindex={:?}\nuniversal_control={:?}\n\
-         unreadable={}\n",
-        cfg.spotlight_noindex, cfg.universal_control, cfg.unreadable
+        "atpkg-machine-applied v2\nuniversal_control={:?}\nunreadable={}\n",
+        cfg.universal_control, cfg.unreadable
     )
 }
 
@@ -680,7 +492,7 @@ pub fn changed_since_applied(
 }
 
 /// Forget the applied table, so the next pass's edge applies it again — what an apply that
-/// did not FINISH leaves (a live build skipped, a rename or a `defaults` write that failed):
+/// did not FINISH leaves (a `defaults` write that failed):
 /// the passes carry only a changed table, so without this nothing but the next day's launch
 /// apply ([`launch_apply_due`]) would retry what it missed. Best-effort.
 pub fn forget_applied(layout: &crate::store::Layout) {
@@ -747,7 +559,7 @@ impl LaunchApply {
 
 /// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily
 /// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
-/// session and a window opening both claim it here, so their walk of `$HOME` runs once a
+/// session and a window opening both claim it here, so their `defaults` writes run once a
 /// day between them, not at every tab and every window; an edit to `[machine]` rides the
 /// next pass ([`changed_since_applied`]) and Settings' Apply now runs at once, unclaimed.
 ///
@@ -927,7 +739,8 @@ mod tests {
         record_applied(&layout, &default);
         let leave = crate::config::parse_machine("[machine]\nuniversal_control = \"leave\"\n");
         assert!(changed_since_applied(&layout, &leave), "an edit");
-        let spelled_default = crate::config::parse_machine("[machine]\nspotlight_noindex = true\n");
+        let spelled_default =
+            crate::config::parse_machine("[machine]\nuniversal_control = \"off\"\n");
         assert!(
             changed_since_applied(&layout, &spelled_default),
             "spelling out a default is an edit too"
@@ -1150,56 +963,20 @@ mod tests {
                     let s = MachineState {
                         universal_control: uc,
                         policy,
-                        spotlight_noindex: policy == UniversalControlPolicy::Off,
-                        exposed: 4,
-                        hidden: 2,
-                        would_migrate: 3,
-                        scan_complete: home != HomePosture::Mismatch,
                         home,
                         config_unreadable: uc == UcPosture::Unknown,
-                        open: (home == HomePosture::Account).then_some(OpenSplit {
-                            free_standing: 1,
-                            busy: 2,
-                            refused: 3,
-                        }),
                     };
                     let line = machine_state_line(&s);
                     assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
                 }
             }
         }
-        let full = "universal-control=disabled; policy=off; noindex=true; spotlight-exposed=1; \
-                    spotlight-hidden=9; spotlight-migratable=0; scan=complete; home=account";
+        let full = "universal-control=disabled; policy=off; home=account";
         assert!(parse_machine_state(full).is_some());
         assert!(parse_machine_state(&format!("{full}; future-key=whatever")).is_some());
         assert!(parse_machine_state("universal-control=disabled; policy=off").is_none());
         assert!(parse_machine_state(&full.replace("home=account", "home=elsewhere")).is_none());
         assert!(parse_machine_state("").is_none());
-    }
-
-    /// The "nothing an apply can do" verdict both surfaces show: the split when the record
-    /// has one, "now" while a build holds a dir, and no dangling colon with no split.
-    #[test]
-    fn stay_open_verdict_names_the_split() {
-        assert_eq!(
-            stay_open_verdict(2, None),
-            "nothing an apply can do — 2 cargo target dir(s) stay open to Spotlight"
-        );
-        assert_eq!(
-            stay_open_verdict(2, Some(OpenSplit::default())),
-            "nothing an apply can do — 2 cargo target dir(s) stay open to Spotlight"
-        );
-        assert_eq!(
-            stay_open_verdict(
-                1,
-                Some(OpenSplit {
-                    busy: 1,
-                    ..OpenSplit::default()
-                })
-            ),
-            "nothing an apply can do now — 1 cargo target dir(s) stay open to Spotlight: 1 in \
-             a running build (the next apply retries it)"
-        );
     }
 
     /// The posture derivation: both keys = disabled, one key = partial, neither = the
@@ -1220,99 +997,51 @@ mod tests {
     }
 
     /// THE VERDICT TABLE — the read verb's `next —` line and the window's Apply button
-    /// both read this. The live case that motivated it: Universal Control already off,
-    /// one target dir a pass would rename — the old read said "nothing to apply".
+    /// both read it.
     #[test]
-    fn machine_read_hint_covers_spotlight_as_well_as_universal_control() {
+    fn an_apply_is_next_only_where_it_would_change_universal_control() {
         use UcPosture::*;
         use UniversalControlPolicy::*;
-        assert_eq!(
-            machine_next(Disabled, Off, true, 1),
-            Some(MachineNext {
-                universal_control: false,
-                spotlight: 1
-            }),
-            "the live case: UC done, one dir to hide"
-        );
-        assert_eq!(
-            machine_next(Disabled, Off, true, 0),
-            None,
-            "everything done"
-        );
-        assert_eq!(
-            machine_next(Disabled, Off, false, 1),
-            None,
-            "noindex switched off"
-        );
-        assert_eq!(
-            machine_next(Default, Off, true, 0),
-            Some(MachineNext {
-                universal_control: true,
-                spotlight: 0
-            })
-        );
-        assert_eq!(
-            machine_next(Partial, Off, true, 0).map(|n| n.universal_control),
-            Some(true),
+        let at = |universal_control, policy| MachineState {
+            universal_control,
+            policy,
+            home: HomePosture::Account,
+            config_unreadable: false,
+        };
+        assert!(!at(Disabled, Off).next(), "everything done");
+        assert!(at(Default, Off).next());
+        assert!(
+            at(Partial, Off).next(),
             "a half state is completed, not reported done"
         );
-        assert_eq!(machine_next(Default, Leave, true, 0), None, "policy leave");
-        assert_eq!(
-            machine_next(Unknown, Off, true, 2),
-            Some(MachineNext {
-                universal_control: true,
-                spotlight: 2
-            }),
+        assert!(
+            at(Unknown, Off).next(),
             "an unreadable posture is re-applied, never skipped"
         );
-        // And the record's own `next()` refuses under a synthetic home, whatever is left.
-        let s = MachineState {
-            universal_control: Default,
-            policy: Off,
-            spotlight_noindex: true,
-            exposed: 3,
-            hidden: 0,
-            would_migrate: 3,
-            scan_complete: true,
-            home: HomePosture::Mismatch,
-            config_unreadable: false,
-            open: None,
-        };
-        assert_eq!(s.next(), None);
-        // The other refusal: a config that does not parse cannot say whether either
-        // setting was switched off, so there is nothing to offer either.
-        assert_eq!(
-            MachineState {
-                home: HomePosture::Account,
+        assert!(!at(Default, Leave).next(), "policy leave");
+        // The record's own refusals: a synthetic home, and a config that does not parse.
+        let s = at(Default, Off);
+        assert!(
+            !MachineState {
+                home: HomePosture::Mismatch,
+                ..s.clone()
+            }
+            .next()
+        );
+        assert!(
+            !MachineState {
                 config_unreadable: true,
                 ..s.clone()
             }
             .next(),
-            None,
             "an unreadable config offers no next step"
         );
-        // A record written before the key existed parses, and means "readable".
-        let older = "universal-control=default; policy=off; noindex=true; spotlight-exposed=3; \
-                     spotlight-hidden=0; spotlight-migratable=3; scan=complete; home=account";
-        let parsed = parse_machine_state(older).expect("the older record still parses");
-        assert!(!parsed.config_unreadable);
-        assert!(parsed.next().is_some());
-        // And the new key round-trips.
         let flagged = MachineState {
-            home: HomePosture::Account,
             config_unreadable: true,
-            ..s.clone()
+            ..s
         };
         let line = machine_state_line(&flagged);
         assert!(line.ends_with("; config=unreadable"), "{line}");
         assert_eq!(parse_machine_state(&line), Some(flagged));
-        assert!(
-            MachineState {
-                home: HomePosture::Account,
-                ..s
-            }
-            .next()
-            .is_some()
-        );
     }
 }

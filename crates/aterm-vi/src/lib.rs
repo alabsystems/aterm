@@ -175,15 +175,14 @@ impl ViMode {
         }
     }
 
-    /// Execute a basic motion (no grid content needed).
+    /// Execute a basic motion (no grid needed).
     ///
-    /// For motions that require grid content (word, bracket, paragraph,
-    /// search, marks), use [`Self::motion_with_grid`] instead. Those motions
+    /// For motions that need the grid (word, bracket, paragraph, search,
+    /// marks, H/M/L), use [`Self::motion_with_grid`] instead. Those motions
     /// are silently ignored here.
     #[cfg(test)]
     pub fn motion(
         &mut self,
-        visible_rows: u16,
         cols: u16,
         topmost_line: i32,
         bottommost_line: i32,
@@ -193,14 +192,9 @@ impl ViMode {
         if !self.active {
             return;
         }
-        self.cursor = self.cursor.motion(
-            visible_rows,
-            cols,
-            topmost_line,
-            bottommost_line,
-            motion,
-            boundary,
-        );
+        self.cursor = self
+            .cursor
+            .motion(cols, topmost_line, bottommost_line, motion, boundary);
     }
 
     /// Execute any motion with buffer access.
@@ -326,11 +320,29 @@ impl ViMode {
                 }
             }
 
+            // --- H/M/L: the top, middle and bottom rows the viewport shows ---
+            //
+            // Scrolled back, the viewport's top row is line
+            // `-display_offset`, not live line 0.
+            ViMotion::High | ViMotion::Middle | ViMotion::Low => {
+                // saturating ops: exact for every real grid (the offset is at
+                // most the history length, `rows` a u16).
+                let top = grid.display_offset().saturating_neg();
+                let rows = i32::from(visible_rows);
+                let row = match motion {
+                    ViMotion::High => 0,
+                    ViMotion::Middle => rows / 2,
+                    _ => rows.saturating_sub(1),
+                };
+                self.cursor.point.line = top.saturating_add(row).clamp(topmost, bottommost);
+                self.cursor.point.col = self.cursor.point.col.min(cols.saturating_sub(1));
+            }
+
             // --- Basic motions — delegate to cursor ---
             _ => {
-                self.cursor =
-                    self.cursor
-                        .motion(visible_rows, cols, topmost, bottommost, motion, boundary);
+                self.cursor = self
+                    .cursor
+                    .motion(cols, topmost, bottommost, motion, boundary);
             }
         }
     }
@@ -426,13 +438,21 @@ impl ViMode {
         self.inline_search = Some(state);
     }
 
-    /// Scroll the cursor by `delta` lines.
-    #[cfg(test)]
-    pub fn scroll(&mut self, topmost_line: i32, bottommost_line: i32, delta: i32) {
+    /// Move the cursor `delta` lines (negative is up, toward history),
+    /// clamped to `topmost_line..=bottommost_line`, and its column to
+    /// `last_col`.
+    ///
+    /// Lines are live-relative, so when output scrolls the live screen up by
+    /// `n` rows, the text the cursor was on is now `n` lines up; the terminal
+    /// calls this with `-n` to keep the cursor on its text. It also calls it
+    /// when the grid itself changed (a resize, a cleared history), so the
+    /// cursor never names a cell the grid does not have.
+    pub fn scroll(&mut self, topmost_line: i32, bottommost_line: i32, last_col: u16, delta: i32) {
         if !self.active {
             return;
         }
         self.cursor = self.cursor.scroll(topmost_line, bottommost_line, delta);
+        self.cursor.point.col = self.cursor.point.col.min(last_col);
     }
 }
 

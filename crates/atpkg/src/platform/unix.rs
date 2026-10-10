@@ -454,48 +454,19 @@ fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
 #[cfg(target_os = "macos")]
 const BOUNDED_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The deadline loop behind [`bounded_stdout`]: kills and reaps the child at `ceiling`. A
-/// Spotlight query against a rebuilding index is exactly the wedged probe this bounds.
+/// The deadline behind [`bounded_stdout`]: `crate::doctor::output_bounded_within`, which
+/// kills and reaps the child at `ceiling` and reads its stdout while it runs, never waiting
+/// on a process the child left behind holding the pipe. A Spotlight query against a
+/// rebuilding index is exactly the wedged probe this bounds.
 ///
 /// stderr is `null` because `mdfind` writes `[UserQueryParser] Loading keywords …` there
 /// on a healthy query; nulled for every caller so parser chatter never reaches a report.
-/// Reading stdout only after the child exits cannot deadlock on a full pipe: every
-/// answer is one probe path, one `mdutil` line or one `defaults` value.
 #[cfg(target_os = "macos")]
 fn bounded_stdout_inner(
     cmd: &mut aterm_uds::spawnfd::Command,
     ceiling: std::time::Duration,
 ) -> Option<(bool, Vec<u8>)> {
-    use aterm_uds::spawnfd::Stdio;
-    use std::io::Read as _;
-    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + ceiling;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                std::thread::sleep(POLL.min(remaining));
-            }
-            Err(_) => return None,
-        }
-    };
-    let mut stdout = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_end(&mut stdout);
-    }
-    Some((status.success(), stdout))
+    crate::doctor::output_bounded_within(cmd, ceiling).map(|out| (out.status.success(), out.stdout))
 }
 
 /// Case-insensitive ASCII substring test over raw bytes — enough to read `mdutil`'s

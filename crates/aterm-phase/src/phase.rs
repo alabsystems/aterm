@@ -1403,13 +1403,18 @@ pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
 /// [`crate::wall::wall`] (every kind), so the two can never disagree about
 /// WHERE a wall is.
 ///
-/// A `⎿` block counts as the VENDOR's row except in the two forms this
-/// recognises as output: the `⏺` row it hangs from is a tool call written
-/// `⏺ Name(…)` (`⏺ Bash(…)`, `⏺ Update(notes.txt)`, [`is_tool_call`]), or
-/// it opens with the command's own echo (`⎿  $ touch x`, Claude Code 2.1.280
-/// draws a running command so). Any other owner's block — a Monitor event's
-/// payload included — is read as the vendor's ([`crate::wall`], module
-/// header).
+/// A `⎿` block is read as the VENDOR's row by [`block_is_vendors`]: never
+/// at a column but 2 (a tool's output continues at column 5); never the
+/// FIRST column-2 row under a call ([`is_tool_call`]), which is the call's
+/// output; a later column-2 row under a call, and every column-2 row under
+/// any other owner or none on the screen, read — for recall: the screen
+/// cannot tell some of those from a tool's output (an MCP result's second
+/// block), so the supervisor acts on a wall only where the session's
+/// transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`), and
+/// a wall read under a call's later row says so ([`Wall::under_call`]). A
+/// block that opens with the command's own echo (`⎿  $ touch x`, Claude Code
+/// 2.1.280 draws a running command so) is output too ([`crate::wall`],
+/// module header).
 pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
     let mut found = notice_placed(rows, classify)?;
     // Claude Code 2.1.284 draws an armed auto-continue as
@@ -1569,9 +1574,14 @@ fn notice_at(
     let head = crate::text::trim_start(&rows[open])
         .trim_start_matches('⎿')
         .trim();
-    if head.starts_with("$ ") || owner_is_tool_call(rows, open) {
+    if head.starts_with("$ ") {
         return None;
     }
+    let under_call = match block_is_vendors(rows, open) {
+        Block::Output => return None,
+        Block::UnderCall => true,
+        Block::Vendors => false,
+    };
     let kind = classify(head)?;
     let parts: Vec<&str> = std::iter::once(head)
         .chain(rows[open + 1..=last].iter().map(|r| crate::text::trim(r)))
@@ -1584,6 +1594,7 @@ fn notice_at(
         reset,
         row: open,
         placement: Placement::Gutter,
+        under_call,
     })
 }
 
@@ -1674,38 +1685,219 @@ fn error_row_notice(
         message: text,
         row: open,
         placement: Placement::ErrorRow,
+        under_call: false,
     })
 }
 
-/// Whether the `⏺` row the `⎿` block opening at `open` hangs from is a tool
-/// call: walking up over the block's own rows (more `⎿` rows, rows indented
-/// under them) to the first row in column 0, with no blank row between.
-fn owner_is_tool_call(rows: &[String], open: usize) -> bool {
-    for row in rows[..open].iter().rev() {
-        if crate::text::trim(row).is_empty() {
-            return false;
-        }
-        if leading_spaces(row) == 0 {
-            return is_tool_call(row);
-        }
-    }
-    false
+/// The column Claude Code draws its OWN `⎿` rows at (`  ⎿  …`). A tool's
+/// output continues at [`GUTTER_TEXT_COLUMN`], under the gutter's text, so a
+/// `⎿` the output itself prints lands at column 5 or deeper — behind a blank
+/// row of the output, a file's carriage returns, tabs, cursor moves and
+/// backspaces included (measured on 2.1.294:
+/// `claude-2.1.294-bash-output-blank-row-then-gutter-phrase.txt`).
+const VENDOR_GUTTER_COLUMN: usize = 2;
+
+/// What the owner walk ([`block_is_vendors`]) makes of a `⎿` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    /// A tool's output: never a wall.
+    Output,
+    /// Read as Claude Code's own row, from a later column-2 row under a call
+    /// (rule 3): [`Wall::under_call`].
+    UnderCall,
+    /// Read as Claude Code's own row under any other owner, or none the
+    /// walk reaches.
+    Vendors,
 }
 
-/// A transcript row that is a tool call, `⏺ <Name>(…)`: the marker, then a
-/// name of letters, digits, `_`, `:`, `.` or `-` running straight into `(`
-/// (`⏺ Bash(ls -la)`, `⏺ Update(notes.txt)`, `⏺ mcp__srv__tool(…)`). A
-/// completion notice (`⏺ Dynamic workflow "…" completed`, `⏺ Background
-/// command "…" completed`) and the worker's prose are not.
+/// Whether the `⎿` block opening at `open` is READ as Claude Code's own row —
+/// the SCREEN'S half of H6-HARNESS-1 (ruling 2026-10-08). It reads for
+/// RECALL: a wall read here is acted on only where the session's own
+/// transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`), so
+/// where the screen cannot tell Claude Code's row from a tool's, it reads
+/// the wall. Three rules, each measured on Claude Code 2.1.294 in
+/// `tools/real-claude-lab`:
+///
+/// 1. **The column.** A `⎿` row at any column but 2 is never Claude Code's:
+///    its own rows are at column 2, and a tool's output continues at column
+///    5 whatever the output prints.
+/// 2. **The owner walk** (main's): up from `open`, over the rows of the
+///    blocks above it, to the first row in column 0. A CALL there
+///    ([`is_tool_call`]: `⏺ Bash(…)`, an MCP tool's `⏺ <server> - <title>
+///    (MCP)…`, an integration's `⏺ Name[tool]…`, a shell-mode `! cmd`) owns
+///    the block, and its FIRST column-2 row is the call's output — the first
+///    line of what the file, the page, the server or the command said —
+///    never a wall.
+/// 3. **A later column-2 row under a call is read.** Claude Code draws its
+///    wall under the call's output when the request after the tool fails
+///    (`⏺ Bash(…)` / `⎿  stamped` / `⎿  Context limit reached · …`) — under
+///    every call, an MCP tool's and one a hook's row opens included, where
+///    the later row can also be the output's own (an MCP result's second
+///    content block in verbose output; the output under a PreToolUse hook's
+///    row): the screen cannot tell those apart, and the transcript decides
+///    ([`Block::UnderCall`]: where no transcript can be read, a supervisor
+///    does not act on a wall read here — main never read one under a `⏺
+///    Name(…)` call, but did under an MCP call and a `! cmd`, which it did
+///    not know as calls: a loss of recall ruled 2026-10-08). A row of
+///    the CALL's own — its arguments wrapped onto a row under it (`⏺
+///    Bash(…` / `  …)`) — is no column-2 `⎿` row, so the output's first row
+///    under a wrapped call is still its first.
+///
+/// Any other owner is read as Claude Code's: the person's `❯` turn, the
+/// worker's message, a task notice, a Monitor event (its payload included),
+/// a hook summary. So is a block whose owner the walk does not reach — a
+/// blank row over a row that opens an item (below), or the top of the
+/// screen, comes first — which is where Claude Code's walls stand under a
+/// prompt's second paragraph, under a collapsed tool group (its row wrapped
+/// or not), and under a long output whose call has scrolled off (all
+/// measured).
+///
+/// A BLANK ROW INSIDE A CALL'S ROWS does not end the walk (ruling
+/// 2026-10-08, the review of pass 5). A blank row ends it only where the
+/// next non-blank row below opens an item of its own: a row at column 2 or
+/// less that is no `⎿` row (a prompt's second paragraph, a collapsed
+/// group's row). Under any other the walk goes on over it to the owner:
+/// * a row past column 2 — an output's own row at column 5, a command's at
+///   column 6 — makes it a blank line of the output or the command. So an
+///   MCP result whose first block holds a paragraph break reads its second
+///   block under the call
+///   (`claude-2.1.294-mcp-blank-row-in-first-block-then-login-phrase.txt`),
+///   and a heredoc command's output, behind the command's own blank row,
+///   is the first row under its call: no wall;
+/// * a column-2 `⎿` row — a block hangs from the row above it, and no
+///   measured screen draws Claude Code's own `⎿` row behind a blank row
+///   under a call's rows (after a `/compact` it draws one under its own
+///   `✻ Conversation compacted` row, which no call owns) —
+///   makes it a blank line that ENDS a block of the output: an MCP result
+///   whose first block ends on a blank line draws two blank rows right
+///   above its second block
+///   (`claude-2.1.294-mcp-trailing-blank-rows-in-first-block-then-login-phrase.txt`,
+///   measured in pass 6: read under no owner, a supervisor with no
+///   transcript typed `/login` on it).
+///
+/// The price: Claude Code's real wall under an output that holds a blank
+/// row is read under the call too ([`Block::UnderCall`]), which a
+/// supervisor with no transcript does not act on.
+fn block_is_vendors(rows: &[String], open: usize) -> Block {
+    if leading_spaces(&rows[open]) != VENDOR_GUTTER_COLUMN {
+        return Block::Output;
+    }
+    let mut later = false;
+    // The nearest non-blank row below the one the walk stands on.
+    let mut below = &rows[open];
+    for row in rows[..open].iter().rev() {
+        if crate::text::trim(row).is_empty() {
+            let opens_an_item = leading_spaces(below) <= VENDOR_GUTTER_COLUMN
+                && !crate::text::trim_start(below).starts_with('⎿');
+            if opens_an_item {
+                return Block::Vendors;
+            }
+            continue;
+        }
+        below = row;
+        let lead = leading_spaces(row);
+        if lead == 0 {
+            return match (is_tool_call(row), later) {
+                (false, _) => Block::Vendors,
+                (true, true) => Block::UnderCall,
+                (true, false) => Block::Output,
+            };
+        }
+        later |= lead == VENDOR_GUTTER_COLUMN && crate::text::trim_start(row).starts_with('⎿');
+    }
+    Block::Vendors
+}
+
+/// A transcript row that opens a CALL — a tool's or a command's, whose `⎿`
+/// rows are what it printed, never anybody's words. Claude Code's forms
+/// (2.1.294, measured in `tools/real-claude-lab` and read from its binary):
+/// * `⏺ <Name>(…)`: a name of letters, digits, `_`, `:`, `.` or `-` (`⏺
+///   Bash(ls -la)`, `⏺ Update(notes.txt)`, `⏺ mcp__srv__tool(…)`), or one to
+///   three capitalised words (`⏺ Web Search(…)`), running straight into `(`;
+/// * an MCP tool by its `userFacingName`, `<server> - <title> (MCP)`, then
+///   its arguments' `(…)` or, with none, nothing (`⏺ github - get_issue
+///   (MCP)(owner: "acme")`, `⏺ github - ping (MCP)`); the server and the title
+///   may hold spaces (`⏺ ticket desk - …`, `⏺ claude.ai Gmail - …`), and a
+///   tool its server no longer lists is drawn `⏺ mcp__srv__tool (MCP)`;
+/// * an integration's tool, `<Name>[<tool>]` and its arguments or none (`⏺
+///   Claude in Chrome[get_page_text](tabId: 1)`);
+/// * a shell-mode command and its output: `! <command>` in column 0 (`❯
+///   !<command>` as an older echo drew it).
+///
+/// A completion notice (`⏺ Dynamic workflow "…" completed`, `⏺ Background
+/// command "…" completed`) and the worker's prose are not. The ONE reader of
+/// "a call" for every reader that needs it: this crate's wall placement
+/// (`notice`) and the worker's last words ([`crate::turn::said_tail`]), and
+/// aterm-agent's report blocks.
 pub fn is_tool_call(row: &str) -> bool {
+    if let Some(command) = row.strip_prefix('!').or_else(|| {
+        row.strip_prefix('❯')
+            .map(crate::text::trim_start)
+            .and_then(|r| r.strip_prefix('!'))
+    }) {
+        return !crate::text::trim(command).is_empty();
+    }
     let Some(rest) = row.strip_prefix(['⏺', '●']) else {
         return false;
     };
     let rest = crate::text::trim_start(rest);
-    let name_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-')))
-        .unwrap_or(rest.len());
-    name_len > 0 && rest[name_len..].starts_with('(')
+    if let Some((name, args)) = rest.split_once(" (MCP)")
+        && (name.contains(" - ") || name.starts_with("mcp__"))
+        && (crate::text::trim_end(args).is_empty() || args.starts_with('('))
+    {
+        return true;
+    }
+    bracketed_call(rest)
+        || rest
+            .find('(')
+            .is_some_and(|open| is_call_name(&rest[..open]))
+}
+
+/// `<Name>[<tool>]`, then the arguments' `(…)` or nothing: one to four words,
+/// the first capitalised, each of letters, digits, `_` or `-`, then the
+/// bracketed tool, a name with no space in it (`Claude in Chrome[read_page]`,
+/// its `userFacingName` in 2.1.294).
+fn bracketed_call(rest: &str) -> bool {
+    let Some((name, tail)) = rest.split_once('[') else {
+        return false;
+    };
+    let Some((tool, args)) = tail.split_once(']') else {
+        return false;
+    };
+    let words: Vec<&str> = name.split(' ').collect();
+    words.len() <= 4
+        && words
+            .first()
+            .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_uppercase()))
+        && words.iter().all(|w| {
+            !w.is_empty()
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        })
+        && !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        && (crate::text::trim_end(args).is_empty() || args.starts_with('('))
+}
+
+/// The name of a `Name(…)` call: one run of letters, digits, `_`, `:`, `.`
+/// or `-`, or one to three words each a capital letter then letters, digits,
+/// `_` or `-` (`Web Search`, `Edit Notebook`), forty characters at most.
+fn is_call_name(name: &str) -> bool {
+    let one = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'));
+    let words: Vec<&str> = name.split(' ').collect();
+    let capitalised = name.chars().count() <= 40
+        && words.len() <= 3
+        && words.iter().all(|w| {
+            w.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        });
+    one || capitalised
 }
 
 /// A notice in the footer, under the bottom rule (from row `from`) and above
@@ -1738,6 +1930,7 @@ fn footer_notice(
                         reset: reset_of(item),
                         row: i,
                         placement: Placement::Footer,
+                        under_call: false,
                     }
                 })
         })
@@ -1780,6 +1973,7 @@ fn banner_notice(
             reset: reset_of(t),
             row: i,
             placement: Placement::Banner,
+            under_call: false,
         })
     })
 }
@@ -4248,16 +4442,19 @@ mod tests {
             worker_phase(&with(&[SPINNER], &format!("  {NOTICE}"))),
             Phase::Busy
         );
+        // Under the gutter, hanging from the worker's words as Claude Code
+        // hangs its notices from the last thing drawn.
+        const SAID: &str = "⏺ The runs are queued.";
         let gutter = format!("  ⎿  {SHORTLY}");
         assert_eq!(
-            worker_phase(&with(&[gutter.as_str(), ""], IDLE_FOOTER)),
+            worker_phase(&with(&[SAID, gutter.as_str(), ""], IDLE_FOOTER)),
             Phase::Limited {
                 message: SHORTLY.to_string(),
                 reset: Some("shortly".to_string()),
             }
         );
         assert_eq!(
-            worker_phase(&with(&[gutter.as_str(), "", SPINNER], BUSY_FOOTER)),
+            worker_phase(&with(&[SAID, gutter.as_str(), "", SPINNER], BUSY_FOOTER)),
             Phase::Busy
         );
         // A banner that is not a notice stays what it was: parked, not the

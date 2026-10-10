@@ -96,6 +96,12 @@ pub trait Host: Copy + Eq + Debug {
     fn stall_stopped(stall: &Self::Stall) -> bool;
     /// The program outlived its restart signal.
     fn stall_survived(stall: &Self::Stall) -> bool;
+    /// The restart the host would CARRY for the stalled program, as a person
+    /// runs it (aterm's: `aterm ctl @<sid> restart pid=<leader>
+    /// if-stalled`), or `None` where it would not. Where it names one, the
+    /// spoken remedy names it — for a survivor too, in place of `signal
+    /// kill`; elsewhere the words name no command.
+    fn stall_restart(stall: &Self::Stall) -> Option<&str>;
     /// Whether `holder` is the drive-lease holder name of THIS process's own
     /// harness (ruling 313).
     fn is_aterms_holder(holder: &str) -> bool;

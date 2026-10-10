@@ -1020,6 +1020,7 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Release,
     };
     let _ = app.input(wid, release, Source::Human);
@@ -1051,6 +1052,7 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let _ = app.input(wid, press, Source::Human);

@@ -34,7 +34,7 @@
 //! Stops are warnings by default: where the harness would halt, end or wait
 //! on an agent on its own judgment, it says so and goes on. Each stop is one
 //! opt-in switch away: `upgrade_ask` (the live upgrade's notice and READY
-//! handshake), `stall_term` (a frozen agent ended with `signal term`),
+//! handshake), `stall_term` (a frozen agent restarted with `restart if-stalled`),
 //! `rm_breaker_ask` (under `approve = "safe"`, an unproven rm circuit breaker
 //! handed to a person). Written `true`, each is a limit by
 //! [`SupervisorConfig::limits`]'s measure (it takes the harness's own move
@@ -181,7 +181,7 @@ pub struct SupervisorConfig {
     pub approve: Approve,
     /// Folders whose trust dialog is answered under [`Approve::Safe`]. A
     /// leading `~/` is the home directory; a trailing `*` matches any suffix
-    /// of the last component (`~/aterm*` is every aterm worktree).
+    /// of the last component (`~/Developer/aterm*` is every aterm worktree).
     pub trust_roots: Vec<String>,
     /// Under `approve = "safe"`, hand an unproven rm circuit breaker to a
     /// person. Off (the default): the vendor's `rm` on a possibly-empty
@@ -240,39 +240,35 @@ pub struct SupervisorConfig {
     /// the reset (`limit-wait@v1`). Off: the dialog is a person's
     /// (owner, 2026-09-24).
     pub limit_wait: bool,
-    /// WHICH SESSIONS THE OWNER'S LISTED CLAUDE CODE ACCOUNTS ARE ROTATED FOR
-    /// (`accounts.toml` beside this file, `aterm harness accounts`;
+    /// Which sessions are rotated across the owner's listed Claude Code
+    /// accounts (`accounts.toml` beside this file, `aterm harness accounts`;
     /// `docs/DESIGN-claude-accounts-2026-10-01.md` §3, §6): a session whose
     /// turn ends on a usage limit is relaunched on its own conversation under
-    /// the next account that can be run on ([`Mode::Wall`]), and ahead of the
-    /// limit too ([`Mode::Early`], the default: at a plain turn end, off an
-    /// account another session found at its limit or one a `/usage` sample
-    /// shows low — the sample being the accounts probe's, which only `early`
-    /// makes: `/usage` typed at an idle turn end, the panel read and closed);
-    /// [`Mode::Off`], its limit, moves no session. Inert with no roster, so
-    /// full power needs no exception to the rule. The turn-end policy reads
-    /// only whether it is off (`policy::turn_end`); which account, when, and
-    /// whether a probe is claimed is the host's
-    /// (`crate::harness::accounts::advise`, which takes this mode;
-    /// `IdleHost::account_probe`).
+    /// the next runnable account ([`Mode::Wall`]), and ahead of the limit too
+    /// ([`Mode::Early`], the default: at a plain turn end, off an account
+    /// another session found at its limit, or one the accounts probe's
+    /// `/usage` sample shows low; only `early` probes: `/usage` typed at an
+    /// idle turn end, the panel read and closed). [`Mode::Off`], its limit,
+    /// moves no session. Inert with no roster, so full power needs no
+    /// exception to the rule. The turn-end policy reads only whether it is off;
+    /// which account and when is the host's
+    /// (`crate::harness::accounts::advise`, `IdleHost::account_probe`).
     pub accounts: Mode,
-    /// TAKE A LIMIT RESET THE PLAN OFFERS at Claude Code's usage-limit dialog,
-    /// in front of [`Self::limit_wait`]'s row (`limit-reset@v1`;
-    /// `docs/SPEC-claude-accounts-resets-2026-10-02.md`): only through the
-    /// dialog's own reset row, matched by its exact label, and then its
-    /// confirmation, read whole — keys only. No command is ever typed for
-    /// it, and a confirmation that does not read exactly is closed with the
-    /// reset kept. OFF BY DEFAULT: a reset is the owner's scarce purchase,
-    /// so `true` is more power, as [`Self::stall_term`]'s is —
-    /// [`Self::limit`] leaves it off and a misplaced table never turns it
-    /// on. It acts only with [`Self::resume_limits`] on (a reset is a way of
-    /// resuming a limit); that gate is the loop's, this reader takes the key
-    /// as written. BUILT, AND NEVER RUN AGAINST A REAL WALL: every reset
-    /// screen its reader knows was composed from the vendor's bundle, none
-    /// captured, and the default stays `false` until that spec's live check
-    /// (§6) has passed.
+    /// Take a limit reset the plan offers at Claude Code's usage-limit
+    /// dialog, ahead of [`Self::limit_wait`]'s row (`limit-reset@v1`;
+    /// `docs/SPEC-claude-accounts-resets-2026-10-02.md`): keys only, through
+    /// the dialog's reset row matched by its exact label, then its
+    /// confirmation read whole. No command is ever typed for it, and a
+    /// confirmation that does not read exactly is closed with the reset kept. Off by default: a reset is the owner's
+    /// scarce purchase, so `true` is more power, as [`Self::stall_term`]'s
+    /// is: [`Self::limit`] leaves it off and a misplaced table never turns it
+    /// on. Acts only with
+    /// [`Self::resume_limits`] on (the loop's gate; this reader takes the key
+    /// as written). Never yet run against a real wall: its screens were
+    /// composed from the vendor's bundle, so the default stays `false` until
+    /// that spec's live check (§6) passes.
     pub limit_reset: bool,
-    /// CLAUDE CODE'S model fallback: the model the agent is RELAUNCHED on at
+    /// Claude Code's model fallback: the model the agent is relaunched on at
     /// a model-bucket limit (`--model`, session-only — never Claude's
     /// `/model`, which saves the person's default), and back from at its
     /// reset; set, full power also switches Claude Code's model-refusal pause
@@ -298,12 +294,12 @@ pub struct SupervisorConfig {
     /// (`supervise/stall.rs`).
     pub relaunch: bool,
     /// How long an agent stands frozen (not reading its input, nobody's hand
-    /// on it) before the supervisor ends it with `signal term` for its
+    /// on it) before the supervisor restarts it (`restart if-stalled`) for its
     /// relaunch (`supervise/stall.rs`); `0` never. Its own limit, apart from
     /// [`Self::relaunch`]: the automatic end of a frozen worker can be
     /// switched off while crashes are still relaunched.
     pub stall_term_after_s: u32,
-    /// End a frozen agent with `signal term` once it has stood
+    /// Restart a frozen agent (`restart pid=<n> if-stalled`) once it has stood
     /// [`Self::stall_term_after_s`]. Off (the default): the same bound takes a
     /// warning instead (one line said and one record in the window's
     /// Messages, `supervise/stall.rs`), and the agent is left running for a
@@ -330,8 +326,8 @@ pub struct SupervisorConfig {
     /// work), and until then its tab only says that a newer build is installed
     /// and that it moves over when idle (owner, 2026-09-29).
     pub upgrade_ask: bool,
-    /// After a person's keystroke into a session, the supervisor keeps its
-    /// hands off that session for this many seconds.
+    /// Seconds the supervisor keeps its hands off a session after a person's
+    /// keystroke into it.
     pub human_grace_s: u32,
     /// Safe rules a retired key switched off ([`RETIRED_KEYS`]); no key of
     /// its own sets it.
@@ -367,9 +363,14 @@ impl Default for SupervisorConfig {
             enabled: true,
             headless: true,
             approve: Approve::All,
-            trust_roots: ["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]
-                .map(String::from)
-                .to_vec(),
+            trust_roots: [
+                "~/Developer/aterm*",
+                "~/Developer/ay*",
+                "~/Developer/trust*",
+                "/private/tmp/claude-*",
+            ]
+            .map(String::from)
+            .to_vec(),
             rm_breaker_ask: false,
             answer_questions: true,
             question_priority: QuestionPriority::Recommended,
@@ -431,10 +432,7 @@ impl SupervisorConfig {
             }
         };
         let flag = switch_word(v);
-        let text = {
-            let v = value.trim();
-            (!v.is_empty()).then(|| v.to_string())
-        };
+        let text = (!v.is_empty()).then(|| v.to_string());
         macro_rules! switch {
             ($field:ident) => {
                 match flag {
@@ -612,10 +610,9 @@ impl SupervisorConfig {
     /// is off, `approve` is `none`, a cap is one an hour, the grace is an
     /// hour, a frozen agent is never ended (`stall_term_after_s = 0`), no
     /// session is moved between accounts (`accounts = "off"`), no limit reset
-    /// is taken (`limit_reset = false`, its default);
-    /// a text keeps its default (no text limits more than another), and so
-    /// does `question_priority` — HOW a question is answered, no power to
-    /// take.
+    /// is taken (`limit_reset = false`, its default). A text and
+    /// `question_priority` (HOW a question is answered) keep their defaults:
+    /// neither carries power.
     pub fn limit(&mut self, key: &str) {
         match key {
             "enabled" => self.enabled = false,
@@ -856,9 +853,8 @@ impl SupervisorConfig {
     /// field moved, and no switch is on that was off, no approval looser, no
     /// cap higher or absent, no grace or stall bound shorter, no account mode
     /// wider, no trust root or fallback model new, and no text or question
-    /// priority changed (a text
-    /// neither limits nor grants, and neither does HOW a question is answered,
-    /// so where a key may only limit, neither is taken).
+    /// priority changed (neither limits nor grants, so where a key may only
+    /// limit, neither is taken).
     fn limits(&self, before: &Self) -> bool {
         let cap = |n: u32| if n == 0 { u32::MAX } else { n };
         let no_more = |now: bool, then: bool| !now || then;
@@ -2108,20 +2104,21 @@ mod tests {
         );
         // trust_roots is read only where `safe` consults it: fewer roots
         // there are a limit, more are the owner's own; under `all` neither.
-        let roots = "trust_roots = [\"~/aterm*\"]\n";
+        let roots = "trust_roots = [\"~/Developer/aterm*\"]\n";
         assert!(read(&format!("[harness]\n{roots}")).against_default() == Written::default());
         assert_eq!(
             read(&format!("[harness]\napprove = \"safe\"\n{roots}"))
                 .against_default()
                 .limits,
-            ["approve: safe", "trust_roots: ~/aterm*"]
+            ["approve: safe", "trust_roots: ~/Developer/aterm*"]
         );
-        let more = "trust_roots = [\"~/aterm*\", \"~/ay*\", \"$HOME/trust*\", \"/private/tmp/claude-*\", \"~/x\"]\n";
+        let more = "trust_roots = [\"~/Developer/aterm*\", \"~/Developer/ay*\", \
+                    \"~/Developer/trust*\", \"/private/tmp/claude-*\", \"~/x\"]\n";
         let w = read(&format!("[harness]\napprove = \"safe\"\n{more}")).against_default();
         assert_eq!((w.limits.len(), w.own), (1, vec!["trust_roots"]));
     }
 
-    /// D9: 0.93.0 shipped `approve_all`, `auto_reads`, `rm_breaker`,
+    /// Owner decision D9: 0.93.0 shipped `approve_all`, `auto_reads`, `rm_breaker`,
     /// `read_outside_cwd` and `trust_dialog`. One written `false` is a limit
     /// the owner wrote, so it is read as the limit it named (never lifted as
     /// "not a harness key") and said so, with the key to write instead;

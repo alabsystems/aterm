@@ -18,7 +18,8 @@ fn journal(done: Vec<String>) -> publish::Journal {
         build_number: 55,
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         min_build: Some(55),
-        arm64_only: false,
+        artifact: Some("aa".repeat(32)),
+        macho_sha256: Some("bb".repeat(32)),
         linux: None,
         manifest_signed: false,
         signature_required: false,
@@ -116,7 +117,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     // publication — visible-channel convergence), and unlock-complete.
     assert_eq!(
         publish::STEPS,
-        ["lock", "build", "selfcheck", "tag", "publish", "unlock"]
+        ["lock", "sign", "selfcheck", "tag", "publish", "unlock"]
     );
     for (abstract_count, concrete_count, action) in [
         (0, 0, "AdmitEmptyPrefix"),
@@ -145,7 +146,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     for done in [
         vec!["lock".into(), "unknown".into()],
         vec!["lock".into(), "lock".into()],
-        vec!["lock".into(), "build".into(), "unlock".into()],
+        vec!["lock".into(), "sign".into(), "unlock".into()],
     ] {
         assert!(journal(done).save(&path).is_err());
     }

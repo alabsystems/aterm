@@ -21,11 +21,11 @@ pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
 /// Page-backed storage internals. Exposed under `feature = "testing"` for
-/// downstream property tests and Kani; production uses [`Row`] and
+/// downstream property tests; production uses [`Row`] and
 /// [`PageStore`] (re-exported at the crate root).
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub mod page;
-#[cfg(not(any(test, kani, feature = "testing")))]
+#[cfg(not(any(test, feature = "testing")))]
 pub(crate) mod page;
 pub mod pin;
 pub mod row;
@@ -39,13 +39,6 @@ pub mod grid;
 pub(crate) mod test_counters;
 #[cfg(feature = "testing")]
 pub mod test_counters;
-
-// The Kani half of the verifier ledger. The ring harnesses in
-// `grid/proofs_kani_ring.rs` are `#[cfg(kani)]`; these `proof_anchor!`
-// registrations name them by string and are gated only by `spec-anchors` (or
-// `test`), so they register in normal builds.
-#[cfg(any(test, feature = "spec-anchors"))]
-mod spec_proof_anchors;
 
 // Re-export Grid and related types at crate root.
 pub use grid::Grid;
@@ -62,7 +55,7 @@ pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{
     Damage, DamageBoundsIterator, DamagedRowIterator, LineDamageBounds, RowDamageBounds,
 };
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub use extra::is_combining_mark;
 pub use extra::{
     CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
@@ -76,7 +69,7 @@ pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, Sty
 // Re-export page-level constants and harmless aliases needed by other crates.
 pub use page::PAGE_SIZE;
 pub use page::PageId;
-#[cfg(any(test, feature = "testing", kani))]
+#[cfg(any(test, feature = "testing"))]
 pub use pin::{Generation, Pin, PinnedRange};
 
 // Cursor, scroll region, and grid state types.
@@ -106,11 +99,3 @@ pub const MAX_GRID_ROWS: u16 = 4096;
 
 /// Maximum columns a [`Grid`] will hold; see [`MAX_GRID_ROWS`].
 pub const MAX_GRID_COLS: u16 = 4096;
-
-/// Maximum rows for Kani grid stubs.
-#[cfg(kani)]
-pub const KANI_MAX_ROWS: u16 = 8;
-
-/// Maximum columns for Kani grid stubs.
-#[cfg(kani)]
-pub const KANI_MAX_COLS: u16 = 16;

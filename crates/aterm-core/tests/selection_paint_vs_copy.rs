@@ -8,14 +8,10 @@
 //! half-cell anchors, so a drag can stop inside one. The renderer decides per
 //! cell (`RenderInput::selection_contains_cell` -> `TextSelection::contains_cell`)
 //! and the clipboard decides per column range (`Terminal::selection_to_string`).
-//! Two authorities over one boundary is how the highlight comes to cover half a
-//! character while the clipboard receives the whole one — literally
-//! not-what-you-see-is-what-you-get. [`glyph_cell_span`] is the one rule both
-//! consult, and these tests are what holds them to it.
-//!
-//! These tests reconstruct the painted run through the renderer's own frame and
-//! predicate and compare it to the copy, so the two cannot drift apart without
-//! one of them failing here.
+//! Two authorities over one boundary let the highlight cover half a character
+//! while the clipboard receives the whole one. [`glyph_cell_span`] is the one
+//! rule both consult; these tests reconstruct the painted run through the
+//! renderer's own frame and predicate and compare it to the copy.
 //!
 //! [`glyph_cell_span`]: aterm_types::selection::glyph_cell_span
 

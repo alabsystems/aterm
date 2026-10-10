@@ -23,10 +23,9 @@
 //! `incremental/` is the ONLY unit, by design: `deps/`, `build/` and
 //! `.fingerprint/` are `targo clean`'s. Cargo releases its locks before it
 //! runs tests, doctests or a runner, and those read `deps/` and `build/`, so
-//! no lock proves them unused (decided 2026-09-30 under the owner's standing
-//! direction: a boundary, not a follow-up).
+//! no lock proves them unused: a boundary, not a follow-up.
 //!
-//! ONE EXCEPTION, decided 2026-10-01: below the floor, a build directory
+//! ONE EXCEPTION: below the floor, a build directory
 //! whose OWNER IS GONE — an ended Claude Code session's scratch build, the
 //! cells cache of a removed checkout (`super::discover`'s owners) — goes
 //! WHOLE ([`reclaim_whole`]). The boundary's reason — no lock proves a test

@@ -12,20 +12,6 @@ use super::super::types::StreamingMatch;
 use super::super::types::{FilterMode, NavigationDirection, SearchState};
 use super::StreamingSearch;
 
-#[cfg(kani)]
-fn kani_retain<T: Clone>(items: &mut Vec<T>, mut keep: impl FnMut(&T) -> bool) {
-    let mut retained = Vec::new();
-    let mut index = 0;
-    while index < items.len() {
-        let item = items[index].clone();
-        if keep(&item) {
-            retained.push(item);
-        }
-        index += 1;
-    }
-    *items = retained;
-}
-
 /// Guards the one-time `aterm_log` warning emitted when a regex pattern first
 /// abandons a row on its scan budget. Process-wide and never reset: the point
 /// is to explain *once* why results are short, not to narrate every row.
@@ -115,9 +101,9 @@ impl StreamingSearch {
     /// Update the pattern incrementally (as user types).
     ///
     /// NOT a model action: pattern CONTENT is unbounded (no scalar twin); the
-    /// observable effect is `Start` (restart) or `Cancel` (cleared). Kani covers
-    /// it locally (`proofs_gaps.rs::update_pattern_*`, deliberately unanchored).
-    #[cfg(any(test, kani))]
+    /// observable effect is `Start` (restart) or `Cancel` (cleared), and
+    /// `verify_all_invariants` covers it locally (deliberately unanchored).
+    #[cfg(test)]
     pub fn update_pattern(&mut self, new_pattern: &str) -> Result<(), SearchError> {
         if !matches!(
             self.state,
@@ -174,7 +160,7 @@ impl StreamingSearch {
     /// one row contributes exactly one match or no matches, and the last-row
     /// auto-complete (`complete_search`) is folded into that atomic call. A
     /// general row may contribute multiple matches; that broader path is outside
-    /// the exact scalar transition and remains covered by local/Kani invariants.
+    /// the exact scalar transition and remains covered by `verify_all_invariants`.
     /// Returns the number of matches found in this row.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -614,7 +600,7 @@ impl StreamingSearch {
     /// Model action `Add` binds the Tier-1 unit-effect case where the row adds
     /// exactly one match. A general row may add multiple matches; that broader
     /// path is outside the exact scalar transition and remains covered by
-    /// local/Kani invariants. When in `NoResults` state and new content matches
+    /// `verify_all_invariants`. When in `NoResults` state and new content matches
     /// the query, transitions to `HasResults` so the user sees updated match count.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
@@ -706,15 +692,9 @@ impl StreamingSearch {
         // --- Remove stale matches for this row ---
         let removed_count = self.results.iter().filter(|m| m.row == row).count();
 
-        #[cfg(kani)]
-        kani_retain(&mut self.results, |m| m.row != row);
-        #[cfg(not(kani))]
         self.results.retain(|m| m.row != row);
 
         // Purge dedup entries for the row so re-scan can re-insert.
-        #[cfg(kani)]
-        kani_retain(&mut self.seen_positions, |(r, _)| *r != row);
-        #[cfg(not(kani))]
         self.seen_positions.retain(|(r, _)| *r != row);
 
         // Adjust total_matches by the number of removed stored results.
@@ -806,7 +786,7 @@ impl StreamingSearch {
     /// Model action `Invalidate` binds the Tier-1 unit-effect case where the
     /// range removes exactly one stored match. A general range may remove many
     /// matches in one atomic engine call; that broader path is outside the exact
-    /// scalar transition and remains covered by local/Kani invariants.
+    /// scalar transition and remains covered by `verify_all_invariants`.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -823,17 +803,9 @@ impl StreamingSearch {
         let prev_len = self.results.len();
 
         // Remove results in the invalidated range
-        #[cfg(kani)]
-        kani_retain(&mut self.results, |m| m.row < from_row || m.row > to_row);
-        #[cfg(not(kani))]
         self.results.retain(|m| m.row < from_row || m.row > to_row);
 
         // Update dedup set
-        #[cfg(kani)]
-        kani_retain(&mut self.seen_positions, |(row, _)| {
-            *row < from_row || *row > to_row
-        });
-        #[cfg(not(kani))]
         self.seen_positions
             .retain(|(row, _)| *row < from_row || *row > to_row);
 

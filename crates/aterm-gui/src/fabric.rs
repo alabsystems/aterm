@@ -2298,6 +2298,18 @@ fn posts_outstanding(store: &Store) -> bool {
 /// [`STALE_AFTER`] rather than either a stale verdict it has not earned or an
 /// exemption it has not earned either.
 fn settle_work_owed(store: &Store) {
+    // A SIBLING TEST'S RETIREMENT SETTLES NO SECTION'S DEBT (see
+    // [`LINK_SECTION`]). `outbox sent` and `deliver landed=` reconcile against
+    // their CALLER's store, and a test outside a live section has a store of
+    // its own with nothing outstanding: its retirement cleared the debt the
+    // section was measuring, and
+    // `a_bridge_that_owes_an_answer_reads_stale_and_a_quiet_one_does_not` read
+    // `connected` where it had made the debt `stale` (the gate, 2026-10-09).
+    // The arm, `note_work_owed`, already took this guard; the settle had not.
+    #[cfg(test)]
+    if link_section_is_foreign() {
+        return;
+    }
     let outstanding = posts_outstanding(store);
     let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
     link.owed_since = outstanding.then(std::time::Instant::now);
@@ -3052,6 +3064,9 @@ pub(crate) fn is_pty_reaching(verb: &str) -> bool {
             | "resize"
             | "focus"
             | "signal"
+            // The explicit restart ends the agent in the tab: halted as
+            // `signal` is.
+            | "restart"
             // The manual reset (2026-09-26): it moves the session's terminal
             // modes out from under whatever runs there, and `reset flush`
             // drops its input queue — a driver's act on the session, which a
@@ -7345,6 +7360,42 @@ mod inbox_hold {
                 "connected",
                 "the new incarnation has not been asked for anything yet"
             );
+        });
+    }
+
+    /// **A SIBLING'S RETIREMENT SETTLES NO SECTION'S DEBT.** `outbox sent` and
+    /// `deliver landed=` reconcile the owed clock against their caller's store
+    /// ([`settle_work_owed`]). A test outside this section retires a post of its
+    /// own on its own thread, where nothing is outstanding; that must not clear
+    /// the debt this section made `stale`. The retirement runs on a second
+    /// thread here, which is all that makes it a sibling's.
+    #[test]
+    fn a_siblings_retirement_does_not_settle_this_sections_debt() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(generation)), "OK\n");
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| settle_work_owed(&new_store()))
+                    .join()
+                    .expect("the sibling's retirement");
+            });
+            assert_eq!(
+                fabric_state(),
+                "stale",
+                "a sibling test's empty store settled this section's debt"
+            );
+
+            // CONTROL: the section's own retirement still settles it.
+            settle_work_owed(&new_store());
+            assert_eq!(fabric_state(), "connected");
         });
     }
 

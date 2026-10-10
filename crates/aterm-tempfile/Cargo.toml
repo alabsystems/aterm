@@ -7,14 +7,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Zero-dependency temporary files and directories with RAII cleanup"
+description = "Zero-dependency temporary directories with RAII cleanup"
 
 [features]
 # `stand_in`: executable stand-ins for tests, one shared inode per body (its doc
 # says why). Off by default, so no shipped build or verifier lane compiles it.
 stand-in = []
-
-[dependencies]
 
 [lints]
 workspace = true

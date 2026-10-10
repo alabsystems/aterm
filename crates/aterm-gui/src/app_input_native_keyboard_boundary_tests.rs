@@ -15,6 +15,7 @@ fn key(character: char, mods: Modifiers) -> InputEvent {
         key: Key::Character(character),
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -275,6 +276,7 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
                 key: Key::Named(aterm_types::keyboard::NamedKey::Escape),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             Source::Human,

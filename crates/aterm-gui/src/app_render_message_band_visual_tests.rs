@@ -428,7 +428,7 @@ fn first_run_read_at(extracted: u64) -> crate::PkgProgressSnapshot {
 /// and must leave the glass unchanged.
 fn record_the_answers(app: &mut App) {
     app.record_toolchain_outcome(toolchain_words::installed(INSTALLED));
-    app.post_machine_settings("spotlight-noindex 73 dir(s) migrated; universal-control disabled");
+    app.post_machine_settings("universal-control disabled");
     app.post_managed_current("claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)");
 }
 

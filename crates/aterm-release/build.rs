@@ -11,8 +11,8 @@
 //! binary that ran had been built from an older tree. It validated its own
 //! output against its own older rules and passed every gate.
 //!
-//! So the binary carries its own commit, and `gates::cutter_identity_gate`
-//! refuses a real cut whose stamp is not the tree's `HEAD`.
+//! So the binary carries its own commit, and `gates::own_cutter_gate` refuses
+//! a real cut whose stamp is not the commit it cuts.
 //!
 //! FAIL-CLOSED BY CONSTRUCTION. A build whose source closure is dirty carries
 //! Git's all-zero null object ID, which can never equal `HEAD`; when Git or the

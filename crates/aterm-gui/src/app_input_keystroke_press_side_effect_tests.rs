@@ -16,6 +16,7 @@ fn key(event_type: KeyEventType) -> InputEvent {
         key: Key::Character('a'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type,
     }
 }
@@ -26,6 +27,7 @@ fn modifier_press(key: Key) -> InputEvent {
         key,
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -36,6 +38,7 @@ fn fx_celebration_enter_uses_the_committed_input_path() {
         key: Key::Named(NamedKey::Enter),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     for (event, fires) in [
@@ -204,6 +207,7 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
         key: Key::Character('k'),
         mods: Modifiers::CTRL,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let class = classify_press(&ctrl_k);
@@ -284,18 +288,21 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
             key: Key::Character('u'),
             mods: Modifiers::CTRL,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         InputEvent::Key {
             key: Key::Character('w'),
             mods: Modifiers::CTRL,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         InputEvent::Key {
             key: Key::Named(NamedKey::Backspace),
             mods: Modifiers::ALT,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
     ] {
@@ -340,18 +347,21 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
             key: Key::Character('a'),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         InputEvent::Key {
             key: Key::Named(NamedKey::Enter),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         InputEvent::Key {
             key: Key::Named(NamedKey::Tab),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
     ];

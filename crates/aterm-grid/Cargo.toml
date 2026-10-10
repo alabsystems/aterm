@@ -20,8 +20,9 @@ disk-tier = ["aterm-scrollback/disk-tier"]
 alacritty-compat = []  # Expose legacy Alacritty-facing CellFlags aliases
 fuzz = ["aterm-scrollback/fuzz"]  # Expose fuzz-only APIs
 testing = []  # Expose test-only helpers for downstream crate tests
-# Register the ring-buffer kani harnesses as `proof_anchor!`s in the verifier ledger
-# (TRUST_NATIVE_TLA §4). Off by default so production builds carry no aterm-spec.
+# Compile the `#[refines]` anchors (page store, row, resize undo) into the library so
+# the `spec_xref_closure` gate in aterm-gui collects them. Off by default so
+# production builds carry no aterm-spec.
 spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
@@ -34,7 +35,7 @@ aterm-log = { workspace = true }
 aterm-hash = { workspace = true }
 aterm-alloc = { workspace = true }
 aterm-grapheme = { workspace = true }
-# Verifier-ledger anchors only (`spec-anchors`).
+# The `#[refines]` anchors only (`spec-anchors`).
 aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -43,7 +44,8 @@ aterm-spec = { workspace = true, optional = true }
 aterm-scrollback = { workspace = true, features = ["testing"] }
 aterm-tempfile = { workspace = true }
 aterm-selection = { workspace = true }
-# So the `#[cfg(test)]` `spec_proof_anchors` module compiles under a plain test run.
+# The `#[refines]` anchors under a plain test run, and the derived models and seeded
+# `XorShift` the tests use.
 aterm-spec = { workspace = true }
 
 [build-dependencies]

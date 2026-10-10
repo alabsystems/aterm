@@ -226,7 +226,7 @@ fn the_stray_probe_s_bed_bridges_a_real_word_hop_across_a_repaint() {
 fn a_nav_key_that_moved_nothing_licenses_no_cross_row_relocation_at_any_repaint_phase() {
     let targets = [
         (4u16, 90u16), // two rows down, across the pane
-        (5, 88),       // three rows down (the review's autorepeat face)
+        (5, 88),       // three rows down (an autorepeat face)
         (6, 3),        // four rows down, at the box's start (its worst face)
         (0, 30),       // two rows UP to an interior column
         (9, 3),        // seven rows down: the owner's measured stray

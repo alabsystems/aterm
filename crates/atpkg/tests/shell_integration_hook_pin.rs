@@ -1,9 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The shell integration re-sources atpkg's hook LIVE (2026-09-16, owner ask: "all the
-//! latest and best MUST WORK IN THE SAME TAB with live update") — so the two crates
-//! now share two facts that nothing else ties together, and this file pins both from
+//! The shell integration re-sources atpkg's hook LIVE, in the same tab — so the two
+//! crates share two facts that nothing else ties together, and this file pins both from
 //! atpkg's side (`aterm-shell-integration` cannot depend on `atpkg`):
 //!
 //! 1. THE HOOK PATH SPELLING. Each script hard-codes `~/.aterm/shell.d/00-atpkg.<ext>`

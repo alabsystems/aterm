@@ -57,6 +57,19 @@ fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut St
     }
 }
 
+/// What a row extraction does with the blanks at the end of its range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailingBlanks {
+    /// Drop trailing whitespace: the row ends a logical line (or the reader
+    /// wants it trimmed), so the blanks after its text are layout.
+    Trim,
+    /// Keep every cell the program wrote, blanks included, and nothing past
+    /// that: what a history [`Line`](aterm_scrollback::Line) stores for the row.
+    /// A cell past `Row::len` was never written (an untouched tail, or the cell
+    /// a wide glyph left when it wrapped early), so it is not text.
+    Written,
+}
+
 /// Extract live-frame (screen-row, display_offset-independent) row text for an
 /// inclusive column range.
 #[must_use]
@@ -65,6 +78,7 @@ pub(crate) fn visible_row_bounds_to_string(
     row: u16,
     start_col: u16,
     end_col: u16,
+    trailing: TrailingBlanks,
 ) -> String {
     // Clamp end_col to the grid width: `side_adjusted_bounds` uses u16::MAX as
     // an "entire row" sentinel.
@@ -101,13 +115,21 @@ pub(crate) fn visible_row_bounds_to_string(
         usize::from(end_col.saturating_sub(effective_start)).saturating_add(1),
     );
     if let Some(cells) = grid.row_at_screen(row) {
-        for col in effective_start..=end_col {
-            push_row_cell_text(grid, row, cells, col, &mut line);
+        let end_col = match trailing {
+            TrailingBlanks::Trim => Some(end_col),
+            TrailingBlanks::Written => cells.len().checked_sub(1).map(|last| end_col.min(last)),
+        };
+        if let Some(end_col) = end_col {
+            for col in effective_start..=end_col {
+                push_row_cell_text(grid, row, cells, col, &mut line);
+            }
         }
     }
 
-    let trimmed_len = line.trim_end().len();
-    line.truncate(trimmed_len);
+    if trailing == TrailingBlanks::Trim {
+        let trimmed_len = line.trim_end().len();
+        line.truncate(trimmed_len);
+    }
     line
 }
 
@@ -297,11 +319,29 @@ impl Terminal {
     // Smart Selection API
     // ========================================================================
 
+    /// How wide the grid writes an East Asian Ambiguous character (`→`, `─`,
+    /// `°`): the `ambiguous_width` policy. Every text measurer that maps text
+    /// back to grid columns (find, a scrollback copy, a double-click's word
+    /// bounds) measures under it, so its columns are the cells the grid drew.
+    ///
+    /// The policy in force now: a row written before a live switch keeps the
+    /// geometry it was written with (`apply_config` reflows nothing), and is
+    /// measured under the new policy.
+    #[must_use]
+    pub fn ambiguous_width(&self) -> aterm_types::text_shaping::AmbiguousWidth {
+        if self.modes.ambiguous_width_double {
+            aterm_types::text_shaping::AmbiguousWidth::Double
+        } else {
+            aterm_types::text_shaping::AmbiguousWidth::Single
+        }
+    }
+
     /// Text of an absolute terminal row (the search index's coordinate), read
     /// from the same sources `build_search_index` indexes, so a snippet equals
     /// the line the match came from: history via the bounded
-    /// `get_history_line`, visible rows via `get_line_text`. `None` when `abs`
-    /// is evicted or past the live viewport. Feeds `search_summary`'s snippet.
+    /// `get_history_line`, visible rows via `written_line_text`. `None` when
+    /// `abs` is evicted or past the live viewport. Feeds `search_summary`'s
+    /// snippet.
     #[must_use]
     pub fn abs_row_text(&self, abs: u64) -> Option<String> {
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
@@ -322,7 +362,7 @@ impl Terminal {
             return None;
         }
         let r = i32::try_from(visible_row).ok()?;
-        self.get_line_text(r, None)
+        self.written_line_text(r)
     }
 
     /// Smart word boundaries at a position on a display-relative row.
@@ -340,7 +380,7 @@ impl Terminal {
         smart: &crate::selection::SmartSelection,
     ) -> Option<(usize, usize)> {
         let text = self.display_row_text(row)?;
-        smart.word_boundaries_at_column(&text, col)
+        smart.word_boundaries_at_column_with(&text, col, self.ambiguous_width())
     }
 }
 

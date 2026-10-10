@@ -4,7 +4,10 @@
 
 //! Mouse-based text selection state machine.
 //!
-//! Specified in `docs/DESIGN-selection-custody-2026-08-21.md` §5.2.
+//! Specified in `docs/DESIGN-selection-custody-2026-08-21.md` §5.2; the
+//! lifecycle below is the `TextSelectionLifecycle` model
+//! (`aterm_spec::derive::text_selection_lifecycle_model`), bound to these calls
+//! by `tests/conformance_text_selection.rs`.
 //!
 //! Selection lifecycle:
 //! - None -> InProgress (start selection on mouse down)
@@ -46,11 +49,6 @@ pub struct SelectionProjection {
     pub is_block: bool,
 }
 
-#[cfg(kani)]
-mod anchor_proofs;
-#[cfg(kani)]
-mod state_machine_proofs;
-
 #[cfg(test)]
 mod tests;
 
@@ -87,20 +85,6 @@ impl SelectionAnchor {
     #[inline]
     pub(super) const fn new(row: i32, col: u16, side: SelectionSide) -> Self {
         Self { row, col, side }
-    }
-
-    /// Create an anchor at the left side of a cell.
-    #[inline]
-    #[cfg(kani)]
-    pub(super) const fn left(row: i32, col: u16) -> Self {
-        Self::new(row, col, SelectionSide::Left)
-    }
-
-    /// Create an anchor at the right side of a cell.
-    #[inline]
-    #[cfg(kani)]
-    pub(super) const fn right(row: i32, col: u16) -> Self {
-        Self::new(row, col, SelectionSide::Right)
     }
 }
 
@@ -169,14 +153,14 @@ impl TextSelection {
     }
 
     /// Check if selection is complete (mouse button released).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn is_complete(&self) -> bool {
         matches!(self.state, SelectionState::Complete)
     }
 
     /// Check if selection is in progress (mouse button held).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn is_in_progress(&self) -> bool {
         matches!(self.state, SelectionState::InProgress)
@@ -439,6 +423,14 @@ impl TextSelection {
     /// Start a new selection.
     ///
     /// This clears any existing selection and begins a new one at the given position.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "text_selection_lifecycle",
+            action = "Start",
+            project = "conformance_text_selection::project"
+        )
+    )]
     pub fn start_selection(
         &mut self,
         row: i32,
@@ -459,6 +451,14 @@ impl TextSelection {
     /// Update the selection endpoint (during mouse drag).
     ///
     /// Only works when selection is in progress.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "text_selection_lifecycle",
+            action = "Update",
+            project = "conformance_text_selection::project"
+        )
+    )]
     pub fn update_selection(&mut self, row: i32, col: u16, side: SelectionSide) {
         if self.state == SelectionState::InProgress {
             self.end = SelectionAnchor::new(row, col, side);
@@ -466,6 +466,14 @@ impl TextSelection {
     }
 
     /// Complete the selection (mouse button released).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "text_selection_lifecycle",
+            action = "Complete",
+            project = "conformance_text_selection::project"
+        )
+    )]
     pub fn complete_selection(&mut self) {
         if self.state == SelectionState::InProgress {
             self.state = SelectionState::Complete;
@@ -473,6 +481,14 @@ impl TextSelection {
     }
 
     /// Clear the selection.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "text_selection_lifecycle",
+            action = "Clear",
+            project = "conformance_text_selection::project"
+        )
+    )]
     pub fn clear(&mut self) {
         self.state = SelectionState::None;
         // Anchors are left stale; the truncation report goes with the span.
@@ -485,6 +501,14 @@ impl TextSelection {
     /// Moves the end anchor to the new position and re-enters `InProgress`
     /// state so that `update_selection` / `complete_selection` can refine
     /// the endpoint further.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "text_selection_lifecycle",
+            action = "Extend",
+            project = "conformance_text_selection::project"
+        )
+    )]
     pub fn extend_selection(&mut self, row: i32, col: u16, side: SelectionSide) {
         if self.state == SelectionState::Complete {
             let moving_anchor = SelectionAnchor::new(row, col, side);

@@ -47,6 +47,10 @@ pub mod cli;
 pub mod differential;
 pub mod disk;
 pub mod exec;
+/// aterm-digest's FIPS 180-4 SHA-256, compiled in by path as the toolchain
+/// resolution is (this crate takes no dependencies); [`sha256`] is its face here.
+#[path = "../../aterm-digest/src/sha256.rs"]
+mod fips_sha256;
 pub mod first_exec;
 pub mod glob;
 pub mod identity;
@@ -57,6 +61,41 @@ pub mod plan;
 pub mod receipt;
 pub mod sched;
 pub mod scope;
+
+/// SHA-256 — the ONE in the tree (`crates/aterm-digest/src/sha256.rs`), so the key a
+/// MEASURE receipt is filed under and the digest the release cutter keys the bytes it
+/// signs by are one function.
+pub mod sha256 {
+    pub use crate::fips_sha256::Sha256;
+
+    /// The digest of `bytes`, lowercase hex.
+    #[must_use]
+    pub fn hex(bytes: &[u8]) -> String {
+        lower_hex(&Sha256::digest(bytes))
+    }
+
+    /// The digest of the file at `path`, read in 1 MiB pieces, lowercase hex.
+    ///
+    /// # Errors
+    /// The file cannot be opened or read.
+    pub fn file_hex(path: &std::path::Path) -> std::io::Result<String> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(lower_hex(&h.finalize()));
+            }
+            h.update(&buf[..n]);
+        }
+    }
+
+    fn lower_hex(digest: &[u8]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
 // The smokes drive a unix control socket with unix process plumbing; off unix
 // the two smoke rows are named skips (`stages::run_stage`).
 #[cfg(unix)]
@@ -108,8 +147,6 @@ pub struct EnvSnapshot {
     pub path: OsString,
     pub home: PathBuf,
     pub trust_stage2_bin: Option<PathBuf>,
-    pub trust_mc_sysroot: Option<PathBuf>,
-    pub ay_bin_dir: Option<PathBuf>,
     /// `XDG_CONFIG_HOME`: where atpkg's config (`aterm/aterm.toml`, the
     /// `[packages].prefix` override) lives ([`toolchain::atpkg_prefix`]).
     pub xdg_config_home: Option<PathBuf>,
@@ -138,8 +175,6 @@ impl EnvSnapshot {
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: var_path("HOME").unwrap_or_default(),
             trust_stage2_bin: var_path("TRUST_STAGE2_BIN"),
-            trust_mc_sysroot: var_path("TRUST_MC_SYSROOT"),
-            ay_bin_dir: var_path("AY_BIN_DIR"),
             xdg_config_home: var_path("XDG_CONFIG_HOME").filter(|p| !p.as_os_str().is_empty()),
             rustup_home: std::env::var_os("RUSTUP_HOME"),
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
@@ -150,6 +185,50 @@ impl EnvSnapshot {
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
         }
+    }
+}
+
+/// THE BYTES MEASURE JUDGES (2026-10-09, build once): a release bundle the
+/// release built once and hands the MEASURE tier (`--measure <APP>`, `--full
+/// <APP>`), never a release `aterm` the gate builds itself. Its executable's
+/// SHA-256 is the key the MEASURE receipt is filed under
+/// ([`receipt::measure_key`]), so `measured yes` is a fact about these bytes, and
+/// the release signs only bytes whose digest holds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasureArtifact {
+    /// The bundle, canonical: `<…>/aterm.app`.
+    pub app: PathBuf,
+    /// SHA-256 of `<app>/Contents/MacOS/aterm`, lowercase hex.
+    pub macho_sha256: String,
+}
+
+impl MeasureArtifact {
+    /// The bundle at `app`: a directory holding an executable
+    /// `Contents/MacOS/aterm`, digested now.
+    ///
+    /// # Errors
+    /// What `app` is instead, in words: no such bundle, no executable `aterm` in
+    /// it, or an executable that cannot be read.
+    pub fn at(app: &Path) -> Result<Self, String> {
+        let app = std::fs::canonicalize(app)
+            .map_err(|e| format!("{} is not a release bundle: {e}", app.display()))?;
+        let aterm = app.join("Contents/MacOS/aterm");
+        if !is_executable_file(&aterm) {
+            return Err(format!(
+                "{} is not a release bundle: it holds no executable Contents/MacOS/aterm",
+                app.display()
+            ));
+        }
+        let macho_sha256 =
+            sha256::file_hex(&aterm).map_err(|e| format!("read {}: {e}", aterm.display()))?;
+        Ok(Self { app, macho_sha256 })
+    }
+
+    /// `<app>/Contents/MacOS/<name>`: `aterm`, or one of the argv0 names the
+    /// bundle links to it (`aterm-gui`, `aterm-ctl`).
+    #[must_use]
+    pub fn bin(&self, name: &str) -> PathBuf {
+        self.app.join("Contents/MacOS").join(name)
     }
 }
 
@@ -192,9 +271,12 @@ pub struct Ctx {
     /// `--no-windows`: every stage that puts a window on the desktop
     /// ([`plan::WINDOWED`]) answers a named SKIP.
     pub no_windows: bool,
-    /// `--compile-qos`: the tier every compile-only child runs at
-    /// ([`exec::CompileQos`]) — UTILITY, unless this is a release's MEASURE run.
-    pub compile_qos: exec::CompileQos,
+    /// The release bundle the MEASURE tier judges (`--measure <APP>`, `--full
+    /// <APP>`): the paint and spin suites are handed its `aterm`, the pacing
+    /// smoke drives its `aterm-gui` and `aterm-ctl`, and the run's MEASURE
+    /// receipt is filed under its executable's digest. `None` for a run of the
+    /// LAND tier alone; a MEASURE stage without one COULD NOT RUN.
+    pub measure_artifact: Option<MeasureArtifact>,
     /// The source state a snapshot's sync verified. The tripwire arms on it
     /// (and compares it with a fresh capture) rather than re-arming from
     /// whatever the root holds by the time the ladder starts.
@@ -247,9 +329,9 @@ pub struct Ctx {
     /// a `Ctx` and it says `None`, and nothing in `main.rs` or `cli.rs` sets it.
     pub only_stages: Option<Vec<plan::StageId>>,
     /// The host's physical memory in bytes ([`exec::host_memory_bytes`]),
-    /// which decides whether the MEASURE tier's workspace build may overlap the
-    /// land tier's ([`plan::measure_overlap`]). `None` — unread, and in every
-    /// `Ctx` a test makes unless it says otherwise — takes the serial order.
+    /// which sizes the land tier's builds at once ([`plan::land_builds`]) and
+    /// the test pool ([`testrun::memory_jobs`]). `None` — unread, and in every
+    /// `Ctx` a test makes unless it says otherwise — takes the floor pool.
     pub host_memory: Option<u64>,
     /// `host_memory` is Linux's `MemTotal`, which reads under the installed
     /// RAM, so a RAM figure derived from it says so.
@@ -372,8 +454,7 @@ pub const LIBTEST_UNSTABLE_ENV: [&str; 5] = [
 pub const CHILD_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 
 /// The run's toolchain, discovered once from `env` under the pin `root` declares
-/// and the atpkg prefix atpkg itself would read (also handed to the trust-mc / ay
-/// store probes in `stages::kani_floor`).
+/// and the atpkg prefix atpkg itself would read.
 ///
 /// `main` calls this once and hands the result to the lane stamp, `--changed`'s
 /// selection and every stage ([`Ctx::new_with_tools`]). Separate discoveries can
@@ -437,7 +518,7 @@ impl Ctx {
                 .collect(),
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
-            compile_qos: exec::CompileQos::Utility,
+            measure_artifact: None,
             source_baseline: None,
             disk_budget: disk::Budget::MEASURED,
             disk_floor: None,
@@ -662,19 +743,19 @@ impl Ctx {
         self
     }
 
-    /// `--compile-qos`: the tier of every [`exec::Cmd::demoted`] child. A run
-    /// that keeps them at the inherited tier says so on its header, so a
-    /// ladder read later shows its compiles did not yield to the desktop.
+    /// The release bundle the MEASURE tier judges ([`Ctx::measure_artifact`]),
+    /// named on the run's header with the digest its receipt is filed under.
     #[must_use]
-    pub fn with_compile_qos(mut self, qos: exec::CompileQos) -> Self {
-        self.compile_qos = qos;
-        if qos == exec::CompileQos::Inherited {
-            self.notes.push(
-                "verify: compile children at the inherited QoS (--compile-qos inherited: a \
-                 release's MEASURE run, whose compile must not yield to peers' builds)"
-                    .to_string(),
-            );
+    pub fn with_measure_artifact(mut self, artifact: Option<MeasureArtifact>) -> Self {
+        if let Some(a) = &artifact {
+            self.notes.push(format!(
+                "verify: MEASURE judges {} (Contents/MacOS/aterm sha256 {}) — the bytes a \
+                 release signs; this run builds no release aterm",
+                a.app.display(),
+                a.macho_sha256
+            ));
         }
+        self.measure_artifact = artifact;
         self
     }
 
@@ -713,16 +794,17 @@ impl Ctx {
     /// [`Ctx::with_memory_build_jobs`] on a host with `cores` cores.
     fn with_memory_build_jobs_on(mut self, cores: u32) -> Self {
         // EVERY MODE, NOT ONLY THE LAND TIER (2026-10-06): a `--measure` run has
-        // no land-tier build to serialise, but its release build still ran
-        // cargo's six compilers on 4.4 GiB. The trigger is the degraded host
+        // no land-tier build to serialise, but its release build (the gate's own
+        // until 2026-10-09) still ran cargo's six compilers on 4.4 GiB, and its
+        // measuring tests still compile. The trigger is the degraded host
         // itself — wired memory past the allowance, the figure every other
         // memory decision reads ([`plan::build_memory`]) — not one plan's shape.
         // The side lanes name their own `CARGO_BUILD_JOBS`, which beats
         // `child_env_add` ([`exec::ExecEnv::add_env`]), so the cap reaches them
         // through `memory_jobs` and [`Ctx::build_jobs_ceiling`] — recorded on
-        // EVERY degraded host (review of 2026-10-07): their constants (driver 8,
-        // release 6) exceed a small host's cores, so a 2-core host with 4.5 GiB
-        // usable, which needs no export, still ran 8 driver compilers.
+        // EVERY degraded host (review of 2026-10-07): their constants (driver 8)
+        // exceed a small host's cores, so a 2-core host with 4.5 GiB usable,
+        // which needs no export, still ran 8 driver compilers.
         let held = memory_jobs_held(self.host_memory, self.host_usable);
         self.memory_jobs = held;
         let caller = parse_build_jobs(self.env.cargo_build_jobs.as_deref());
@@ -740,7 +822,6 @@ impl Ctx {
             // notes say only what they change.
             let widest = [
                 plan::Lane::DriverTarget,
-                plan::Lane::ConformanceRelease,
                 plan::Lane::XtaskTarget,
                 plan::Lane::TrustTarget,
             ]
@@ -856,7 +937,6 @@ impl Ctx {
             child_ceiling: self.child_ceiling,
             remove_env: &self.child_env_remove,
             add_env: &self.child_env_add,
-            compile_qos: self.compile_qos,
         }
     }
 
@@ -993,13 +1073,13 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     for note in &ctx.notes {
         writeln!(out, "{note}")?;
     }
-    // On a host too small for both tiers' builds at once, say before an hour
-    // is spent that the MEASURE tier waits ([`plan::measure_overlap`]); on one
-    // with no room beside the land tier's builds, that the trust lane waits
-    // ([`plan::trust_overlap`]); and how wide the test pool is
-    // ([`plan::test_pool_note`]); on one whose wired memory leaves too little
-    // for the land tier's builds at once, that they build one at a time
-    // ([`plan::land_builds`]). The RAM is stated once, before them.
+    // Say before an hour is spent how wide the test pool is
+    // ([`plan::test_pool_note`]) and, on a host whose wired memory leaves too
+    // little for the land tier's builds at once, that they build one or two
+    // at a time ([`plan::land_builds`]); the RAM is stated once, before them.
+    // Then, apart from memory, that the trust lane waits for the land tier's
+    // builds, test run and doctests, and why ([`plan::trust_overlap`]: the
+    // verifier's budgets are clocks).
     let stages = plan::plan(ctx);
     for line in plan::memory_notes(
         ctx.host_memory,
@@ -1008,6 +1088,9 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         &stages,
         ctx.test_jobs(),
     ) {
+        writeln!(out, "{line}")?;
+    }
+    if let Some(line) = plan::trust_overlap(&stages).note() {
         writeln!(out, "{line}")?;
     }
 
@@ -1228,13 +1311,14 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         reports.push(r);
     }
     // Did this run measure the tree: asked of the MEASURE tier's own stages, not
-    // the verdict (a skipped Kani floor still measured; a red paint row did not,
+    // the verdict (a skipped cross-cell check still measured; a red paint row did not,
     // whatever main's receipt excuses).
     let stage_reports = &reports[ctx.prelude.len()..ctx.prelude.len() + stages.len()];
-    let measured = ctx
-        .mode
-        .runs(plan::Tier::Measure)
-        .then(|| verdict::measured(&stages, stage_reports, &ctx.scope, moved.is_some()));
+    let measured = ctx.mode.runs(plan::Tier::Measure).then(|| {
+        // The bytes the receipt is filed under must still be the bytes judged.
+        artifact_unmoved(ctx.measure_artifact.as_ref())
+            .and_then(|()| verdict::measured(&stages, stage_reports, &ctx.scope, moved.is_some()))
+    });
 
     // A planned stage that recorded no outcome is invisible to `tally`, so a
     // whole-tree run missing it could still print the merge-contract sentence.
@@ -1346,6 +1430,27 @@ struct Judged<'a> {
     loads: Vec<(ladder::StageLoad, String)>,
 }
 
+/// A MEASURE run's artifact is still the bytes it was handed: its executable's
+/// digest at the end of the run is the digest its receipt is filed under
+/// ([`MeasureArtifact::macho_sha256`]). A run handed none measured nothing.
+fn artifact_unmoved(artifact: Option<&MeasureArtifact>) -> Result<(), String> {
+    let Some(a) = artifact else {
+        return Err("no release bundle was handed to judge (--measure <APP>)".to_string());
+    };
+    match sha256::file_hex(&a.bin("aterm")) {
+        Ok(now) if now == a.macho_sha256 => Ok(()),
+        Ok(now) => Err(format!(
+            "{}'s executable changed under the run ({} -> {now})",
+            a.app.display(),
+            a.macho_sha256
+        )),
+        Err(e) => Err(format!(
+            "{}'s executable could not be read again: {e}",
+            a.app.display()
+        )),
+    }
+}
+
 /// Publish a `--baseline` run's receipt ([`differential::publish`]) and say
 /// what happened, in one line. A failure costs other machines the baseline,
 /// never this run its verdict: the receipt already stands in the store every
@@ -1375,8 +1480,9 @@ fn publish_line(caller: &Path, head: &str, text: &str, ctx: &Ctx) -> String {
 /// where the release cutter reads it (`crates/aterm-release/src/gates.rs`
 /// `receipt_report`): filed under the commit and `<commit>^{tree}`, naming the
 /// scope (`changed:<base>` for a change-scoped run), the compiler and the spec
-/// checkers. A MEASURE-tier run also records `measured yes|no` under the measure
-/// keys (`gates::measure_report`); a `--measure` run files there only.
+/// checkers. A MEASURE-tier run also records `measured yes|no` and the artifact
+/// it judged under that artifact's measure key (`gates::measured`); a
+/// `--measure` run files there only.
 ///
 /// It itemizes every finding with when main first went red on it (from
 /// `judged.since_from`), the reds the since chain held that this run could not
@@ -1431,6 +1537,10 @@ fn write_receipt(
         .to_string(),
         merge_contract: verdict.claims_merge_contract,
         measured: judged.measured,
+        artifact: judged
+            .measured
+            .and(ctx.measure_artifact.as_ref())
+            .map(|a| a.macho_sha256.clone()),
         skipped: receipt::skipped_line(&tally.skips),
         toolchain: tools.toolchain,
         checkers: tools.checkers,
@@ -1772,16 +1882,15 @@ mod tests {
     }
 
     /// The side lanes this file's tests judge, with their own job counts.
-    const SIDE_LANES: [plan::Lane; 4] = [
+    const SIDE_LANES: [plan::Lane; 3] = [
         plan::Lane::DriverTarget,
-        plan::Lane::ConformanceRelease,
         plan::Lane::XtaskTarget,
         plan::Lane::TrustTarget,
     ];
 
     /// THE SIDE LANES TAKE THE MEMORY'S FIGURE ON EVERY DEGRADED HOST (the
-    /// review of 2026-10-07): their own counts (driver 8, release 6, xtask and
-    /// trust 4) can exceed a small host's cores, so the figure is their ceiling
+    /// review of 2026-10-07): their own counts (driver 8, xtask and trust 4)
+    /// can exceed a small host's cores, so the figure is their ceiling
     /// even where the main lane needs no export. Until then a 2-core host with
     /// 4.5 GiB usable ran 8 driver compilers, and a 4-core one with 12 GiB
     /// usable of 16 ran 8 where the memory holds 6. The ceiling never raises a
@@ -1794,13 +1903,13 @@ mod tests {
         let two_core = (Some(8 * GIB), Some(GIB * 9 / 2));
         assert_eq!(memory_job_cap(two_core.0, two_core.1, 2, None), None);
         assert_eq!(memory_jobs_held(two_core.0, two_core.1), Some(2));
-        assert_eq!(lanes(Some(2)), [Some(2); 4], "2 cores, 4.5 GiB usable");
+        assert_eq!(lanes(Some(2)), [Some(2); 3], "2 cores, 4.5 GiB usable");
         let four_core = (Some(16 * GIB), Some(12 * GIB));
         assert_eq!(memory_job_cap(four_core.0, four_core.1, 4, None), None);
         assert_eq!(memory_jobs_held(four_core.0, four_core.1), Some(6));
         assert_eq!(
             lanes(Some(6)),
-            [Some(6), Some(6), Some(4), Some(4)],
+            [Some(6), Some(4), Some(4)],
             "4 cores, 12 GiB usable of 16"
         );
         // Roomy yet past the allowance: the figure is above every constant.
@@ -2073,41 +2182,6 @@ mod tests {
             ctx().with_child_ceiling(off).exec_env().child_ceiling,
             None,
             "and an operator who types `off` gets the old unbounded wait"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn every_child_gets_the_compile_qos_the_flag_set() {
-        // The wiring from `--compile-qos` to the value every stage child is
-        // launched with (`Ctx::exec_env`; exec.rs decides what it does), and the
-        // header line that says a run did not demote its compiles.
-        let tmp = mktemp_dir("atv-compile-qos").expect("mktemp");
-        let ctx = || {
-            Ctx::new(
-                tmp.clone(),
-                Mode::Measure,
-                Scope::Workspace,
-                EnvSnapshot::default(),
-                tmp.clone(),
-            )
-        };
-        let plain = ctx();
-        assert_eq!(plain.exec_env().compile_qos, exec::CompileQos::Utility);
-        assert!(
-            !plain.notes.iter().any(|n| n.contains("QoS")),
-            "{:?}",
-            plain.notes
-        );
-        let release = ctx().with_compile_qos(exec::CompileQos::Inherited);
-        assert_eq!(release.exec_env().compile_qos, exec::CompileQos::Inherited);
-        assert!(
-            release
-                .notes
-                .iter()
-                .any(|n| n.contains("--compile-qos inherited")),
-            "{:?}",
-            release.notes
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

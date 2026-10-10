@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 //
-// REAL heap-delta verification for SearchIndex::release / TerminalSearch::release
-// (Wave-4A prescription a). A logical `clear()` empties the containers but a
+// REAL heap-delta verification for SearchIndex::release / TerminalSearch::release.
+// A logical `clear()` empties the containers but a
 // HashMap/Vec RETAINS its grown capacity (and the bloom keeps its bit array), so
 // a cleared idle document still pins its peak footprint. `release()` must return
 // that capacity to the allocator. "Logical clears insufficient" is not provable
@@ -209,13 +209,13 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
         "negative control must retain enough row data to fail the scan bound: {retained} bytes"
     );
     // Text alone exceeds the allowance, independently of batch-only postings:
-    // the old columns-only BudgetedSearch would fail the same live-heap bound.
+    // a scan that kept only rows' column maps would fail the same bound.
     assert!(row.len() * SCAN_ROWS > 4 * SCRATCH_ALLOWANCE as usize);
 
     // -------- (5) screen refreshes do not inflate the filter's live heap ---
     // One wide row isolates filter growth from line and posting allocations.
-    // Previously every unchanged refresh counted thousands of duplicate
-    // trigram inserts, growing the filter by hundreds of KiB.
+    // Counting duplicate trigram inserts per refresh would grow the filter by
+    // hundreds of KiB.
     let wide = "compiler_worker emitted another build diagnostic ".repeat(100);
     let mut refreshed = SearchIndex::new();
     refreshed.index_line(0, &wide);
@@ -242,9 +242,9 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     );
     drop(capped);
 
-    // Actual allocation control: this asks for the full million-row tables
-    // that the previous constructor reserved even with the 32-row cap. There
-    // is no content allocation, and it is released before the next assertion.
+    // Allocation control: the full million-row tables an uncapped reservation
+    // asks for. No content is allocated, and it is released before the next
+    // assertion.
     let before_full_reservation = net();
     let full_reservation = SearchIndex::with_capacity_and_max(1_000_000, 1_000_000);
     let full_bytes = net() - before_full_reservation;
@@ -257,8 +257,8 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
 
     // -------- (7) a full history's front eviction does not decode survivors -
     // One shared trigram isolates posting maintenance while the real index
-    // drops and appends rows. Count GROSS allocation, since the former decode
-    // scratch was freed immediately and was invisible to net-heap readings.
+    // drops and appends rows. Count GROSS allocation: decode scratch would be
+    // freed immediately and so is invisible to net-heap readings.
     const HISTORY_ROWS: usize = 10_000;
     const ADVANCES: usize = 256;
     let mut moving = SearchIndex::with_capacity_and_max(HISTORY_ROWS, HISTORY_ROWS);
@@ -281,9 +281,9 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     assert_eq!(moving.search_with_positions("aaa").len(), HISTORY_ROWS);
     assert!(!moving.results_may_be_incomplete());
 
-    // Real historical-allocation control: even ONE posting's old to_vec()
-    // allocated all retained u32 IDs each time. This omits re-encoding and
-    // text costs, so it is a conservative measurement of the removed traffic.
+    // Allocation control: decoding even ONE posting to a Vec allocates every
+    // retained u32 ID per step. It omits re-encoding and text costs, so it is
+    // a conservative measure of the traffic a decoding eviction would cost.
     let before_old = ALLOCATED.load(Ordering::Relaxed);
     for step in 0..ADVANCES as u32 {
         let decoded: Vec<u32> = (step..step + HISTORY_ROWS as u32).collect();

@@ -106,12 +106,9 @@ const HAYSTACKS: &[&str] = &[
     "",
     " ",
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    // NEWLINE-BEARING. The corpus carried `(?m)^a`, `(?m)a$`, `(?m)^` and
-    // `(?m)$` from the start and not one haystack above holds a `\n`, so on
-    // every one of them `(?m)^` is indistinguishable from `^` and the multiline
-    // half of the corpus was agreeing about nothing. These are what tell
-    // `StartText` and `StartLine` apart — and what a scrollback export, a
-    // pasted diff or a bracketed-paste payload actually looks like.
+    // NEWLINE-BEARING. No haystack above holds a `\n`, so none tells `(?m)^`
+    // from `^`. These tell `StartText` and `StartLine` apart — and are what a
+    // scrollback export, a pasted diff or a bracketed-paste payload looks like.
     "a\nb\nc",
     "ERROR one\nERROR two\nok three",
     "\nleading",
@@ -587,8 +584,7 @@ fn zero_width_matches_are_pinned() {
 /// Repetitions whose body can match nothing, and repetitions whose body is
 /// itself a lazy loop. This is the corner where the compiled shape decides the
 /// answer — `(|a)*` has to prefer the empty iteration, and `(.*?){2,}\b` has to
-/// stop at the first word boundary rather than run to the end — and both of
-/// those broke, in opposite directions, before the star grew two shapes.
+/// stop at the first word boundary rather than run to the end.
 #[test]
 fn nullable_and_lazy_repetitions_are_pinned() {
     const PATTERNS: &[&str] = &[
@@ -669,8 +665,7 @@ fn nullable_and_lazy_repetitions_are_pinned() {
 /// not symmetric: whitespace may separate `(` from the `?` that qualifies it,
 /// and `[` from the `^` that negates it, and it may sit between a *counted*
 /// repetition and its `?` laziness marker — but not between `*`, `+` or `?` and
-/// theirs, where `a? ?` is `(a?)?` and not `a??`. Every one of those is checked
-/// here, because every one of them was wrong first.
+/// theirs, where `a? ?` is `(a?)?` and not `a??`.
 #[test]
 fn extended_mode_is_pinned() {
     const PATTERNS: &[&str] = &[

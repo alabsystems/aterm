@@ -17,6 +17,7 @@ fn key(character: char) -> InputEvent {
         key: Key::Character(character),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }

@@ -14,8 +14,7 @@
 //! 3. **Conservative gate** — `classify_shape` admits EXACTLY the two
 //!    grid-mappable forms (1:1, or N:1 with `N>=2` behind the flag) and rejects
 //!    everything else; with the flag off it is byte-identical to the legacy
-//!    `accept iff n_out == n_in`. This is the SAME invariant the `gate_*` kani
-//!    proofs carry, and `classify_shape_conforms_to_ligature_gate_model` is the
+//!    `accept iff n_out == n_in`. `classify_shape_conforms_to_ligature_gate_model` is the
 //!    Tier-1 bind to the `LigatureGate` derived ty model: the model's own
 //!    `Classify` rule judges every real verdict.
 

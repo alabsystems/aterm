@@ -341,6 +341,62 @@ fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     }
 }
 
+/// THE DEVELOPER ROOT IS A FOLDER OF CHECKOUTS, as `$HOME` is (`atpkg::devroot`):
+/// once the code lives in `~/Developer`, an idle `~/Developer/trust` still gives its
+/// x.py bootstrap build directory and its `crates/target`, and a worktree of a checkout
+/// there is still walked — each found from the checkout, never from `~/Developer`
+/// itself (which would put the x.py rule and the two-level walk one folder too high).
+#[test]
+fn the_developer_roots_checkouts_are_walked_like_homes() {
+    let tmp = Tmp::new("discover-devroot");
+    let home = mkdirs(&tmp.path().join("home"));
+    let trust = mkdirs(&home.join("Developer/trust"));
+    std::fs::write(trust.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    let stage1 = lay_target(&trust.join("build/aarch64-apple-darwin/stage1-std"));
+    let crates = lay_target(&trust.join("crates/target"));
+    // A worktree of a checkout in the root, outside it.
+    mkdirs(&trust.join(".git/worktrees/wt1"));
+    let wt1 = mkdirs(&tmp.path().join("elsewhere/wt1"));
+    std::fs::write(wt1.join(".git"), "gitdir: x\n").expect(".git file");
+    std::fs::write(
+        trust.join(".git/worktrees/wt1/gitdir"),
+        format!("{}\n", wt1.join(".git").display()),
+    )
+    .expect("gitdir");
+    let wt1_target = lay_target(&wt1.join("target"));
+
+    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
+    assert!(d.notes.is_empty(), "{:?}", d.notes);
+    let origin = |p: &Path| {
+        d.found
+            .iter()
+            .find(|f| f.path == canon(p))
+            .map(|f| f.origin.clone())
+    };
+    assert_eq!(
+        origin(&stage1),
+        Some(Origin::Bootstrap {
+            repo: canon(&trust),
+            slim: false
+        }),
+        "{:?}",
+        d.found
+    );
+    assert_eq!(
+        origin(&crates),
+        Some(Origin::Checkout {
+            root: canon(&trust)
+        }),
+        "{:?}",
+        d.found
+    );
+    assert!(
+        matches!(origin(&wt1_target), Some(Origin::Checkout { .. })),
+        "{:?}",
+        d.found
+    );
+}
+
 /// THE SESSION'S OWNER: GONE ONLY WHEN NOTHING NAMES IT AND NOTHING OF IT
 /// WAS WRITTEN. A session the registry names for a running process (this
 /// test's own pid) is live; one no record names, every file of it written
@@ -1563,7 +1619,7 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
         unreachable!("a whole row");
     };
 
-    let mut tests = std::process::Command::new("/bin/sleep")
+    let mut tests = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("120")
         .current_dir(gone.join("debug/deps"))
         .spawn()
@@ -1580,7 +1636,7 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(gone.join("debug/deps/liblay.rlib").exists());
 
     let held = owner.dir().join("tasks/t1.output");
-    let mut holder = std::process::Command::new("/bin/sh")
+    let mut holder = aterm_uds::spawnfd::command("/bin/sh")
         .arg("-c")
         .arg("exec 3<\"$1\"; exec /bin/sleep 120")
         .arg("sh")

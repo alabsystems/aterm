@@ -152,8 +152,8 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
             }
             // Raw control characters (a stray \r, ESC, DEL, …) are refused by
             // Manifest::to_toml at emission time — but emission runs in
-            // step_build, AFTER the claim commit is pushed and the whole
-            // build completed, so that refusal alone burns a ledger number.
+            // step_sign, AFTER the claim commit is pushed, so that refusal
+            // alone burns a ledger number.
             // Mirror the emitter's exact rule here (spec decision 12
             // sequences representability BEFORE the claim): \t is TOML-legal,
             // and \n never appears inside a lines() item.
@@ -238,11 +238,7 @@ pub fn claim_changelogs(
     date: &str,
 ) -> Result<(String, String)> {
     let source_rolled = has_section(source, version);
-    let release = if source_rolled {
-        source.to_string()
-    } else {
-        roll(source, version, date)?
-    };
+    let release = release_changelog(source, version, date)?;
     let landing = if has_section(main, version) {
         main.to_string()
     } else if source_rolled {
@@ -254,6 +250,31 @@ pub fn claim_changelogs(
         roll_shipped(main, source, version, date)?
     };
     Ok((release, landing))
+}
+
+/// The RELEASE commit's changelog — [`claim_changelogs`]' first half, the one
+/// definition the reservation that writes it and the claim that checks it share:
+/// `source` rolled for `version` on `date`, or `source` as it stands when it already
+/// carries the section (published after an earlier roll).
+///
+/// # Errors
+/// [`roll`]'s.
+pub fn release_changelog(source: &str, version: &str, date: &str) -> Result<String> {
+    if has_section(source, version) {
+        Ok(source.to_string())
+    } else {
+        roll(source, version, date)
+    }
+}
+
+/// The date of `version`'s section, `## [version] - <date>`: what the release commit's
+/// roll was dated, read back so a claim on a later day checks the roll it was made with.
+#[must_use]
+pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
+    let header = format!("## [{version}] - ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(header.as_str()))
+        .map(str::trim)
 }
 
 /// Roll `main` for a release whose notes are `source`'s `[Unreleased]` body — the

@@ -19,8 +19,7 @@ use core::time::Duration;
 mod js {
     use wasm_bindgen::prelude::wasm_bindgen;
 
-    // `unsafe extern` is the edition-2024 spelling of a foreign block;
-    // `#[wasm_bindgen]` consumes it and emits safe wrappers.
+    // `#[wasm_bindgen]` turns this foreign block into safe wrappers.
     #[wasm_bindgen]
     unsafe extern "C" {
         /// `performance.now()`: milliseconds since the document's time origin,
@@ -54,7 +53,6 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
     let millis = if whole >= u64::MAX as f64 {
         u64::MAX
     } else {
-        // Truncating on purpose: `whole` is already integral.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,

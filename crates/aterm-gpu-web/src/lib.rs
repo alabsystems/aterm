@@ -567,6 +567,14 @@ impl AtermGpuTerminal {
     ) -> Result<AtermGpuTerminal, String> {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
+        // The wasm artifact is its own root, the binary of the web terminal: it
+        // stamps its version here (XTVERSION reads it), and only on wasm32, so
+        // the native compile of this library carries no build fact.
+        #[cfg(target_arch = "wasm32")]
+        aterm_types::version::install(aterm_types::version::BuildStamp {
+            app_version: env!("CARGO_PKG_VERSION"),
+            ..aterm_types::version::BuildStamp::UNSTAMPED
+        });
         let theme = Theme {
             fg,
             bg,
@@ -1761,6 +1769,15 @@ impl AtermGpuTerminal {
     /// sequences itself (Windows ConPTY). Survives `init`.
     pub fn set_kitty_keyboard_enabled(&mut self, enabled: bool) {
         self.term.set_kitty_keyboard_enabled(enabled);
+    }
+
+    /// Declare that the PTY behind this terminal is a Windows ConPTY (default
+    /// off). Only then does conhost's `CSI ? 9001 h` take effect, so key
+    /// encoding sends the win32-input-mode records conhost asked for
+    /// (Shift/Ctrl+Enter). Anywhere else that request is program output and is
+    /// ignored. Survives `init`.
+    pub fn set_win32_input_enabled(&mut self, enabled: bool) {
+        self.term.set_win32_input_enabled(enabled);
     }
 
     /// The live `Terminal::keyboard_mode()` bits, zero-extended from `u16`, for
@@ -3601,6 +3618,30 @@ mod tests {
             t.encode_key("Enter", 1, 0, None).as_deref(),
             Some(&b"\x1b[13;2u"[..]),
             "Shift+Enter under pushed kitty disambiguate must be CSI-u"
+        );
+    }
+
+    /// win32-input-mode is the host's to grant: conhost's `?9001h` changes
+    /// nothing until the embedder says a ConPTY is behind the terminal
+    /// (`set_win32_input_enabled`). Then Shift+Enter is the key-record pair
+    /// conhost reads (down, up) instead of the legacy LF.
+    #[test]
+    fn a_conpty_host_opts_in_to_win32_input_records() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(24, 80, 16.0) else {
+            return;
+        };
+        t.process(b"\x1b[?9001h");
+        assert_eq!(
+            t.encode_key("Enter", 1, 0, None).as_deref(),
+            Some(&[0x0a][..]),
+            "program output alone grants nothing"
+        );
+        t.set_win32_input_enabled(true);
+        t.process(b"\x1b[?9001h");
+        let pair = b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_";
+        assert_eq!(
+            t.encode_key("Enter", 1, 0, None).as_deref(),
+            Some(&pair[..])
         );
     }
 

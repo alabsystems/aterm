@@ -2624,7 +2624,6 @@ fn drop_history_below_is_a_noop_at_or_below_the_first_cached_line() {
     assert!(!idx.results_may_be_incomplete());
 }
 
-/// The executable twin of the `index_length_is_a_high_water_mark` Kani harness:
 /// `len()` is one past the highest line ever indexed (sparse indexing counts
 /// the gap), and re-indexing an existing line does not move it.
 #[test]

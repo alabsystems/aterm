@@ -6,9 +6,9 @@
 //!
 //! They live OUTSIDE this crate (the root manifest, build scripts), and none
 //! of them breaks a test when it regresses — it only makes `tools/verify.sh`
-//! slower by recompiling what it already compiled. That is exactly how the 14 h
-//! `--fast` run of 2026-09-10 went unnoticed, so the facts are asserted here,
-//! where the gate's own tests run on every merge.
+//! slower by recompiling what it already compiled (a 14 h `--fast` run once
+//! went unnoticed that way), so the facts are asserted here, where the gate's
+//! own tests run on every merge.
 //!
 //! No manifest parser: this crate has no dependencies on purpose (see its
 //! Cargo.toml), and a line scan is all these facts need.
@@ -47,13 +47,13 @@ fn table_value(toml: &str, table: &str, key: &str) -> Option<String> {
     None
 }
 
-/// 2026-09-13. Without this pin, host code (build scripts, proc-macros and their
+/// Without this pin, host code (build scripts, proc-macros and their
 /// deps) is compiled at debuginfo 0 in a plain dev build but at the dev level
 /// when the same crate is also a normal dependency of a test — so the gate's
 /// compiles each built a DIFFERENT variant of syn/quote/proc-macro2 and
-/// everything downstream of them. Unit graphs at 18f19eea6 with the pin: the
+/// everything downstream of them. Unit graphs measured with the pin: the
 /// doctest stage needs 0 compile units beyond `test --workspace --no-run` (was
-/// 117); the smoke build 22 (was 49). Since 2026-09-25 both levels are line
+/// 117); the smoke build 22 (was 49). Both levels are line
 /// tables (`[profile.dev] debug = "line-tables-only"`), so this pins the dev
 /// level itself and the override EQUAL to it — and refuses any other `debug`
 /// under `[profile.test*]` (which `cargo test` builds with, inheriting
@@ -96,15 +96,14 @@ fn the_dev_profile_builds_line_tables() {
     }
 }
 
-/// 2026-09-26. `tools/verify.sh` compiles the gate before every invocation —
-/// `--help` included — and until this date it did so with
-/// `--release`: fat LTO and one codegen unit, the shipping engine's settings,
-/// for a std-only program that orchestrates child processes. The gate now
-/// builds under its own `[profile.gate]`, which keeps release's semantics
-/// (it inherits them: no debug-assertions, no overflow checks) and drops LTO
-/// and the single codegen unit. Three facts have to hold together, and a
-/// regression in any one is silent — a slower start, or (for the last) a gate
-/// that execs a stale binary from an older profile's directory:
+/// `tools/verify.sh` compiles the gate before every invocation — `--help`
+/// included — so it builds under its own `[profile.gate]`, not `--release` (fat
+/// LTO and one codegen unit, wasted on a std-only orchestrator), which keeps
+/// release's semantics (it inherits them: no debug-assertions, no overflow
+/// checks) and drops LTO and the single codegen unit. Three facts have to hold
+/// together, and a regression in any one is silent — a slower start, or (for
+/// the last) a gate that execs a stale binary from an older profile's
+/// directory:
 ///  * the profile exists with those values;
 ///  * every build of aterm-verify in the shim names it, never `--release`;
 ///  * the shim execs the binary from THAT profile's output directory, both

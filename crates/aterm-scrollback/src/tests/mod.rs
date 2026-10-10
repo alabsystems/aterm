@@ -3,8 +3,6 @@
 // Author: Andrew Yates
 
 //! Tests for the scrollback module.
-//!
-//! Split from monolithic tests.rs (#5931) into focused submodules.
 
 use super::*;
 
@@ -18,6 +16,5 @@ mod repaired_trimmed;
 mod threading;
 mod truncation;
 
-// Performance proofs extracted to stay under 1000-line limit.
 #[path = "../performance_tests.rs"]
 mod performance_tests;

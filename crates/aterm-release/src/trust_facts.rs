@@ -12,9 +12,9 @@
 //! being judged. A filed verdict would key on the floors too, so a floors-only
 //! commit would need a whole new run. One judge: the lane prints its own
 //! verdict with it (`aterm-release trust conclude`), the cutter and `ship
-//! check` call it in-process ([`trust_report`]), and
-//! `tools/release-preflight.sh` and `tools/release.sh` ask it through
-//! `targo --unverified ship trust verdict`.
+//! check` call it in-process ([`trust_report`]), `ship release` asks it
+//! in-process ([`verdict_for`], [`pending_for`]), and `targo --unverified ship
+//! trust verdict` prints it.
 //!
 //! THE KEY ([`facts_key`]). A facts record is filed under a key over
 //! everything that determines what the lane measured, except the two files
@@ -39,7 +39,7 @@
 //! THE ENVIRONMENT IS THE LANE'S, NOT THE CALLER'S. The
 //! lane runs every compile — the judge, the graph, each check — in an
 //! environment it BUILDS from a list (the script's "THE LANE'S ENVIRONMENT"):
-//! its pins (`SOURCE_DATE_EPOCH`, aterm-gui's git stamps, …), which are in the
+//! its pins (`CARGO_INCREMENTAL`, `TRUST_NO_MIGRATE_WARN`), which are in the
 //! tree the key covers, and a few variables it passes from the host (`HOME`,
 //! `TMPDIR`, …), whose values no key covers. Nothing else the caller exported
 //! reaches a compile: not `TRUSTFLAGS` (targo-trust's per-run `-Ztrust-*`
@@ -3604,11 +3604,10 @@ fn env_dep_refusal(
 ///   name neither;
 /// * the ENVIRONMENT: every compile ran in the lane's own ([`LaneEnv`]). Every
 ///   `# env-dep:` line — rustc's record of an `env!`/`option_env!` read and the
-///   value it compiled in (the plan's §4.2 env-deps: aterm-gui's
-///   `ATERM_RELEASE_BUILD`, objc2's `MACOSX_DEPLOYMENT_TARGET`) — must read a
-///   value the key determines ([`env_dep_refusal`]), a build script's
-///   `cargo:rustc-env` output (under the slots' `build/*/output`) counting as
-///   one.
+///   value it compiled in (the plan's §4.2 env-deps, such as objc2's
+///   `MACOSX_DEPLOYMENT_TARGET`) — must read a value the key determines
+///   ([`env_dep_refusal`]), a build script's `cargo:rustc-env` output (under
+///   the slots' `build/*/output`) counting as one.
 ///
 /// And at least one `.d` must have been written by this run: no dep-info at
 /// all is no evidence.
@@ -4262,7 +4261,8 @@ pub fn trustc_commit(bin: &Path) -> String {
 // ASSEMBLY: the verdict for a commit, from its facts and its own ratchet
 // ---------------------------------------------------------------------------
 
-/// The prover a verdict is asked for: the toolchain a cut builds with.
+/// The prover a verdict is asked for: the toolchain a cut judges with — the one
+/// whose `trustc` compiled the bytes it signs.
 #[derive(Clone, Debug)]
 pub struct Prover {
     /// Its `bin/` (the [`crate::gates::cut_toolchain`] directory).
@@ -4303,7 +4303,7 @@ impl Prover {
     }
 }
 
-/// Whether the tree a cut builds is verified by the whole-tree Trust lane.
+/// Whether the tree a cut releases is verified by the whole-tree Trust lane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrustReport {
     /// Facts for its tree (the floors aside), from the cut's prover, that its
@@ -4323,7 +4323,7 @@ pub enum TrustReport {
     },
     /// No such verdict: why, in a few words. `narrowed` is a NARROWED
     /// verdict's: `why` already names its one action (a machine with more
-    /// memory), which a rerun or `cut --gate` here is not.
+    /// memory), which a rerun here is not.
     Unverified { why: String, narrowed: bool },
 }
 
@@ -4565,7 +4565,7 @@ pub fn facts_for(
         Ok(id) => id.clone(),
         Err(why) => {
             return Ok(Err(format!(
-                "the prover this cut builds with ({}) cannot be identified: {why}",
+                "the prover this cut judges with ({}) cannot be identified: {why}",
                 prover.bin.display()
             )));
         }
@@ -4577,7 +4577,7 @@ pub fn facts_for(
     let Ok(text) = fs::read_to_string(receipts.join(&name)) else {
         let others = records_about(receipts, &tsr);
         let mut why = format!(
-            "no whole-tree Trust facts for its tree (every file but {RATCHET} and {MEMORY}) from the prover this cut builds with ({}, identity {}) (`{shown}`)",
+            "no whole-tree Trust facts for its tree (every file but {RATCHET} and {MEMORY}) from the prover this cut judges with ({}, identity {}) (`{shown}`)",
             prover.bin.display(),
             short(&id)
         );
@@ -4695,7 +4695,7 @@ pub fn verified_line(head: &str, prover: &Prover, report: &TrustReport) -> Strin
 
 /// The cutter's refusal of a tree the lane did not verify. A NARROWED
 /// verdict's `why` names its one action (a machine with more memory): a rerun
-/// here, or `cut --gate`, only narrows again, so neither is offered.
+/// here only narrows again, so it is not offered.
 #[must_use]
 pub fn refusal(head: &str, why: &str, narrowed: bool) -> String {
     let verify = if narrowed {
@@ -4708,7 +4708,7 @@ pub fn refusal(head: &str, why: &str, narrowed: bool) -> String {
         )
     };
     format!(
-        "the tree this cut builds ({head}) has no passing whole-tree Trust advisory run: \
+        "the tree this cut releases ({head}) has no passing whole-tree Trust advisory run: \
          {why}.{verify} Nothing was claimed."
     )
 }
@@ -4911,15 +4911,52 @@ pub fn parse_cmd<'a>(
     })
 }
 
-/// The prover a verdict is asked for: `--prover`, else the one the cut builds
+/// The prover a verdict is asked for: `--prover`, else the one the cut judges
 /// with.
 fn asked_prover(prover: Option<PathBuf>) -> std::result::Result<Prover, String> {
     match prover {
         Some(bin) => Ok(Prover::at(&bin)),
         None => crate::gates::cut_toolchain()
             .map(|tc| Prover::of_toolchain(&tc))
-            .map_err(|e| format!("cannot name the prover the cut builds with: {e}")),
+            .map_err(|e| format!("cannot name the prover the cut judges with: {e}")),
     }
+}
+
+/// THE TRUST VERDICT for `rev` with `prover`, judged now: `(true, the verified
+/// line)`, or `(false, why not)` — what `trust verdict` prints, and what `ship
+/// release` reads in-process for its trust step.
+///
+/// # Errors
+/// The commit or the receipt store cannot be read: no answer either way.
+pub fn verdict_for(git: &dyn GitRunner, prover: &Prover, rev: &str) -> Result<(bool, String)> {
+    let stores = crate::gates::Stores::of(git)?;
+    let head = rev_parse(git, &format!("{rev}^{{commit}}"))?;
+    Ok(match trust_report(git, &stores, prover, &head)? {
+        report @ TrustReport::Verified { .. } => (true, verified_line(&head, prover, &report)),
+        TrustReport::Unverified { why, .. } => (false, why),
+    })
+}
+
+/// What `rev`'s stored facts from `prover` leave UNDECIDED — the libraries
+/// `tools/trust-gate-all.sh --remeasure` measures again — or `Err(why)` when there
+/// are no facts to complete: what `trust pending` prints.
+///
+/// # Errors
+/// The commit, the store or the commit's floors cannot be read.
+pub fn pending_for(
+    git: &dyn GitRunner,
+    prover: &Prover,
+    rev: &str,
+) -> Result<std::result::Result<Vec<String>, String>> {
+    let store = crate::gates::receipt_store(git)?;
+    let head = rev_parse(git, &format!("{rev}^{{commit}}"))?;
+    let (facts, _) = match facts_for(git, &store, prover, &head)? {
+        Ok(found) => found,
+        Err(why) => return Ok(Err(why)),
+    };
+    let ratchet = ratchet_at(git, &head)?;
+    let verdict = judge(&facts, ratchet.as_deref(), RATCHET, MEMORY, Update::NONE);
+    Ok(Ok(verdict.unverified))
 }
 
 /// Run a `trust` verb in the repository at `repo`; the exit status it answers:
@@ -5008,18 +5045,10 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
                     return 2;
                 }
             };
-            let answer = crate::gates::Stores::of(&git).and_then(|stores| {
-                let head = rev_parse(&git, &format!("{commit}^{{commit}}"))?;
-                Ok((trust_report(&git, &stores, &prover, &head)?, head))
-            });
-            match answer {
-                Ok((report @ TrustReport::Verified { .. }, head)) => {
-                    println!("{}", verified_line(&head, &prover, &report));
-                    0
-                }
-                Ok((TrustReport::Unverified { why, .. }, _)) => {
-                    println!("{why}");
-                    1
+            match verdict_for(&git, &prover, &commit) {
+                Ok((verified, line)) => {
+                    println!("{line}");
+                    if verified { 0 } else { 1 }
                 }
                 Err(e) => {
                     eprintln!("aterm-release trust verdict: {e}");
@@ -5035,26 +5064,14 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
                     return 2;
                 }
             };
-            let found = crate::gates::receipt_store(&git).and_then(|store| {
-                let head = rev_parse(&git, &format!("{commit}^{{commit}}"))?;
-                Ok((facts_for(&git, &store, &prover, &head)?, head))
-            });
-            match found {
-                Ok((Ok((facts, _)), head)) => {
-                    let ratchet = match ratchet_at(&git, &head) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("aterm-release trust pending: {e}");
-                            return 2;
-                        }
-                    };
-                    let verdict = judge(&facts, ratchet.as_deref(), RATCHET, MEMORY, Update::NONE);
-                    for name in &verdict.unverified {
+            match pending_for(&git, &prover, &commit) {
+                Ok(Ok(names)) => {
+                    for name in &names {
                         println!("{name}");
                     }
                     0
                 }
-                Ok((Err(why), _)) => {
+                Ok(Err(why)) => {
                     eprintln!("no facts to complete: {why}");
                     1
                 }

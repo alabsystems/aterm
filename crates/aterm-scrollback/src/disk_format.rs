@@ -101,9 +101,8 @@ pub(crate) struct PageIndexEntry {
     pub(crate) compressed_size: u32,
     /// Number of lines in this page.
     ///
-    /// Persisted in page headers for:
-    /// - File format compatibility (read during load)
-    /// - Kani proof verification of line count consistency
+    /// Persisted in page headers for file format compatibility (read during
+    /// load).
     ///
     /// After construction, cumulative_lines is used for lookups instead.
     /// Debug builds assert this matches cumulative line counts.

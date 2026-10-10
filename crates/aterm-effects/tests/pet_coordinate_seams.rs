@@ -27,6 +27,20 @@
 //! the pet's pixel frame to the other pane, the re-sighting ghost was dropped
 //! with it, and the cat vanished from the old pane in one frame. Its ghost now
 //! carries the glass it was drawn on and fades there.
+//!
+//! The residuals after the quick return (2026-10-08): an arriver that adopted
+//! its own ghost changed pose in place on the adoption frame, and with three
+//! panes the owner kept one own glass, so a ghost in the first pane the focus
+//! left was cut at the second switch. Every ghost now knows its own pane, and
+//! an adopted body goes on in the look the user saw.
+//!
+//! The residuals after that (2026-10-08): on a tall screen the new world
+//! could not see where the old body stood and culled its ghost; a ghost a
+//! real guarantee refuses took its presence with it; the breed handoff's
+//! leaver vanished at any boundary; and a carried ghost whose bake was
+//! deferred was not drawn. Unknown is not evidence (a protected cell the
+//! world sees still is), a refused ghost hands its presence to its arriver,
+//! every ghost on glass is carried, and a ghost's held tile is its own.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -40,6 +54,8 @@ use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{
     CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
 };
+use aterm_effects::kitty_pet::{PetAction, PetFrame};
+use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
@@ -66,6 +82,8 @@ struct Host {
     pane: Option<(i32, i32)>,
     /// The other pane of a split, unfocused and still on glass.
     other: Option<Pane>,
+    /// A third pane beside them, unfocused and still on glass.
+    third: Option<Pane>,
     /// Offer the split's panes as glass before each tick, as the composed
     /// host does (`CompanionOwner::offer_glass`).
     offer: bool,
@@ -103,6 +121,10 @@ struct Shot {
     ghost_under: bool,
     /// Sprites drawn into the window channel: a ghost on its own glass.
     glass_sprites: usize,
+    /// The window channel's first sprites: `(x0, alpha)` in window pixels.
+    own: [Option<(i32, u8)>; 4],
+    /// The focused pane's cell `(0, 0)` in window pixels.
+    pane_at: (i32, i32),
 }
 
 impl Shot {
@@ -131,6 +153,7 @@ impl Host {
             session: 7,
             pane: None,
             other: None,
+            third: None,
             offer: false,
             owner,
             decos: WordDecorations::default(),
@@ -163,6 +186,9 @@ impl Host {
     /// One present in the native order: observe, prepare, tick, rescan.
     fn present(&mut self) -> Shot {
         self.now += FRAME;
+        // A composed host opens every presented frame: the bake budget, the
+        // atlas clock and the one-body door are per frame.
+        self.decos.begin_host_frame();
         let (rows, cols) = self.grid();
         let mut input = self.term.cell_frame(usize::from(rows), usize::from(cols));
         if self.stale {
@@ -198,14 +224,16 @@ impl Host {
                 cols,
                 rows,
             };
-            let other = self.other.as_ref().map(|p| PetGlass {
+            let glass = |p: &Pane| PetGlass {
                 session: p.session,
                 origin: p.origin,
                 cols: p.term.grid().cols(),
                 rows: p.term.grid().rows(),
-            });
+            };
+            let other = self.other.as_ref().map(glass);
+            let third = self.third.as_ref().map(glass);
             self.owner
-                .offer_glass(std::iter::once(focused).chain(other));
+                .offer_glass(std::iter::once(focused).chain(other).chain(third));
         }
         let tick = self.owner.prepare(
             PetFacts {
@@ -293,6 +321,8 @@ impl Host {
             ghost_alpha: ghost_sprite.map_or(0, |(_, s)| s.alpha),
             ghost_under: ghost_sprite.is_some_and(|(_, s)| s.z == FreeZ::UnderText),
             glass_sprites: window.len(),
+            own: core::array::from_fn(|i| window.get(i).map(|s| (s.x, s.alpha))),
+            pane_at: pane,
         }
     }
 
@@ -321,19 +351,70 @@ impl Host {
         h
     }
 
+    /// Three panes side by side in a 30x98 window, each 32 columns: LEFT
+    /// (session 8, cols 0..32, its prompt on row 20), the focused MIDDLE
+    /// (session 7, cols 33..65, its prompt on row 10) with the pet settled
+    /// beside its prompt, and RIGHT (session 9, cols 66..98, its prompt on
+    /// row 5). The composed host offers all three as glass.
+    fn three_settled() -> Self {
+        let mut h = Self::new(30, 32);
+        let cw = i32::from(h.cell.0);
+        h.pane = Some((33 * cw, 0));
+        h.origin = (33 * cw, 0);
+        let mut left = Terminal::new(30, 32);
+        left.process(b"\x1b]11;#000000\x07\x1b[21;1H$ ");
+        h.other = Some(Pane {
+            term: left,
+            session: 8,
+            origin: (0, 0),
+        });
+        let mut right = Terminal::new(30, 32);
+        right.process(b"\x1b]11;#000000\x07\x1b[6;1H$ ");
+        h.third = Some(Pane {
+            term: right,
+            session: 9,
+            origin: (66 * cw, 0),
+        });
+        h.offer = true;
+        let settled = h.run(Duration::from_secs(3));
+        assert!(
+            settled.frame.on_glass && settled.frame.pet.alpha == 255,
+            "fixture: the resident settled on glass in the middle pane: {settled:?}"
+        );
+        h
+    }
+
     /// Focus the split's other pane: the terminal, the session and the
     /// pixel frame the pet chases swap, and the hosts' two fences run — the
     /// layout fence (another view is focused) and the owner fence (another
     /// terminal), both through the re-sighting crossfade.
     fn focus_other(&mut self) {
-        let mut other = self.other.take().expect("a split");
+        self.focus_pane(false);
+    }
+
+    /// Focus the third pane, as [`Self::focus_other`] focuses the other.
+    fn focus_third(&mut self) {
+        self.focus_pane(true);
+    }
+
+    fn focus_pane(&mut self, third: bool) {
+        let slot = if third {
+            &mut self.third
+        } else {
+            &mut self.other
+        };
+        let mut other = slot.take().expect("a split");
         std::mem::swap(&mut self.term, &mut other.term);
         std::mem::swap(&mut self.session, &mut other.session);
         let origin = other.origin;
         other.origin = self.pane.expect("a split pane");
         self.pane = Some(origin);
         self.origin = origin;
-        self.other = Some(other);
+        if third {
+            self.third = Some(other);
+        } else {
+            self.other = Some(other);
+        }
         self.owner.resight_coordinate_space();
         self.owner.resight_owner();
     }
@@ -415,6 +496,7 @@ fn project(
         ("Return", None) => {
             post.insert("returned", 1);
             post.insert("ticked", 0);
+            post.insert("refused", 0);
             post.insert("lit", i64::from(owner.brain().is_active()));
             post.insert("hit", i64::from(owner.hit_rect().is_some()));
             // A dark boundary draws nothing: the ghosts still fading are
@@ -426,6 +508,17 @@ fn project(
         }
         ("Lose", None) => {
             post.insert("lost", 1);
+        }
+        ("Refuse", None) => {
+            post.insert("refused", 1);
+        }
+        ("Handoff", Some(s)) => {
+            // The breed handoff's leaver on glass beside the body: a ghost
+            // in another coat than the body's.
+            let worn = owner.brain().worn_pair().map(|(coat, _)| coat);
+            let mut ghosts = s.frame.pet.departures.iter().flatten();
+            let leaver = s.cat() && ghosts.any(|d| Some(d.coat) != worn);
+            post.insert("leaver", i64::from(leaver));
         }
         ("Tick" | "BlindLong", Some(s)) => {
             if action == "Tick" {
@@ -785,13 +878,13 @@ fn a_split_pane_focus_switch_crossfades_across_panes() {
         let g = ghost(&first).expect("the old body fades as a ghost");
         assert!(g.own_glass && g.under_ink, "{g:?}");
         assert_eq!(
-            first.frame.glass,
-            Some(PetGlass {
+            first.frame.glass.iter().flatten().collect::<Vec<_>>(),
+            [&PetGlass {
                 session: 7,
                 origin: (51 * cw, 0),
                 cols: 49,
                 rows: 30,
-            }),
+            }],
             "the ghost carries the glass it was drawn on"
         );
         assert_eq!(
@@ -870,7 +963,9 @@ fn a_split_pane_focus_switch_crossfades_across_panes() {
     h.other = None;
     let next = h.present();
     assert!(
-        ghost(&next).is_none() && next.glass_sprites == 0 && next.frame.glass.is_none(),
+        ghost(&next).is_none()
+            && next.glass_sprites == 0
+            && next.frame.glass.iter().all(Option::is_none),
         "the ghost goes with its pane: {next:?}"
     );
     assert!(!h.owner.brain().has_own_glass_ghost());
@@ -961,21 +1056,50 @@ fn tails(shots: &[Shot]) -> Vec<u8> {
     out
 }
 
+/// The look of the most present body at `seat` this frame — `(pose,
+/// facing_left)` as drawn — on the focused surface (`own == false`: the
+/// arriver and the live lane's ghosts) or on the pane the focus left (`own`:
+/// its own-glass ghosts).
+fn seat_look(shot: &Shot, seat: (f32, f32), own: bool) -> Option<(PetGlyphId, bool)> {
+    let mut bodies: Vec<(u8, (PetGlyphId, bool))> = shot
+        .frame
+        .pet
+        .departures
+        .iter()
+        .flatten()
+        .filter(|d| d.own_glass == own && at_seat(d.col, d.row, seat))
+        .map(|d| (drawn_alpha(shot, d), (d.pose, d.facing_left)))
+        .collect();
+    let pet = &shot.frame.pet;
+    if !own && shot.cat() && at_seat(pet.col, pet.row, seat) {
+        bodies.push((pet.alpha, (pet.pose, pet.facing_left)));
+    }
+    bodies.retain(|&(alpha, _)| alpha > 0);
+    bodies
+        .iter()
+        .max_by_key(|&&(alpha, _)| alpha)
+        .map(|&(_, look)| look)
+}
+
 /// The seat a return brings the cat back to, as the frames after it draw it:
 /// `(restarted, most bodies there, presence floor there, what the user saw
 /// there before the return)`. The seat is where the arriver stands on the
 /// first frame; before the return it was on the pane the focus left
 /// (`own`, a ghost on its own glass) or on the same glass. It `restarted` if
-/// a second body of the cat stood there, or the presence there fell below
-/// what the user saw (a frame's rounding allowed).
+/// a second body of the cat stood there, the presence there fell below what
+/// the user saw (a frame's rounding allowed), or the body there changed its
+/// look — pose or facing — on the frame it came back.
 fn return_seat(seen: &Shot, after: &[Shot], own: bool) -> (bool, usize, u8, u8) {
     let seat = (after[0].frame.pet.col, after[0].frame.pet.row);
     let (_, there) = seat_cat(seen, seat, own);
     let story: Vec<(usize, u8)> = after.iter().map(|s| seat_cat(s, seat, false)).collect();
     let most = story.iter().map(|&(n, _)| n).max().unwrap_or(0);
     let floor = story.iter().map(|&(_, p)| p).min().unwrap_or(0);
+    let relooked = seat_look(seen, seat, own)
+        .zip(seat_look(&after[0], seat, false))
+        .is_some_and(|(was, is)| was != is);
     (
-        most > 1 || floor.saturating_add(2) < there,
+        most > 1 || floor.saturating_add(2) < there || relooked,
         most,
         floor,
         there,
@@ -1222,6 +1346,316 @@ fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
     }
 }
 
+/// AN ADOPTED BODY GOES ON IN THE LOOK THE USER SAW (2026-10-08). A quick
+/// return adopts the ghost standing at the arriver's seat
+/// (`a_quick_return_continues_the_one_cat_it_comes_back_to`), and that body
+/// is the one the user was looking at: it goes on in the ghost's look — its
+/// pose and facing — while it rests at that seat, through the homecoming
+/// ramp and, for a still pose, on until the brain's own look steps. Every
+/// handover rides a step the brain takes anyway: its look stepping at rest,
+/// a pose caught mid-stride folding at the ramp's end, or the brain setting
+/// the body in motion (a walk, the gather of a leap). The held look never
+/// travels and never rides a flight. Cases: a cat woken by a key and caught
+/// mid-stretch (the brain walks on to the caret at once), one standing by
+/// its prompt after a few keys, one sitting face-on after them, one asleep,
+/// one caught mid-stride, and the standing one with Enter pressed two frames
+/// after the return (the brain leaps to the next row).
+///
+/// Before this fix, measured here: the adopted arriver wore the fresh
+/// brain's look — the retire reset it to a sit or a sleep — so the
+/// stretching cat became a walk frame at the same cell on the adoption
+/// frame (`PetStretch` to `PetLwalk0` at (3, 10)). And before the seat gate:
+/// the held standing look glided 3.47 cells through the leap, backwards, at
+/// no lift, then became the landing frame in mid-air; a stretch slid 0.62
+/// cells under a walk; and a walk frame stood frozen for 1.28 s on a
+/// motionless cat.
+#[test]
+fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
+    let model = pet_surface_seam_model();
+    for (case, keys, wait, input) in [
+        // Past the stretch's lead, so the live body is drawn at the unit
+        // scale a still ghost is drawn at (`ghost_moved` reads its pixels).
+        ("mid-stretch", 1usize, 12usize, None),
+        ("standing", 3, 30, None),
+        ("face-on", 6, 120, None),
+        ("asleep", 0, 0, None),
+        ("mid-stride", 2, 6, None),
+        ("standing, then Enter", 3, 30, Some(&b"\r\n$ "[..])),
+    ] {
+        let mut h = Host::split_settled();
+        for _ in 0..keys {
+            h.term.process(b"l");
+            h.present();
+            h.present();
+        }
+        for _ in 0..wait {
+            h.present();
+        }
+        let before = h.present();
+        let mut state = model.init_state();
+        step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+        h.focus_other();
+        step(&model, &mut state, "Replace", &h.owner, &before, None).expect("dark boundary");
+        step(&model, &mut state, "Shift", &h.owner, &before, None).expect("shift");
+        let first = h.shots(Duration::from_millis(32));
+        step(
+            &model,
+            &mut state,
+            "Tick",
+            &h.owner,
+            &before,
+            Some(&first[0]),
+        )
+        .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let seen = *first.last().expect("frames");
+        let old = own_ghost(&seen).expect("fixture: the body the focus left fades in its pane");
+        let look = (old.pose, old.facing_left);
+
+        h.focus_other();
+        step(&model, &mut state, "Return", &h.owner, &seen, None)
+            .unwrap_or_else(|e| panic!("{case}: the second boundary is dark: {e}"));
+        let mut after = Vec::new();
+        let quiet = if let Some(bytes) = input {
+            after.extend([h.present(), h.present()]);
+            h.term.process(bytes);
+            2
+        } else {
+            usize::MAX
+        };
+        after.extend(h.shots(Duration::from_millis(3_000)));
+        let next = after[0];
+        let a0 = next.frame.pet;
+        assert!(
+            at_seat(a0.col, a0.row, (old.col, old.row))
+                && a0.alpha.saturating_add(2) >= drawn_alpha(&seen, &old),
+            "{case}: fixture: the arriver adopts the ghost at its seat: {next:?}"
+        );
+        let looks: Vec<(PetGlyphId, bool)> = after
+            .iter()
+            .map(|s| (s.frame.pet.pose, s.frame.pet.facing_left))
+            .collect();
+        let worn = looks.iter().take_while(|&&l| l == look).count();
+        let ramp = after.iter().take_while(|s| s.frame.pet.alpha < 255).count();
+        let handover = after.get(worn).map(|s| s.frame.pet);
+        eprintln!(
+            "{case}: the ghost showed {look:?}; the adopted body wore it {} ms (the ramp ran \
+             {} ms), then {:?}",
+            worn * 16,
+            ramp * 16,
+            handover.map(|p| (p.pose, p.action, p.col, p.row, p.lift))
+        );
+        let (restarted, most, ..) = return_seat(&seen, &after[..quiet.min(after.len())], true);
+        let mut post = project(&state, "Tick", &h.owner, &seen, Some(&next));
+        post.insert("restarted", i64::from(restarted));
+        conform(&model, &mut state, "Tick", post)
+            .unwrap_or_else(|e| panic!("{case}: one body goes on in the look the user saw: {e}"));
+        assert_eq!(most, 1, "{case}: one body at the seat");
+        // The held look rests at its seat: it never slides, lifts or rides a
+        // gather, a flight or a landing.
+        let flying = |p: &PetFrame| {
+            p.lift.abs() > 0.05
+                || matches!(
+                    p.action,
+                    PetAction::Crouch | PetAction::Leap | PetAction::Land
+                )
+        };
+        let travelled = after[..worn]
+            .iter()
+            .map(|s| {
+                (s.frame.pet.col - a0.col)
+                    .abs()
+                    .max((s.frame.pet.row - a0.row).abs())
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            travelled < 0.25 && !after[..worn].iter().any(|s| flying(&s.frame.pet)),
+            "{case}: the held look travelled {travelled:.2} cells or flew: {:?}",
+            after[..worn]
+                .iter()
+                .map(|s| s.frame.pet)
+                .collect::<Vec<_>>()
+        );
+        // Every handover rides a step the brain takes anyway: after the ramp
+        // (a still look until the brain's own steps — the standing cat's own
+        // stand may creep a little before it folds — and a mid-stride one at
+        // the ramp's end, at rest), or the brain setting the body in motion.
+        let handover = handover.unwrap_or_else(|| panic!("{case}: the look hands over: {looks:?}"));
+        let moving = flying(&handover)
+            || (handover.col - a0.col)
+                .abs()
+                .max((handover.row - a0.row).abs())
+                > 0.05;
+        match case {
+            "mid-stretch" | "standing, then Enter" => assert!(
+                worn < ramp && moving,
+                "{case}: the look hands over as the brain sets the body moving: {handover:?}"
+            ),
+            "mid-stride" => assert!(
+                worn >= ramp.min(16) && worn <= ramp.max(16) + 1 && !moving,
+                "{case}: a pose caught mid-stride folds at the ramp's end, at rest: {worn} \
+                 frames, the ramp {ramp}: {handover:?}"
+            ),
+            _ => assert!(
+                worn > ramp,
+                "{case}: the look is worn through the whole ramp: {worn} frames, the ramp {ramp}"
+            ),
+        }
+        let last = after.last().expect("frames");
+        assert!(
+            ghost(last).is_none()
+                && last.glass_sprites == 0
+                && last.frame.pet.alpha == 255
+                && last.frame.pet.action.settled(),
+            "{case}: the brain's behaviour takes over and the cat settles: {last:?}"
+        );
+    }
+}
+
+/// EVERY GHOST FADES IN ITS OWN PANE, HOWEVER MANY PANES THE FOCUS CROSSES
+/// (2026-10-08). A quick cycle across three panes — M to L to R inside the
+/// first crossfade — leaves two ghosts of the cat on two own glasses: M's,
+/// still fading where the focus first left it, and L's. Each is judged by
+/// its own pane, so each keeps fading where it was drawn and reaches zero on
+/// the frame the arriver reaches full; no pane loses its cat in one frame
+/// and the cat never dips. When the focus comes back to one of those panes —
+/// M or L — the ghost there is the cat the arriver adopts.
+///
+/// Before this fix, measured here: the owner tracked ONE own glass, so M's
+/// ghost was dropped at the second switch. Switching 1, 2, 4 and 8 frames
+/// apart, that pane fell from 255, 238, 206 and 140/255 to nothing in one
+/// frame, the cat summed down to 30, 30, 60 and 122/255, and coming back to
+/// M restarted the cat at the ramp's floor.
+#[test]
+fn every_ghost_fades_in_its_own_pane_across_three_panes() {
+    let model = pet_surface_seam_model();
+    for gap in [1usize, 2, 4, 8] {
+        for back in ["none", "M", "L"] {
+            let case = format!("{gap} frames apart, back to {back}");
+            let mut h = Host::three_settled();
+            let cw = i32::from(h.cell.0);
+            let before = h.present();
+            let mut state = model.init_state();
+            step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+            h.focus_other();
+            step(&model, &mut state, "Replace", &h.owner, &before, None).expect("dark boundary");
+            step(&model, &mut state, "Shift", &h.owner, &before, None).expect("shift");
+            let mut all = vec![before];
+            for _ in 0..gap {
+                all.push(h.present());
+            }
+            step(&model, &mut state, "Tick", &h.owner, &before, Some(&all[1]))
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            let seen = *all.last().expect("frames");
+
+            h.focus_third();
+            step(&model, &mut state, "Return", &h.owner, &seen, None)
+                .unwrap_or_else(|e| panic!("{case}: the second boundary is dark: {e}"));
+            let mut after = vec![h.present()];
+            let (restarted, ..) = return_seat(&seen, &after, true);
+            let mut post = project(&state, "Tick", &h.owner, &seen, Some(&after[0]));
+            post.insert("restarted", i64::from(restarted));
+            conform(&model, &mut state, "Tick", post).unwrap_or_else(|e| panic!("{case}: {e}"));
+            let next = after[0];
+            match back {
+                "none" => {
+                    after.extend(h.shots(Duration::from_millis(400)));
+                    // From the frame before the switch to R: a ghost cut at
+                    // that boundary leaves glass there.
+                    let tails = tails(&[&[seen][..], &after[..]].concat());
+                    let mut post = project(&state, "Spend", &h.owner, &seen, None);
+                    post.insert("tail", i64::from(tails.iter().any(|&t| t > 1)));
+                    conform(&model, &mut state, "Spend", post).unwrap_or_else(|e| {
+                        panic!("{case}: every ghost leaves at full presence: {e} {tails:?}")
+                    });
+                    all.extend(after);
+                }
+                _ => {
+                    for _ in 1..gap {
+                        after.push(h.present());
+                    }
+                    let seen = *after.last().expect("frames");
+                    if back == "M" {
+                        h.focus_other();
+                    } else {
+                        h.focus_third();
+                    }
+                    let home = h.shots(Duration::from_millis(400));
+                    let (restarted, most, floor, there) = return_seat(&seen, &home, true);
+                    assert!(
+                        !restarted && most == 1 && there > 0,
+                        "{case}: the arriver adopts the ghost in the pane the focus came back \
+                         to: {most} bodies, floor {floor} after {there}"
+                    );
+                    all.extend(after);
+                    all.extend(home);
+                }
+            }
+            let story: Vec<[u16; 3]> = all.iter().map(|s| by_pane(s, cw)).collect();
+            let mut cut = [0u16; 3];
+            for pair in story.windows(2) {
+                for (worst, (was, is)) in cut.iter_mut().zip(pair[0].iter().zip(&pair[1])) {
+                    *worst = (*worst).max(was.saturating_sub(*is));
+                }
+            }
+            let low = all.iter().map(total_presence).min().unwrap_or(0);
+            eprintln!(
+                "three panes, {case}: the largest one-frame fall in L/M/R {cut:?}, the cat summed \
+                 at least {low}/255"
+            );
+            assert!(
+                cut.iter().all(|&c| c <= 20),
+                "{case}: a pane lost its cat mid-fade (one fade step is at most 17): {cut:?}"
+            );
+            assert!(low >= 245, "{case}: the cat dipped to {low}");
+            let own = next
+                .frame
+                .pet
+                .departures
+                .iter()
+                .flatten()
+                .filter(|d| d.own_glass)
+                .count();
+            assert!(
+                own == 2 && next.glass_sprites == 2,
+                "{case}: two ghosts after the switch to R, each drawn in its own pane: {next:?}"
+            );
+            let last = all.last().expect("frames");
+            assert!(
+                ghost(last).is_none() && last.glass_sprites == 0 && last.frame.pet.alpha == 255,
+                "{case}: the crossfade completes: {last:?}"
+            );
+            assert!(!h.owner.brain().has_own_glass_ghost());
+        }
+    }
+}
+
+/// The cat in each of `Host::three_settled`'s panes (L, M, R by window x)
+/// this frame, summed as drawn: the focused pane's arriver and its
+/// same-glass ghosts, and each window-channel ghost in the pane it stands in.
+fn by_pane(shot: &Shot, cw: i32) -> [u16; 3] {
+    let pane = |x: i32| ((x / cw) / 33).clamp(0, 2) as usize;
+    let mut out = [0u16; 3];
+    if !shot.cat() {
+        return out;
+    }
+    let focused = pane(shot.pane_at.0);
+    out[focused] += u16::from(shot.frame.pet.alpha);
+    for d in shot
+        .frame
+        .pet
+        .departures
+        .iter()
+        .flatten()
+        .filter(|d| !d.own_glass)
+    {
+        out[focused] += u16::from(drawn_alpha(shot, d));
+    }
+    for &(x, alpha) in shot.own.iter().flatten() {
+        out[pane(x)] += u16::from(alpha);
+    }
+    out
+}
+
 /// AN INCOHERENT FRAME HOLDS, A SUB-ROW SCROLL IS NOT INCOHERENT. A stale
 /// snapshot (the cells extracted before a scroll the facts saw) certifies
 /// nothing, so the pet is held exactly where it was drawn, at full opacity,
@@ -1300,4 +1734,555 @@ fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
     let back = h.run(Duration::from_secs(2));
     assert!(back.frame.on_glass && back.frame.pet.alpha == 255);
     assert!(!jumped(&before, &back), "{back:?}");
+}
+
+/// A TALL SCREEN CROSSFADES THE BODY IT REPLACED (2026-10-08). The world a
+/// surface is judged in is a bounded window of rows around its caret
+/// (`pet_world::MAX_WORLD_ROWS`): on a 90-row terminal, a full-screen program
+/// whose caret is at the bottom cannot see the rows where the shell's body
+/// stood, nor the shell the program's. Unknown is not evidence: the ghost
+/// keeps the verdict its own surface gave it at the boundary, beneath
+/// whatever ink is there, and fades where it was drawn while the arriver
+/// comes up — entering the program and quitting it.
+///
+/// THE ONE GUARANTEE THAT FORBIDS THE GHOST (`PetSurfaceSeam`'s `Refuse`):
+/// the program's screen is protected under the old body — here double-width
+/// rows, which the world never admits a body over: two rows the world sees
+/// whole, or on the tall screen one row it sees under the ghost's feet while
+/// its head is outside the window (a protected cell the world sees refuses
+/// what it cannot see the rest of). No ghost is drawn there, and its presence
+/// is not lost: the arriver carries it, so the cat stands at its new station
+/// at the presence the user saw.
+///
+/// Before this fix, measured here: the tall screen culled the ghost as if
+/// protected, and the first frame had the arriver alone at its ramp's floor
+/// (15/255) on entering and on quitting; both protected screens did the same
+/// (`Cull`).
+#[test]
+fn a_tall_screen_crossfades_the_body_it_replaced() {
+    let model = pet_surface_seam_model();
+    for case in ["enter", "quit", "protected", "half-seen"] {
+        let mut h = match case {
+            "protected" => Host::new(30, 100),
+            _ => Host::new(90, 100),
+        };
+        if case == "quit" {
+            // The program is up, its caret at the bottom; the cat settled
+            // there.
+            h.term.process(b"\x1b[?1049h\x1b[2J\x1b[90;5H");
+            h.owner.resight_owner();
+        }
+        let before = h.run(Duration::from_secs(3));
+        assert!(
+            before.frame.on_glass && before.frame.pet.alpha == 255,
+            "{case}: fixture: the cat settled: {before:?}"
+        );
+        let mut state = model.init_state();
+        step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+        match case {
+            "enter" => h.term.process(b"\x1b[?1049h\x1b[2J\x1b[90;5H"),
+            "quit" => h.term.process(b"\x1b[?1049l"),
+            "half-seen" => {
+                // The world's window starts at the old body's feet row (its
+                // caret 32 rows below it), which is double-width; the head's
+                // row above is outside the window.
+                let feet = before.frame.pet.row as u16;
+                let screen = format!(
+                    "\x1b[?1049h\x1b[2J\x1b[{};1H\x1b#6\x1b[{};5H",
+                    feet + 1,
+                    feet + 33
+                );
+                h.term.process(screen.as_bytes());
+            }
+            _ => h
+                .term
+                .process(&protected_screen(before.frame.pet.row as u16 + 1, 26)),
+        }
+        h.owner.resight_owner();
+        step(&model, &mut state, "Replace", &h.owner, &before, None)
+            .unwrap_or_else(|e| panic!("{case}: the boundary is dark: {e}"));
+        let refused = case.starts_with("protected") || case == "half-seen";
+        if refused {
+            let post = project(&state, "Refuse", &h.owner, &before, None);
+            conform(&model, &mut state, "Refuse", post).expect("refuse");
+        }
+        let after = h.shots(Duration::from_millis(400));
+        let first = after[0];
+        let low = after.iter().map(total_presence).min().unwrap_or(0);
+        let high = after.iter().map(total_presence).max().unwrap_or(0);
+        eprintln!(
+            "tall screen, {case}: the first frame's arriver {}, ghost {:?}; the cat summed \
+             {low}..={high}/255",
+            first.frame.pet.alpha,
+            ghost(&first).map(|g| drawn_alpha(&first, &g))
+        );
+        let mut post = project(&state, "Tick", &h.owner, &before, Some(&first));
+        post.insert("dipped", i64::from(total_presence(&first) < 240));
+        conform(&model, &mut state, "Tick", post).unwrap_or_else(|e| panic!("{case}: {e}"));
+        if refused {
+            assert!(
+                ghost(&first).is_none() && first.frame.pet.alpha >= 240,
+                "{case}: no ghost over protected cells, and the arriver carries its presence: \
+                 {first:?}"
+            );
+        } else {
+            let g = ghost(&first).expect("the old body fades as a ghost");
+            assert!(
+                g.under_ink && (g.col, g.row) == (before.frame.pet.col, before.frame.pet.row),
+                "{case}: where the body was drawn, beneath whatever ink the new world cannot \
+                 see: {g:?}"
+            );
+            let tails = tails(&after);
+            assert!(
+                tails.iter().all(|&t| t <= 1),
+                "{case}: the ghost left glass early: {tails:?}"
+            );
+        }
+        assert!(
+            low >= 245 && high <= 275,
+            "{case}: the cat dipped or doubled: {low}..={high}/255: {after:?}"
+        );
+        let mut post = project(&state, "Spend", &h.owner, &before, None);
+        post.insert("tail", i64::from(tails(&after).iter().any(|&t| t > 1)));
+        conform(&model, &mut state, "Spend", post).unwrap_or_else(|e| panic!("{case}: {e}"));
+        let last = after.last().expect("frames");
+        assert!(
+            ghost(last).is_none() && last.frame.pet.alpha == 255,
+            "{case}: the crossfade completes: {last:?}"
+        );
+    }
+}
+
+/// A full-screen program whose rows `feet - 1..=feet` are double width (an
+/// expanded row: protected, a ghost may not fade over it), its caret on
+/// `caret_row`.
+fn protected_screen(feet: u16, caret_row: u16) -> Vec<u8> {
+    let mut screen = b"\x1b[?1049h\x1b[2J".to_vec();
+    for row in feet - 1..=feet {
+        screen.extend_from_slice(format!("\x1b[{row};1H\x1b#6").as_bytes());
+    }
+    screen.extend_from_slice(format!("\x1b[{caret_row};5H").as_bytes());
+    screen
+}
+
+/// A REFUSED GHOST IS HANDED OVER ONCE (2026-10-08). A full-screen program
+/// whose expanded rows lie under the old body refuses that body's ghost, and
+/// the arriver carries its presence — for good: the ghost leaves the lane on
+/// the frame it is refused. Then, a few frames into that crossfade, the
+/// program quits (the old screen comes back), the focus moves to the other
+/// pane of a split, or the program rewrites the rows single width (the
+/// protection lifts). Through all of it the cat sums to one cat, never a
+/// dip and never a second cat, and the arriver never falls in one frame.
+///
+/// Before this fix, measured here: the refusal was judged afresh every frame
+/// with the ghost kept in the lane, so the next boundary carried it beside
+/// the boosted arriver — 510/255 on the first frame after a quit one frame
+/// in, 492 two frames in — and a lifted protection re-admitted it while the
+/// arriver fell 206/255 in one frame.
+#[test]
+fn a_refused_ghost_is_handed_over_once() {
+    for (case, k) in [
+        ("quit", 1usize),
+        ("quit", 2),
+        ("quit", 4),
+        ("switch", 2),
+        ("lift", 3),
+    ] {
+        let label = format!("{case} after {k}");
+        let mut h = if case == "switch" {
+            Host::split_settled()
+        } else {
+            Host::new(30, 100)
+        };
+        let before = h.run(Duration::from_secs(3));
+        assert!(
+            before.frame.on_glass && before.frame.pet.alpha == 255,
+            "{label}: fixture: the cat settled: {before:?}"
+        );
+        let feet = before.frame.pet.row as u16 + 1;
+        h.term.process(&protected_screen(feet, 26));
+        h.owner.resight_owner();
+        let mut shots: Vec<Shot> = (0..k).map(|_| h.present()).collect();
+        assert!(
+            ghost(&shots[0]).is_none() && shots[0].frame.pet.alpha >= 240,
+            "{label}: fixture: the ghost refused, its presence on the arriver: {:?}",
+            shots[0]
+        );
+        match case {
+            "quit" => {
+                h.term.process(b"\x1b[?1049l");
+                h.owner.resight_owner();
+            }
+            "switch" => h.focus_other(),
+            _ => h.term.process(
+                format!("\x1b[{};1H\x1b#5\x1b[{feet};1H\x1b#5\x1b[26;5H", feet - 1).as_bytes(),
+            ),
+        }
+        shots.extend(h.shots(Duration::from_millis(400)));
+        let sums: Vec<u16> = shots.iter().map(total_presence).collect();
+        let (low, high) = (
+            sums.iter().copied().min().unwrap_or(0),
+            sums.iter().copied().max().unwrap_or(0),
+        );
+        eprintln!("refused, then {label}: the cat summed {low}..={high}/255: {sums:?}");
+        assert!(
+            low >= 245 && high <= 275,
+            "{label}: the cat dipped or doubled: {sums:?}"
+        );
+        if case == "lift" {
+            let arriver: Vec<u8> = shots.iter().map(|s| s.frame.pet.alpha).collect();
+            assert!(
+                arriver.windows(2).all(|w| w[1] >= w[0])
+                    && shots.iter().all(|s| ghost(s).is_none()),
+                "{label}: the refused ghost came back: {arriver:?}"
+            );
+        }
+    }
+}
+
+/// The drawn presence of every ghost in `coat` this frame, summed.
+fn coat_presence(shot: &Shot, coat: u8) -> u16 {
+    if !shot.cat() {
+        return 0;
+    }
+    shot.frame
+        .pet
+        .departures
+        .iter()
+        .flatten()
+        .filter(|d| d.coat == coat)
+        .map(|d| u16::from(drawn_alpha(shot, d)))
+        .sum()
+}
+
+/// THE BREED HANDOFF'S LEAVER CROSSES A BOUNDARY WHERE IT WAS DRAWN
+/// (2026-10-08). A new cat takes over (`PetArrival::Ceremony`: the old coat
+/// runs off toward its edge while the new one fades up; `Quiet`: the old coat
+/// fades in place), and mid-handoff the surface is replaced — a full-screen
+/// program starts, or the focus moves to the other pane of a split. The
+/// leaver is the same pet's body on glass: it is carried with the crossfade
+/// ghosts, stopped where the user saw it, and fades there on the arriver's
+/// ramp (in its own pane for the split) — no frame where it falls by more
+/// than one step of that fade, and it leaves glass on the arriver's full
+/// frame (`GhostLeavesAtFullPresence`).
+///
+/// Before this fix, measured here: the leaver vanished at the boundary, from
+/// 255 to 0 in one frame (ceremony, alternate screen and split), and from
+/// 229 at a homecoming.
+///
+/// WHAT IS CARRIED IS WHAT WAS DRAWN. A selection over the leaver, clear of
+/// the body, culls the leaver on every frame before the seam: nothing of it
+/// is on glass, so nothing of it crosses. After the boundary the old coat is
+/// never brighter than on the last frame before it, and on the pane the
+/// focus left nothing unseen is handed to the arriver. Measured before this
+/// fix: the carry read the brain's record instead of the frame, and a leaver
+/// the user never saw popped in at 255 after an alternate-screen enter (the
+/// cat 126 → 396/255 in one frame).
+#[test]
+fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use aterm_effects::companion::CompanionRung;
+    use aterm_effects::kitty_pet::PetArrival;
+    use aterm_effects::kitty_registry::coat_distance;
+    let model = pet_surface_seam_model();
+    for (case, arrival, frames_in, selected) in [
+        ("screen", PetArrival::Ceremony, 10usize, false),
+        ("split", PetArrival::Ceremony, 30, false),
+        ("screen", PetArrival::Quiet, 3, false),
+        ("screen", PetArrival::Ceremony, 25, true),
+        ("split", PetArrival::Ceremony, 30, true),
+    ] {
+        let label = format!(
+            "{case} {arrival:?}{}",
+            if selected { " under a selection" } else { "" }
+        );
+        let mut h = if case == "split" {
+            Host::split_settled()
+        } else {
+            Host::settled()
+        };
+        let old = h.owner.brain().worn_pair().expect("dressed");
+        let coat = (0..16u8)
+            .find(|&c| coat_distance(old.0, c) >= 40.0)
+            .expect("a far coat");
+        h.owner
+            .set_look((coat, old.1), arrival, CompanionRung::Program);
+        // The handoff fires after its debounce, at a cat kept awake.
+        let mut fired = false;
+        for k in 0..400 {
+            if k % 60 == 0 {
+                h.term.process(b"l");
+            }
+            if coat_presence(&h.present(), old.0) > 0 {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "{label}: fixture: the handoff fired");
+        let mut shots = vec![];
+        for _ in 0..frames_in {
+            shots.push(h.present());
+        }
+        if selected {
+            // A block selection over the leaver's side of the body's rows,
+            // clear of the body: the console culls the leaver on every frame
+            // and keeps the body.
+            let shot = *shots.last().expect("frames");
+            let (cw, ch) = (i32::from(h.cell.0), i32::from(h.cell.1));
+            let (x0, y0, x1, y1) = shot.body_win.expect("fixture: the body on glass");
+            let (px, py) = shot.pane_at;
+            let leaver = shot
+                .frame
+                .pet
+                .departures
+                .iter()
+                .flatten()
+                .find(|d| d.coat == old.0)
+                .expect("fixture: the leaver");
+            let (from, to) = if leaver.col * h.cell.0 as f32 >= (x1 - px) as f32 {
+                ((x1 - px) / cw + 1, i32::from(h.grid().1) - 1)
+            } else {
+                (0, (x0 - px) / cw - 1)
+            };
+            let selection = h.term.text_selection_mut();
+            selection.start_selection(
+                (y0 - py) / ch,
+                from as u16,
+                SelectionSide::Left,
+                SelectionType::Block,
+            );
+            selection.update_selection((y1 - 1 - py) / ch, to as u16, SelectionSide::Right);
+            for _ in 0..3 {
+                shots.push(h.present());
+            }
+        }
+        let before = *shots.last().expect("frames");
+        let seen = coat_presence(&before, old.0);
+        if selected {
+            assert!(
+                seen == 0 && before.frame.pet.alpha > 0,
+                "{label}: fixture: the selection culls the leaver and not the body: {before:?}"
+            );
+        } else {
+            assert!(
+                seen > 192,
+                "{label}: fixture: the leaver on glass at the boundary: {before:?}"
+            );
+        }
+        let mut state = model.init_state();
+        step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+        if selected {
+            let post = project(&state, "Handoff", &h.owner, &before, Some(&before));
+            assert_eq!(post["leaver"], 0, "{label}: fixture: no leaver on glass");
+        } else {
+            step(
+                &model,
+                &mut state,
+                "Handoff",
+                &h.owner,
+                &before,
+                Some(&before),
+            )
+            .expect("leaver");
+            assert_eq!(
+                state["leaver"], 1,
+                "{label}: fixture: the leaver is on glass"
+            );
+        }
+        if case == "split" {
+            h.focus_other();
+        } else {
+            h.term.process(&tui_bytes());
+            h.owner.resight_owner();
+        }
+        step(&model, &mut state, "Replace", &h.owner, &before, None).expect("dark boundary");
+        if case == "split" {
+            step(&model, &mut state, "Shift", &h.owner, &before, None).expect("shift");
+        }
+        let after = h.shots(Duration::from_millis(400));
+        if selected {
+            let carried: Vec<u16> = after.iter().map(|s| coat_presence(s, old.0)).collect();
+            let sums: Vec<u16> = after.iter().map(total_presence).collect();
+            eprintln!(
+                "breed leaver, {label}: the cat {} before the boundary, the old coat {seen}; \
+                 after it the old coat {carried:?}, the cat {sums:?}",
+                total_presence(&before)
+            );
+            assert!(
+                carried.iter().all(|&a| a <= seen),
+                "{label}: a leaver nobody saw came onto glass: {seen} before, {carried:?} after"
+            );
+            // Nor is it handed to the arriver: the cat is one cat, the old
+            // body's ghost and its arriver (the crossfade's rounding allowed,
+            // as `a_refused_ghost_is_handed_over_once` allows it).
+            assert!(
+                sums.iter().all(|&s| s <= 275),
+                "{label}: a leaver nobody saw doubled the cat: {sums:?}"
+            );
+        }
+        step(
+            &model,
+            &mut state,
+            "Tick",
+            &h.owner,
+            &before,
+            Some(&after[0]),
+        )
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        if selected {
+            // The selection cut the leaver, not the boundary: what it owed
+            // as it left glass is the selection's, and nothing crossed.
+            assert!(after.iter().all(Shot::cat), "{label}: a frame with no cat");
+            continue;
+        }
+        shots.extend(after.iter().copied());
+        let leaver: Vec<u16> = shots.iter().map(|s| coat_presence(s, old.0)).collect();
+        let fall = leaver
+            .windows(2)
+            .map(|w| w[0].saturating_sub(w[1]))
+            .max()
+            .unwrap_or(0);
+        // What the leaver still owed when it left glass: its presence then
+        // times what its arriver was still missing.
+        let gone = leaver.iter().rposition(|&a| a > 0).expect("drawn") + 1;
+        let tail = shots.get(gone).map_or(0, |s| {
+            u32::from(leaver[gone - 1]) * u32::from(255 - s.frame.pet.alpha) / 255
+        });
+        eprintln!(
+            "breed leaver, {label}: {} at the boundary, its largest one-frame fall {fall}, owed \
+             {tail} as it left",
+            leaver[frames_in - 1]
+        );
+        assert!(
+            fall <= 20,
+            "{label}: the leaver fell by {fall} in one frame: {leaver:?}"
+        );
+        let mut post = project(&state, "Spend", &h.owner, &before, None);
+        post.insert("tail", i64::from(tail > 1));
+        conform(&model, &mut state, "Spend", post)
+            .unwrap_or_else(|e| panic!("{label}: the leaver left glass early: {e} {leaver:?}"));
+        assert!(after.iter().all(Shot::cat), "{label}: a frame with no cat");
+    }
+}
+
+/// A GHOST ITS OWN GLASS REFUSES HANDS ITS PRESENCE TO THE ARRIVER
+/// (2026-10-08). A split-pane switch on the frame after an incoherent
+/// observation of the pane the focus leaves (a stale snapshot: the body is
+/// held lit there, and nothing under it is certified): that pane cannot admit
+/// the old body as a ghost (`PetSurfaceSeam`'s `Refuse` after a `Shift`), so
+/// none is drawn there — and the arriver comes up from the presence the user
+/// saw instead of from nothing.
+///
+/// Before this fix, measured here: the refused ghost was dropped with its
+/// presence, and the first frame after the switch had no cat at all (the
+/// arriver at 0/255).
+#[test]
+fn a_ghost_its_own_glass_refuses_hands_its_presence_to_the_arriver() {
+    let model = pet_surface_seam_model();
+    let mut h = Host::split_settled();
+    h.stale = true;
+    let before = h.present();
+    h.stale = false;
+    assert!(
+        before.frame.on_glass && before.frame.pet.alpha == 255 && before.observed == 0,
+        "fixture: the body held lit over an observation that certifies nothing: {before:?}"
+    );
+    let mut state = model.init_state();
+    step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+    h.focus_other();
+    step(&model, &mut state, "Replace", &h.owner, &before, None).expect("dark boundary");
+    step(&model, &mut state, "Shift", &h.owner, &before, None).expect("shift");
+    let post = project(&state, "Refuse", &h.owner, &before, None);
+    conform(&model, &mut state, "Refuse", post).expect("refuse");
+    let after = h.shots(Duration::from_millis(400));
+    let first = after[0];
+    let low = after.iter().map(total_presence).min().unwrap_or(0);
+    eprintln!(
+        "own glass refused: the first frame's arriver {}, {} ghosts; the cat summed at least \
+         {low}/255",
+        first.frame.pet.alpha,
+        first.frame.pet.departures.iter().flatten().count()
+    );
+    let mut post = project(&state, "Tick", &h.owner, &before, Some(&first));
+    post.insert("dipped", i64::from(total_presence(&first) < 240));
+    conform(&model, &mut state, "Tick", post).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        first.glass_sprites == 0 && first.frame.pet.alpha >= 240,
+        "no ghost on the refusing glass, and the arriver carries its presence: {first:?}"
+    );
+    assert!(low >= 245, "the cat dipped to {low}/255: {after:?}");
+}
+
+/// A CARRIED GHOST KEEPS ITS OWN TILE (2026-10-08). The emitter bakes at most
+/// two new tiles a frame and re-emits a ghost's held tile when its bake is
+/// deferred; the hold is the ghost's (`PetDepartureSprite::id`), wherever the
+/// lane puts it. A breed homecoming's leaver carried to a tab of another
+/// background is the third new tile of the frame after the switch (the
+/// arriver and the body the user saw take the budget): it is drawn in the
+/// tile it wore a frame ago, and every ghost on the lane is drawn on every
+/// frame.
+///
+/// Before this fix, measured here: the hold was keyed on the ghost's birth
+/// stamp, which a carried ghost re-bases (and every crossfade ghost shared,
+/// 0.0), so the deferred leaver had no hold and was not drawn on that frame.
+#[test]
+fn a_carried_ghost_keeps_its_own_tile() {
+    use aterm_effects::companion::CompanionRung;
+    use aterm_effects::kitty_pet::PetArrival;
+    use aterm_effects::kitty_registry::coat_distance;
+    let mut h = Host::settled();
+    let old = h.owner.brain().worn_pair().expect("dressed");
+    let coat = (0..16u8)
+        .find(|&c| coat_distance(old.0, c) >= 40.0)
+        .expect("a far coat");
+    h.owner
+        .set_look((coat, old.1), PetArrival::Quiet, CompanionRung::Program);
+    let mut fired = false;
+    for k in 0..400 {
+        if k % 60 == 0 {
+            h.term.process(b"l");
+        }
+        if coat_presence(&h.present(), old.0) > 0 {
+            fired = true;
+            break;
+        }
+    }
+    assert!(fired, "fixture: the homecoming fired");
+    // The other tab: a light background under its prompt.
+    let mut tab = Terminal::new(30, 100);
+    let mut paint = b"\x1b]11;#f0f0f0\x07\x1b[47m".to_vec();
+    for row in 1..=30 {
+        paint.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
+    }
+    paint.extend_from_slice(b"\x1b[21;1H$ ");
+    tab.process(&paint);
+    std::mem::swap(&mut h.term, &mut tab);
+    h.session = 9;
+    h.owner.resight_coordinate_space();
+    h.owner.resight_owner();
+    let after = h.shots(Duration::from_millis(400));
+    assert!(
+        coat_presence(&after[0], old.0) > 0,
+        "fixture: the leaver is carried to the tab: {:?}",
+        after[0]
+    );
+    for (k, shot) in after.iter().enumerate() {
+        if shot.frame.pet.motes.iter().any(Option::is_some) {
+            continue;
+        }
+        let ghosts = shot
+            .frame
+            .pet
+            .departures
+            .iter()
+            .flatten()
+            .filter(|d| !d.own_glass && drawn_alpha(shot, d) > 0)
+            .count();
+        let body = usize::from(shot.frame.pet.alpha > 0);
+        assert_eq!(
+            shot.sprites,
+            ghosts + body,
+            "frame {k}: every body on the lane is drawn: {shot:?}"
+        );
+    }
 }

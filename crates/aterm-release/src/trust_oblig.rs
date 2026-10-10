@@ -1758,14 +1758,10 @@ impl AtermRepo<'_> {
 }
 
 /// The git the gate reads the trust repository with (and the aterm one a
-/// ledger row's audited commit is read in, [`AtermRepo`]): `git -C <repo>`, its
-/// environment cleared of every `GIT_*` variable the caller's shell set
-/// (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-/// `GIT_REPLACE_REF_BASE`, `GIT_GRAFT_FILE`, `GIT_SHALLOW_FILE` … would each
-/// answer for another repository or rewrite this one's history), with no system
-/// or global config, replace refs ignored, no lazy fetch and no prompt. (A
-/// graft file, which no variable turns off quietly, [`TrustRepo::unfit`]
-/// refuses.)
+/// ledger row's audited commit is read in, [`AtermRepo`]):
+/// [`crate::ledger::object_git`] — no `GIT_*` variable, system or global config
+/// steering it, replace refs ignored, no lazy fetch and no prompt. (A graft file,
+/// which no variable turns off quietly, [`TrustRepo::unfit`] refuses.)
 pub struct TrustGit {
     repo: PathBuf,
 }
@@ -1778,21 +1774,7 @@ impl TrustGit {
 
 impl GitRunner for TrustGit {
     fn git(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
-        let mut cmd = std::process::Command::new("git");
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("GIT_") {
-                cmd.env_remove(&k);
-            }
-        }
-        cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0");
-        let out = cmd
-            .arg("-C")
-            .arg(&self.repo)
+        let out = crate::ledger::object_git(&self.repo)
             .args(args)
             .output()
             .map_err(|e| {

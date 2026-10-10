@@ -129,7 +129,11 @@ struct Broker {
 
 impl Broker {
     fn spawn(s: &Scratch) -> Self {
+        use aterm_uds::spawnfd::InheritNothing as _;
+        // std's, for `harness::first_line_within`, with the strip: the broker
+        // holds its stdio and nothing else of this process while it serves.
         let mut child = Command::new(harness::link_to_launch())
+            .inherit_nothing()
             .args(["broker", &s.sock(), &s.path("root/bus.log")])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

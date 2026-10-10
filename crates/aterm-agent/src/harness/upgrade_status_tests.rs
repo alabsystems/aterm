@@ -1010,7 +1010,7 @@ fn the_awake_clock_is_the_machines_last_wake_or_boot() {
 }
 
 /// AN UNWATCHED RECORD IS TOLD AS ATERM'S OWN FAULT (design record 2026-09-28,
-/// C6 and C10, §5's words; the owner's ruling of 2026-09-29): a stall
+/// C6 and C10): a stall
 /// ([`Row::stall`] `unwatched`) and ONE fault line in the log
 /// ([`Row::attention`], kind `unwatched`) — never a row or the tab's mark,
 /// since the owner has nothing to do about aterm's own timer — over what the
@@ -1355,8 +1355,7 @@ fn a_host_that_has_just_begun_or_resumed_watching_flags_nothing_unwatched() {
 /// writing to a terminal nobody reads would sit in its exit's drain), so once
 /// both have exec'd no job holds the terminal, its last slave closes, and
 /// the session loses it (`ps` reads no tty, `tpgid` none) — the front then
-/// reads as aside too. Until 2026-09-30 an inheritable `openpty(3)` slave,
-/// leaked into both jobs, kept it open by accident.
+/// reads as aside too.
 #[cfg(unix)]
 fn jobs_on_a_tty(
     dir: &std::path::Path,
@@ -1366,6 +1365,7 @@ fn jobs_on_a_tty(
     u32,
     (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
 ) {
+    use aterm_uds::spawnfd::InheritNothing as _;
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
     // Both ends close-on-exec from birth: the zsh below holds its terminal,
@@ -1381,20 +1381,23 @@ fn jobs_on_a_tty(
         exe.display()
     );
     let pid_file = dir.join("back.pid");
+    // `std`'s, for the hook below, with the strip installed first: the zsh
+    // and the jobs it starts hold their stdio and nothing else of this process.
     let mut zsh = std::process::Command::new("/bin/zsh");
-    zsh.args([
-        "-f",
-        "-c",
-        &format!(
-            "setopt monitor; {park} & print -r -- $! > '{}'; exec {park}",
-            pid_file.display()
-        ),
-    ])
-    .env("UPGRADE_DRIVE_TEST_PARK", "1")
-    .env("ATERM_PARENT_SESSION_ID", tab)
-    .stdin(tty(&slave))
-    .stdout(tty(&slave))
-    .stderr(tty(&slave));
+    zsh.inherit_nothing()
+        .args([
+            "-f",
+            "-c",
+            &format!(
+                "setopt monitor; {park} & print -r -- $! > '{}'; exec {park}",
+                pid_file.display()
+            ),
+        ])
+        .env("UPGRADE_DRIVE_TEST_PARK", "1")
+        .env("ATERM_PARENT_SESSION_ID", tab)
+        .stdin(tty(&slave))
+        .stdout(tty(&slave))
+        .stderr(tty(&slave));
     // SAFETY: async-signal-safe calls only, between fork and exec: a new
     // session, and the terminal on stdin made its controlling terminal.
     unsafe {
@@ -1682,14 +1685,11 @@ fn a_tab_another_supervisor_claims_reads_its_claim_never_aterms_own_fault() {
     pin_awake_since(0);
 }
 
-/// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB (the
-/// review of 2026-09-30): a build before 2026-09-25 recorded no tab, and
-/// `--status` shows such a row under the tab its holder is proven in — but
-/// read its aside BEFORE it filled that tab in, so no claim could hold it
-/// and the row read `stalled=unwatched`, "aterm's own fault", where the
-/// window names the claim. Read once its tab is known, it reads the claim.
-/// NEGATIVE CONTROLS: the same record with no tab claimed, or another tab,
-/// reads `unwatched` as ever.
+/// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB: `--status`
+/// shows such a row under the tab its holder is proven in, and reads its aside
+/// only once that tab is filled in, so a claim there holds it (never
+/// `stalled=unwatched`). NEGATIVE CONTROLS: the same record with no tab
+/// claimed, or another tab, reads `unwatched`.
 #[test]
 fn a_record_with_no_recorded_tab_reads_the_claim_on_its_holders_tab() {
     let dir = ScratchDir::new("upgrade-status", "claimed-untabbed");
@@ -1726,13 +1726,10 @@ fn a_record_with_no_recorded_tab_reads_the_claim_on_its_holders_tab() {
     pin_awake_since(0);
 }
 
-/// THE ROW A WORD PRINTS IS READ AS `--status` READS IT (the review of
-/// 2026-09-30): `aterm harness upgrade <sid> --now` printed the row the word
-/// left with no aside read, so on a tab another supervisor's claim holds —
-/// no host runs a worker there, and `--status` names the claim — it printed
-/// `stalled=unwatched`, "aterm's own fault". The one rule reads it now
-/// ([`Row::set_aside`]). NEGATIVE CONTROLS: no tab claimed, or another tab,
-/// and the same word's row reads `unwatched` as ever.
+/// THE ROW A WORD PRINTS IS READ AS `--status` READS IT: `aterm harness upgrade
+/// <sid> --now` on a tab another supervisor's claim holds prints the claim,
+/// never `stalled=unwatched` ([`Row::set_aside`]). NEGATIVE CONTROLS: no tab
+/// claimed, or another tab, and the same word's row reads `unwatched`.
 #[test]
 fn the_row_a_word_prints_reads_the_claim_on_its_tab() {
     let dir = ScratchDir::new("upgrade-status", "ask-claimed");
@@ -1772,13 +1769,10 @@ fn the_row_a_word_prints_reads_the_claim_on_its_tab() {
     pin_awake_since(0);
 }
 
-/// A RECORD NO BUILD GAVE A TAB IS WATCHED IN THE TAB ITS HOLDER IS PROVEN IN
-/// (the watch's review, 2026-09-28): an older build recorded the tab only at
-/// the announcement (measured 2026-09-25 on the owner's machine), and the
-/// view dropped a row with no tab before it read any watch, so such a record
-/// was never watched — its deadline shown by `--status` alone. It is named
-/// due, and its instant named, under the live tab its holder is proven in,
-/// as `--status` shows it. NEGATIVE CONTROLS: the same record whose holder
+/// A RECORD NO BUILD GAVE A TAB IS WATCHED IN THE TAB ITS HOLDER IS PROVEN IN:
+/// an older build recorded the tab only at the announcement. It is named due,
+/// and its instant named, under the live tab its holder is proven in, as
+/// `--status` shows it. NEGATIVE CONTROLS: the same record whose holder
 /// is proven in a tab this instance does not show is neither listed nor
 /// timed; and with its holders unread nothing proves its tab, so nothing is
 /// watched off a guess.
@@ -2198,7 +2192,7 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
     sweep(&mut view);
     // THE FIRST LOOK OF A PROCESS LOWERS WHAT AN EARLIER ONE RAISED (a
     // seamless update carries every keyed attention across the handoff, and
-    // this view starts with nothing marked; round eight, #20): one idempotent
+    // this view starts with nothing marked): one idempotent
     // `unset` for the tab it wants no mark on, and nothing that marks.
     assert_eq!(
         meta(&asked),
@@ -2241,14 +2235,11 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
     );
 }
 
-/// A MARK THIS VIEW DID NOT RAISE IS LOWERED AT ITS FIRST LOOK (round eight,
-/// #20): a seamless update carries every keyed owner's attention but the
-/// server's into the successor, and the successor's view began with nothing
-/// it had raised — so an `owner=upgrade` "upgrade stalled" mark its producer
-/// raised stood on the tab after the stall it named was over, and was
-/// carried on at every later update. Now the successor's first whole look
-/// lowers the `owner=upgrade` entry of every live tab it does not want
-/// marked, once, by that key alone. NEGATIVE CONTROLS: its later looks send
+/// A MARK THIS VIEW DID NOT RAISE IS LOWERED AT ITS FIRST LOOK: a seamless
+/// update carries keyed attention into the successor, whose view begins with
+/// nothing raised, so the successor's first whole look lowers the
+/// `owner=upgrade` entry of every live tab it does not want marked, once, by
+/// that key alone. NEGATIVE CONTROLS: its later looks send
 /// nothing more; a tab it wants marked is written, never lowered; and a view
 /// that stood down settles its tabs again at its next look.
 #[test]
@@ -2452,14 +2443,11 @@ fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     }
 }
 
-/// AN OVERDUE TAB IS NEVER MARKED (the owner, 2026-09-28: "don't continue to
-/// persist alerts to the user that are not actionable"; the tab of that day
-/// wore an orange diamond for 7 hours for a session that was merely behind
-/// and busy), and THE TAB'S MARK OF A STALL THAT IS ONE IS SENT ONCE (review
-/// of 2026-09-25: the overdue text carried `behind for 7h1m`, so each minutely
-/// sweep re-sent `meta set attention` — three sets in three minutes, each a
-/// meta-change event and a wake, and each taking the shown attention back from
-/// a later owner). Three sweeps a minute apart on an overdue tab send NONE;
+/// AN OVERDUE TAB IS NEVER MARKED (the owner: "don't continue to persist
+/// alerts to the user that are not actionable"), and THE TAB'S MARK OF A STALL
+/// THAT IS ONE IS SENT ONCE: a mark text carrying an age would be re-sent at
+/// every sweep, each a meta-change event and a wake. Three sweeps a minute
+/// apart on an overdue tab send NONE;
 /// when the agent it was moving is gone (the upgrade ended it and it is not
 /// back) the mark is sent ONCE, holding no age; a change of KIND is a new
 /// text, sent once more.
@@ -2725,13 +2713,8 @@ fn an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time() {
     assert_eq!(untimed.stall(NOW).as_deref(), Some("overdue"));
 }
 
-/// A GAVE-UP UPGRADE IS NOT STALLED, BEFORE OR AFTER `--now` RE-ARMS IT. The
-/// review of 2026-09-25 found a session six hours behind re-armed by `--now`
-/// reading `overdue` at once — the gave-up row resolved, a NEW Warn row
-/// naming `--now` again posted, the tab's mark re-sent under new words — and
-/// the fix left the give-up itself a stall (`stalled=gave-up`, a band row and
-/// the tab's mark), for good: the owner's tab of 2026-09-27 read it for
-/// 1d22h ("you should NEVER have upgrades stalled"). Now a round that gave up
+/// A GAVE-UP UPGRADE IS NOT STALLED, BEFORE OR AFTER `--now` RE-ARMS IT (the
+/// owner: "you should NEVER have upgrades stalled"). A round that gave up
 /// rests until its next one, which `--status` names (`next_round=`), and is
 /// never marked; the owner's `--now` re-arms it at once, as its remedy says,
 /// and nothing is marked then either. NEGATIVE CONTROL: the same row as a
@@ -2805,7 +2788,7 @@ fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
             .unwrap_or_default()
     };
     // Marks SET, never the view's first-look lowering of one it did not
-    // raise (round eight, #20).
+    // raise.
     let sets = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
         meta(asked)
             .into_iter()
@@ -2881,14 +2864,14 @@ fn a_line_refusal_says_the_line_not_the_flags() {
 /// park test, its tab in its environment. Not `/bin/sleep`: a platform
 /// binary's environment is hidden from `KERN_PROCARGS2`.
 #[cfg(unix)]
-fn parked_agent(tab: &str) -> std::process::Child {
-    let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+fn parked_agent(tab: &str) -> aterm_uds::spawnfd::Child {
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("exe"))
         .args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
         .env("UPGRADE_DRIVE_TEST_PARK", "1")
         .env("ATERM_PARENT_SESSION_ID", tab)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .spawn()
         .expect("the stand-in agent");
     // Its environment is read once it has exec'd (a fork not yet exec'd reads
@@ -2971,7 +2954,7 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
             .unwrap_or_default()
     };
     // Marks SET, never the view's first-look lowering of one it did not
-    // raise (round eight, #20).
+    // raise.
     let sets = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
         meta(asked)
             .into_iter()
@@ -3864,8 +3847,7 @@ fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
 }
 
 /// A Claude Code waiting on its own work is worded for the user within the
-/// band's 64 characters at any age below 100 days, and `--now` is not offered
-/// (owner, 2026-09-26).
+/// band's 64 characters at any age below 100 days, and `--now` is not offered.
 #[test]
 fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
     for wait in ["background", "not-idle:shell"] {
@@ -3945,11 +3927,9 @@ fn a_person_at_the_tab_is_named_only_while_a_look_has_seen_them() {
     for ago in [30, 6 * 3_600] {
         assert_eq!(at(ago).remedy(NOW), Some(Remedy::Waits), "{ago}");
     }
-    // THE TAB'S MARK SAYS WHAT THE ROW SAYS (the review of 2026-09-28, the
-    // s-d3346 shape): a person no look has seen lately is no person on the
-    // mark either — it said "waiting on a person (a question, a draft, a
-    // login or a hold)" beside the row's "it waits for its next turn end".
-    // It changes once, at the instant the row does, and not again.
+    // THE TAB'S MARK SAYS WHAT THE ROW SAYS: a person no look has seen lately
+    // is no person on the mark either. It changes once, at the instant the
+    // row does, and not again.
     let mark = |seen_ago: u64| {
         assert_eq!(at(seen_ago).badge(NOW), None, "a wait marks no tab");
         at(seen_ago).overdue_cause(NOW)
@@ -4154,13 +4134,12 @@ fn a_release_still_owed_is_shown_and_worded() {
     );
 }
 
-/// NO RAW WAIT WORD IN A PERSON'S WORDS (round 18, day four, D3: `waiting
-/// (not-idle:busy)`, `waiting (background)`): every wait a Claude step
-/// records reads as words, a wait with none is left out, and the words fit
-/// the band's first line. An ANNOUNCED move on its own work is still asking
-/// by itself (D5): it marks no tab — and neither does the same wait before
-/// any notice, nor a turn still running (the owner, 2026-09-28: behind for
-/// hours is no reason to mark a tab).
+/// NO RAW WAIT WORD IN A PERSON'S WORDS (never `waiting (not-idle:busy)`):
+/// every wait a Claude step records reads as words, a wait with none is left
+/// out, and the words fit the band's first line. An ANNOUNCED move on its own
+/// work is still asking by itself: it marks no tab — and neither does the same
+/// wait before any notice, nor a turn still running (behind for hours is no
+/// reason to mark a tab).
 #[test]
 fn a_claude_stall_never_prints_its_wait_word() {
     for wait in [
@@ -4224,7 +4203,7 @@ fn a_claude_stall_never_prints_its_wait_word() {
     assert!(!pending_with("background").asks_on_its_own(NOW));
     assert!(pending_with("background").badge(NOW).is_none());
     // An announced move whose turn is still running is the upgrade asking
-    // on its own too (ruling 380, the owner's decision of 2026-09-28): an
+    // on its own too (ruling 380): an
     // overdue upgrade stands on the ladder's last rung, which `--now` is, so
     // no word of the owner's moves it sooner. A record, no tab mark — as is
     // every wait: only an interrupt marks a tab.
@@ -4303,16 +4282,14 @@ fn pending_with(wait: &str) -> Row {
     }
 }
 
-/// AN OVERDUE MOVE NAMES ITS CAUSE, BY CLASS (design record 2026-09-28, §1.4):
-/// tab #1's mark read "behind for more than 6h" for as long as it stood —
-/// true, and silent on what held it and who could end it. The class
+/// AN OVERDUE MOVE NAMES ITS CAUSE, BY CLASS (design record 2026-09-28, §1.4),
+/// not just "behind for more than 6h". The class
 /// ([`Row::cause`], in words [`Row::overdue_cause`]) is the agent's own
 /// work, a person, a usage limit, aterm's own notice, a wait no look has
 /// recorded, and — loud — a word this build does not classify; one text per
-/// class whatever the word under it. Since the owner's ruling of 2026-09-28
-/// ("don't continue to persist alerts that are not actionable") an overdue
-/// tab is NEVER MARKED — the class is what the digest line, `--status` and
-/// the log say (`an_overdue_tab_is_never_marked`).
+/// class whatever the word under it. An overdue tab is NEVER MARKED — the
+/// class is what the digest line, `--status` and the log say
+/// (`an_overdue_tab_is_never_marked`).
 #[test]
 fn an_overdue_move_names_its_cause_by_class() {
     let mark = |wait: &str| {
@@ -4391,8 +4368,8 @@ fn an_overdue_move_names_its_cause_by_class() {
     );
     // Two classes, two texts.
     assert_ne!(mark("not-idle:busy"), mark("box"));
-    // The words the review of 2026-09-28 found falling to "does not
-    // classify": the Codex thread's own turn, a resting round, and the waits
+    // Words that must not fall to "does not classify": the Codex thread's
+    // own turn, a resting round, and the waits
     // on a tab or conversation aterm cannot reach.
     for (wait, words) in [
         ("busy-thread", "held by its own work"),
@@ -4413,12 +4390,10 @@ fn an_overdue_move_names_its_cause_by_class() {
     }
 }
 
-/// THE CODEX LADDER'S AND THE GOAL PAUSE'S WORDS ARE CLASSED (the merge of
-/// 2026-09-28, rulings 380 and 381 beside the design record's step 1): each
-/// wait the Codex lane records since the ladder and the goal pause reads, on
-/// an overdue mark, as the class of what holds the move — never "a wait
-/// aterm does not classify", which main's class reader says of any word it
-/// was not taught. A goal, the pause's own steps and the tab's own
+/// THE CODEX LADDER'S AND THE GOAL PAUSE'S WORDS ARE CLASSED (rulings 380 and
+/// 381): each wait the Codex lane's ladder and goal pause record reads, on an
+/// overdue mark, as the class of what holds the move — never "a wait aterm
+/// does not classify". A goal, the pause's own steps and the tab's own
 /// conversation's turn are its own work; a save-then-wait switch is the
 /// usage limit it waits out; a goal aterm paused and left waits on the hand
 /// step its own row names; the daemon's waits are the daemon's; a screen or
@@ -4483,13 +4458,11 @@ fn an_overdue_codex_mark_classes_the_ladders_and_goal_pauses_words() {
     );
 }
 
-/// ONE STALL ON ITS OWN WORK IS ONE MARK, WHATEVER ITS GATES SAID (review of
-/// 2026-09-28): tab #1's stall ran through `background` at a break,
-/// `announce-refused:changed` where the notice's fence refused at an idle
-/// point, and `attended`/`draft` when a person touched the tab. Read from the
-/// word alone, each moved the class and so the text (then the tab's mark,
-/// re-sent at each move; now the digest line's words and its once-only
-/// identity). While processes run under the agent those passing words read
+/// ONE STALL ON ITS OWN WORK IS ONE MARK, WHATEVER ITS GATES SAID: a stall
+/// passes through `background` at a break, `announce-refused:changed` where
+/// the notice's fence refused at an idle point, and `attended`/`draft` when a
+/// person touched the tab; read from the word alone, each would move the class
+/// and so the digest line's words. While processes run under the agent those passing words read
 /// as its own work; with none recorded, the same words still name their own
 /// class — the branch the precedence adds, shown working.
 #[test]
@@ -4517,7 +4490,7 @@ fn an_overdue_move_holds_its_class_through_the_notice_paths_passing_words() {
         assert_eq!(under(wait).overdue_cause(NOW), first, "{wait}");
         assert_eq!(under(wait).badge(NOW), None, "{wait}: never marked");
     }
-    // A PERSON'S DRAFT AND A HOLD STAND (the safety review of 2026-09-28):
+    // A PERSON'S DRAFT AND A HOLD STAND:
     // text a person typed and did not send, or a halt or another driver's
     // lease, is theirs until they end it, whatever runs under the agent — the
     // draft that was a misread (`a_displaced_grid_never_makes_a_placeholder_a_
@@ -5040,8 +5013,8 @@ fn a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall()
         twice.column(NOW),
         "stalled/2.1.282/failed:signal-refused/8h"
     );
-    // A stop that repeats is ONE line in the digest, never a mark on the tab
-    // (the owner, 2026-09-28): it can wait, and the owner's action is theirs.
+    // A stop that repeats is ONE line in the digest, never a mark on the tab:
+    // it can wait, and the owner's action is theirs.
     assert_eq!(twice.badge(NOW), None);
     assert!(
         matches!(twice.attention(NOW), Attention::Digest(n) if n.kind == "repeating-stop"),
@@ -5089,21 +5062,17 @@ fn a_stop_that_asks_again_marks_nothing_and_one_that_repeats_carries_its_stall()
     );
 }
 
-/// A PERSON'S HOLD IS NOT THE UPGRADE ASKING ON ITS OWN (round six, F6), AND
-/// IT IS NOT AN ALERT EITHER (the owner, 2026-09-28: an alert persists only
-/// where they can act, and says why and what). The row's STATE is exact: an
+/// A PERSON'S HOLD IS NOT THE UPGRADE ASKING ON ITS OWN, AND IT IS NOT AN
+/// ALERT EITHER (an alert persists only where the owner can act, and says why
+/// and what). The row's STATE is exact: an
 /// announced round whose notice waits on a draft, a box, aterm's hold, a
 /// login or a question is never asked again (the re-ask waits under the same
 /// gate), so it never gives up either, and only the person ends it. Its
 /// LOUDNESS is the classifier's: the person who holds it is at the tab, so a
 /// hold is a record while the last notice is fresh, ONE log line naming the
 /// waits once a day has passed with no progress, and — a draft nobody sent,
-/// stood for a day — ONE digest line. Never a tab mark, never a row: round
-/// six's "a row with a mark naming a person" is superseded (design record
-/// 2026-09-29, D14).
-///
-/// FAILS WITHOUT THE STATE FIX: each read `asks_on_its_own`. FAILS WITHOUT
-/// THE CLASSIFIER: the mark was `Some("… waiting on a person …")`.
+/// stood for a day — ONE digest line. Never a tab mark, never a row (design
+/// record 2026-09-29, D14).
 #[test]
 fn a_person_held_announced_upgrade_is_a_record_never_a_mark() {
     for wait in [
@@ -5206,18 +5175,14 @@ fn a_person_held_announced_upgrade_is_a_record_never_a_mark() {
     }
 }
 
-/// THE MOVE CLOCK (round six, F7; [`MOVE_BUDGET_S`]): a session whose own
+/// THE MOVE CLOCK ([`MOVE_BUDGET_S`]): a session whose own
 /// work never ends is asked, given up on, rested and asked again for as long
 /// as it runs. A day behind, the row's WORDS say so — nothing is "pending on
 /// its next round" for a day, whatever its rounds do — and the classifier
 /// makes the day news, once: an agent whose own work has answered a whole
 /// round with "not yet" a day behind is ONE digest line (`own-work`), never a
-/// row, a mark or an interrupt (round six's "every phase of the cycle is a
-/// row with a mark" is superseded, design record 2026-09-29, D14). A usage
+/// row, a mark or an interrupt (design record 2026-09-29, D14). A usage
 /// limit stays a record until its reset (ruling 307).
-///
-/// FAILS WITHOUT THE FIX: five rounds given up in a row, three days behind,
-/// read `asks_on_its_own` with nothing in the digest.
 #[test]
 fn a_day_behind_is_news_whatever_the_rounds_do() {
     let gave_up = Row {
@@ -5312,26 +5277,20 @@ fn a_day_behind_is_news_whatever_the_rounds_do() {
     );
 }
 
-/// A LIMIT WHOSE NAMED RESET HAS PASSED IS TOLD (the assessment of
-/// 2026-09-29, A1; design record 2026-09-28, §3.2 C6, `Wall(until)`): a tab
-/// left at its usage limit's notice after the reset the transcript named —
-/// no turn since to clear it, the loop's wall guard withholding every point
-/// while the notice stands — was a record for ever: `asks_on_its_own` and
-/// `past_move_budget` read `limited` alone, and no record kept the reset
-/// (`HarnessUpgradeProgress`'s `LimitRecordForEver`). Now the record keeps
-/// the reset (`limit_until`), and [`LIMIT_GRACE_S`] past it the move is told
+/// A LIMIT WHOSE NAMED RESET HAS PASSED IS TOLD (design record 2026-09-28,
+/// §3.2 C6, `Wall(until)`; `HarnessUpgradeProgress`'s `LimitRecordForEver`): a
+/// tab left at its usage limit's notice after the reset the transcript named
+/// has no turn to clear it, the loop's wall guard withholding every point
+/// while the notice stands. The record keeps the reset (`limit_until`), and
+/// [`LIMIT_GRACE_S`] past it the move is told
 /// whatever its age, its phase or the owner's `--now` (which never waives a
 /// limit) — AS ATERM'S OWN FAULT, ONE LINE IN THE LOG (`limit-passed`): the
 /// resume that continues a session at its reset has not cleared the notice,
 /// which the owner can do nothing about now. Never a row, a mark or a digest
-/// line (the owner's rule of 2026-09-28: an alert persists only where the
-/// owner can act); the view wakes for that instant. NEGATIVE CONTROLS —
-/// ruling 307 kept: a reset still ahead, a reset inside its grace, and a
-/// record with no reset read (`0`, every record before this) are a record at
-/// any age, unmarked and quiet.
-///
-/// FAILS WITHOUT THE FIX: the limit four hours past its reset, a day and
-/// more behind, read `asks_on_its_own` and quiet.
+/// line (an alert persists only where the owner can act); the view wakes for
+/// that instant. NEGATIVE CONTROLS (ruling 307): a reset still ahead, a reset
+/// inside its grace, and a record with no reset read (`0`) are a record at any
+/// age, unmarked and quiet.
 #[test]
 fn a_limit_whose_named_reset_has_passed_is_told() {
     let passed = NOW - LIMIT_GRACE_S - 3 * 3_600;
@@ -5440,9 +5399,8 @@ fn a_limit_whose_named_reset_has_passed_is_told() {
     assert!(matches!(ahead.attention(turns), Attention::Fault(_)));
     assert_eq!(ahead.next_attention_at(NOW), Some(turns));
     // With no reset read, the reset's instant is never named; the BOUND is
-    // (a week after the wait began, `LONGEST_LIMIT_S`, the review of
-    // 2026-09-29 — until then "none comes", a record for ever): quiet a
-    // second before it, a fault at it.
+    // (a week after the wait began, `LONGEST_LIMIT_S`): quiet a second
+    // before it, a fault at it.
     let unnamed = Row {
         limit_until: 0,
         ..ahead.clone()
@@ -5485,14 +5443,13 @@ fn a_limit_whose_named_reset_has_passed_is_told() {
     );
 }
 
-/// WHAT HOLDS THE MOVE AND WHAT THE OWNER IS TOLD, ON `--status` (design
-/// record 2026-09-28, §3.2 C8): `cause=` names the class of the wait — for a
-/// record as for a row — and `told=` whether the owner has been told and of
-/// what (`-`: nothing told; else the KIND of the fault line, digest line or
-/// interrupt, [`Row::attention`]). The line said the wait word and the stall
-/// alone, so "is the owner told, and of what?" had no answer but the window.
-/// `--json` carries both as `cause` and `told` (and the class as a sentence,
-/// `cause_words`). A wait is a record: told only where the owner's rule says.
+/// WHAT HOLDS THE MOVE AND WHAT THE OWNER IS TOLD, ON `--status` (design record
+/// 2026-09-28, §3.2 C8): `cause=` names the class of the wait — for a record as
+/// for a row — and `told=` whether the owner has been told and of what (`-`:
+/// nothing told; else the KIND of the fault line, digest line or interrupt,
+/// [`Row::attention`]). `--json` carries both as `cause` and `told` (and the
+/// class as a sentence, `cause_words`). A wait is a record: told only where the
+/// owner's rule says.
 #[test]
 fn status_says_what_holds_the_move_and_what_the_owner_is_told() {
     let words = |row: &Row| {
@@ -5639,7 +5596,7 @@ const WAITS: &[&str] = &[
     "no-shell-integration",
     "thread-locked",
     // The Codex lane's ladder and goal pause (rulings 380 and 381), and the
-    // words the waiting record classes since the review of 2026-09-28.
+    // waiting record's words.
     "goal",
     "goal:switch",
     "goal-held",
@@ -5670,13 +5627,8 @@ const WAITS: &[&str] = &[
 
 /// HOW LOUD AN UPGRADE IS IS DECIDED BY WHETHER THE OWNER CAN DO ANYTHING,
 /// NEVER BY HOW LONG THE SESSION HAS BEEN BEHIND — AND NO WAIT IS QUIET FOR
-/// EVER (the owner, 2026-09-28: "don't continue to persist alerts to the user
-/// that are not actionable"; the tab of that day carried a warn row, an orange
-/// diamond and a menu-bar line for 7 hours because a timer crossed six; and
-/// the review of the plan that removed them found that, at thirty days, a
-/// held, limited, queued, boxed, attended or settling record read quiet, the
-/// six-hour row having been the only thing that caught a session nobody
-/// asked). For every wait word, in either phase, for either agent: a record
+/// EVER (the owner: "don't continue to persist alerts to the user that are not
+/// actionable"). For every wait word, in either phase, for either agent: a record
 /// an hour old is quiet (bar the two owner-only facts that need no time); the
 /// same record with no progress in a hundred days is NEVER quiet and never an
 /// interrupt — a digest line where the owner has the one action that ends it,
@@ -5815,11 +5767,10 @@ fn a_quiet_wait_turns_a_fault_line_at_its_own_horizon() {
     assert_eq!(live.next_attention_at(NOW), None);
 }
 
-/// THE AGENT'S OWN WORK IS THE ROUND'S, NOT THE LAST LOOK'S (the safety
-/// review of 2026-09-28: right after each notice, give-up and re-arm the act
-/// had cleared the wait and the list of holders, and the class fell to quiet
-/// until the next look — thirteen flips in one round, each a new log line and
-/// a dismissed entry back). The last look that saw the work is remembered for
+/// THE AGENT'S OWN WORK IS THE ROUND'S, NOT THE LAST LOOK'S: each notice,
+/// give-up and re-arm clears the wait and the list of holders, so the class
+/// must not fall to quiet until the next look (each flip a new log line and a
+/// dismissed entry back). The last look that saw the work is remembered for
 /// [`OWN_WORK_HOLD_S`], across the acts and across the box or draft a look met
 /// in between; a limit is its own class, and the memory runs out.
 #[test]
@@ -6034,13 +5985,10 @@ fn only_an_agent_the_upgrade_ended_interrupts() {
     assert_eq!(need.fingerprint, format!("agent-down/{TAB}"));
 }
 
-/// A WHOLE ROUND NEVER FLIPS THE OWNER'S LINE AT ITS ACTS (the safety review
-/// of 2026-09-28 replayed one round of tab 1's kind - a resting look, the
-/// rest, the re-arm, four notices with a look either side of each, the give-up, the
-/// release, three resting looks - and read the class change THIRTEEN times:
-/// every act cleared the wait and the holders the last look recorded, so the
-/// own-work line fell to quiet and rose again, each rise a new log line and a
-/// dismissed entry back). Driven through the record's own transitions
+/// A WHOLE ROUND NEVER FLIPS THE OWNER'S LINE AT ITS ACTS: one round — a
+/// resting look, the rest, the re-arm, four notices with a look either side of
+/// each, the give-up, the release, three resting looks — where every act clears
+/// the wait and the holders the last look recorded. Driven through the record's own transitions
 /// (`note_step`, `note_held`, `announced`, `give_up`, `released`, `rearm`) and
 /// read after each with the real classifier: the line stands, unbroken, from
 /// the first look. NEGATIVE CONTROL: with the work never seen (no holders, a
@@ -6215,10 +6163,8 @@ fn every_interrupt_is_a_stall_the_host_posts() {
     }
 }
 
-/// THE AGENT'S OWN WORK IS NEWS ONLY AFTER A DAY AND A ROUND (tab 1 of
-/// 2026-09-28: a workflow, two monitors and a watcher held the move; the row
-/// said "behind for 2 days" at 11 s, and named 16 processes for a wait that
-/// was not about them): quiet within the first day, quiet with no whole round
+/// THE AGENT'S OWN WORK IS NEWS ONLY AFTER A DAY AND A ROUND: quiet within the
+/// first day, quiet with no whole round
 /// of notices answered "not yet", ONE digest line past both — and the words
 /// carry the counts, never a pid. The day is the PROCESS's ([`Row::behind_since`]): a record that
 /// outlived a restart no longer lends its age
@@ -6261,7 +6207,7 @@ fn the_agents_own_work_is_news_only_after_a_day_and_a_round() {
         assert_eq!(r.attention(NOW), Attention::Quiet, "{why}");
     }
     // A resting round IS the agent's own work outlasting the notices, with
-    // or without the processes recorded (review of 2026-09-28); the words
+    // or without the processes recorded; the words
     // say only what is known.
     let bare_row = round(30 * 3_600, 2, false);
     let bare = digest(&bare_row).expect("a round given up on");
@@ -6272,21 +6218,21 @@ fn the_agents_own_work_is_news_only_after_a_day_and_a_round() {
     assert_eq!(bare.then, "Ask it to wrap up in the tab when it suits you");
     assert_eq!(
         bare_row.more_lines(&bare, NOW)[0],
-        "Asked 8 times in 1d6h and declined"
+        "Asked 8 times in 1d6h, unanswered"
     );
     let news_row = round(DIGEST_AFTER_S, 2, true);
     let news = digest(&news_row).expect("a day, a round, work");
     assert_eq!((news.kind, news.severity), ("own-work", NeedSeverity::Info));
-    // THE REASON THE OWNER IS NEEDED is aterm's rule, with the count of what
-    // runs; the notices declined are the details (`more_lines`), and no pid is
-    // ever in a sentence.
+    // THE REASON THE OWNER IS NEEDED is aterm's rule; what runs and the
+    // notices are the details (`more_lines`), and no pid is ever in a
+    // sentence.
     assert_eq!(
         news.why,
-        "aterm never ends running work, and 16 programs under it are still running"
+        "aterm never ends running work, and work it started is still running"
     );
     assert_eq!(news.then, "Stop that work in the tab when it suits you");
     let more = news_row.more_lines(&news, NOW);
-    assert_eq!(more[0], "Asked 8 times in 1d and declined", "{more:?}");
+    assert_eq!(more[0], "Asked 8 times in 1d, unanswered", "{more:?}");
     assert!(more[1].starts_with("Held by "), "{more:?}");
     assert!(more.len() <= 3 && more.iter().all(|l| l.chars().count() <= 200));
     assert!(!news.why.contains("pid") && !news.then.contains("pid"));
@@ -6307,18 +6253,14 @@ fn the_agents_own_work_is_news_only_after_a_day_and_a_round() {
     let news = digest(&asking).expect("announced, a round behind it");
     assert_eq!(
         asking.more_lines(&news, NOW)[0],
-        "Asked 6 times in 1d6h and declined"
+        "Asked 6 times in 1d6h, unanswered"
     );
 }
 
 /// A RECORD AN OLDER BUILD WROTE IS AGED FROM ITS MINTING UNTIL A VISIT SETTLES
-/// IT (the review of 2026-09-28): the owner's tab, read before any visit of the
-/// fixed build had vetted the age against the process that holds the
-/// conversation, would have read "behind for 3d5h" — the stale clock the owner
-/// complained about — in the log or the digest badge. The record names no
-/// process and keeps no wait log, and its age (09-25 14:50) predates its own
-/// minting (09-28 11:02): it is read from the minting, the safe direction (a
-/// later digest, never an earlier one). NEGATIVE CONTROLS: every record this
+/// IT: it names no process and keeps no wait log, and its age predates its own
+/// minting, so it is read from the minting, the safe direction (a later
+/// digest, never an earlier one). NEGATIVE CONTROLS: every record this
 /// build writes names its process or keeps a wait log, and is read as it
 /// stands; so is an age from within the record's own life.
 #[test]
@@ -6376,11 +6318,9 @@ fn a_record_an_older_build_wrote_is_aged_from_its_minting_until_a_visit_settles_
     }
 }
 
-/// THE INTERRUPT'S MARK NEVER CUTS THE ACTION (the review of 2026-09-28: with
-/// a long model name in the move's words the 200-byte cut fell inside the
-/// resume command's conversation id, and an owner copying it from the
-/// notification got "no conversation found"): the head — the move and why —
-/// gives way, with an ellipsis, before the action loses a byte.
+/// THE INTERRUPT'S MARK NEVER CUTS THE ACTION: with a long model name in the
+/// move's words, the head — the move and why — gives way, with an ellipsis,
+/// before the 200-byte cut reaches the resume command's conversation id.
 #[test]
 fn the_interrupt_mark_never_cuts_the_action() {
     let session = "07422bc3-1be9-4875-9672-2eaf7b28aa21";
@@ -6413,9 +6353,7 @@ fn the_interrupt_mark_never_cuts_the_action() {
 }
 
 /// THE HOST IS TOLD THE INSTANT A ROW READS OTHERWISE BY TIME ALONE, FOR EVERY
-/// ROW (the safety review of 2026-09-28 swept 176,640 rows and found 144 where
-/// the class turned at one instant and the host was told at another, so the
-/// log line and the digest entry came late or not at all): read off
+/// ROW, so the log line and the digest entry never come late: read off
 /// [`Row::attention`] itself — every span its classifier compares an age
 /// against, added to every instant it compares it from — never a second copy
 /// of its horizons. Here: for a grid of rows the instant named is an instant
@@ -6489,12 +6427,9 @@ fn next_attention_at_names_every_change_by_time() {
     assert!(rows > 500, "{rows} rows swept");
 }
 
-/// THE FIRST LOOK OF A PROCESS LOWERS WHAT AN EARLIER ONE RAISED (the review
-/// of 2026-09-28: a seamless update carries every keyed attention across the
-/// handoff — the upgrade's `owner=upgrade` among them — while the successor's
-/// view starts with nothing marked, so a tab the old build marked for a wait
-/// that is no interrupt any more kept its orange diamond, and the menu-bar row
-/// and rim that read the same attention, for the life of the tab). One
+/// THE FIRST LOOK OF A PROCESS LOWERS WHAT AN EARLIER ONE RAISED: a seamless
+/// update carries `owner=upgrade` across the handoff while the successor's
+/// view starts with nothing marked. One
 /// idempotent `meta unset attention owner=upgrade` per live tab the look
 /// wants no mark on, sent once; a tab it does mark is marked, not lowered.
 #[cfg(unix)]
@@ -6554,8 +6489,8 @@ fn a_first_look_lowers_a_mark_an_earlier_process_raised() {
 }
 
 /// A DIGEST LINE IS KEYED BY KIND AND TAB, NEVER BY THE BUILD, AN AGE OR THE
-/// WORDS (the row of 2026-09-28 was keyed by the build: Claude ships about
-/// daily, and each release raised what the owner had dismissed): the same
+/// WORDS (Claude ships about daily, so a build key would raise again what the
+/// owner dismissed): the same
 /// tab's `no-terminal` line has one fingerprint for 2.1.284 and for 2.1.290,
 /// however old, and another tab's has its own. Every sentence fits its cap
 /// and asks for no restart (the reporters' guard reads the same words).
@@ -6776,14 +6711,14 @@ fn a_row_that_crosses_a_horizon_is_a_changed_row() {
     }
 }
 
-/// ATERM'S OWN FAULT IS A RECORD, NEVER A DIGEST LINE OR A MARK (the owner,
-/// 2026-09-28: "don't continue to persist alerts to the user that are not
-/// actionable"): a wait this build does not classify, and a notice the fence
-/// keeps refusing, are aterm's to fix. Young they are the upgrade working;
-/// 90 minutes on they are ONE Warn line in the log (`Attention::Fault`) and
-/// the wait log says the rest. A daemon move that keeps failing is the same
-/// after a day. NEGATIVE CONTROLS: the agent's own work, a person, a limit
-/// and a suspended job are never a fault, at any age.
+/// ATERM'S OWN FAULT IS A RECORD, NEVER A DIGEST LINE OR A MARK (the owner:
+/// "don't continue to persist alerts to the user that are not actionable"): a
+/// wait this build does not classify, and a notice the fence keeps refusing,
+/// are aterm's to fix. Young they are the upgrade working; 90 minutes on they
+/// are ONE Warn line in the log (`Attention::Fault`) and the wait log says the
+/// rest. A daemon move that keeps failing is the same after a day. NEGATIVE
+/// CONTROLS: the agent's own work, a person, a limit and a suspended job are
+/// never a fault, at any age.
 #[test]
 fn aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark() {
     // (The session has been behind for as long as the wait, and at least six
@@ -6830,8 +6765,8 @@ fn aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark() {
         );
     }
     // A Pending record NO LOOK has recorded a wait for: minted and never
-    // visited (or every visit returned before it recorded). The six-hour row
-    // used to shout at it; quiet by age, it is told once as aterm's fault.
+    // visited (or every visit returned before it recorded). Quiet by age, it
+    // is told once as aterm's fault.
     let minted = |minted_ago: u64, phase: Phase, wait: &str| Row {
         phase,
         wait: wait.to_string(),
@@ -7057,8 +6992,7 @@ fn an_upgrade_that_cannot_run_is_one_owner_sentence() {
 /// said while there is one, comes after them): when a look off a point read the
 /// record, which build, the last point, the guard, and when it is watched
 /// next (`due` once past; `-` for none) — design record 2026-09-28, §3.2
-/// C8. The fields are the record's (rollout step 5); the watch that stamps
-/// them is step 7's.
+/// C8.
 #[test]
 fn status_says_the_watchs_fields_last() {
     let st = St {
@@ -7107,20 +7041,18 @@ fn status_says_the_watchs_fields_last() {
     );
 }
 
-/// A NOTICE STOPPED PART-WAY IS NEVER "NOTHING TO DO" (review of 2026-09-30,
-/// findings 12 and 15): the host stops a pressed notice at a person's key, a
-/// screen switch or its deadline — or types it whole and its guarded Enter
-/// misses — presses no Enter, and the part typed sits in the prompt
-/// (`announce-refused:cut-<why>`). The owner reads that aterm stopped it,
-/// unsent, and that the part left waits in the prompt to be sent or cleared:
-/// aterm never takes it back (the safety review of 2026-09-30). What stands
-/// of it is ATERM'S (`left-typed:<why>`), never read as a person's draft —
-/// but only a person moves it, nothing of aterm's will (the re-review): a
-/// person's hold however it stands — alone and unsent, behind a box or no
-/// drawn composer, or with a person's keys among it (`left-typed:mixed`).
-/// NEGATIVE CONTROLS: a notice its fence
-/// refused whole typed nothing, and is tried again — nothing to do; a
-/// person's own draft is a person's hold.
+/// A NOTICE STOPPED PART-WAY IS NEVER "NOTHING TO DO": the host stops a pressed
+/// notice at a person's key, a screen switch or its deadline — or types it
+/// whole and its guarded Enter misses — presses no Enter, and the part typed
+/// sits in the prompt (`announce-refused:cut-<why>`). The owner reads that
+/// aterm stopped it, unsent, and that the part left waits in the prompt to be
+/// sent or cleared: aterm never takes it back. What stands of it is ATERM'S
+/// (`left-typed:<why>`), never read as a person's draft — but only a person
+/// moves it, nothing of aterm's will: a person's hold however it stands — alone
+/// and unsent, behind a box or no drawn composer, or with a person's keys among
+/// it (`left-typed:mixed`). NEGATIVE CONTROLS: a notice its fence refused whole
+/// typed nothing, and is tried again — nothing to do; a person's own draft is a
+/// person's hold.
 #[test]
 fn a_notice_stopped_part_way_names_the_part_left_in_the_prompt() {
     for why in ["person", "changed", "deadline", "guard"] {
@@ -7275,7 +7207,7 @@ fn a_notice_aterm_could_not_type_is_told_as_aterms_own() {
         ),
         "{words}"
     );
-    // ATERM'S OWN FAILURE IS A RECORD, NEVER A MARK (the owner, 2026-09-28):
+    // ATERM'S OWN FAILURE IS A RECORD, NEVER A MARK:
     // the words above are the record's and `--status`'s; the tab's diamond,
     // the menu-bar row and the notification are for an agent that is down.
     assert_eq!(a.badge(now), None, "aterm's own failure marks no tab");
@@ -7390,15 +7322,14 @@ fn a_rearmed_round_its_agents_own_work_holds_is_a_record() {
     assert!(!refused.asks_on_its_own(NOW), "aterm's own failure: told");
 }
 
-// ---------------------------------------------------------------- the second review (2026-09-29)
+// ---------------------------------------------------------------- repeated
+// asks, relaunches, refusals
 
-/// A SESSION ASKED AGAIN AND AGAIN IS NEWS (the safety review of 2026-09-29):
-/// the digest read "a whole round declined" off the GIVE-UP that ends a round,
-/// and the backstop counted every ask as progress, so a session asked at the
-/// end of every run of its work never reached either and read quiet for a
-/// hundred days. A whole round is [`upgrade::MAX_ASKS`] declined notices, given
-/// up on or not. NEGATIVE CONTROLS: fewer asks in a young round, a day not yet
-/// behind, and no work under the agent stay quiet.
+/// A SESSION ASKED AGAIN AND AGAIN IS NEWS: a session asked at the end of every
+/// run of its work must not read quiet for ever. A whole round is
+/// [`upgrade::MAX_ASKS`] declined notices, given up on or not. NEGATIVE
+/// CONTROLS: fewer asks in a young round, a day not yet behind, and no work
+/// under the agent stay quiet.
 #[test]
 fn a_session_asked_again_and_again_is_news() {
     let day = 86_400;
@@ -7485,12 +7416,10 @@ fn a_session_asked_again_and_again_is_news() {
     assert!(matches!(gave_up.attention(NOW), Attention::Digest(_)));
 }
 
-/// A RELAUNCHED AGENT THAT REACHES NO PROMPT IS A LOG LINE, THEN AN INTERRUPT
-/// (the safety review of 2026-09-29): the upgrade ended the owner's agent, it
-/// came back on a screen that is neither a box (the supervisor answers those
-/// within moments) nor idle, and for as long as it stood there was one Warn line
-/// in a log the owner does not read. The same fact as an agent that did not
-/// come back: only the owner can look at the tab. A fault line at
+/// A RELAUNCHED AGENT THAT REACHES NO PROMPT IS A LOG LINE, THEN AN INTERRUPT:
+/// it came back on a screen that is neither a box (the supervisor answers those
+/// within moments) nor idle — the same fact as an agent that did not come back:
+/// only the owner can look at the tab. A fault line at
 /// [`RELAUNCH_STUCK_S`], the owner interrupted at [`RELAUNCH_INTERRUPT_S`]
 /// with the one action, and no interrupt for a relaunch that reached its
 /// prompt.
@@ -7541,13 +7470,10 @@ fn a_relaunched_agent_that_reaches_no_prompt_is_a_log_line_then_an_interrupt() {
     assert_eq!(held.attention(NOW), Attention::Quiet);
 }
 
-/// LOOKS AT THE SAME WORK DO NOT CHANGE THE ROW (the safety review of
-/// 2026-09-29, against the plan's claim that rows are re-sent only when a class
-/// changes): the record stamped `own_work_at` at every look, the row carried
-/// the stamp and compared it, and a tab whose work held the move sent the
-/// window a summary — and woke its GUI thread — at every look, about a minute
-/// at a break. The stamp is renewed at most every quarter of the hold it
-/// feeds ([`OWN_WORK_RESTAMP_S`]).
+/// LOOKS AT THE SAME WORK DO NOT CHANGE THE ROW: the row carries `own_work_at`,
+/// so restamping it at every look would send the window a summary, and wake its
+/// GUI thread, about every minute. The stamp is renewed at most every quarter
+/// of the hold it feeds ([`OWN_WORK_RESTAMP_S`]).
 #[test]
 fn looks_at_the_same_work_do_not_change_the_row() {
     let t0 = 1_790_000_000;
@@ -7588,13 +7514,12 @@ fn looks_at_the_same_work_do_not_change_the_row() {
     assert_eq!(st.own_work_at, later);
 }
 
-/// A NOTICE A PERSON OR A PEER REFUSED IS NOT ATERM'S TO FIX (the safety review
-/// of 2026-09-29): `announce-refused:held` (another driver's lease),
-/// `:draft` and `:box` are the fence telling the truth, and for 90 minutes they
-/// read as a Fault naming aterm's screen. A refusal that names a person's
-/// state stands until they end it: the day's backstop, and a draft is news at a
-/// day as any draft is. NEGATIVE CONTROL: the refusal aterm's own screen causes
-/// (`changed`) is aterm's, at 90 minutes.
+/// A NOTICE A PERSON OR A PEER REFUSED IS NOT ATERM'S TO FIX:
+/// `announce-refused:held` (another driver's lease), `:draft` and `:box` are
+/// the fence telling the truth, never a Fault naming aterm's screen. A refusal
+/// that names a person's state stands until they end it: the day's backstop,
+/// and a draft is news at a day as any draft is. NEGATIVE CONTROL: the refusal
+/// aterm's own screen causes (`changed`) is aterm's, at 90 minutes.
 #[test]
 fn a_refusal_a_person_or_a_peer_caused_is_not_blamed_on_aterm() {
     let refused = |why: &str, waited: u64| Row {
@@ -7643,7 +7568,7 @@ fn a_refusal_a_person_or_a_peer_caused_is_not_blamed_on_aterm() {
 /// (which has no `cd` form). A change to the line's shape that hides the program from
 /// [`resume_command`] fails here, not on the owner's tab 1.
 ///
-/// AND IT IS THE ONE LINE (2026-10-02): the one every other place tells for the
+/// AND IT IS THE ONE LINE: the one every other place tells for the
 /// launch ([`crate::harness::upgrade_drive::resume_command_kept`]), each word quoted
 /// as it quotes it — read by a rule of its own, a 1M model's `[1m]` or a directory
 /// with a space dropped every flag — and the whole of it on the tab's mark, within its
@@ -7844,12 +7769,9 @@ fn a_resume_by_hand_says_which_login_it_runs_under() {
 }
 
 /// THE INTERRUPT'S ACTION FOLLOWS FROM WHY THE AGENT COULD NOT BE BROUGHT BACK,
-/// AND CARRIES THE LAUNCH'S OWN FLAGS (the safety review of 2026-09-29): the one
-/// sentence was "Type claude --resume <id> in that tab" for every reason — for a
-/// tab whose shell is gone there is no prompt to type at, for a Codex whose
-/// rollout is gone nothing to resume, and for tab 1 (started with
-/// `--dangerously-skip-permissions`, which the harness's own relaunch line
-/// keeps) it brought the orchestrator back in another permission mode. The
+/// AND CARRIES THE LAUNCH'S OWN FLAGS: a tab whose shell is gone has no prompt
+/// to type at, a Codex whose rollout is gone has nothing to resume, and a bare
+/// `claude --resume <id>` would drop `--dangerously-skip-permissions`. The
 /// command is the record's own planned line's flags and the conversation, in
 /// `Need::command`, never cut into the capped sentence. NEGATIVE CONTROLS: a
 /// line whose flags would not leave the mark its head room, another program's,
@@ -7901,10 +7823,9 @@ fn the_interrupts_action_follows_its_reason_and_keeps_the_launchs_flags() {
     );
     // THE WHOLE LINE — its sentence, the login clause and the flags — IS
     // BUDGETED AGAINST THE MARK, AND THE PERMISSION MODE IS THE LAST THING IT
-    // GIVES UP (round three of the joint audit of 2026-10-01): a fixed flag
-    // allowance blind to the sentence beside it cut the conversation id off
-    // a mark whose sentence carries the login clause, and past the allowance
-    // every flag went at once, `--dangerously-skip-permissions` with them.
+    // GIVES UP: a fixed flag allowance blind to the sentence beside it would
+    // cut the conversation id off a mark whose sentence carries the login
+    // clause, and drop every flag at once past it.
     let launched = |flags: &str, login: bool| {
         let export = if login {
             format!(
@@ -8000,12 +7921,19 @@ fn the_interrupts_action_follows_its_reason_and_keeps_the_launchs_flags() {
     }
 }
 
-/// THE OWN-WORK LINE NAMES WHAT KEEPS THE AGENT BUSY (the second review of
-/// 2026-09-29: for tab 1 "16 programs under it" was true and not the whole
-/// truth — a `/goal` re-prompts Claude at every turn end, its status stays
-/// busy, and stopping the programs alone does not open the restart's gate).
+/// THE OWN-WORK LINE NAMES WHAT KEEPS THE AGENT BUSY, IN WORDS THE DOOR
+/// TAKES: a `/goal` re-prompts Claude at every turn end, its status stays busy,
+/// and stopping the programs alone does not open the restart's gate. Every arm
+/// — programs under it, a goal, both, a break of its own background work,
+/// none of these — is handed to the exceptions door the window hands it to
+/// (`aterm_messages::exceptions::Entry::message`): a reason that leans on
+/// "waiting" or an action with an " or " in it is refused there, logged and
+/// never shown (2026-10-08: the background arm's "waiting on background work
+/// of its own", twelve refusals in a day, the entry never on screen).
 #[test]
 fn the_own_work_line_names_the_goal_the_programs_and_the_break() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
     let day = 86_400;
     let holders = |n: u32| -> Vec<HeldBy> {
         (0..n)
@@ -8033,58 +7961,193 @@ fn the_own_work_line_names_the_goal_the_programs_and_the_break() {
         goal,
         ..Row::default()
     };
+    // The words of `row`'s own-work line, through the door.
     let words = |row: &Row| match row.attention(NOW) {
         Attention::Digest(n) => {
             assert_eq!(n.kind, "own-work");
             assert!(
                 n.why.chars().count() <= NEED_WHY_MAX && n.then.chars().count() <= NEED_THEN_MAX
             );
+            let entry = Entry::new(
+                Family::Upgrade,
+                "",
+                n.kind,
+                "Claude in tab 3 is behind",
+                Why::OnlyYou(Reason::new(&n.why)),
+                Then::step(&n.then),
+            );
+            if let Err(fault) = entry.message() {
+                panic!("the door refuses {:?} / {:?}: {fault:?}", n.why, n.then);
+            }
             (n.why, n.then)
         }
         other => panic!("{:?}", other.level()),
     };
-    assert_eq!(
-        words(&round("failed", 16, true)),
-        (
-            "aterm never ends running work: 16 programs run under it and its /goal is active"
-                .to_string(),
-            "End or pause its /goal, or stop that work, in the tab when it suits you".to_string()
-        )
-    );
-    assert_eq!(
-        words(&round("failed", 1, true)).0,
-        "aterm never ends running work: 1 program runs under it and its /goal is active"
-    );
-    assert_eq!(
-        words(&round("failed", 0, true)).0,
-        "aterm never ends running work, and its /goal is still active"
-    );
-    assert_eq!(
-        words(&round("failed", 16, false)),
-        (
-            "aterm never ends running work, and 16 programs under it are still running".to_string(),
-            "Stop that work in the tab when it suits you".to_string()
-        )
-    );
-    assert_eq!(
-        words(&round("background", 0, false)).0,
-        "aterm never ends running work, and it is waiting on background work of its own"
-    );
-    assert_eq!(
-        words(&round("failed", 0, false)),
-        (
-            "aterm never ends running work, and it is busy with work of its own".to_string(),
-            "Ask it to wrap up in the tab when it suits you".to_string()
-        )
-    );
+    let arms = [
+        ("failed", 16, true),
+        ("failed", 1, true),
+        ("failed", 0, true),
+        ("failed", 16, false),
+        ("failed", 1, false),
+        ("background", 0, false),
+        ("background-terminal", 0, false),
+        ("release:background", 0, false),
+        ("failed", 0, false),
+    ];
+    let said: Vec<(String, String)> = arms
+        .iter()
+        .map(|(wait, held, goal)| words(&round(wait, *held, *goal)))
+        .collect();
+    for ((wait, held, goal), (why, then)) in arms.iter().zip(&said) {
+        let at = format!("{wait} held={held} goal={goal}: {why} / {then}");
+        // A goal in force is named, in the reason and in the action.
+        assert_eq!(why.contains("/goal"), *goal, "{at}");
+        assert_eq!(then.contains("/goal"), *goal, "{at}");
+        // A break of the agent's own background work is named as one.
+        let breaking = wait.contains("background") && *held == 0 && !*goal;
+        assert_eq!(why.contains("background"), breaking, "{at}");
+    }
+    // The arms say different things: programs, a goal, both, a break, the
+    // agent's own busy turn.
+    let mut whys: Vec<&str> = [0, 2, 3, 5, 8]
+        .iter()
+        .map(|i| said[*i].0.as_str())
+        .collect();
+    whys.sort_unstable();
+    whys.dedup();
+    assert_eq!(whys.len(), 5, "{said:?}");
 }
 
-/// A CODEX GOAL THE MOVE PAUSED AND COULD NOT RESUME IS THE UPGRADE'S OWN DAMAGE
-/// (the owner's decision of 2026-09-28, ruling 381: aterm never leaves the goal
-/// paused): an interrupt with the one hand step in the tab, whatever became of the
-/// move and whatever the owner's word on it says. Its thread fallen into a sandbox
-/// names the relaunch first. NEGATIVE CONTROL: with nothing left paused, the same
-/// finished move is quiet.
+/// THE OWN-WORK LINE DOES NOT MOVE WITH THE HOLDER COUNT: what runs under
+/// the agent comes and goes at every look, and a count in the reason changed
+/// the entry's words with it — 44 restatements in a day on the owner's
+/// machine (2026-10-08). Two looks that differ only in how many programs run
+/// under the agent say one line, with or without a goal; the count is the
+/// details' (`more_lines`), and those still say it.
+#[test]
+fn the_own_work_line_does_not_move_with_the_holder_count() {
+    let look = |held: u32, goal: bool| {
+        let row = Row {
+            session: "07422bc3-1be9-4875-9672-2eaf7b28aa21".into(),
+            tab: TAB.into(),
+            from: "2.1.283".into(),
+            to: "2.1.284".into(),
+            phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+            streak_why: upgrade::GAVE_UP.to_string(),
+            stop_streak: 2,
+            behind_since: NOW - 2 * 86_400,
+            minted_at: NOW - 2 * 86_400,
+            wait: "failed".into(),
+            wait_since: NOW - 3_600,
+            own_work_at: NOW - 60,
+            held_by: (0..held)
+                .map(|i| HeldBy {
+                    pid: 4000 + i,
+                    name: "zsh".into(),
+                    since: NOW - 600,
+                })
+                .collect(),
+            goal,
+            ..Row::default()
+        };
+        let Attention::Digest(need) = row.attention(NOW) else {
+            panic!("own work at {held} programs");
+        };
+        let more = row.more_lines(&need, NOW);
+        (
+            (
+                need.fingerprint,
+                need.title,
+                need.severity,
+                need.why,
+                need.then,
+            ),
+            more,
+        )
+    };
+    for goal in [false, true] {
+        let (one, one_more) = look(1, goal);
+        let (two, _) = look(2, goal);
+        let (many, many_more) = look(16, goal);
+        assert_eq!(one, two, "goal={goal}");
+        assert_eq!(one, many, "goal={goal}");
+        assert_ne!(one_more, many_more, "goal={goal}: the details say how many");
+    }
+}
+
+/// THE ASK COUNT IS THE PROCESS'S, NOT THE ROUND'S (2026-10-08: a tab whose
+/// notice the ledger records 22 times read "Asked 4 times in 9d4h and
+/// declined"): counted from the round alone — whole rounds given up and this
+/// round's asks — a retarget that started a round over lost every ask before
+/// it. Asked twice, retargeted onto a round of its own (the model rule named
+/// another model: a new consent), asked four more times and given up, the
+/// record read back from its state file says six, as unanswered.
+/// NEGATIVE CONTROL: another process holding the conversation (the owner
+/// restarted it by hand) is asked afresh, from none.
+#[test]
+fn the_ask_count_survives_a_retarget_and_the_state_file() {
+    let dir = ScratchDir::new("upgrade-status", "ask-count");
+    let o = opts(&dir);
+    let day = 86_400;
+    let t0 = NOW - 9 * day;
+    let running = Version::parse("2.1.283").expect("running");
+    let build = |v: &str| upgrade::Candidate {
+        exe: PathBuf::from("/p/agents/claude"),
+        version: Version::parse(v).expect("target"),
+        source: upgrade::Source::Managed,
+    };
+    let who = super::super::Proc {
+        start: "Thu Sep 24 08:00:00 2026",
+        started_s: t0 - 600,
+    };
+    let mut st = St::for_target(None, &running, &build("2.1.284"), None, who, t0);
+    st.tab = TAB.to_string();
+    st.announced("m1".to_string(), t0 + 60, 1);
+    st.announced("m2".to_string(), t0 + 1_860, 2);
+    let (mut st, how) = St::retarget(
+        Some(st),
+        &running,
+        &build("2.1.285"),
+        Some("claude-opus-4-1"),
+        who,
+        NOW - 3 * day,
+    );
+    assert_eq!(how, super::super::Retarget::Anew, "the round starts over");
+    assert_eq!(st.phase, Phase::Pending);
+    for ask in 1..=4_u32 {
+        let at = NOW - 4 * 3_600 + u64::from(ask) * 1_800;
+        st.announced(format!("n{ask}"), at, ask);
+    }
+    st.give_up(NOW - 600);
+    // What holds the move is the agent's own work.
+    st.own_work_at = NOW - 60;
+    super::super::save_at(&o, "07422bc3-1be9-4875-9672-2eaf7b28aa21", &st, NOW);
+    let (rows, whole) = read_rows(&o, NOW);
+    assert!(whole);
+    let [row] = rows.as_slice() else {
+        panic!("one record: {rows:?}");
+    };
+    let Attention::Digest(need) = row.attention(NOW) else {
+        panic!("{:?}", row.attention(NOW).level());
+    };
+    assert_eq!(need.kind, "own-work");
+    let more = row.more_lines(&need, NOW);
+    assert_eq!(more[0], "Asked 6 times in 9d, unanswered", "{more:?}");
+    // NEGATIVE CONTROL: the conversation held by another process.
+    let other = super::super::Proc {
+        start: "Fri Oct  2 09:00:00 2026",
+        started_s: NOW - 60,
+    };
+    let anew = St::for_target(Some(st), &running, &build("2.1.285"), None, other, NOW);
+    assert_eq!(anew.notices, 0, "{anew:?}");
+}
+
+/// A CODEX GOAL THE MOVE PAUSED AND COULD NOT RESUME IS THE UPGRADE'S OWN
+/// DAMAGE (ruling 381: aterm never leaves the goal paused): an interrupt with
+/// the one hand step in the tab, whatever became of the move and whatever the
+/// owner's word on it says. Its thread fallen into a sandbox names the relaunch
+/// first. NEGATIVE CONTROL: with nothing left paused, the same finished move is
+/// quiet.
 #[test]
 fn a_codex_goal_left_paused_is_an_interrupt_whatever_the_owners_word_says() {
     let paused = Row {
@@ -8181,7 +8244,7 @@ fn a_rearmed_rounds_first_looks_are_still_its_rest() {
     }
     let stood = rearmed("draft", NOW - upgrade::REASK_S);
     assert!(!stood.asks_on_its_own(NOW), "a draft that stood: a row");
-    // The tab is marked for an interrupt only (owner rules, 2026-09-28): a
+    // The tab is marked for an interrupt only: a
     // draft that stood is not the rest, but a wait is no mark.
     assert_eq!(stood.badge(NOW), None, "no mark for a wait");
     let queued = rearmed("queued", NOW - 60);
@@ -8321,8 +8384,8 @@ fn a_stall_whose_words_carry_no_age_never_wakes_for_it() {
     assert_ne!(read(pending(7 * 3_600), NOW + 3_600), overdue);
 }
 
-/// AN ANNOUNCED ROUND UNDER THE QUIET FLOW IS JUDGED AS A PENDING ONE (the
-/// review of 2026-09-30): nothing asks it again there — the quiet step
+/// AN ANNOUNCED ROUND UNDER THE QUIET FLOW IS JUDGED AS A PENDING ONE: nothing
+/// asks it again there — the quiet step
 /// answers a round an older aterm announced, and never re-asks nor gives up
 /// — so its busy agent's stall reads `overdue` at six hours behind (the
 /// column and `--status`), never "asked again every half hour"; either way
@@ -8382,17 +8445,13 @@ fn an_announced_round_under_the_quiet_flow_reads_overdue_at_six_hours() {
 }
 
 /// A STATUS THAT LAGS IS NO COMFORT UNDER THE QUIET FLOW, AND `--now` MOVES
-/// IT (round eight, #5): the ask flow's notice goes through a status of
-/// Claude's own that lags its idle screen, and its turn rewrites the status;
-/// the quiet flow types nothing, so the record that said "nothing to do: it
-/// starts on its own at a quiet moment" of a `status-stale` wait was false,
-/// and once overdue its row offered no `Upgrade now` (`Remedy::Waits`). Now
-/// the record says what moves it — Claude's own `idle`, or the owner's word —
+/// IT: the quiet flow types nothing to rewrite a `status-stale` status, so the
+/// record says what moves it — Claude's own `idle`, or the owner's word —
 /// and the overdue row's remedy is `--now`, which the quiet restart reads the
 /// lag past on (`upgrade::quiet_step`). A quiet round that GAVE UP (on its
 /// agent's own work, an older aterm's notice) says the next round moves it at
 /// a quiet moment, never that it "asks again". NEGATIVE CONTROLS: the ask
-/// flow's rows, as before.
+/// flow's rows.
 #[test]
 fn a_lagging_status_under_the_quiet_flow_is_no_comfort_and_now_moves_it() {
     for status in ["busy", "shell"] {
@@ -8440,15 +8499,13 @@ fn a_lagging_status_under_the_quiet_flow_is_no_comfort_and_now_moves_it() {
     assert!(words.contains("asks again"), "{words}");
 }
 
-/// A LIMIT PAST ITS NAMED RESET IS THE QUIET MOVE'S BEFORE IT IS TOLD (the
-/// review of 2026-09-30, [`Row::limit_told_at`]): under the quiet flow a tab
-/// whose limit row named its reset may be moved from that reset's grace on —
-/// the very instant the view told it until the fix, so every quiet move at a
-/// spent limit was marked "upgrade stalled", aterm's own fault, for the
-/// moments before it went. Such a row is told [`QUIET_MOVE_S`] later, and
+/// A LIMIT PAST ITS NAMED RESET IS THE QUIET MOVE'S BEFORE IT IS TOLD
+/// ([`Row::limit_told_at`]): under the quiet flow a tab whose limit row named
+/// its reset may be moved from that reset's grace on, so telling it then would
+/// blame aterm for a move about to go. Such a row is told [`QUIET_MOVE_S`] later, and
 /// the view wakes for that instant. NEGATIVE CONTROLS: the ask flow's row,
 /// and a quiet row whose reset no row named (bounded by the week), are told
-/// at the grace's end, as before.
+/// at the grace's end.
 #[test]
 fn a_quiet_move_at_a_spent_limit_has_its_chance_before_the_tell() {
     // The reset's grace ends now.
@@ -8526,13 +8583,12 @@ fn a_row_served_late_is_judged_with_the_awake_clock_as_it_stands() {
 }
 
 /// A QUIET GIVE-UP ITS AGENT'S OWN WORK HELD IS A WAIT THE OWNER'S `--NOW`
-/// DOES NOT MOVE (round eight, #4's review): the quiet flow gives a round up
+/// DOES NOT MOVE: the quiet flow gives a round up
 /// only once the agent's own work has held its restart a whole re-ask window,
 /// and the round `--now` re-arms waits on that same work — the quiet
 /// restart's gate holds `background` while anything runs under the agent or
-/// at a break, whatever the owner said. The row read [`Remedy::AskAgain`]:
-/// "Upgrade now moves it at its next pause", the button offered, nothing
-/// moved. Now the work seen since its notice ([`St::work_seen`], carried
+/// at a break, whatever the owner said, so [`Remedy::AskAgain`] would offer a
+/// button that moves nothing. The work seen since its notice ([`St::work_seen`], carried
 /// into the row of a give-up alone) or running under the agent at the last
 /// look ([`Row::held_by`]) makes it [`Remedy::Waits`]. NEGATIVE CONTROLS: the
 /// ask flow's give-up (`--now` asks it again), a quiet give-up no work held
@@ -8601,10 +8657,9 @@ fn a_quiet_give_up_its_own_work_held_is_a_wait_the_owners_now_does_not_move() {
     assert_eq!(skipped.remedy(NOW), None);
 }
 
-/// A QUIET GIVE-UP THE OWNER'S `--NOW` DOES MOVE KEEPS `UPGRADE NOW` (round
-/// eight, the review of #4's review). Two give-ups whose work was seen read
-/// [`Remedy::Waits`] — "it moves once that ends", no button — although that
-/// end moves neither and `--now` does:
+/// A QUIET GIVE-UP THE OWNER'S `--NOW` DOES MOVE KEEPS `UPGRADE NOW`. Two
+/// give-ups whose work was seen, where the work's end moves neither and
+/// `--now` does:
 ///
 /// - A CODEX give-up. The Codex lane never re-arms a resting round at the
 ///   end of its TUI's work (its reducer reads no `work_ended`, and a stopped
@@ -8678,19 +8733,16 @@ fn a_quiet_give_up_the_owners_now_does_move_keeps_upgrade_now() {
     assert_eq!(at_a_break.remedy(NOW), Some(Remedy::Waits));
 }
 
-/// A MOVE THE PERSON HOLDS SAYS SO WHERE THEY ARE (the owner, 2026-09-30,
-/// s-61dfc15a: `wait:awaiting-ready`, the agent's READY, then
-/// `wait:attended` and nothing since — 5 h 38 min behind, so only a keystroke
-/// within `KEYS_GAP_S` held it, and nothing on the screen said so: "hey! why
-/// didn't you upgrade?"). The incident's shape notes the build, that it is
-/// ready and what holds it — the person using the tab, or the draft they
-/// leave when they pause — never a promise of when it goes: the same words
-/// at the first rung, where anyone within `human_grace_s` holds it, before
-/// the READY, and overdue. A row the draft held has words for a draft alone.
-/// The looks that only restamp the person move the row, never the note.
-/// NEGATIVE CONTROLS: no note once no look has seen the person, for any other
-/// wait, once the move is under way, under the owner's holding word, or for a
-/// Codex row.
+/// A MOVE THE PERSON HOLDS SAYS SO WHERE THEY ARE (the owner: "hey! why didn't
+/// you upgrade?" of a move only a keystroke within `KEYS_GAP_S` held). The note
+/// names the build, that it is ready and what holds it — the person using the
+/// tab, or the draft they leave when they pause — never a promise of when it
+/// goes: the same words at the first rung, where anyone within `human_grace_s`
+/// holds it, before the READY, and overdue. A row the draft held has words for
+/// a draft alone. The looks that only restamp the person move the row, never
+/// the note. NEGATIVE CONTROLS: no note once no look has seen the person, for
+/// any other wait, once the move is under way, under the owner's holding word,
+/// or for a Codex row.
 #[test]
 fn a_move_the_person_holds_is_noted_for_their_footer() {
     use crate::harness::footer::UpgradeWords;
@@ -8917,4 +8969,30 @@ fn a_token_word_reads_as_the_cut_reads_it() {
     ] {
         assert_eq!(word(s), cut(s), "{s:?}");
     }
+}
+
+/// A FINISHED MOVE'S ROW CARRIES WHEN IT MOVED (audit 2026-10-09: a move
+/// recorded "moved onto 2.1.287" seven days after it happened, at the
+/// session's next idle turn end): the record keeps the relaunch's instant
+/// through Done (`St::relaunched_at`, which the phase drops), and the row the
+/// window is handed names it (`Row::moved_at`), for the record to say when.
+/// NEGATIVE CONTROL: a record an older build wrote carries none.
+#[test]
+fn a_finished_moves_row_carries_its_relaunch_instant() {
+    let now = now_s();
+    let st = St {
+        phase: Phase::Done,
+        from: "2.1.286".to_string(),
+        to: "2.1.287".to_string(),
+        tab: TAB.to_string(),
+        done_at: now - 5,
+        relaunched_at: now - 7 * 86_400,
+        ..St::default()
+    };
+    assert_eq!(Row::of("aaa", &st, now).moved_at, now - 7 * 86_400);
+    let older = St {
+        relaunched_at: 0,
+        ..st
+    };
+    assert_eq!(Row::of("aaa", &older, now).moved_at, 0);
 }

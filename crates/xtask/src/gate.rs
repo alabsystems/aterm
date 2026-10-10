@@ -116,32 +116,14 @@ fn gate_usage() -> String {
     out
 }
 
-/// Retired verbs that still have a home, with the package and argument that run
-/// them now, so a caller typing an old name (dated records under `docs/` keep
-/// it) is told where it went.
-const RETIRED_VERBS: &[(&str, &str, &str)] = &[
-    ("mainloop", "aterm-census", "--mainloop"),
-    ("lockorder", "aterm-census", "--locks"),
-    ("wasmloop", "aterm-census", "--wasm"),
-    ("scope", "aterm-census", "--scope"),
-    ("lazyinit", "aterm-census", "--lazy-init"),
-    ("perf", "xtask", "perf"),
-];
-
 /// What `xtask gate` says when `check` names no verb it dispatches: the usage
-/// line for a bare `gate`, the verb list for an unknown one, and the new home
-/// of a retired verb.
+/// line for a bare `gate`, the verb list for an unknown one.
 fn unknown_verb_message(check: Option<&str>) -> String {
     let Some(verb) = check else {
         return gate_usage();
     };
-    let moved = RETIRED_VERBS
-        .iter()
-        .find(|(old, ..)| *old == verb)
-        .map(|(_, package, arg)| format!(" (now: targo --unverified run -p {package} -- {arg})"))
-        .unwrap_or_default();
     format!(
-        "xtask gate: no verb `{verb}`{moved} — verbs: {}",
+        "xtask gate: no verb `{verb}` — verbs: {}",
         verb_names().join(", ")
     )
 }
@@ -2134,7 +2116,7 @@ fn cells_verdict(
             text: format!(
                 "{} — {} of the {} cell(s) this run selected {had}, so NO COMPILER READ THEM: \
                  {names}. {ran} checked: {coverage}.\n\
-                 gate cells: {fix}, then run again. `tools/verify.sh --full` withholds `{}` \
+                 gate cells: {fix}, then run again. A `tools/verify.sh --full` run withholds `{}` \
                  until then.{scope}",
                 aterm_verify::stages::CELLS_NOT_PROVEN,
                 skipped.len(),
@@ -3289,9 +3271,9 @@ mod tests {
     }
 
     /// A bare `xtask gate` prints the usage line and an unknown verb the verb
-    /// list — never a Rust `Option` — and a retired verb says where it went.
+    /// list — never a Rust `Option`.
     #[test]
-    fn an_unknown_gate_verb_names_the_verbs_and_the_new_home_of_a_retired_one() {
+    fn an_unknown_gate_verb_names_the_verbs() {
         let usage = unknown_verb_message(None);
         assert!(usage.starts_with("usage: xtask gate <verb>"), "{usage}");
         for (name, ..) in VERBS {
@@ -3301,13 +3283,6 @@ mod tests {
         let unknown = unknown_verb_message(Some("nope"));
         assert!(unknown.contains("no verb `nope`"), "{unknown}");
         assert!(unknown.contains(&verbs), "{unknown}");
-        assert!(!unknown.contains("now:"), "{unknown}");
-        for (old, package, arg) in RETIRED_VERBS {
-            assert!(
-                unknown_verb_message(Some(old)).contains(&format!("-p {package} -- {arg})")),
-                "{old}"
-            );
-        }
     }
 
     /// PASS THREE, IN BOTH DIRECTIONS: a crate whose `rustfmt.toml` edition

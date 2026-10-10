@@ -65,16 +65,14 @@ aterm-spec = { workspace = true, optional = true }
 # the engine core knows nothing of "a turn" or "a Claude prompt".
 aterm-observe = { workspace = true }
 # The worker-phase reader and the approval-box parser (`supervise::phase`,
-# `supervise::prompt` are re-exports of it). A crate of its own since round 13
-# so the fabric bridge publishes `phase=` from the SAME reader `aterm drive
-# phase` prints. No dependencies.
+# `supervise::prompt` re-export it), shared so the fabric bridge publishes
+# `phase=` from the SAME reader `aterm drive phase` prints. No dependencies.
 aterm-phase = { workspace = true }
 # The portable control-socket stream (std-only): `RelayClient`'s local-connect /
 # `dial` constructors talk raw control protocol over a `CtlStream`. No external deps.
 aterm-uds = { workspace = true }
-# `aterm fleet status|manage|...` is a one-binary in-process client of the
-# embedded operator. The legacy federation modes still launch per-instance
-# streamers, but the operator surface must not depend on a shipped sibling.
+# `aterm fleet status|manage|...` is an in-process client of the embedded
+# operator, so the operator surface depends on no shipped sibling binary.
 aterm-ctl = { path = "../aterm-ctl" }
 # The operator WAL uses the workspace's audited SHA-256 implementation for
 # independently checksummed frames. `libc` is Unix-only at the call sites and
@@ -151,9 +149,8 @@ aterm-shell-integration = { workspace = true }
 # this one writes none. Not a new edge in the shipped graph: aterm-gui already
 # links it, under the same `cfg(unix)`. Unix-only, like the crate itself
 # (`#![cfg(unix)]`) and its one user here (`disk_target::fd`); elsewhere the
-# reclaim refuses. Declared for every target, it pulled aterm-dirfd into the
-# Windows cells' graph, whose test-target pass then compiled its Unix-only
-# tests for Windows — 135 errors per cell.
+# reclaim refuses. Declared for every target, the Windows cells would compile
+# its Unix-only tests.
 aterm-dirfd = { workspace = true }
 
 [dev-dependencies]
@@ -181,6 +178,12 @@ aterm-tempfile = { workspace = true, features = ["stand-in"] }
 # onto it kept a copy of its own master. Already in this test build through
 # aterm-session; no cycle (aterm-pty does not depend on aterm-agent).
 aterm-pty = { workspace = true }
+# The upgrade's owner-facing words are handed to the exceptions door
+# (`aterm_messages::exceptions::Entry::message`) by the window's host; the words
+# tests hand every arm to that same door, so a word it refuses fails here, not
+# as an entry never shown. Test-only; no cycle (aterm-messages depends only on
+# aterm-time).
+aterm-messages = { workspace = true }
 
 # ---- integration tests (autotests = false above) ----------------------------
 

@@ -97,6 +97,11 @@ impl Row {
     #[inline]
     pub(crate) fn clear_range_with(&mut self, start: u16, end: u16, fill: Cell) {
         let _ = self.clear_range_with_orphan(start, end, fill, Cell::EMPTY);
+        // A DECFRA glyph is content: one written into an early-wrap hole ends
+        // it. A blank fill (DECERA) erases, and the hole stays a hole.
+        if !super::is_wrap_hole_blank(&fill) {
+            self.note_write_through(usize::from(end));
+        }
     }
 
     /// Clear cells from start to `end` (exclusive) with `fill`, giving an

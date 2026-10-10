@@ -72,7 +72,7 @@ impl StreamingMatch {
     }
 
     /// Check if this match overlaps with another at the same position.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn same_position(&self, other: &Self) -> bool {
         self.row == other.row && self.start_col == other.start_col
@@ -100,7 +100,7 @@ impl Default for StreamingSearchConfig {
             max_results: 10_000,
             max_pattern_len: 1024,
             wrap_enabled: true,
-            case_sensitive: cfg!(kani),
+            case_sensitive: false,
             highlight_all: true,
         }
     }

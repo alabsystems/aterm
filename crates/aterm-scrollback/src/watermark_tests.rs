@@ -419,3 +419,28 @@ fn watermark_storage_reflects_pressure() {
         "storage should delegate watermark level from inner Scrollback"
     );
 }
+
+/// THE THRESHOLDS ARE BOUNDED FOR EVERY BUDGET, and a fresh scrollback
+/// starts Green: for every budget 0..=100_000, the yellow threshold never
+/// exceeds the budget nor the red one, both are positive exactly from a
+/// budget of 2 (80% and 95% of 1 truncate to 0, and a zero budget is zero),
+/// and zero bytes against positive thresholds stays Green from Green through
+/// the real (hysteretic) `recompute_watermark`.
+#[test]
+fn thresholds_are_bounded_for_every_budget() {
+    for budget in 0..=100_000usize {
+        let yellow = threshold_bytes(DEFAULT_YELLOW_PERCENT, budget);
+        let red = threshold_bytes(DEFAULT_RED_PERCENT, budget);
+        let exit = threshold_bytes(YELLOW_EXIT_PERCENT, budget);
+        assert!(yellow <= budget && yellow <= red, "budget {budget}");
+        assert_eq!(yellow == 0, budget <= 1, "budget {budget}");
+        assert_eq!(red == 0, budget <= 1, "budget {budget}");
+        if budget >= 2 {
+            assert_eq!(
+                recompute_watermark(WatermarkLevel::Green, 0, red, yellow, exit),
+                WatermarkLevel::Green,
+                "budget {budget}"
+            );
+        }
+    }
+}

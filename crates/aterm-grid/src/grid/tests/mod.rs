@@ -12,6 +12,7 @@ mod basic;
 mod boundary;
 mod deferred_line_equivalence;
 mod extras_performance;
+mod history_link_budget;
 mod horizontal_margin_scope;
 mod hyperlink_perf;
 mod link_translation_accessors;

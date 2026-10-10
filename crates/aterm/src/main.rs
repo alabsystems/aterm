@@ -119,15 +119,38 @@ fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     Ok(report.render(ms, Some("client")))
 }
 
+/// THE build facts of this binary — the only place any of them is compiled in.
+/// The version is this crate's own (`version.workspace = true`); the rest come
+/// from `build.rs` (the commit and build number from git or the cutter's pins,
+/// the compiler from `$RUSTC -vV`, the profile, the verification state), and the
+/// release marker is the cutter's. Libraries read them at runtime
+/// (`aterm_types::version`): no library's compile reads any of them, so a commit
+/// recompiles this crate alone and no verified library's bytes carry one.
+const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::BuildStamp {
+    app_version: env!("CARGO_PKG_VERSION"),
+    git_commit: env!("ATERM_GIT_COMMIT"),
+    git_commit_full: env!("ATERM_GIT_COMMIT_FULL"),
+    git_dirty: env!("ATERM_GIT_DIRTY"),
+    build_time: env!("ATERM_BUILD_TIME"),
+    build_number: env!("ATERM_BUILD_NUMBER"),
+    dev_commits: env!("ATERM_DEV_COMMITS"),
+    compiler_version_line: env!("ATERM_COMPILER_VERSION_LINE"),
+    compiler_commit: env!("ATERM_COMPILER_COMMIT"),
+    compiler_host: env!("ATERM_COMPILER_HOST"),
+    compiler_trust_version: env!("ATERM_COMPILER_TRUST_VERSION"),
+    compiler_flavor: env!("ATERM_COMPILER_FLAVOR"),
+    build_profile: env!("ATERM_BUILD_PROFILE"),
+    trust_verify: env!("ATERM_TRUST_VERIFY"),
+    release_build: option_env!("ATERM_RELEASE_BUILD").is_some(),
+};
+
 // `pub(crate)`, not private: `src/windowed.rs` includes this file as a module
 // and calls this `main` from its own — a parent module cannot reach a child's
 // private items, and rustc accepts any visibility on a bin root's `main`.
 pub(crate) fn main() -> ExitCode {
-    // The binary's per-commit provenance (commit, build number, build time),
-    // stamped by this crate's build script rather than aterm-gui's so a commit
-    // does not recompile the window library. FIRST, before any route can read
-    // provenance (`aterm --version`, About, `ctl version`, the handoff identity).
-    aterm_gui::install_build_stamp(aterm_gui::build_stamp!());
+    // FIRST, before any route can read a build fact (`aterm --version`, About,
+    // `ctl version`, the handoff identity, XTVERSION).
+    aterm_types::version::install(BUILD_STAMP);
     // Start the broad window cold-start clock before argv0 parsing or route
     // selection. The compatibility GUI-entry clock is anchored separately if
     // this dispatches to a window. Dyld/process-loader time remains excluded.
@@ -288,7 +311,9 @@ pub(crate) fn main() -> ExitCode {
             // same code and its silent exit 0.
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
-            aterm_cli::Verb::Keeper => aterm_keeper::cli::main_entry(forwarded),
+            aterm_cli::Verb::Keeper => {
+                aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
+            }
             // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
             // it means handing the WHOLE operand list back to that parser.
             aterm_cli::Verb::Agents => {
@@ -333,8 +358,6 @@ pub(crate) fn main() -> ExitCode {
         .iter()
         .any(|(name, _)| *name == first);
     if mode_free {
-        // `--version` names the build the updater's start probe looks for.
-        aterm_cli::set_running_build(aterm_gui::running_build_number());
         let _ = aterm_cli::parse_args(rest);
         // parse_args returns only for a launch decision, which cannot happen
         // for a mode-free first token; defend anyway.
@@ -461,8 +484,8 @@ pub(crate) fn main() -> ExitCode {
 
     // THE SESSION SAYS NOTHING UNASKED ON STDERR: its log is the
     // window's `aterm.log`, and atpkg's unasked notices (a config it cannot read, a
-    // prefix it will not use, a lay that is not provenance-clean) are records in it —
-    // both set up here, before the lane's first atpkg call and its first thread.
+    // prefix it will not use) are records in it — both set up here, before the lane's
+    // first atpkg call and its first thread.
     aterm_gui::install_session_log();
     atpkg::notice::to_host_log();
     // ONE read of aterm.toml's `[packages]` and ONE layout for the whole lane — the
@@ -549,8 +572,9 @@ pub(crate) fn main() -> ExitCode {
     // THE TOOLCHAIN'S OWN CHECK, from the session lane, SILENT (failures are log lines):
     //
     //  -  THE HOST SETTINGS (`pkg machine apply`) are not the package manager's to
-    //     gate: no store lock, no index, no network. They walk `$HOME`, so they run
-    //     ONCE A DAY on the slot a window's launch claims too
+    //     gate: no store lock, no index, no network. They write two `defaults
+    //     -currentHost` keys and walk nothing; they run ONCE A DAY on the slot a
+    //     window's launch claims too
     //     (`atpkg::machine::launch_apply_due`), never under a private state root
     //     (ruling 409; the claim logs why it stood aside).
     //  -  THE PACKAGE PASS, under the machine-wide rule the window's six-hour walk
@@ -1403,7 +1427,13 @@ const NO_REROUTE_FLAG: &str = "--no-reroute";
 /// deliberately NOT a "plain" launch for the single-instance routing policy (which
 /// reads the unstripped `rest`): a tab forwarded to another instance would not carry
 /// the environment the flag asked for, so it opens here.
+///
+/// [`atpkg::reroute::ANNOUNCED_ENV`] is REMOVED on every launch (2026-10-01): it marks a
+/// child of a command the reroute already ran — `cargo run -p aterm` from a session hands
+/// it to the aterm it starts — and a new session's commands are typed, not spawned, so
+/// each is announced. Inherited, it would have silenced every signpost in that session.
 fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
+    aterm_log::env::unset(atpkg::reroute::ANNOUNCED_ENV);
     // Same form, same reason as the `scan` slice above.
     if rest
         .get(..payload_boundary(rest))
@@ -1901,13 +1931,16 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     // the directory not private (`ensure_private_dir`). One cause per line, never a
     // hedge between them.
     let Some(st) = st else {
-        println!("{}", update_unreadable_line(aterm_gui::running_version()));
+        println!(
+            "{}",
+            update_unreadable_line(aterm_types::version::app_version())
+        );
         return ExitCode::FAILURE;
     };
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     let lane = aterm_update::apply_lane_report(build);
     let (line, trouble) = update_summary(
-        aterm_gui::running_version(),
+        aterm_types::version::app_version(),
         build,
         &st,
         lane.as_ref(),
@@ -1999,7 +2032,7 @@ impl DevCopy {
             return Self::No;
         }
         let lag = if asked_check || aterm_update::automatic() {
-            aterm_update::dev_channel::standing(aterm_gui::running_version())
+            aterm_update::dev_channel::standing(aterm_types::version::app_version())
         } else {
             None
         };
@@ -2526,8 +2559,39 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--version", "print the version and exit"),
 ];
 
+/// Compiler-provenance probe (`rustc -vV` parser + r/t flavor classifier). The
+/// production copy is `include!`d by `build.rs` (which stamps the env values
+/// [`BUILD_STAMP`] reads); this test-only mount runs the same code against real
+/// `-vV` fixtures.
+#[cfg(test)]
+mod compiler_probe;
+
 #[cfg(test)]
 mod tests {
+    /// The compiler facts `build.rs` stamped are in the classifier's domain: only
+    /// 'r'/'t' can be stamped, verification is on or off, and the `-vV` first line
+    /// leads with `rustc` (the ecosystem contract) or a future `trustc` banner and
+    /// carries a release token.
+    #[test]
+    fn the_build_stamp_is_well_formed() {
+        let stamp = super::BUILD_STAMP;
+        assert!(
+            stamp.compiler_flavor == "r" || stamp.compiler_flavor == "t",
+            "stamped flavor must be r|t: {}",
+            stamp.compiler_flavor
+        );
+        assert!(stamp.trust_verify == "on" || stamp.trust_verify == "off");
+        let line = stamp.compiler_version_line;
+        assert!(
+            line.starts_with("rustc ") || line.starts_with("trustc "),
+            "unexpected -vV first line: {line}"
+        );
+        assert!(
+            line.split_whitespace().nth(1).is_some(),
+            "a release token follows the compiler name: {line}"
+        );
+    }
+
     /// Round-seven update audit #11: a window started as `aterm --window` from a
     /// shell keeps that shell's terminal on stdin, and its update successor is routed
     /// by this same fork. Forwarded only the stripped argv, the successor had no
@@ -4436,7 +4500,9 @@ mod tests {
     /// `__ATERM_REROUTE_PASSTHROUGH=1` marker in the process environment: the one reading
     /// both lanes and every child share. A launch WITHOUT the flag clears an inherited
     /// marker: the flag is the one spelling of the escape, so no environment left over
-    /// from another launch can make this one skip the reroute. The flag also completes.
+    /// from another launch can make this one skip the reroute — nor silence it: the
+    /// marker a reroute-run command hands its children (`cargo run -p aterm`) is cleared
+    /// on every launch. The flag also completes.
     #[test]
     fn no_reroute_is_stripped_before_dispatch_and_sets_the_marker() {
         let _env_lock = NO_REROUTE_ENV_LOCK
@@ -4484,6 +4550,17 @@ mod tests {
             None,
             "a --no-reroute launch fails closed to a local spawn"
         );
+        // A child of a command the reroute ran is not a session: an inherited
+        // `ANNOUNCED_ENV` is cleared by every launch, flagged or not.
+        let announced = atpkg::reroute::ANNOUNCED_ENV;
+        for flags in [&["--window"][..], &["--window", "--no-reroute"][..]] {
+            aterm_log::env::set(announced, "1");
+            let _ = take_no_reroute(&osv(flags));
+            assert!(
+                std::env::var_os(announced).is_none(),
+                "{flags:?}: an inherited {announced} would silence the session's signposts"
+            );
+        }
         aterm_log::env::unset(env);
         assert!(
             COMPLETION_FLAGS

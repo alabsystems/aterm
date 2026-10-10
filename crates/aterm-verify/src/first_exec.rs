@@ -172,7 +172,6 @@ mod tests {
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             remove_env: &[],
             add_env: add,
-            compile_qos: exec::CompileQos::Utility,
         }
     }
 

@@ -452,6 +452,21 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<Defe
         }
         col = new_col;
     }
+    // The line is content, so every cell it filled is: a printed blank (a
+    // space at a rewrap chunk end, trailing blanks of a row its successor
+    // continues) stays inside the row's length, as the write path counts a
+    // printed space. `Row::set` alone counts only non-empty cells, and a ring
+    // row that later spills to the tiered store is staged at its length.
+    row.update_len(col);
+    // A line ends where its content ends. One that fills all but the last
+    // cell left that cell as the rewrap's early-wrap hole (the next glyph was
+    // wide and did not fit); record it, so a rewrap that rejoins this row with
+    // its continuation drops that cell and nothing else. On a row nothing
+    // continues the mark changes nothing: the rejoining readers consult it
+    // only for a continued row, and the history staging that consults it on
+    // every row (`DeferredLine::new_boxed`) cuts the last cell, which this
+    // line never filled (unless a background-coloured erase blanks it since).
+    row.set_early_wrap_hole(usize::from(col) + 1 == row.cells_len());
     deferred
 }
 

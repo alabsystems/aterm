@@ -307,9 +307,70 @@ pub fn reorder_cells_with_classes_into(
     scratch: &mut Scratch,
     out: &mut Vec<usize>,
 ) {
+    let s = scratch;
+    fold_cells_and_resolve(cell_classes, cell_brackets, is_wide_continuation, base, s);
+    reorder_paragraphs_into(&s.logical, &s.levels, &mut s.char_order);
+
+    // 3. Expand each logical character back to its cell(s).
+    out.clear();
+    for &c in &s.char_order {
+        if let Some(&lead) = s.lead_cell.get(c) {
+            out.push(lead);
+            if s.has_cont.get(c).copied().unwrap_or(false) {
+                out.push(lead.saturating_add(1));
+            }
+        }
+    }
+}
+
+/// The resolved UAX #9 embedding level of every CELL of a terminal row,
+/// parallel to `cell_classes`: the levels [`reorder_cells_with_classes_into`]
+/// reorders by, from the same fold, so a wide glyph's continuation cell takes
+/// its lead's level. An odd level is a right-to-left cell, whose visual left
+/// edge is its logical end — what a pointer on its left half means.
+#[must_use]
+pub fn cell_levels(
+    cell_classes: &[BidiClass],
+    cell_brackets: &[Bracket],
+    is_wide_continuation: &[bool],
+    base: BaseDirection,
+) -> Vec<u8> {
+    let mut s = Scratch::default();
+    fold_cells_and_resolve(
+        cell_classes,
+        cell_brackets,
+        is_wide_continuation,
+        base,
+        &mut s,
+    );
+    let mut out = vec![0; cell_classes.len()];
+    for (c, &lead) in s.lead_cell.iter().enumerate() {
+        let level = s.levels.get(c).copied().unwrap_or(0);
+        if let Some(slot) = out.get_mut(lead) {
+            *slot = level;
+        }
+        if s.has_cont.get(c).copied().unwrap_or(false)
+            && let Some(slot) = out.get_mut(lead.saturating_add(1))
+        {
+            *slot = level;
+        }
+    }
+    out
+}
+
+/// Steps 1 and 2 of the cell reorder, shared by
+/// [`reorder_cells_with_classes_into`] and [`cell_levels`] so the two cannot
+/// fold a row differently: fold the cells into logical characters, then
+/// resolve each character's level into `s.levels`.
+fn fold_cells_and_resolve(
+    cell_classes: &[BidiClass],
+    cell_brackets: &[Bracket],
+    is_wide_continuation: &[bool],
+    base: BaseDirection,
+    s: &mut Scratch,
+) {
     // 1. Fold cells into logical characters: each non-continuation cell starts a
     //    character that also owns the immediately-following continuation cell.
-    let s = scratch;
     s.logical.clear();
     s.logical_brackets.clear();
     s.lead_cell.clear();
@@ -330,7 +391,7 @@ pub fn reorder_cells_with_classes_into(
         i = i.saturating_add(if cont { 2 } else { 1 });
     }
 
-    // 2. Reorder the logical characters.
+    // 2. Resolve the logical characters' levels.
     resolve_into(
         &s.logical,
         &s.logical_brackets,
@@ -338,18 +399,6 @@ pub fn reorder_cells_with_classes_into(
         &mut s.resolve,
         &mut s.levels,
     );
-    reorder_paragraphs_into(&s.logical, &s.levels, &mut s.char_order);
-
-    // 3. Expand each logical character back to its cell(s).
-    out.clear();
-    for &c in &s.char_order {
-        if let Some(&lead) = s.lead_cell.get(c) {
-            out.push(lead);
-            if s.has_cont.get(c).copied().unwrap_or(false) {
-                out.push(lead.saturating_add(1));
-            }
-        }
-    }
 }
 
 /// Resolve the UAX #9 embedding level of every character in `text` (see the
@@ -1263,6 +1312,28 @@ mod tests {
         assert_eq!(
             reorder_cells(&cc, &wide, BaseDirection::Auto),
             vec![1, 2, 0]
+        );
+    }
+
+    /// `cell_levels` folds the row as the reorder does: a Hebrew run is odd, an
+    /// LTR word and the blank between them even, and a wide glyph's
+    /// continuation cell carries its lead's level (here an `L` glyph inside an
+    /// RTL paragraph, level 2, and the paragraph's RTL letter, level 1).
+    #[test]
+    fn cell_levels_marks_rtl_cells_and_pairs_wide_glyphs() {
+        let cc = chars("ab \u{05D0}\u{05D1}");
+        let classes: Vec<BidiClass> = cc.iter().map(|&c| bidi_class(c)).collect();
+        let wide = vec![false; cc.len()];
+        assert_eq!(
+            cell_levels(&classes, &[], &wide, BaseDirection::Ltr),
+            vec![0, 0, 0, 1, 1]
+        );
+        let cc = [ALEF, CJK, ' '];
+        let classes: Vec<BidiClass> = cc.iter().map(|&c| bidi_class(c)).collect();
+        let wide = [false, false, true];
+        assert_eq!(
+            cell_levels(&classes, &[], &wide, BaseDirection::Rtl),
+            vec![1, 2, 2]
         );
     }
 

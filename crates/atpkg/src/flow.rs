@@ -1186,9 +1186,6 @@ pub(crate) fn land_artifact(
     // publisher who repaired the asset under the same pin is exactly the case the
     // cooldown exists to let through, so the memo goes with the verdict it held.
     crate::store::clear_stage_refusal(&build_dir);
-    // 6a. Provenance cleared BEFORE activation, as a group member's is (`stage_fetched`,
-    // [`crate::provenance::heal_staged`]); the door-end heal is the backstop.
-    let _ = crate::provenance::heal_staged(layout, &build_dir);
 
     // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op).
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
@@ -4167,11 +4164,6 @@ fn stage_fetched(
     // This member's bytes are good, whatever an earlier pass recorded about them (the
     // singleton lane's reasoning, member by member).
     crate::store::clear_stage_refusal(&build_dir);
-    // PROVENANCE BEFORE THE FLIP (gap #35, measured — [`crate::provenance::heal_staged`]):
-    // the tag a tracked writer left is cleared while nothing runs from this tree, because
-    // clearing it after the flip moves the ctimes a starting tippy pins, and that tippy
-    // refuses the toolchain mid-run. The door-end heal stays the backstop.
-    let _ = crate::provenance::heal_staged(layout, &build_dir);
     // The archive of a member that STAGED stays until the transaction knows the whole
     // tuple's fate (`carried_archive`): a sibling's abort discards this tree, and the
     // archive is what spares the retry the download.

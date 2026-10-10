@@ -49,9 +49,10 @@ mod word;
 pub use emoji_presentation::{is_emoji_presentation, is_vs16_emoji_capable};
 pub use grapheme_iter::{GraphemeClusters, GraphemeIndices, Graphemes};
 pub use grid::{
-    GridColumns, GridGrapheme, GridGraphemes, GridStep, grid_graphemes, str_grid_columns,
+    GridColumns, GridGrapheme, GridGraphemes, GridStep, grid_graphemes, grid_graphemes_with,
+    str_grid_columns, str_grid_columns_with,
 };
-pub use position::{byte_to_column, column_to_char_index};
+pub use position::{byte_to_column, byte_to_column_with, column_to_char_index};
 pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width};
 pub use types::{Grapheme, GraphemeInfo};
 pub use width::{
@@ -61,15 +62,15 @@ pub use width::{
 };
 pub use word::{Words, is_word_char, word_break_before, word_start_before, words};
 
-// === Test/Kani-only API ===
-#[cfg(any(test, kani))]
+// === Test-only API ===
+#[cfg(test)]
 pub use position::{
     GraphemeCells, GraphemeSegmenter, ascii_width, assign_cells, column_to_byte, grapheme_at_byte,
     grapheme_at_column, is_ascii_only, pad_to_width, truncate_to_width,
 };
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub use types::GraphemeType;
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub use width::{
     classify_grapheme, has_skin_tone, has_zwj, is_flag_emoji, is_regional_indicator,
     is_skin_tone_modifier,
@@ -80,6 +81,3 @@ mod ucs_detect_tests;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

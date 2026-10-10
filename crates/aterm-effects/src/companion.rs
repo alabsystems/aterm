@@ -32,8 +32,8 @@ use crate::host::{
     CaptureMode, HostFrameInput, PressOutcome, SingFacts, TerminalFacts, Visibility,
 };
 use crate::kitty_pet::{
-    ART_ASPECT, ART_ROWS, PetArrival, PetBrain, PetFrame, PetInputKind, PetSense, PetSpecies,
-    RoomInbox, SyncLookOutcome,
+    ART_ASPECT, ART_ROWS, PET_DEPARTURES_MAX, PetArrival, PetBrain, PetFrame, PetInputKind,
+    PetSense, PetSpecies, RoomInbox, SyncLookOutcome,
 };
 use crate::kitty_registry::KittyLook;
 use crate::rainbow_kitty::ARM_MIN;
@@ -652,11 +652,13 @@ pub struct CompanionFrame {
     /// `PetFrame::fp` — non-zero while anything rides the lane, byte-stable
     /// once nothing does.
     pub fp: u64,
-    /// THE GLASS a ghost of this frame stands on when it is not this frame's
-    /// surface (`PetDepartureSprite::own_glass`): the pane the focus left,
-    /// still on glass where the body was drawn. `None` when no such ghost
-    /// rides the lane. [`CompanionOwner::emit_on`] draws that ghost there.
-    pub glass: Option<PetGlass>,
+    /// THE GLASS each ghost of this frame stands on when it is not this
+    /// frame's surface (`PetDepartureSprite::own_glass`), slot for slot with
+    /// `pet.departures`: the pane that ghost was drawn in — the one the focus
+    /// left, or one it left before — still on glass where the body was
+    /// drawn. `None` for every other slot. [`CompanionOwner::emit_on`] draws
+    /// each such ghost in its own pane.
+    pub glass: [Option<PetGlass>; PET_DEPARTURES_MAX],
 }
 
 /// ONE TERMINAL SURFACE'S PLACE ON GLASS: its session, and where its cell
@@ -750,29 +752,42 @@ pub struct CompanionOwner {
     /// ([`OwnGlass::colors`]), not in the one the arriver samples in the
     /// other pane.
     resight_colors: Option<CatColorKey>,
-    /// The pixel frame of a ghost standing on its OWN glass — the pane the
-    /// focus left ([`PetBrain::displace_resight`]) — for as long as it fades
-    /// there. Every tick re-asks the host whether that glass is still on
-    /// glass as drawn ([`Self::offer_glass`]).
-    own_glass: Option<OwnGlass>,
-    /// The own glass of a ghost that was still fading at the last boundary
-    /// (`PetBrain::come_home`): if the next tick's frame is that glass
-    /// exactly as drawn, the focus came back to it and the ghost keeps
-    /// fading there — or, standing at the arriver's seat, is the arriver.
-    home_glass: Option<PixelFrame>,
-    /// This frame's host vouched that the glass the ghost wants
-    /// ([`Self::resight_frame`] pending, else [`Self::own_glass`]) is on
-    /// glass exactly as it was drawn. Consumed by every tick: a host that
-    /// offers nothing spends no ghost off its own surface.
-    glass_offered: bool,
+    /// THE OWN GLASSES: the pixel frame of each pane a ghost stands on
+    /// beside the focused surface — the pane the focus left
+    /// ([`PetBrain::displace_resight`]), and the panes it left before while
+    /// their ghosts still fade — one entry per glass, for as long as a ghost
+    /// fades there. Every tick re-asks the host whether each is still on
+    /// glass as drawn ([`Self::offer_glass`]), and each is judged on its own:
+    /// kept, dropped with its ghosts, or home when the focus came back to it
+    /// (`PetBrain::come_home`) — so a quick cycle across three panes keeps
+    /// every ghost fading where it is. Bounded: a glass holds a ghost, and
+    /// the lane holds at most [`PET_DEPARTURES_MAX`], plus the one the
+    /// boundary just displaced.
+    own_glass: [Option<OwnGlass>; OWN_GLASS_MAX],
+    /// The last own-glass key handed out (`OwnGlass::key`); never `0`.
+    glass_key: u32,
+    /// This frame's host vouched that the pending ghost's glass
+    /// ([`Self::resight_frame`]) is on glass exactly as it was drawn.
+    /// Consumed by every tick: a host that offers nothing spends no ghost
+    /// off its own surface.
+    resight_offered: bool,
 }
 
-/// A ghost's own glass ([`CompanionOwner::own_glass`]): the pixel frame it
-/// was drawn in and the palette it was drawn with.
+/// At most this many own glasses at once ([`CompanionOwner::own_glass`]):
+/// one per ghost the lane can hold, plus the one a boundary displaces.
+const OWN_GLASS_MAX: usize = PET_DEPARTURES_MAX + 1;
+
+/// A ghost's own glass ([`CompanionOwner::own_glass`]): the key its ghosts
+/// carry (`PetDepartureSprite::glass`), the pixel frame they were drawn in
+/// and the palette they were drawn with.
 #[derive(Clone, Copy, Debug)]
 struct OwnGlass {
+    key: u32,
     frame: PixelFrame,
     colors: Option<CatColorKey>,
+    /// This frame's host offered it, exactly as drawn: consumed by every
+    /// tick.
+    offered: bool,
 }
 
 /// Where a resident's cells land: the frame-pixel origin of its grid, the
@@ -807,9 +822,9 @@ impl Default for CompanionOwner {
             drawn_frame: None,
             resight_frame: None,
             resight_colors: None,
-            own_glass: None,
-            home_glass: None,
-            glass_offered: false,
+            own_glass: [None; OWN_GLASS_MAX],
+            glass_key: 0,
+            resight_offered: false,
         }
     }
 }
@@ -1120,20 +1135,26 @@ impl CompanionOwner {
 
     /// THE GLASS BESIDE THE FOCUSED SURFACE: the host's terminal panes on
     /// glass this frame ([`PetGlass`]), offered before [`Self::tick`]. The
-    /// owner keeps one answer — whether the glass its ghost wants (a pending
-    /// re-sighting ghost's, else one fading on its own glass) is among them,
-    /// exactly as it was drawn — and the next tick consumes it. Only a
-    /// composed host has panes beside the focused one; a host that offers
-    /// nothing never spends a ghost off its own surface.
+    /// owner keeps one answer per glass a ghost wants — the pending
+    /// re-sighting ghost's, and each own glass a ghost fades on — whether it
+    /// is among them, exactly as it was drawn; the next tick consumes them.
+    /// Only a composed host has panes beside the focused one; a host that
+    /// offers nothing never spends a ghost off its own surface.
     pub fn offer_glass(&mut self, glass: impl IntoIterator<Item = PetGlass>) {
-        let Some(want) = self
-            .resight_frame
-            .or(self.own_glass.map(|own| own.frame))
-            .map(|f| f.glass)
-        else {
+        if self.resight_frame.is_none() && self.own_glass.iter().all(Option::is_none) {
             return;
-        };
-        self.glass_offered = glass.into_iter().any(|g| g == want);
+        }
+        let pending = self.resight_frame.map(|f| f.glass);
+        self.resight_offered = false;
+        for own in self.own_glass.iter_mut().flatten() {
+            own.offered = false;
+        }
+        for g in glass {
+            self.resight_offered |= pending == Some(g);
+            for own in self.own_glass.iter_mut().flatten() {
+                own.offered |= own.frame.glass == g;
+            }
+        }
     }
 
     /// THE INK/SKIN SEAM (gauntlet F1/F3/F5/F8), the half of
@@ -1160,7 +1181,32 @@ impl CompanionOwner {
             cell: (geom.cell_w, geom.cell_h),
             glass: t.glass,
         };
-        let offered = std::mem::take(&mut self.glass_offered);
+        let offered = std::mem::take(&mut self.resight_offered);
+        // EVERY GHOST ON ITS OWN GLASS IS JUDGED BY ITS OWN PANE, before the
+        // pending ghost below takes a glass of its own: the focus came back
+        // to that pane exactly as drawn — its ghosts are this cat on the
+        // focused surface again (`PetBrain::come_home`): the arriver adopts
+        // the one at its seat, the rest fade beside it; the pane is still
+        // on glass as drawn beside the focused one — its ghosts keep fading
+        // there, whatever the focus did meanwhile; otherwise — its pane
+        // closed or zoomed away, the cell metrics changed, or the focused
+        // pane stands on it now — its pixels are gone and so are its ghosts.
+        for slot in &mut self.own_glass {
+            let Some(own) = slot.as_mut() else {
+                continue;
+            };
+            let on_glass = std::mem::take(&mut own.offered);
+            if own.frame == frame_px {
+                self.pet.come_home(own.key);
+                *slot = None;
+            } else if !on_glass
+                || own.frame.cell != frame_px.cell
+                || own.frame.glass.origin == frame_px.glass.origin
+            {
+                self.pet.forget_own_glass(own.key);
+                *slot = None;
+            }
+        }
         // A RE-SIGHTING GHOST IS PIXELS THE USER SAW, so it is spent only
         // where those pixels still are:
         //
@@ -1179,36 +1225,26 @@ impl CompanionOwner {
         // grid moved under it — it would stand where no old body was, so it
         // is dropped and the replacement fades in alone.
         if let Some(drawn) = self.resight_frame.take() {
+            let free = self.own_glass.iter().position(Option::is_none);
             if drawn.cell != frame_px.cell {
                 self.pet.forget_resight();
             } else if drawn.origin == frame_px.origin {
                 // The same glass, a new surface on it.
-            } else if offered && drawn.glass.origin != frame_px.glass.origin {
-                self.pet.displace_resight();
-                self.own_glass = Some(OwnGlass {
+            } else if offered
+                && drawn.glass.origin != frame_px.glass.origin
+                && let Some(free) = free
+            {
+                self.glass_key = self.glass_key.wrapping_add(1).max(1);
+                self.pet.displace_resight(self.glass_key);
+                self.own_glass[free] = Some(OwnGlass {
+                    key: self.glass_key,
                     frame: drawn,
                     colors: self.resight_colors,
+                    offered: false,
                 });
             } else {
                 self.pet.forget_resight();
             }
-        } else if self
-            .own_glass
-            .is_some_and(|own| own.frame.cell != frame_px.cell || !offered)
-        {
-            // Mid-fade, the same law: its pane closed or zoomed away, or the
-            // cell metrics changed, so its pixels are gone.
-            self.pet.forget_own_glass();
-            self.own_glass = None;
-        }
-        // A ghost that was still fading on its own glass at the boundary is
-        // spent there only if the focus came BACK to that glass exactly as
-        // it was drawn — a quick toggle between two panes. It is then this
-        // cat on the focused surface, never cut mid-fade: the arriver adopts
-        // it at its seat, or it keeps fading beside the arriver on the
-        // arriver's ramp; anywhere else the brain's tick drops it.
-        if self.home_glass.take().is_some_and(|home| home == frame_px) {
-            self.pet.come_home();
         }
         self.pet.set_console_presentable(t.visible);
         let pet_frame = match t.capture {
@@ -1241,13 +1277,19 @@ impl CompanionOwner {
         self.last_visible = t.visible;
         // A ghost the brain did not spend (no caret sighted, reduced motion)
         // or that has faded leaves its glass with it.
-        if !self.pet.has_own_glass_ghost() {
-            self.own_glass = None;
+        for slot in &mut self.own_glass {
+            if slot.is_some_and(|own| !self.pet.has_ghost_on_glass(own.key)) {
+                *slot = None;
+            }
         }
-        let glass = self
-            .own_glass
-            .filter(|_| pet_frame.departures.iter().flatten().any(|d| d.own_glass))
-            .map(|own| own.frame.glass);
+        let glass = pet_frame.departures.map(|d| {
+            let key = d.filter(|d| d.own_glass)?.glass;
+            self.own_glass
+                .iter()
+                .flatten()
+                .find(|own| own.key == key)
+                .map(|own| own.frame.glass)
+        });
         let companion = cursor_companion_on_glass(duty, t.painted_caret, None, body_px);
         CompanionFrame {
             pet: pet_frame,
@@ -1385,24 +1427,35 @@ impl CompanionOwner {
         if let Some(pet_fp) = decos.pet_cursor(frame, free) {
             fp ^= pet_fp.rotate_left(29);
             // Only beside a pet the emitter drew: the same baker frame, the
-            // same one-body claim, the same presence envelope.
-            if let Some(glass) = t.glass {
+            // same one-body claim, the same presence envelope. Each ghost on
+            // its own glass is drawn in ITS pane.
+            let out = match window {
+                Some(window) => window,
+                None => free,
+            };
+            for (slot, glass) in t.glass.iter().enumerate() {
+                let Some(glass) = glass else {
+                    continue;
+                };
                 let own = EffectGeom {
                     cols: glass.cols,
                     rows: glass.rows,
                     ..geom
                 };
-                // In the palette the body was drawn with in ITS pane, not
+                // In the palette the body was drawn with in its pane, not
                 // the one the arriver samples in this one.
+                let key = t.pet.departures[slot].map_or(0, |d| d.glass);
                 let frame = PetCursorFrame {
-                    colors: self.own_glass.and_then(|own| own.colors).unwrap_or(colors),
+                    colors: self
+                        .own_glass
+                        .iter()
+                        .flatten()
+                        .find(|own| own.key == key)
+                        .and_then(|own| own.colors)
+                        .unwrap_or(colors),
                     ..frame
                 };
-                let out = match window {
-                    Some(window) => window,
-                    None => free,
-                };
-                if let Some(ghost_fp) = decos.pet_own_glass(frame, own, glass.origin, out) {
+                if let Some(ghost_fp) = decos.pet_own_glass(frame, own, glass.origin, slot, out) {
                     fp ^= ghost_fp.rotate_left(37);
                 }
             }
@@ -1521,9 +1574,8 @@ impl CompanionOwner {
         self.hit_rect = None;
         self.drawn_frame = None;
         self.resight_frame = None;
-        self.own_glass = None;
-        self.home_glass = None;
-        self.glass_offered = false;
+        self.own_glass = [None; OWN_GLASS_MAX];
+        self.resight_offered = false;
     }
 
     /// THE SAME SURFACE, RE-GRIDDED — a resize, a font step, a DPI change, a
@@ -1556,12 +1608,13 @@ impl CompanionOwner {
             self.pet.retire_coordinate_space();
         }
         // The brain carries every crossfade ghost still fading
-        // (`PetBrain::carried`); one on its own glass is spent by the next
-        // tick only if the focus came back to that glass.
-        if let Some(own) = self.own_glass.take() {
-            self.home_glass = Some(own.frame);
+        // (`PetBrain::carried`); one on its own glass keeps its glass here,
+        // and the next tick judges that glass on its own: home if the focus
+        // came back to it, kept while it is on glass as drawn, else gone.
+        self.resight_offered = false;
+        for own in self.own_glass.iter_mut().flatten() {
+            own.offered = false;
         }
-        self.glass_offered = false;
         self.hit_rect = None;
     }
 
@@ -1603,9 +1656,8 @@ impl CompanionOwner {
         self.hit_rect = None;
         self.drawn_frame = None;
         self.resight_frame = None;
-        self.own_glass = None;
-        self.home_glass = None;
-        self.glass_offered = false;
+        self.own_glass = [None; OWN_GLASS_MAX];
+        self.resight_offered = false;
         self.last_alpha = 0;
         self.last_static = false;
         self.last_shed_tick = None;
@@ -1615,13 +1667,12 @@ impl CompanionOwner {
     /// worn look). The session latches (the host's record of the streams), the
     /// opt-in and the verdict in hand survive. Idempotent.
     pub fn drain(&mut self) {
-        self.pet = PetBrain::default();
+        self.pet = self.pet.reborn();
         self.hit_rect = None;
         self.drawn_frame = None;
         self.resight_frame = None;
-        self.own_glass = None;
-        self.home_glass = None;
-        self.glass_offered = false;
+        self.own_glass = [None; OWN_GLASS_MAX];
+        self.resight_offered = false;
         self.last_alpha = 0;
         self.last_visible = false;
         self.last_static = false;
@@ -1632,7 +1683,7 @@ impl CompanionOwner {
     /// authority change); behaviour, position and breed handoff continue.
     pub fn invalidate_colors(&mut self) {
         self.pet.invalidate_colors();
-        if let Some(own) = self.own_glass.as_mut() {
+        for own in self.own_glass.iter_mut().flatten() {
             own.colors = None;
         }
     }

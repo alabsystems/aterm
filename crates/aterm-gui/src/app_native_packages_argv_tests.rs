@@ -139,30 +139,27 @@ fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
     // the worker hands it on as the card's newest state, so the completion
     // has nothing to confirm by a read.
     let applied = machine_apply_stdout(&format!(
-        "atpkg noindex: /Users//x/ay/target: renamed target.noindex\n\
-         atpkg: {MACHINE_SETTINGS_MARKER}spotlight-noindex 1 dir(s) migrated; universal-control disabled\n\
-         atpkg: {}universal-control=disabled; policy=off; noindex=true; \
-         spotlight-exposed=0; spotlight-hidden=9; spotlight-migratable=0; \
-         scan=complete; home=account\n\
-         {MACHINE_VERDICT_PREFIX}applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled\n",
+        "atpkg: Universal Control disabled for this host (revert: …)\n\
+         atpkg: {MACHINE_SETTINGS_MARKER}universal-control disabled\n\
+         atpkg: {}universal-control=disabled; policy=off; home=account\n\
+         {MACHINE_VERDICT_PREFIX}applied — universal-control disabled\n",
         atpkg::cli::MACHINE_STATE_MARKER
     ));
     assert_eq!(applied.events.len(), 1, "{:?}", applied.events);
     assert!(matches!(
         &applied.events[0],
-        Wake::PkgMachineSettings(body)
-            if body == "spotlight-noindex 1 dir(s) migrated; universal-control disabled"
+        Wake::PkgMachineSettings(body) if body == "universal-control disabled"
     ));
     assert!(
         applied
             .record
             .as_ref()
-            .is_some_and(|s| s.hidden == 9 && s.exposed == 0),
+            .is_some_and(|s| s.universal_control == atpkg::machine::UcPosture::Disabled),
         "the record rides the completion, not the event stream"
     );
     assert_eq!(
         applied.verdict.as_deref(),
-        Some("applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled")
+        Some("applied — universal-control disabled")
     );
     assert!(applied.refusal.is_none());
 
@@ -203,24 +200,17 @@ fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
 fn machine_state_is_read_from_the_marker_line_and_never_guessed() {
     use atpkg::machine::{HomePosture, UcPosture};
     let stdout = "atpkg machine: warn — Universal Control is at the OS default (…)\n\
-                  atpkg machine: 2 cargo target dir(s) under /Users//x open to Spotlight (1 a pass would hide), 8 hidden ([machine] spotlight_noindex = true)\n\
-                  atpkg: machine-state: universal-control=default; policy=off; noindex=true; spotlight-exposed=2; spotlight-hidden=8; spotlight-migratable=1; scan=complete; home=account\n\
-                  atpkg machine: next — aterm pkg machine apply (Universal Control off for this host; 1 target dir(s) hidden from Spotlight)\n";
+                  atpkg: machine-state: universal-control=default; policy=off; home=account\n\
+                  atpkg machine: next — aterm pkg machine apply (Universal Control off for this host)\n";
     let state = parse_machine_state_output(stdout).expect("the marker line parses");
     assert_eq!(state.universal_control, UcPosture::Default);
     assert_eq!(state.policy, atpkg::config::UniversalControlPolicy::Off);
-    assert!(state.spotlight_noindex);
-    assert_eq!(
-        (state.exposed, state.hidden, state.would_migrate),
-        (2, 8, 1)
-    );
-    assert!(state.scan_complete);
     assert_eq!(state.home, HomePosture::Account);
-    assert!(state.next().is_some());
+    assert!(state.next());
     assert!(
         parse_machine_state_output(
             "atpkg machine: ok — Universal Control is disabled on this host\n\
-             atpkg machine: nothing to apply — Universal Control and Spotlight are where [machine] wants them\n"
+             atpkg machine: nothing to apply — Universal Control is where [machine] wants it\n"
         )
         .is_none(),
         "prose is not a record"

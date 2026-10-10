@@ -120,57 +120,6 @@ impl StyleTable {
         table
     }
 
-    /// Create a style table optimized for Kani verification.
-    ///
-    /// Uses an empty HashMap (never populated) to avoid the symbolic state
-    /// explosion that FxHashMap/hashbrown causes in CBMC. Pair with
-    /// `kani_intern()`, which also avoids HashMap.
-    #[cfg(kani)]
-    #[must_use]
-    pub(crate) fn kani_stub() -> Self {
-        let mut table = Self {
-            styles: Vec::new(),
-            ref_counts: Vec::new(),
-            lookup: FxHashMap::default(),
-            extended: Vec::new(),
-            #[cfg(test)]
-            l1_cache: [None; STYLE_L1_WAYS],
-            #[cfg(test)]
-            l1_next: 0,
-            #[cfg(test)]
-            intern_cache: Vec::new(),
-            #[cfg(test)]
-            rgb_cache: Vec::new(),
-            _not_sync: std::marker::PhantomData,
-        };
-        table.styles.push(Style::default());
-        table.ref_counts.push(1);
-        table.extended.push(None);
-        table
-    }
-
-    /// Intern a style using linear Vec scan (O(n)) instead of HashMap (O(1)).
-    ///
-    /// Semantically identical to `intern()` but avoids HashMap operations
-    /// that are intractable for CBMC. Safe for Kani proofs where tables
-    /// contain at most a few entries.
-    #[cfg(kani)]
-    pub(crate) fn kani_intern(&mut self, style: Style) -> StyleId {
-        // Linear dedup scan — equivalent to HashMap lookup for small tables
-        for (idx, existing) in self.styles.iter().enumerate() {
-            if *existing == style {
-                self.ref_counts[idx] = self.ref_counts[idx].saturating_add(1);
-                return StyleId::new(u16::try_from(idx).unwrap_or(u16::MAX));
-            }
-        }
-
-        let id = StyleId::new(u16::try_from(self.styles.len()).unwrap_or(u16::MAX));
-        self.styles.push(style);
-        self.ref_counts.push(1);
-        self.extended.push(None);
-        id
-    }
-
     /// L1 cache probe: check if the given style is in the L1 cache.
     ///
     /// On hit, increments the refcount and returns the cached `StyleId`.
@@ -316,7 +265,7 @@ impl StyleTable {
     const INTERN_CACHE_SIZE: usize = 256;
 
     /// 90% of u16::MAX — diagnostic warning threshold.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     const CAPACITY_WARNING_THRESHOLD: usize = (u16::MAX as usize) * 9 / 10;
 
     /// Insert a new style (not in table yet).
@@ -325,7 +274,7 @@ impl StyleTable {
     /// compaction remaps IDs that grid cells still hold, which would corrupt
     /// existing styles. New styles degrade to DEFAULT while existing cells stay
     /// correct.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn insert_new_style(
         &mut self,
         style: Style,
@@ -399,7 +348,7 @@ impl StyleTable {
     ///
     /// The default style (index 0) is never decremented.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn release(&mut self, id: StyleId) {
         let idx = id.raw() as usize;
         if idx > 0 && idx < self.ref_counts.len() && self.ref_counts[idx] > 0 {

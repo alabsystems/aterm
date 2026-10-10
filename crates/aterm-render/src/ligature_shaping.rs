@@ -66,8 +66,8 @@ pub fn build_feature_list(user: &[FontFeature], ligatures_on: bool) -> Vec<rusty
 
 /// Whether [`crate::Renderer::row_glyph_plan`] should run the rustybuzz shaping pass
 /// for a row, vs short-circuit to an all-[`ColumnGlyph::PerCell`] plan. Factored out
-/// as a PURE function so it is unit- AND formally (Kani/trust-mc) verifiable
-/// independent of a live `Renderer` (see the `kani_proofs` module).
+/// as a PURE function so its whole boolean input space is unit-tested
+/// independent of a live `Renderer`.
 ///
 /// Run shaping iff the primary-face bytes are retained AND there is OpenType work to
 /// do: either the user configured `font_features` (`has_user_features`), OR ligatures
@@ -87,8 +87,8 @@ pub fn should_run_shaping(
 
 /// The minimum run length the planner will attempt to shape: 1 when the user
 /// configured `font_features` (a single cell can substitute — `zero` on a lone `0`,
-/// `ss01` on one char), else 2 (a single cell cannot ligate). PURE, for unit + Kani
-/// verification; keeps the two `min_run` derivation sites (planner gate + run gate)
+/// `ss01` on one char), else 2 (a single cell cannot ligate). PURE, for unit
+/// tests; keeps the two `min_run` derivation sites (planner gate + run gate)
 /// from drifting.
 #[must_use]
 pub fn shaping_min_run(has_user_features: bool) -> usize {
@@ -135,14 +135,12 @@ pub enum ShapeVerdict {
 }
 
 /// Classify a shaping result of `n_out` output glyphs over `n_in` input cells into
-/// the grid-mappable [`ShapeVerdict`] (M4). PURE, so the gate is unit- AND formally
-/// (kani/trust-mc + the `LigatureGate` ty model) verifiable independent of a live
-/// shaper.
+/// the grid-mappable [`ShapeVerdict`] (M4). PURE, so the gate is unit-tested and
+/// bound to the `LigatureGate` ty model independent of a live shaper.
 ///
 /// With `admit_collapsed == false` this reduces EXACTLY to the legacy gate
 /// (`accept iff n_out == n_in`), so the no-flag path stays byte-identical — proved
-/// for the whole small-count lattice by `classify_shape_lattice` and by the
-/// `gate_admit_off_is_legacy` kani proof. The `Collapsed` branch is the ONLY
+/// for the whole small-count lattice by `classify_shape_lattice`. The `Collapsed` branch is the ONLY
 /// behaviour the flag adds, and it admits EXACTLY the `N:1` (`N >= 2`) case.
 #[must_use]
 pub fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> ShapeVerdict {
@@ -774,8 +772,8 @@ mod tests {
         );
     }
 
-    /// Concrete companion to the Kani proof `gate_no_features_is_legacy`: with no user
-    /// features the gate equals the legacy short-circuit for ALL 8 flag combinations.
+    /// With no user features the gate equals the legacy short-circuit for ALL 8
+    /// flag combinations.
     #[test]
     fn should_run_shaping_matches_legacy_without_user_features() {
         for &rb in &[false, true] {
@@ -1107,124 +1105,5 @@ mod tests {
         assert!(extract_cell_slice(&raster, raster_w, height, 0, 0, 0).is_empty());
         assert!(extract_cell_slice(&raster, raster_w, 0, 0, cell_w, 0).is_empty());
         assert!(extract_cell_slice(&[], raster_w, height, 0, cell_w, 0).is_empty());
-    }
-}
-
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs for the typography shaping
-/// GATE. These are CONFIG-FREE (no `#[kani::unwind]`/stub/solver), so the default
-/// verification lane (`KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`)
-/// discharges them through trust-mc + ay. They prove the gate refactor is
-/// behaviour-preserving and total over the ENTIRE boolean input space — a guarantee
-/// example-based golden/parity tests cannot give.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::{ShapeVerdict, classify_shape, shaping_min_run, should_run_shaping};
-
-    /// M4 — with the N:1 flag OFF the amended gate is byte-identical to the legacy
-    /// accept (`accept iff n_out == n_in`), for EVERY small count pair: adding the
-    /// Cascadia branch did not perturb the shipping 1:1 path, and no `Collapsed`
-    /// verdict is ever produced without the flag.
-    #[kani::proof]
-    fn gate_admit_off_is_legacy() {
-        let n_in: usize = kani::any();
-        let n_out: usize = kani::any();
-        kani::assume(n_in <= 8 && n_out <= 8);
-        let legacy_accept = n_in >= 1 && n_out == n_in;
-        let v = classify_shape(n_in, n_out, false);
-        kani::assert(
-            matches!(v, ShapeVerdict::OneToOne) == legacy_accept,
-            "admit-off gate must equal the legacy 1:1 accept",
-        );
-        kani::assert(
-            !matches!(v, ShapeVerdict::Collapsed),
-            "no Collapsed verdict without the flag",
-        );
-    }
-
-    /// M4 — CONSERVATIVENESS: with the flag on, the gate accepts EXACTLY the two
-    /// grid-mappable forms (1:1, or N:1 with N>=2) and REJECTS everything else
-    /// (partial collapse, expansion). Any shape outside the two proven forms still
-    /// falls back to the per-cell path — the gate is never weakened.
-    #[kani::proof]
-    fn gate_collapsed_admits_only_n_to_one() {
-        let n_in: usize = kani::any();
-        let n_out: usize = kani::any();
-        kani::assume(n_in <= 8 && n_out <= 8);
-        let v = classify_shape(n_in, n_out, true);
-        let one_to_one = n_in >= 1 && n_out == n_in;
-        let collapsed = n_out == 1 && n_in >= 2;
-        // The two admissible forms are mutually exclusive (n_out==n_in vs n_out==1<n_in).
-        kani::assert(
-            matches!(v, ShapeVerdict::OneToOne) == one_to_one,
-            "1:1 verdict iff equal non-zero counts",
-        );
-        kani::assert(
-            matches!(v, ShapeVerdict::Collapsed) == (collapsed && !one_to_one),
-            "collapsed verdict iff N:1 with N>=2",
-        );
-        kani::assert(
-            matches!(v, ShapeVerdict::Reject) == !(one_to_one || collapsed),
-            "reject iff neither grid-mappable form",
-        );
-    }
-
-    /// With NO user features the new gate is byte-identical to the legacy gate
-    /// (`run iff bytes present AND ligatures on AND the font advertises liga/calt`),
-    /// for EVERY combination of the three flags — the formal guarantee that adding
-    /// `font_features` did not perturb the no-features common path.
-    #[kani::proof]
-    fn gate_no_features_is_legacy() {
-        let rb: bool = kani::any();
-        let off: bool = kani::any();
-        let lig: bool = kani::any();
-        let legacy = rb && !off && lig;
-        kani::assert(
-            should_run_shaping(rb, false, off, lig) == legacy,
-            "no-features gate must equal the legacy short-circuit decision",
-        );
-    }
-
-    /// User-configured features force a shaping pass whenever the primary bytes are
-    /// present (so a feature reaches pixels on ANY font / with ligatures off), and
-    /// never when the bytes are absent (no face to shape with).
-    #[kani::proof]
-    fn gate_user_features_run_iff_bytes() {
-        let off: bool = kani::any();
-        let lig: bool = kani::any();
-        kani::assert(
-            should_run_shaping(true, true, off, lig),
-            "user features must shape when primary bytes are present",
-        );
-        kani::assert(
-            !should_run_shaping(false, true, off, lig),
-            "shaping must never run without primary bytes",
-        );
-    }
-
-    /// TOTALITY: the gate never returns true without primary bytes, for any flag
-    /// combination — there is no path that shapes a face the renderer does not hold.
-    #[kani::proof]
-    fn gate_requires_bytes() {
-        let hu: bool = kani::any();
-        let off: bool = kani::any();
-        let lig: bool = kani::any();
-        kani::assert(
-            !should_run_shaping(false, hu, off, lig),
-            "no primary bytes => never shape",
-        );
-    }
-
-    /// `shaping_min_run` is 1 exactly when user features are configured, else 2 — so a
-    /// single cell is only ever shaped when a feature can substitute it.
-    #[kani::proof]
-    fn min_run_matches_user_features() {
-        kani::assert(
-            shaping_min_run(true) == 1,
-            "user features allow single-cell substitution runs",
-        );
-        kani::assert(
-            shaping_min_run(false) == 2,
-            "no features => minimum run length 2",
-        );
     }
 }

@@ -1292,10 +1292,17 @@ pub(crate) fn seed_adopted_title(
     true
 }
 
-/// On a ConPTY session the kitty keyboard protocol is off
-/// ([`Terminal::set_kitty_keyboard_enabled`]): `CSI ? u` goes unanswered and an
-/// application's push/set/pop is ignored, so keys stay legacy VT (or the
-/// win32-input-mode records conhost asked for).
+/// The console-host keyboard posture of the PTY behind `master`
+/// ([`Terminal::set_console_host_posture`]), keyed on the same resize seam
+/// policy the session resizes under ([`crate::app_render::pty_resize_policy`]),
+/// so a `cast drift` replay folded under that policy rebuilds the same engine.
+///
+/// On a ConPTY session the kitty keyboard protocol is off: `CSI ? u` goes
+/// unanswered and an application's push/set/pop is ignored, so keys stay
+/// legacy VT (or the win32-input-mode records conhost asked for). And DEC 9001
+/// is honored: conhost asks for those records at every ConPTY start. No other
+/// session has a console host, so there the same request is a program's output
+/// and changes nothing, whatever a hydrated checkpoint carried.
 ///
 /// conhost forwards a program's kitty push but cannot turn our CSI-u reports
 /// into the key records a console program reads, so keys such as Ctrl+L and
@@ -1303,15 +1310,11 @@ pub(crate) fn seed_adopted_title(
 /// loses only kitty's extras.
 ///
 /// Gated on the backend (`aterm_pty::backend_is_conpty`), not `cfg(windows)`:
-/// stub/replay sessions and Unix PTYs are unchanged. A conhost that encodes key
-/// records as CSI-u would make this unnecessary for that backend.
+/// stub/replay sessions and Unix PTYs get the native posture. A conhost that
+/// encodes key records as CSI-u would make this unnecessary for that backend.
 pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
-    #[cfg(windows)]
-    if aterm_pty::backend_is_conpty(master) {
-        term_lock(term).set_kitty_keyboard_enabled(false);
-    }
-    #[cfg(not(windows))]
-    let _ = (term, master);
+    let policy = crate::app_render::pty_resize_policy(master);
+    term_lock(term).set_console_host_posture(policy);
 }
 
 /// The `rlimit` set a daily-driver (`user`/`master`) shell is spawned with:
@@ -2617,7 +2620,7 @@ mod pty_keyboard_posture_tests {
     use crate::term_lock;
     use aterm_core::terminal::Terminal;
     use aterm_types::keyboard::{
-        Key, KeyEventType, KeyboardMode, Modifiers, encode_key_with_layout,
+        Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout,
     };
     use std::sync::Mutex;
 
@@ -2676,6 +2679,35 @@ mod pty_keyboard_posture_tests {
         }
     }
 
+    /// A native session has no console host, so a program's DEC 9001 (a file
+    /// `cat` writes, a remote over ssh) changes nothing: Escape and Shift+Enter
+    /// keep their own bytes for whatever reads the tab next, through the
+    /// lock-free word the input seam encodes from.
+    #[test]
+    fn a_native_session_ignores_a_programs_win32_input_request() {
+        for master in [-1, 0x7fff_ffff] {
+            let term = live_engine();
+            apply_pty_keyboard_posture(&term, master);
+            let mut t = term_lock(&term);
+            t.process(b"\x1b[?9001h");
+            let mode = t.mode_mirror().keyboard_mode();
+            assert!(!mode.contains(KeyboardMode::WIN32_INPUT), "master {master}");
+            let press = |key: Key, mods| {
+                encode_key_with_layout(&key, mods, mode, KeyEventType::Press, None)
+            };
+            assert_eq!(
+                press(Key::Named(NamedKey::Escape), Modifiers::empty()),
+                b"\x1b",
+                "master {master}"
+            );
+            assert_eq!(
+                press(Key::Named(NamedKey::Enter), Modifiers::SHIFT),
+                b"\n",
+                "master {master}"
+            );
+        }
+    }
+
     /// A ConPTY session does not advertise the protocol: `CSI ? u` gets no reply
     /// and a push leaves keys legacy, so Ctrl+L and Alt+a stay `^L` and `ESC a`.
     ///
@@ -2713,6 +2745,13 @@ mod pty_keyboard_posture_tests {
             "a push must not reach the encoder: {kitty:?}"
         );
         assert_eq!(keys, [vec![0x0c], b"\x1ba".to_vec()]);
+        // conhost's own `?9001h` at ConPTY start is honored on this backend.
+        term_lock(&term).process(b"\x1b[?9001h");
+        assert!(
+            term_lock(&term)
+                .keyboard_mode()
+                .contains(KeyboardMode::WIN32_INPUT)
+        );
     }
 
     /// `spawn_session` applies the posture to EVERY session it builds, once,

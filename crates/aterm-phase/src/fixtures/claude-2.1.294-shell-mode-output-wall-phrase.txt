@@ -1,0 +1,49 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a shell-mode command (`!` typed into the empty composer, then `cat notes.txt`) whose output opens with a wall phrase (`notes.txt`'s first line is `Not logged in · Please run /login`), the stub's reply EMPTY (a custom mode streaming no text), so the `! cat notes.txt` row and its `⎿` block are the last thing said, over the done row; the server published `agent=wall:auth` here, and with the harness on (continue = false) it TYPED `/login` within a second (`auth-login@v1`, the rows above: `❯ /login` / `⎿  Login interrupted` is the lab's Esc on the dialog it opened)
+
+⏺ Tool call done.
+
+✻ Cooked for 16s · done 5:44 AM
+
+❯ toolstart
+
+  Called github (ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Baked for 4s · done 5:44 AM
+
+❯ toolstart
+
+  Called github (ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Cogitated for 4s · done 5:45 AM
+
+! cat notes.txt
+  ⎿  Not logged in · Please run /login
+     second line of notes
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 5:45 AM
+
+! cat notes.txt
+  ⎿  Not logged in · Please run /login
+     second line of notes
+
+✻ Worked for 0s · done 5:45 AM
+
+❯ /login
+  ⎿  Login interrupted
+
+! cat notes.txt
+  ⎿  Not logged in · Please run /login
+     second line of notes
+
+✻ Crunched for 0s · done 5:46 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

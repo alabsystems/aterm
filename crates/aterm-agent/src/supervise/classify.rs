@@ -509,12 +509,11 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
 /// `Ok` when `line` is PLAIN: written only in the part of zsh's grammar that
 /// expands nothing, so no zsh form this module has not measured can hide in
 /// it. What `approve = "safe"`'s read-only rule also requires of a line the
-/// Bash tool may run under zsh (decided 2026-09-30 under the owner's standing
-/// direction, closing the audit's "the zsh sweeps are exhaustive only over the
-/// forms tried": [`classify_command_with`] refuses the forms it knows, and
-/// this admits only what cannot be one). It is a list of SIMPLE commands: no
-/// reserved word opens one ([`ZSH_RESERVED`]: `for path in …` assigns zsh's
-/// tied `path`, `repeat` evaluates arithmetic), a leading redirect included
+/// Bash tool may run under zsh ([`classify_command_with`] refuses the forms
+/// it knows; this admits only what cannot be one). It is a list of SIMPLE
+/// commands: no reserved word opens one ([`ZSH_RESERVED`]: `for path in …`
+/// assigns zsh's tied `path`, `repeat` evaluates arithmetic), a leading
+/// redirect included
 /// (`2>/dev/null for …` is the loop). Outside single quotes the line
 /// holds no `$`, backtick, backslash, `(`, `)`, `{`, `}` or `[[`; no word
 /// that opens with `=`, and no `=` in a word that is not a flag (an

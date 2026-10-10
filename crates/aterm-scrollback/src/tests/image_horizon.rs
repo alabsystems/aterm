@@ -190,7 +190,7 @@ fn the_horizon_is_reported_only_for_lines_that_actually_carried_a_picture() {
 
 #[test]
 fn the_horizon_count_never_decreases_and_survives_a_clear() {
-    // Monotonic, like every other out-of-band loss signal (audit E10a): a host
+    // Monotonic, like every other out-of-band loss signal: a host
     // polling it must be able to diff two reads without the count walking back
     // under it.
     let image = placement(1, 2, 2_048);

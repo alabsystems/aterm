@@ -1677,8 +1677,8 @@ mod macos {
             // SAME FILE, NOT SAME SPELLING. `image` is what dladdr resolved —
             // a real path, symlinks already followed. `current_exe` is the path
             // this process was LAUNCHED through. Those differ whenever anything
-            // between them is a link, and one is: the Spotlight-noindex
-            // migration leaves `target` a symlink to `target.noindex`, so the
+            // between them is a link, and one can be: a checkout whose `target`
+            // is a symlink to `target.noindex` (an older Spotlight rename), so the
             // two names for the one executable are
             // `…/target/debug/examples/objc_window_drive` and
             // `…/target.noindex/debug/examples/objc_window_drive`. A string

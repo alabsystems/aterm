@@ -864,10 +864,9 @@ fn the_paste_fallback_never_claims_an_older_turns_paste() {
 }
 
 /// A composer holding a draft that starts with `1.` (an answer to the
-/// worker's numbered question, typed but not sent) was skipped by
-/// `composer_index` as an option row, so no composer frame was found and the
-/// report was the draft, the rule and the footer. The caret in column 0 under
-/// a composer rule is the composer, whatever it holds.
+/// worker's numbered question, typed but not sent) is the composer, not an
+/// option row: the caret in column 0 under a composer rule is the composer,
+/// whatever it holds, so the draft, the rule and the footer are not report.
 #[test]
 fn a_numbered_draft_in_the_composer_is_not_the_start() {
     let rule = "─".repeat(120);
@@ -952,9 +951,9 @@ fn the_done_row_that_ends_a_turn_is_kept() {
 }
 
 /// An `aterm ctl` that predates `offscreen` frames an unknown verb as a
-/// STATUS line: it prints `OK <n> first=…` on stdout and drops the rows. That
-/// was a hard failure (`the header counts 12 rows, 0 came`); DRIVE_HELP
-/// promises no-archive and the screen alone.
+/// STATUS line: it prints `OK <n> first=…` on stdout and drops the rows. The
+/// report is no-archive and the screen alone, as DRIVE_HELP promises, never
+/// a header-count failure.
 #[test]
 fn an_aterm_ctl_that_frames_offscreen_as_status_falls_back() {
     let screen = claude(&["❯ Keep going", "⏺ Kept going.", ""], &[]);
@@ -1069,7 +1068,7 @@ fn a_paste_row_that_does_not_fit_the_turn_is_not_the_start() {
 /// The `--final` and `--messages` views on the saved screen of a real worker
 /// (`idle-after-limit-and-model-switch`, the fixture
 /// [`the_transcript_ends_at_the_live_zone`] reads): the default report is
-/// byte-identical to what it always printed, `--final` is the worker's last
+/// byte-identical to the view-less report, `--final` is the worker's last
 /// message and the done row that ended the turn, and `--messages` keeps every
 /// message block, the user's `❯` row and the done rows while dropping every
 /// tool row — a collapsed `Ran N shell commands` group, a `⏺ Stop Task`, a

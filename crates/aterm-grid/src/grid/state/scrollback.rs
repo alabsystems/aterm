@@ -114,9 +114,7 @@ impl GridStorage {
     #[must_use]
     #[inline]
     pub(crate) fn ring_history_extras(&self, ring_idx: usize) -> Option<&ScrolledRowExtras> {
-        self.ring_extras
-            .get(ring_idx)
-            .and_then(|opt| opt.as_deref())
+        self.ring_extras.get(ring_idx)
     }
 
     /// Total scrollback lines (ring buffer + lazy buffer + tiered scrollback).

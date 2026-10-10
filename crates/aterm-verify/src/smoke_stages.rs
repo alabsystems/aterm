@@ -32,8 +32,11 @@
 //!    handback) run with nothing else in flight.
 //!
 //! 5b) GUI TYPING-PACING SMOKE (macOS desktop only; the MEASURE tier's since
-//!    2026-09-26 — `--measure` and `--full` run it, the merge contract does
-//!    not, and a release cut requires it green). Headless never PRESENTS, so
+//!    2026-09-26 — `--measure <APP>` and `--full <APP>` run it, the merge
+//!    contract does not, and a release signs only bytes it measured green). It
+//!    drives the release bundle the run was handed — APP's `aterm-gui` and
+//!    `aterm-ctl`, argv0 names of the one `aterm` — and builds nothing, so the
+//!    latencies it judges are the shipped bytes' (2026-10-09). Headless never PRESENTS, so
 //!    only a real window can measure pacing. The 2026-07-05 incident build
 //!    presented at ~5/s with 190-530 ms input→present; a healthy build does 30+/s
 //!    under 15 ms. Skips automatically without a WindowServer session (CI/SSH), or
@@ -66,7 +69,7 @@
 //!
 //! TWO RULES THAT LOOK LIKE DETAILS AND ARE NOT:
 //!  * BUILD BOTH BINARIES SYNCHRONOUSLY, THEN DRIVE THE BINARIES — never `targo
-//!    run`. (1) Timing: the test stage links `aterm-gui`'s dev-deps with
+//!    run` (the headless smoke; the GUI smoke drives the handed bundle). (1) Timing: the test stage links `aterm-gui`'s dev-deps with
 //!    `spec-anchors` ON, which invalidates its non-test build, so a `run` here
 //!    would rebuild and the bounded socket-poll budget would expire MID-BUILD,
 //!    reporting a false "socket never appeared" on healthy code. (Since
@@ -477,7 +480,7 @@ impl Sandbox {
             format!(
                 "{extra}agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
                  [packages]\nenabled = false\n\
-                 [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n"
+                 [machine]\nuniversal_control = \"leave\"\n"
             ),
         )
         .ok()?;
@@ -565,7 +568,9 @@ enum Ready {
     Stopped,
 }
 
-/// The preamble both smokes share, with the label prefix each one uses.
+/// The preamble both smokes share, with the label prefix each one uses. With
+/// `driven` (the GUI smoke's handed bundle) it builds nothing and drives that
+/// bundle's `aterm-gui` and `aterm-ctl`; without it, the driver lane's.
 fn bring_up(
     ctx: &Ctx,
     r: &mut Report,
@@ -573,30 +578,34 @@ fn bring_up(
     tag: &str,
     log_label: &str,
     headless: bool,
+    driven: Option<&crate::MeasureArtifact>,
 ) -> Ready {
-    let build = crate::stages::driver_build_cmd(ctx, smoke_build_args())
-        .capture(Capture::Append(sb.gui_log.clone()));
-    let built = exec_run(&build, ctx.exec_env());
-    if !built.ok {
-        r.fail_child(
-            &built,
-            format!("{tag}: targo build -p aterm-gui -p aterm-ctl failed"),
-        );
-        r.raw(smoke_log_tail(log_label, &sb.gui_log));
-        // What the build kept from running is decided by nothing (2026-09-27,
-        // fourth review): a smoke build red main had stood for the smoke.
-        if built.environment_failure().is_none() {
-            crate::stages::not_run_behind(
-                r,
-                &format!("{tag}: the smoke's checks"),
-                "the build above failed, so there is no fresh aterm-gui to launch",
+    let (gui, ctl) = if let Some(bundle) = driven {
+        (bundle.bin("aterm-gui"), bundle.bin("aterm-ctl"))
+    } else {
+        let build = crate::stages::driver_build_cmd(ctx, smoke_build_args())
+            .capture(Capture::Append(sb.gui_log.clone()));
+        let built = exec_run(&build, ctx.exec_env());
+        if !built.ok {
+            r.fail_child(
+                &built,
+                format!("{tag}: targo build -p aterm-gui -p aterm-ctl failed"),
             );
+            r.raw(smoke_log_tail(log_label, &sb.gui_log));
+            // What the build kept from running is decided by nothing (2026-09-27,
+            // fourth review): a smoke build red main had stood for the smoke.
+            if built.environment_failure().is_none() {
+                crate::stages::not_run_behind(
+                    r,
+                    &format!("{tag}: the smoke's checks"),
+                    "the build above failed, so there is no fresh aterm-gui to launch",
+                );
+            }
+            return Ready::Stopped;
         }
-        return Ready::Stopped;
-    }
-    // The driver lane's dir: that is where the build above put them.
-    let gui = driver_bin(ctx, "aterm-gui");
-    let ctl = driver_bin(ctx, "aterm-ctl");
+        // The driver lane's dir: that is where the build above put them.
+        (driver_bin(ctx, "aterm-gui"), driver_bin(ctx, "aterm-ctl"))
+    };
     if !crate::is_executable_file(&gui) || !crate::is_executable_file(&ctl) {
         r.cannot_run(format!(
             "{tag}: just-built binaries missing ({}, {})",
@@ -761,7 +770,7 @@ pub fn control_socket_smoke(ctx: &Ctx, r: &mut Report) {
         return;
     };
     if let Ready::Up { ctl: ctl_bin } =
-        bring_up(ctx, r, &mut sb, "smoke", "control-socket smoke", true)
+        bring_up(ctx, r, &mut sb, "smoke", "control-socket smoke", true, None)
     {
         cursor_round_trip(ctx, r, &sb, &ctl_bin);
         headless_typing_burst(ctx, r, &sb, &ctl_bin);
@@ -850,6 +859,12 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         r.skip(reason);
         return;
     }
+    // A MEASURE run always names its bundle (`cli`); one without it judged
+    // nothing, and says so rather than timing a binary of the gate's choosing.
+    let Some(bundle) = &ctx.measure_artifact else {
+        r.cannot_run("gui smoke: no release bundle was handed to judge (--measure <APP>)");
+        return;
+    };
     let mut readings = Vec::new();
     for lane in effect_lanes() {
         let tag = format!("gui smoke [{}]", lane.label);
@@ -857,7 +872,8 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
             r.cannot_run(format!("{tag}: mktemp"));
             continue;
         };
-        if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, &tag, "GUI smoke", false)
+        if let Ready::Up { ctl: ctl_bin } =
+            bring_up(ctx, r, &mut sb, &tag, "GUI smoke", false, Some(bundle))
             && let Some(reading) = effect_lane_burst(ctx, r, &mut sb, &ctl_bin, &lane)
         {
             readings.push((lane.label, reading));
@@ -985,9 +1001,6 @@ fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
             .is_some_and(|s| !s.is_empty())
     {
         return Some("gui smoke (no WindowServer session)".into());
-    }
-    if !ctx.tools.have_targo() {
-        return Some("gui smoke (no targo)".into());
     }
     if !Path::new("/usr/bin/swift").exists() {
         return Some(

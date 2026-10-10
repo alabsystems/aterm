@@ -4,10 +4,12 @@
 
 //! Grapheme position conversion, cell assignment, and segmentation utilities.
 
-use crate::grid::grid_graphemes;
-#[cfg(any(test, kani))]
+use aterm_types::text_shaping::AmbiguousWidth;
+
+use crate::grid::{grid_graphemes, grid_graphemes_with};
+#[cfg(test)]
 use crate::types::Grapheme;
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use crate::width::{grapheme_width, split_graphemes};
 
 /// Find the grapheme cluster that contains a given byte offset.
@@ -16,7 +18,7 @@ use crate::width::{grapheme_width, split_graphemes};
 /// ENSURES: `byte_offset >= s.len()` implies `None`; `Some(g)` implies `byte_offset` is inside `g`'s byte range.
 ///
 /// Returns `None` if the offset is out of bounds.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn grapheme_at_byte(s: &str, byte_offset: usize) -> Option<Grapheme<'_>> {
     if byte_offset >= s.len() {
         return None;
@@ -38,7 +40,7 @@ pub fn grapheme_at_byte(s: &str, byte_offset: usize) -> Option<Grapheme<'_>> {
 /// ENSURES: `Some(g)` implies `column` lies in that grapheme's display-column span.
 ///
 /// Returns `None` if the column is beyond the string's display width.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn grapheme_at_column(s: &str, column: usize) -> Option<Grapheme<'_>> {
     let mut current_col = 0;
 
@@ -67,9 +69,15 @@ pub fn grapheme_at_column(s: &str, column: usize) -> Option<Grapheme<'_>> {
 /// display width put every later column two cells left of its text. Byte
 /// offsets that fall inside a grapheme map to the column after that grapheme.
 pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
+    byte_to_column_with(s, byte_offset, AmbiguousWidth::Single)
+}
+
+/// [`byte_to_column`] under the terminal's `ambiguous_width` policy (see
+/// [`grid_graphemes_with`]).
+pub fn byte_to_column_with(s: &str, byte_offset: usize, ambiguous: AmbiguousWidth) -> usize {
     let mut column = 0usize;
 
-    for g in grid_graphemes(s) {
+    for g in grid_graphemes_with(s, ambiguous) {
         if g.byte_offset >= byte_offset {
             return column;
         }
@@ -85,7 +93,7 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
 /// ENSURES: returns a byte offset in `0..=s.len()` at a grapheme boundary (or `s.len()` past the end).
 ///
 /// Returns the byte offset at the start of the grapheme at the given column.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn column_to_byte(s: &str, column: usize) -> usize {
     let mut current_col = 0;
 
@@ -127,7 +135,7 @@ pub fn column_to_char_index(s: &str, column: usize) -> usize {
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns a prefix of `s` whose display width is at most `max_width` and does not split graphemes.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
     let mut width = 0;
     let mut end_byte = 0;
@@ -147,7 +155,7 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returned string has display width `<= width` and begins with `truncate_to_width(s, width)`.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn pad_to_width(s: &str, width: usize) -> String {
     let info = grapheme_width(s);
 
@@ -164,7 +172,7 @@ pub fn pad_to_width(s: &str, width: usize) -> String {
 /// Check if a string is entirely ASCII (fast path for terminals).
 ///
 /// ASCII-only text can use simpler width calculation.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[inline]
 pub fn is_ascii_only(s: &str) -> bool {
     s.bytes().all(|b| b < 128)
@@ -174,7 +182,7 @@ pub fn is_ascii_only(s: &str) -> bool {
 ///
 /// O(n) in string length: counts printable ASCII bytes (0x20..0x7F).
 /// Each ASCII character is 1 cell wide (control characters are 0).
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[inline]
 pub fn ascii_width(s: &str) -> usize {
     s.bytes().filter(|&b| (0x20..0x7F).contains(&b)).count()
@@ -185,7 +193,7 @@ pub fn ascii_width(s: &str) -> usize {
 /// This struct provides stateful grapheme processing suitable for
 /// terminal input handling, tracking position information for
 /// cursor management.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct GraphemeSegmenter {
     /// Current column position.
@@ -194,14 +202,14 @@ pub struct GraphemeSegmenter {
     index: usize,
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl Default for GraphemeSegmenter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl GraphemeSegmenter {
     /// Create a new segmenter starting at column 0.
     #[inline]
@@ -237,7 +245,7 @@ impl GraphemeSegmenter {
 ///
 /// When rendering graphemes to terminal cells, a grapheme may span
 /// 1 or 2 cells. This struct describes the cell assignment.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphemeCells {
     /// First cell column.
@@ -248,7 +256,7 @@ pub struct GraphemeCells {
     pub is_wide: bool,
 }
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 impl GraphemeCells {
     /// Get the ending column (exclusive).
     #[inline]
@@ -267,7 +275,7 @@ impl GraphemeCells {
 ///
 /// Returns an iterator of (grapheme, cells) pairs showing how each
 /// grapheme maps to terminal cells.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub fn assign_cells(
     s: &str,
     start_col: usize,

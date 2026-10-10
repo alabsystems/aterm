@@ -1129,15 +1129,25 @@ impl Meter {
         // the fill is measured finer than the count (a pass's programs by
         // phase: 36 % while the fourth of ten installs), and it is kept
         // inside the count's own span — never under `3 of 10`'s 30 %, never at
-        // `4 of 10`'s 40 % before the count says four. A measured level is a
-        // gauge, not a count; a busy row (no fill) stays a comet.
+        // `4 of 10`'s 40 % before the count says four: its top is one
+        // permille under the PERCENT the next count paints, as the band
+        // floors it (399, `39%`; 999 beside `9 of 10`, never the whole bar
+        // while one is left; ruling 441 (a)). The next count's own permille
+        // is rounded (`count_span`), so one short of it can floor to its
+        // percent: `2 of 3` paints 66 % (667), and `1 of 3` stops at 659,
+        // `65%`. Where two counts paint the same percent (`1 of 300`,
+        // `2 of 300`) the span's floor wins. A complete count's span is the
+        // whole bar alone. A measured level is a gauge, not a count; a busy
+        // row (no fill) stays a comet.
         let counted = (!level)
             .then(|| count_span(&self.stats))
             .flatten()
             .filter(|_| fill_permille.is_some());
         let fill_permille = match (counted, amount.is_some() || measured) {
             (Some((lo, _)), false) => Some(lo),
-            (Some((lo, hi)), true) => fill_permille.map(|p| p.clamp(lo, hi)),
+            (Some((lo, hi)), true) => {
+                fill_permille.map(|p| p.clamp(lo, (hi / 10 * 10).saturating_sub(1).max(lo)))
+            }
             (None, _) => fill_permille,
         };
         Self {

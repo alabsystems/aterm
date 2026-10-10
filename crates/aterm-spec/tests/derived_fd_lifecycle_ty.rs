@@ -5,9 +5,7 @@
 //!
 //! `fd_lifecycle_model()` (machine `FdLifecycle`) is the drift-free, code-bound twin
 //! of the `SinkWriter` PTY-master ownership discipline in `aterm-session/src/sink.rs`
-//! (initiative A7, WS-G). It SUPERSEDES the hand-written `FdLifecycle.tla`, deleted
-//! on 2026-10-01 with the rest of `aterm-spec-models/specs/legacy/` (in git
-//! history), as the kernel family's were.
+//! (initiative A7, WS-G).
 //!
 //! **Tier-0 prove-AND-catch** (tiered, VERIFY-1): the in-process interpreter BFSes
 //! the whole bounded `MaxClones = 3` state space at the committed `Buggy = 0` and

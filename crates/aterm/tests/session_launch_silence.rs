@@ -13,9 +13,9 @@
 //!
 //! * a store that has never completed a pass;
 //! * a MALFORMED `[packages]` table;
-//! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a retired
-//!   `tracked_install` key and a configured prefix this user cannot write (the lay
-//!   failure comes from a thread beside the live shell).
+//! * the reroute ENGAGED over a store whose `reroute/` cannot be made, with a configured
+//!   prefix this user cannot write (the lay failure comes from a thread beside the live
+//!   shell).
 //!
 //! Nothing here reaches the machine: every root is private ([`launch_isolation`]), no
 //! one-shot `aterm pkg update` is spawned (the lane's own pass slot is claimed in the
@@ -42,7 +42,7 @@ mod launch_isolation;
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The `[machine]` table every fixture carries: nothing on the host is touched.
-const MACHINE: &str = "[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+const MACHINE: &str = "[machine]\nuniversal_control = \"leave\"\n";
 
 /// The `[update]` table every fixture carries: the app updater off, as in every launch
 /// test (`launch_isolation::CONFIG_OFF`).
@@ -235,8 +235,8 @@ fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
 
 /// The reroute ENGAGED over a `reroute/` that cannot be made (a regular file stands
 /// there), so both the directory and the background lay fail — the lay on a thread beside
-/// the live shell — plus a retired `tracked_install` key and, where the test is not root, a
-/// configured prefix this user cannot write. Each is a log record now.
+/// the live shell — plus, where the test is not root, a configured prefix this user cannot
+/// write. Each is a log record now.
 #[test]
 fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing() {
     // `/usr/…`: a root-owned chain the vet admits and this user cannot write, so the
@@ -250,7 +250,7 @@ fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing(
     };
     let root = fixture(
         "reroute",
-        &format!("[packages]\nenabled = true\ntracked_install = \"maybe\"\n{foreign_prefix}"),
+        &format!("[packages]\nenabled = true\n{foreign_prefix}"),
     );
     // The default prefix, made the way atpkg makes it (every component 0700), its pass
     // slot held, and a regular file where `reroute/` goes.

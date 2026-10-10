@@ -1819,7 +1819,7 @@ mod tests {
         assert_eq!(trust, 14, "`{TRUST_MARKER}` marker count");
         // Pinned so any change to a vendored fork's local patches is noticed;
         // re-pin when a fork edit adds or removes a marker.
-        assert_eq!(patch, 123, "`{LOCAL_PATCH_MARKER}` marker count");
+        assert_eq!(patch, 126, "`{LOCAL_PATCH_MARKER}` marker count");
         let by_name: BTreeMap<&str, (u64, u64)> = forks
             .iter()
             .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
@@ -1828,7 +1828,7 @@ mod tests {
         assert_eq!(by_name["smol_str"], (4, 0));
         assert_eq!(by_name["libm"], (1, 0));
         assert_eq!(by_name["pkg-config"], (1, 0));
-        assert_eq!(by_name["winit"], (0, 123));
+        assert_eq!(by_name["winit"], (0, 126));
     }
 
     /// The patch table partitioned: vendored forks (third-party source that is

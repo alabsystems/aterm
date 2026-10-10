@@ -911,12 +911,12 @@ mod tests {
         let path = dir.join("s");
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-        let mut nc = std::process::Command::new("/usr/bin/nc")
+        let mut nc = aterm_uds::spawnfd::command("/usr/bin/nc")
             .arg("-U")
             .arg(&path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("nc");
         let (stream, _) = listener.accept().expect("accept");

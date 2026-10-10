@@ -433,7 +433,9 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
 /// Commit (the test's pipe has no reader, so the write fails as an EPIPE
 /// does and rolls back — never an activity refusal). A pass whose admission
 /// now refuses — a quit pressed during the fence — gives the claim to the
-/// rejection, as activity, with the take still answered.
+/// rejection, as activity, with the take still answered. A row the park's
+/// carry left is closed only at the write (ruling 441 (d)): the refused pass
+/// keeps running with it open, its reporter's id still live.
 ///
 /// The derived machine says the same (`NativeUpdateOverlapHandoff`): input
 /// queued under the claim disables `CommitModern` until it drains.
@@ -488,10 +490,29 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
+        // A row the park's carry leaves (in flight, not yet revealed), which
+        // ends with this process at its Commit (ruling 441 (d)).
+        let uncarried = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::PACKAGES,
+                aterm_messages::Severity::Info,
+                "Checking ALab tools",
+            )
+            .in_flight()
+            .key("toolchain.pass")
+            .hold(aterm_messages::Hold::Live {
+                stale_after: aterm_messages::STALE_TAILED,
+            })
+            .reveal_after(aterm_messages::PROGRESS_GRACE),
+        );
         let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
         assert!(
             matches!(parked, ParkAttempt::Parked),
             "PRECONDITION: the park landed ({parked:?})"
+        );
+        assert!(
+            !app.handoff_carried_messages.contains(&uncarried.raw()),
+            "PRECONDITION: the carry left the unrevealed row"
         );
         let pending = app
             .pending_update_handoff
@@ -530,6 +551,10 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
         assert!(
             rejected.try_recv().is_err(),
             "nothing was rejected: no Commit was written"
+        );
+        assert!(
+            app.messages.live(uncarried).is_some(),
+            "the claim's answers close no row: the held pass may still refuse"
         );
         let pending = app.pending_update_handoff.as_mut().expect("the attempt");
         assert!(
@@ -573,6 +598,12 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
         assert!(
             app.handoff_reposts.as_ref().is_some_and(Vec::is_empty),
             "the held pass committed or refused, never re-posted again"
+        );
+        assert_eq!(
+            app.messages.live(uncarried).is_some(),
+            quit_during_the_fence,
+            "a held pass the admission refused keeps running with the row its \
+             reporter still holds; one that reached its write closed it there"
         );
 
         app.pending_update_handoff = None;
@@ -820,7 +851,7 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 fn a_held_claim_activates_the_successor_only_at_its_write() {
     /// The stand-in successor, killed (`SIGKILL`) and reaped however the
     /// test ends; and the scratch rendezvous, put back.
-    struct StandIn(std::process::Child);
+    struct StandIn(aterm_uds::spawnfd::Child);
     impl Drop for StandIn {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -840,7 +871,7 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     let _put_back = Rendezvous;
     for refused in [false, true] {
         let successor = StandIn(
-            std::process::Command::new("/bin/sleep")
+            aterm_uds::spawnfd::command("/bin/sleep")
                 .arg("60")
                 .spawn()
                 .expect("a stand-in successor"),
@@ -1001,8 +1032,11 @@ fn the_successor_is_activated_in_the_write_alone() {
 /// for up to `MESSAGES_FLUSH_COMMIT_WAIT`, and a key the OS queued then
 /// would die with the `_exit`. A writer that waits out its bound restarts
 /// the dispatch fence's clock and asks for the drain gate again, once per
-/// attempt, touching no `video` request. CONTROL: an idle writer answers at
-/// once and the Commit goes on under the fence it has.
+/// attempt, touching no `video` request. CONTROLS: a hold under one fence
+/// grain leaves the fence it has and one grain restarts it, decided by a
+/// chosen hold (`App::settle_commit_flush`), never by how fast this machine
+/// ran; and with no writer behind, the flush waits on nothing — answered, no
+/// new fence.
 #[test]
 fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let mut app = crate::App::headless_for_test();
@@ -1035,14 +1069,28 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     );
     assert!(!app.commit_flush_refences(), "once per attempt");
 
-    // CONTROL: no writer behind, no new fence.
+    // CONTROL: a hold under one grain keeps the fence it has; one grain
+    // restarts it.
+    let pending = app.pending_update_handoff.as_mut().expect("the attempt");
+    pending.commit_drain_started = Some(drain_started);
+    let under = super::HANDOFF_INPUT_DRAIN_YIELD - std::time::Duration::from_micros(1);
+    assert!(!app.settle_commit_flush(true, under));
+    let pending = app.pending_update_handoff.as_ref().expect("the attempt");
+    assert_eq!(pending.commit_flush, Some(true));
+    assert_eq!(pending.commit_drain_started, Some(drain_started));
+    assert!(app.settle_commit_flush(true, super::HANDOFF_INPUT_DRAIN_YIELD));
+    let pending = app.pending_update_handoff.as_ref().expect("the attempt");
+    assert_eq!(pending.commit_drain_started, None, "one grain restarts it");
+
+    // CONTROL: no writer behind, the flush waits on nothing: answered, and
+    // the fence it has stands.
     app.messages_log = None;
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_flush = None;
     pending.commit_drain_started = Some(drain_started);
-    assert!(!app.commit_flush_refences());
+    assert!(!app.commit_flush_refences(), "no writer: no new fence");
     let pending = app.pending_update_handoff.as_ref().expect("the attempt");
-    assert_eq!(pending.commit_flush, Some(true));
+    assert_eq!(pending.commit_flush, Some(true), "no writer: answered");
     assert_eq!(pending.commit_drain_started, Some(drain_started));
 
     app.pending_update_handoff = None;

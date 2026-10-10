@@ -3434,7 +3434,11 @@ impl crate::App {
     /// window gaining focus (`on_focus`); the status sweep sees a failure that
     /// publishes while the session is already in front.
     pub(crate) fn note_session_seen(&mut self, wid: crate::WindowId, session: u64) {
-        let looking = self.windows.get(&wid).is_some_and(crate::os_window_focused)
+        let looking = self
+            .windows
+            .get(&wid)
+            .map(Box::as_ref)
+            .is_some_and(crate::os_window_focused)
             && self.focused_session_id(wid) == Some(session);
         if looking && self.session_status.note_seen(session) {
             self.refresh_session_status_chrome(session);

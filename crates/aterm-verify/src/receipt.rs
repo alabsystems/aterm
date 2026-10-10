@@ -76,8 +76,7 @@
 //! `rustflags` or a profile in any of them builds other code exactly as the
 //! variable would. Roles, not paths, so two checkouts with the same files
 //! agree; a receipt without the line (an older gate's, or a run whose config
-//! could not be read) serves no run as a base, and the release cutter's
-//! MEASURE check requires it to be the cut tree's own config and nothing else.
+//! could not be read) serves no run as a base.
 //!
 //! WHAT FAILED, ITEMIZED (2026-09-26). A receipt lists every failure the run
 //! found — `failures <n>`, then one `fail <msg-hash> <since-commit>
@@ -111,20 +110,24 @@
 //! busy ([`crate::ladder::StageLoad`]). Additive, and a record only: no
 //! reader decides anything from it.
 //!
-//! A MEASURE RECEIPT IS FILED APART (2026-09-26). A run that ran the MEASURE
-//! tier ([`crate::plan::MEASURE_TIER`]: `--measure`, `--full`) records whether
-//! it MEASURED the tree — `measured yes` only when every MEASURE stage ran over
-//! the whole tree and was green with nothing skipped — and files its receipt
-//! under [`measure_key`]s too: `measure-<commit>` and `measure-tree-<tree>`. A
-//! `--measure` run files there ONLY, since it ran no stage of the merge
-//! contract and must never stand where a merge receipt (or main's list of
-//! reds) belongs; a `--full` run files under both. The release cutter
-//! (`aterm-release` `gates::measure_report`) requires `measured yes` under the
-//! cut tree's measure key, from a run whose `toolchain` line is the compiler
-//! the cut builds with (2026-09-27), before it claims a build number. Under
-//! the measure keys a receipt that measured is never replaced by one that did
-//! not ([`measure_strength`]), so a later red take cannot unmake a green one
-//! and a merge-contract run never touches either.
+//! A MEASURE RECEIPT IS FILED APART, UNDER THE BYTES IT JUDGED (2026-09-26;
+//! keyed by the artifact since 2026-10-09). A run that ran the MEASURE tier
+//! ([`crate::plan::MEASURE_TIER`]: `--measure <APP>`, `--full <APP>`) records
+//! whether it MEASURED — `measured yes` only when every MEASURE stage ran over
+//! the whole tree and was green with nothing skipped — and the release bundle
+//! it judged (`artifact <sha256 of Contents/MacOS/aterm>`,
+//! [`crate::MeasureArtifact`]), and files its receipt under that digest's
+//! [`measure_key`], `measure-artifact-<sha256>`. A `--measure` run files there
+//! ONLY, since it ran no stage of the merge contract and must never stand where
+//! a merge receipt (or main's list of reds) belongs; a `--full` run files under
+//! both. The release cutter signs only bytes whose digest holds `measured yes`
+//! from a run on the release's own commit (`aterm-release` `gates::measured`):
+//! the key IS the bytes, so no compiler, build environment or config line has to
+//! stand in for them, and the receipt's `head` names whose measuring suite
+//! judged them. Under the
+//! measure key a receipt that measured is never replaced by one that did not
+//! ([`measure_strength`]), so a later red take cannot unmake a green one and a
+//! merge-contract run never touches it.
 //!
 //! A WEAKER RECEIPT NEVER REPLACES A STRONGER ONE ([`write`], [`strength`]),
 //! under either key. The store is shared, so without this a `--changed` or
@@ -157,15 +160,16 @@ pub fn tree_key(tree: &str) -> String {
 
 /// The file-name prefix of a MEASURE receipt ([`measure_key`]). A commit id
 /// never starts with it, and neither does [`TREE_KEY_PREFIX`], so the three
-/// families share one directory. The release cutter's reader (`aterm-release`
-/// `gates::RECEIPT_MEASURE_PREFIX`) mirrors it.
-pub const MEASURE_KEY_PREFIX: &str = "measure-";
+/// families share one directory.
+pub const MEASURE_KEY_PREFIX: &str = "measure-artifact-";
 
-/// The name a MEASURE receipt is filed under for `key` — a commit, or a
-/// [`tree_key`]: `measure-<commit>`, `measure-tree-<tree>`.
+/// The name a MEASURE receipt is filed under: the SHA-256 of the executable it
+/// judged ([`crate::MeasureArtifact::macho_sha256`]),
+/// `measure-artifact-<sha256>`. The release cutter reads this key, and requires
+/// the receipt's `head` to be its release's commit.
 #[must_use]
-pub fn measure_key(key: &str) -> String {
-    format!("{MEASURE_KEY_PREFIX}{key}")
+pub fn measure_key(macho_sha256: &str) -> String {
+    format!("{MEASURE_KEY_PREFIX}{macho_sha256}")
 }
 
 /// The first line of every receipt. A reader that does not recognise it must
@@ -180,7 +184,7 @@ pub fn measure_key(key: &str) -> String {
 pub const MAGIC: &str = "aterm-verify receipt 2";
 
 /// How many receipt files are kept — two per run, one under the commit and
-/// one under its tree (four for a `--full` run, which is also a MEASURE
+/// one under its tree (three for a `--full` run, which is also a MEASURE
 /// receipt), so about a thousand runs. One store serves every worktree of
 /// the repository, so this covers days of gating; a receipt is a few hundred
 /// bytes.
@@ -216,6 +220,11 @@ pub struct Receipt {
     /// a run that did not run the tier, and in a receipt an older gate wrote.
     /// What the release cutter requires, under [`measure_key`].
     pub measured: Option<bool>,
+    /// The SHA-256 of the release executable a MEASURE run judged
+    /// ([`crate::MeasureArtifact`]): the key the receipt is filed under, and
+    /// the bytes `measured` is about. `None` for a run that did not run the
+    /// MEASURE tier.
+    pub artifact: Option<String>,
     /// What this run SKIPPED, every skip in the verdict's own words
     /// ([`skipped_line`]) — never part of the decision, which `merge_contract`
     /// already carries, but the difference between "the gate refused you" and
@@ -377,6 +386,9 @@ impl Receipt {
         if let Some(measured) = self.measured {
             let _ = writeln!(s, "measured {}", if measured { "yes" } else { "no" });
         }
+        if let Some(artifact) = &self.artifact {
+            let _ = writeln!(s, "artifact {}", one_line(artifact));
+        }
         let _ = writeln!(s, "skipped {}", one_line(&self.skipped));
         // One line each, whatever they hold: a newline would forge a key.
         for (key, value) in [("toolchain", &self.toolchain), ("checkers", &self.checkers)] {
@@ -488,6 +500,7 @@ impl Receipt {
             verdict: get.get("verdict")?.clone(),
             merge_contract: get.get("merge-contract").is_some_and(|v| v == "yes"),
             measured: get.get("measured").map(|v| v == "yes"),
+            artifact: get.get("artifact").cloned(),
             skipped: get.get("skipped").cloned().unwrap_or_default(),
             toolchain: get.get("toolchain").cloned().unwrap_or_default(),
             checkers: get.get("checkers").cloned().unwrap_or_default(),
@@ -579,8 +592,8 @@ pub fn strength(r: &Receipt) -> u8 {
     }
 }
 
-/// The same rule under the MEASURE keys ([`measure_key`]): `2` it measured
-/// the tree (`measured yes`), `1` a whole-tree run of the tier that did not,
+/// The same rule under the MEASURE key ([`measure_key`]): `2` it measured the
+/// artifact (`measured yes`), `1` a whole-tree run of the tier that did not,
 /// `0` a narrowed one.
 #[must_use]
 pub fn measure_strength(r: &Receipt) -> u8 {
@@ -596,10 +609,10 @@ pub fn measure_strength(r: &Receipt) -> u8 {
 /// Write `r` under `root`: a run of the LAND tier ([`Receipt::lands`]) under
 /// the commit it is about and, when `r` names one, under its tree
 /// ([`tree_key`]); a run of the MEASURE tier (`measured` set) under the
-/// [`measure_key`] of each — every key unless it already holds a stronger
-/// receipt ([`strength`], [`measure_strength`]). The answer is about the
-/// commit key of the first family written: the merge-contract one when the run
-/// landed, else the MEASURE one.
+/// [`measure_key`] of the artifact it judged — every key unless it already
+/// holds a stronger receipt ([`strength`], [`measure_strength`]). The answer is
+/// about the first key written: the commit's when the run landed, else the
+/// artifact's.
 ///
 /// The checks and the replaces happen under an exclusive lock on
 /// `<store>.lock`, so two runs finishing together cannot interleave a weaker
@@ -631,10 +644,13 @@ pub fn write(root: &Path, r: &Receipt) -> std::io::Result<Written> {
         }
     }
     if r.measured.is_some() {
-        for key in keys(measure_key) {
-            let w = file_under(&dir, &key, r, measure_strength)?;
-            first.get_or_insert(w);
-        }
+        let artifact = r.artifact.as_deref().ok_or_else(|| {
+            std::io::Error::other(
+                "a MEASURE receipt names no artifact it judged, so it is filed nowhere",
+            )
+        })?;
+        let w = file_under(&dir, &measure_key(artifact), r, measure_strength)?;
+        first.get_or_insert(w);
     }
     first.ok_or_else(|| {
         std::io::Error::other(format!(
@@ -759,6 +775,7 @@ mod tests {
                 mode: "measure".into(),
                 merge_contract: false,
                 measured,
+                artifact: Some("c".repeat(64)),
                 ..green()
             };
             let text = r.render();
@@ -1205,17 +1222,19 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A MEASURE RECEIPT IS FILED APART, AND NOTHING THAT DID NOT MEASURE
-    /// REPLACES ONE (2026-09-26). A `--measure` run files under the measure
-    /// keys only — never where the commit's merge receipt stands; a `--full`
-    /// run files under both families; a merge-contract run touches neither
-    /// measure key. Under them, `measured yes` is never replaced by a run that
-    /// did not measure (a later red take), while a newer measurement refreshes
-    /// it. The negative control: the same writes under the merge keys would
-    /// have let the `--measure` run replace a whole-tree FAIL — main's list of
-    /// reds — since the two are the same strength there.
+    /// A MEASURE RECEIPT IS FILED APART, UNDER THE BYTES IT JUDGED, AND NOTHING
+    /// THAT DID NOT MEASURE REPLACES ONE (2026-09-26; keyed by the artifact
+    /// since 2026-10-09). A `--measure` run files under `measure-artifact-<sha>`
+    /// only — never where the commit's merge receipt stands, and never under the
+    /// commit or its tree (a tree is not a binary); a `--full` run files under
+    /// both families; a merge-contract run touches no measure key. Under it,
+    /// `measured yes` is never replaced by a run that did not measure (a later
+    /// red take), while a newer measurement refreshes it, and another artifact's
+    /// measurement stands apart. The negative control: the same writes under
+    /// the merge keys would have let the `--measure` run replace a whole-tree
+    /// FAIL — main's list of reds — since the two are the same strength there.
     #[test]
-    fn a_measure_receipt_is_filed_apart_and_only_a_measurement_replaces_one() {
+    fn a_measure_receipt_is_filed_under_its_artifact_and_only_a_measurement_replaces_one() {
         let (tmp, main) = repo("atv-receipt-measure");
         let (head, tree) = (rev(&main, "HEAD"), rev(&main, "HEAD^{tree}"));
         let store = dir(&main).expect("store");
@@ -1232,6 +1251,7 @@ mod tests {
             n.sort();
             n
         };
+        let (bytes, other) = ("a".repeat(64), "b".repeat(64));
         let at = |r: Receipt| Receipt {
             head: head.clone(),
             tree: Some(tree.clone()),
@@ -1251,25 +1271,26 @@ mod tests {
             mode: "measure".into(),
             merge_contract: false,
             measured: Some(true),
+            artifact: Some(bytes.clone()),
             when: 2,
             ..green()
         });
         let path = stored(write(&main, &measured).expect("write"));
-        assert_eq!(path, store.join(measure_key(&head)));
-        let mut want = vec![
-            head.clone(),
-            measure_key(&head),
-            measure_key(&tree_key(&tree)),
-            tree_key(&tree),
-        ];
+        assert_eq!(path, store.join(measure_key(&bytes)));
+        assert_eq!(measure_key(&bytes), format!("measure-artifact-{bytes}"));
+        let mut want = vec![head.clone(), measure_key(&bytes), tree_key(&tree)];
         want.sort();
-        assert_eq!(names(), want);
+        assert_eq!(
+            names(),
+            want,
+            "nothing under the commit's or tree's measure"
+        );
         assert_eq!(
             read(&head),
             red_main,
             "main's reds stand under the merge key"
         );
-        assert_eq!(read(&measure_key(&tree_key(&tree))), measured);
+        assert_eq!(read(&measure_key(&bytes)), measured);
         assert_eq!(
             [&red_main, &measured].map(strength),
             [1, 1],
@@ -1277,51 +1298,70 @@ mod tests {
              replaced main's reds"
         );
 
-        // A --full run whose MEASURE tier went red: its merge receipt files,
-        // and the measurement stands.
+        // A --full run whose MEASURE tier went red on the same bytes: its merge
+        // receipt files, and the measurement stands.
         let full_red = at(Receipt {
             mode: "full".into(),
             verdict: "FAIL".into(),
             merge_contract: false,
             measured: Some(false),
+            artifact: Some(bytes.clone()),
             failures: Some(Vec::new()),
             when: 3,
             ..green()
         });
         stored(write(&main, &full_red).expect("write"));
         assert_eq!(read(&head), full_red);
-        assert_eq!(read(&measure_key(&head)), measured);
-        assert_eq!(read(&measure_key(&tree_key(&tree))), measured);
+        assert_eq!(read(&measure_key(&bytes)), measured);
         // A merge-contract run touches no measure key.
         let fast = at(Receipt { when: 4, ..green() });
         stored(write(&main, &fast).expect("write"));
-        assert_eq!(read(&measure_key(&head)), measured);
+        assert_eq!(read(&measure_key(&bytes)), measured);
         // A newer measurement — a green --full — refreshes both families.
         let full_green = at(Receipt {
             mode: "full".into(),
             measured: Some(true),
+            artifact: Some(bytes.clone()),
             when: 5,
             ..green()
         });
         stored(write(&main, &full_green).expect("write"));
-        assert_eq!(read(&measure_key(&head)), full_green);
+        assert_eq!(read(&measure_key(&bytes)), full_green);
         assert_eq!(read(&head), full_green);
+        // Other bytes of the same commit are measured apart.
+        let rebuilt = at(Receipt {
+            mode: "measure".into(),
+            merge_contract: false,
+            measured: Some(false),
+            artifact: Some(other.clone()),
+            when: 6,
+            ..green()
+        });
+        stored(write(&main, &rebuilt).expect("write"));
+        assert_eq!(read(&measure_key(&other)), rebuilt);
+        assert_eq!(read(&measure_key(&bytes)), full_green);
         assert_eq!(
             [&measured, &full_red, &fast].map(measure_strength),
             [2, 1, 1]
         );
-        assert!(
-            write(
-                &main,
-                &Receipt {
-                    mode: "measure".into(),
-                    measured: None,
-                    ..green()
-                }
-            )
-            .is_err(),
-            "a receipt of neither tier is filed nowhere, and says so"
-        );
+        for nowhere in [
+            Receipt {
+                mode: "measure".into(),
+                measured: None,
+                ..green()
+            },
+            Receipt {
+                mode: "measure".into(),
+                measured: Some(true),
+                artifact: None,
+                ..green()
+            },
+        ] {
+            assert!(
+                write(&main, &nowhere).is_err(),
+                "a MEASURE receipt with no tier or no artifact is filed nowhere, and says so"
+            );
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 

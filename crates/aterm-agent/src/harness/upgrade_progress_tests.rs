@@ -2,19 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! NO UPGRADE STUCK FOREVER, BOUND TO THE CODE (design record 2026-09-28,
-//! §4.4, adapted to main on 2026-09-29 and to the owner's alert rules): the
-//! derived `HarnessUpgradeProgress` machine against the REAL reducer and the
-//! REAL classifier, over every state the committed machine reaches — the
-//! machine main IS today, its gap latch clear since 2026-09-29: `keep` (the
-//! watch recorded only a read that waits; closed by `upgrade::held_point` and
-//! `upgrade::NEXT_POINT`), a negative control now. The other gap, a limit a
+//! §4.4): the derived `HarnessUpgradeProgress` machine against the REAL
+//! reducer and the REAL classifier, over every state the committed machine
+//! reaches, its gap latch clear: `keep` (the watch recorded only a read that
+//! waits; closed by `upgrade::held_point` and `upgrade::NEXT_POINT`) is a
+//! negative control. The other gap, a limit a
 //! record at any age, is the CLASSIFIER's claim (`St::limit_until`,
 //! `Row::limit_passed`), bound in T1-f. Four tests:
 //!
 //! * T1-a, THE REDUCER — THE ASK-AND-DRAIN FLOW's (`upgrade_ask = true`,
-//!   opt-in since 2026-09-29), whose steps the machine's are: each state
-//!   becomes the facts of a real look — at an
-//!   idle point, at a settled break (`background_point`), and as the watch's
+//!   opt-in), whose steps the machine's are: each state becomes the facts of
+//!   a real look — at an idle point, at a settled break (`background_point`), and as the watch's
 //!   dry read sees the screen (no break known) — and the real
 //!   `upgrade::requested_step` (with `upgrade::break_step` at a break)
 //!   decides: the machine's `StepAtIdle`/`StepAtBreak` is enabled exactly
@@ -27,11 +25,10 @@
 //!   answered `background` at a break), the terminal stop (before
 //!   `d633246d4`: a stopped round waits `failed` for good), and the `Buggy`
 //!   member `RestartOverWork` — each caught where the real reducer does
-//!   otherwise — and two looks that are not main's: the one main had until
-//!   2026-09-29 (`RecordedWordStands`: an act read records nothing, the
-//!   latch's machine), and a posture-blind neutral word (every act read
-//!   `next-point`), which names aterm's own class at a person's box where the
-//!   machine names the person.
+//!   otherwise — and two looks that are not main's: the latch's
+//!   (`RecordedWordStands`: an act read records nothing), and a
+//!   posture-blind neutral word (every act read `next-point`), which names
+//!   aterm's own class at a person's box where the machine names the person.
 //! * T1-a', THE QUIET UPGRADE'S READ (`upgrade_ask = false`, the default):
 //!   its one step, the restart at a genuinely idle point, is not the
 //!   machine's, so its truth is not the machine's `T`; over the same
@@ -42,8 +39,8 @@
 //! * T1-f, THE CLASSIFIER OVER THE MACHINE'S STATES: each state becomes a
 //!   record ([`Row`]); its projection ([`progress_projection`]) is the state,
 //!   and the owner-facing class the real [`Row::attention`] gives it is the
-//!   owner's rule (2026-09-28: "don't continue to persist alerts to the user
-//!   that are not actionable"): a fresh record is QUIET — a wait is a record,
+//!   owner's rule ("don't continue to persist alerts to the user that are not
+//!   actionable"): a fresh record is QUIET — a wait is a record,
 //!   never a row or a mark — save for a limit whose named reset has passed
 //!   (a fault line, [`Row::limit_passed`]) and the agent's own work held for
 //!   a day (one digest line); a record with NO PROGRESS for a day is told
@@ -54,10 +51,9 @@
 //!   told only after the quiet move's chance. NEGATIVE CONTROL: the ask flow's
 //!   classification over the same quiet world tells a spent limit at the
 //!   instant the quiet move may first go.
-//! * THE REFUSED NOTICE'S INSTANT (the assessment's gap 3, closed): a fault
-//!   line that turns at `refused_at + TELL_S` is an instant [`next_change`]
-//!   names — found unnamed by the same check, which the view without that arm
-//!   still fails.
+//! * THE REFUSED NOTICE'S INSTANT: a fault line that turns at
+//!   `refused_at + TELL_S` is an instant [`next_change`] names; the view
+//!   without that arm fails the check.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -262,7 +258,7 @@ fn break_arm_094(s: &State, look: Look) -> Step {
 }
 
 /// The terminal stop: a stopped round waited `failed` for good, never
-/// re-armed. Replayed over the real reducer (owner, 2026-09-27).
+/// re-armed. Replayed over the real reducer.
 fn terminal_stop(s: &State, look: Look) -> Step {
     let (step, _) = real_step(s, look);
     if matches!(phase_of(s), Phase::Failed(_)) {
@@ -491,8 +487,8 @@ fn read_word(s: &State, f: &Facts) -> String {
 /// the person — and, with processes under the agent too, either, since both
 /// hold the restart and the view tells both at the same instant. An
 /// ANNOUNCED round past its window whose restart its own work holds GIVES UP
-/// (round eight, #4: the quiet flow asks nothing again, and a round an older
-/// aterm announced stood announced for good over work that never ended): the
+/// (the quiet flow asks nothing again, so a round an older aterm announced
+/// would stand announced for good over work that never ends): the
 /// release it owes goes at the next point a notice may go, which nothing
 /// holds at an idle point.
 fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
@@ -852,11 +848,10 @@ fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
     }
 }
 
-/// T1-f', THE CLASSIFIER UNDER THE QUIET FLOW (the review of 2026-09-30): the
-/// classifier reads the flow its rows are read under — an announced round
-/// nothing asks again judged as pending, a limit past its named reset told
-/// only after the quiet move's chance — and T1-f built every row under the ask
-/// flow, so the default flow's classification was bound to nothing. Here every
+/// T1-f', THE CLASSIFIER UNDER THE QUIET FLOW: the classifier reads the flow
+/// its rows are read under — an announced round nothing asks again judged as
+/// pending, a limit past its named reset told only after the quiet move's
+/// chance — and T1-f builds every row under the ask flow. Here every
 /// state the machine reaches becomes a QUIET row ([`quiet_row`]) and is held to
 /// the owner's rule as T1-f holds it: nothing marks the tab or takes a row;
 /// the only things told of a record that acts are a limit whose reset and
@@ -949,14 +944,12 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     );
 }
 
-/// THE REFUSED NOTICE'S INSTANT IS NAMED (the assessment of 2026-09-29, gap
-/// 3, closed): a notice aterm's own fence refused is aterm's fault to fix
-/// [`TELL_S`] after the first refusal ([`Row::refused_notice`]), before the
-/// move is overdue — and [`next_change`] names `refused_at + TELL_S`, so the
-/// view's host looks then. Until then it named no such instant: the class
-/// came at the next one it did name (the record's watch, up to [`WATCH_GAP`]
-/// later in a steady state, and hours later with no watch due). The check the
-/// classifier bind makes of every state found it. NEGATIVE CONTROLS: the view
+/// THE REFUSED NOTICE'S INSTANT IS NAMED: a notice aterm's own fence refused
+/// is aterm's fault to fix [`TELL_S`] after the first refusal
+/// ([`Row::refused_notice`]), before the move is overdue — and [`next_change`]
+/// names `refused_at + TELL_S`, so the view's host looks then rather than at
+/// the next watch (up to [`WATCH_GAP`] later, hours with none due). NEGATIVE
+/// CONTROLS: the view
 /// without that arm — the chain of instants it names less this one, which is
 /// exactly what `next_change` named before, since each arm's instant is
 /// independent of the others — leaves the turn unnamed, with no watch due for

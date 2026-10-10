@@ -66,7 +66,8 @@
 //!    view PRESENTS — `store/trust/current`, or a dev-linked sysroot checkout — never the
 //!    view's own clones, exactly as `aterm-release`'s `gates::rustup_entry_source` reads
 //!    it ([`view_presents`]). The receipt names the directory a run built with, and the
-//!    cutter refuses a MEASURE receipt naming another than its own: a gate that built
+//!    cutter refused a MEASURE receipt naming another than its own (until build once,
+//!    2026-10-09, filed that receipt under the bytes it judged): a gate that built
 //!    through the view named `<prefix>/rustup/trust/bin` while the cut built with
 //!    `<prefix>/store/trust/<build>/bin`, so on a machine whose rustup `trust` is atpkg's
 //!    view the cutter's own remedy — `tools/verify.sh --measure` — filed a receipt the
@@ -713,12 +714,19 @@ impl Toolchain {
 
     /// The remedy every "no toolchain" diagnostic leads with. The signed
     /// package index is the ordinary source of the pinned toolchain; a from-source
-    /// build is the developer alternative, SEALED first — `promote-toolchain.sh` points
-    /// the rustup `trust` toolchain at the seal, never at the live build tree, which
-    /// `x.py` empties for the length of every rebuild (discovery probes no build tree).
+    /// build is the developer alternative, built from the pinned Trust seed and
+    /// SEALED first — `promote-toolchain.sh` points the rustup `trust` toolchain at the
+    /// seal, never at the live build tree, which `x.py` empties for the length of every
+    /// rebuild (discovery probes no build tree). Never a bare `x.py build`: that runs
+    /// whatever stage0 the checkout's `bootstrap.toml` names, and until 2026-09-29
+    /// `$HOME/trust`'s was stock rustup Rust under Trust names; `--require-seed
+    /// --fresh-seed` refuses rather than wrap a stock rustc. aterm-release's
+    /// `gates::TRUST_FROM_SOURCE` spells the same command.
     pub const INSTALL_REMEDY: &'static str = "`aterm pkg install trust` (then `aterm pkg doctor` \
-         to confirm the store); from source instead: python3 x.py build --stage 2 in $HOME/trust, \
-         then seal it with $HOME/trust/scripts/promote-toolchain.sh";
+         to confirm the store); from source instead, in $HOME/trust: python3 \
+         scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed --no-register \
+         (stage0 = the pinned Trust seed; it refuses rather than wrap a stock rustc), then \
+         seal it with scripts/promote-toolchain.sh";
 
     /// The fix for an explicit `$TRUST_STAGE2_BIN` that lacks a tool: it is never fallen
     /// back from, so installing the store's build changes nothing there.
@@ -807,6 +815,11 @@ mod tests {
         }
         Ok(PathBuf::from(path))
     }
+
+    /// The from-source build every remedy names: trust's recreator from the pinned
+    /// seed, refusing a stock fallback, never a bare `x.py build`.
+    const SEED_BUILD: &str =
+        "scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed --no-register";
 
     /// `chmod +x`, where an execute bit exists. A no-op elsewhere BY DESIGN and
     /// not by neglect: [`is_executable_file`] is
@@ -909,8 +922,11 @@ mod tests {
 
     #[test]
     fn every_remedy_leads_with_the_package_manager_and_names_source_second() {
-        // The signed index is the ordinary way to have the toolchain; x.py is the
-        // developer alternative. Every diagnostic says them in that order.
+        // The signed index is the ordinary way to have the toolchain; a seed-first
+        // source build is the developer alternative. Every diagnostic says them in
+        // that order, and none offers a bare `x.py build` over whatever stage0 a
+        // leftover bootstrap.toml names (a stock one on the owner's Mac until
+        // 2026-09-29).
         let home = Path::new("/nonexistent-home");
         let prefix = default_atpkg_prefix(home);
         let t = Toolchain::discover_with_store(
@@ -929,9 +945,13 @@ mod tests {
                 panic!("the remedy must lead with the package manager: {label}")
             });
             let src = label
-                .find("x.py build --stage 2")
+                .find(SEED_BUILD)
                 .unwrap_or_else(|| panic!("the from-source alternative must be named: {label}"));
             assert!(pkg < src, "package manager first, source second: {label}");
+            assert!(
+                !label.contains("x.py build"),
+                "never a bare x.py over an unnamed stage0: {label}"
+            );
         }
         // The absent-toolchain label also names where the store WOULD have been.
         let label = t.missing_targo_label();

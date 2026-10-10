@@ -158,8 +158,8 @@ fn append_plain_run(
 ///
 /// Does not test `Cell::has_extras()`: this is consulted only when the map
 /// holds no entry on the row, where every lookup returns `None` regardless,
-/// so ignoring the flag is exact and a stale flag (bulk clears leave them;
-/// see `grid/proofs_kani_extras_invariants.rs`) cannot defeat the gate.
+/// so ignoring the flag is exact and a stale flag (bulk clears leave them)
+/// cannot defeat the gate.
 ///
 /// Branch-free fold (`|`, not `||`): the common row has nothing and visits
 /// every cell anyway, so accumulating beats an unpredictable short-circuit.
@@ -232,7 +232,16 @@ impl DeferredLine {
         extras: Option<Box<ScrolledRowExtras>>,
         mut scratch: Vec<Cell>,
     ) -> Self {
-        let len = row.len();
+        // A line stores content only, so a recorded early-wrap hole stays out
+        // of it, also when the wrap blanked it with a background colour (the
+        // row's length then covers it). The hole is then the cell the line
+        // leaves unfilled, which a row rebuilt from it records again
+        // (`fill_row_cells`).
+        let len = if row.has_early_wrap_hole() {
+            row.len().min(row.cols().saturating_sub(1))
+        } else {
+            row.len()
+        };
         scratch.clear();
         if len != 0 {
             scratch.extend_from_slice(&row.as_slice()[..len as usize]);
@@ -259,34 +268,72 @@ impl DeferredLine {
 
     /// Estimated heap bytes owned by this deferred line (excluding
     /// `size_of::<DeferredLine>()`, which the container counts via its
-    /// capacity). Extras are counted shallow, as in `Grid::memory_used`'s
-    /// `ring_extras` convention.
+    /// capacity): the cell body, everything the extras retain (links, complex
+    /// text, image shares; `ScrolledRowExtras::retained_memory_used`) and the
+    /// materialized line once read.
     pub(crate) fn heap_memory_used(&self) -> usize {
-        let mut total = self.cells.capacity() * std::mem::size_of::<Cell>();
-        if let Some(extras) = self.extras.as_deref() {
-            total += std::mem::size_of::<ScrolledRowExtras>();
-            // Plus this row's share of any inline-image payload, which the
-            // shallow convention would hide from the ring byte watermark.
-            total += extras.image_bytes();
-        }
+        // Saturating throughout, as in `Grid::memory_used`.
+        let mut total = self
+            .cells
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .saturating_add(self.extras_bytes());
         if let Some(line) = self.cached.get() {
-            total += line.memory_used();
+            total = total.saturating_add(line.memory_used());
         }
         total
     }
 
-    /// What staging this line costs, fixed while it is staged: its spine slot,
-    /// its cell body's capacity (a recycled body can exceed the row) and its
-    /// extras. The lazily materialized `cached` line is excluded: it appears
+    /// What staging this line costs: its spine slot, its cell body's capacity
+    /// (a recycled body can exceed the row) and everything its extras retain,
+    /// so the flood path's memory check (`LazyBuffer::front_rows_over`) sees
+    /// link payload. Fixed while staged except through
+    /// [`strip_hyperlinks`](Self::strip_hyperlinks), which the buffer
+    /// re-weighs. The lazily materialized `cached` line is excluded: it appears
     /// only on read, and a figure that moves under `&self` could not be kept as
     /// a running sum.
     pub(crate) fn staged_bytes(&self) -> usize {
-        let mut total =
-            std::mem::size_of::<Self>() + self.cells.capacity() * std::mem::size_of::<Cell>();
-        if let Some(extras) = self.extras.as_deref() {
-            total += std::mem::size_of::<ScrolledRowExtras>() + extras.image_bytes();
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.cells
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Cell>()),
+            )
+            .saturating_add(self.extras_bytes())
+    }
+
+    /// Everything the extras retain, boxed struct included.
+    fn extras_bytes(&self) -> usize {
+        self.extras
+            .as_deref()
+            .map_or(0, ScrolledRowExtras::retained_memory_used)
+    }
+
+    /// The OSC 8 payload this line holds (`ScrolledRowExtras::link_bytes`).
+    pub(crate) fn link_bytes(&self) -> usize {
+        self.extras
+            .as_deref()
+            .map_or(0, ScrolledRowExtras::link_bytes)
+    }
+
+    /// Drop this line's links, keeping its text, colours and images, and the
+    /// materialized line built with them; returns the link bytes freed.
+    pub(crate) fn strip_hyperlinks(&mut self) -> usize {
+        let Some(extras) = self.extras.as_deref_mut() else {
+            return 0;
+        };
+        let freed = extras.link_bytes();
+        if freed == 0 {
+            return 0;
         }
-        total
+        extras.strip_hyperlinks();
+        // The `None ⟺ empty` encoding `heap_memory_used` and the readers use.
+        if extras.is_empty() {
+            self.extras = None;
+        }
+        // A line materialized before the strip still holds the links' `Arc`s.
+        self.cached = OnceCell::new();
+        freed
     }
 
     /// Convert into an owned [`Line`], consuming the deferred line and its cell
@@ -480,6 +527,13 @@ pub(crate) struct LazyBuffer {
     /// flood of short lines costs a fraction of `rows × cols`; charging the full
     /// width would cap short-line floods in wide windows far below the budget.
     staged_bytes: usize,
+    /// Running sum of [`DeferredLine::link_bytes`] over `lines`: the staged
+    /// rows' share of the history link budget (`Grid::history_link_budget`).
+    link_bytes: usize,
+    /// `lines[..linkless_front]` hold no link bytes: where the next
+    /// [`strip_oldest_links`](Self::strip_oldest_links) resumes, so a flood
+    /// visits each staged row once. Front removals shift it down with the rows.
+    linkless_front: usize,
     /// Rows staged since the last bounded drain opportunity took the count
     /// ([`take_arrivals`](Self::take_arrivals)): the stream's rate as the
     /// host's drain sees it, used by `Grid::trickle_lazy_bounded`. Arrivals,
@@ -657,8 +711,13 @@ impl CellPool {
 
     /// Heap bytes held by the free-list (bodies + the `Vec<Vec<Cell>>` spine).
     fn memory_used(&self) -> usize {
-        self.bufs.capacity() * std::mem::size_of::<Vec<Cell>>()
-            + self.pooled_cells * std::mem::size_of::<Cell>()
+        self.bufs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Cell>>())
+            .saturating_add(
+                self.pooled_cells
+                    .saturating_mul(std::mem::size_of::<Cell>()),
+            )
     }
 
     /// Test-only: pooled body count, for the recycling/bound tests.
@@ -676,6 +735,8 @@ impl LazyBuffer {
             pool: CellPool::default(),
             cut: None,
             staged_bytes: 0,
+            link_bytes: 0,
+            linkless_front: 0,
             arrivals_since_drain: 0,
         }
     }
@@ -688,11 +749,11 @@ impl LazyBuffer {
         self.stage(deferred);
     }
 
-    /// The one place a line joins `lines`, so neither running count can miss
-    /// one.
+    /// The one place a line joins `lines`, so no running count can miss one.
     #[inline]
     fn stage(&mut self, deferred: DeferredLine) {
         self.staged_bytes += deferred.staged_bytes();
+        self.link_bytes += deferred.link_bytes();
         self.arrivals_since_drain = self.arrivals_since_drain.saturating_add(1);
         self.lines.push_back(deferred);
     }
@@ -776,7 +837,15 @@ impl LazyBuffer {
     /// sum always equals a fresh walk, whichever path removed the rows.
     #[cfg(test)]
     pub(crate) fn staged_bytes(&self) -> usize {
-        debug_assert_eq!(
+        self.assert_running_sums();
+        self.staged_bytes
+    }
+
+    /// Test-only: both running sums equal a fresh walk, whichever path moved
+    /// the rows, and the strip cursor's prefix holds no link.
+    #[cfg(test)]
+    pub(crate) fn assert_running_sums(&self) {
+        assert_eq!(
             self.staged_bytes,
             self.lines
                 .iter()
@@ -784,7 +853,20 @@ impl LazyBuffer {
                 .sum::<usize>(),
             "the running staged-byte sum drifted from the rows it sums"
         );
-        self.staged_bytes
+        assert_eq!(
+            self.link_bytes,
+            self.lines
+                .iter()
+                .map(DeferredLine::link_bytes)
+                .sum::<usize>(),
+            "the running link-byte sum drifted from the rows it sums"
+        );
+        assert!(
+            self.lines
+                .range(..self.linkless_front.min(self.lines.len()))
+                .all(|line| line.link_bytes() == 0),
+            "a staged row before the strip cursor still holds a link"
+        );
     }
 
     /// Whether a flood cut is open at the front (see [`FloodCut`]).
@@ -812,6 +894,8 @@ impl LazyBuffer {
         // Every staged row leaves, consumed or not: `VecDeque::Drain` removes
         // the whole range when it is dropped.
         self.staged_bytes = 0;
+        self.link_bytes = 0;
+        self.linkless_front = 0;
         // Disjoint field borrows: the drain owns `lines`, the recycling owns
         // `pool`. Each materialized line hands its cell body back for the next
         // scroll-off to fill.
@@ -842,8 +926,13 @@ impl LazyBuffer {
         let n = n - usize::from(marker.is_some());
         // Weighed before the drain: the range leaves whether or not the
         // iterator is consumed, and it is O(n) like the drain itself.
-        let leaving: usize = self.lines.range(..n).map(DeferredLine::staged_bytes).sum();
+        let (leaving, leaving_links) =
+            self.lines.range(..n).fold((0, 0), |(bytes, links), line| {
+                (bytes + line.staged_bytes(), links + line.link_bytes())
+            });
         self.staged_bytes -= leaving;
+        self.link_bytes -= leaving_links;
+        self.linkless_front = self.linkless_front.saturating_sub(n);
         // The steady-state consumption site under flood: the worker's bounded
         // batch is exactly where the reader's per-newline bodies come back.
         let pool = &mut self.pool;
@@ -875,6 +964,8 @@ impl LazyBuffer {
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
         self.staged_bytes = 0;
+        self.link_bytes = 0;
+        self.linkless_front = 0;
         self.pool.clear();
         // The hole is part of the history being invalidated: a marker for
         // lines the user just erased would be a hole in nothing.
@@ -958,9 +1049,39 @@ impl LazyBuffer {
         for mut deferred in self.lines.drain(..n) {
             // Weighed before the body is taken: its capacity is part of it.
             self.staged_bytes -= deferred.staged_bytes();
+            self.link_bytes -= deferred.link_bytes();
             pool.put(std::mem::take(&mut deferred.cells));
         }
+        self.linkless_front = self.linkless_front.saturating_sub(n);
         n
+    }
+
+    /// The staged rows' OSC 8 payload (the running sum), O(1).
+    #[inline]
+    #[must_use]
+    pub(crate) fn link_bytes(&self) -> usize {
+        self.link_bytes
+    }
+
+    /// Strip the links of the oldest staged rows that hold any until at least
+    /// `want` link bytes are freed or none are left; returns the bytes freed.
+    /// The rows keep their text, colours and images, and their place: this
+    /// opens no cut.
+    pub(crate) fn strip_oldest_links(&mut self, want: usize) -> usize {
+        let mut freed = 0;
+        while freed < want && self.linkless_front < self.lines.len() {
+            let line = &mut self.lines[self.linkless_front];
+            self.linkless_front += 1;
+            let before = line.staged_bytes();
+            let links = line.strip_hyperlinks();
+            if links == 0 {
+                continue;
+            }
+            self.staged_bytes -= before - line.staged_bytes();
+            self.link_bytes -= links;
+            freed += links;
+        }
+        freed
     }
 
     /// Estimated bytes held by the staged (not yet drained) lines: the backing
@@ -968,15 +1089,21 @@ impl LazyBuffer {
     /// watermark sees the backlog under flood backpressure. O(staged) per call;
     /// used only by poll-time accounting.
     pub(crate) fn memory_used(&self) -> usize {
-        let mut total = self.lines.capacity() * std::mem::size_of::<DeferredLine>();
+        // Saturating throughout, as in `Grid::memory_used`.
+        let mut total = self
+            .lines
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DeferredLine>());
         for line in &self.lines {
-            total += line.heap_memory_used();
+            total = total.saturating_add(line.heap_memory_used());
         }
         // Pooled bodies are real retained heap (bounded by POOL_MAX_CELLS).
-        total += self.pool.memory_used();
+        total = total.saturating_add(self.pool.memory_used());
         // An open cut is a counter plus, once read, one short line.
         if let Some(cut) = &self.cut {
-            total += std::mem::size_of::<FloodCut>() + cut.line.get().map_or(0, Line::memory_used);
+            total = total
+                .saturating_add(std::mem::size_of::<FloodCut>())
+                .saturating_add(cut.line.get().map_or(0, Line::memory_used));
         }
         total
     }
@@ -1041,27 +1168,30 @@ impl ScrolledRowExtras {
     /// Estimated bytes retained by this boxed extras value, including vector
     /// capacities and out-of-line strings. Shared strings are conservatively
     /// charged per holder; image payloads use the same per-row share as lines.
+    ///
+    /// Every holder charges this — the ring (`RingExtras`), the lazy buffer's
+    /// staged rows (`DeferredLine`) and the resize undo — so a row's links,
+    /// complex text and pictures cost the same wherever it waits.
     pub(crate) fn retained_memory_used(&self) -> usize {
+        // Saturating throughout, as in `Grid::memory_used`.
         fn capacity_bytes<T>(values: &Vec<T>) -> usize {
-            values.capacity() * std::mem::size_of::<T>()
+            values.capacity().saturating_mul(std::mem::size_of::<T>())
         }
         let mut total = std::mem::size_of::<Self>()
-            + capacity_bytes(&self.hyperlinks)
-            + capacity_bytes(&self.complex_chars)
-            + capacity_bytes(&self.combining)
-            + capacity_bytes(&self.rgb_fg)
-            + capacity_bytes(&self.rgb_bg)
-            + capacity_bytes(&self.underline_colors)
-            + capacity_bytes(&self.images);
-        for span in &self.hyperlinks {
-            total += span.url.len() + span.id.as_ref().map_or(0, |id| id.len());
-        }
+            .saturating_add(self.link_bytes())
+            .saturating_add(capacity_bytes(&self.complex_chars))
+            .saturating_add(capacity_bytes(&self.combining))
+            .saturating_add(capacity_bytes(&self.rgb_fg))
+            .saturating_add(capacity_bytes(&self.rgb_bg))
+            .saturating_add(capacity_bytes(&self.underline_colors))
+            .saturating_add(capacity_bytes(&self.images));
         for (_, text) in &self.complex_chars {
-            total += text.len();
+            total = total.saturating_add(text.len());
         }
         for (_, marks) in &self.combining {
             if marks.spilled() {
-                total += marks.capacity() * std::mem::size_of::<char>();
+                total = total
+                    .saturating_add(marks.capacity().saturating_mul(std::mem::size_of::<char>()));
             }
         }
         for span in &self.images {
@@ -1085,20 +1215,40 @@ impl ScrolledRowExtras {
             && self.images.is_empty()
     }
 
-    /// This row's share of the inline-image payloads it holds.
+    /// The OSC 8 share of [`retained_memory_used`](Self::retained_memory_used):
+    /// the span vector's capacity plus each span's URL and `id=` bytes, which
+    /// is what [`strip_hyperlinks`](Self::strip_hyperlinks) gives back.
     ///
-    /// The rest of a `ScrolledRowExtras` is accounted shallow by its holders
-    /// (`Grid::memory_used`'s `ring_extras` walk, `DeferredLine`), which is fine
-    /// for small extras but not for a screenshot. This uses the same per-row
-    /// share [`ImageSpan::memory_used`] charges a `Line`, so a footprint costs
-    /// the byte watermark the same in the ring, staging or the tiered store.
+    /// An `Arc` held by several spans is charged once per span, the convention
+    /// `retained_memory_used` and the store's `Line::memory_used` share. It is
+    /// an upper bound, and over-counts only one link covering several rows:
+    /// each OSC 8 mints its own `Arc` (`handle_osc_8`), so a few hundred links
+    /// to one URL are a few hundred real copies, while one link's run charges
+    /// rows × its length. Under the 25 MiB default allowance
+    /// (`Grid::history_link_budget`) one run must cover over 3,000 rows at the
+    /// 8 KiB URL cap before it costs any link, and at a 100-byte URL more rows
+    /// than any ring holds. Exact sharing would couple a row's charge to its
+    /// neighbours' (or need a refcount walk) on the scroll path.
     #[must_use]
-    pub(crate) fn image_bytes(&self) -> usize {
-        let mut total = 0usize;
-        for span in &self.images {
-            total = total.saturating_add(span.memory_used());
+    pub(crate) fn link_bytes(&self) -> usize {
+        // Saturating throughout, as in `Grid::memory_used`.
+        let mut total = self
+            .hyperlinks
+            .capacity()
+            .saturating_mul(std::mem::size_of::<HyperlinkSpan>());
+        for span in &self.hyperlinks {
+            total = total
+                .saturating_add(span.url.len())
+                .saturating_add(span.id.as_ref().map_or(0, |id| id.len()));
         }
         total
+    }
+
+    /// Drop this row's links, spans and vector both, keeping its text, colours
+    /// and images: the history link budget's eviction (`Grid::history_link_budget`).
+    #[inline]
+    pub(crate) fn strip_hyperlinks(&mut self) {
+        self.hyperlinks = Vec::new();
     }
 
     /// Clear all fields, retaining `Vec` capacities so the struct can be
@@ -1327,7 +1477,7 @@ impl Grid {
         // otherwise be dropped on scroll.
         //
         // `RowFlags::HAS_STYLE_ID` is only originated by
-        // `row/style_id_write.rs` (test/kani-only), so in the shipped binary
+        // `row/style_id_write.rs` (test-only), so in the shipped binary
         // this short-circuit rests on `has_any_data()` alone.
         if !extras.has_any_data() && !row.has_style_id() {
             return;
@@ -1360,7 +1510,7 @@ impl Grid {
         // repeated growth reallocs on the scroll path; one counting pass over
         // the cells, skipped when recycled vectors already have capacity.
         //
-        // Not gated on `row.has_style_id()` (test/kani-only; plain truecolor
+        // Not gated on `row.has_style_id()` (test-only; plain truecolor
         // writes via `set_rgb_ring_range` set no row flag).
         //
         // fg and bg overflow independently, so count them separately: extra
@@ -2134,5 +2284,66 @@ mod extract_gate_tests {
             after.is_empty(),
             "an armed ring on another row changed what a plain row extracts"
         );
+    }
+}
+
+#[cfg(test)]
+mod scrolled_row_extras_tests {
+    use std::sync::Arc;
+
+    use aterm_alloc::SmallVec;
+    use aterm_scrollback::{HyperlinkSpan, ImageSpan};
+    use aterm_types::{ImageData, ImageFormat, ImageScaling};
+
+    use super::ScrolledRowExtras;
+
+    /// `is_empty` is what lets a plain row skip its boxed extras, so a false
+    /// positive drops scrollback extras: over every subset of the seven
+    /// fields, it is true exactly when none is populated.
+    #[test]
+    fn is_empty_iff_every_field_is_empty() {
+        let image = Arc::new(ImageData {
+            bytes: vec![0x89, b'P', b'N', b'G'],
+            format: ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        });
+        for subset in 0u8..(1 << 7) {
+            let has = |field: u8| subset >> field & 1 == 1;
+            let mut extras = ScrolledRowExtras::default();
+            if has(0) {
+                extras
+                    .hyperlinks
+                    .push(HyperlinkSpan::new(0, 1, Arc::from("https://example.com")));
+            }
+            if has(1) {
+                extras.complex_chars.push((0, Arc::from("abc")));
+            }
+            if has(2) {
+                extras
+                    .combining
+                    .push((0, SmallVec::from_slice(&['\u{0300}'])));
+            }
+            if has(3) {
+                extras.rgb_fg.push((0, [255, 0, 0]));
+            }
+            if has(4) {
+                extras.rgb_bg.push((0, [0, 0, 255]));
+            }
+            if has(5) {
+                extras.underline_colors.push((0, 0x01_FF_00_00));
+            }
+            if has(6) {
+                extras
+                    .images
+                    .push(ImageSpan::new(0, 1, 0, 0, Arc::clone(&image)));
+            }
+            assert_eq!(extras.is_empty(), subset == 0, "fields {subset:07b}");
+        }
     }
 }

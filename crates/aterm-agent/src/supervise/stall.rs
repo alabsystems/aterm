@@ -11,8 +11,8 @@
 //! publishes `agent=wall:unresponsive` and an attention entry of its own. A
 //! socket key behind input that has waited a second is still written, its `OK`
 //! carrying `warn=input-unread`; only one behind a published stall (or a
-//! stopped job) is refused `ERR busy input-unread` (owner direction,
-//! 2026-09-29: a slow read is a warning, not a block).
+//! stopped job) is refused `ERR busy input-unread`: a slow read is a
+//! warning, not a block.
 //!
 //! On `input=stalled|stopped` ([`Session::hold_for_stall`]) the loop unsets its
 //! own badge ([`Session::unset_if_ours`]), forgets the escalated box and the
@@ -20,13 +20,19 @@
 //! ([`frozen_mail_text`]) and journals `FROZEN …`. Any other word
 //! ([`Session::thaw`]) journals `THAWED …` and the point is decided afresh.
 //!
-//! The remedy ([`Session::stall_remedy`]; decided 2026-09-27 under the owner's
-//! standing direction): once a stall of `input=stalled` has
+//! The remedy ([`Session::stall_remedy`]): once a stall of `input=stalled` has
 //! stood `[harness] stall_term_after_s` (`0` never), with no person's hand
 //! within `human_grace_s`, no other hand, and a host that relaunches the agent
 //! ([`IdleHost::relaunches_after_stall`]), the loop warns once per episode
 //! (`STALL-WARNED …`, [`frozen_warning_text`]), or with `stall_term = true`
-//! sends `signal term`. `signal kill` stays a person's.
+//! sends the explicit restart, `restart pid=<leader> if-stalled
+//! quiet=<grace>` (design of 2026-10-08): the server stamps the agent before
+//! it signals it, so its exit is the restart's whoever reads it, and ends a
+//! program that lives through its `SIGTERM`. The server's own fences decide
+//! (`ERR not-stalled`, `busy`, `halted`: nothing, the next read decides;
+//! `ERR restart unavailable`: counted, the warning said instead); an older
+//! server that does not know the verb (`ERR unknown verb`, or `ERR denied`
+//! for a verb aimed at a session) gets the bare `signal term`.
 //!
 //! [`Session::stall_step`] runs after every unlatched wait step
 //! ([`Session::wait_for_next`]); [`Session::stall_look`] runs while a stall is
@@ -39,7 +45,7 @@
 
 use super::escalate::status_field;
 use super::*;
-use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS};
+use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS, restart_command};
 
 /// A worker the server says is not reading its input: `status
 /// input=stalled|stopped` and the numbers beside it (`-`, or absent, is
@@ -126,6 +132,20 @@ fn rss_text(mb: u64) -> String {
     format!("rss {}.{} GB", tenths / 10, tenths % 10)
 }
 
+/// A reply's one line for the journal: an `OK`'s first line, else its error
+/// (the server's `ERR …`, without the client's prefix).
+fn reply_line(r: &CtlReply) -> String {
+    if r.ok() {
+        return r.stdout.lines().next().unwrap_or("OK").trim().to_string();
+    }
+    let e = r.err_text();
+    if e.is_empty() {
+        r.stdout.trim().to_string()
+    } else {
+        e.to_string()
+    }
+}
+
 /// What the frozen mail and warning say of a stall after its word: how long
 /// the input has waited, then what is queued and the resident size —
 /// ` for 2m41s (1 B queued, rss 38.8 GB)`, each part only where the reply
@@ -151,16 +171,27 @@ fn stall_facts(stall: &WorkerStall) -> String {
 ///
 /// ```text
 /// claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing nothing until it reads again — restart it: signal term (signal kill if it survives), then claude --resume <its conversation>
-/// claude frozen: … — restart it: signal term (signal kill if it survives); aterm relaunches it on its conversation
+/// claude frozen: … — restart it: aterm ctl @s-1 restart pid=4242 if-stalled; aterm relaunches it on its conversation
+/// codex frozen: … — restart it: aterm ctl @s-1 restart pid=4242 if-stalled
 /// claude stopped with input queued for 41s (1 B queued); pressing nothing until it reads again — resume it: signal cont
 /// ```
 ///
 /// `program` names the worker (`status program=`, else `claude`); `after` is
 /// what follows the restart ([`crate::harness::resume::AfterRestart`]): the
-/// worker's own resume line, the host's relaunch, or nothing. Never `claude
-/// --continue`, which may resume a sibling tab's conversation. `signal kill` is
-/// the fallback for a program that survives `signal term`.
-pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, after: &AfterRestart) -> String {
+/// worker's own resume line, the host's relaunch on its conversation, or
+/// nothing. Where the host carries the act (`Relaunch`, `Act`), the restart
+/// named is the explicit one ([`crate::harness::resume::restart_command`]
+/// for tab `sid`'s leader `pid`), which ends a survivor itself — and only a
+/// `Relaunch` promises the conversation; elsewhere `signal term`, with
+/// `signal kill` the fallback for a program that survives it. Never `claude
+/// --continue`, which may resume a sibling tab's conversation.
+pub(super) fn frozen_mail_text(
+    stall: &WorkerStall,
+    program: &str,
+    after: &AfterRestart,
+    sid: Option<&str>,
+    pid: Option<u32>,
+) -> String {
     let facts = stall_facts(stall);
     if stall.word == "stopped" {
         return format!(
@@ -168,14 +199,19 @@ pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, after: &After
              again \u{2014} resume it: signal cont"
         );
     }
-    let resume = match after {
-        AfterRestart::Unknown => String::new(),
-        AfterRestart::Command(line) => format!(", then {line}"),
-        AfterRestart::Relaunch => format!("; {RELAUNCH_WORDS}"),
+    let remedy = match after {
+        AfterRestart::Unknown => "signal term (signal kill if it survives)".to_string(),
+        AfterRestart::Command(line) => {
+            format!("signal term (signal kill if it survives), then {line}")
+        }
+        AfterRestart::Relaunch => {
+            format!("{}; {RELAUNCH_WORDS}", restart_command(sid, pid))
+        }
+        AfterRestart::Act => restart_command(sid, pid),
     };
     format!(
         "{program} frozen: not reading input{facts}; pressing nothing until it reads \
-         again \u{2014} restart it: signal term (signal kill if it survives){resume}"
+         again \u{2014} restart it: {remedy}"
     )
 }
 
@@ -185,19 +221,41 @@ pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, after: &After
 ///
 /// ```text
 /// claude frozen: not reading input for 11m00s (1 B queued, rss 38.8 GB)
-/// aterm leaves it running — `aterm ctl @s-1 signal term` ends it (`signal kill` if it survives), and aterm relaunches it on its conversation
+/// aterm leaves it running — `aterm ctl @s-1 restart pid=4242 if-stalled` ends it, and aterm relaunches it on its conversation
 /// ```
 ///
-/// `after` is decided as the mail's is ([`Session::after_restart`]): the
-/// host's relaunch ([`RELAUNCH_WORDS`]) only where it would come, else the
-/// resume line, else nothing. `sid` is the session's own id where known.
+/// `after` is decided as the mail's is ([`Session::after_restart`]): where
+/// the host carries the act, the explicit restart of the leader `pid`
+/// ([`crate::harness::resume::restart_command`]), with the host's relaunch
+/// ([`RELAUNCH_WORDS`]) only where that is promised; else `signal term` and
+/// the resume line, else `signal term` alone. `sid` is the session's own id
+/// where known.
 pub(super) fn frozen_warning_text(
     stall: &WorkerStall,
     program: &str,
     sid: Option<&str>,
     after: &AfterRestart,
+    pid: Option<u32>,
 ) -> String {
     let facts = stall_facts(stall);
+    let act = || restart_command(Some(sid.unwrap_or("<sid>")), pid);
+    match after {
+        AfterRestart::Relaunch => {
+            return format!(
+                "{program} frozen: not reading input{facts}\naterm leaves it running \u{2014} \
+                 `{}` ends it, and {RELAUNCH_WORDS}",
+                act()
+            );
+        }
+        AfterRestart::Act => {
+            return format!(
+                "{program} frozen: not reading input{facts}\naterm leaves it running \u{2014} \
+                 `{}` restarts it",
+                act()
+            );
+        }
+        AfterRestart::Unknown | AfterRestart::Command(_) => {}
+    }
     // The loop's selector (`@s-1`) or a bare id: either names it once.
     let sid = sid.map_or("<sid>", |s| s.trim_start_matches('@'));
     let end = format!(
@@ -215,7 +273,7 @@ pub(super) fn frozen_warning_text(
             .map(|l| format!(", then `{l}` resumes it"))
             .find(|then| end.chars().count() + then.chars().count() <= NOTE_LINE_CHARS)
             .unwrap_or_default(),
-        AfterRestart::Relaunch => format!(", and {RELAUNCH_WORDS}"),
+        AfterRestart::Relaunch | AfterRestart::Act => String::new(),
     };
     format!("{program} frozen: not reading input{facts}\n{end}{then}")
 }
@@ -301,19 +359,23 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// What follows the stall's restart, for the mail ([`frozen_mail_text`])
-    /// and the warning ([`frozen_warning_text`]): the host's relaunch where it
-    /// would make one ([`super::IdleHost::relaunches_on_exit`], not merely
-    /// [`super::IdleHost::can_restart`], since a relaunch may refuse a launch),
-    /// else the line resuming the worker's own conversation
-    /// ([`super::IdleHost::resume_command`]), else nothing (`drive watch` reads
-    /// no process).
+    /// and the warning ([`frozen_warning_text`]): the explicit restart where
+    /// the host would carry the act ([`super::IdleHost::restart_offered`],
+    /// the one predicate the server's own words choose by) — with the host's
+    /// relaunch on its conversation only where that is promised — else the
+    /// line resuming the worker's own conversation
+    /// ([`super::IdleHost::resume_command`]), else nothing (`drive watch`
+    /// reads no process).
     fn after_restart(&self) -> AfterRestart {
-        match &self.stall_host {
-            Some(host) if host.relaunches_on_exit() => AfterRestart::Relaunch,
-            Some(host) => host
+        let Some(host) = &self.stall_host else {
+            return AfterRestart::Unknown;
+        };
+        match host.restart_offered() {
+            Some(true) => AfterRestart::Relaunch,
+            Some(false) => AfterRestart::Act,
+            None => host
                 .resume_command()
                 .map_or(AfterRestart::Unknown, AfterRestart::Command),
-            None => AfterRestart::Unknown,
         }
     }
 
@@ -376,7 +438,14 @@ impl<C: Ctl> Session<'_, C> {
                     let reader =
                         aterm_phase::identify(read_rest.program.as_deref(), rows).program();
                     let program = read_rest.program.as_deref().unwrap_or(reader.name());
-                    let text = frozen_mail_text(&stall, program, &self.after_restart());
+                    let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
+                    let text = frozen_mail_text(
+                        &stall,
+                        program,
+                        &self.after_restart(),
+                        self.sid.as_deref(),
+                        leader,
+                    );
                     let to = format!("to={to}");
                     let r = self.call(&["post", &to, "kind=ask", "--wait=0", &text])?;
                     post_word(&r)
@@ -423,11 +492,14 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The stall's remedy (module header): once the held stall has stood
     /// `[harness] stall_term_after_s` (`0` never), a warning by default
-    /// ([`frozen_warning_text`] to [`super::IdleHost::inform`]) or `signal term`
-    /// under `stall_term = true`. Once per episode, only where the host
-    /// relaunches the agent, never under a person's or another driver's hand,
-    /// never for a stopped job. A refused signal is not counted, so the next
-    /// read tries again.
+    /// ([`frozen_warning_text`] to [`super::IdleHost::inform`]) or the
+    /// explicit restart under `stall_term = true` (`restart pid=<leader>
+    /// if-stalled quiet=<grace>`; an older server, `signal term`). Once per
+    /// episode, only where the host relaunches the agent, never under a
+    /// person's or another driver's hand, never for a stopped job. A refusal
+    /// the next read may lift (`not-stalled`, `busy`, `halted`) is not
+    /// counted, so the next read tries again; one it cannot (`restart
+    /// unavailable`) is, the warning said instead.
     pub(super) fn stall_remedy(
         &mut self,
         read: &StallRead,
@@ -456,48 +528,124 @@ impl<C: Ctl> Session<'_, C> {
         if self.stall_termed || bound_ms == 0 || !stall.wait_ms.is_some_and(|ms| ms >= bound_ms) {
             return Ok(());
         }
-        let dash = || "-".to_string();
         if !self.stall_term {
-            // The default: a warning where the signal would be, once per
+            // The default: a warning where the restart would be, once per
             // episode: said, and one record for the person (the Messages).
             self.stall_termed = true;
-            let rows = self.last.as_ref().map_or(&[][..], |s| s.rows.as_slice());
-            let reader = aterm_phase::identify(read.program.as_deref(), rows).program();
-            let program = read.program.as_deref().unwrap_or(reader.name());
-            let text =
-                frozen_warning_text(&stall, program, self.sid.as_deref(), &self.after_restart());
-            if let Some(host) = &self.stall_host {
-                host.inform(&text);
-            }
-            review
-                .say(&format!(
-                    "STALL-WARNED seq={seq} input={} wait_ms={} rss_mb={} ended=no \
-                     (`[harness] stall_term = true` ends it)",
-                    stall.word,
-                    stall.wait_ms.map_or_else(dash, |v| v.to_string()),
-                    stall.rss_mb.map_or_else(dash, |v| v.to_string()),
-                ))
-                .map_err(Fail::Hard)?;
-            return Ok(());
+            let after = self.after_restart();
+            return self.warn_stall(
+                read,
+                &stall,
+                &after,
+                seq,
+                review,
+                "(`[harness] stall_term = true` ends it)",
+            );
         }
+        // THE EXPLICIT RESTART (design of 2026-10-08): the server stamps the
+        // agent before it signals, so its exit is the restart's whoever
+        // reads it, and its own fences decide under the same read.
+        let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
+        let pid = leader.map(|p| format!("pid={p}"));
+        let quiet = format!("quiet={}", self.stall_grace_s);
+        let mut args = vec!["restart"];
+        if let Some(pid) = pid.as_deref() {
+            args.push(pid);
+        }
+        args.extend(["if-stalled", quiet.as_str()]);
+        let r = self.call(&args)?;
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!("restart failed: {}", r.stderr.trim())));
+        }
+        if crate::supervise::report::without_verb(&r) {
+            // An older server: the bare `signal term` it knows. It answers a
+            // verb it does not know `ERR unknown verb` — or, aimed at a
+            // session as this one is (`@<sid>`), `ERR denied`: an unknown
+            // verb has no op class to authorize (review of 3eaa8f83c).
+            return self.stall_signal_term(&stall, seq, review);
+        }
+        let reply = reply_line(&r);
+        if r.is_err("restart unavailable") {
+            // The server cannot carry the restart here: counted, and the
+            // warning said instead, naming what a person can do.
+            self.stall_termed = true;
+            let after = self.stall_host.as_ref().map_or(AfterRestart::Unknown, |h| {
+                h.resume_command()
+                    .map_or(AfterRestart::Unknown, AfterRestart::Command)
+            });
+            return self.warn_stall(read, &stall, &after, seq, review, &format!("({reply})"));
+        }
+        // `ERR not-stalled`, `busy`, `halted`: not counted, the next read
+        // decides.
+        if r.ok() {
+            self.stall_termed = true;
+        }
+        let dash = || "-".to_string();
+        review
+            .say(&format!(
+                "{} seq={seq} input={} wait_ms={} rss_mb={} reply={reply}",
+                if r.ok() {
+                    "RESTARTED"
+                } else {
+                    "RESTART-REFUSED"
+                },
+                stall.word,
+                stall.wait_ms.map_or_else(dash, |v| v.to_string()),
+                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+            ))
+            .map_err(Fail::Hard)?;
+        Ok(())
+    }
+
+    /// The stall's warning in place of its remedy (once an episode): said
+    /// `STALL-WARNED … ended=no <why>`, and the record for a person
+    /// ([`frozen_warning_text`] with `after`) told the host.
+    fn warn_stall(
+        &mut self,
+        read: &StallRead,
+        stall: &WorkerStall,
+        after: &AfterRestart,
+        seq: u64,
+        review: &mut dyn Review,
+        why: &str,
+    ) -> Result<(), Fail> {
+        let rows = self.last.as_ref().map_or(&[][..], |s| s.rows.as_slice());
+        let reader = aterm_phase::identify(read.program.as_deref(), rows).program();
+        let program = read.program.as_deref().unwrap_or(reader.name());
+        let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
+        let text = frozen_warning_text(stall, program, self.sid.as_deref(), after, leader);
+        if let Some(host) = &self.stall_host {
+            host.inform(&text);
+        }
+        let dash = || "-".to_string();
+        review
+            .say(&format!(
+                "STALL-WARNED seq={seq} input={} wait_ms={} rss_mb={} ended=no {why}",
+                stall.word,
+                stall.wait_ms.map_or_else(dash, |v| v.to_string()),
+                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+            ))
+            .map_err(Fail::Hard)
+    }
+
+    /// The remedy an older server knows (no `restart` verb): the bare `signal
+    /// term`, counted once it is sent.
+    fn stall_signal_term(
+        &mut self,
+        stall: &WorkerStall,
+        seq: u64,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
         let sig = "term";
         let r = self.call(&["signal", sig])?;
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("signal failed: {}", r.stderr.trim())));
         }
-        let reply = if r.ok() {
-            r.stdout.lines().next().unwrap_or("OK").trim().to_string()
-        } else {
-            let e = r.stderr.trim();
-            if e.is_empty() {
-                r.stdout.trim().to_string()
-            } else {
-                e.to_string()
-            }
-        };
+        let reply = reply_line(&r);
         if r.ok() {
             self.stall_termed = true;
         }
+        let dash = || "-".to_string();
         review
             .say(&format!(
                 "SIGNALLED seq={seq} signal={sig} input={} wait_ms={} rss_mb={} reply={reply}",
@@ -627,23 +775,29 @@ mod tests {
             "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string(),
         );
         assert_eq!(
-            frozen_mail_text(&s, "claude", &own),
+            frozen_mail_text(&s, "claude", &own, Some("@s-1"), Some(4242)),
             "claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing \
              nothing until it reads again \u{2014} restart it: signal term (signal kill if it \
              survives), then claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
         );
         // The host relaunches it itself: no command for the manager to run.
-        let hosted = frozen_mail_text(&s, "claude", &AfterRestart::Relaunch);
+        let hosted = frozen_mail_text(
+            &s,
+            "claude",
+            &AfterRestart::Relaunch,
+            Some("@s-1"),
+            Some(4242),
+        );
         assert!(
             hosted.ends_with(
-                "restart it: signal term (signal kill if it survives); aterm relaunches it on \
+                "restart it: aterm ctl @s-1 restart pid=4242 if-stalled; aterm relaunches it on \
                  its conversation"
             ),
             "{hosted}"
         );
         // A program with no resume command, or a Claude Code whose record
         // was not read: the restart alone — never a guess.
-        let t = frozen_mail_text(&s, "vim", &AfterRestart::Unknown);
+        let t = frozen_mail_text(&s, "vim", &AfterRestart::Unknown, Some("@s-1"), Some(4242));
         assert!(
             t.ends_with("restart it: signal term (signal kill if it survives)"),
             "{t}"
@@ -656,7 +810,13 @@ mod tests {
             ..s.clone()
         };
         assert_eq!(
-            frozen_mail_text(&small, "claude", &AfterRestart::Unknown),
+            frozen_mail_text(
+                &small,
+                "claude",
+                &AfterRestart::Unknown,
+                Some("@s-1"),
+                Some(4242)
+            ),
             "claude frozen: not reading input (1 B queued, rss 12 MB); pressing nothing until \
              it reads again \u{2014} restart it: signal term (signal kill if it survives)"
         );
@@ -667,7 +827,7 @@ mod tests {
             ..s
         };
         assert_eq!(
-            frozen_mail_text(&stopped, "claude", &own),
+            frozen_mail_text(&stopped, "claude", &own, Some("@s-1"), Some(4242)),
             "claude stopped with input queued for 41s (1 B queued); pressing nothing until it \
              reads again \u{2014} resume it: signal cont"
         );

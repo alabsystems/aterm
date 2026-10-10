@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The band in a wrapped composer is one run, on every frame
-//! (owner, 2026-09-16).
+//! The band in a wrapped composer is one run, on every frame.
 //!
 //! [`Ribbon::retract_suffix`] states the law: contiguous at every frame,
 //! nothing removed from the middle. Every path that takes light off a row by

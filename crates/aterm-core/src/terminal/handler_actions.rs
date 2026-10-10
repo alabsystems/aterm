@@ -200,9 +200,6 @@ impl ActionSink for TerminalHandler<'_> {
                         };
                         self.grid.set_cursor(row - 1, wrap_col);
                     }
-                } else if self.modes.grapheme_cluster_mode {
-                    // Mode 2027: respect grapheme cluster boundaries
-                    self.cursor_state().cursor_backward_graphemes(1);
                 } else {
                     self.grid
                         .cursor_backward_margin(1, self.modes.left_right_margin_mode);
@@ -3070,21 +3067,13 @@ impl TerminalHandler<'_> {
             }
             b'C' => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_state().cursor_forward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_forward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_forward_margin(n, self.modes.left_right_margin_mode);
             }
             b'D' => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                if self.modes.grapheme_cluster_mode {
-                    self.cursor_state().cursor_backward_graphemes(n);
-                } else {
-                    self.grid
-                        .cursor_backward_margin(n, self.modes.left_right_margin_mode);
-                }
+                self.grid
+                    .cursor_backward_margin(n, self.modes.left_right_margin_mode);
             }
             b'H' | b'f' => {
                 let row = params.first().copied().unwrap_or(1).saturating_sub(1);

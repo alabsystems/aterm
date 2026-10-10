@@ -13,11 +13,11 @@
 //! ITERATION BOUNDS ARE NOT ENOUGH. They cap the NUMBER of reads, but each
 //! `aterm_pty::read` is a single blocking `ReadFile` with NO timeout — if the
 //! waiter never breaks the pipe (the exact regression these tests guard), read
-//! #1 simply never returns and the loop counter never advances, so `cargo
-//! test` wedges FOREVER instead of failing. Hence [`run_with_deadline`]: every
+//! #1 simply never returns and the loop counter never advances, so the test
+//! binary wedges instead of failing. Hence [`run_with_deadline`]: every
 //! `#[test]` body runs on a named worker thread with a hard wall-clock
-//! deadline. On timeout we `panic!` with a diagnosis naming the suspected
-//! waiter/EOF regression instead of hanging CI. The wedged thread CANNOT be
+//! deadline, and a timeout panics naming the suspected waiter/EOF
+//! regression. The wedged thread CANNOT be
 //! cancelled (there is no portable way to interrupt a parked `ReadFile` from
 //! std); it stays parked, and libtest's process exit reaps it — acceptable
 //! precisely because a timeout already means the run is a failure.
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 /// Hard per-test wall-clock budget. GENEROUS on purpose: the slowest body
 /// (interactive cmd.exe + `ping -n 2` ≈ seconds) finishes in well under a
-/// minute on a loaded CI box, so a trip here is a real wedge, never flake.
+/// minute on a loaded machine, so a trip here is a real wedge, never flake.
 const DEADLINE: Duration = Duration::from_secs(120);
 
 /// Run `body` on a named thread and fail HARD if it outlives [`DEADLINE`].
@@ -72,13 +72,9 @@ fn run_with_deadline(name: &str, body: impl FnOnce() + Send + 'static) {
             }
         }
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "windows_smoke::{name} exceeded its {DEADLINE:?} wall-clock deadline. \
-             Each aterm_pty::read is ONE blocking ReadFile with NO timeout, so the \
-             iteration-bounded loops cannot rescue a read that never returns: this \
-             is the signature of a waiter-thread/EOF regression (child exit or \
-             hangup no longer reaches ClosePseudoConsole, the out pipe is never \
-             broken, EOF is never manufactured). The worker thread is still parked \
-             inside ReadFile and cannot be cancelled; libtest's process exit reaps it."
+            "windows_smoke::{name} exceeded {DEADLINE:?}: a ReadFile never returned; \
+             child exit or hangup did not reach ClosePseudoConsole, so no EOF came \
+             (the parked worker is reaped at process exit)"
         ),
     }
 }

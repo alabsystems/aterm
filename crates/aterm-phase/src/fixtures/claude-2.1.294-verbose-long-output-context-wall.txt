@@ -1,0 +1,50 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (the review of H6-HARNESS-1 pass 2), `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a Bash call printing `seq 1 80` (verbose output) and the follow-up request too long: the output fills the screen, its call row and first row scrolled off, and the real context wall stands under its rows 40 to 80 at column 5
+     40
+     41
+     42
+     43
+     44
+     45
+     46
+     47
+     48
+     49
+     50
+     51
+     52
+     53
+     54
+     55
+     56
+     57
+     58
+     59
+     60
+     61
+     62
+     63
+     64
+     65
+     66
+     67
+     68
+     69
+     70
+     71
+     72
+     73
+     74
+     75
+     76
+     77
+     78
+     79
+     80
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Crunched for 3s · done 8:47 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents                                                                               21426 tokens

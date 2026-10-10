@@ -92,54 +92,9 @@ pub struct InvariantAnchor {
     pub location: &'static str,
 }
 
-/// Which verifier discharges a [`ProofAnchor`]'s obligation (TRUST_NATIVE_TLA §4,
-/// Phase 4 — "Unify the verifier ledger"). Today only [`Kani`](ProofKind::Kani) is
-/// emitted (bounded-local BMC harnesses); the variant exists so the ledger is open to
-/// other bounded/SMT verifiers without churning the record shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProofKind {
-    /// A `#[kani::proof]` harness (bounded model checking of a local data-structure
-    /// property). Dormant under stock `cargo` (the harness is `#[cfg(kani)]`); the
-    /// ANCHOR is decoupled from the harness so it registers in normal/test builds.
-    Kani,
-}
-
-/// A proof→spec binding, emitted by the `proof_anchor!` macro (TRUST_NATIVE_TLA §4).
-///
-/// This is the kani-harness analogue of [`RefinementAnchor`]: it joins a bounded-local
-/// proof to the SAME `(machine, action)` namespace the temporal (`ty`) models use, so
-/// the gate can emit ONE per-action ledger over both verifiers — `ty` (temporal /
-/// conformance) and `kani` (bounded-local). No proof is moved or merged; the anchor
-/// just records that the named harness *refers to* that action.
-///
-/// CRITICAL (the §4 subtlety): the kani harnesses are `#[cfg(kani)]`-gated — dormant
-/// under stock `cargo`. An ATTRIBUTE on the harness fn would be stripped (and never
-/// register) in normal/test builds. So the `proof_anchor!` macro is a MODULE-LEVEL
-/// declarative-macro INVOCATION decoupled from the harness fn (it names the harness by
-/// string), gated behind the `spec-anchors` feature exactly like [`RefinementAnchor`].
-#[derive(Debug, Clone, Copy)]
-pub struct ProofAnchor {
-    /// The TLA+ machine name (e.g. `"Ring"`) — matches a `Model::name` (lower/CamelCase
-    /// resolved by [`machine_matches`]) or an external module name. Same namespace as
-    /// [`RefinementAnchor::machine`].
-    pub machine: &'static str,
-    /// The model action this proof refers to (e.g. `"Push"`) — must resolve in `machine`
-    /// (Ob.1), the SAME obligation refinements satisfy.
-    pub action: &'static str,
-    /// The `#[kani::proof]` harness fn name (e.g. `"line_count_accurate"`). A diagnostic
-    /// label for the ledger; the precise DefId binding is out of scope (mirrors
-    /// [`RefinementAnchor::rust_method`]).
-    pub proof_name: &'static str,
-    /// Which verifier discharges this anchor (always [`ProofKind::Kani`] today).
-    pub kind: ProofKind,
-    /// Source location `file:line` (proc-macro/`file!()`/`line!()` of the invocation).
-    pub location: &'static str,
-}
-
 inventory::collect!(RefinementAnchor);
 inventory::collect!(Waiver);
 inventory::collect!(InvariantAnchor);
-inventory::collect!(ProofAnchor);
 
 /// All [`RefinementAnchor`]s linked into the current binary.
 // Skip: the linkme/`inventory` registry iterator's body lives in the
@@ -164,13 +119,6 @@ pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn invariant_anchors() -> impl Iterator<Item = &'static InvariantAnchor> {
     inventory::iter::<InvariantAnchor>.into_iter()
-}
-
-/// All [`ProofAnchor`]s linked into the current binary (the kani-harness ledger half).
-// Skip: inventory registry walk — see `refinements()`.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn proof_anchors() -> impl Iterator<Item = &'static ProofAnchor> {
-    inventory::iter::<ProofAnchor>.into_iter()
 }
 
 // ---------------------------------------------------------------------------
@@ -204,16 +152,14 @@ pub fn proof_anchors() -> impl Iterator<Item = &'static ProofAnchor> {
 // one. What the cfg does buy is exactly what the COST paragraph below is about: with no
 // call site, no shipping code path pays even the `bool` load.
 //
-// PER STEP, NOT PER RUN — and that distinction is the whole strength of this. The
-// first version of this module audited one window around the WHOLE conformance, which
-// asks only "was this fn entered at some point during a run that drives eleven
-// actions". That is far weaker than it reads: an anchor moved onto ANY fn the
-// conformance happens to touch — `Terminal::process`, or even `Terminal::text_selection`,
-// which only the HARNESS'S projection calls — is entered during the run and passes.
-// So the window is now ONE STEP wide: [`StepEvidence::step`] clears the record, runs
-// the single shipping call that drives action A, and snapshots what was entered before
-// the harness reads anything back. `Evict`'s anchor moved onto `Terminal::process`
-// then fails, because the `Evict` step calls only `set_scrollback_line_limit`.
+// PER STEP, NOT PER RUN — and that distinction is the whole strength of this. One window around the
+// WHOLE conformance asks only "was this fn entered at some point during a run that drives eleven
+// actions". That is far weaker than it reads: an anchor moved onto ANY fn the conformance happens
+// to touch — `Terminal::process`, or even `Terminal::text_selection`, which only the HARNESS'S
+// projection calls — is entered during the run and passes. So the window is ONE STEP wide:
+// [`StepEvidence::step`] clears the record, runs the single shipping call that drives action A, and
+// snapshots what was entered before the harness reads anything back. `Evict`'s anchor moved onto
+// `Terminal::process` then fails, because the `Evict` step calls only `set_scrollback_line_limit`.
 //
 // AND THE CONTRAPOSITIVE, because per-step entry alone is still weaker than it reads.
 // A window is only as narrow as the seam its step calls, and a step that drives a
@@ -304,12 +250,11 @@ pub fn note_entered(entry_id: &'static str) {
 /// the probe. Returns whether the window is genuinely open — the record is provably
 /// empty AND the probe armed.
 ///
-/// THE RETURN VALUE IS THE POINT. This used to be `-> ()` with both failure modes
-/// (`try_with` on a destroyed TLS slot, `try_borrow_mut` on a re-entrant borrow)
-/// discarded, so a reset that silently no-opped left the PREVIOUS conformance's
-/// entries in place and every audit after it passed on stale evidence — a total
-/// fail-open, and invisible. A caller that cannot make the window open must fail
-/// loudly instead; [`StepEvidence::step`] asserts on it.
+/// THE RETURN VALUE IS THE POINT. Both failure modes (`try_with` on a destroyed TLS
+/// slot, `try_borrow_mut` on a re-entrant borrow) would otherwise leave the PREVIOUS
+/// conformance's entries in place, and every audit after it would pass on stale
+/// evidence. A caller that cannot open the window must fail loudly;
+/// [`StepEvidence::step`] asserts on it.
 // Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
 // `BTreeSet::clear/is_empty` — absent std bodies). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -387,8 +332,7 @@ pub fn entered_anchor_count() -> Option<usize> {
 /// Exists so [`StepEvidence::step`] can check its window SURVIVED the closure it ran.
 /// The exit disarms unconditionally, so a nested `step` — or any hand call to
 /// [`disarm_entered_anchors`] — inside the drive closure closes the outer window early,
-/// and the outer action is then credited with whatever the inner window recorded. The
-/// non-nesting rule used to be a doc comment with nothing behind it.
+/// and the outer action is then credited with whatever the inner window recorded.
 // Skip: thread-local read (`LocalKey::try_with`, `Cell::get`). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -407,8 +351,8 @@ pub fn window_is_armed() -> Option<bool> {
 /// window is open on this thread: a closed window's record is not this work's — a
 /// [`StepEvidence::step`] disarms on exit and leaves its record readable, so a worker
 /// on a reused thread that never opened a window of its own, or one a nested step
-/// closed, would otherwise hand over a stale or partial record as its own (review of
-/// 2026-10-05; [`merge_entered_anchors`] refuses a closed window for the same reason).
+/// closed, would otherwise hand over a stale or partial record as its own
+/// ([`merge_entered_anchors`] refuses a closed window for the same reason).
 // Skip: thread-local bookkeeping (`LocalKey::try_with`, `RefCell::try_borrow_mut`,
 // `mem::take`). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1084,12 +1028,12 @@ pub fn model_registry() -> Vec<Model> {
         // drives the real center in lock step.
         exceptions_digest_model(),
         // An exception its reporter stopped naming ENDS by its own clock, with
-        // no second look and never early (2026-09-29): the upgrade's looks are
+        // no second look and never early: the upgrade's looks are
         // sent only when its rows change, so the second edition's entry stood
         // for ever after one empty look. Liveness in `liveness_registry`;
         // Tier-1 in aterm-messages' conformance_digest_ends.
         exceptions_digest_ends_model(),
-        // The exceptions digest raises a cause ONCE (2026-09-28): a dismissal
+        // The exceptions digest raises a cause ONCE: a dismissal
         // is a line on disk, the same cause is not raised again across the
         // restarts and the seamless updates that replaced the process (six of
         // the Full Disk Access question's eight raises came within a second
@@ -1110,8 +1054,8 @@ pub fn model_registry() -> Vec<Model> {
         // alternate-screen re-entry; Tier-1 in aterm-core's conformance_observe.
         observation_screen_generation_model(),
         // The `Wake::Output` latch + lost-wake watchdog: one machine held to two
-        // laws — bounded damage→present (Buggy=1: the 2026-07-05 one-shot latch)
-        // and no false heal of a queued wake (Buggy=1: the 2026-09-29 age-only
+        // laws — bounded damage→present (Buggy=1: the one-shot latch)
+        // and no false heal of a queued wake (Buggy=1: the age-only
         // heal). Tier-1 in aterm-gui's `spawn` (reader latch + watchdog verdict).
         damage_to_present_model(),
         wake_heal_evidence_model(),
@@ -1157,14 +1101,14 @@ pub fn model_registry() -> Vec<Model> {
         // crate's `spec-anchors` feature, which aterm-gui's closure gate
         // links).
         claude_footer_model_model(),
-        // The event loop's run-loop wake timer (the 2026-09-26 freeze): a late
+        // The event loop's run-loop wake timer: a late
         // timer costs CoreFoundation one catch-up step, and a spent timer is
         // re-armed, never trusted. Tier-1 in aterm-objc's `conformance_wake_timer`
         // over the real CoreFoundation; no `#[refines]` anchors (the crate ships
         // with zero dependencies).
         run_loop_waker_model(),
         // A main-thread verb is refused at once while the main thread is
-        // stalled, and only then (the 2026-09-28 stall): the watchdog's beat
+        // stalled, and only then: the watchdog's beat
         // writes the heartbeat's time, `main_stall` reads it with the count
         // of hops the main thread has not yet taken. Tier-1 in aterm-gui's
         // watchdog tests drives the real writer, census reset, hop count,
@@ -1204,7 +1148,7 @@ pub fn model_registry() -> Vec<Model> {
         atpkg_index_pending_park_model(),
         atpkg_contention_release_park_model(),
         atpkg_vendor_pending_check_model(),
-        // Who watches the vendor heads (gap #28, 2026-09-26): a window, or with none
+        // Who watches the vendor heads: a window, or with none
         // open one terminal session, never both kinds at once. Tier-1 bound in atpkg
         // (`vendor_direct::watch::host`) to the real claims; no `#[refines]` anchors.
         atpkg_head_watch_hosts_model(),
@@ -1227,18 +1171,20 @@ pub fn model_registry() -> Vec<Model> {
         // before retrying a waiting tab. Tier-1 drives the real restored
         // worker with a waiting first tab and a healthy second one.
         harness_restored_first_attempt_model(),
-        // Harness work in flight at a seamless update's Commit (round four,
-        // plan item 7): the restored queue a park freezes and the successor
-        // relaunches, and the restart records its Commit sweeps. Tier-1 drives
+        // Harness work in flight at a seamless update's Commit: the restored queue a park freezes
+        // and the successor relaunches, and the restart records its Commit sweeps. Tier-1 drives
         // the real host's queue and sweep (`harness_host`).
         harness_restored_carry_model(),
-        // A crashed agent's relaunch through a park's Commit that fails (F13,
-        // rounds eleven to thirteen): the Commit's mark on the session, read
-        // whenever its worker decides; an exit no worker was handed, handed
-        // by the host once it supervises again; and the next park carrying a
-        // relaunch the rollback queued. Tier-1 drives the real host
-        // (`harness_host`).
+        // A crashed agent's relaunch through a park's Commit that fails: the Commit's mark on the
+        // session, read whenever its worker decides; an exit no worker was handed, handed by the
+        // host once it supervises again; and the next park carrying a relaunch the rollback queued.
+        // Tier-1 drives the real host (`harness_host`).
         harness_commit_owed_model(),
+        // The explicit restart: its stamp is on disk BEFORE its signal, its exit is read by
+        // lookup whoever reads it (a successor after a Commit included), and it always ends the
+        // program it stamped. Tier-1 drives the real `restart` verb over a real pty and the
+        // real reader chain (`harness_host`).
+        harness_restart_stamp_model(),
         // The shared API probe's shutdown takes the waiter's mutex so its
         // notification cannot be lost before parking. Tier-1 drives the real
         // loop at this boundary, including the historical unlocked publisher.
@@ -1252,49 +1198,42 @@ pub fn model_registry() -> Vec<Model> {
         // (src/net/index_publish_conformance.rs); no `#[refines]` anchors.
         atpkg_index_publish_walk_model(),
         harness_upgrade_notice_owner_model(),
-        // The host's relaunch of an agent that left its tab: an exit the
-        // harness's own restart made is carried whoever is at the tab (S0 of
-        // the in-flight review, 2026-09-27), a person's or a holder's exit is
-        // theirs, the launch's own end is left, a limited one is said, any
-        // other is relaunched on a growing back-off or said to a person.
-        // Tier-1 in aterm-agent's `harness::relaunch` tests.
+        // The host's relaunch of an agent that left its tab: an exit the harness's own restart made
+        // is carried whoever is at the tab, a person's or a holder's exit is theirs, the launch's
+        // own end is left, a limited one is said, any other is relaunched on a growing back-off or
+        // said to a person. Tier-1 in aterm-agent's `harness::relaunch` tests.
         harness_relaunch_on_exit_model(),
         // What an exit left of Claude Code's own record, read as the exit is seen
         // and kept: a crash is never read as a graceful exit because another Claude
-        // Code removed the dead record during the back-off (D2, 2026-09-26). Tier-1
+        // Code removed the dead record during the back-off. Tier-1
         // in aterm-agent's upgrade tests over the real `exit_record`/`after_exit`;
         // no `#[refines]` anchors.
         harness_exit_record_model(),
-        // A Codex's exit, read on its shell's word alone (the review of
-        // 2026-09-27): someone's signal is never relaunched, and a crash is
-        // left only when the word of the block it ran in could not be read
-        // at the attempt either (round three of the joint audit of
-        // 2026-10-01) — the thread lock is no witness, nor another command's
-        // block.
-        // Tier-1 in aterm-agent's `harness::upgrade_codex_drive` tests over
-        // the real `look_at_exit`/`exit_record`/`after_exit`; no `#[refines]`
-        // anchors.
+        // A Codex's exit, read on its shell's word alone: someone's signal is never relaunched, and
+        // a crash is left only when the word of the block it ran in could not be read at the
+        // attempt either — the thread lock is no witness, nor another command's block. Tier-1 in
+        // aterm-agent's `harness::upgrade_codex_drive` tests over the real
+        // `look_at_exit`/`exit_record`/`after_exit`; no `#[refines]` anchors.
         harness_codex_exit_witness_model(),
         // The host hands a worker its agent's exit only for an exit: a name
         // the roster could not read while the agent still holds its tab is no
         // exit, an exit that follows is still seen (a short look, the
         // backstop for one nothing rang for), and the upgrade's own restart
-        // in flight at its exit
-        // is carried on whatever `[harness] relaunch` says (the gate failure
-        // of 32a51a716) — and no other exit in the tab is. Tier-1 in
+        // in flight at its exit is carried on whatever `[harness] relaunch`
+        // says — and no other exit in the tab is. Tier-1 in
         // aterm-gui's harness_host tests over the real host; no `#[refines]`
         // anchors.
         harness_leave_model(),
         // The live upgrade's looks at one session: never let go for what a
         // look could not read — a READY answer included — and, from the
         // worker's attach, its note behind asked until the launch's record
-        // reads, the state behind from the attach (the re-test of 155c72a28).
+        // reads, the state behind from the attach.
         // Tier-1 in aterm-gui's harness_host tests over the real `attach`,
         // `WorkerIdle` and `ask_note`, and in aterm-agent's upgrade tests over
         // the real classifier (`due_among`, `no_record`); no `#[refines]`
         // anchors.
         harness_upgrade_look_model(),
-        // An age belongs to one process (the owner's tab of 2026-09-28): a
+        // An age belongs to one process: a
         // retarget carries the age only while the process that counted it is
         // the holder, and a record for a build the session runs is closed.
         // Tier-1 in aterm-agent's upgrade_drive tests over the real
@@ -1302,8 +1241,8 @@ pub fn model_registry() -> Vec<Model> {
         // anchors.
         harness_upgrade_age_model(),
         // The drain's bound against a person, and the agent's own work — a
-        // status of Claude's own that only lags an idle screen among it (the
-        // review of 2026-09-27): never ended on, never waited on in silence.
+        // status of Claude's own that only lags an idle screen among it:
+        // never ended on, never waited on in silence.
         // Tier-1 bound to `upgrade::next_step` in aterm-agent's upgrade tests.
         harness_upgrade_drain_bound_model(),
         // The live upgrade never strands the agent it asked: never a notice
@@ -1316,36 +1255,33 @@ pub fn model_registry() -> Vec<Model> {
         harness_upgrade_never_strands_model(),
         // The end of the agent's own work is the upgrade's point: the first
         // idle point after work seen since the notice asks again (or re-arms
-        // a rest and asks), never goes to the loop (2026-09-28, s-692e6), and
+        // a rest and asks), never goes to the loop, and
         // no wait there outlives the re-ask's window (a status lagging the
         // idle screen). Tier-1 in aterm-agent's `harness::upgrade` tests over
         // the real reducer on every reachable idle point.
         harness_upgrade_work_end_model(),
-        // The login wall (2026-09-27): nothing of the upgrade's typed where
+        // The login wall: nothing of the upgrade's typed where
         // the wall shows or stands, no give-up spent on a notice the wall
         // answered, no continuation into a login the supervisor saw gone,
         // and the owner told before anything else. Tier-1 in aterm-agent's
         // `conformance_login_wall` over the real readers, reducer and
         // turn-end decider on every reachable state; no `#[refines]` anchors.
         harness_login_wall_model(),
-        // The notice queued behind a usage limit (the owner's report of
-        // 2026-09-27): no ask typed behind a notice the model has not taken,
-        // a queued notice typed again straight away at most `REQUEUE_MAX`
-        // times and past that once per rest — a rest that grows with every
-        // copy unread, so at most `Daily` copies go after a rest shorter than
-        // a day — no give-up before `MAX_ASKS`
-        // asks the model took, and never quiet while an ask it could read is
-        // owed — a full queue included. Tier-1 in aterm-agent's
-        // `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`) over the
-        // real readers, `queue_facts`, clock and reducer on every reachable
-        // state; no `#[refines]` anchors.
+        // The notice queued behind a usage limit: no ask typed behind a notice the model has not
+        // taken, a queued notice typed again straight away at most `REQUEUE_MAX` times and past
+        // that once per rest — a rest that grows with every copy unread, so at most `Daily` copies
+        // go after a rest shorter than a day — no give-up before `MAX_ASKS` asks the model took,
+        // and never quiet while an ask it could read is owed — a full queue included. Tier-1 in
+        // aterm-agent's `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`) over the real
+        // readers, `queue_facts`, clock and reducer on every reachable state; no `#[refines]`
+        // anchors.
         harness_upgrade_limit_queue_model(),
         // The live upgrade's Codex branch: when the shared daemon may be moved
         // onto the managed build. Tier-1 bound in aterm-agent's
         // `harness::upgrade_codex` tests to the real `daemon_step` over every
         // reachable state; no `#[refines]` anchors.
         harness_codex_daemon_update_model(),
-        // The live upgrade's LADDER (the owner's decision of 2026-09-28): the
+        // The live upgrade's LADDER: the
         // longer an upgrade has been behind, the less it waits, and no rung
         // relaxes a floor, nor holds an idle client for another session's
         // turn once its screen has placed it. Tier-1 in aterm-agent's
@@ -1353,12 +1289,12 @@ pub fn model_registry() -> Vec<Model> {
         // each built into real looks and read by the visit's own assembly
         // (`ladder_look`, `codex_daemon_turn`, `screen_turn`, `quiet_s`)
         // through the real `gate`, `rung`, `St::still`, `daemon_turn` and
-        // `daemon_step`, and a replay of the 2026-09-28 incident; `#[refines]`
+        // `daemon_step`, and a replayed incident; `#[refines]`
         // anchors on those five, the environment's steps and the `Buggy`
         // members waived (the crate's `spec-anchors` feature, which
         // aterm-gui's closure gate links). Liveness: `TheUpgradeLands`.
         harness_upgrade_ladder_model(),
-        // The live upgrade's GOAL PAUSE (the owner's decision of 2026-09-28):
+        // The live upgrade's GOAL PAUSE:
         // at the Land rung a goal whose own turn is all that holds the move is
         // paused with `/goal pause` (the Esc only at a goal turn's head), the
         // move made, and the goal resumed once — never left paused, never
@@ -1371,14 +1307,11 @@ pub fn model_registry() -> Vec<Model> {
         // steps (the clock's among them) and the `Buggy` members waived.
         // Liveness: `TheUpgradeLandsUnderAGoal`.
         harness_upgrade_goal_pause_model(),
-        // NO UPGRADE STUCK FOREVER (design record 2026-09-28, §4, adapted to
-        // main on 2026-09-29 and to the owner's alert rules): the upgrade
-        // moves, or its record names what holds it now — the watch off any
-        // point and the class of the recorded wait; how the owner is then
-        // told is the classifier's (`Row::attention`), bound in aterm-agent.
-        // Main today is this machine, its latch clear: the gap the assessment
-        // of 2026-09-29 found in the record, `RecordedWordStands`, closed that
-        // day and a negative control since, proved closed in
+        // NO UPGRADE STUCK FOREVER: the upgrade moves, or its record names
+        // what holds it now — the watch off any point and the class of the
+        // recorded wait; how the owner is then told is the classifier's
+        // (`Row::attention`), bound in aterm-agent. `RecordedWordStands` is a
+        // negative control, proved closed in
         // tests/derived_harness_upgrade_progress.rs: the read says what holds
         // the point of an act (`upgrade::held_point`) and the watch records
         // it, else `upgrade::NEXT_POINT` — for a Claude Code record only (a
@@ -1396,7 +1329,7 @@ pub fn model_registry() -> Vec<Model> {
         // on those, the world's steps and the `Buggy` members waived.
         // Liveness: `TheUpgradeMovesOrTheRecordNamesWhatHoldsIt`.
         harness_upgrade_progress_model(),
-        // The live upgrade's Codex records are collected (gap #22, 2026-09-29):
+        // The live upgrade's Codex records are collected:
         // a closed tab's settled record goes after a week, never a live tab's,
         // an in-flight restart's or a fresh one. Tier-1 in aterm-agent's
         // `upgrade_codex_drive` tests over the real `codex::prune` and its
@@ -1404,18 +1337,18 @@ pub fn model_registry() -> Vec<Model> {
         // historical defect; no `#[refines]` anchors. Liveness:
         // `AClosedTabsSettledRecordGoes`.
         harness_upgrade_state_collection_model(),
-        // The supervisor's done check (2026-09-27): a done report is typed the
+        // The supervisor's done check: a done report is typed the
         // check, never a plain continuation; the check's done yield ends the
         // task until someone else's turn. Tier-1 in aterm-agent's
         // `supervise_conformance_done_check` over the real decider on every
         // reachable state; no `#[refines]` anchors.
         supervisor_done_check_model(),
-        // The stall's remedy (D4, 2026-09-27; cut back by that day's review):
+        // The stall's remedy:
         // one `signal term` an episode, never under a hand, never a kill.
         // Tier-1 in aterm-agent's `supervise::stall` tests over the real loop
         // on every reachable configuration; no `#[refines]` anchors.
         supervisor_stall_remedy_model(),
-        // The same box is one point (FIX 3, the re-alert of 2026-09-25): a
+        // The same box is one point (FIX 3): a
         // request is asked of the manager once however the vendor redraws
         // it, and every request the loop looks at is asked — two Edit boxes
         // on one path included. Tier-1 in aterm-agent's
@@ -1424,16 +1357,13 @@ pub fn model_registry() -> Vec<Model> {
         // bound read by read, the key before FIX 3 replayed through the same
         // walk as the caught negative control; no `#[refines]` anchors.
         supervisor_box_ask_model(),
-        // The question answer's recommended path (R3, the critique of
-        // 2026-09-25): every key the supervisor sends a question dialog meets
-        // the state it was decided on — no Enter in the free-text field or
-        // off the chosen row, none on a later tab or the review's cancel,
-        // none into the composer — under a person's quiet, the progression
-        // rule and the person fence. Tier-1 in aterm-agent's
-        // `policy/question_tests.rs` (the decider) and `run_engine_tests.rs`
-        // (the loop); no `#[refines]` anchors. Its policy-text twin,
-        // `supervisor_question_text_model`, is not here yet: its `Buggy = 1`
-        // space outgrows the interpreter's budget (its own doc says so).
+        // The question answer's recommended path: every key the supervisor sends a question dialog
+        // meets the state it was decided on — no Enter in the free-text field or off the chosen
+        // row, none on a later tab or the review's cancel, none into the composer — under a
+        // person's quiet, the progression rule and the person fence. Tier-1 in aterm-agent's
+        // `policy/question_tests.rs` (the decider) and `run_engine_tests.rs` (the loop); no
+        // `#[refines]` anchors. Its policy-text twin, `supervisor_question_text_model`, is not here
+        // yet: its `Buggy = 1` space outgrows the interpreter's budget (its own doc says so).
         supervisor_question_answer_model(),
         // The live upgrade's model priority list: its writers (the automatic
         // insertion of a model Claude Code recommends, and `upgrade models set`)
@@ -1442,20 +1372,20 @@ pub fn model_registry() -> Vec<Model> {
         // `Priority::admit`, `render`/`parse` and `upgrade_models::target`; no
         // per-method `#[refines]` anchors.
         harness_model_priority_model(),
-        // WHEN a due model move is taken (the 2026-09-25 incident's ladder).
+        // WHEN a due model move is taken.
         // Tier-1 in aterm-agent tests/conformance_upgrade_models/ladder.rs.
         harness_model_ladder_model(),
-        // The live upgrade's model SWITCH (2026-09-27): the rule (`model_due`,
+        // The live upgrade's model SWITCH: the rule (`model_due`,
         // same family first, then the list), the ladder (`model_moves_now`),
         // the announcement's stickiness (`model_to`), the ride's guard
-        // (`ride_bar`: the rule's move laws inside the ride, 2026-10-01) and
+        // (`ride_bar`: the rule's move laws inside the ride) and
         // the settle step (`ModelRecord::settle`, the due clock, the ask) as
         // one conversation's lifecycle. Tier-1 bound in aterm-agent's
         // `conformance_upgrade_models` (`switch` module) to the real visit
         // (`upgrade_models::model_read_step`, which `upgrade_drive::model_judge`
         // wraps, and `model_to`) and relaunch (`ModelRecord::asked`, its
         // `take_back` on a signal never sent, the line's `line_model`, which
-        // drops a `--model` recorded failed, 2026-10-01, `live_model_at`)
+        // drops a `--model` recorded failed, `live_model_at`)
         // over every reachable state; no `#[refines]` anchors.
         harness_model_switch_model(),
         // The supervisor at a network wall (an API error that never reached
@@ -1466,9 +1396,9 @@ pub fn model_registry() -> Vec<Model> {
         // `tests/supervise_conformance_network_wall.rs` over the real
         // `decide_turn_end`; no `#[refines]` anchors.
         supervisor_network_wall_model(),
-        // Codex's rate-limit nudge and the save-then-wait switch (2026-09-28): the
+        // Codex's rate-limit nudge and the save-then-wait switch: the
         // nudge switched only near the limit, the work saved once on the cheaper
-        // model and nothing else run there (the save's own turn bounded, round 4),
+        // model and nothing else run there (the save's own turn bounded),
         // the session held on its own model, no continuation into a pursued goal
         // or a fallen sandbox. Tier-1 in
         // aterm-agent's `tests/supervise_conformance_codex_rate_nudge.rs` over the
@@ -1479,15 +1409,13 @@ pub fn model_registry() -> Vec<Model> {
         // the `Buggy` members waived (the crate's `spec-anchors` feature,
         // which aterm-gui's closure gate links).
         supervisor_codex_rate_nudge_model(),
-        // The supervisor at a USAGE wall (2026-09-28: a weekly wall behind a
-        // background shell stood 4h44m unseen): a session at a usage wall is
+        // The supervisor at a USAGE wall: a session at a usage wall is
         // continued once its tokens are back, in bounded time, on a ladder
         // that never gives up; no first act before the reset the notice names.
         // Tier-1 in aterm-agent's `tests/supervise_conformance_usage_wall.rs`
         // over the real reader and `decide_turn_end`; no `#[refines]` anchors.
         supervisor_usage_wall_model(),
-        // The supervisor's model switch (2026-09-22 to 09-27: 240 relaunches in
-        // five days, a return guessed at a wall no reset ends): the fallback is
+        // The supervisor's model switch: the fallback is
         // asked for until the host can make it, the return is made only at a
         // reset the notice named, and a deferred return holds nothing. Tier-1 in
         // aterm-agent's `tests/supervise_conformance_model_switch.rs` over the
@@ -1531,7 +1459,7 @@ pub fn model_registry() -> Vec<Model> {
         // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
         // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
         atpkg_pending_wait_model(),
-        // Flip when quiet (2026-09-26): an unattended pass stages a new Trust toolchain and
+        // Flip when quiet: an unattended pass stages a new Trust toolchain and
         // holds its flip while the one it replaces is in use or cannot be told, up to a
         // ceiling; a revoked build never waits. Tier-1 bound to the real `decide` and
         // `Busy` classification in `atpkg::quiet`'s tests; no `#[refines]` anchors (atpkg
@@ -1564,21 +1492,22 @@ pub fn model_registry() -> Vec<Model> {
         // conformance driving real gestures and real `Terminal::process` batches
         // (`aterm_gui::selection_custody_conformance`), run by the gate.
         //
-        // `PressCustody` is ACTIVELY-BOUND too, as of the custody RECORD. It was
-        // report-only for a real reason rather than a procedural one: five of its
-        // eleven actions had no seam at which their state change could be told from
-        // another's — `RepeatPress`, `InertPress` and `ReleaseEvent` are identical in
-        // every observable variable, and `OutputAtLive` is an identity transition any
-        // function satisfies — so anchoring bought a green ledger line rather than a
-        // check. `Terminal::note_custody` closes that: the site that DECIDES a
-        // transition records which one it was, so the conformance validates each step
-        // against the action the engine itself named. 16/16 anchored on the four
-        // recorders, Tier-1 in `aterm_gui::press_custody_conformance`, run by the gate.
+        // `PressCustody` is ACTIVELY-BOUND too, through the custody RECORD: five of its eleven
+        // actions (`RepeatPress`, `InertPress`, `ReleaseEvent` are identical in every observable
+        // variable; `OutputAtLive` is an identity transition) cannot be told apart by state, so
+        // `Terminal::note_custody` has the site that DECIDES a transition record which one it was,
+        // and the conformance validates each step against the action the engine named. 16/16
+        // anchored on the four recorders, Tier-1 in `aterm_gui::press_custody_conformance`, run by
+        // the gate.
         //
         // Registration alone (independent of anchoring) is what puts BOTH under
         // `ty check --strict-vacuity` in the repo-wide gate.
         press_custody_model(),
         selection_custody_model(),
+        // The mouse-selection lifecycle under that custody: TextSelection's five
+        // calls, each a no-op outside its phase. 5/5 actions anchored in
+        // aterm-selection; Tier-1 in its tests/conformance_text_selection.rs.
+        text_selection_lifecycle_model(),
         // Introspection / recursive-stacking control plane (audit findings M1/M2/S1).
         // Tier-1 conformance for these three, the forward-handshake liveness twin,
         // `capability_secrecy_model` and the authority pair below lives beside the
@@ -1606,24 +1535,23 @@ pub fn model_registry() -> Vec<Model> {
         // + `#[refines]` anchors in aterm-gui (`control`, `identity_claim`).
         handoff_address_owner_model(),
         // A person's grace over a READY answer ends in the upgrade's restart,
-        // never in the loop's `keep going` (2026-09-27 20:28:42). Tier-1 in
+        // never in the loop's `keep going`. Tier-1 in
         // aterm-gui's harness_host (the real worker's ownership) and
         // aterm-agent's turn-end policy (the loop's guard).
         upgrade_attended_turn_end_model(),
         // The loop's own act, once the agent took it, never withholds a break
-        // of its background work from the host (2026-09-28: s-d3346 and
-        // s-5c03a had no upgrade look for hours). Tier-1 in aterm-agent's
+        // of its background work from the host. Tier-1 in aterm-agent's
         // run_engine_tests over the real loop.
         supervisor_break_offer_model(),
         // The point the upgrade acts at next (a READY's restart) is owned
         // through its settle: every act of the upgrade's, at an idle point or
-        // a break, starts the counts over (2026-09-28 18:21, s-5c03a). Tier-1
+        // a break, starts the counts over. Tier-1
         // in aterm-gui's harness_host over the real worker.
         upgrade_settle_turn_end_model(),
         // A notice its own fence refused owns its point for a bounded number
         // of looks at the first rung, counted on their own and started over
-        // by an act or the owner's word, never renewed by a turn (2026-09-28
-        // 14:52:45, s-d3346). Tier-1 in aterm-gui's harness_host.
+        // by an act or the owner's word, never renewed by a turn. Tier-1 in
+        // aterm-gui's harness_host.
         upgrade_refused_turn_end_model(),
         // GUI native-chrome safety: split-pane tree integrity + session-pool refcount
         // accounting (the Tier-1 conformance + #[refines] anchors live in aterm-gui).
@@ -1702,7 +1630,7 @@ pub fn model_registry() -> Vec<Model> {
         // never read as fresh. Tier-1 lives in aterm-release's claim_landing_model.rs.
         release_claim_landing_model(),
         // The whole-tree Trust lane's facts and the one judge that reads them (FACTS,
-        // NOT VERDICTS, 2026-09-29): verified only from this tree's and this prover's
+        // NOT VERDICTS): verified only from this tree's and this prover's
         // facts, against these floors, and a floors-only change reuses them. Tier-1
         // lives in aterm-release's trust_facts_model.rs.
         trust_facts_reuse_model(),
@@ -1718,15 +1646,13 @@ pub fn model_registry() -> Vec<Model> {
         // crash-loop poison class). Tier-1 conformance + #[refines] anchors
         // live in aterm-update::manifest.
         native_update_failed_mark_suppression_model(),
-        // A stage's roster authorization goes stale (round eight of the update
-        // audit, #503): the check that admits a roster retires a revoked stage or
-        // stamps a trusted one, and no lane swaps a stage stamped a window ago or
-        // more, so a revocation published a window before a swap is never missed.
-        // Tier-1 + #[refines] anchors live in aterm-update (`github.rs`'s
-        // `roster_freshness_conformance`, over the real `stage_admission_gates`
-        // and `observe_floor_and_withdraw_at`).
+        // A stage's roster authorization goes stale: the check that admits a roster retires a
+        // revoked stage or stamps a trusted one, and no lane swaps a stage stamped a window ago or
+        // more, so a revocation published a window before a swap is never missed. Tier-1 +
+        // #[refines] anchors live in aterm-update (`github.rs`'s `roster_freshness_conformance`,
+        // over the real `stage_admission_gates` and `observe_floor_and_withdraw_at`).
         native_update_roster_freshness_model(),
-        // A STRUCTURAL convergence's latch (gap 14, 2026-09-26; round three): one
+        // A STRUCTURAL convergence's latch: one
         // re-sample after a day, never the launch the boot trial reverts on, a
         // newer verified release takes the activation's place without launching
         // it, and build N stays covered whatever the digest. Tier-1 + #[refines]
@@ -1738,7 +1664,7 @@ pub fn model_registry() -> Vec<Model> {
         // The boot trial's count under overlapping launches of one build: a launch
         // is given back by the process that made it, never by the shared count's
         // movement, and one whose give-back met a held apply lock is owed and paid
-        // by the next holder of the lock (round eight, lead U7). Tier-1 + #[refines]
+        // by the next holder of the lock. Tier-1 + #[refines]
         // anchors live in aterm-update's `install_boot_tests.rs` over the real
         // `count_trial_launch`, `forgive_trial_launch_of_at`, `owe_trial_launch` and
         // `pay_owed_trial_launches`.
@@ -1880,7 +1806,7 @@ pub fn model_registry() -> Vec<Model> {
         native_preview_font_convergence_model(),
         semantic_prewarm_handshake_model(),
         semantic_prewarm_request_swap_model(),
-        // 2026-07-20 zoom/typing incident: whole-surface presentation,
+        // Zoom/typing integrity: whole-surface presentation,
         // bounded/typed recovery, redraw delivery, and no-flash predictive
         // visibility. These are scalar prove-and-catch models, so registering
         // them enrolls every action in the global strict-vacuity audit as well
@@ -1914,30 +1840,27 @@ pub fn model_registry() -> Vec<Model> {
         // sink receipts in aterm-gui/src/app_input.rs.
         queued_key_kernel_delivery_model(),
         // A socket driver's key is never queued behind input a program the
-        // watch has published as not reading has left unread (the 2026-09-24
-        // frozen-agent incident), and nothing else is refused — a slow read is
-        // a warning (owner direction, 2026-09-29). Tier-1 drives a real pty and
+        // watch has published as not reading has left unread, and nothing else
+        // is refused — a slow read is a warning. Tier-1 drives a real pty and
         // the shipped `input_backlog::gate` and `classify` in
         // aterm-session/tests/conformance_input_unread.rs.
         input_unread_gate_model(),
         // A program that loses the terminal with program-only modes armed is
-        // handed back at the byte where the foreground group changed (the
-        // 2026-09-25 "crashed" tab). Tier-1 drives the real PTY reader with a
-        // scripted foreground probe in
+        // handed back at the byte where the foreground group changed. Tier-1
+        // drives the real PTY reader with a scripted foreground probe in
         // aterm-gui/src/foreground_handback_conformance.rs.
         foreground_handback_model(),
-        // Who owns an input mode across jobs when the reader MISSES one (the
-        // 2026-09-27 lane at load 59-65): a re-armed mode is the re-armer's,
+        // Who owns an input mode across jobs when the reader MISSES one (a
+        // loaded machine): a re-armed mode is the re-armer's,
         // so a missed job loses only its own handback. Tier-1 drives the real
         // PTY reader in aterm-gui/src/foreground_handback_conformance.rs.
         foreground_handback_ownership_model(),
-        // A self-update carries every history line of a tab or COUNTS it
-        // (2026-09-26): the join names a sidecar only over the session's own
-        // fenced, contiguous history, and every fallback and failed sidecar is
-        // counted. Tier-1 drives the real export, park, join, sidecar and
-        // import in aterm-gui/src/handoff_history_conformance.rs.
+        // A self-update carries every history line of a tab or COUNTS it: the join names a sidecar
+        // only over the session's own fenced, contiguous history, and every fallback and failed
+        // sidecar is counted. Tier-1 drives the real export, park, join, sidecar and import in
+        // aterm-gui/src/handoff_history_conformance.rs.
         native_update_history_carry_model(),
-        // A self-update keeps each window's show state (2026-09-26, gap #29):
+        // A self-update keeps each window's show state:
         // the successor stacks the carried windows only once they are on glass
         // and, on the update lane, only in the call that writes its adoption
         // proof, gives the keyboard back to the carried key window at Commit
@@ -1945,26 +1868,24 @@ pub fn model_registry() -> Vec<Model> {
         // Commit and only while aterm is in front. Tier-1 drives the real App
         // carry and proof path in aterm-gui/src/window_show_conformance.rs.
         native_update_window_show_model(),
-        // Where an update's successor rebuilds its layout (warm successor P3,
-        // 2026-09-29): a cold launch only after its first present (RESTORE-1),
+        // Where an update's successor rebuilds its layout (warm successor P3): a
+        // cold launch only after its first present (RESTORE-1),
         // the handoff lane in window 0's attach pass, and the proof only once
         // the rebuild drained and every window painted. Tier-1 drives the real
         // `restore_pass_due` and paint decision in
         // aterm-gui/src/restore_pass_conformance.rs.
         native_update_successor_attach_model(),
-        // The outgoing process's artifact diet (warm successor P5,
-        // 2026-09-29): a layout sidecar written before the park reaches the
-        // successor only once the park read it back byte-equal to its own
-        // layout, and every retired attempt sweeps it. Tier-1 drives the real
-        // writer, seal, reader and sweep in aterm-gui/src/handoff_diet.rs.
+        // The outgoing process's artifact diet (warm successor P5): a layout sidecar written before
+        // the park reaches the successor only once the park read it back byte-equal to its own
+        // layout, and every retired attempt sweeps it. Tier-1 drives the real writer, seal, reader
+        // and sweep in aterm-gui/src/handoff_diet.rs.
         native_update_speculative_sidecar_model(),
         // A health warning that crosses a self-update is handed to the producer
         // here whose proof heals it, its digest line claimed again; the
-        // ledger's healing never ends the stall (round-seven update audit,
-        // findings 206/207). Tier-1 drives the real seed, door and watchdog in
+        // ledger's healing never ends the stall. Tier-1 drives the real seed, door and watchdog in
         // aterm-gui/src/carried_health_conformance.rs.
         native_update_carried_health_model(),
-        // A self-update's pre-Commit input queue (2026-09-26, gap #33): a focus
+        // A self-update's pre-Commit input queue: a focus
         // loss marks it incoherent only when input for that window is already
         // queued ahead of it, so the replay's repair — disarming the ambient
         // modifiers — happens for a real drop or reorder and never for winit's
@@ -1972,7 +1893,7 @@ pub fn model_registry() -> Vec<Model> {
         // settle in aterm-gui/src/precommit_input_conformance.rs; no
         // `#[refines]` anchors.
         native_update_precommit_input_model(),
-        // An unsaved editor tab rides a self-update (2026-09-26, gap #32): its
+        // An unsaved editor tab rides a self-update: its
         // draft is carried by the crash journal the successor replays when it
         // reopens the file, and the outgoing process commits only when the image
         // read back at Commit replays to exactly its editor's text and no write
@@ -1983,12 +1904,11 @@ pub fn model_registry() -> Vec<Model> {
         native_update_editor_carry_model(),
         // A driver's own lease never re-grids the session it may still type
         // into, so its `if-gen=` fence is never refused by a repaint its own
-        // hand caused (2026-09-27: the live upgrade's notice, refused 121
-        // visits of 121). Tier-1 drives the real `turn` and `lease` verbs on a
+        // hand caused. Tier-1 drives the real `turn` and `lease` verbs on a
         // real pty against the real presence projection in
         // aterm-gui/src/driver_geometry_conformance.rs.
         driver_geometry_model(),
-        // The window's chrome regrow floor (ruling 414, 2026-09-29):
+        // The window's chrome regrow floor:
         // after any rise of a window's chrome rows, no source's quiet fall
         // re-grids it back inside `CHROME_REGROW_SETTLE` (a presence row born
         // 4-6 ms before the band's quiet shrink, a band row rising just before
@@ -1997,7 +1917,7 @@ pub fn model_registry() -> Vec<Model> {
         // `#[refines]` anchors on the two re-grid points, the rest waived.
         chrome_regrow_floor_model(),
         // The owner's debugger-access change (docs/DESIGN-macos-debugger-access-
-        // 2026-09-29.md §5.1; rulings O7/O8, 2026-09-29): `DevToolsSecurity
+        // 2026-09-29.md §5.1; rulings O7/O8): `DevToolsSecurity
         // -enable`/`-disable` runs only after the owner's "Allow…" in aterm's
         // alert, only over a fresh `-status` read of its precondition under the
         // Mac-wide change lock, one child on the Mac at a time, and a surface
@@ -2006,24 +1926,20 @@ pub fn model_registry() -> Vec<Model> {
         // requires its counterexample. Tier-1 drives the real lane, worker and
         // order in aterm-gui/src/debugger_access.rs.
         debugger_access_change_model(),
-        // An unsaved Settings draft rides a seamless self-update (2026-09-27,
-        // plan P2-2): the handoff layout carries each Settings view's field
-        // drafts, the successor reopens the view holding them (or says which it
-        // could not), the Commit re-captures and compares Settings leaves in
-        // full so a key typed during the overlap keeps the outgoing process, and
-        // neither the cold lane nor an older successor may spend a token that
-        // carries one. Tier-1 drives a real outgoing App and a real successor
-        // App over the real layout wire in
+        // An unsaved Settings draft rides a seamless self-update: the handoff layout carries each
+        // Settings view's field drafts, the successor reopens the view holding them (or says which
+        // it could not), the Commit re-captures and compares Settings leaves in full so a key typed
+        // during the overlap keeps the outgoing process, and neither the cold lane nor an older
+        // successor may spend a token that carries one. Tier-1 drives a real outgoing App and a
+        // real successor App over the real layout wire in
         // aterm-gui/src/settings_draft_carry_conformance.rs.
         native_update_settings_draft_carry_model(),
-        // The rendezvous grant across a version boundary (item 13 of the fifth
-        // update-robustness round): the chunked `ATRZ2G` grant is offered only
-        // to a candidate whose verified bundle declares it, claimed only when
-        // offered, sent only to an `ATRZ2C` claim of more than 62 sessions, and
-        // adopted only whole. Tier-1 drives the shipping decisions and a real
-        // chunked grant in aterm-gui's handoff_rendezvous tests.
+        // The rendezvous grant across a version boundary: the chunked `ATRZ2G` grant is offered
+        // only to a candidate whose verified bundle declares it, claimed only when offered, sent
+        // only to an `ATRZ2C` claim of more than 62 sessions, and adopted only whole. Tier-1 drives
+        // the shipping decisions and a real chunked grant in aterm-gui's handoff_rendezvous tests.
         native_update_rendezvous_grant_model(),
-        // The crash journal's claim (2026-09-26, PTY keeper P1): a window's
+        // The crash journal's claim (PTY keeper P1): a window's
         // layout journal is taken once, never while its owner runs, reopened
         // only after an unclean end the crash marker attests, never when the
         // launch that wrote it had itself reopened a journal and died within
@@ -2031,7 +1947,7 @@ pub fn model_registry() -> Vec<Model> {
         // real owner and claim over a real directory, lock and crash markers
         // in aterm-gui/src/crash_journal_conformance.rs.
         crash_journal_claim_model(),
-        // The PTY keeper (2026-09-28, P2): custody of every master outside the
+        // The PTY keeper (P2): custody of every master outside the
         // window — never two readers, an offer only with no live holder, a
         // closed tab never handed on, no relaunch after a quit, and a shell
         // lost only when the keeper also failed — and the relaunch brake's
@@ -2039,7 +1955,7 @@ pub fn model_registry() -> Vec<Model> {
         // RelaunchBrake in aterm-keeper/src/conformance_custody.rs.
         pty_keeper_custody_model(),
         keeper_relaunch_brake_model(),
-        // The keeper's judgement of one window's end (P3's limits, 2026-09-28):
+        // The keeper's judgement of one window's end (P3's limits):
         // a quit whose BYE was lost is told from a crash by the kernel's exit
         // status AND the window's crash marker agreeing, never by either alone,
         // and an orphan whose shell dies is pruned on its leader's exit. Tier-1
@@ -2051,14 +1967,13 @@ pub fn model_registry() -> Vec<Model> {
         // ran is taken back, file and all. Tier-1 drives the real issue and
         // settle, engine and file in aterm-gui/src/typed_rekey_conformance.rs.
         typed_rekey_model(),
-        // The relaunch line's read of a returned prompt (tab #1, 2026-10-01):
+        // The relaunch line's read of a returned prompt:
         // never typed after a person's keys at a marked prompt, and typed at
         // a prompt nobody keyed whatever the shell's mark names. Tier-1 drives
         // the real relaunch line in aterm-agent's upgrade_drive_tests.
         relaunch_prompt_read_model(),
         // Streaming-search lifecycle: drift-free twin of aterm-search's
-        // StreamingSearch engine (supersedes the never-committed hand
-        // StreamingSearch.tla). Registering it enrolls every action in the
+        // StreamingSearch engine. Registering it enrolls every action in the
         // global strict-vacuity audit, the verifier ledger, and trust-ir
         // spec-link; #[refines] anchors + Tier-1 lockstep live in aterm-search.
         streaming_search_model(),
@@ -2094,36 +2009,40 @@ pub fn model_registry() -> Vec<Model> {
 pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
     use crate::derive::*;
     vec![
-        // An unnamed exception ends by its own clock (2026-09-29 review, F1),
+        // An unnamed exception ends by its own clock,
         // under nothing but time and the loop's wake. Tier-0 in
         // tests/derived_exceptions_digest.rs, interpreter and `ty` both.
         (
             exceptions_digest_ends_model(),
             exceptions_digest_ends_liveness(),
         ),
-        // Law 1 of the apply ladder: the staged build lands (round three of the
-        // 2026-09 update robustness work, plan P1-7). Tier-0 in
+        // Law 1 of the apply ladder: the staged build lands. Tier-0 in
         // tests/derived_ring_ty.rs, interpreter and `ty` both.
         (
             native_update_apply_ladder_model(),
             native_update_apply_ladder_liveness(),
         ),
-        // The driver's geometry (2026-09-28): a row a moved lease holds
+        // The explicit restart ends the program it stamped: its escalation, or the
+        // successor's carrier after a Commit. Tier-0 in tests/derived_harness_restart.rs.
+        (
+            harness_restart_stamp_model(),
+            harness_restart_stamp_liveness(),
+        ),
+        // The driver's geometry: a row a moved lease holds
         // catches up with the live want once the wake is handled. Tier-0 in
         // tests/derived_driver_geometry.rs.
         (driver_geometry_model(), driver_geometry_liveness()),
-        // The relaunch line types at a prompt nobody keyed (tab #1,
-        // 2026-10-01: a misplaced mark read as typing kept the line out for
-        // good). Tier-0 in tests/derived_relaunch_prompt_read.rs.
+        // The relaunch line types at a prompt nobody keyed (a misplaced mark read as typing never
+        // keeps it out for good). Tier-0 in tests/derived_relaunch_prompt_read.rs.
         (
             relaunch_prompt_read_model(),
             relaunch_prompt_read_liveness(),
         ),
-        // The chrome regrow floor (2026-09-29): a fall it waits is applied
+        // The chrome regrow floor: a fall it waits is applied
         // once its own quiet and the floor have run — the floor delays a
         // re-grid, never loses one. Tier-0 in tests/derived_chrome_regrow.rs.
         (chrome_regrow_floor_model(), chrome_regrow_floor_liveness()),
-        // The owner's debugger-access change (2026-09-29): an exited change
+        // The owner's debugger-access change: an exited change
         // child's result is always taken and re-probed — the park's
         // `RESULT_RECHECK` re-read (`WF(Notice)`), not the result's wake.
         // Tier-0 in tests/derived_debugger_access.rs.
@@ -2131,7 +2050,7 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
             debugger_access_change_model(),
             debugger_access_change_liveness(),
         ),
-        // The supervisor's `[harness]` policy (2026-09-29): the window catches
+        // The supervisor's `[harness]` policy: the window catches
         // up with the file once edits stop, whatever the lane admitted and
         // wherever the Commit fell. Tier-0 in
         // tests/derived_harness_policy_one_writer.rs.
@@ -2161,48 +2080,48 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
             native_update_successor_warm_before_claim_liveness(),
         ),
         // A successor that dies before its dial ends the parent's wait without
-        // the dial budget (2026-09-29). Tier-0 in
+        // the dial budget. Tier-0 in
         // tests/derived_launched_dial_wait.rs.
         (
             native_update_launched_dial_wait_model(),
             native_update_launched_dial_wait_liveness(),
         ),
         // Codex's save-then-wait switch: the session comes back to its own
-        // model (2026-09-28). Tier-0 in tests/derived_supervise.rs.
+        // model. Tier-0 in tests/derived_supervise.rs.
         (
             supervisor_codex_rate_nudge_model(),
             supervisor_codex_rate_nudge_liveness(),
         ),
         // The live agent upgrade's ladder: the upgrade lands, or a floor no
-        // rung relaxes stands (the owner's decision of 2026-09-28). Tier-0 in
+        // rung relaxes stands. Tier-0 in
         // tests/derived_harness_upgrade_ladder.rs, interpreter and `ty` both.
         (
             harness_upgrade_ladder_model(),
             harness_upgrade_ladder_liveness(),
         ),
         // The goal pause: the upgrade lands under a goal that never pauses by
-        // itself, and leaves it pursued (2026-09-28). Tier-0 in
+        // itself, and leaves it pursued. Tier-0 in
         // tests/derived_harness_upgrade_goal_pause.rs.
         (
             harness_upgrade_goal_pause_model(),
             harness_upgrade_goal_pause_liveness(),
         ),
         (repaint_nudge_model(), repaint_nudge_liveness()),
-        // A usage wall ends once the tokens are back (2026-09-28). Tier-0 in
+        // A usage wall ends once the tokens are back. Tier-0 in
         // tests/derived_supervise.rs, interpreter and `ty` both.
         (
             supervisor_usage_wall_model(),
             supervisor_usage_wall_liveness(),
         ),
         // The tab at a model limit is moved to the fallback once the host can
-        // make it (2026-09-28). Tier-0 in tests/derived_supervise.rs.
+        // make it. Tier-0 in tests/derived_supervise.rs.
         (
             supervisor_model_switch_model(),
             supervisor_model_switch_liveness(),
         ),
         // A session at a usage wall is moved once an account it could run on
         // is usable, unless its jobs, the canary's ten-minute hold or the
-        // breaker hold it (2026-10-01) — a claim about a session whose host
+        // breaker hold it — a claim about a session whose host
         // makes the relaunch or says `wait:`; one it refused is latched, which
         // the model leaves out. Tier-0 in tests/derived_supervise.rs.
         (
@@ -2212,7 +2131,7 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
         // A `/usage` panel the harness opened does not stand for good while
         // nothing stands in the Escape's way — a person's hand, a hold and a
         // running turn are exceptions in the goal, not fairness assumed of
-        // the world (2026-10-01). Tier-0 in tests/derived_supervise.rs.
+        // the world. Tier-0 in tests/derived_supervise.rs.
         (
             supervisor_usage_probe_model(),
             supervisor_usage_probe_liveness(),
@@ -2220,7 +2139,7 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
         // A limit reset's claim, which holds every other session of the
         // account at its wall, does not stay in flight for good: the loop
         // reads its line, the clock ends a claim with no outcome, and the
-        // vendor answers its own claim (2026-10-02). Tier-0 in
+        // vendor answers its own claim. Tier-0 in
         // tests/derived_supervise.rs.
         (
             supervisor_limit_reset_model(),
@@ -2228,23 +2147,22 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
         ),
         // A confirmation the harness's row opened does not stand for good
         // while nothing stands in the Escape's way — a person's hand and a
-        // hold are exceptions in the goal, not fairness assumed of the world
-        // (2026-10-02). Tier-0 in tests/derived_supervise.rs.
+        // hold are exceptions in the goal, not fairness assumed of the world.
+        // Tier-0 in tests/derived_supervise.rs.
         (
             supervisor_limit_reset_model(),
             supervisor_limit_reset_confirmation_liveness(),
         ),
         // No upgrade stuck forever: the upgrade moves, or its record names what
-        // holds it (design record 2026-09-28 §4.2, adapted to main 2026-09-29
-        // and to the owner's alert rules). Tier-0 in
+        // holds it. Tier-0 in
         // tests/derived_harness_upgrade_progress.rs, interpreter and `ty`
         // both.
         (
             harness_upgrade_progress_model(),
             harness_upgrade_progress_liveness(),
         ),
-        // The Codex records: a closed tab's settled record goes (gap #22,
-        // 2026-09-29). Tier-0 in tests/derived_harness_state_collection.rs.
+        // The Codex records: a closed tab's settled record goes. Tier-0 in
+        // tests/derived_harness_state_collection.rs.
         (
             harness_upgrade_state_collection_model(),
             harness_upgrade_state_collection_liveness(),
@@ -2285,25 +2203,18 @@ impl SpecModule {
         }
     }
 
-    /// The names a REFINEMENT / PROOF / WAIVER anchor may RESOLVE to for obligation 1
+    /// The names a REFINEMENT / WAIVER anchor may RESOLVE to for obligation 1
     /// ("action exists"). This is the ACTION namespace — for an embedded model its
     /// `Action` names; for an external `.tla` the `Next` disjuncts ONLY (the
     /// [`coverage_actions`](Self::coverage_actions) set), NOT every top-level def.
     ///
-    /// TRUST_VACUITY_GATE §2.4 (finding 4): the External arm previously returned
-    /// `t.actions` (ALL top-level defs — `Init`/`TypeOK`/named constants/invariants),
-    /// so an external `#[refines]`/`proof_anchor!` aimed at a non-`Next` def like
-    /// `TypeOK` OVER-resolved and was wrongly accepted. The lowered Trust artifact is
-    /// already strict here (it emits only `coverage_actions()` and Ob.1-checks against
-    /// that — the L3 lock), so the in-Rust gate was the looser of the two. Narrowing
-    /// this to `coverage_actions()` ALIGNS the in-Rust gate with Trust's
-    /// already-strict artifact: a `#[refines]`/`proof_anchor!` naming `Init`/`TypeOK`
-    /// now fails Ob.1 in BOTH paths. `#[spec_invariant]` keeps the full def set via the
-    /// separate [`invariant_names`](Self::invariant_names) (invariants legitimately
-    /// name non-`Next` defs).
+    /// TRUST_VACUITY_GATE §2.4 (finding 4): resolving against every top-level def
+    /// would let an external `#[refines]` aimed at `Init`/`TypeOK`
+    /// over-resolve. This matches the lowered Trust artifact, which emits only
+    /// `coverage_actions()` and checks Ob.1 against that (the L3 lock), so such an
+    /// anchor fails Ob.1 in BOTH paths. `#[spec_invariant]` uses the wider
+    /// [`invariant_names`](Self::invariant_names).
     pub fn action_names(&self) -> BTreeSet<String> {
-        // For an embedded model the action set IS the coverage set; for an external
-        // `.tla` this is now the `Next` disjuncts only (the L3-locked behavior).
         self.coverage_actions()
     }
 
@@ -2436,135 +2347,6 @@ impl ClosureReport {
     }
 }
 
-/// One row of the UNIFIED VERIFIER LEDGER (TRUST_NATIVE_TLA §4, Phase 4): for a single
-/// `(machine, action)`, which verifier(s) are bound to it — `ty` (temporal: a `#[refines]`
-/// binding drives Tier-0/Tier-1 `ty` over the model action) and/or a kani ANCHOR
-/// (bounded-local: a `proof_anchor!`'d harness names it). This is the "single coverage
-/// ledger over both verifiers" the design calls for — no proof is merged; the IR just
-/// learns they refer to the same action.
-#[derive(Debug, Clone)]
-pub struct LedgerEntry {
-    /// Canonical machine name (the resolved `SpecModule.name`).
-    pub machine: String,
-    /// The model action.
-    pub action: String,
-    /// Bound temporally: ≥1 `#[refines]` binds this action to the `ty`-checked model.
-    pub ty: bool,
-    /// Waived: a `#[spec_unmodeled]` waiver names this action. A stated reason the
-    /// code is NOT bound, so it never sets [`Self::ty`]; the report says `ty=waived`
-    /// when it is the row's only temporal mark.
-    pub waived: bool,
-    /// Anchored bounded-locally: ≥1 `proof_anchor!`'d kani harness names it. An anchor,
-    /// not a verdict: the harness runs — and may come back inconclusive — in the Kani
-    /// lane (`scripts/verify-kani-proofs.sh`), never here, so the report says
-    /// `kani-anchor`.
-    pub kani: bool,
-    /// The kani harness names that refer to this action (for the report detail).
-    pub proofs: BTreeSet<String>,
-}
-
-impl LedgerEntry {
-    /// The `ty=✓/waived/–  kani-anchor=✓/–  <machine>::<action>` line for the gate
-    /// report.
-    pub fn render(&self) -> String {
-        let mark = |b: bool| if b { "✓" } else { "–" };
-        let ty = if !self.ty && self.waived {
-            "waived"
-        } else {
-            mark(self.ty)
-        };
-        format!(
-            "ty={ty}  kani-anchor={}  {}::{}",
-            mark(self.kani),
-            self.machine,
-            self.action
-        )
-    }
-}
-
-/// Build the per-`(machine, action)` UNIFIED VERIFIER LEDGER over the registered
-/// `modules`, the collected `refinements`/`waivers` (the `ty`/temporal half) and
-/// `proof_anchors` (the `kani`/bounded-local half) (TRUST_NATIVE_TLA §4, Phase 4).
-///
-/// Every action of every registered machine gets a row; `ty` is set iff a refinement
-/// (or a machine+action waiver) binds it, `kani` iff a `proof_anchor!`'d harness names
-/// it. Anchors whose `machine` resolves to no module are silently skipped here — they are
-/// already flagged as Ob.4 violations by [`check_closure`], so the ledger never invents a
-/// row for a dangling machine.
-// Skip: BTreeSet keyed build + Extend/format (absent std bodies). The
-// spec-anchor ledger the xref gate reads; not shipping runtime code.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn verifier_ledger(modules: &[SpecModule]) -> Vec<LedgerEntry> {
-    ledger_of(
-        modules,
-        refinements().map(|r| (r.machine, r.action)),
-        waivers().map(|w| (w.machine, w.action)),
-        proof_anchors(),
-    )
-}
-
-/// [`verifier_ledger`] over given `#[refines]` (`bound`) and `#[spec_unmodeled]`
-/// (`waived`) `(machine, action)` pairs and proof anchors.
-#[cfg_attr(trust_verify, trust::skip)]
-fn ledger_of<'a>(
-    modules: &[SpecModule],
-    bound: impl Iterator<Item = (&'a str, &'a str)>,
-    waived: impl Iterator<Item = (&'a str, &'a str)>,
-    proofs: impl Iterator<Item = &'a ProofAnchor>,
-) -> Vec<LedgerEntry> {
-    // Seed a row for every (canonical machine, action).
-    let mut rows: BTreeMap<(String, String), LedgerEntry> = BTreeMap::new();
-    for m in modules {
-        let canon = m.name().to_string();
-        for action in m.action_names() {
-            rows.entry((canon.clone(), action.clone()))
-                .or_insert_with(|| LedgerEntry {
-                    machine: canon.clone(),
-                    action: action.clone(),
-                    ty: false,
-                    waived: false,
-                    kani: false,
-                    proofs: BTreeSet::new(),
-                });
-        }
-    }
-
-    let resolve = |anchor_machine: &str| -> Option<String> {
-        modules
-            .iter()
-            .find(|m| machine_matches(anchor_machine, m.name()))
-            .map(|m| m.name().to_string())
-    };
-
-    // ty half: a refinement binds its action; a machine+action waiver only waives it.
-    let key = |machine: &str, action: &str| resolve(machine).map(|c| (c, action.to_string()));
-    for (machine, action) in bound {
-        if let Some(e) = key(machine, action).and_then(|k| rows.get_mut(&k)) {
-            e.ty = true;
-        }
-    }
-    for (machine, action) in waived {
-        if machine.is_empty() || action.is_empty() {
-            continue;
-        }
-        if let Some(e) = key(machine, action).and_then(|k| rows.get_mut(&k)) {
-            e.waived = true;
-        }
-    }
-
-    // kani half: each proof anchor marks `kani` and records the harness name.
-    for p in proofs {
-        if let Some(canon) = resolve(p.machine)
-            && let Some(e) = rows.get_mut(&(canon, p.action.to_string()))
-        {
-            e.kani = true;
-            e.proofs.insert(p.proof_name.to_string());
-        }
-    }
-
-    rows.into_values().collect()
-}
-
 /// One module's three indexed namespaces, keyed by its declared machine name:
 /// `(machine name, action set, invariant-def set, coverage-action set)`. They
 /// coincide for embedded models and diverge for external `.tla` (see [`check_closure`]).
@@ -2584,7 +2366,7 @@ struct AnchorObligationSpec<'a> {
 /// push a [`ClosureViolation`] when `resolved` is `None`, else when `target` does
 /// not resolve in the namespace `select`ed from the module's index. `site` is the
 /// anchor's rendered position (e.g. `"#[refines] at src/x.rs:3 (Foo::bar)"`);
-/// `authoring_hint` appends the refinement/proof arms' "Either author the model…"
+/// `authoring_hint` appends the refinement arm's "Either author the model…"
 /// tail to the Ob.4 message; `noun`/`known` fix the Ob.1 wording ("action"/
 /// "actions" vs "id"/"definitions"). `target == None` skips Ob.1 (a waiver with
 /// no action). Message text is byte-identical to the former per-arm formats.
@@ -2776,30 +2558,6 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
         );
     }
 
-    // ---- Obligation 4 + 1 for PROOF anchors (TRUST_NATIVE_TLA §4, Phase 4) ----
-    // A `proof_anchor!`'d kani harness joins the SAME (machine, action) namespace as a
-    // refinement, so it must satisfy the SAME structural obligations: its `machine`
-    // resolves to a registered SpecModule (Ob.4) and its `action` exists in that machine
-    // (Ob.1). This is the teeth of the unified ledger — a proof_anchor naming a bogus
-    // action fails the gate exactly like a #[refines] would. (A proof anchor does NOT
-    // discharge the coverage obligation — kani is bounded-LOCAL, not the temporal binding
-    // coverage demands — so it is intentionally NOT folded into `bound` below.)
-    for p in proof_anchors() {
-        check_anchor_obligations(
-            &mut violations,
-            resolve(p.machine),
-            AnchorObligationSpec {
-                site: &format!("proof_anchor! at {} (proof `{}`)", p.location, p.proof_name),
-                machine: p.machine,
-                target: Some(p.action),
-                select: |idx| &idx.1,
-                authoring_hint: true,
-                noun: "action",
-                known: "actions",
-            },
-        );
-    }
-
     // ---- Obligation 3: coverage over active machines, report over the rest ----
     // Bind/waive sets keyed by the MODULE's declared name (canonical).
     let mut bound: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -2872,7 +2630,6 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::derive::{cursor_model, ring_model};
     use crate::tla_check::TlaSpec;
 
     /// TRUST_VACUITY_GATE §2.4 LOCK (finding 4): an EXTERNAL module's `action_names()`
@@ -2904,64 +2661,6 @@ mod tests {
             m.invariant_names().contains("Apply"),
             "the def set is a superset of actions"
         );
-    }
-
-    // A real proof_anchor! invocation at module level (the kani-half of the ledger).
-    // Submitted into the inventory slice for this crate's own unit-test binary, so the
-    // collection / resolution / ledger path is exercised in aterm-spec itself (NOT inside
-    // any #[cfg(kani)] block — that is the whole point of the decoupling).
-    crate::proof_anchor!(
-        machine = "Ring",
-        action = "Push",
-        proof = "aterm_spec_self_test_ring_push"
-    );
-    crate::proof_anchor!(
-        machine = "Cursor",
-        action = "Grow",
-        proof = "aterm_spec_self_test_cursor_grow"
-    );
-
-    #[test]
-    fn proof_anchor_macro_submits_a_collectable_kani_record() {
-        let mine: Vec<_> = proof_anchors()
-            .filter(|p| p.proof_name.starts_with("aterm_spec_self_test_"))
-            .collect();
-        assert_eq!(
-            mine.len(),
-            2,
-            "both self-test proof anchors should be collected"
-        );
-        assert!(mine.iter().all(|p| p.kind == ProofKind::Kani));
-        let ring = mine
-            .iter()
-            .find(|p| p.machine == "Ring")
-            .expect("ring anchor");
-        assert_eq!(ring.action, "Push");
-        assert!(
-            ring.location.contains("xref.rs"),
-            "location is file:line: {}",
-            ring.location
-        );
-    }
-
-    #[test]
-    fn proof_anchor_machine_action_resolves_under_the_closure() {
-        // The proof anchors above name (Ring, Push) and (Cursor, Grow) — both REAL model
-        // actions, so check_closure must NOT flag them (Ob.1/Ob.4 satisfied). We isolate
-        // the proof-anchor obligations by checking no violation mentions a self-test proof.
-        let modules = vec![
-            SpecModule::Embedded(ring_model()),
-            SpecModule::Embedded(cursor_model()),
-        ];
-        let report = check_closure(&modules);
-        for v in &report.violations {
-            assert!(
-                !v.message.contains("aterm_spec_self_test_"),
-                "a VALID self-test proof anchor was wrongly flagged: [Ob.{}] {}",
-                v.obligation,
-                v.message
-            );
-        }
     }
 
     // ── The per-step audit's DERIVATIONS, on synthetic ledgers ──────────────
@@ -3213,74 +2912,6 @@ mod tests {
             audit.dark_sites,
             vec!["Ring::Evict @ batch"],
             "…and the site that never ran is reported instead of vanishing"
-        );
-    }
-
-    /// A `#[spec_unmodeled]` waiver is a stated reason the code is NOT bound: it
-    /// marks its row `waived`, never `ty`, so "ty=✓" counts `#[refines]` bindings
-    /// alone (PROOF_CARRYING_PERFORMANCE.md's "Ledger rows fully green").
-    #[test]
-    fn a_waiver_marks_its_row_waived_never_ty() {
-        let modules = vec![SpecModule::Embedded(cursor_model())];
-        let ledger = ledger_of(
-            &modules,
-            [("Cursor", "Deliver")].into_iter(),
-            [("Cursor", "Deliver"), ("Cursor", "Grow"), ("", "")].into_iter(),
-            std::iter::empty(),
-        );
-        let row = |action: &str| {
-            ledger
-                .iter()
-                .find(|e| e.machine == "Cursor" && e.action == action)
-                .unwrap_or_else(|| panic!("Cursor::{action} row"))
-        };
-        let (bound, waived) = (row("Deliver"), row("Grow"));
-        assert!(bound.ty && bound.waived, "{}", bound.render());
-        assert!(bound.render().starts_with("ty=✓  "), "{}", bound.render());
-        assert!(!waived.ty && waived.waived, "{}", waived.render());
-        assert!(
-            waived.render().starts_with("ty=waived  kani-anchor=–"),
-            "{}",
-            waived.render()
-        );
-    }
-
-    #[test]
-    fn verifier_ledger_marks_kani_for_proof_anchored_actions() {
-        let modules = vec![
-            SpecModule::Embedded(ring_model()),
-            SpecModule::Embedded(cursor_model()),
-        ];
-        let ledger = verifier_ledger(&modules);
-        // Ring::Push is proof-anchored (kani-anchor=✓) by the self-test above.
-        let ring_push = ledger
-            .iter()
-            .find(|e| e.machine == "Ring" && e.action == "Push")
-            .expect("Ring::Push row");
-        assert!(
-            ring_push.kani,
-            "Ring::Push must be kani-anchored in the ledger"
-        );
-        assert!(ring_push.proofs.contains("aterm_spec_self_test_ring_push"));
-        // Cursor::Deliver is NOT proof-anchored here (kani-anchor=–).
-        let deliver = ledger
-            .iter()
-            .find(|e| e.machine == "Cursor" && e.action == "Deliver")
-            .expect("Cursor::Deliver row");
-        assert!(
-            !deliver.kani,
-            "Cursor::Deliver has no proof anchor — kani-anchor must be –"
-        );
-        // The render is the per-(machine,action) ledger line shape.
-        assert!(
-            ring_push.render().contains("kani-anchor=✓  Ring::Push"),
-            "{}",
-            ring_push.render()
-        );
-        assert!(
-            deliver.render().contains("kani-anchor=–  Cursor::Deliver"),
-            "{}",
-            deliver.render()
         );
     }
 

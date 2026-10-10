@@ -107,9 +107,7 @@ fn combining_without_a_preceding_cell_is_kept_and_advances_content() {
     );
     assert!(
         term.content_seq() > before,
-        "a retained mark changed the grapheme, so content readers must be \
-         invalidated — the old test asserted the reverse, which only held \
-         while the mark was being thrown away"
+        "a retained mark changed the grapheme: content readers must be invalidated"
     );
     assert_eq!(
         (term.cursor().row, term.cursor().col),

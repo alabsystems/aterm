@@ -339,6 +339,7 @@ pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
                 key: Key::Character(c.to_ascii_lowercase()),
                 mods,
                 base_layout: base_explicit,
+                layout_text: None,
                 event_type,
             }),
             _ => None,
@@ -348,6 +349,7 @@ pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
         key: Key::Named(named),
         mods,
         base_layout: base_explicit,
+        layout_text: None,
         event_type,
     })
 }
@@ -391,6 +393,7 @@ pub(crate) fn control_attempt_closes_cursor_license(verb: &str) -> bool {
             | "ctrl"
             | "feed"
             | "signal"
+            | "restart"
             | "mouse"
             | "paste"
             | "focus"
@@ -889,13 +892,15 @@ pub(crate) fn input_if_fenced(
             key,
             mods,
             base_layout,
+            layout_text,
             event_type,
-        } => aterm_types::keyboard::encode_key_with_layout(
+        } => aterm_types::keyboard::encode_key_with_text(
             key,
             *mods,
             terminal.keyboard_mode(),
             *event_type,
             *base_layout,
+            *layout_text,
         ),
         // Raw bytes go to the PTY verbatim — the `send` policy, no encoder.
         InputEvent::KeySequence(bytes) => bytes.clone(),
@@ -1082,6 +1087,7 @@ pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
         key: Key::Character(c.to_ascii_lowercase()),
         mods: Modifiers::CTRL,
         base_layout: None,
+        layout_text: None,
         event_type: aterm_types::keyboard::KeyEventType::Press,
     })
 }
@@ -1145,7 +1151,8 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
 /// verb refuses discards nothing. The reply does not wait to see the program
 /// end: a published stall whose program lives through the signal stays
 /// published, and names `signal kill` once it has for five seconds
-/// ([`crate::input_stall::Restart`]).
+/// ([`crate::input_stall::Restart`]) — or, where the act would be carried,
+/// the explicit `restart` ([`crate::restart_act::offered`]).
 ///
 /// POSIX-only: on Windows (no process groups / killpg for a ConPTY) the verb
 /// stays in the table but honestly replies
@@ -1186,29 +1193,48 @@ pub(crate) fn cmd_signal(
     // (`input_stall::discard_before_signal`, 2026-09-25).
     let discarded = crate::input_stall::discard_before_signal(master, sink, sig);
     let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
-    let reply = if let Some(pid) = pid {
+    // A signal is just a signal: the harness reads the exit it causes as the
+    // program's own. The restart that is recognised as one is `restart`
+    // (`crate::restart_act`), whose record comes before its signal.
+    let rc = match pid {
         // SAFETY: `kill` on a pid this terminal's own foreground group is led
         // by, re-read just above.
-        let rc = unsafe { libc::kill(pid, sig) };
-        if rc == 0 {
-            format!("OK signalled pid {pid}{tail}\n")
-        } else {
-            format!("ERR kill failed{tail}\n")
-        }
-    } else {
+        Some(pid) => unsafe { libc::kill(pid, sig) },
         // SAFETY: `killpg` on the terminal's own foreground group, read from
         // the master just above; it takes no pointers.
-        let rc = unsafe { libc::killpg(pgrp, sig) };
-        if rc == 0 {
-            format!("OK signalled pgrp {pgrp}{tail}\n")
-        } else {
-            format!("ERR killpg failed{tail}\n")
-        }
+        None => unsafe { libc::killpg(pgrp, sig) },
+    };
+    let reply = match (pid, rc) {
+        (Some(pid), 0) => format!("OK signalled pid {pid}{tail}\n"),
+        (Some(_), _) => format!("ERR kill failed{tail}\n"),
+        (None, 0) => format!("OK signalled pgrp {pgrp}{tail}\n"),
+        (None, _) => format!("ERR killpg failed{tail}\n"),
     };
     // A program that lives through it keeps its stall (2026-09-25, third
     // round): the watch looks now (`input_stall::after_signal`).
     crate::input_stall::after_signal(sink, sig);
     reply
+}
+
+/// THE `signal` VERB AS THE CONTROL DISPATCH RUNS IT ([`super::handle`]'s
+/// arm): [`cmd_signal`] on the session's own person stamp (`human_ms`, read
+/// now). One function for the dispatch and for the tests that drive the real
+/// verb.
+pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
+    cmd_signal(
+        master,
+        rest,
+        &ctx.sink,
+        ctx.human_input.ms_since(crate::metrics::now_us()),
+    )
+}
+
+/// THE `restart` VERB AS THE CONTROL DISPATCH RUNS IT ([`super::handle`]'s
+/// arm): the explicit restart of the tab's agent in place
+/// ([`crate::restart_act`]). One wiring function, as [`signal_verb`] is, so
+/// the act the dispatch makes is the one its tests drive.
+pub(crate) fn restart_verb(master: i32, rest: &str, ctx: &std::sync::Arc<SessionCtx>) -> String {
+    crate::restart_act::restart(master, rest, ctx)
 }
 
 /// PURE parser for `signal <name> [pid=<n>] [quiet=<s>]` → (signal number,
@@ -2528,6 +2554,7 @@ mod tests {
     /// driver would be.
     #[cfg(target_os = "macos")]
     fn typeahead_after_restart(remedy: Remedy, typed: Typed) -> (bool, Option<String>) {
+        use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
         use std::time::Duration;
@@ -2537,9 +2564,11 @@ mod tests {
         // SAFETY: `slave` is a fresh fd this function alone owns.
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks.
+        // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks;
+        // the strip first, so the shell holds its terminal and nothing else of this process.
         let mut shell = std::process::Command::new("/bin/zsh");
         shell
+            .inherit_nothing()
             .args(["-f", "-i"])
             .env("TERM", "xterm")
             .stdin(stdio())
@@ -2672,7 +2701,7 @@ mod tests {
                         master,
                         &format!("term pid={pgrp} quiet=120"),
                         &sink,
-                        Some(5_000)
+                        Some(5_000),
                     ),
                     "ERR busy person human_ms=5000\n"
                 );
@@ -2681,7 +2710,7 @@ mod tests {
                         master,
                         &format!("term pid={pgrp} quiet=1"),
                         &sink,
-                        Some(5_000)
+                        Some(5_000),
                     ),
                     format!("ERR busy input-unread bytes={unread}\n"),
                     "a person past the grace is no hold; the unread input still is"
@@ -3289,6 +3318,7 @@ mod video_keys_ledger_tests {
                 key: Key::Named(NamedKey::ShiftLeft),
                 mods: Modifiers::default(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
         ] {

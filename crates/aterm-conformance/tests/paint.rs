@@ -5,8 +5,9 @@
 //!
 //! Launches a release-profile `aterm` headless, drives real keystrokes through
 //! the control socket, captures the take, and asserts on the pixels through
-//! `tools/paint-conformance/paint_probe.sh`, the same driver and scanner the
-//! release cut's paint smoke uses (docs/RELEASE-PROOF-DISCIPLINE.md).
+//! `tools/paint-conformance/paint_probe.sh`. Run by `tools/verify.sh --measure
+//! <aterm.app>` against the executable of the bundle a release built once, it is
+//! the release's pixel proof of the bytes it ships (docs/RELEASE-PROOF-DISCIPLINE.md).
 //!
 //! The matrix has 23 live-artifact rows plus the scanner's semantic negative
 //! controls: prompt, fake-Claude, ESC7/ESC8 streamer and cold-output shapes; a
@@ -43,8 +44,9 @@
 //!
 //! The merge gate's test run skips every `measuring::…` test
 //! (`aterm_verify::stages::MEASURING_TESTS`); they are the MEASURE tier
-//! (`tools/verify.sh --measure`, `--full`), run alone in the exclusive
-//! `measuring tests` stage, and a release cut requires them green. A probe
+//! (`tools/verify.sh --measure <APP>`, `--full <APP>`), run alone in the
+//! exclusive `measuring tests` stage over the release bundle the release built
+//! once, and a release signs only bytes they measured green. A probe
 //! that decides nothing (exit 2, or paint's unproved exit 3) is recorded as
 //! COULD NOT RUN, never as a finding or as green.
 //!
@@ -52,7 +54,7 @@
 //! macOS bundle's binary. The video rows audit a real-time pipeline, so
 //! verdict-bearing runs want a quiet machine; re-run a charged video row with
 //! `ATERM_PAINT_KEEP=1` before believing or dismissing it (the probe header's
-//! LOAD sensitivity note). The binary is release profile, handed over in
+//! LOAD sensitivity note). The binary is the release bundle's, handed over in
 //! `ATERM_PAINT_BIN`; without it a row says `not measured`
 //! (`support::release_bin`).
 #![cfg(target_os = "macos")]

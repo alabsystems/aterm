@@ -4,7 +4,7 @@
 use aterm_spec::derive::{harness_upgrade_goal_pause_liveness, harness_upgrade_goal_pause_model};
 use aterm_spec::{interp, verify};
 
-/// THE LIVE UPGRADE'S GOAL PAUSE (the owner's decision of 2026-09-28): a
+/// THE LIVE UPGRADE'S GOAL PAUSE: a
 /// goal the upgrade paused is resumed before the host lets the tab go, the
 /// Esc is pressed only at a turn's head, the goal is resumed once and never
 /// over a person's hand, and no pause is made under an open switch or before
@@ -83,7 +83,7 @@ fn the_goal_pause_is_resumed_once_and_never_cuts_a_tool_off() {
 
     // A person's hand on a pause the lane has not seen yet: what shows may be
     // theirs (their Esc, their own `/goal pause`) — released, never taken,
-    // and nothing is resumed after the move (the review of 2026-09-28).
+    // and nothing is resumed after the move.
     let mut q = model.init_state();
     for a in ["Advance", "GoalPause", "PersonPauses"] {
         assert!(model.fire(a, &mut q), "{a}");

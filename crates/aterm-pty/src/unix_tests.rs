@@ -1236,10 +1236,12 @@ fn alone() -> bool {
         test.replace("::", "-")
     ));
     let out = std::fs::File::create(&log).expect("the child's log");
-    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+    // `spawnfd`'s: the re-run holds its stdio and nothing else of this process,
+    // not another test thread's pipe for as long as it runs.
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
         .env(RUN_ALONE, &test)
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(out.try_clone().expect("the log, twice"))
         .stderr(out)
         .spawn()

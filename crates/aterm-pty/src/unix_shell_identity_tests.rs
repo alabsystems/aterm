@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 /// A hang detector, never a latency budget: a reap ends the wait the moment
@@ -57,23 +56,17 @@ fn parked_session(script: &str) -> SpawnedShell {
 /// The bystander: a `sleep` in its OWN session (`setsid`), so it is a
 /// session leader and a group leader — the shape the old
 /// `getpgid(pid) == pid` guard could not tell from a shell.
-fn setsid_sleep() -> std::process::Child {
-    let mut command = std::process::Command::new("/bin/sleep");
-    command.arg("30");
-    // SAFETY: `setsid` is async-signal-safe and touches no parent state;
-    // it is the only thing run between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().expect("the bystander sleep must spawn")
+/// `spawnfd`'s, its session a spawn attribute: it holds its stdio and nothing
+/// else of this process, not another test thread's pipe for as long as it lives.
+fn setsid_sleep() -> aterm_uds::spawnfd::Child {
+    aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("30")
+        .setsid(true)
+        .spawn()
+        .expect("the bystander sleep must spawn")
 }
 
-fn end(mut child: std::process::Child) {
+fn end(mut child: aterm_uds::spawnfd::Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -174,7 +167,7 @@ fn adoption_records_a_birth_only_for_the_ptys_session_leader() {
     assert!(!stranger.verify(), "and so it never verifies");
 }
 
-/// POSITIVE CONTROL — the historical teardown survives for a VERIFIED
+/// POSITIVE CONTROL — the teardown survives for a VERIFIED
 /// shell (`docs/DESIGN-pty-keeper-2026-09-26.md` F3): its group is hung up,
 /// and one that ignores `SIGHUP` is still force-killed at the ~250 ms tick.
 /// Recorded the adopted way, so the escalation is authorized by the start
@@ -227,7 +220,7 @@ fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
     // is COUNTED in the loop's own ticks — the SIGKILL went out at the kill
     // tick, and the loop saw the death before its give-up tick — rather
     // than timed: a descheduled test thread stretches the ticks, never
-    // their number, and it outlasted the old 1.5 s stopwatch.
+    // their number.
     assert!(
         took >= REAP_POLL * REAP_KILL_AT,
         "it outlived SIGHUP (took {took:?})"
@@ -279,8 +272,7 @@ fn still_unreaped_after(pid: i32, patience: Duration) -> bool {
     is_unreaped_child(pid)
 }
 
-/// THE WINDOW'S ZOMBIE (2026-09-29: pid 61283, a child of the owner's
-/// window born the second a fresh tab spawned, `<defunct>` hours later).
+/// THE WINDOW'S ZOMBIE: a tab's shell left `<defunct>` under the window.
 ///
 /// A session leader that exits with output still queued on its terminal
 /// does not become a zombie: its exit sleeps in the tty drain until someone
@@ -405,9 +397,8 @@ fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
 }
 
 /// `reap_in_background` waits for a helper nobody else waits for. The
-/// control — the same helper as a `std` child simply dropped, which is
-/// what the window's link opener did — is still an unreaped zombie
-/// afterwards.
+/// control — the same helper as a `std` child simply dropped — is still an
+/// unreaped zombie afterwards.
 #[test]
 fn a_child_handed_to_the_reaper_is_reaped_and_a_dropped_one_is_not() {
     let dropped = std::process::Command::new("/usr/bin/true")

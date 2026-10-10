@@ -5434,6 +5434,9 @@ fn fill_divider_grid_cells<T>(
     }
     reset_sparse_rows(&mut dst.clusters, rows, keep);
     reset_sparse_rows(&mut dst.combining, rows, keep);
+    // BiDi maps: a seam row is in logical order, and each pane blit re-lays
+    // its own rows' maps at its columns.
+    reset_sparse_rows(&mut dst.visual_to_logical, rows, keep);
     // Inline-image placements are per-row sparse like clusters/combining; reset them
     // to exactly `rows` empty rows each compose frame, mirroring `cell_frame_into`'s
     // `images.resize_with(rows, Vec::new)`. Without this, `prepend_strip_rows`
@@ -6077,6 +6080,28 @@ pub(crate) fn blit_pane_into_retained(
                 aterm_render::rgb_to_u32(blank.bg),
             ));
             dst_spans.sort_unstable_by_key(|span| span.start_col);
+        }
+        // A BiDi-reordered pane row keeps its visual→logical map in frame
+        // columns, so the composed selection (whose anchors are frame columns
+        // too) still lights the cells it copies. The map permutes the pane's
+        // materialized prefix only; a stale snapshot wider than the pane (the
+        // resize-convergence case above) or than the composite row has no map
+        // that fits, and stays in painted order for that frame.
+        let src_map = src.visual_to_logical_row(sr);
+        let map_end = col_off.saturating_add(src_map.len());
+        if !src_map.is_empty()
+            && src_map.len() <= src.cols
+            && map_end <= pane_end
+            && let Some(dst_map) = dst.visual_to_logical.get_mut(dr)
+        {
+            if dst_map.len() < map_end {
+                let identity_from = dst_map.len();
+                dst_map
+                    .extend((identity_from..map_end).map(|c| u16::try_from(c).unwrap_or(u16::MAX)));
+            }
+            for (v, &l) in src_map.iter().enumerate() {
+                dst_map[col_off + v] = u16::try_from(col_off + usize::from(l)).unwrap_or(u16::MAX);
+            }
         }
         // The per-row (col, _) lists must stay sorted by column with one entry per
         // column so the renderers' per-column lookups binary-search instead of
@@ -9783,7 +9808,7 @@ impl App {
         clip: Option<ComposedCursorEffectClip>,
         cursor_override: Option<CursorStyle>,
     ) -> bool {
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
             return false;
         };
         let valid = window.composed_cursor_effect_valid;
@@ -10161,7 +10186,7 @@ impl App {
         if let Some((caret_row, _, _)) = row_probe {
             let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
             let (wanted, needs_read) = {
-                let Some(window) = self.windows.get_mut(&wid) else {
+                let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
                     return false;
                 };
                 let WindowState {
@@ -10209,7 +10234,7 @@ impl App {
                     if local >= pane_rows {
                         continue;
                     }
-                    let Some(window) = self.windows.get_mut(&wid) else {
+                    let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
                         return false;
                     };
                     let WindowState {
@@ -14945,11 +14970,14 @@ impl App {
         // active, at its line mapped through the display offset (off-viewport keeps
         // the normal cursor). Render-only; after the prediction override so
         // copy-mode wins. The tab-strip splice shifts it with the normal cursor.
+        // Its column is logical (the selection it steers is): on a BiDi row it
+        // is painted on the cell that holds that column, as the fill already
+        // did for the terminal cursor.
         if let Some((row, col)) = vi_cursor_override
             && let Some(ws) = self.windows.get_mut(&id)
         {
             ws.input_scratch.cursor_row = row;
-            ws.input_scratch.cursor_col = col;
+            ws.input_scratch.cursor_col = ws.input_scratch.visual_col(row, col);
             ws.input_scratch.cursor_visible = true;
         }
         // Record whether this present painted a guess, so the early-out repaints
@@ -19349,10 +19377,15 @@ impl App {
         }
         // Paint the vi (copy-mode) cursor instead of the terminal cursor while
         // steering, mapped through the focused pane's display offset into window
-        // coords; after the prediction advance so copy-mode wins.
+        // coords; after the prediction advance so copy-mode wins. Its column is
+        // logical, as in the single-pane override: the composite carries the
+        // pane's BiDi map at its window columns, so it is looked up there.
         if let Some((vr, vc)) = focus_vi_screen {
-            ws.input_scratch.cursor_row = usize::from(focus_off.0) + vr;
-            ws.input_scratch.cursor_col = usize::from(focus_off.1) + vc;
+            let row = usize::from(focus_off.0) + vr;
+            ws.input_scratch.cursor_row = row;
+            ws.input_scratch.cursor_col = ws
+                .input_scratch
+                .visual_col(row, usize::from(focus_off.1) + vc);
             ws.input_scratch.cursor_visible = true;
         }
         // Record whether this present painted a guess, so the early-out repaints
@@ -20331,8 +20364,28 @@ impl App {
                 } else {
                     cols_wide - 1
                 };
-                let row = &mut ws.input_scratch.cells[strip + term_row as usize];
-                for cell in row.iter_mut().take(through + 1).skip(from) {
+                let frame_row = strip + term_row as usize;
+                let row = &mut ws.input_scratch.cells[frame_row];
+                // `from..=through` are LOGICAL columns, as the search reads the
+                // grid; on a BiDi-reordered row the cell painted at `v` holds
+                // logical column `map[v]`, so tint where that falls in the hit.
+                let map = ws
+                    .input_scratch
+                    .visual_to_logical
+                    .get(frame_row)
+                    .map_or(&[][..], Vec::as_slice);
+                // An unpermuted row (every row of an LTR screen) scans just the
+                // hit; a permuted one may paint the hit anywhere in the row.
+                let (scan_from, scan_end) = if map.is_empty() {
+                    (from, through.saturating_add(1))
+                } else {
+                    (0, row.len())
+                };
+                for (v, cell) in row.iter_mut().enumerate().take(scan_end).skip(scan_from) {
+                    let logical = map.get(v).map_or(v, |&l| usize::from(l));
+                    if !(from..=through).contains(&logical) {
+                        continue;
+                    }
                     cell.bg = hi;
                     if !is_current {
                         cell.fg = crate::settings::u32_rgb(aterm_render::floor_selection_fg(
@@ -20363,6 +20416,10 @@ impl App {
             }
             if let Some(c) = ws.input_scratch.combining.get_mut(frame_row) {
                 c.clear();
+            }
+            // The bar paints in logical order: no BiDi map on its rows.
+            if let Some(m) = ws.input_scratch.visual_to_logical.get_mut(frame_row) {
+                m.clear();
             }
             if let Some(im) = ws.input_scratch.images.get_mut(frame_row) {
                 im.clear();
@@ -21179,6 +21236,9 @@ impl App {
                 }
                 if let Some(c) = ws.input_scratch.combining.get_mut(r) {
                     c.clear();
+                }
+                if let Some(m) = ws.input_scratch.visual_to_logical.get_mut(r) {
+                    m.clear();
                 }
                 if let Some(im) = ws.input_scratch.images.get_mut(r) {
                     im.clear();

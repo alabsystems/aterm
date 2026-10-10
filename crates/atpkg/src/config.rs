@@ -31,11 +31,11 @@
 //! `[packages.links]` (a checkout-path link is a dev link and stays). A dropped `prefix`
 //! naming another store also stops unattended installs until the line is removed
 //! ([`PackagesConfig::installs_unattended`]). Every load-time note is said ONCE per
-//! process ([`crate::notice::say_spelling`]). `channel`, `include` and
-//! `tracked_install` are retired: named once and ignored. Nothing here is a trust input: the
-//! account is slug-validated downstream, and a `[packages.links]` entry can only
-//! redirect WHERE bytes are fetched from or suppress registry management — never what
-//! verifies (§5/§8: the host is not an authenticity input).
+//! process ([`crate::notice::say_spelling`]). `channel` and `include` are retired: named
+//! once and ignored. Nothing here is a trust input: the account is slug-validated
+//! downstream, and a `[packages.links]` entry can only redirect WHERE bytes are fetched
+//! from or suppress registry management — never what verifies (§5/§8: the host is not an
+//! authenticity input).
 //!
 //! A missing file, or a file without a `[packages]` table, yields the `[packages]`
 //! defaults: automatic updates and installs on, no links, compiled account — the
@@ -142,10 +142,6 @@ pub struct PackagesConfig {
     pub include: Option<aterm_toml::Value>,
     /// Narrowing-only exclude filter: the per-program opt-out.
     pub exclude: Option<Vec<String>>,
-    /// RETIRED: the policy of the deleted untracked install lanes — the store heal is the one cure
-    /// for the macOS tag ([`crate::provenance::heal_store`]). Parsed as any value, named once at
-    /// load, never read.
-    pub tracked_install: Option<aterm_toml::Value>,
     /// `[packages.links]`: `name = "/path/to/checkout"` (or `~/…`) declares a
     /// managed dev-link ([`crate::linkmode`] — registry management skipped; a
     /// maintainer's key, never in Settings); `name = "owner/repo"` declares a
@@ -254,9 +250,8 @@ impl PackagesConfig {
 
     /// What doctor says about this table's spelling — one line per key a person should
     /// rename or remove: the retired `auto_update`/`seed_install` (still honoured), and
-    /// the retired `channel`/`include`/`tracked_install` (ignored). The development
-    /// settings a shipped binary dropped are named at load ([`admit_packages`]), where they
-    /// are dropped.
+    /// the retired `channel`/`include` (ignored). The development settings a shipped binary
+    /// dropped are named at load ([`admit_packages`]), where they are dropped.
     #[must_use]
     pub fn config_notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -289,7 +284,6 @@ impl PackagesConfig {
         for (key, present) in [
             ("channel", self.channel.is_some()),
             ("include", self.include.is_some()),
-            ("tracked_install", self.tracked_install.is_some()),
         ] {
             if present {
                 notes.push(retired_key_note(key));
@@ -335,10 +329,6 @@ fn retired_key_note(key: &str) -> String {
     match key {
         "channel" => "[packages] channel is retired — atpkg reads the one `stable` channel; \
                       remove the key"
-            .to_string(),
-        "tracked_install" => "[packages] tracked_install is retired — atpkg clears the macOS \
-                              tag from installed files itself (`aterm pkg repair`); remove \
-                              the key"
             .to_string(),
         _ => format!(
             "[packages] {key} is retired — a machine keeps the whole signed set minus \
@@ -465,30 +455,21 @@ pub fn config_path() -> Option<PathBuf> {
 /// first open and keeps applied (a pass carries only an edit to the table). Read by atpkg because
 /// atpkg APPLIES them: the GUI only renders the resulting `machine-settings:` row.
 ///
-/// All-Option like [`PackagesConfig`]; defaults live ONLY in the resolver methods. Both
-/// defaults ACT — this is the one table whose "absent" means "do the doctor's remedy" —
-/// so the opt-outs are spelled explicitly: `spotlight_noindex = false`,
-/// `universal_control = "leave"`.
+/// All-Option like [`PackagesConfig`]; defaults live ONLY in the resolver methods. The
+/// default ACTS — this is the one table whose "absent" means "do the doctor's remedy" —
+/// so the opt-out is spelled explicitly: `universal_control = "leave"`.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct MachineConfig {
-    /// `[machine].spotlight_noindex`: rename every cargo target dir the doctor's scan
-    /// finds under `$HOME` to its `.noindex` form and keep that repo's cargo pointed at
-    /// it (a `target` symlink in a git checkout, a `.cargo/config.toml` edit elsewhere)
-    /// — by `aterm pkg machine apply` (which the window runs as it opens and a terminal
-    /// session once a day), and at a seed/update/install pass when the `[machine]` table
-    /// changed.
-    /// Default `true`.
-    pub spotlight_noindex: Option<bool>,
     /// `[machine].universal_control`: `"off"` (default) writes
     /// `com.apple.universalcontrol Disable`/`DisableMagicEdges` for the current host when
     /// they are not already set; `"leave"` never touches them.
     pub universal_control: Option<String>,
-    /// The config file EXISTS and could not be parsed, so neither opt-out above could be
+    /// The config file EXISTS and could not be parsed, so the opt-out above could not be
     /// read. Never deserialized — [`parse_machine`] sets it.
     ///
-    /// FAIL CLOSED. Both defaults ACT, so "malformed ⇒ defaults" would let a typo anywhere
-    /// in `aterm.toml` re-enable changes the owner switched off. A table whose defaults
+    /// FAIL CLOSED. The default ACTS, so "malformed ⇒ defaults" would let a typo anywhere
+    /// in `aterm.toml` re-enable a change the owner switched off. A table whose defaults
     /// change the machine may not be inferred from a file nobody could read.
     #[serde(skip)]
     pub unreadable: bool,
@@ -505,8 +486,8 @@ pub enum UniversalControlPolicy {
 }
 
 impl MachineConfig {
-    /// The reading a `[machine]` table we could not PARSE gets: touch nothing, with both
-    /// opt-outs spelled out.
+    /// The reading a `[machine]` table we could not PARSE gets: touch nothing, with the
+    /// opt-out spelled out.
     ///
     /// Not [`Self::default`], which is the opposite — every default in this table ACTS,
     /// so falling to it over an unreadable file meant a hand-edited typo silently
@@ -516,19 +497,12 @@ impl MachineConfig {
     #[must_use]
     pub fn inert() -> Self {
         Self {
-            spotlight_noindex: Some(false),
             universal_control: Some("leave".to_string()),
             // An inert table is not by itself an unreadable one: a caller may build
             // this for its own reasons. `parse_machine` sets the flag when the file is
             // what could not be read.
             unreadable: false,
         }
-    }
-
-    /// `[machine].spotlight_noindex`, default `true`.
-    #[must_use]
-    pub fn spotlight_noindex(&self) -> bool {
-        self.spotlight_noindex.unwrap_or(true)
     }
 
     /// `[machine].universal_control`, default `off`. An unrecognised spelling is
@@ -586,9 +560,14 @@ pub struct RerouteConfig {
     /// Trust tool is missing. Default TRUE. `false` silences the line and changes
     /// nothing else — the upstream tool still runs, and a DIRECT row still says what it
     /// substituted (that line is the "never silently substituting" guarantee itself).
+    /// A refusal is not an announcement: inside a Trust source checkout a `cargo`/`rustc`
+    /// that is not Trust is refused whatever this says
+    /// ([`crate::reroute::trust_checkout_refusal`]).
     pub announce: Option<bool>,
     /// `[reroute].strict`: default FALSE — every stub runs something, with a one-line
-    /// notice. `true` refuses instead: `z3` refuses (exit 2),
+    /// notice, except a `cargo`/`rustc` that is not Trust inside a Trust source checkout
+    /// ([`crate::reroute::trust_checkout_refusal`]). `true` refuses instead: `z3` refuses
+    /// (exit 2),
     /// a DIRECT row whose Trust tool is missing exits 127 instead of running upstream,
     /// and a stub that cannot reach atpkg exits 2 instead of walking PATH.
     pub strict: Option<bool>,
@@ -711,7 +690,7 @@ fn not_toml_note(text: &str) -> Option<String> {
 
 /// The per-key admission a WELL-FORMED `[packages]` table still gets, once, at load.
 ///
-/// RETIRED AND DEVELOPMENT KEYS. A retired `channel`/`include`/`tracked_install` is named
+/// RETIRED AND DEVELOPMENT KEYS. A retired `channel`/`include` is named
 /// ([`crate::notice::say_spelling`]) and never read. In a shipped binary (`dev_seams`
 /// false) the development settings — `prefix`, `account`, and every `owner/repo` value of
 /// `[packages.links]` — are named and DROPPED from the table, so no resolver downstream
@@ -729,7 +708,6 @@ fn admit_packages(mut cfg: PackagesConfig, dev_seams: bool, home: Option<&Path>)
     for (key, present) in [
         ("channel", cfg.channel.is_some()),
         ("include", cfg.include.is_some()),
-        ("tracked_install", cfg.tracked_install.is_some()),
     ] {
         if present {
             crate::notice::say_spelling(&retired_key_note(key));
@@ -814,7 +792,7 @@ pub fn parse_machine(text: &str) -> MachineConfig {
             if !say_not_toml(text) {
                 crate::notice::say(&format!(
                     "[machine] in aterm.toml: {e} \u{2014} its settings are not applied; \
-                     Universal Control and Spotlight are left as they are"
+                     Universal Control is left as it is"
                 ));
             }
             MachineConfig {
@@ -893,16 +871,13 @@ pub fn cached() -> &'static PackagesConfig {
 mod tests {
     use super::*;
 
-    // `[machine]`: both defaults ACT (spotlight on, Universal Control off); the two
-    // opt-outs are the explicit spellings; a word the owner did not write is inert.
+    // `[machine]`: the default ACTS (Universal Control off); the opt-out is the explicit
+    // spelling; a word the owner did not write is inert.
     #[test]
     fn machine_table_defaults_act_and_opt_outs_are_explicit() {
         let none = parse_machine("font_px = 12.0\n[packages]\nexclude = [\"trust\"]\n");
-        assert!(none.spotlight_noindex());
         assert_eq!(none.universal_control(), UniversalControlPolicy::Off);
-        let off =
-            parse_machine("[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n");
-        assert!(!off.spotlight_noindex());
+        let off = parse_machine("[machine]\nuniversal_control = \"leave\"\n");
         assert_eq!(off.universal_control(), UniversalControlPolicy::Leave);
         let explicit = parse_machine("[machine]\nuniversal_control = \"off\"\n");
         assert_eq!(explicit.universal_control(), UniversalControlPolicy::Off);
@@ -918,11 +893,13 @@ mod tests {
             "a [machine] table that does not parse falls to the INERT reading, loudly: \
              these defaults ACT, and unreadable words are no licence to write the host"
         );
-        assert!(!unreadable.spotlight_noindex());
         // The two tables come out of one file, independently.
-        let both = "[packages]\nexclude = [\"ay\"]\n[machine]\nspotlight_noindex = false\n";
+        let both = "[packages]\nexclude = [\"ay\"]\n[machine]\nuniversal_control = \"leave\"\n";
         assert_eq!(parse_packages(both).exclude(), ["ay".to_string()]);
-        assert!(!parse_machine(both).spotlight_noindex());
+        assert_eq!(
+            parse_machine(both).universal_control(),
+            UniversalControlPolicy::Leave
+        );
     }
 
     /// A TYPO IN `[packages]` MUST NOT RE-ARM THE ACTING `[machine]` DEFAULTS. Each table
@@ -932,19 +909,15 @@ mod tests {
     #[test]
     fn a_packages_typo_never_re_arms_the_machine_defaults() {
         let typo = "[packages]\nauto_install = \"yes\"\n[machine]\n\
-                    universal_control = \"leave\"\nspotlight_noindex = false\n";
+                    universal_control = \"leave\"\n";
         let m = parse_machine(typo);
         assert_eq!(
             m.universal_control(),
             UniversalControlPolicy::Leave,
             "a [packages] type error must not cancel an explicit universal_control opt-out"
         );
-        assert!(
-            !m.spotlight_noindex(),
-            "a [packages] type error must not cancel an explicit spotlight_noindex opt-out"
-        );
         // The mirror: a `[machine]` type error must not silence the `[packages]` table.
-        let other = "[packages]\nexclude = [\"ay\"]\n[machine]\nspotlight_noindex = 3\n";
+        let other = "[packages]\nexclude = [\"ay\"]\n[machine]\nuniversal_control = 3\n";
         assert_eq!(
             parse_packages(other).exclude(),
             ["ay".to_string()],
@@ -953,7 +926,6 @@ mod tests {
         // A file that is not TOML at all: nothing readable said to act, so nothing acts.
         let broken = parse_machine("[machine\nnot toml");
         assert_eq!(broken.universal_control(), UniversalControlPolicy::Leave);
-        assert!(!broken.spotlight_noindex());
         // A syntax error outside both tables is the FILE's, said once, never blamed on
         // [packages]; a well-formed file has no such line.
         let note = not_toml_note("[packages]\nexclude = [\"ay\"]\n[window]\ntitle = \"x\n")
@@ -1285,37 +1257,6 @@ mod tests {
         assert!(PackagesConfig::default().auto_install());
         assert!(PackagesConfig::unreadable_table().unreadable);
         assert!(!PackagesConfig::unreadable_table().auto_install());
-    }
-
-    /// `[packages].tracked_install` is retired (2026-09-24, its lanes deleted): any value,
-    /// of any type, reads, is never acted on, and doctor names it once; the rest of the
-    /// table survives it.
-    #[test]
-    fn retired_tracked_install_is_ignored_and_named() {
-        for value in ["\"refuse\"", "\"record\"", "\"refuze\"", "true"] {
-            let cfg = parse_packages(&format!(
-                "[packages]\nexclude = [\"ay\"]\ntracked_install = {value}\n"
-            ));
-            assert!(
-                !cfg.unreadable,
-                "{value}: a retired key never fails the table"
-            );
-            assert_eq!(cfg.exclude(), ["ay".to_string()], "{value}");
-            let notes = cfg.config_notes();
-            assert_eq!(
-                notes
-                    .iter()
-                    .filter(|n| n.contains("tracked_install is retired"))
-                    .count(),
-                1,
-                "{value}: {notes:?}"
-            );
-        }
-        assert!(
-            parse_packages("[packages]\nexclude = []\n")
-                .config_notes()
-                .is_empty()
-        );
     }
 
     #[cfg(unix)]

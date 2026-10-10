@@ -15,7 +15,7 @@ fn every_launch_runs_the_machine_one_shot_before_any_gate() {
     let body = &src[start..];
     let body = &body[..body[3..].find("\nfn ").map_or(body.len(), |i| i + 3)];
     // The one-shot runs unconditionally before the thread and any gate, and before the
-    // launch seed; atpkg's `machine.lock` keeps the walks apart.
+    // launch seed; atpkg's `machine.lock` keeps the applies apart.
     let call = body
         .find("spawn_machine_settings_once(atpkg.clone(), proxy.clone())")
         .expect("every launch runs the [machine] one-shot");
@@ -203,7 +203,7 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
         Some(Wake::PkgManagedCurrent(body)) => assert_eq!(body, managed),
         other => panic!("expected PkgManagedCurrent (bare), got {other:?}"),
     }
-    let machine = "spotlight-noindex 73 dir(s) migrated; universal-control disabled";
+    let machine = "universal-control disabled";
     match parse_seed_line(&format!("atpkg: machine-settings: {machine}")) {
         Some(Wake::PkgMachineSettings(body)) => assert_eq!(body, machine),
         other => panic!("expected PkgMachineSettings, got {other:?}"),
@@ -241,14 +241,12 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
     // `machine-state:` is an event (`PkgMachineState`, the card's newest state), never a
     // row, and never mistaken for the change marker sharing its prefix.
     match parse_seed_line(&format!(
-        "atpkg: {}universal-control=disabled; policy=off; noindex=true; \
-         spotlight-exposed=0; spotlight-hidden=8; spotlight-migratable=0; \
-         scan=complete; home=account",
+        "atpkg: {}universal-control=disabled; policy=off; home=account",
         atpkg::cli::MACHINE_STATE_MARKER
     )) {
         Some(Wake::PkgMachineState(body)) => {
             let state = atpkg::machine::parse_machine_state(&body).expect("the record parses");
-            assert_eq!(state.hidden, 8);
+            assert_eq!(state.universal_control, atpkg::machine::UcPosture::Disabled);
         }
         other => panic!("expected PkgMachineState, got {other:?}"),
     }
@@ -379,9 +377,7 @@ fn a_machine_change_is_answered_by_the_records_behind_it_or_by_a_fallback() {
         atpkg::cli::MACHINE_SETTINGS_MARKER
     );
     let record = format!(
-        "atpkg: {}universal-control=disabled; policy=off; noindex=true; \
-         spotlight-exposed=0; spotlight-hidden=8; spotlight-migratable=0; \
-         scan=complete; home=account",
+        "atpkg: {}universal-control=disabled; policy=off; home=account",
         atpkg::cli::MACHINE_STATE_MARKER
     );
     let collect = |stdout: String| {

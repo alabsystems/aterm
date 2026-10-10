@@ -946,14 +946,14 @@ pub(crate) fn cmd_ready(
     use crate::subscribe::SubscriberSet;
 
     // Accept a bare `<ms>` (original) or `timeout=<ms>` (k=v, aligning with the
-    // rest of the wait family).
-    let timeout_ms = {
-        let t = rest.trim();
-        t.strip_prefix("timeout=")
-            .unwrap_or(t)
-            .parse::<u64>()
-            .unwrap_or(30_000)
-            .min(600_000)
+    // rest of the wait family); anything else is the usage line, never the
+    // default ([`aterm_control::wire::wait_ms`]).
+    let timeout_ms = match rest.trim() {
+        "" => aterm_control::wire::WAIT_DEFAULT_MS,
+        t => match aterm_control::wire::wait_ms(t.strip_prefix("timeout=").unwrap_or(t)) {
+            Some(ms) => ms,
+            None => return "ERR usage: ready [<ms>|timeout=<ms>]\n".to_string(),
+        },
     };
     let now0 = Instant::now();
     let deadline = now0 + Duration::from_millis(timeout_ms);
@@ -1097,23 +1097,28 @@ pub(crate) fn cmd_await(
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
     // predicate + its arguments.
     let mut toks = rest.split_whitespace();
-    let mut timeout_ms = 30_000u64;
+    let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
     let mut args: Vec<&str> = Vec::new();
     while let Some(tok) = toks.next() {
         // Accept BOTH `timeout <ms>` (the original await grammar) and `timeout=<ms>`
         // (the k=v form turn/turns/subscribe use) so the wait family reads uniformly.
-        // A bare trailing `timeout` is an argument like any other word.
-        if let Some(v) = tok.strip_prefix("timeout=") {
-            timeout_ms = v.parse().unwrap_or(30_000);
+        // A bare trailing `timeout` is an argument like any other word. An `<ms>`
+        // that is not one is the usage line, never the default.
+        let value = if let Some(v) = tok.strip_prefix("timeout=") {
+            v
         } else if tok == "timeout"
             && let Some(v) = toks.next()
         {
-            timeout_ms = v.parse().unwrap_or(30_000);
+            v
         } else {
             args.push(tok);
-        }
+            continue;
+        };
+        let Some(ms) = aterm_control::wire::wait_ms(value) else {
+            return USAGE.to_string();
+        };
+        timeout_ms = ms;
     }
-    let timeout_ms = timeout_ms.min(600_000);
     let Some(&kind) = args.first() else {
         return USAGE.to_string();
     };
@@ -1669,6 +1674,7 @@ fn typed_key_event(g: &str) -> Option<InputEvent> {
         key,
         mods,
         base_layout,
+        layout_text: None,
         event_type: KeyEventType::Press,
     })
 }
@@ -2200,18 +2206,25 @@ pub(crate) fn cmd_await_momentum(
     use crate::subscribe::SubscriberSet;
 
     const USAGE: &str = "ERR usage: await momentum <floor 0..=1> [timeout <ms>]\n";
+    use aterm_control::wire::wait_ms;
     let mut floor: Option<f32> = None;
-    let mut timeout_ms = 30_000u64;
+    let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
     let toks: Vec<&str> = rest.split_whitespace().collect();
     let mut i = 0;
     while i < toks.len() {
         if i == 0 && toks[0] == "momentum" {
             i += 1;
         } else if let Some(v) = toks[i].strip_prefix("timeout=") {
-            timeout_ms = v.parse().unwrap_or(30_000);
+            let Some(ms) = wait_ms(v) else {
+                return USAGE.to_string();
+            };
+            timeout_ms = ms;
             i += 1;
         } else if toks[i] == "timeout" && i + 1 < toks.len() {
-            timeout_ms = toks[i + 1].parse().unwrap_or(30_000);
+            let Some(ms) = wait_ms(toks[i + 1]) else {
+                return USAGE.to_string();
+            };
+            timeout_ms = ms;
             i += 2;
         } else if floor.is_none() {
             match toks[i].parse::<f32>() {
@@ -2226,7 +2239,7 @@ pub(crate) fn cmd_await_momentum(
     let Some(floor) = floor else {
         return USAGE.to_string();
     };
-    let until = Instant::now() + Duration::from_millis(timeout_ms.min(600_000));
+    let until = Instant::now() + Duration::from_millis(timeout_ms);
     let sub = SubscriberSet::register(subscribers, &[session]);
     let probe = exit_probe(store, session);
     let exited = || probe(store);

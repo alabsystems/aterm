@@ -1731,3 +1731,89 @@ fn a_calm_freeze_never_leaks_into_a_later_episodes_record() {
         r.detail
     );
 }
+
+/// Ruling 209: a fold withdraws the row and that log entry BECOMES the
+/// episode's record. An episode that saw critical memory pressure records
+/// Warn (`record_severity`); when a later calmer reading restated its row
+/// Info, the one entry the fold leaves still reads the record's Warn, as it
+/// does when no row is live and the record is posted whole
+/// (`MessageCenter::withdraw_as_record`, ruling 441 (c)). Mirrors the host's
+/// `perform_strain`.
+#[test]
+fn the_episodes_one_entry_reads_the_records_severity() {
+    let mut s = Sim::new();
+    let yes = World::loaded(yes12(200), 1000);
+    s.run(20_000, &yes, Some((EVERY, SLOW)));
+    assert_eq!(s.posts().len(), 1, "premise: the row is up: {:?}", s.outs);
+    // One critical reading mid-episode, then ordinary ones.
+    s.auto = false;
+    s.run(21_000, &yes, Some((EVERY, SLOW)));
+    let mut crit = yes.clone();
+    crit.pressure = Some(MemoryLevel::Critical);
+    s.sample(&crit);
+    s.auto = true;
+    s.run(40_000, &yes, Some((EVERY, SLOW)));
+    s.run(90_000, &World::calm(), Some((EVERY, FAST)));
+    let folds = s.folds();
+    assert_eq!(folds.len(), 1, "{:?}", s.outs);
+    let record = folds[0].1.clone().expect("the episode's record");
+    assert_eq!(
+        record.severity,
+        Severity::Warn,
+        "premise: the episode saw critical memory"
+    );
+    // The host: every out into a center, in order.
+    let mut c = MessageCenter::new(MessageLog::empty(), s.base);
+    let mut row = None;
+    let mut last_row_sev = None;
+    for (t, out) in s.outs.clone() {
+        let now = s.at(t);
+        let _ = c.settle(now, true);
+        match out {
+            StrainOut::Post(msg) => {
+                last_row_sev = Some(msg.severity);
+                row = Some(c.post(msg, WallStamp { unix_ms: t + 1 }, now).id);
+                c.commit_rows(now, 3);
+            }
+            StrainOut::Restate(msg) => {
+                last_row_sev = Some(msg.severity);
+                let id = row.expect("a row to restate");
+                assert!(c.restate(
+                    id,
+                    Restatement {
+                        title: Some(msg.title.clone()),
+                        detail: Some(msg.detail.clone()),
+                        meter: Some(msg.meter.clone()),
+                        actions: Some(msg.actions.clone()),
+                        hold: Some(msg.hold),
+                        severity: Some(msg.severity),
+                        glyph: Some(msg.glyph),
+                        excerpt: Some(msg.excerpt),
+                        finished: Some(msg.finished.clone()),
+                    },
+                    now,
+                ));
+            }
+            StrainOut::Fold { record } => {
+                let id = row.take().expect("a row to fold");
+                let rec = record.expect("a record");
+                assert!(
+                    c.withdraw_as_record(id, &rec, now),
+                    "the row becomes the record"
+                );
+                let entry = c.log().get(id).expect("the entry");
+                assert_eq!(
+                    last_row_sev,
+                    Some(Severity::Info),
+                    "premise: the row was restated Info after the critical reading"
+                );
+                assert_eq!(
+                    entry.severity, rec.severity,
+                    "the episode's one entry reads the row's last mark, not its record's: {:?}",
+                    entry.title
+                );
+            }
+            StrainOut::Record(_) | StrainOut::None => {}
+        }
+    }
+}

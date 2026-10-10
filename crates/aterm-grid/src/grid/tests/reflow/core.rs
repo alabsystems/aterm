@@ -17,7 +17,6 @@ fn reflow_shrink_wraps_long_line() {
     }
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
 
-    // Resize narrower to 5 columns
     grid.resize(5, 5);
 
     // Content should reflow to 2 rows
@@ -95,7 +94,6 @@ fn reflow_grow_preserves_cursor_position() {
     // Position cursor at row 1, col 2 ('H')
     grid.set_cursor(1, 2);
 
-    // Resize to 12 columns
     grid.resize(5, 12);
 
     // Row 1 col 2 was logical offset 7; unwrapped to 12 cols it is row 0 col 7.
@@ -119,7 +117,6 @@ fn reflow_cursor_at_chunk_boundary() {
     // offset 5 is on the boundary.
     grid.resize(5, 5);
 
-    // Verify content
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
 
@@ -132,7 +129,6 @@ fn reflow_cursor_at_chunk_boundary() {
 /// positioned correctly after unwrap.
 #[test]
 fn reflow_cursor_at_wrapped_line_end() {
-    // Start with 5-column grid
     let mut grid = Grid::new(5, 5);
     // Write "ABCDE" - fills row 0 exactly (cols 0-4)
     for c in "ABCDE".chars() {
@@ -173,14 +169,11 @@ fn reflow_round_trip() {
         grid.write_char(c);
     }
 
-    // Shrink to 5 cols
     grid.resize(5, 5);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
 
-    // Grow back to 10 cols
     grid.resize(5, 10);
-    // Should merge back
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
     assert!(grid.row(1).unwrap().is_empty());
 }
@@ -275,7 +268,6 @@ fn reflow_handles_empty_rows() {
         grid.write_char(c);
     }
 
-    // Shrink
     grid.resize(5, 3);
     // "Hel" on row 0, "lo" on row 1
     assert_eq!(grid.row(0).unwrap().to_string(), "Hel");

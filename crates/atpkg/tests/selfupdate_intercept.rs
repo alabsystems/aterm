@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SELF-UPDATE INTERCEPT at the REAL process edge (2026-09-19, `atpkg::selfupdate`):
+//! THE SELF-UPDATE INTERCEPT at the REAL process edge (`atpkg::selfupdate`):
 //! the dev `atpkg` binary driven as `__selfupdate claude <prefix> -- <args…>`, the way
 //! the `agents/claude` twin execs it, over a temp prefix with a fake `bin/claude` that
 //! echoes its argv and exits 7.
@@ -11,14 +11,14 @@
 //! relay of its status. A store lock held by THIS process (a `Layout` over the temp
 //! prefix, exactly what a sibling process presents to `flock`) for the first seconds of
 //! the run makes the child WAIT — the default wait, thirty minutes, the window's own
-//! bound, with no environment knob to shorten it (owner, 2026-09-19) — and, on STDOUT,
-//! print the `--wait-lock` lane's two markers a typed `aterm pkg update` never prints
-//! (`lock-waiting:` after the 2 s grace, `lock-acquired:` when the holder lets go;
-//! review, 2026-09-19: the child IS a `--wait-lock` caller, so a person's terminal sees
-//! them); then, the holder gone, the child runs its verb — claude's vendor-direct lane,
-//! which a `dir:` registry cannot reach — and fails on its own line, so the verb answers
-//! with the incomplete line, exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole bound
-//! elapsing) is not drivable here without a knob, and there is none: it is pinned
+//! bound, with no environment knob to shorten it — and, on STDOUT, print the
+//! `--wait-lock` lane's two markers a typed `aterm pkg update` never prints
+//! (`lock-waiting:` after the 2 s grace, `lock-acquired:` when the holder lets go: the
+//! child IS a `--wait-lock` caller, so a person's terminal sees them); then, the holder
+//! gone, the child runs its verb — claude's vendor-direct lane, which a `dir:` registry
+//! cannot reach — and fails on its own line, so the verb answers with the incomplete
+//! line, exit 1 — never 75 while a pass is merely busy. The 75 ending itself (the whole
+//! bound elapsing) is not drivable here without a knob, and there is none: it is pinned
 //! in-process by `cli.rs`'s own test, where `selfupdate_check` takes the bound as a
 //! parameter and the same dev binary waits one second at a lock that test holds. The
 //! other endings — help, a declined shape, an unrostered program, the disabled
@@ -47,7 +47,11 @@ use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+// `spawnfd`'s: every child here holds its stdio and nothing else of this
+// process — not a pipe another test thread had open unflagged at the spawn,
+// held for as long as a waiting child lives.
+use aterm_uds::spawnfd::{Child, Command, Stdio};
+use std::process::{ExitStatus, Output};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -319,13 +323,12 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
         .filter(|l| {
             !(l.starts_with("atpkg: machine")
                 || l.starts_with("atpkg machine:")
-                || l.starts_with("atpkg noindex:")
                 || l.starts_with("atpkg: Universal Control"))
         })
         .collect()
 }
 
-/// THE DEFAULT WAIT REALLY WAITS (owner, 2026-09-19: no environment knob — the bound is
+/// THE DEFAULT WAIT REALLY WAITS (no environment knob — the bound is
 /// the window's own thirty minutes, `selfupdate::WAIT_LOCK_SECS`): the store lock held
 /// here for the first seconds of the run, and the child — the standard `update claude
 /// --wait-lock 1800` — does not exit 75 while a pass is merely busy. It announces the
@@ -428,9 +431,9 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
 
 /// THE INCOMPLETE ENDING: claude updates vendor-direct and the fixture's `dir:` registry
 /// reaches no vendor, so the child's `update claude` fails on its own line
-/// ([`UNREACHABLE_LINE`], formerly the index lane's `update claude failed:`) and the verb exits 1
-/// with the announce line first and the incomplete line last — the build that stays
-/// named — and the store lock, taken by the child for its try, released again.
+/// ([`UNREACHABLE_LINE`]) and the verb exits 1 with the announce line first and the
+/// incomplete line last — the build that stays named — and the store lock, taken by the
+/// child for its try, released again.
 #[test]
 fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_line() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
@@ -473,14 +476,13 @@ fn an_unreachable_registry_answers_1_with_the_childs_line_then_the_incomplete_li
 /// shim with the arguments verbatim — its stdout, its exit code (7) — and no store lock
 /// ever comes into being.
 ///
-/// AND THE MANAGED NAME ITSELF ANSWERS (audit 2026-10-02): outside an aterm session the rc
+/// AND THE MANAGED NAME ITSELF ANSWERS: outside an aterm session the rc
 /// hook puts `bin/` on PATH and not `agents/`, so there `claude` IS `bin/claude`, and the
 /// activation lays it with the twin's block. Run through `/bin/sh` with this dev binary as
 /// the embedded atpkg — named by a twin an older client laid, the field's shape — `bin/claude
 /// update --help` is handed to the verb (the note), whose forward re-enters `bin/claude`;
-/// the block lets that re-entry through to the store build, once. Before the fix the
-/// vendor's verb ran with no note; without the re-entry guard every forward handed over
-/// again, forever (a minute's hang detector).
+/// the block lets that re-entry through to the store build, once. Without the re-entry
+/// guard every forward would hand over again, forever (a minute's hang detector).
 #[test]
 fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
     let fx = Fixture::new("help");
@@ -541,9 +543,8 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
 
 /// DECLINED SHAPES: `install stable`, `install 2.1.200` and `update --foo` exit 2 with
 /// their exact line, nothing on stdout, the fake never run, no lock — and no
-/// environment can change that: there is no escape hatch (the first cut's was removed
-/// 2026-09-19 at the owner's direction), so the vendor's installer is never run through
-/// the managed name.
+/// environment can change that: there is no escape hatch, so the vendor's installer is
+/// never run through the managed name.
 #[test]
 fn a_declined_shape_exits_2_with_its_line_and_runs_nothing() {
     use atpkg::selfupdate::{Decline, declined_line};
@@ -610,9 +611,9 @@ fn an_unrostered_program_forwards_silently() {
     assert!(!fx.lock_held());
 }
 
-/// NO ENVIRONMENT KILL SWITCH (2026-09-23): `ATPKG_DISABLE=1`, which used to reach the
-/// disabled line, is inert — the verb a person typed goes on to its check. The disabled
-/// line itself is an unpinned build's alone now, pinned as a pure render elsewhere.
+/// NO ENVIRONMENT KILL SWITCH: `ATPKG_DISABLE=1` is inert — the verb a person typed goes
+/// on to its check. The disabled line is an unpinned build's alone, pinned as a pure
+/// render elsewhere.
 #[test]
 fn an_environment_variable_does_not_disable_the_intercept() {
     let fx = Fixture::new("disabled");

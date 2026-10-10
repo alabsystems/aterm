@@ -3395,8 +3395,7 @@ mod tests {
 
     /// An unknown build variable is recorded: every `RUST*` and `CARGO*`
     /// variable but the inert ones, and a build script's native toolchain, so
-    /// neither a base nor a MEASURE receipt read as `build-env none` passes one
-    /// over.
+    /// no base read as `build-env none` passes one over.
     #[test]
     fn an_unknown_build_variable_is_recorded() {
         for recorded in [

@@ -1,0 +1,25 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (the review of H6-HARNESS-1 pass 2), `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a prompt of two paragraphs and the request too long: Claude Code draws the paragraph break as a blank row and hangs the real context wall under the second paragraph (column 2), so the walk up from the wall meets the blank row before the `❯` row
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 14)
+
+✻ Churned for 0s · done 8:29 AM
+
+❯ Please fix the parser.
+
+  The second paragraph says what done looks like.
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Cooked for 0s · done 8:29 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

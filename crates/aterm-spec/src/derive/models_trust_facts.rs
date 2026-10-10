@@ -13,7 +13,7 @@ use super::*;
 /// the tree less its floors (`tools/trust-gate-ratchet.tsv` and the memory record),
 /// the prover (the content of its whole toolchain directory) and the lane. The READER
 /// is the cutter's assembly (`trust_facts::trust_report`, behind the cut, `ship
-/// check`, the preflight and `tools/release.sh`): it opens the record the key of the
+/// check` and `ship release`): it opens the record the key of the
 /// commit it judges names, and judges it against THAT commit's floors — held, when the
 /// facts were measured on another commit, to the merge contract's up-only rule against
 /// the floors they were measured with (`trust_facts::floors_lowered`, review

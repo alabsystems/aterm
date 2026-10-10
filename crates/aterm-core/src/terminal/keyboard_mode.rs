@@ -55,8 +55,9 @@ pub(crate) fn keyboard_mode_from_state(
     // `kitty_keyboard_enabled` and never enters the kitty flag word — conhost
     // set it and conhost reads the bytes, so in the encoder the record it
     // asked for outranks a kitty push the application made through it (see
-    // `KeyboardMode::WIN32_INPUT` for the measurement).
-    if modes.win32_input_mode {
+    // `KeyboardMode::WIN32_INPUT` for the measurement). Only where the host
+    // says a console host is there (`win32_input_active`).
+    if modes.win32_input_active() {
         km.insert(KeyboardMode::WIN32_INPUT);
     }
     km
@@ -342,6 +343,14 @@ mod shift_enter_e2e_tests {
     // Ctrl+Enter is indistinguishable from Enter. These walk the negotiation
     // and pin the bytes conhost receives.
 
+    /// A session behind a console host: the posture aterm-gui applies to a
+    /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
+    fn conpty_term() -> Terminal {
+        let mut term = Terminal::new(24, 80);
+        term.set_win32_input_enabled(true);
+        term
+    }
+
     /// The win32 key-record pair for `VK_RETURN`, spelled from the spec
     /// (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`), not from the encoder.
     fn win32_enter_pair(uc: u32, cs: u32) -> Vec<u8> {
@@ -350,7 +359,7 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn conpty_9001_turns_enter_chords_into_win32_records_and_9001l_turns_them_back() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         let mode = term.keyboard_mode();
         assert!(mode.contains(KeyboardMode::WIN32_INPUT));
@@ -400,7 +409,7 @@ mod shift_enter_e2e_tests {
         // The pair already carries its key-up; the GUI's Release event for the
         // same chord must therefore encode to nothing (the seam treats an empty
         // encoding as a faithful no-op).
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         for mods in [
             Modifiers::SHIFT,
@@ -423,7 +432,7 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn conpty_9001_never_leaks_into_the_kitty_query_or_the_kitty_stack() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         // The progressive-enhancement query still says "nothing negotiated".
         term.process(b"\x1b[?u");
@@ -466,7 +475,7 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn conpty_9001_changes_no_application_facing_projection() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         assert!(
             !term.kitty_suppresses_predictive_echo(),
@@ -493,7 +502,7 @@ mod shift_enter_e2e_tests {
             )
         };
         let esc = || Key::Named(NamedKey::Escape);
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         assert_eq!(
             key(&term, esc(), Modifiers::empty()),
@@ -516,9 +525,46 @@ mod shift_enter_e2e_tests {
         assert_eq!(key(&term, Key::Character('['), Modifiers::ALT), b"\x1b[");
     }
 
+    /// DEC 9001 is a negotiation with a Windows console host, and only a
+    /// session a host put behind ConPTY has one. Anywhere else the request is
+    /// program output (`cat` of a file holding `ESC [ ? 9001 h`), and it must
+    /// change nothing: Escape, Ctrl+[ and the Enter chords keep their own
+    /// bytes for whatever reads the tab next, and DECRQM answers as a terminal
+    /// without the mode.
+    #[test]
+    fn program_output_cannot_turn_on_win32_records_without_a_console_host() {
+        let key = |term: &Terminal, key: Key, mods: Modifiers| {
+            encode_key_with_layout(
+                &key,
+                mods,
+                term.mode_mirror().keyboard_mode(),
+                KeyEventType::Press,
+                None,
+            )
+        };
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert!(
+            !term
+                .mode_mirror()
+                .keyboard_mode()
+                .contains(KeyboardMode::WIN32_INPUT)
+        );
+        assert_eq!(
+            key(&term, Key::Named(NamedKey::Escape), Modifiers::empty()),
+            b"\x1b"
+        );
+        assert_eq!(key(&term, Key::Character('['), Modifiers::CTRL), b"\x1b");
+        assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
+        assert_eq!(enc_enter(&term, Modifiers::CTRL), vec![0x0d]);
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;0$y");
+    }
+
     #[test]
     fn conpty_9001_is_reported_by_decrqm_and_cleared_by_ris() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
         term.process(b"\x1b[?9001h");
@@ -531,6 +577,47 @@ mod shift_enter_e2e_tests {
         assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
         term.process(b"\x1b[?9001$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
+    }
+
+    /// The console-host posture is a function of the resize seam policy, both
+    /// ways. Under `ConPty` conhost's 9001 takes and `CSI ? u` goes unanswered.
+    /// Under `Native` the reverse holds even for an engine restored from a
+    /// ConPTY checkpoint that carried the capability and the live mode.
+    #[test]
+    fn the_console_host_posture_follows_the_resize_policy_both_ways() {
+        use crate::grid::ResizePolicy;
+        let mut conpty = Terminal::new(24, 80);
+        conpty.set_console_host_posture(ResizePolicy::ConPty);
+        conpty.process(b"\x1b[?u");
+        assert_eq!(
+            conpty.take_response(),
+            None,
+            "no kitty offer behind conhost"
+        );
+        conpty.process(b"\x1b[?9001h");
+        assert!(conpty.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert_eq!(
+            enc_enter(&conpty, Modifiers::SHIFT),
+            win32_enter_pair(13, 0x10)
+        );
+
+        let mut native = Terminal::from_checkpoint(&conpty.checkpoint());
+        assert!(
+            native.keyboard_mode().contains(KeyboardMode::WIN32_INPUT),
+            "control: the checkpoint carried the console host's bits"
+        );
+        native.set_console_host_posture(ResizePolicy::Native);
+        assert!(!native.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert!(
+            !native
+                .mode_mirror()
+                .keyboard_mode()
+                .contains(KeyboardMode::WIN32_INPUT)
+        );
+        assert_eq!(enc_enter(&native, Modifiers::SHIFT), vec![0x0a]);
+        native.process(b"\x1b[?9001h\x1b[?u");
+        assert!(!native.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert_eq!(native.take_response().unwrap_or_default(), b"\x1b[?0u");
     }
 }
 

@@ -481,7 +481,9 @@ fn trial_give_back_projection(
 /// under the sibling's — is `Buggy=1` too (Q's `PaysOwed` is not enabled there).
 #[test]
 fn overlapping_launches_of_one_trial_are_given_back_by_name() {
-    use std::process::{Child, Command};
+    // `spawnfd`'s: a stand-in holds its stdio and nothing else of this process,
+    // not another test thread's pipe for as long as it lives.
+    use aterm_uds::spawnfd::{Child, Command};
     const BUILD: u64 = 11;
     let spawn = || -> Child {
         Command::new("/bin/sleep")
@@ -883,7 +885,7 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
 /// is a crash loop and still reaches the revert.
 #[test]
 fn concurrent_live_candidates_of_one_trial_never_revert() {
-    use std::process::{Child, Command};
+    use aterm_uds::spawnfd::{Child, Command};
     let spawn = || -> Child {
         Command::new("/bin/sleep")
             .arg("30")
@@ -970,7 +972,7 @@ fn concurrent_live_candidates_of_one_trial_never_revert() {
 /// NEGATIVE CONTROL: the same later launches as handoff targets are not counted.
 #[test]
 fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
-    use std::process::{Child, Command};
+    use aterm_uds::spawnfd::{Child, Command};
     let spawn = || -> Child {
         Command::new("/bin/sleep")
             .arg("30")
@@ -1057,7 +1059,7 @@ fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
 #[test]
 fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     use crate::TrialWitness::{Headless, Window};
-    use std::process::{Child, Command};
+    use aterm_uds::spawnfd::{Child, Command};
     use std::time::Duration;
     let spawn = || -> Child {
         Command::new("/bin/sleep")
@@ -1490,7 +1492,7 @@ fn a_window_re_trial_is_bounded() {
 #[test]
 fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
     use crate::TrialWitness::{Headless, Window};
-    use std::process::{Child, Command};
+    use aterm_uds::spawnfd::{Child, Command};
     let spawn = || -> Child {
         Command::new("/bin/sleep")
             .arg("30")

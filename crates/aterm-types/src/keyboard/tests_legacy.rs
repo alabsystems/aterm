@@ -436,6 +436,57 @@ fn test_vt52_cursor_keys_ignore_modifiers() {
     );
 }
 
+/// VT52: F1-F4 are PF1-PF4 (`ESC P`..`ESC S`) and Home/End `ESC H`/`ESC F`,
+/// modifiers ignored, as the arrows are (xterm's VT52_CURSOR_KEYS); F5 up keep
+/// their ANSI form. They used to go out in ANSI form (F1 `ESC O P`).
+#[test]
+fn vt52_function_keys_and_home_end() {
+    let mode = KeyboardMode::VT52_MODE;
+    let named = |k| encode_key(&Key::Named(k), Modifiers::empty(), mode);
+    assert_eq!(named(NamedKey::F1), b"\x1bP");
+    assert_eq!(named(NamedKey::F4), b"\x1bS");
+    assert_eq!(named(NamedKey::Home), b"\x1bH");
+    assert_eq!(named(NamedKey::End), b"\x1bF");
+    assert_eq!(named(NamedKey::F5), b"\x1b[15~");
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::F2), Modifiers::SHIFT, mode),
+        b"\x1bQ"
+    );
+}
+
+/// Alt ESC-prefixes the Ctrl byte of Space and Backspace, as it does a Ctrl
+/// letter (kitty's legacy C0 table; xterm under altSendsEscape): readline's
+/// M-C-h and emacs's C-M-SPC. Alt+Shift+Tab stays `ESC [ Z`.
+#[test]
+fn ctrl_alt_space_and_backspace_keep_the_alt() {
+    let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+    let named = |k, m| encode_key(&Key::Named(k), m, KeyboardMode::empty());
+    assert_eq!(named(NamedKey::Space, ctrl_alt), [0x1b, 0x00]);
+    assert_eq!(named(NamedKey::Backspace, ctrl_alt), [0x1b, 0x08]);
+    assert_eq!(named(NamedKey::Space, Modifiers::CTRL), [0x00]);
+    assert_eq!(named(NamedKey::Backspace, Modifiers::ALT), [0x1b, 0x7f]);
+    assert_eq!(
+        named(NamedKey::Tab, Modifiers::SHIFT | Modifiers::ALT),
+        b"\x1b[Z"
+    );
+}
+
+/// Ctrl+~ (Ctrl+Shift+` on US keyboards) is RS, 0x1E: kitty's legacy ctrl
+/// table ("~ -> 30") and xterm's control alias. It wrote a literal `~`.
+#[test]
+fn ctrl_tilde_is_record_separator() {
+    let mode = KeyboardMode::empty();
+    assert_eq!(encode_key(&ch('~'), Modifiers::CTRL, mode), [0x1e]);
+    assert_eq!(
+        encode_key(&ch('`'), Modifiers::CTRL | Modifiers::SHIFT, mode),
+        [0x1e]
+    );
+    assert_eq!(
+        encode_key(&ch('6'), Modifiers::CTRL | Modifiers::SHIFT, mode),
+        [0x1e]
+    );
+}
+
 #[test]
 fn test_vt52_numpad_application_mode() {
     // VT52 application keypad: ESC ? followed by the digit character.

@@ -1,0 +1,21 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP tool (a stdio server `github`, user-scope `mcpServers`) whose result is THREE text content blocks (`Issue 7: the parser drops a row`, then a context-wall phrase, then a login-wall phrase), Claude Code in verbose output (`"verbose": true` in the scratch config), the reply after it EMPTY: Claude Code draws each content block as its own column-2 `⎿` row under the call, so a server's second and third blocks stand where Claude Code's own rows do
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ github - get_issue (MCP)(n: 7)
+  ⎿  Issue 7: the parser drops a row
+  ⎿  Context limit reached · /compact or /clear to continue
+  ⎿  Not logged in · Please run /login
+
+✻ Churned for 3s · done 7:49 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents                                                                               21460 tokens

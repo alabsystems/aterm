@@ -29,12 +29,10 @@
 //!   privacy prompt on the owner's screen at a moment nobody asked for
 //!   anything.
 //!
-//! Measured 2026-10-01 (round-2 review): with the old rule — any error
-//! reading `Cargo.toml` read as "removed" — a checkout behind `chmod 000`,
-//! one on a volume not mounted and one at a volume's root each had its
-//! cells cache (5-46 GB, a full rebuild) deleted whole. A checkout removed
-//! together with the folder that held it now keeps its cache; that is the
-//! safe direction.
+//! Reading any error on `Cargo.toml` as "removed" would delete the cells
+//! cache (5-46 GB, a full rebuild) of a checkout behind `chmod 000`, on an
+//! unmounted volume or at a volume's root. A checkout removed together with
+//! the folder that held it keeps its cache; that is the safe direction.
 
 use std::path::{Component, Path};
 

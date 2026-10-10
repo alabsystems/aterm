@@ -77,8 +77,6 @@ pub mod process;
 /// nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;
 pub mod rand;
-/// trust-mc proofs for [`rand::hex_encode`] (compiled only under `cfg(kani)`).
-mod rand_kani_proofs;
 /// Which Windows console a child process gets: a WINDOWLESS one when this
 /// process has none (the window), so no console flashes on screen, and nothing
 /// changed when it has one or off Windows. [`spawnfd::command`] applies it to

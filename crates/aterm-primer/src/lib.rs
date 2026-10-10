@@ -74,7 +74,7 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// person who wants stricter rules writes them OUTSIDE the managed block, which
 /// every install preserves byte-for-byte.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v13 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v14 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 /// The end marker closing the managed block.
 const MARK_END: &str = "<!-- /aterm primer -->";
@@ -97,6 +97,10 @@ const MARK_END: &str = "<!-- /aterm primer -->";
 /// * `rm`: an unguarded `$VAR` operand raises a box the window's harness answers
 ///   Yes by default (`[harness] approve`), so `${VAR:?}` is the agent's own guard.
 ///   "an aterm window's" because a headless or disabled harness presses nothing.
+/// * `~/Developer`: the one folder the owner adds to Spotlight's Search Privacy
+///   (`atpkg::devroot`); a clone made in `~` is indexed, embeddings and all. The
+///   sentence says where code goes, never that the folder is skipped: on most Macs it
+///   is not yet, and only the doctors' measured `spotlight:` row can say so.
 const PRIMER_BODY: &str = "\
 ## aterm
 If the environment has `TERM_PROGRAM=aterm` or `ATERM_CHILD=1`, this terminal is aterm — an
@@ -112,6 +116,8 @@ file is usually privacy consent, sometimes with no dialog: `aterm ctl privacy` n
 a retry or `sudo` meets it again, and only a person's grant lifts it (`aterm help permissions`).
 In Claude Code, an unguarded `$VAR` in an `rm` operand raises a box an aterm window's harness
 answers Yes by default; `\"${VAR:?}/…\"` fails safe when the variable is empty.
+On macOS code lives under `~/Developer`: clones and `git worktree add` targets go there;
+`aterm pkg devroot` names checkouts that are not.
 If neither variable is set, you are not inside aterm; ignore this section.";
 
 /// The Rust paragraph (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md §4
@@ -4453,12 +4459,14 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         // the body is a POINTER — a sentence that earns its place in every
         // agent's context file in every project is rare, and depth belongs
         // behind `aterm help <topic>` — so the next author argues for a raise.
+        // Raised 2026-10-09 by the measured 139 bytes and 2 lines of the
+        // developer-root sentence (where code lives).
         assert!(
-            PRIMER_BODY.len() <= 1_300,
+            PRIMER_BODY.len() <= 1_420,
             "primer body is {} bytes — depth belongs behind `aterm help`",
             PRIMER_BODY.len()
         );
-        assert!(PRIMER_BODY.lines().count() <= 15);
+        assert!(PRIMER_BODY.lines().count() <= 17);
         assert!(
             FABRIC_NOTE.len() <= 1_400,
             "fabric note is {} bytes - depth belongs behind `aterm help fabric`",
@@ -4502,7 +4510,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         );
         let lines = primer_block(None).lines().count();
         assert!(
-            lines <= 54,
+            lines <= 56,
             "the generic block is {lines} lines — same argument as the byte budget"
         );
         // The sum of the parts is the block, so a new paragraph cannot hide

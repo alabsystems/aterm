@@ -1019,14 +1019,17 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
 /// is a shell with 400 lines of styled history; tab 0 is Claude Code, entered
 /// from a prompt on the last row, so 1049's DECSC slot is row 55. The update's
 /// row then appears in the message band (through the real messages engine)
-/// and takes one row from every session: 55x149 at the park, and the Claude
-/// Code tab's slot names a row its grid no longer has. The handoff fixtures'
-/// `incident-55x149` desks are the same desk built from bare engines.
+/// and takes one row from every session: 55x149 at the park. Builds before
+/// the saved cursor followed its text left the Claude Code tab's slot on row
+/// 55, a row its grid no longer has; the shrink demotes the saved primary's
+/// top row, and the slot now rides up with the prompt to row 54. The handoff
+/// fixtures' `incident-55x149` desks are the same desk built from bare
+/// engines by those builds, slot past the grid and all.
 ///
-/// Both sessions must cross at the Full rung: the slot raw (row 55 of 55,
-/// which the successor's 1049 exit needs once the band gives the row back),
-/// the shell's full 256 lines of history, the band row and its message in the
-/// window carry, the digest and the proof equal.
+/// Both sessions must cross at the Full rung: the slot on the prompt's row
+/// (row 54 of 55, after the prompt, where the successor's 1049 exit puts the
+/// shell back), the shell's full 256 lines of history, the band row and its
+/// message in the window carry, the digest and the proof equal.
 #[test]
 fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1062,7 +1065,8 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         }
         t.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~/src/aterm % claude");
         assert_eq!(t.cursor().row, 55, "the prompt is on the last row");
-        // Claude Code: 1049 saves the cursor (row 55) and draws its frame.
+        // Claude Code: 1049 saves the cursor (row 55, after the prompt) and
+        // draws its frame.
         t.process(
             b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1m\xe2\x95\xad\xe2\x94\x80 Claude Code\x1b[0m\r\n",
         );
@@ -1150,9 +1154,12 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         "{at}: the Claude Code tab's saved primary crosses under its alternate screen"
     );
     assert_eq!(
-        claude_carry.saved_cursor_main.map(|saved| saved.cursor_row),
-        Some(55),
-        "{at}: the Claude Code tab's DECSC slot rides raw — row 55 of a 55-row grid"
+        claude_carry
+            .saved_cursor_main
+            .map(|saved| (saved.cursor_row, saved.cursor_col)),
+        Some((54, 31)),
+        "{at}: the Claude Code tab's DECSC slot rode the band's shrink up with its \
+         prompt — row 54 of a 55-row grid, after `% claude`"
     );
     let shell_carry = carried(1);
     assert_eq!(

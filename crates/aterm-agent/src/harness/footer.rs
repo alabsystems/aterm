@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CLAUDE CODE FOOTER — aterm's facts about a Claude Code session, on
-//! the glass beside Claude Code's own (owner directions, 2026-09-24 and
-//! 2026-09-28): one run of marks, Codex-style —
+//! the glass beside Claude Code's own: one run of marks, Codex-style —
 //!
 //! ```text
 //! ────────────────────────────────────────────── ‹top effort› ─
@@ -13,14 +12,12 @@
 //! ```
 //!
 //! model and effort under one mark, then the session's working directory
-//! (home as `~`; owner, 2026-09-27: the repository's name alone "isn't
-//! enough"), then the branch — written INTO the rule under Claude Code's
-//! input box, right-aligned the way Claude writes its own effort tag (its
-//! top-effort mode's name, `‹top effort›` above) into the rule above it
-//! (owner, 2026-09-28: "the original footer from claude code should also be
-//! there because I'm worried about excluding information from claude code
-//! originally"). Claude's own footer
-//! row under the rule is never touched, and only cells that are plain rule
+//! (home as `~`; the repository's name alone is not enough), then the
+//! branch — written INTO the rule under Claude Code's input box,
+//! right-aligned the way Claude writes its own effort tag (its top-effort
+//! mode's name, `‹top effort›` above) into the rule above it, so none of
+//! Claude Code's own footer is hidden. Claude's own footer row under the
+//! rule is never touched, and only cells that are plain rule
 //! glyphs are covered ([`rule_run`]); the rule is the pane's whole width, so
 //! the facts fit at 80 columns too, and a pane too narrow for them gives
 //! way in a fixed order: a light's hover or selection title first; a live
@@ -75,9 +72,8 @@
 //!   model ([`facts_ladder`]);
 //! * a LIVE UPGRADE that waits only on the person at this composer (`⇣
 //!   Claude Code 2.1.286 is ready · waits while you use this tab`, or `…
-//!   waits until your draft is sent or cleared`, [`FooterFacts::upgrade`];
-//!   the owner, 2026-09-30: the agent had answered READY, the restart waited
-//!   on the owner at the tab, and nothing on the screen said so) — not read
+//!   waits until your draft is sent or cleared`, [`FooterFacts::upgrade`],
+//!   so a restart held by the person at the tab says so) — not read
 //!   here: the window lays it in from its upgrade host's row for the tab,
 //!   first in the run;
 //! * the ACCOUNT the process runs on (`⎆ work-2` after the model,
@@ -141,8 +137,8 @@ pub const ACCOUNT_MARK: char = '\u{2386}'; // ⎆
 pub const WALL_MARK: char = '\u{29D7}'; // ⧗
 /// The mark before the session's usage.
 pub const USAGE_MARK: char = '\u{03A3}'; // Σ
-/// The mark inside a limit wall that stands for "resets" (owner, 2026-09-30:
-/// "use a recycle icon to save more space"): `⧗ 5h ♻ 3pm`. Not
+/// The mark inside a limit wall that stands for "resets", for its width:
+/// `⧗ 5h ♻ 3pm`. Not
 /// `Emoji_Presentation`, so it draws as one narrow text cell.
 pub const RESET_MARK: char = '\u{267B}'; // ♻
 /// The mark before a live upgrade that waits on the person at this composer
@@ -526,6 +522,29 @@ pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBu
         .filter_map(Result::ok)
         .map(|dir| dir.path().join(&file))
         .find(|candidate| candidate.is_file())
+}
+
+/// [`transcript_path`] for a reader that must not guess between two: the
+/// project's own `<claude dir>/projects/<slug>/<id>.jsonl` (which settles two
+/// files of one id), else the ONE project directory holding the id — two of
+/// them, and the project's own place empty, are none. What the supervisor
+/// confirms a wall on its agent's screen by (`supervise/wall_confirm.rs`):
+/// a file planted under another project's name can then neither stand in for
+/// the conversation's transcript nor be picked over it.
+pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
+    let projects = claude_dir.join("projects");
+    let file = format!("{}.jsonl", entry.session_id);
+    let direct = projects.join(project_slug(&entry.cwd)).join(&file);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut found = std::fs::read_dir(&projects)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|dir| dir.path().join(&file))
+        .filter(|candidate| candidate.is_file());
+    let one = found.next()?;
+    found.next().is_none().then_some(one)
 }
 
 /// What the last [`TAIL_BYTES`] of the transcript at `path` say about the

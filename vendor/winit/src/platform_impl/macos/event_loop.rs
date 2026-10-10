@@ -13,7 +13,7 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFIndex, CFRelease};
+use core_foundation::base::{CFIndex, CFRelease, CFRetain};
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopSourceContext,
     CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
@@ -80,12 +80,21 @@ impl PanicInfo {
 
 #[derive(Debug)]
 pub struct ActiveEventLoop {
-    delegate: aterm_objc::Retained<ApplicationDelegate>,
+    backend: Backend,
     /// LOCAL PATCH (aterm), W12: `aterm_objc::MainThread`, not
     /// `MainThreadMarker`. `window.rs` reads this field, and reading it is what
     /// used to make that file need `objc2_foundation` — a CROSS-FILE
     /// CONSUMPTION through a struct field rather than through a call.
     pub(super) mtm: MainThread,
+}
+
+/// LOCAL PATCH (aterm), 2026-09-26: the AppKit loop's delegate, or the
+/// display-free loop's state (`headless.rs`), whose arms below answer without
+/// AppKit or CoreGraphics' display services (a WindowServer connection).
+#[derive(Debug)]
+enum Backend {
+    AppKit(aterm_objc::Retained<ApplicationDelegate>),
+    Headless(super::headless::LoopState),
 }
 
 impl ActiveEventLoop {
@@ -98,26 +107,53 @@ impl ActiveEventLoop {
         // question the marker's own constructor asks.
         let mtm =
             MainThread::new().expect("an ActiveEventLoop was rooted off the main thread");
-        let p = Self { delegate, mtm };
+        let p = Self { backend: Backend::AppKit(delegate), mtm };
         RootWindowTarget { p, _marker: PhantomData }
     }
 
-    pub(super) fn app_delegate(&self) -> &ApplicationDelegate {
-        &self.delegate
+    pub(super) fn new_headless(mtm: MainThread) -> Self {
+        Self { backend: Backend::Headless(super::headless::LoopState::new()), mtm }
+    }
+
+    /// `None` on a display-free loop: no application, so no window.
+    pub(super) fn app_delegate(&self) -> Option<&ApplicationDelegate> {
+        match &self.backend {
+            Backend::AppKit(delegate) => Some(delegate),
+            Backend::Headless(_) => None,
+        }
+    }
+
+    pub(super) fn headless_state(&self) -> Option<&super::headless::LoopState> {
+        match &self.backend {
+            Backend::AppKit(_) => None,
+            Backend::Headless(state) => Some(state),
+        }
     }
 
     pub fn create_custom_cursor(&self, source: CustomCursorSource) -> RootCustomCursor {
+        if self.headless_state().is_some() {
+            unimplemented!(
+                "a headless event loop has no display to define a cursor on; this backend is \
+                 selected only by an explicit `with_headless`, so reaching here is a caller bug"
+            )
+        }
         RootCustomCursor { inner: CustomCursor::new(source.inner) }
     }
 
     #[inline]
     pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
-        monitor::available_monitors()
+        match &self.backend {
+            Backend::AppKit(_) => monitor::available_monitors(),
+            Backend::Headless(_) => VecDeque::new(),
+        }
     }
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        monitor::primary_monitor()
+        match &self.backend {
+            Backend::AppKit(_) => monitor::primary_monitor(),
+            Backend::Headless(_) => None,
+        }
     }
 
     #[inline]
@@ -126,11 +162,20 @@ impl ActiveEventLoop {
     #[cfg(feature = "rwh_05")]
     #[inline]
     pub fn raw_display_handle_rwh_05(&self) -> rwh_05::RawDisplayHandle {
+        if self.headless_state().is_some() {
+            unimplemented!(
+                "a headless event loop has no display handle; nothing can be presented \
+                 without a surface, and rwh 0.5 has no way to say so"
+            )
+        }
         rwh_05::RawDisplayHandle::AppKit(rwh_05::AppKitDisplayHandle::empty())
     }
 
     #[inline]
     pub fn system_theme(&self) -> Option<Theme> {
+        if self.headless_state().is_some() {
+            return None;
+        }
         let _ = self.mtm;
         // LOCAL PATCH (aterm), W12: `appearance_to_theme` takes the raw `id`
         // its own sends take, and this file now HAS one — the crossing that
@@ -157,34 +202,60 @@ impl ActiveEventLoop {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::AppKit(rwh_06::AppKitDisplayHandle::new()))
+        match &self.backend {
+            Backend::AppKit(_) => {
+                Ok(rwh_06::RawDisplayHandle::AppKit(rwh_06::AppKitDisplayHandle::new()))
+            },
+            Backend::Headless(_) => Err(rwh_06::HandleError::NotSupported),
+        }
     }
 
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
-        self.delegate.set_control_flow(control_flow)
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.set_control_flow(control_flow),
+            Backend::Headless(state) => state.set_control_flow(control_flow),
+        }
     }
 
     pub(crate) fn control_flow(&self) -> ControlFlow {
-        self.delegate.control_flow()
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.control_flow(),
+            Backend::Headless(state) => state.control_flow(),
+        }
     }
 
     pub(crate) fn exit(&self) {
-        self.delegate.exit()
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.exit(),
+            Backend::Headless(state) => state.exit(),
+        }
     }
 
     pub(crate) fn clear_exit(&self) {
-        self.delegate.clear_exit()
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.clear_exit(),
+            Backend::Headless(state) => state.clear_exit(),
+        }
     }
 
     pub(crate) fn exiting(&self) -> bool {
-        self.delegate.exiting()
+        match &self.backend {
+            Backend::AppKit(delegate) => delegate.exiting(),
+            Backend::Headless(state) => state.exiting(),
+        }
     }
 
     pub(crate) fn owned_display_handle(&self) -> OwnedDisplayHandle {
-        OwnedDisplayHandle
+        match &self.backend {
+            Backend::AppKit(_) => OwnedDisplayHandle::AppKit,
+            Backend::Headless(_) => OwnedDisplayHandle::Headless,
+        }
     }
 
     pub(crate) fn hide_application(&self) {
+        if self.headless_state().is_some() {
+            return;
+        }
         let _ = self.mtm;
         // SAFETY: `-hide:` is `v24@0:8@16` on `NSApplication`; its argument is
         // the `nil` sender upstream passed as `None`.
@@ -192,12 +263,19 @@ impl ActiveEventLoop {
     }
 
     pub(crate) fn hide_other_applications(&self) {
+        if self.headless_state().is_some() {
+            return;
+        }
         let _ = self.mtm;
         // SAFETY: `-hideOtherApplications:` is `v24@0:8@16` on `NSApplication`.
         unsafe { send_v_id(app(), sel!(hideOtherApplications:), Id::NIL) }
     }
 
     pub(crate) fn set_allows_automatic_window_tabbing(&self, enabled: bool) {
+        if let Some(state) = self.headless_state() {
+            state.set_allows_automatic_window_tabbing(enabled);
+            return;
+        }
         let _ = self.mtm;
         // SAFETY: `+setAllowsAutomaticWindowTabbing:` is `v20@0:8B16` — a CLASS
         // method on `NSWindow`, which is why the receiver is the class object.
@@ -211,6 +289,9 @@ impl ActiveEventLoop {
     }
 
     pub(crate) fn allows_automatic_window_tabbing(&self) -> bool {
+        if let Some(state) = self.headless_state() {
+            return state.allows_automatic_window_tabbing();
+        }
         let _ = self.mtm;
         // SAFETY: `+allowsAutomaticWindowTabbing` is `B16@0:8`, a class method.
         unsafe {
@@ -236,7 +317,68 @@ fn map_user_event<T: 'static>(
     }
 }
 
-pub struct EventLoop<T: 'static> {
+/// LOCAL PATCH (aterm), 2026-09-26: the AppKit loop or the display-free one
+/// (`headless.rs`), chosen at `new` by the builder's `with_headless`.
+pub enum EventLoop<T: 'static> {
+    AppKit(AppKitEventLoop<T>),
+    Headless(super::headless::EventLoop<T>),
+}
+
+impl<T> EventLoop<T> {
+    pub(crate) fn new(
+        attributes: &PlatformSpecificEventLoopAttributes,
+    ) -> Result<Self, EventLoopError> {
+        // Before anything touches AppKit: the AppKit arm's first act is
+        // `+[NSApplication sharedApplication]`.
+        if attributes.headless {
+            return super::headless::EventLoop::new().map(Self::Headless);
+        }
+        AppKitEventLoop::new(attributes).map(Self::AppKit)
+    }
+
+    pub fn window_target(&self) -> &RootWindowTarget {
+        match self {
+            Self::AppKit(el) => el.window_target(),
+            Self::Headless(el) => el.window_target(),
+        }
+    }
+
+    pub fn run<F>(mut self, handler: F) -> Result<(), EventLoopError>
+    where
+        F: FnMut(Event<T>, &RootWindowTarget),
+    {
+        self.run_on_demand(handler)
+    }
+
+    pub fn run_on_demand<F>(&mut self, handler: F) -> Result<(), EventLoopError>
+    where
+        F: FnMut(Event<T>, &RootWindowTarget),
+    {
+        match self {
+            Self::AppKit(el) => el.run_on_demand(handler),
+            Self::Headless(el) => el.run_on_demand(handler),
+        }
+    }
+
+    pub fn pump_events<F>(&mut self, timeout: Option<Duration>, handler: F) -> PumpStatus
+    where
+        F: FnMut(Event<T>, &RootWindowTarget),
+    {
+        match self {
+            Self::AppKit(el) => el.pump_events(timeout, handler),
+            Self::Headless(el) => el.pump_events(timeout, handler),
+        }
+    }
+
+    pub fn create_proxy(&self) -> EventLoopProxy<T> {
+        match self {
+            Self::AppKit(el) => el.create_proxy(),
+            Self::Headless(el) => el.create_proxy(),
+        }
+    }
+}
+
+pub struct AppKitEventLoop<T: 'static> {
     /// Store a reference to the application for convenience.
     ///
     /// We intentionally don't store `WinitApplication` since we want to have
@@ -264,16 +406,24 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
     pub(crate) activation_policy: Option<ActivationPolicy>,
     pub(crate) default_menu: bool,
     pub(crate) activate_ignoring_other_apps: bool,
+    /// LOCAL PATCH (aterm): the display-free loop (`headless.rs`); set only by
+    /// `with_headless`. The three AppKit knobs above mean nothing to it.
+    pub(crate) headless: bool,
 }
 
 impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
-        Self { activation_policy: None, default_menu: true, activate_ignoring_other_apps: true }
+        Self {
+            activation_policy: None,
+            default_menu: true,
+            activate_ignoring_other_apps: true,
+            headless: false,
+        }
     }
 }
 
-impl<T> EventLoop<T> {
-    pub(crate) fn new(
+impl<T> AppKitEventLoop<T> {
+    fn new(
         attributes: &PlatformSpecificEventLoopAttributes,
     ) -> Result<Self, EventLoopError> {
         let mtm = MainThread::new()
@@ -320,28 +470,21 @@ impl<T> EventLoop<T> {
         setup_control_flow_observers(mtm, Rc::downgrade(&panic_info));
 
         let (sender, receiver) = mpsc::channel();
-        Ok(EventLoop {
+        Ok(AppKitEventLoop {
             app,
             delegate: delegate.clone_retained(),
             sender,
             receiver: Rc::new(receiver),
             window_target: RootWindowTarget {
-                p: ActiveEventLoop { delegate, mtm },
+                p: ActiveEventLoop { backend: Backend::AppKit(delegate), mtm },
                 _marker: PhantomData,
             },
             panic_info,
         })
     }
 
-    pub fn window_target(&self) -> &RootWindowTarget {
+    fn window_target(&self) -> &RootWindowTarget {
         &self.window_target
-    }
-
-    pub fn run<F>(mut self, handler: F) -> Result<(), EventLoopError>
-    where
-        F: FnMut(Event<T>, &RootWindowTarget),
-    {
-        self.run_on_demand(handler)
     }
 
     // NB: we don't base this on `pump_events` because for `MacOs` we can't support
@@ -463,14 +606,23 @@ impl<T> EventLoop<T> {
     }
 }
 
+/// LOCAL PATCH (aterm): a display-free loop has no AppKit handle to hand out.
 #[derive(Clone)]
-pub(crate) struct OwnedDisplayHandle;
+pub(crate) enum OwnedDisplayHandle {
+    AppKit,
+    Headless,
+}
 
 impl OwnedDisplayHandle {
     #[cfg(feature = "rwh_05")]
     #[inline]
     pub fn raw_display_handle_rwh_05(&self) -> rwh_05::RawDisplayHandle {
-        rwh_05::AppKitDisplayHandle::empty().into()
+        match self {
+            Self::AppKit => rwh_05::AppKitDisplayHandle::empty().into(),
+            Self::Headless => unimplemented!(
+                "a headless event loop has no display handle to hand to rwh 0.5"
+            ),
+        }
     }
 
     #[cfg(feature = "rwh_06")]
@@ -478,7 +630,10 @@ impl OwnedDisplayHandle {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::AppKitDisplayHandle::new().into())
+        match self {
+            Self::AppKit => Ok(rwh_06::AppKitDisplayHandle::new().into()),
+            Self::Headless => Err(rwh_06::HandleError::NotSupported),
+        }
     }
 }
 
@@ -581,6 +736,9 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
 pub struct EventLoopProxy<T> {
     sender: mpsc::Sender<T>,
     source: CFRunLoopSourceRef,
+    /// LOCAL PATCH (aterm): `source` is a display-free loop's shared wake
+    /// source, held by a retain ([`Self::sharing`]).
+    shared: bool,
 }
 
 unsafe impl<T: Send> Send for EventLoopProxy<T> {}
@@ -596,11 +754,42 @@ impl<T> Drop for EventLoopProxy<T> {
 
 impl<T> Clone for EventLoopProxy<T> {
     fn clone(&self) -> Self {
+        if self.shared {
+            // SAFETY: a live source; the clone's retain is released by its `Drop`.
+            unsafe { CFRetain(self.source as _) };
+            return EventLoopProxy { sender: self.sender.clone(), source: self.source, shared: true };
+        }
         EventLoopProxy::new(self.sender.clone())
     }
 }
 
 impl<T> EventLoopProxy<T> {
+    /// LOCAL PATCH (aterm), 2026-09-26: a proxy for the display-free loop
+    /// that signals THAT loop's wake source instead of making its own.
+    ///
+    /// WHY NOT [`Self::new`]. A mode keeps its version-0 sources in a `CFSet`,
+    /// and CoreFoundation calls two sources equal when order, callbacks and
+    /// `info` match: every source `new` makes has the same order and `perform`
+    /// and a NULL `info`, so only the FIRST is ever in the run loop, and a
+    /// clone's signal marks a source no run loop holds (measured 2026-09-26 with
+    /// a CoreFoundation-only probe: the second never fires, though
+    /// `CFRunLoopContainsSource` answers yes by equality). The AppKit loop
+    /// survives that because its observers drain the channel on every
+    /// `CFRunLoopWakeUp`; the display-free loop returns only on a HANDLED
+    /// source, and CoreFoundation ignores a wake-up that lands between runs,
+    /// so a clone's event sat until an unrelated wake (control verbs stalled
+    /// 10 s and more). A shared source with a unique `info` is always in the
+    /// run loop, and a signal on it survives the gap between runs.
+    ///
+    /// # Safety
+    /// `source` must be a live version-0 source in the MAIN run loop; this
+    /// proxy takes (and its `Drop` releases) a retain on it.
+    pub(super) unsafe fn sharing(sender: mpsc::Sender<T>, source: CFRunLoopSourceRef) -> Self {
+        // SAFETY: the caller's contract; the retain is balanced by `Drop`.
+        unsafe { CFRetain(source as _) };
+        EventLoopProxy { sender, source, shared: true }
+    }
+
     fn new(sender: mpsc::Sender<T>) -> Self {
         unsafe {
             // just wake up the eventloop
@@ -625,7 +814,7 @@ impl<T> EventLoopProxy<T> {
             CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
             CFRunLoopWakeUp(rl);
 
-            EventLoopProxy { sender, source }
+            EventLoopProxy { sender, source, shared: false }
         }
     }
 

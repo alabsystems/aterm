@@ -309,7 +309,9 @@ impl App {
             _ => presence::WallAnswer::Nobody,
         };
         // The published input stall (`input_stall::InputWatches`): the fact
-        // the frozen program's unmoving screen cannot carry.
+        // the frozen program's unmoving screen cannot carry — with the
+        // explicit restart (`act`) its publication gave the watch's copy, the
+        // one the attention entry and the menu row name too. No lock.
         let input_stall = self.session_status.input_stall(session).cloned();
         Some(Facts {
             role,
@@ -1018,6 +1020,7 @@ impl Desk for App {
     fn band_visible(&self, w: WindowId) -> bool {
         self.windows
             .get(&w)
+            .map(Box::as_ref)
             .is_some_and(crate::messages_host::band_on_screen)
     }
 

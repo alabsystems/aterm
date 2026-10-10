@@ -185,15 +185,15 @@ fn densely_filled_oversized_grid_bounds_instances_no_abort() {
     let cols = 4096usize;
     let mut term = Terminal::new(rows as u16, cols as u16);
     // Fill EVERY cell with a non-space glyph (autowrap tiles the whole grid) so the
-    // GlyphInstance stream is maximal — the stream that overflowed pre-fix.
+    // GlyphInstance stream is maximal.
     term.process(&vec![b'X'; rows * cols]);
     let input = term.cell_frame(rows, cols);
 
     let frame = gpu.render_input(&mut win, &input, None);
     let total = gpu.last_instances();
 
-    // Reaching here == no abort (pre-fix the glyph/bg streams' `create_buffer` could
-    // exceed max_buffer_size and abort).
+    // Reaching here == no abort (an unbounded glyph/bg stream's `create_buffer`
+    // would exceed max_buffer_size and abort).
     assert!(total >= 1, "a densely-filled grid must emit some instances");
     // Streams are bounded by the on-screen area: unbounded code would build
     // about two instances per cell.
@@ -254,7 +254,7 @@ fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
     );
 
     // Frame 2: change ONLY the BOTTOM row — its pixel origin is far below the clamp.
-    // PRE-FIX: the scissor origin exceeded the attachment ⇒ validation abort HERE.
+    // An unclamped scissor origin would exceed the attachment ⇒ validation abort.
     term.process(format!("\x1b[{rows};1HZ").as_bytes());
     let mut input2 = term.cell_frame(rows, cols);
     input2.cursor_visible = false;

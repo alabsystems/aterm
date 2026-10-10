@@ -107,11 +107,68 @@ impl Terminal {
         Some((text, map))
     }
 
+    /// Where a pointer on viewport cell (`row`, `col`) lands in logical order:
+    /// the logical column of the cell the frame paints at visual column `col`
+    /// of viewport row `row` (the offset-aware row a frame fill renders), and
+    /// whether that cell resolved right-to-left.
+    ///
+    /// The selection model is logical (the BiDi recommendation's "selection
+    /// operates on the model", and VTE's pointer path): a pointer anchors at
+    /// the logical cell under it, and on a right-to-left cell the half-cell
+    /// side flips, since its visual left half is its logical end. The
+    /// permutation is the renderer's ([`Self::bidi_visual_order_cells`] over
+    /// the same cells); `(col, false)` when BiDi is off, the row has no
+    /// right-to-left text, or `col` is past the row's written cells, where no
+    /// row is ever permuted.
+    #[must_use]
+    pub fn viewport_cell_logical(&self, row: u16, col: u16) -> (u16, bool) {
+        if self.modes.bidi_mode == BiDiMode::Disabled {
+            return (col, false);
+        }
+        // A drag asks on every pointer move, so read the stored codepoints of
+        // the same offset-aware row first: only a row with one at or past the
+        // first RTL block can reorder. `Cell::char` is the packed codepoint, or
+        // U+FFFD for a complex cell (which passes, and is resolved below), so
+        // this rejects no row the renderer would permute.
+        let view = self.grid().visible_row_view(row);
+        if col >= view.len()
+            || !(0..view.len()).any(|c| view.cell(c).is_some_and(|cell| cell.char() >= '\u{0590}'))
+        {
+            return (col, false);
+        }
+        let cells = self.render_row(usize::from(row));
+        let visual = usize::from(col);
+        if visual >= cells.len() || !cells.iter().any(|c| c.ch >= '\u{0590}') {
+            return (col, false);
+        }
+        let classes: Vec<aterm_bidi::BidiClass> =
+            cells.iter().map(|c| aterm_bidi::bidi_class(c.ch)).collect();
+        if !aterm_bidi::has_bidi_classes(&classes) {
+            return (col, false);
+        }
+        let brackets: Vec<aterm_bidi::Bracket> =
+            cells.iter().map(|c| aterm_bidi::bracket_of(c.ch)).collect();
+        let wide: Vec<bool> = cells.iter().map(|c| c.wide).collect();
+        let base = base_direction_from_classes(
+            self.modes.bidi_direction,
+            self.modes.bidi_autodetection,
+            &classes,
+        );
+        let order = aterm_bidi::reorder_cells_with_classes(&classes, &brackets, &wide, base);
+        let logical = order.get(visual).copied().unwrap_or(visual);
+        let levels = aterm_bidi::cell_levels(&classes, &brackets, &wide, base);
+        let rtl = levels.get(logical).is_some_and(|level| level % 2 == 1);
+        (u16::try_from(logical).unwrap_or(col), rtl)
+    }
+
     /// Reorder each row of a render snapshot into BiDi visual order, in place.
     ///
     /// Applies [`Self::bidi_visual_order_cells`] to the dense
     /// [`RenderCell`](super::RenderCell) row, the column-indexed sparse arrays
-    /// (clusters, combining marks, inline images) and the cursor column. Called
+    /// (clusters, combining marks, inline images) and the cursor column, and
+    /// records the permutation in
+    /// [`RenderInput::visual_to_logical`](crate::render::RenderInput::visual_to_logical)
+    /// (whose rows the caller has reset to the identity). Called
     /// from [`Terminal::cell_frame_into`](super::Terminal::cell_frame_into).
     /// Pure-LTR rows are skipped by a first-RTL-block guard; a no-op when BiDi is
     /// disabled.
@@ -226,6 +283,18 @@ impl Terminal {
             // The cursor follows its logical cell to its new visual column.
             if frame.cursor_row == r && frame.cursor_col < scratch.inv.len() {
                 frame.cursor_col = scratch.inv[frame.cursor_col];
+            }
+            // Record the map, so the selection and find tints test each painted
+            // cell at its logical column (`RenderInput::selection_hit`). A row
+            // is at most `u16::MAX` columns (the grid's own column type).
+            if let Some(map) = frame.visual_to_logical.get_mut(r) {
+                map.clear();
+                map.extend(
+                    scratch
+                        .cell_order
+                        .iter()
+                        .map(|&l| u16::try_from(l).unwrap_or(u16::MAX)),
+                );
             }
             reordered_any = true;
         }
@@ -377,6 +446,7 @@ fn base_direction_from_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::{SelectionSide, SelectionType};
     use crate::terminal::Terminal;
 
     const ALEF: char = '\u{05D0}';
@@ -676,6 +746,217 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(seen, (0..rcells.len()).collect::<Vec<_>>());
     }
+    /// `abc שלום עולם def`: the frame paints the two Hebrew words reversed in
+    /// place, so visual cells 4..=7 show עולם (logical 9..=12) and 9..=12 show
+    /// שלום (logical 4..=7).
+    const MIXED: &str = "abc \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD} def";
+    const OLAM: &str = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}";
+
+    /// The visual columns of frame row 0 the renderer's predicate paints as
+    /// selected, with the frame's own wide flags.
+    fn painted(frame: &crate::render::RenderInput) -> Vec<usize> {
+        let row = &frame.cells[0];
+        (0..frame.cols)
+            .filter(|&v| {
+                let wide_lead = row.get(v + 1).is_some_and(|c| c.wide);
+                let wide_cont = row.get(v).is_some_and(|c| c.wide);
+                frame.selection_contains_cell(0, v, wide_lead, wide_cont)
+            })
+            .collect()
+    }
+
+    /// The text the frame paints on `cols` of row 0, read back in logical
+    /// order (the order the copy reads).
+    fn painted_text_logical(frame: &crate::render::RenderInput, cols: &[usize]) -> String {
+        let mut logical: Vec<(usize, char)> = cols
+            .iter()
+            .map(|&v| (frame.logical_col(0, v), frame.cells[0][v].ch))
+            .collect();
+        logical.sort_unstable();
+        logical.into_iter().map(|(_, ch)| ch).collect()
+    }
+
+    /// What is highlighted is what is copied on a BiDi row: the selection is a
+    /// logical range, and the frame records each permuted row's map so the
+    /// renderer predicate lights the cells that hold it, wherever the reorder
+    /// painted them. A pure-LTR row has no map and paints its own columns.
+    #[test]
+    fn a_logical_selection_lights_the_cells_it_copies_on_a_reordered_row() {
+        let mut term = Terminal::new(4, 30);
+        term.process(MIXED.as_bytes());
+        // Select the second Hebrew word, logical columns 9..=12.
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 9, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 12, SelectionSide::Right);
+        sel.complete_selection();
+        assert_eq!(term.selection_to_string().as_deref(), Some(OLAM));
+
+        let frame = term.cell_frame(4, 30);
+        assert_eq!(
+            frame.visual_to_logical_row(0)[..14],
+            [0, 1, 2, 3, 12, 11, 10, 9, 8, 7, 6, 5, 4, 13],
+            "the frame records the row's visual→logical map"
+        );
+        assert!(
+            frame.visual_to_logical_row(1).is_empty(),
+            "an unpermuted row records no map"
+        );
+        let lit = painted(&frame);
+        assert_eq!(
+            lit,
+            vec![4, 5, 6, 7],
+            "the highlight sits where עולם is painted"
+        );
+        assert_eq!(painted_text_logical(&frame, &lit), OLAM);
+
+        // A drag across the run boundary is still one logical range: `c ש`
+        // (logical 2..=4) lights `c`, the blank, and ש at the right end of
+        // its reversed word.
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 2, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 4, SelectionSide::Right);
+        sel.complete_selection();
+        let frame = term.cell_frame(4, 30);
+        let lit = painted(&frame);
+        assert_eq!(lit, vec![2, 3, 12]);
+        assert_eq!(
+            painted_text_logical(&frame, &lit),
+            term.selection_to_string().unwrap_or_default()
+        );
+
+        // Control: a pure-LTR row paints its own columns and carries no map.
+        let mut ltr = Terminal::new(4, 30);
+        ltr.process(b"abc hello world def");
+        let sel = ltr.text_selection_mut();
+        sel.start_selection(0, 4, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 8, SelectionSide::Right);
+        sel.complete_selection();
+        let frame = ltr.cell_frame(4, 30);
+        assert!(frame.visual_to_logical.iter().all(Vec::is_empty));
+        assert_eq!(painted(&frame), vec![4, 5, 6, 7, 8]);
+        assert_eq!(ltr.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    /// A reused scratch forgets a map with the order it described: once the
+    /// row is rewritten in LTR text, the next fill leaves it unmapped, so a
+    /// selection there lights its own columns again.
+    #[test]
+    fn a_refill_drops_the_map_of_a_row_that_no_longer_reorders() {
+        let mut term = Terminal::new(4, 30);
+        term.process(MIXED.as_bytes());
+        let mut scratch = crate::render::RenderInput::empty();
+        term.cell_frame_into(&mut scratch, 4, 30);
+        assert!(!scratch.visual_to_logical_row(0).is_empty());
+        term.process(b"\r\x1b[2Kabc hello world def");
+        term.cell_frame_into(&mut scratch, 4, 30);
+        assert!(scratch.visual_to_logical.iter().all(Vec::is_empty));
+        assert_eq!(scratch.logical_col(0, 5), 5);
+    }
+
+    /// The pointer's side of the same contract: a viewport cell maps to the
+    /// logical cell the frame paints there, with the right-to-left flag that
+    /// swaps its halves, on the live screen and on a scrolled-back row alike.
+    #[test]
+    fn viewport_cell_logical_follows_the_painted_order() {
+        let mut term = Terminal::new(4, 30);
+        term.process(MIXED.as_bytes());
+        assert_eq!(term.viewport_cell_logical(0, 1), (1, false), "LTR cell");
+        assert_eq!(term.viewport_cell_logical(0, 4), (12, true));
+        assert_eq!(term.viewport_cell_logical(0, 5), (11, true));
+        assert_eq!(term.viewport_cell_logical(0, 12), (4, true));
+        assert_eq!(
+            term.viewport_cell_logical(0, 8),
+            (8, true),
+            "the blank between the words joins their RTL run (UAX #9 N1)"
+        );
+        assert_eq!(
+            term.viewport_cell_logical(0, 13),
+            (13, false),
+            "the blank before `def` resolves to the LTR paragraph"
+        );
+        assert_eq!(
+            term.viewport_cell_logical(0, 25),
+            (25, false),
+            "past the text"
+        );
+        assert_eq!(term.viewport_cell_logical(1, 3), (3, false), "a blank row");
+
+        // Scrolled into history and back into view: the pointer reads the row
+        // the viewport shows, not the live screen row beneath it (now blank).
+        term.process(b"\r\n\r\n\r\n\r\n");
+        term.scroll_display(1);
+        assert_eq!(term.grid().display_offset(), 1);
+        let frame = term.cell_frame(4, 30);
+        let row: String = frame.cells[0].iter().map(|c| c.ch).collect();
+        assert!(
+            row.starts_with("abc \u{05DD}\u{05DC}\u{05D5}\u{05E2}"),
+            "{row:?}"
+        );
+        assert_eq!(term.viewport_cell_logical(0, 5), (11, true));
+
+        // Control: BiDi off paints and maps the identity.
+        let mut off = Terminal::new(4, 30);
+        off.process(MIXED.as_bytes());
+        off.modes.bidi_mode = BiDiMode::Disabled;
+        assert_eq!(off.viewport_cell_logical(0, 5), (5, false));
+        assert!(
+            off.cell_frame(4, 30)
+                .visual_to_logical
+                .iter()
+                .all(Vec::is_empty)
+        );
+    }
+
+    /// The map's DIRECTION, on a row whose permutation is not its own
+    /// inverse. A lone RTL run reversed in place maps each cell to its mirror,
+    /// so a map recorded or read backwards (logical→visual, or a level read at
+    /// the visual index) gives the same answers there. Hebrew with a number
+    /// does not: in `abc אב 12 ג def` the number keeps its digits in order
+    /// (UAX #9 I2 lifts it to level 2) inside the reversed run, so the frame
+    /// paints `abc ג 12 בא def`.
+    #[test]
+    fn a_number_inside_an_rtl_run_pins_the_maps_direction() {
+        const ROW: &str = "abc \u{05D0}\u{05D1} 12 \u{05D2} def";
+        let mut term = Terminal::new(4, 30);
+        term.process(ROW.as_bytes());
+        let frame = term.cell_frame(4, 30);
+        let shown: String = frame.cells[0][..15].iter().map(|c| c.ch).collect();
+        assert_eq!(shown, "abc \u{05D2} 12 \u{05D1}\u{05D0} def");
+        assert_eq!(
+            frame.visual_to_logical_row(0)[..15],
+            [0, 1, 2, 3, 10, 9, 7, 8, 6, 5, 4, 11, 12, 13, 14],
+            "visual→logical, not its inverse ([.., 10, 9, 8, 6, 7, 5, 4, ..])"
+        );
+        for v in 0..30 {
+            assert_eq!(
+                frame.visual_col(0, frame.logical_col(0, v)),
+                v,
+                "visual {v}"
+            );
+        }
+
+        // Select the number, logical 7..=8: the highlight lights the cells
+        // that paint `12`, and they hold what the copy reads.
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 7, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 8, SelectionSide::Right);
+        sel.complete_selection();
+        assert_eq!(term.selection_to_string().as_deref(), Some("12"));
+        let frame = term.cell_frame(4, 30);
+        let lit = painted(&frame);
+        assert_eq!(lit, vec![6, 7]);
+        assert_eq!(painted_text_logical(&frame, &lit), "12");
+
+        // The pointer reads the same direction: the cell painting `1` is
+        // logical 7 at an even (LTR) level, while the blank painted beside it
+        // (logical 6) sits inside the RTL run.
+        assert_eq!(term.viewport_cell_logical(0, 6), (7, false));
+        assert_eq!(term.viewport_cell_logical(0, 7), (8, false));
+        assert_eq!(term.viewport_cell_logical(0, 8), (6, true));
+        assert_eq!(term.viewport_cell_logical(0, 4), (10, true), "ג");
+        assert_eq!(term.viewport_cell_logical(0, 10), (4, true), "א");
+    }
+
     /// Row 0 of a fresh render snapshot as a string, `n` columns wide.
     fn row0(term: &mut Terminal, rows: usize, cols: usize, n: usize) -> String {
         term.cell_frame(rows, cols).cells[0]

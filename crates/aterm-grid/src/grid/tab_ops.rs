@@ -86,7 +86,7 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col >= old(self.storage.cursor.col)
     /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn tab_n(&mut self, n: u16) {
         for _ in 0..n {
             self.tab();
@@ -164,7 +164,7 @@ impl Grid {
     ///
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn back_tab_n(&mut self, n: u16) {
         for _ in 0..n {
             self.back_tab();

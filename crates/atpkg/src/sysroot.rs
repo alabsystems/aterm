@@ -6,9 +6,9 @@
 //! successful install.
 //!
 //! The install-time relocation that used to live here (re-pointing a `rustup-linked`
-//! bundle's `toolchain` link, writing its `rust-toolchain-version`, and the `~/.kani`
-//! link wiring) went with the `rustup-linked` reloc policy: the trust toolchain ships
-//! `self-contained` bundles, so nothing selected that path.
+//! bundle's `toolchain` link, writing its `rust-toolchain-version`, and the model
+//! checker's home-directory link wiring) went with the `rustup-linked` reloc policy:
+//! the trust toolchain ships `self-contained` bundles, so nothing selected that path.
 
 use std::path::Path;
 

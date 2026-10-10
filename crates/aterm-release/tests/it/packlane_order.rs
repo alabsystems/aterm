@@ -42,6 +42,7 @@ fn every_byte_mutation_precedes_relocate_gates_tar_and_sign() {
     let strip = at(&s, "# --- PACK-TIME SYMBOL STRIP");
     let relocate = at(&s, "# --- relocate at PACK time");
     let compiler_gate = at(&s, "# --- ONE-COMPILER GATE");
+    let lineage = at(&s, "# --- THE PAYLOAD'S LINEAGE");
     let smoke = at(&s, "# --- PER-BIN SMOKE-EXEC");
     let hello = at(&s, "# --- TOOLCHAIN HELLO-WORLD");
     let tippy = at(&s, "# --- TIPPY PROBE");
@@ -66,6 +67,12 @@ fn every_byte_mutation_precedes_relocate_gates_tar_and_sign() {
     assert!(
         relocate < compiler_gate && compiler_gate < smoke && smoke < hello && hello < tippy,
         "gates run on relocated bytes"
+    );
+    // …the LINEAGE stamp and the payload scan over the final bytes (after the last
+    // signing pass, before anything is tarred or signed)…
+    assert!(
+        compiler_gate < lineage && lineage < tar,
+        "the lineage stamp and scan read the relocated bytes the manifest signs"
     );
     // …and only then the tarball and the size that feed the signed manifest.
     assert!(tippy < tar && tar < disk, "tar + DISK_INSTALLED come last");
@@ -94,6 +101,9 @@ fn the_lane_keeps_its_fail_closed_guards_and_its_escape_hatches() {
         "atpkg_bundle_one_compiler",
         "atpkg_bundle_compiler_gate",
         "atpkg_bundle_tippy_gate",
+        // Lineage: the compiler admitted before the stage, the payload scanned before tar.
+        "atpkg_lineage_check_compiler",
+        "atpkg_lineage_scan",
     ] {
         assert!(s.contains(guard), "the lane lost its {guard:?} guard");
     }

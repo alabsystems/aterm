@@ -717,11 +717,10 @@ static FULL_GRID: AtomicBool = AtomicBool::new(false);
 ///
 /// THE WHOLE GRID is 120 Hz at three key latencies and 60 Hz, five frame phases
 /// each: 20 replays. The default run replays SIX of them, spread over both
-/// frame rates, four phases and all three latencies. That is not a guess at what
-/// bites: the file header records, for every law, the replays that went RED
-/// without its fix — the owner's shape 15 of 20, the 100 ms stream 16 of 20,
-/// every other shape 20 of 20 — and any six DISTINCT replays of twenty contain
-/// at least one of the red ones when no more than five are green. Replays are
+/// frame rates, four phases and all three latencies. Without each law's fix,
+/// RED replays were the owner's shape 15 of 20, the 100 ms stream 16 of 20 and
+/// every other shape 20 of 20, and any six DISTINCT replays of twenty contain
+/// at least one red one when no more than five are green. Replays are
 /// deterministic (a synthetic screen through a real `Terminal`, no clock), so
 /// the sample bites every time the defect is present, at 3.3x less cost per law
 /// (a sweep is 20 full `Terminal` replays and each test runs two to six). The
@@ -754,9 +753,8 @@ fn grid() -> Vec<(u64, u64, u64)> {
 
 /// Every replay of `take` in `shape` ([`grid`]). Each replay is its own
 /// `Terminal` and engine on its own clock, so they run on the binary's
-/// threads and are judged in this order (2026-09-30: over the whole grid, one
-/// after another, the six sweeps of the line-editing law were this binary's
-/// 18 s wall; on the pool, 7.5 s).
+/// threads and are judged in this order (serially, the line-editing law's six
+/// sweeps were this binary's 18 s wall; on the pool, 7.5 s).
 fn sweep(take: Take, shape: Shape) {
     let runs = grid();
     let n = runs.len();
@@ -788,9 +786,8 @@ fn sweep(take: Take, shape: Shape) {
 #[ignore = "the exhaustive 20-replay grid of every law (the default run samples 6); run it when the glow lane's custody changes"]
 fn every_law_over_the_whole_frame_and_latency_grid() {
     FULL_GRID.store(true, Ordering::Relaxed);
-    // Every law runs, red or not: the first red law no longer hides the rest,
-    // which is what tells a defect's footprint (the header records, per law,
-    // which went red without its fix) from a single law's.
+    // Every law runs, red or not: a red law does not hide the rest, which is
+    // what tells a defect's footprint from a single law's.
     let laws: [(&str, fn()); 6] = [
         (
             "a_status_row_digit_inside_a_hesitated_keys_echo_window_leaves_no_hole",

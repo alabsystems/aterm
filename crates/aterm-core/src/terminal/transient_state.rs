@@ -188,7 +188,7 @@ pub(super) struct TransientState {
     /// 1049 exit.
     pub(super) alt_entered_without_cursor_save: bool,
     /// An orphaned alternate screen was left while a Windows console host sits
-    /// between us and the app (`win32_input_mode`): our screen is primary again
+    /// between us and the app (`win32_input_active`): our screen is primary again
     /// but conhost's own alternate buffer is still up. Its next alt-screen enter
     /// arrives as a full blank repaint followed by `?1049h` in one read, and its
     /// exit as `?1049l` followed by a repaint of its frozen primary; both would

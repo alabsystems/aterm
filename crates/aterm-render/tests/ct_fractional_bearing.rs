@@ -7,7 +7,7 @@
 //! [`aterm_render::ct_padded_extent`] — the pure fns `CtFont::rasterize`
 //! (macOS) applies to every glyph.
 //!
-//! The sin being fixed (audit sin 10): `ct_rasterize` pinned each ink box to an
+//! The bug this catches: `ct_rasterize` pinned each ink box to an
 //! integer bitmap origin (pen `= -b`) and stored `round(b)` bearings, so every
 //! glyph sat up to 0.5px off its designed position in both axes, error varying
 //! glyph-to-glyph. The fix rasterizes the outline at its true sub-pixel offset
@@ -23,7 +23,7 @@
 //!   `CtFracBearing` derived model (`aterm_spec::derive::ct_frac_bearing_model`)
 //!   carries `Decompose` (bearing + retained phase == designed position,
 //!   exactly) and `PhaseInUnit` (reported phase in `[0, 1)`).
-//!   `cargo test -p aterm-spec`
+//!   `targo --unverified test -p aterm-spec`
 //!   (`derived_ct_frac_bearing_proves_and_catches_rounded_pin`) runs the REAL
 //!   `ty` binary over the whole bounded eighth-px lattice: it PROVES both at
 //!   `Buggy=0` and CATCHES the pre-fix round-and-pin placement at `Buggy=1`

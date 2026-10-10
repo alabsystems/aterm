@@ -4,40 +4,35 @@
 //! THE HANDBACK LANE SENDS EACH KEY TO THE HOLDER IT IS MEANT FOR.
 //!
 //! `tools/test-foreground-handback.sh` (the merge contract's "foreground
-//! handback" stage) drives a real zsh's job control. On 2026-09-27 it failed
-//! 4-6 of its rows on a loaded machine (load 57-69) with the binary of that day
-//! AND with the binary of 2026-09-26 that had passed the same stage: the rows
-//! were the lane's, not aterm's. It guessed who held the terminal from a quiet
-//! screen (`await idle 500`) and sent Ctrl-C; zsh's `fg` prints the job line
-//! and only then `tcsetpgrp`s the job, so the Ctrl-C reached zsh's own group,
-//! the job lived on holding the terminal (measured: `sleep 30` S+, zsh's
-//! tpgid its group), nothing was handed back because nothing died, and the
-//! next row's command line went into the job's cooked tty, where its echo —
-//! `parent-back` spelled out in the typed line — satisfied the row's
-//! `await match`.
+//! handback" stage) drives a real zsh's job control. On a loaded machine its
+//! rows failed with binaries that had passed before: the fault was the lane's.
+//! It guessed who held the terminal from a quiet screen (`await idle 500`) and
+//! sent Ctrl-C; zsh's `fg` prints the job line and only then `tcsetpgrp`s the
+//! job, so the Ctrl-C reached zsh's own group, the job lived on holding the
+//! terminal, and the next row's command line went into the job's cooked tty,
+//! where its echo — `parent-back` spelled out in the typed line — satisfied
+//! the row's `await match`.
 //!
 //! A live run can only sample that race. This drives the REAL lane against
 //! `tests/fixtures/handback-fake-aterm.sh`, which plays the shell's job
 //! control under the adversarial schedule — a handover of the terminal is
 //! visible only to a driver that READS the holder (`who`'s `fgpgid=`), never
 //! to one that waits on a quiet screen — and records every key that reaches
-//! the wrong holder and every `await match` its own typed line satisfies.
-//! Before the fix the lane made 8 such sends and waits (6 control keys to the
-//! shell, the `inside` and `parent-back` echoes); after it, none.
+//! the wrong holder and every `await match` its own typed line satisfies: the
+//! lane must make none (the old shape made 8).
 //!
 //! The live-holder row releases its holder with a line on the holder's stdin
-//! once it has read the holder's modes (2026-09-27: a 2 s self-kill timer was
-//! outlasted at load ~50, and the row read a dead holder); the fake counts
+//! once it has read the holder's modes (a 2 s self-kill timer was outlasted
+//! under load, and the row read a dead holder); the fake counts
 //! that release as a key the JOB must hold the terminal for, and its log line
 //! is one of the non-vacuity checks.
 //!
 //! The forced-miss row (the lane SIGSTOPs its own instance across a one-shot
 //! `?1000h`, leaving a shell-owned mouse=normal when the miss takes) runs LAST
 //! in the zsh session, followed only by the recovery row (`armed-4`, a job that
-//! re-arms mouse reporting and dies). From 2026-09-27 until the fix it ran
-//! before the Ctrl-Z, pipeline and live-holder rows, so each of those started
-//! from the stale mode and none covered its scenario from a clean state. The
-//! fake logs every `await match`, so the order of the rows is pinned here too.
+//! re-arms mouse reporting and dies): run earlier, it leaves the Ctrl-Z,
+//! pipeline and live-holder rows starting from the stale mode. The fake logs
+//! every `await match`, so the order of the rows is pinned here too.
 //!
 //! NEGATIVE CONTROL: a driver in the lane's old shape (Ctrl-C right after the
 //! command line; a wait on a marker its own line spells out) is caught by the

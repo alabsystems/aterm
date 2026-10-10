@@ -210,7 +210,7 @@ pub struct Typed {
 /// standing rules riding in it), its answers (`answer_text`), the agent's
 /// own suggestions it accepted, the wall's retries and its commands. The
 /// harness's own turns, which make no conversation's task
-/// (`crate::harness::upgrade::TaskScan`, D1 of the live E2E of 2026-09-26: a
+/// (`crate::harness::upgrade::TaskScan`: a
 /// `keep going` or an `answer_text` is the supervisor's, however the vendor
 /// records it). The ledger is the SESSION's (the tab's), kept across every
 /// conversation it holds: the time is what places a text in one. A missing
@@ -483,7 +483,7 @@ pub fn model_switch_reason(from: Option<&str>, back_at_unix: Option<i64>) -> Str
 /// the switch go (`TurnEndState::restarted`), so a loop that starts after it
 /// has no return to make. Read back as open, the switch relaunched the
 /// session once more at the OLD account's bucket's reset, onto the model it
-/// already ran (the review of 2026-10-01).
+/// already ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSwitch {
     /// The bucket's model (`None`: none `/model` knows).
@@ -640,10 +640,7 @@ pub struct AccountMoves {
     pub made_ms: Vec<i64>,
     /// The last move made, until a row says it was SERVED
     /// ([`account_answer_reason`]): still to be answered by the loop that
-    /// reads this. (Until 2026-10-01 any `typed` row after it closed it —
-    /// so a loop that started after the move's first typed act never told
-    /// its host `served`, and one that started before it could tell a lost
-    /// login twice.)
+    /// reads this.
     pub open: Option<OpenAccountMove>,
     /// A move could not be made, and neither an act of the policy's nor the
     /// end of the wall it waited on ([`RULE_WALL_WAIT_END`]) follows that

@@ -17,7 +17,9 @@ use aterm_core::selection::{SelectionSide, SelectionType, SmartSelection};
 use aterm_core::terminal::Terminal;
 
 use crate::host::SessionHost;
-use crate::wire::{json_ok, json_str_field, pct_encode_into, visible_char};
+use crate::wire::{
+    WAIT_DEFAULT_MS, json_ok, json_str_field, pct_encode_into, visible_char, wait_ms,
+};
 
 /// The host does not resolve the target sid. Unreachable from a dispatcher that
 /// resolves the session before dispatch (aterm-gui's does); it exists so a
@@ -193,8 +195,9 @@ fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
 
 /// `wait [timeout_ms]` -> the newest completed command block as
 /// `OK complete <id> exit=<code|->`; `OK timeout` if nothing completes in time
-/// (default 30 000 ms, capped at 600 000). Run a command, `wait`, then read
-/// with `blocktext`. Needs shell integration (OSC 133); without it, times out.
+/// (default 30 000 ms, capped at 600 000; any other tail is the usage line, per
+/// [`wait_ms`]). Run a command, `wait`, then read with `blocktext`. Needs shell
+/// integration (OSC 133); without it, times out.
 ///
 /// Entry race: a fast command can complete between the submit and this call.
 /// So with no block executing and a completed block present, the newest is
@@ -207,7 +210,13 @@ fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
 /// Event-driven: registers a subscriber and parks on its wake (every output
 /// burst notifies), re-checking on each wake; the deadline is the backstop.
 pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
-    let timeout_ms = rest.trim().parse::<u64>().unwrap_or(30_000).min(600_000);
+    let timeout_ms = match rest.trim() {
+        "" => WAIT_DEFAULT_MS,
+        ms => match wait_ms(ms) {
+            Some(ms) => ms,
+            None => return "ERR usage: wait [<ms>]\n".to_string(),
+        },
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let reply = |id: u64, exit: Option<i32>| {
         let exit = exit.map_or_else(|| "-".to_string(), |c| c.to_string());
@@ -300,6 +309,9 @@ pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, 
     // a small window and widen only when the match reaches an edge that is not
     // the line's own end.
     let (line_first, line_last) = t.logical_line_span(row);
+    // Columns as the grid drew them: an East Asian Ambiguous character takes
+    // the cells the `ambiguous_width` policy gives it.
+    let ambiguous = t.ambiguous_width();
     let mut back = WORD_WINDOW_ROWS;
     let mut fwd = WORD_WINDOW_ROWS;
     let (first_row, start, end) = loop {
@@ -313,12 +325,14 @@ pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, 
         let offset = usize::try_from(row.checked_sub(win_first)?).ok()?;
         let global = offset.checked_mul(cols)?.checked_add(usize::from(col))?;
         // A click right of the text is an empty cell: `None` from the rules.
-        let (start, end) = smart_rules().word_boundaries_at_column(&text, global)?;
+        let (start, end) =
+            smart_rules().word_boundaries_at_column_with(&text, global, ambiguous)?;
         // A match touching the window edge may continue past it. Widen and re-ask, unless
         // the edge IS the logical line's end, where there is nothing more to read.
         let open_up = start == 0 && win_first > line_first;
-        let open_down =
-            end >= aterm_core::grapheme::byte_to_column(&text, text.len()) && win_last < line_last;
+        let open_down = end
+            >= aterm_core::grapheme::byte_to_column_with(&text, text.len(), ambiguous)
+            && win_last < line_last;
         if !open_up && !open_down {
             break (win_first, start, end);
         }
@@ -869,6 +883,57 @@ mod gesture_tests {
             !picked.contains("NEXTWORD"),
             "widening walked past the hard newline into the next logical line: {picked:?}"
         );
+    }
+
+    /// With `ambiguous_width = "wide"` the grid draws an East Asian Ambiguous
+    /// character (`→`) in two cells, and a double-click measures the line the
+    /// same way: a click on any cell of `foo` (cells 4-6) selects `foo`, on the
+    /// screen and from scrollback.
+    #[test]
+    fn a_double_click_measures_ambiguous_characters_as_the_grid_draws_them() {
+        let mut term = Terminal::new(4, 20);
+        term.apply_config(&aterm_core::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        term.process("→→foo bar\r\n".as_bytes());
+        assert!(
+            term.grid().is_wide_continuation_at(0, 3),
+            "precondition: the second arrow takes cells 2-3"
+        );
+        for col in 4..=6 {
+            assert_eq!(
+                select_word(&mut term, 0, col),
+                ((0, 4), (0, 6)),
+                "col {col}"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some("foo"));
+        }
+        assert_eq!(select_word(&mut term, 0, 8), ((0, 8), (0, 10)));
+        assert_eq!(term.selection_to_string().as_deref(), Some("bar"));
+
+        term.process(b"1\r\n2\r\n3\r\n4");
+        let row = (1..=4)
+            .map(|n| -n)
+            .find(|&r| {
+                term.get_line_text(r, None)
+                    .is_some_and(|t| t.ends_with("foo bar"))
+            })
+            .expect("the line reached scrollback");
+        assert_eq!(select_word(&mut term, row, 5), ((row, 4), (row, 6)));
+        assert_eq!(term.selection_to_string().as_deref(), Some("foo"));
+
+        // A word straddling a wrap after ambiguous characters: four arrows and
+        // `ab` fill row 0's ten cells, so `abcd` is one word across the wrap.
+        let mut term = Terminal::new(4, 10);
+        term.apply_config(&aterm_core::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        term.process("→→→→abcd efgh".as_bytes());
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(select_word(&mut term, 1, 0), ((0, 8), (1, 1)));
+        assert_eq!(term.selection_to_string().as_deref(), Some("abcd"));
     }
 
     /// An ordinary unwrapped line still selects exactly itself, word and line

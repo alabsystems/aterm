@@ -23,38 +23,66 @@ impl Grid {
     }
 
     /// Estimate total memory used by the grid and attached scrollback.
+    ///
+    /// Exact whenever the true sum fits in `usize`, pinned at `usize::MAX`
+    /// otherwise: every sum and every product that could exceed `usize` is
+    /// spelled `saturating_*`, here and in each accounting function it adds
+    /// up. An estimate has no use for a panic or a wrap. On 3f93665e8, checked
+    /// sums carried around two walks (the ring rows' walk, which 6bfc88a82
+    /// later replaced with a running sum, and the undo rows' below) used up
+    /// the verifier's 120 s budget, and 48 of this function's 57 obligations
+    /// timed out; with one such walk left the function is decided. Saturating
+    /// sums keep it decided whatever walks it gains
+    /// (docs/AUDIT-control-2026-10-08.md F3).
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let mut total = self.storage.pages.total_memory();
-        total += self.storage.extras.memory_used();
-        total += self.storage.rows.capacity() * std::mem::size_of::<crate::row::Row>();
-        total += self.storage.tab_stops.capacity() * std::mem::size_of::<bool>();
-        total += self.storage.ring_extras.capacity()
-            * std::mem::size_of::<Option<Box<super::scroll_convert::ScrolledRowExtras>>>();
-        for extras in self.storage.ring_extras.iter().flatten() {
-            total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
-            // An image-bearing ring row charges its share of the payload.
-            total += extras.image_bytes();
-        }
+        total = total.saturating_add(self.storage.extras.memory_used());
+        total = total.saturating_add(
+            self.storage
+                .rows
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::row::Row>()),
+        );
+        total = total.saturating_add(
+            self.storage
+                .tab_stops
+                .capacity()
+                .saturating_mul(std::mem::size_of::<bool>()),
+        );
+        total = total.saturating_add(
+            self.storage
+                .ring_extras
+                .capacity()
+                .saturating_mul(std::mem::size_of::<super::ring_extras::RingSlot>()),
+        );
+        // Everything the ring rows' extras retain (links, complex text, image
+        // shares), as a running sum: a ring row is not just its cells.
+        total = total.saturating_add(self.storage.ring_extras.retained_bytes());
         // Resize undo owns copies outside the page arena and the live/ring
         // extras maps (including images only an undo row retains).
         if let Some(undo) = &self.storage.resize_undo {
             use super::resize_undo::{ResizeUndo, UndoRow};
-            total += std::mem::size_of::<ResizeUndo>()
-                + undo.entries.capacity() * std::mem::size_of::<UndoRow>();
+            total = total
+                .saturating_add(std::mem::size_of::<ResizeUndo>())
+                .saturating_add(
+                    undo.entries
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<UndoRow>()),
+                );
             for entry in &undo.entries {
                 if let UndoRow::Demoted(row, extras) | UndoRow::Pushed(row, extras) = entry {
-                    total += row.heap_memory_used();
+                    total = total.saturating_add(row.heap_memory_used());
                     if let Some(extras) = extras {
-                        total += extras.retained_memory_used();
+                        total = total.saturating_add(extras.retained_memory_used());
                     }
                 }
             }
         }
         // Staged scroll-off lines the tiered store has not absorbed yet.
-        total += self.storage.lazy_buffer.memory_used();
+        total = total.saturating_add(self.storage.lazy_buffer.memory_used());
         if let Some(scrollback) = &self.storage.scrollback {
-            total += scrollback.total_memory_used();
+            total = total.saturating_add(scrollback.total_memory_used());
         }
         total
     }

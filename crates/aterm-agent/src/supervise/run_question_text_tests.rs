@@ -1139,30 +1139,31 @@ fn a_fresh_supervisor_over_a_typed_field_hands_it_over_without_a_key() {
 /// * the `status` alone (their gesture landed between read-back and
 ///   `status`): held for the person too.
 ///
-/// Held for the person, the loop looks again once their grace is over (the
-/// person aged to 10 ms short of it); the loop is stopped at the worker's
-/// first busy read, where a choice is told. Negative control (scenario 1): no
-/// person, one `CHOSE`.
+/// Held for the person, the loop looks again once the hold is over, and that
+/// look finds their grace over (the person typed just now, [`TYPED_NOW`]);
+/// the loop is stopped at the worker's first busy read, where a choice is
+/// told. Negative control (scenario 1): no person, one `CHOSE`.
 #[test]
 fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
+    let (now, past) = (stamp_ms(TYPED_NOW), stamp_ms(QUIET_PAST_GRACE));
     // (case, each read's `"human_ms"`, `status human_ms=` from the n-th
     // read on: the 4th is the read-back).
     for (case, reads, status) in [
         (
             "the read alone",
-            vec!["null", "null", "null", "2000", "15000"],
+            vec!["null", "null", "null", TYPED_NOW, QUIET_PAST_GRACE],
             vec![],
         ),
         (
             "the read and its status",
-            vec!["null", "null", "null", "9990", "15000"],
-            vec![(4, 9_990), (5, 15_000)],
+            vec!["null", "null", "null", TYPED_NOW, QUIET_PAST_GRACE],
+            vec![(4, now), (5, past)],
         ),
         (
             "the status alone",
-            vec!["null", "null", "null", "null", "15000"],
-            vec![(4, 9_990), (5, 15_000)],
+            vec!["null", "null", "null", "null", QUIET_PAST_GRACE],
+            vec![(4, now), (5, past)],
         ),
     ] {
         let held = !status.is_empty();
@@ -1182,11 +1183,12 @@ fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
         }
         let (jdir, journal) = journal_file("text-person-after");
         let (ndir, notes) = notes_file("text-person-after-notes");
-        let opts = SuperviseOpts {
+        let mut opts = SuperviseOpts {
             journal: Some(journal.clone()),
             notes: Some(notes.clone()),
             ..hosted_by(LONG)
         };
+        opts.policy.human_grace_s = PERSON_GRACE_S;
         let lines = {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut out: Vec<u8> = Vec::new();
@@ -1199,6 +1201,7 @@ fn a_persons_input_after_the_text_leaves_the_enter_but_not_the_told_choice() {
                 s.set_approval_env(owner_env());
                 s.set_clock(TEST_NOW, PDT);
                 s.set_zone_lookup(test_zones);
+                s.set_person_hold_wait(Duration::ZERO);
                 let _ = s.run_hosted(&opts, stop, &mut out);
             }
             String::from_utf8(out)
@@ -1358,7 +1361,7 @@ fn a_tab_too_short_for_the_text_falls_back_to_its_recommended_option() {
 ///
 /// The next decision after the partial write comes after an outage, as the
 /// lost answer's does: the dialog handed over is the same point however its
-/// focus moves (FIX 3, the review key holds across a moved focus), and an
+/// focus moves (the review key holds across a moved focus), and an
 /// outage is what makes the point still showing a new one.
 #[test]
 fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not() {

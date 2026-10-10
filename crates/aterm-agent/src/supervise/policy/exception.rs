@@ -6,8 +6,7 @@
 //! 2026-09-28: *"there needs to be some clear reason why the user must be
 //! engaged and what the user should do"*). Pure: [`exception_for`] reads what
 //! the policy already knows and says whether one stands. The wall's
-//! [`outlook`](super::outlook::outlook) — the table the tab chip reads — is the
-//! earlier module's.
+//! [`outlook`](super::outlook::outlook) is the table the tab chip reads.
 //!
 //! The words fit the digest's entry (design-exceptions 8.4): `why` and `action`
 //! at most 90 characters each, the action ONE imperative with no ` or `, no

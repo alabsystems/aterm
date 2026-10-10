@@ -2,15 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The replay / lash-mirror determinism seed.
-//!
-//! This is the falsifiable seed behind the astream "deterministic replay
-//! substrate" thesis applied to a terminal: **the screen is a pure function of
-//! the ordered output-byte log.** A session is recorded as an ordered list of
-//! output records (the bytes a PTY emitted — exactly the `BYTES` frames an
-//! aterm `subscribe` stream carries). We feed that log into the shipping engine
-//! via the injected-clock seam ([`Terminal::process_at`] + a fixed
-//! [`ClockReading`]) so the result cannot depend on real wall-clock pacing.
+//! Replay / lash-mirror determinism: **the screen is a pure function of the
+//! ordered output-byte log.** A session is an ordered list of output records
+//! (the bytes a PTY emitted, the `BYTES` frames an aterm `subscribe` stream
+//! carries), fed through the injected-clock seam ([`Terminal::process_at`] +
+//! a fixed [`ClockReading`]) so wall-clock pacing cannot matter.
 //!
 //! Two things are proven, both bit-exact:
 //!

@@ -132,8 +132,9 @@ with a journal beside it (`<sid>.journal.jsonl`):
   — `/exit` from anyone, ctrl-d, a `kill` — is someone's decision and is left alone, as
   is a launch's own end (`-p`). A worker frozen ten minutes (`status input=stalled`)
   with nobody's hand on it is WARNED about once (a Messages record) and left running
-  (`stall_term_after_s`, 0 never); `stall_term = true` ends it instead (`signal term`,
-  once) for its relaunch.
+  (`stall_term_after_s`, 0 never); `stall_term = true` restarts it instead, once
+  (`aterm ctl @<sid> restart pid=<leader> if-stalled`: stamped first, then ended and
+  relaunched on its conversation).
 - **A person wins:** within `human_grace_s` (120 s) of a person's keystroke, click,
   scroll or IME composition in the session through a window (`status human_ms=`, `EVENT <local> human`;
   control-socket writes, yours included, are not a person) — or of a draft in the

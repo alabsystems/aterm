@@ -350,7 +350,9 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let log = fleet.tmp.join("watch.log");
     let out = std::fs::File::create(&log).expect("observer log");
     let err = out.try_clone().expect("observer log clone");
-    let child = std::process::Command::new(harness::link_to_launch())
+    // `spawnfd`'s: the observer holds its stdio and nothing else of this
+    // process, not another test thread's pipe for as long as it serves.
+    let child = aterm_uds::spawnfd::command(harness::link_to_launch())
         .args([
             "serve",
             "--fleet",
@@ -369,14 +371,14 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
             "--token-file",
             token_file.to_string_lossy().as_ref(),
         ])
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(out)
         .stderr(err)
         .spawn()
         .expect("hand-start an observer");
     // Killed on every exit path, panics included: nothing here is supervised,
     // so a leaked observer would outlive the test and keep publishing.
-    struct Reaper(std::process::Child);
+    struct Reaper(aterm_uds::spawnfd::Child);
     impl Drop for Reaper {
         fn drop(&mut self) {
             let _ = self.0.kill();

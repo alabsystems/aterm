@@ -1,34 +1,21 @@
-// Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
+// Copyright 2026 Andrew Yates
 
-//! SPILL-CAP regression gate — the non-parking egress must bound its spill.
+//! The non-parking egress must bound its spill.
 //!
-//! `SinkWriter::write_frame_nonparking` (the UI-thread keystroke egress) must NOT
-//! park the calling thread, so it normally SKIPS the `SPILL_CAP` backpressure that
-//! the blocking `write_frame` applies. The bug this test pins: skipping the cap
-//! *entirely* let an automated machine-rate small-frame producer — the cross-session
-//! `input`/`mouse` control verbs funnel through this same egress — grow the spill
-//! `VecDeque<u8>` without bound whenever the foreground program wedged (stopped
-//! reading its PTY input). The fix routes an over-cap non-parking frame to the
-//! blocking, cap-enforcing path so the producer feels backpressure instead.
+//! `SinkWriter::write_frame_nonparking` (the UI-thread keystroke egress) must not
+//! park, so it normally skips the `SPILL_CAP` backpressure the blocking
+//! `write_frame` applies. Skipping the cap entirely let a machine-rate small-frame
+//! producer (the cross-session `input`/`mouse` verbs use this egress) grow the
+//! spill without bound while the foreground program stopped reading. An over-cap
+//! non-parking frame therefore takes the blocking, cap-enforcing path.
 //!
-//! This drives the exact mechanism end-to-end: a blocking fd whose read end is opened
-//! and NEVER drained (a wedged foreground), and a detached producer pumping small
-//! frames at machine rate. Under a counting global allocator we assert the retained
-//! heap stays bounded (≈ the 2 MiB `SPILL_CAP`, with slack for VecDeque doubling)
-//! rather than climbing with every frame. An integration test is its own crate, so
-//! the global allocator here affects no other test. Unix-only (the spill / `poll(2)`
-//! machinery does not exist for a Windows ConPTY handle).
-//!
-//! We wedge with a `pipe(2)`, not a pty: it engages the sink's spill path exactly —
-//! `poll(POLLOUT)` goes false and `write(2)` would block once the kernel buffer fills
-//! with no reader, which is precisely what a *raw-mode* wedged foreground pty does. A
-//! *canonical*-mode pty instead DISCARDS overflow input at the line discipline, so it
-//! never backpressures the master — a tty-layer detail orthogonal to the spill bound
-//! under test, and one that would make this test flaky/vacuous.
-//!
-//! Run: `cargo test -p aterm-session --test spill_bound -- --nocapture`.
+//! A blocking pipe whose read end is never drained stands in for the wedged
+//! foreground; a detached producer pumps small frames; a counting global
+//! allocator (this binary only) checks that retained heap stays near the 2 MiB
+//! `SPILL_CAP`. A pipe, not a pty: a raw-mode wedged pty backpressures the same
+//! way, but a canonical-mode pty discards overflow input at the line discipline
+//! and would make the test vacuous. Unix-only: a ConPTY handle has no spill path.
 #![cfg(unix)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -84,14 +71,11 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     // NEVER read, so the kernel buffer fills and further writes block — driving the
     // spill exactly as a wedged raw-mode pty would.
     let mut fds: [libc::c_int; 2] = [0; 2];
+    // SAFETY: `fds` is two writable c_int slots, as pipe(2) requires.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "pipe failed: {}", std::io::Error::last_os_error());
-    let read_end = fds[0];
-    let write_end = fds[1];
-    // Keep the read end alive (undrained) for the whole test so the write end wedges.
-    let _read_end_kept_open = read_end;
 
-    let sink = Arc::new(SinkWriter::new(write_end));
+    let sink = Arc::new(SinkWriter::new(fds[1]));
 
     // Baseline AFTER setup so the delta is attributable to spill growth alone.
     let baseline = net();
@@ -116,7 +100,7 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     };
 
     // Sample retained heap. Two independent signals, checked on every sample so the
-    // wall-clock window never gates correctness (a slow/emulated CI just takes longer
+    // wall-clock window never gates correctness (a slow machine just takes longer
     // to fill the pipe one byte per syscall):
     //   * REGRESSION (fail fast): delta crosses the ceiling. Without the cap the spill
     //     climbs into the hundreds of MiB in well under a second, so this trips almost

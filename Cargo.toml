@@ -34,7 +34,7 @@ account = "alabsystems"
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.101.0"
+version = "0.102.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -243,11 +243,11 @@ log = { path = "crates/aterm-log-shim" }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 # Centralized known-cfg superset (was declared per-crate). Verification/fuzzing
-# tools gate code behind these cfgs (kani proofs, loom interleavings, miri, fuzz
-# harnesses). Declaring
-# the union here keeps `unexpected_cfgs` honest in every crate from one place — an
-# undeclared cfg name still warns; an unused-but-declared one is harmless.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)'] }
+# tools gate code behind these cfgs (loom interleavings, miri, fuzz harnesses,
+# the Trust lanes). Declaring the union here keeps `unexpected_cfgs` honest in
+# every crate from one place — an undeclared cfg name warns, which `-D warnings`
+# makes an error.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

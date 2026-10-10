@@ -2,21 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CLAUDE CODE LIGHTS — a light beside aterm's footer for the setting
-//! the owner always expects on (owner direction, 2026-09-24): the permission
-//! mode. The effort tag Claude Code writes into its own top rule already
-//! shows itself, so it has no light of ours (owner, 2026-09-27: it "already
-//! has a UX element"); nor does thinking, which the owner keeps on for good
-//! (owner, 2026-09-27: "that should always be on") — a light that never
-//! changes says nothing. Nor does fast mode (owner, 2026-09-30: "is there a
-//! fast chip already in claude code? I think so, so we can remove ours"):
-//! Claude Code draws its own `↯` in the composer's top rule while fast mode
-//! is on, so aterm draws no chip and types no `/fast` (the footer still reads
-//! a `/fast` result that moved the model, for its model fact).
+//! the owner always expects on: the permission mode. The effort tag Claude
+//! Code writes into its own top rule already shows itself, so it has no light
+//! of ours; nor does thinking, which the owner keeps on for good — a light
+//! that never changes says nothing. Nor does fast mode: Claude Code draws its
+//! own `↯` in the composer's top rule while fast mode is on, so aterm draws
+//! no chip and types no `/fast` (the footer still reads a `/fast` result that
+//! moved the model, for its model fact).
 //!
 //! DEVIATIONS ONLY. The light is drawn only while its setting DIFFERS from
-//! what the owner expects ([`deviates`]; owner, 2026-09-27: "I don't want to
-//! show the state of parameters that I always expect to be on") — or while a
-//! toggle of it is in flight, or its answer is on show. At rest, everything
+//! what the owner expects ([`deviates`]) — or while a toggle of it is in
+//! flight, or its answer is on show. At rest, everything
 //! as expected, nothing is drawn beside the footer's facts in the composer's
 //! bottom rule, and Claude's own rows are whole. Hover a drawn light to read
 //! its title; click it to toggle.
@@ -268,11 +264,10 @@ impl Reading {
 }
 
 /// Whether `light` shows something the owner does NOT expect — the one
-/// reason a light is drawn at rest (owner, 2026-09-27: "I don't want to show
-/// the state of parameters that I always expect to be on"), and the one
-/// state a click acts in: the mode light deviates in any mode but bypass and
-/// auto, and its click presses forward from there. A light this screen does
-/// not show never deviates: nothing is drawn, or pressed, on a guess.
+/// reason a light is drawn at rest, and the one state a click acts in: the
+/// mode light deviates in any mode but bypass and auto, and its click
+/// presses forward from there. A light this screen does not show never
+/// deviates: nothing is drawn, or pressed, on a guess.
 #[must_use]
 pub fn deviates(light: Light, reading: &Reading) -> bool {
     reading.state(light) == LightState::Off
@@ -440,8 +435,7 @@ mod tests {
 
     /// The mode light's one action is FORWARD to bypass or auto, and only
     /// from another mode: in either expected mode it does not deviate and
-    /// there is nothing to press — the owner's complaint of 2026-09-27 was a
-    /// click that left auto mode.
+    /// there is nothing to press, so a click never leaves auto mode.
     #[test]
     fn each_toggle_is_claudes_own_input() {
         let at = |mode: Mode| Reading {

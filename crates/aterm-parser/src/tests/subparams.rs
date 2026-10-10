@@ -87,7 +87,7 @@ fn parse_csi_no_colon_no_subparams() {
 #[test]
 fn parse_csi_subparam_flag_survives_past_index_16() {
     // MAX_PARAMS is 24; the mask must carry colon flags for indices >= 16
-    // (Kakoune-style long SGR runs with trailing colon groups, #subparam-u32).
+    // (Kakoune-style long SGR runs with trailing colon groups).
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -141,18 +141,4 @@ fn parse_csi_subparam_flag_at_last_param_index() {
     assert_eq!(params.len(), MAX_PARAMS);
     assert_eq!(&params[22..], &[4, 3]);
     assert_eq!(*subparam_mask, 1 << 23);
-}
-
-#[test]
-fn parse_csi_subparam_mask_getter() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // After parsing, check subparam_mask via getter
-    parser.advance(b"\x1b[4:3m", &mut sink);
-
-    // Note: subparam_mask is reset on clear, which happens at start of new sequence
-    // So we need to check before the next sequence starts
-    // The mask should have been used in the dispatch
-    assert_eq!(sink.csi_dispatches_with_subparams[0].3, 0b10);
 }

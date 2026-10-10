@@ -3,7 +3,7 @@
 
 //! The new line's fade: when Enter submits in Claude Code, the composer is
 //! cleared and every glyph under the band goes blank at once. The band must fade
-//! out, not vanish (owner, 2026-09-14).
+//! out, not vanish.
 //!
 //! The content witness's 120 ms melt (`RETIRE_MELT_S`) is for stale light over
 //! replaced text (an input box re-laid elsewhere, light under the wrong

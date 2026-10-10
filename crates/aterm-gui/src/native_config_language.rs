@@ -1210,9 +1210,16 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.stall_term",
-        "End a frozen agent with signal term for its relaunch, instead of warning",
+        "Restart a frozen agent (aterm ctl restart) for its relaunch, instead of warning",
         ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "frozen", "stall", "signal", "strict"],
+        &[
+            "supervisor",
+            "frozen",
+            "stall",
+            "restart",
+            "signal",
+            "strict",
+        ],
         true,
     ),
     manual(
@@ -1397,29 +1404,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // ONE ROW PER KEY. `config_schema()` drops a second entry for a key it already
     // holds, so the duplicate `machine` row that upstream's rework left below this one
     // was dead — and it was the one carrying the words a user searches for ("universal
-    // control", "spotlight", "noindex"). Merged here; the uniqueness test now reads
-    // MANUAL_SCHEMA itself, so a shadowed row fails instead of vanishing.
+    // control"). Merged here; the uniqueness test now reads MANUAL_SCHEMA itself, so a
+    // shadowed row fails instead of vanishing.
     manual(
         "machine",
         "Machine settings",
         ConfigSchemaKind::Table,
-        &[
-            "atpkg",
-            "host",
-            "maintenance",
-            "universal control",
-            "spotlight",
-            "noindex",
-            "mac",
-        ],
+        &["atpkg", "host", "maintenance", "universal control", "mac"],
         false,
-    ),
-    manual(
-        "machine.spotlight_noindex",
-        "Hide build output from Spotlight",
-        ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["atpkg", "spotlight", "index", "build"],
-        true,
     ),
     manual(
         "machine.universal_control",
@@ -2725,9 +2717,6 @@ fn validate_machine_types(
             .unwrap_or(0..source.len().min(1));
         let machine_type_error = match setting.key {
             "machine" if item.as_table_like().is_none() => Some("machine must be a table"),
-            "machine.spotlight_noindex" if item.as_bool().is_none() => {
-                Some("machine.spotlight_noindex must be a boolean (true or false)")
-            }
             "machine.universal_control" if item.as_str().is_none() => {
                 Some("machine.universal_control must be a string (off or leave)")
             }
@@ -5299,10 +5288,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · off stops the background checks only — Check for Updates, `aterm update check` and installing a downloaded build still run; read at launch · the native updater runs on macOS and Linux"
         }
         crate::prefs::EDIT_REROUTE_ANNOUNCE => {
-            " · false silences the line a rerouted cargo/rustc/tlc/z3 (or a clippy/rustfmt/rustdoc/lean whose Trust tool is missing) prints before it runs upstream; the tool still runs, and a direct substitution still says what it ran"
+            " · false silences the line a rerouted cargo/rustc/tlc/z3 (or a clippy/rustfmt/rustdoc/lean whose Trust tool is missing) prints before it runs upstream; the tool still runs, and a direct substitution still says what it ran · a refusal is not a line: inside a Trust source checkout a cargo/rustc that is not Trust is refused either way"
         }
         "reroute.strict" => {
-            " · default false: every rerouted name warns in one line and runs · true restores the refusals — z3 exits 2, a missing tippy/trustfmt/trustdoc/clean exits 127 instead of running upstream, a stub that cannot reach atpkg exits 2 · read at each run; a stub's own copy is re-laid at the next session spawn"
+            " · default false: every rerouted name warns in one line and runs — except a cargo/rustc that is not Trust inside a Trust source checkout, which is refused · true restores the refusals — z3 exits 2, a missing tippy/trustfmt/trustdoc/clean exits 127 instead of running upstream, a stub that cannot reach atpkg exits 2 · read at each run; a stub's own copy is re-laid at the next session spawn"
         }
         "update.owner" | "update.repo" => {
             " · a development build only; a shipped build reads its compiled channel · safe GitHub slug only; invalid/blank values fall through · the native updater runs on macOS and Linux"
@@ -5919,7 +5908,7 @@ mod tests {
             .iter()
             .find(|entry| entry.key == "machine")
             .expect("the [machine] table is described");
-        for word in ["atpkg", "universal control", "spotlight", "noindex"] {
+        for word in ["atpkg", "universal control"] {
             assert!(
                 machine.keywords.contains(&word),
                 "{word:?} must still find the table: {:?}",
@@ -7473,9 +7462,8 @@ home = "~/aterm"
             machine: atpkg::config::MachineConfig,
         }
         let source = "[packages]\nenabled = false\n\
-                      [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+                      [machine]\nuniversal_control = \"leave\"\n";
         let parsed: Document = aterm_toml::from_str(source).expect("real machine schema");
-        assert!(!parsed.machine.spotlight_noindex());
         assert_eq!(
             parsed.machine.universal_control(),
             atpkg::config::UniversalControlPolicy::Leave
@@ -7491,16 +7479,24 @@ home = "~/aterm"
             "valid machine opt-outs must not post a row over a real terminal"
         );
 
-        // A real typo must still create the message the historical omission
-        // incorrectly created for both supported keys.
-        let typo = source.replace("spotlight_noindex", "spotlight_noindx");
-        let notices = crate::app_config::ignored_key_notices(&typo);
-        assert!(notices.iter().any(|line| {
-            line.contains("machine.spotlight_noindx") && line.contains("machine.spotlight_noindex")
-        }));
-        let mut warns = crate::message_reporters::ConfigWarnings::default();
-        warns.extend(crate::message_reporters::ConfigFamily::IgnoredKeys, notices);
-        assert_eq!(warns.into_messages().len(), 1, "one row for the family");
+        // A key no setting reads — a typo, or the retired `spotlight_noindex` — gets the
+        // ordinary unknown-key notice, one row for the family.
+        for stale in [
+            source.replace("universal_control", "universal_contrl"),
+            format!("{source}spotlight_noindex = false\n"),
+        ] {
+            let notices = crate::app_config::ignored_key_notices(&stale);
+            assert!(
+                notices
+                    .iter()
+                    .any(|line| line.contains("machine.universal_contrl")
+                        || line.contains("machine.spotlight_noindex")),
+                "{notices:?}"
+            );
+            let mut warns = crate::message_reporters::ConfigWarnings::default();
+            warns.extend(crate::message_reporters::ConfigFamily::IgnoredKeys, notices);
+            assert_eq!(warns.into_messages().len(), 1, "one row for the family");
+        }
     }
 
     #[test]
@@ -7532,27 +7528,23 @@ home = "~/aterm"
             assert!(warnings.contains("Universal Control is left unchanged"));
             assert!(!warnings.contains("the default is used"));
         }
-        for fields in [
-            "spotlight_noindex = \"false\"\n",
-            "universal_control = true\n",
-        ] {
-            assert!(aterm_toml::from_str::<MachineConfig>(fields).is_err());
-            let source = format!("[machine]\n{fields}");
-            assert!(analyze(&source).has_errors());
-            // The band tells it as a value atpkg could not use, never as a
-            // key with no effect: the key is known, and it is read.
-            let notices = crate::app_config::unaccepted_value_notices(&source, &[]);
-            assert!(notices.iter().any(|line| line.contains("must be")));
-            assert!(
-                notices
-                    .iter()
-                    .any(|line| line.contains("default machine settings"))
-            );
-            assert!(
-                crate::app_config::ignored_key_notices(&source).is_empty(),
-                "{source:?}"
-            );
-        }
+        let fields = "universal_control = true\n";
+        assert!(aterm_toml::from_str::<MachineConfig>(fields).is_err());
+        let source = format!("[machine]\n{fields}");
+        assert!(analyze(&source).has_errors());
+        // The band tells it as a value atpkg could not use, never as a key with no
+        // effect: the key is known, and it is read.
+        let notices = crate::app_config::unaccepted_value_notices(&source, &[]);
+        assert!(notices.iter().any(|line| line.contains("must be")));
+        assert!(
+            notices
+                .iter()
+                .any(|line| line.contains("default machine settings"))
+        );
+        assert!(
+            crate::app_config::ignored_key_notices(&source).is_empty(),
+            "{source:?}"
+        );
         assert!(analyze("machine = false\n").has_errors());
         assert!(
             ignored_key_warnings("machine = false\n")

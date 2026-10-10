@@ -164,8 +164,6 @@ fn scrollback_clear() {
 /// This catches data corruption in the LZ4 (warm) and Zstd (cold) codecs,
 /// off-by-one errors in tier index arithmetic, and decompression cache
 /// coherence issues.
-///
-/// Part of #5550 (memory safety verification).
 #[test]
 fn tier_transition_content_fidelity_multi_cycle() {
     // Very small limits: hot=3, warm=6, block_size=3.

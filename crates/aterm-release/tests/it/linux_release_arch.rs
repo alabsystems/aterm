@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native Linux architecture claims exercise the shipping shared contract,
-//! not a retired tar publisher's duplicate ELF reader. Names, manifest fields,
-//! and ELF machine identity must agree; authenticity additionally requires the
-//! appcast/roster signatures and full digest checked by the worker/installer.
-//! Historical manual tar downloads remain covered by test-check-release-shape.sh.
+//! Native Linux architecture claims exercise the shipping shared contract.
+//! Names, manifest fields, and ELF machine identity must agree; authenticity
+//! additionally requires the appcast/roster signatures and full digest checked
+//! by the worker/installer. Manual tar downloads are covered by
+//! `release_steps::release_shape` (`ship release`'s after-cut step).
 
 use aterm_update_core::Manifest;
 use aterm_update_core::linux::{LINUX_BINARY_MAX_BYTES, LinuxTarget};

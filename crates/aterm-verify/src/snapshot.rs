@@ -17,9 +17,14 @@
 //! anything is planned, the worktree is synced to exactly what the caller has:
 //!
 //!  1. `git checkout --detach --force <caller HEAD>`;
-//!  2. `git clean -fd` — NEVER `-x`, so the ignored target dirs stay warm;
+//!  2. [`clean_to_head`]: `git clean -fd` — NEVER `-x`, so the target dirs the
+//!     tree's `.gitignore` files ignore stay warm — then every untracked file
+//!     the source identity still counts (one only `.git/info/exclude` or
+//!     `core.excludesFile` ignores, an untracked `.gitignore` that ignores
+//!     itself) removed;
 //!  3. `git diff --binary HEAD` from the caller, piped to `git apply --binary`;
-//!  4. every untracked, non-ignored file copied across;
+//!  4. every untracked file no tracked `.gitignore` ignores
+//!     ([`identity::untracked_split`]) copied across;
 //!  5. every edit an assume-unchanged or skip-worktree flag hides from `git
 //!     diff` copied across ([`identity::flag_hidden_edits`]) — the diff cannot
 //!     carry them, and without this the snapshot built HEAD's bytes;
@@ -29,10 +34,11 @@
 //!     then steps 2-5 inside it, recursively.
 //!
 //! and then CHECKED: the snapshot's [`TreeState`] must equal the caller's, or
-//! the sync is retried and finally refused. An ignored file in the caller is
-//! not copied — a test that silently depended on one is a test to fix. The
-//! [`TreeState`] carries each submodule's commit and its dirty paths, so the
-//! check covers the submodule's source as well as the superproject's.
+//! the sync is retried and finally refused. A file the tree's own `.gitignore`
+//! files ignore is not copied — a test that silently depended on one is a test
+//! to fix. The [`TreeState`] carries each submodule's commit and its dirty
+//! paths, so the check covers the submodule's source as well as the
+//! superproject's.
 //!
 //! SUBMODULES NEVER COME FROM THEIR URL (2026-09-24, `vendor/astream`). A linked
 //! worktree does not share its main checkout's submodule checkouts, and `git
@@ -306,6 +312,22 @@ impl Drop for MachineHold {
 /// # Errors
 /// A holder still running after the bound, or a lock that cannot be taken.
 pub fn hold_machine(caller: &Path, lock_dir: Option<&Path>) -> Result<MachineHold, String> {
+    hold_machine_unless(caller, lock_dir, &mut || false)
+}
+
+/// [`hold_machine`], giving the wait up the moment `stop` answers yes — asked at
+/// least every [`STOP_SLICE`] while it waits, so a caller that was interrupted
+/// (`ship release`, whose wait is the machine's lock for up to
+/// [`MACHINE_WAIT_MAX`]) stops waiting within a fraction of a second, its place
+/// in line given up.
+///
+/// # Errors
+/// As [`hold_machine`]; and the wait stopped by `stop`.
+pub fn hold_machine_unless(
+    caller: &Path,
+    lock_dir: Option<&Path>,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<MachineHold, String> {
     let Some(dir) = lock_dir else {
         // No home to anchor a machine-wide lock: unserialized, which is exactly
         // the pre-lock behaviour — and nothing is left behind in `$TMPDIR`.
@@ -316,7 +338,28 @@ pub fn hold_machine(caller: &Path, lock_dir: Option<&Path>) -> Result<MachineHol
         caller,
         MACHINE_WAIT_MAX,
         std::time::Duration::from_secs(5),
+        stop,
     )
+}
+
+/// The longest a waiter for the machine's lock sleeps between two looks at its
+/// `stop` ([`hold_machine_unless`]).
+pub const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Sleep `poll`, in slices of at most [`STOP_SLICE`], asking `stop` before each:
+/// `true` the moment it answers yes.
+fn nap(poll: std::time::Duration, stop: &mut dyn FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + poll;
+    loop {
+        if stop() {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= end {
+            return false;
+        }
+        std::thread::sleep((end - now).min(STOP_SLICE));
+    }
 }
 
 /// How long a gate waits for another one on this machine before it gives up
@@ -468,12 +511,22 @@ fn ahead_in_line(queue: &Path, mine: &Ticket) -> usize {
 /// handle's read of the locked range, even one in this process. The lock is
 /// the kernel's, so a gate that died without running destructors leaves a
 /// file that is free the moment it died, whatever pid its note names.
+///
+/// `stop` answering yes ends the wait at once ([`nap`]): the ticket goes with
+/// it, so the line moves on without this waiter.
 fn acquire_machine_in(
     dir: &Path,
     caller: &Path,
     max_wait: std::time::Duration,
     poll: std::time::Duration,
+    stop: &mut dyn FnMut() -> bool,
 ) -> Result<MachineHold, String> {
+    let stopped = |started: std::time::Instant| {
+        format!(
+            "stopped waiting for this machine's gate after {} — this waiter was interrupted",
+            span(started.elapsed().as_secs())
+        )
+    };
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join("lock");
     let note = dir.join("holder");
@@ -508,7 +561,9 @@ fn acquire_machine_in(
                 );
                 told = Some(std::time::Instant::now());
             }
-            std::thread::sleep(poll);
+            if nap(poll, stop) {
+                return Err(stopped(started));
+            }
             continue;
         }
         let file = std::fs::OpenOptions::new()
@@ -569,7 +624,9 @@ fn acquire_machine_in(
                     eprintln!("verify: waiting for another gate on this machine{holder}{so_far}");
                     told = Some(std::time::Instant::now());
                 }
-                std::thread::sleep(poll);
+                if nap(poll, stop) {
+                    return Err(stopped(started));
+                }
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(format!("cannot lock {}: {e}", path.display()));
@@ -915,11 +972,7 @@ fn sync(caller: &Path, snap: &Path, path_env: &OsStr) -> Result<TreeState, Strin
 
         checkout_detached(snap, &want.head, path_env, "the snapshot")?;
 
-        // `-e`: the gate's own lock, trash and submodule git dirs are not the
-        // caller's to lose.
-        let mut clean = git(snap, path_env);
-        clean.args(["clean", "-fdq", "-e", &format!("/{GATE_STATE_DIR}/")]);
-        run_git(clean, "git clean -fd in the snapshot")?;
+        clean_to_head(snap, snap, path_env, "the snapshot")?;
 
         mirror_worktree_edits(caller, snap, snap, path_env)?;
 
@@ -1054,6 +1107,40 @@ fn checkout_detached(dir: &Path, commit: &str, path_env: &OsStr, what: &str) -> 
     Ok(())
 }
 
+/// Empty `dir` (the snapshot, or a submodule in it) of every untracked file the
+/// source identity counts ([`identity::untracked_paths`]), so the sync then
+/// puts back only the caller's. `git clean -fd` goes first and keeps what the
+/// tree's own `.gitignore` files ignore, the warm lanes; what it also keeps,
+/// and the identity counts as source — a file only the checkout's own exclude
+/// lists ignore, an untracked `.gitignore` that ignores itself — is removed
+/// after it, or a copy the caller has since deleted would read as the
+/// caller's and fail every sync's proof. Removing such a rule file bares what
+/// it hid, hence the rounds. A nested repository (`<dir>/`) stays, as `git
+/// clean` leaves it. `-e`: the gate's own lock, trash and submodule git dirs
+/// are not the caller's to lose. `root` is the snapshot's top, which every
+/// removal is checked against.
+fn clean_to_head(root: &Path, dir: &Path, path_env: &OsStr, what: &str) -> Result<(), String> {
+    loop {
+        let mut clean = git(dir, path_env);
+        clean.args(["clean", "-fdq", "-e", &format!("/{GATE_STATE_DIR}/")]);
+        run_git(clean, &format!("git clean -fd in {what}"))?;
+        let left: Vec<String> = identity::untracked_paths(dir, path_env)
+            .ok_or_else(|| format!("git could not list the untracked files of {what}"))?
+            .into_iter()
+            .filter(|p| !p.ends_with('/'))
+            .collect();
+        if left.is_empty() {
+            return Ok(());
+        }
+        for p in left {
+            let full = dir.join(&p);
+            refuse_symlinked_ancestors(root, &full)
+                .and_then(|()| std::fs::remove_file(&full))
+                .map_err(|e| format!("cannot remove the untracked file {p} from {what}: {e}"))?;
+        }
+    }
+}
+
 /// Steps 3-5 of the sync, from one checkout into its snapshot: the caller's
 /// uncommitted diff, its untracked files, and the edits an index flag hides.
 /// `root` is the snapshot's top, which every write is checked against.
@@ -1116,13 +1203,11 @@ fn mirror_flag_hidden_edits(
 /// `<that>/modules/<path>` for one of THAT submodule — git's own nesting.
 ///
 /// Inside the gate's state dir on purpose: the sync's `git clean` never
-/// touches it, no [`TreeState`] reads it, and the proof guards'
-/// source fingerprint reserves it as scratch — so the git dir's index, which
-/// every checkout rewrites, never reads as a change to the tree. (An embedded
-/// `vendor/astream/.git` DIRECTORY would: `tools/artifact_source_fingerprint.py`
-/// hashes everything below `vendor/`, and paint and spin would re-run on
-/// every sync.) What the tree holds is a one-line `.git` FILE naming it,
-/// relative, exactly as `git submodule absorbgitdirs` would write one.
+/// touches it and no [`TreeState`] reads it — so the git dir's index, which
+/// every checkout rewrites, never reads as a change to the tree, as an embedded
+/// `vendor/astream/.git` DIRECTORY would. What the tree holds is a one-line
+/// `.git` FILE naming it, relative, exactly as `git submodule absorbgitdirs`
+/// would write one.
 const MODULES_DIR: &str = "modules";
 
 /// Refuse a caller whose submodule is not there to copy, naming the command
@@ -1224,9 +1309,7 @@ fn sync_submodules(
             attach_submodule(root, &to, &gitdir, &objects, true, path_env)?;
             checkout_detached(&to, &head, path_env, &what)?;
         }
-        let mut clean = git(&to, path_env);
-        clean.args(["clean", "-fdq"]);
-        run_git(clean, &format!("git clean -fd in {what}"))?;
+        clean_to_head(root, &to, path_env, &what)?;
         mirror_worktree_edits(&from, root, &to, path_env)?;
         sync_submodules(&from, &to, root, &gitdir.join(MODULES_DIR), path_env)?;
     }
@@ -1887,11 +1970,23 @@ mod tests {
             std::env::temp_dir().join(format!("aterm-verify-machine-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let caller = Path::new("/tmp/caller");
-        let held = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect("a free machine is taken at once");
+        let held = acquire_machine_in(
+            &dir,
+            caller,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            &mut || false,
+        )
+        .expect("a free machine is taken at once");
         // Held by a live gate (this process): a zero-bound wait refuses, naming it.
-        let refused = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect_err("a held machine is not taken");
+        let refused = acquire_machine_in(
+            &dir,
+            caller,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            &mut || false,
+        )
+        .expect_err("a held machine is not taken");
         assert!(
             refused.contains("waited 0 s for this machine's gate, held now (pid ")
                 && refused.contains(&format!("pid {}", std::process::id())),
@@ -1916,8 +2011,14 @@ mod tests {
             .try_clone()
             .expect("dup the held descriptor");
         drop(held);
-        let again = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect("a released machine is taken, whatever copies of its descriptor live on");
+        let again = acquire_machine_in(
+            &dir,
+            caller,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            &mut || false,
+        )
+        .expect("a released machine is taken, whatever copies of its descriptor live on");
         drop(again);
         drop(copy);
         // Left behind by a gate that died without destructors: free, whatever
@@ -1928,8 +2029,14 @@ mod tests {
                 format!("pid {pid}\nstarted 0\ncaller /x\n"),
             )
             .unwrap();
-            let taken = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-                .unwrap_or_else(|e| panic!("a lock file naming pid {pid} with no holder: {e}"));
+            let taken = acquire_machine_in(
+                &dir,
+                caller,
+                Duration::ZERO,
+                Duration::from_millis(1),
+                &mut || false,
+            )
+            .unwrap_or_else(|e| panic!("a lock file naming pid {pid} with no holder: {e}"));
             drop(taken);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1966,21 +2073,79 @@ mod tests {
             "one live waiter is ahead"
         );
         // The machine is free, and still not taken past a live waiter in line.
-        let refused = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect_err("a later arrival does not jump the line");
+        let refused = acquire_machine_in(
+            &dir,
+            caller,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            &mut || false,
+        )
+        .expect_err("a later arrival does not jump the line");
         assert!(
             refused.contains("2 gate(s) queued before this one"),
             "{refused}"
         );
         drop(first);
         drop(second);
-        let held = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
-            .expect("first in line takes a free machine");
+        let held = acquire_machine_in(
+            &dir,
+            caller,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            &mut || false,
+        )
+        .expect("first in line takes a free machine");
         let left: Vec<_> = std::fs::read_dir(&queue).unwrap().flatten().collect();
         assert!(
             left.is_empty(),
             "a waiter that stops waiting leaves no ticket: {left:?}"
         );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN INTERRUPTED WAITER STOPS WAITING (`ship release` waits here for up to
+    /// three hours): behind a live holder and behind a live waiter in line alike,
+    /// `stop` is asked between slices of the poll, never once per poll, and the
+    /// first yes ends the wait and gives up the place in line. The poll is two
+    /// minutes and the bound past it, so a wait that slept a whole poll before
+    /// asking would hold this test for minutes (the hang this guards against).
+    #[test]
+    fn a_stopped_waiter_gives_up_at_once_and_leaves_its_place_in_line() {
+        use std::time::{Duration, Instant};
+        let dir =
+            std::env::temp_dir().join(format!("aterm-verify-stop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let caller = Path::new("/tmp/caller");
+        let poll = Duration::from_secs(120);
+        let held = acquire_machine_in(&dir, caller, poll, poll, &mut || false)
+            .expect("a free machine is taken at once");
+        let waits = |dir: &Path| {
+            let mut asked = 0;
+            let t0 = Instant::now();
+            let refused = acquire_machine_in(dir, caller, poll * 10, poll, &mut || {
+                asked += 1;
+                asked >= 3
+            })
+            .expect_err("a stopped waiter takes nothing");
+            (refused, asked, t0.elapsed())
+        };
+        // behind the holder
+        let (refused, asked, took) = waits(&dir);
+        assert!(refused.contains("stopped waiting"), "{refused}");
+        assert_eq!(asked, 3, "asked until it answered yes, then not again");
+        assert!(took < Duration::from_secs(60), "{took:?}");
+        // behind an older waiter in line
+        let ahead = take_ticket(&dir.join("queue")).expect("a ticket ahead");
+        let (refused, _, took) = waits(&dir);
+        assert!(refused.contains("stopped waiting"), "{refused}");
+        assert!(took < Duration::from_secs(60), "{took:?}");
+        drop(ahead);
+        let left: Vec<_> = std::fs::read_dir(dir.join("queue"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "no ticket outlives its waiter: {left:?}");
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }

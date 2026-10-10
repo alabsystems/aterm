@@ -33,8 +33,7 @@
 //!
 //! `WALK_CENSUS=1 targo --unverified test -p aterm-effects --test
 //! effects_suite walk_continuity_census::census -- --nocapture` prints every
-//! verdict; the
-//! other knobs are on [`census`].
+//! verdict; the other knobs are on [`census`].
 
 use crate::walk_census::*;
 use aterm_effects::cursor_glow::InsertWidth;
@@ -850,7 +849,7 @@ fn census() {
     // above (2026-09-30: the 125 replays, one after another, were this
     // binary's 20 s wall; on the pool, 3.9 s). `WALK_CENSUS_RING` prints
     // from inside a replay as it runs, unlabelled, so with it set the census
-    // reads one replay at a time, as it always did.
+    // reads one replay at a time.
     let read_one = |(name, label, run): &(&str, String, Run)| {
         let snaps = match run {
             Run::Scenario(None) => scenario(name).snaps,

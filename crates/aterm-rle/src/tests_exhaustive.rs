@@ -307,9 +307,8 @@ fn rle_set_correctness_exhaustive() {
     }
 }
 
-/// Exhaustive small-domain test covering the exact input space of the
-/// `rle_set_range_value_correctness` Kani proof (len 1..=4).
-/// This proves algorithmically that set_range writes the correct value
+/// Exhaustive small-domain test over every `(len, start, end, check_idx)` with
+/// len 1..=4. This proves algorithmically that set_range writes the correct value
 /// for all valid (len, start, end, check_idx) combinations.
 #[test]
 fn rle_set_range_value_correctness_exhaustive() {
@@ -330,8 +329,7 @@ fn rle_set_range_value_correctness_exhaustive() {
     }
 }
 
-/// Exhaustive small-domain test for set_range preserving total length
-/// (mirrors the Kani `rle_set_range_preserves_length` harness).
+/// Exhaustive small-domain test for set_range preserving total length.
 #[test]
 fn rle_set_range_preserves_length_exhaustive() {
     for len in 1u8..=4 {
@@ -353,8 +351,7 @@ fn rle_set_range_preserves_length_exhaustive() {
     }
 }
 
-/// Exhaustive small-domain test for set_range structural invariants
-/// (mirrors the Kani `rle_set_range_structural_invariants` harness).
+/// Exhaustive small-domain test for set_range structural invariants.
 #[test]
 fn rle_set_range_structural_invariants_exhaustive() {
     for len in 1u8..=4 {

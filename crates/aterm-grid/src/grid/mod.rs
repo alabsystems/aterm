@@ -18,6 +18,7 @@ mod pin_methods;
 pub mod reflow;
 mod reflow_pullback;
 mod resize_undo;
+mod ring_extras;
 mod scroll;
 pub mod scroll_convert;
 mod scroll_fill;
@@ -33,26 +34,6 @@ mod viewport_row_cache;
 mod visible_row_view;
 mod write;
 mod write_split;
-
-#[cfg(kani)]
-mod proofs_kani;
-#[cfg(kani)]
-mod proofs_kani_cursor;
-#[cfg(kani)]
-mod proofs_kani_extras;
-#[cfg(kani)]
-mod proofs_kani_extras_invariants;
-#[cfg(kani)]
-mod proofs_kani_ring;
-#[cfg(kani)]
-mod proofs_kani_scroll;
-#[cfg(kani)]
-#[path = "shift_coord_arithmetic_tests.rs"]
-mod proofs_kani_shift_coord;
-#[cfg(kani)]
-mod proofs_kani_style;
-#[cfg(kani)]
-mod proofs_kani_tabs;
 
 #[cfg(test)]
 mod tests;
@@ -72,10 +53,6 @@ pub(in crate::grid) use crate::{CellCoord, CellExtra, CellExtras};
 pub(in crate::grid) use crate::{ColorType, Cursor, ExtendedStyle, StyleId};
 pub(in crate::grid) use crate::{HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 pub(in crate::grid) use crate::{LineSize, Row};
-
-// Kani constants re-exports.
-#[cfg(kani)]
-pub(in crate::grid) use crate::{KANI_MAX_COLS, KANI_MAX_ROWS};
 
 // Test counter re-exports so grid submodules can use `super::count_*`.
 #[cfg(any(test, feature = "testing"))]

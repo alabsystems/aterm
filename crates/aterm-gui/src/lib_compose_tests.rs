@@ -223,6 +223,43 @@ fn blit_places_pane_and_keeps_seam() {
     assert_eq!(row[4].ch, 'D');
 }
 
+/// A split pane's BiDi row keeps its visual→logical map in the composite, at
+/// the pane's columns, so the pane's selection (relocated into frame columns)
+/// still lights the cells it copies. The left pane and the divider stay in
+/// painted order.
+#[test]
+fn a_composed_bidi_pane_lights_the_cells_its_selection_copies() {
+    use crate::app_render::push_pane_selection;
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    let theme = Theme::default();
+    // 1x20 window: [left pane 0..6] [divider 6] [right pane 7..20].
+    let mut dst = RenderInput::empty();
+    fill_divider_grid(&mut dst, 1, 20, theme, None);
+    let (left, left_blank) = pane_snapshot("LEFT", 1, 6);
+    // `ab אבג cd`, painted `ab גבא cd`: logical 3 (א) sits at pane column 5.
+    let mut term = Terminal::new(1, 13);
+    term.process("ab \u{05D0}\u{05D1}\u{05D2} cd".as_bytes());
+    let sel = term.text_selection_mut();
+    sel.start_selection(0, 3, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(0, 3, SelectionSide::Right);
+    sel.complete_selection();
+    assert_eq!(term.selection_to_string().as_deref(), Some("\u{05D0}"));
+    let mut right = RenderInput::empty();
+    term.cell_frame_into(&mut right, 1, 13);
+    blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+    blit_pane_into(&mut dst, &right, 0, 7, terminal_blank_cell(&term));
+    push_pane_selection(&mut dst, &left, 0, 0, 1, 6, false);
+    push_pane_selection(&mut dst, &right, 0, 7, 1, 13, true);
+
+    let lit: Vec<usize> = (0..20)
+        .filter(|&c| dst.selection_contains_cell(0, c, false, false))
+        .collect();
+    assert_eq!(lit, vec![12], "the composite lights the cell painting א");
+    assert_eq!(dst.cells[0][12].ch, '\u{05D0}');
+    assert_eq!(dst.logical_col(0, 3), 3, "the left pane is unpermuted");
+    assert_eq!(dst.logical_col(0, 6), 6, "so is the divider");
+}
+
 /// DEC line size is per pane, and a composite row can hold several panes: each pane's
 /// line size must stay confined to its own columns, not win the whole row.
 #[test]

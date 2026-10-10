@@ -3,13 +3,12 @@
 
 //! `atpkg run <tool>` — the engine of `aterm <tool>`, which is how a terminal the
 //! `agents/` twin does not lead reaches the managed copy — execs the store binary WITHOUT
-//! its shim, so it has to do what the shim and the twin do before their `exec` (audit
-//! 2026-09-23):
+//! its shim, so it has to do what the shim and the twin do before their `exec`:
 //!
 //! * export the environment the build declares (design S7): `aterm claude` ran Claude
 //!   Code with its own updater ON beside a `bin/claude` that ran it off — and on a machine
-//!   where a pre-2026-09-23 `repair` had laid `bin/claude` plain, reading the shim would
-//!   not have helped, so the build's `<build>.shim-env` sidecar comes first;
+//!   where an older `repair` had laid `bin/claude` plain, reading the shim would not help,
+//!   so the build's `<build>.shim-env` sidecar comes first;
 //! * answer a vendor's own self-update verb as the FIRST argument the way the twin does
 //!   (`atpkg::selfupdate`): `aterm claude install stable` ran the vendor's installer,
 //!   which installs a copy the managed name never runs.
@@ -155,7 +154,7 @@ fn fake_line(out: &Output) -> String {
 }
 
 /// A HEALTHY machine: `bin/claude` exports `DISABLE_AUTOUPDATER=1` (the control) and
-/// `atpkg run claude` must too — it exported nothing until 2026-09-23.
+/// `atpkg run claude` must too.
 #[test]
 fn run_exports_what_the_shim_exports() {
     let fx = Fixture::new("healthy");
@@ -172,7 +171,7 @@ fn run_exports_what_the_shim_exports() {
     assert_eq!(fake_line(&out), "fake: [1] --version", "{}", describe(&out));
 }
 
-/// A DRIFTED machine: a pre-2026-09-23 `repair` laid `bin/claude` plain over a build
+/// A DRIFTED machine: an older `repair` laid `bin/claude` plain over a build
 /// that declares `DISABLE_AUTOUPDATER=1` — the shim itself runs without it (the control)
 /// — and `atpkg run claude` still exports what the build declares.
 #[test]
@@ -229,9 +228,9 @@ fn run_answers_a_self_update_verb_the_way_the_twin_does() {
 
 /// HELP ON A SELF-UPDATE VERB is the one ending of the plan that runs the tool, and it
 /// runs it as every other `aterm claude` is run: the one note, then the vendor's own
-/// `--help` from the store binary WITH the build's environment. It used to be forwarded
-/// the twin's way, through `bin/claude` — which on a drifted machine (the shim laid
-/// plain, the control) ran it with Claude Code's own updater on (review 2026-09-23).
+/// `--help` from the store binary WITH the build's environment, never through
+/// `bin/claude` — which on a drifted machine (the shim laid plain, the control) runs it
+/// with Claude Code's own updater on.
 #[test]
 fn run_answers_self_update_help_with_the_builds_environment() {
     let fx = Fixture::new("selfupdate-help");

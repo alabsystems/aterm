@@ -119,9 +119,8 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
       - BLOCKING EDGES ONLY: `try_lock`/`try_read`/`try_write` cannot block, so
         a try-guard is an edge SOURCE (once held it is held) but never an edge
         TARGET. Scope: non-test sources of the scanned crates with `#[cfg(test)]`
-        AND `#[cfg(kani)]` items masked (neither compiles into the shipped GUI
-        process: test code never ships; kani code exists only under cargo-kani's
-        `--cfg kani`); string/char literals masked before token scans;
+        items masked (test code never compiles into the shipped GUI process);
+        string/char literals masked before token scans;
         `.read()`/`.write()` with ZERO arguments are assumed RwLock acquisitions
         unless raw-pointer evidence applies (next bullet).
       - RAW-POINTER ptr::read: a zero-arg `.read()` is `core::ptr::read`, not an
@@ -651,12 +650,12 @@ pub(crate) fn mask_literals(line: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| line.to_string())
 }
 
-/// Blank out `#[cfg(test)]`- and `#[cfg(kani)]`-gated items so the census
+/// Blank out `#[cfg(test)]`-gated items so the census
 /// graphs only the shipped lock discipline. Line count is preserved, so spans
 /// stay correct. A raw string forging a line that is exactly `<indent>}` can
 /// end a body early: at most a false positive (see [`mask_gated_items`]).
 pub(crate) fn mask_cfg_test_items(text: &str) -> String {
-    mask_gated_items(text, &["#[cfg(test)]", "#[cfg(kani)]"])
+    mask_gated_items(text, &["#[cfg(test)]"])
 }
 
 /// Blank every item whose immediately preceding attribute line (trimmed)
@@ -4002,26 +4001,6 @@ mod tests {
             out.log
         );
         assert!(out.log.contains("my_guard"), "log:\n{}", out.log);
-    }
-
-    #[test]
-    fn synthetic_cfg_kani_items_are_masked() {
-        // A kani-only ABBA (compiled only under `--cfg kani`) must not graph.
-        let out = run_synth(
-            "kanimask",
-            "fn shipped() {\n    let g = alpha_lock.lock().unwrap();\n}\n\
-             #[cfg(kani)]\nmod verification {\n    fn kani_only_ab() {\n        \
-             let g = alpha_lock.lock().unwrap();\n        \
-             let h = beta_lock.lock().unwrap();\n    }\n    fn kani_only_ba() {\n        \
-             let g = beta_lock.lock().unwrap();\n        \
-             let h = alpha_lock.lock().unwrap();\n    }\n}\n",
-        );
-        assert!(out.ok, "cfg(kani) lock use must not graph:\n{}", out.log);
-        assert!(
-            !out.log.contains("alpha_lock -> beta_lock"),
-            "kani-mod edges must be masked; log:\n{}",
-            out.log
-        );
     }
 
     #[test]

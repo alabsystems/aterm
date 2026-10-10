@@ -15,8 +15,12 @@ pub(crate) const DEFAULT_HOT_LIMIT: usize = 1000;
 /// Default warm tier limit (lines).
 pub(crate) const DEFAULT_WARM_LIMIT: usize = 10000;
 
-/// Default memory budget (100 MB).
-pub(crate) const DEFAULT_MEMORY_BUDGET: usize = 100 * 1024 * 1024;
+/// Default memory budget (100 MB): what [`Scrollback::with_defaults`] lets a
+/// store hold, and the budget a grid with no store sizes its history
+/// allowances from.
+///
+/// [`Scrollback::with_defaults`]: crate::Scrollback::with_defaults
+pub const DEFAULT_MEMORY_BUDGET: usize = 100 * 1024 * 1024;
 
 /// Default line limit (lines).
 ///

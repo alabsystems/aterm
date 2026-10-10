@@ -7,7 +7,7 @@
 //! Retention is **live + 1 rollback** per program. A superseded build is never reclaimed
 //! while it is the live build or the rollback target (reclaiming the latter resurrects the
 //! cryptic *"Reading release bundle rust-toolchain-version: No such file or directory"*
-//! failure `scripts/verify-kani-proofs.sh` guards against), so [`reclaimable`] keeps the live build and the
+//! failure), so [`reclaimable`] keeps the live build and the
 //! single most-recent build below it that `aterm pkg rollback` may land on — the verb's own
 //! predicate ([`crate::flow::rollback_lands_on`]), under the channel the caller verified, or
 //! for a vendor program its lane's ([`crate::vendor_direct::lane::rollback_lands_on`]), under
@@ -2660,7 +2660,9 @@ mod tests {
 
         assert_eq!(runs_from(&app), Some(false), "nothing runs from it yet");
         // It outlives the minute's hang detector below; it is killed once seen.
-        let mut child = std::process::Command::new(&link)
+        // `spawnfd`'s: it holds its stdio and nothing else of this process, not
+        // another test thread's pipe while it lives.
+        let mut child = aterm_uds::spawnfd::command(&link)
             .arg("120")
             .spawn()
             .expect("spawn through the symlink");

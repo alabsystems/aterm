@@ -2575,10 +2575,9 @@ thread_local! {
 /// Reuse the `Arc<ImageData>` of an already-rasterized glyph.
 ///
 /// Stable `Arc` identity across strip rebuilds matters more than skipping the
-/// raster: both renderers key their image caches on `Arc` identity
-/// (`aterm_gpu::GpuImageCache::get` by `Arc::ptr_eq`, and `aterm_render`'s
-/// `ImageCache`), and placements key on `Arc::as_ptr` for the `image_plane` reuse
-/// fast path. Nothing mutates through these `Arc`s or branches on their count.
+/// raster: both renderers decode through `aterm_render::ImageCache`, which keys
+/// a decode on the source `Arc`'s address, and placements key on `Arc::as_ptr`
+/// for the `image_plane` reuse fast path. Nothing mutates through these `Arc`s or branches on their count.
 fn memoized_image(key: IconKey, build: impl FnOnce() -> Arc<ImageData>) -> Arc<ImageData> {
     ICON_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();

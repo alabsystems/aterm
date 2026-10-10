@@ -22,7 +22,7 @@
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `ContrastFloor` derived model (`aterm_spec::derive::contrast_floor_model`)
 //!   carries the same `FloorDelivers` invariant over an abstract contrast
-//!   lattice. `cargo test -p aterm-spec` runs the REAL `ty` binary over the
+//!   lattice. `targo --unverified test -p aterm-spec` runs the REAL `ty` binary over the
 //!   whole bounded state space: it PROVES the invariant at `Buggy=0` and
 //!   CATCHES the old midpoint pole rule at `Buggy=1` (counterexample).
 //! * **Tier-1 (concrete, this file)** — the bound is checked against an

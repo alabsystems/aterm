@@ -94,7 +94,8 @@
 //! Never touched: cursor style/blink, SGR, palette and dynamic colours, titles,
 //! OSC 7/8 state (an open OSC 8 link is closed only by the manual reset,
 //! [`Terminal::manual_handback`]), tab stops, grid/scrollback/images, XTSAVE slots, bidi, modes
-//! 3/45/2027, the INACTIVE screen's kitty slot, and every host policy bit.
+//! 3/45 (2027 is permanently reset: a program cannot set it), the INACTIVE
+//! screen's kitty slot, and every host policy bit.
 
 use core::fmt::Write as _;
 

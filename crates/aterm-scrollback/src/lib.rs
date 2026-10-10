@@ -68,8 +68,13 @@
 //!
 //! ## Verification
 //!
-//! - Kani proofs (`kani_proofs.rs`, `lz4_kani.rs`, `disk_kani.rs`), e.g.
-//!   `tier_transition_preserves_count`, `line_limit_enforced`
+//! - The tier laws are the `ty` models `EvictFull` and `TierResidency`
+//!   (aterm-spec), bound by aterm-buffer's conformance suites; the tiers
+//!   themselves by `src/tests/` and `cold_tier_tests.rs`.
+//! - Exhaustive sweeps: the watermark thresholds over every budget up to
+//!   100,000 (`thresholds_are_bounded_for_every_budget`), the LZ4 decoder's
+//!   claim law over every small input (`lz4::tests`), and, with `disk-tier`,
+//!   the disk page lookup and front truncation over every small layout.
 
 #![deny(missing_docs)]
 #![deny(clippy::all)]
@@ -94,10 +99,6 @@ mod log_shim;
 pub mod lz4;
 #[cfg(not(any(fuzzing, feature = "fuzz")))]
 pub(crate) mod lz4;
-// LZ4 decompression safety proofs (#7934). #[cfg(kani)] gates the proofs;
-// unit tests remain visible under `cargo test` for non-Kani coverage.
-#[cfg(any(kani, test))]
-mod lz4_kani;
 // Thin libc mmap wrapper — only compiled for the disk-backed cold tier.
 #[cfg(feature = "disk-tier")]
 pub mod mmap;
@@ -111,11 +112,11 @@ mod watermark;
 
 pub use access::ScrollbackAccess;
 pub use aterm_rle::Rle;
-pub use codec::DEFAULT_LINE_LIMIT;
 pub(crate) use codec::{
-    DEFAULT_BLOCK_SIZE, DEFAULT_HOT_LIMIT, DEFAULT_MEMORY_BUDGET, DEFAULT_WARM_LIMIT,
-    binary_search_counted, decode_cold_bounded, decompress_lz4_bounded, encode_cold_block,
+    DEFAULT_BLOCK_SIZE, DEFAULT_HOT_LIMIT, DEFAULT_WARM_LIMIT, binary_search_counted,
+    decode_cold_bounded, decompress_lz4_bounded, encode_cold_block,
 };
+pub use codec::{DEFAULT_LINE_LIMIT, DEFAULT_MEMORY_BUDGET};
 // zstd codec helper. Referenced by the on-disk `.dtrm` cold format
 // (disk_compaction.rs / disk_memory.rs, behind `disk-tier`) and by the zstd
 // round-trip unit test. With `zstd` but not `disk-tier` it has no production
@@ -561,18 +562,3 @@ mod storage_tests;
 #[cfg(test)]
 #[path = "watermark_tests.rs"]
 mod watermark_tests;
-
-// Kani proofs for tier-level invariants.
-#[cfg(kani)]
-mod kani_proofs;
-
-// TRUST_NATIVE_TLA §4 (Phase 4): the kani-half of the unified verifier ledger.
-//
-// CRITICAL — this module is UN-GATED w.r.t. `cfg(kani)` (it is NOT under the
-// `#[cfg(kani)]` on `kani_proofs`). The `#[kani::proof]` harnesses are dormant under
-// stock cargo; the `proof_anchor!` REGISTRATIONS must NOT share that gate or they would
-// never register in normal/test builds. They are decoupled — they name the harness by
-// string and are gated ONLY by the `spec-anchors` feature (which the `spec_xref_closure`
-// gate turns on for collection; production leaves it off so aterm-spec is not linked).
-#[cfg(any(test, feature = "spec-anchors"))]
-mod spec_proof_anchors;

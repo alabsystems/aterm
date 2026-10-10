@@ -32,17 +32,27 @@
 //!    a contained process's own children too (measured on macOS 26.6).
 //!    **`(deny mach-lookup …)`** over [`DENIED_LAUNCH_BROKERS`]: under
 //!    `(allow default)` every mach service is reachable, and Launch Services
-//!    (`open`) and the Apple Events daemon start code OUTSIDE the sandbox for
-//!    whoever asks — a contained process could hand itself to them. With these
-//!    four names denied each lookup fails (`kr` 1100), measured with no UI on
-//!    macOS 26.6, while git, python3, targo, make, clang/xcrun, `security`, an
-//!    interactive zsh and ad-hoc `codesign` then exec behave exactly as before
-//!    (the Launch Services database and trust-cache names stay allowed: codesign
-//!    uses them). `launchctl submit` from inside the profile is already refused
-//!    by launchd (measured). Other brokers (`com.apple.xpc.smd`) stay reachable;
-//!    a deny-by-default `mach-lookup` allowlist is the general follow-up.
-//! 3. **WRITE confinement** (`TmpOnly` only) — `(deny file-write*)` then
-//!    `(allow file-write* …)` for [`WRITABLE_ROOTS`] (`/private/tmp`,
+//!    (`open`), the Apple Events daemon and the `ServiceManagement` daemon
+//!    (`com.apple.xpc.smd`, behind `SMAppService`/`SMJobBless`) start, drive or
+//!    register code OUTSIDE the sandbox for whoever asks — a contained process
+//!    could hand itself to them (the `ServiceManagement` path registers a login
+//!    item or launch daemon, the broker route to the same plant the write
+//!    confinement blocks on `~/Library/LaunchAgents`). With these names denied
+//!    each lookup fails (`kr` 1100), measured with no UI on macOS 26.6, while
+//!    git, python3, targo, make, clang/xcrun, `security`, an interactive zsh
+//!    and ad-hoc `codesign` then exec behave exactly as before (the Launch
+//!    Services database and trust-cache names stay allowed: codesign uses
+//!    them). `launchctl submit` from inside the profile is already refused by
+//!    launchd (measured). This list is a denylist, so any other mach service
+//!    that works for its caller outside the sandbox stays reachable; the
+//!    root-cause fix, a deny-by-default `mach-lookup` with an allowlist measured
+//!    against the shell-compat proofs, is the open P1 follow-up in
+//!    `docs/HARDCORE_BACKLOG.md` (recorded 2026-10-09). Until it lands, a broker
+//!    found in the meantime is evidence for that allowlist, not a new row here.
+//! 3. **WRITE confinement** (`TmpOnly` only) — [`PREFERENCE_WRITE_DENY`] (the
+//!    preferences daemon writes `~/Library/Preferences` for its caller and
+//!    consults that operation, not the file rules), then `(deny file-write*)`
+//!    and `(allow file-write* …)` for [`WRITABLE_ROOTS`] (`/private/tmp`,
 //!    `/private/var/tmp`, `/dev`), the user's `$TMPDIR` under
 //!    [`USER_TEMP_PARENT`] ([`admitted_user_temp`]) and the shell's history
 //!    files ([`HISTORY_FILES`], each a `literal` at its lexical path, held to
@@ -110,19 +120,27 @@ pub const BASE_PROFILE: &str = "(version 1)(allow default)(deny network*)\
 (deny mach-priv-task-port)(allow mach-priv-task-port (target self))\
 (deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\")\
 (global-name \"com.apple.lsd.open\")(global-name \"com.apple.lsd.openurl\")\
-(global-name \"com.apple.coreservices.appleevents\"))";
+(global-name \"com.apple.coreservices.appleevents\")\
+(global-name \"com.apple.xpc.smd\"))";
 
 /// The launch brokers [`BASE_PROFILE`] denies a contained process a port to:
-/// The Launch Services daemon and its open/open-URL endpoints, and the Apple Events
-/// daemon. Each starts or drives a process that does NOT inherit the caller's
-/// sandbox. The proof (`actuator::tests::enforcement_proof_launch_brokers_denied`)
-/// asks bootstrap for each of these under the real profile, so a name listed here
-/// but missing from the profile fails it.
+/// The Launch Services daemon and its open/open-URL endpoints, the Apple Events
+/// daemon, and the `ServiceManagement` daemon (`com.apple.xpc.smd`) behind
+/// `SMAppService`/`SMJobBless` — the API an app hands a plist to register a
+/// login item or launch daemon, which runs OUTSIDE the caller's sandbox and
+/// survives it. That is the same plant the write confinement blocks on the
+/// filesystem (`~/Library/LaunchAgents`), reached through a broker instead, so
+/// the two must agree; `launchservicesd` et al. start or drive a process that
+/// likewise does not inherit the sandbox. The proof
+/// (`actuator::tests::enforcement_proof_launch_brokers_denied`) asks bootstrap
+/// for each of these under the real profile, so a name listed here but missing
+/// from the profile fails it.
 pub const DENIED_LAUNCH_BROKERS: &[&str] = &[
     "com.apple.coreservices.launchservicesd",
     "com.apple.lsd.open",
     "com.apple.lsd.openurl",
     "com.apple.coreservices.appleevents",
+    "com.apple.xpc.smd",
 ];
 
 /// The canonical roots a Containment ([`FsCapability::TmpOnly`]) shell may still
@@ -151,6 +169,12 @@ fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
     let bucket = canon.parent()?.parent()?;
     (canon.file_name()? == "T" && bucket.parent()? == Path::new(USER_TEMP_PARENT)).then_some(canon)
 }
+
+/// The rule that keeps a `TmpOnly` shell from writing user preferences through
+/// the preferences daemon, which writes `~/Library/Preferences` on the caller's
+/// behalf and asks the sandbox about this operation rather than the file (see
+/// [`push_write_confinement`]).
+pub const PREFERENCE_WRITE_DENY: &str = "(deny user-preference-write)";
 
 /// The shell history files under the canonical `$HOME` a Containment shell may
 /// still write, each with the siblings its shell writes beside it, as `(name,
@@ -191,11 +215,19 @@ pub const HISTORY_FILES: &[&[(&str, &str)]] = &[
 /// The write-confinement rules of a `TmpOnly` profile: deny every write, then allow
 /// [`WRITABLE_ROOTS`], the user's `$TMPDIR` where [`admitted_user_temp`] admits
 /// it, and, with a home, the [`HISTORY_FILES`] under it.
+///
+/// A file deny alone does not confine every write. A user preference is
+/// written by the preferences daemon (`cfprefsd`), outside the sandbox, into
+/// `~/Library/Preferences`; the daemon asks the sandbox about the
+/// `user-preference-write` operation, not about the file, and `(allow default)`
+/// grants it. So [`PREFERENCE_WRITE_DENY`] comes first: no preference domain
+/// is writable from inside.
 fn push_write_confinement(
     profile: &mut String,
     user_temp: Option<&Path>,
     canon_home: Option<&Path>,
 ) {
+    profile.push_str(PREFERENCE_WRITE_DENY);
     profile.push_str("(deny file-write*)(allow file-write*");
     for root in WRITABLE_ROOTS {
         push_subpath_clause(profile, Path::new(root));
@@ -690,9 +722,15 @@ mod tests {
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
 
-        // Deny every write, then allow the roots — in that order, right after the
-        // base profile, so every later deny (secrets, private data) still wins.
-        let confinement = [BASE_PROFILE, "(deny file-write*)(allow file-write*"].concat();
+        // Deny preference writes and every file write, then allow the roots — in
+        // that order, right after the base profile, so every later deny
+        // (secrets, private data) still wins.
+        let confinement = [
+            BASE_PROFILE,
+            PREFERENCE_WRITE_DENY,
+            "(deny file-write*)(allow file-write*",
+        ]
+        .concat();
         assert!(
             profile.starts_with(&confinement),
             "TmpOnly must open with the write confinement; got {profile}"

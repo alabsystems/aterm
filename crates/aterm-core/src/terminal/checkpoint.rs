@@ -218,10 +218,11 @@ impl SavedCursorRepr {
     ///
     /// The slot holds absolute coordinates that nothing reads until DECRC or a
     /// 1049 exit, which clamp to the grid at that moment (`Grid::set_cursor`,
-    /// as xterm's `CursorRestore` does). `Terminal::resize` leaves
-    /// `cursor_save` alone, so after a shrink the slot can name a row the grid
-    /// no longer has; if the grid grows back first, the cursor lands on its
-    /// original row. The projection therefore must not clamp.
+    /// as xterm's `CursorRestore` does). `Terminal::resize` moves the slot
+    /// only with its text (`Grid::lend_saved_cursor`), so a slot on a row a
+    /// shrink trimmed names a row the grid no longer has; if the grid grows
+    /// back first, the cursor lands on that row. The projection therefore must
+    /// not clamp.
     ///
     /// The wire's bound for this slot is the engine's protocol ceiling, not
     /// the current grid (see `seamless::checkpoint_meta_bound_violation`).
@@ -2011,35 +2012,31 @@ mod tests {
             "the restored grid carries no latent scroll sentinel to double-report"
         );
     }
-    /// The engine keeps a DECSC slot raw across a resize, as xterm does, and
-    /// the wire carries it raw (see `SavedCursorRepr::capture`).
+    /// A resize moves a DECSC slot only with its text, and the wire carries it
+    /// as the engine holds it (see `SavedCursorRepr::capture`): a shrink that
+    /// demotes the saved primary's top row moves the slot up with it, and a
+    /// grow that reveals the row again moves it back.
     #[test]
-    fn a_resize_leaves_the_decsc_slot_raw_and_the_wire_carries_it_raw() {
+    fn a_resize_moves_the_decsc_slot_with_its_text_and_the_wire_carries_it() {
         let mut t = Terminal::new(56, 149);
         t.process(b"\x1b[56;1H\x1b[?1049h");
         assert_eq!(t.cursor_save.main.map(|saved| saved.cursor.row), Some(55));
         t.resize(55, 149);
         assert_eq!(
             t.cursor_save.main.map(|saved| saved.cursor.row),
-            Some(55),
-            "the slot is absolute and untouched by the resize"
+            Some(54),
+            "the demote moved the slot's row up one"
         );
         let cp = t.checkpoint_carry(0).expect("Ground");
         assert_eq!(cp.rows, 55);
         assert_eq!(
             cp.saved_cursor_main.map(|saved| saved.cursor_row),
-            Some(55),
-            "the wire carries the slot as the engine holds it, one row past the grid"
+            Some(54),
+            "the wire carries the slot as the engine holds it"
         );
-        // Grown back before the slot is read, the cursor lands where it was
-        // saved — on the live engine and on one restored from that wire alike.
-        let mut restored = Terminal::from_checkpoint(&cp);
-        for terminal in [&mut t, &mut restored] {
-            terminal.resize(56, 149);
-            terminal.process(b"\x1b[?1049l");
-        }
-        assert_eq!(t.cursor().row, 55);
-        assert_eq!(restored.cursor(), t.cursor());
+        t.resize(56, 149);
+        t.process(b"\x1b[?1049l");
+        assert_eq!(t.cursor().row, 55, "the reveal moved it back");
     }
 
     /// A synchronized-update window open at the checkpoint still times out:

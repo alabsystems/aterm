@@ -405,31 +405,10 @@ impl TerminalHandler<'_> {
         )
     )]
     fn reset_terminal_state(&mut self) {
-        // RIS — delegates to shared reset_common_fields.
-        // Preserve host-configured policy flags across mode reset.
-        let allow_osc52_query = self.modes.allow_osc52_query;
-        let allow_osc52_set = self.modes.allow_osc52_set;
-        let allow_window_ops = self.modes.allow_window_ops;
-        let allow_notifications = self.modes.allow_notifications;
-        // Palette reconfigure is host policy; RIS must not
-        // let a rogue program clear it (DoS) or set it (privilege
-        // escalation / palette takeover).
-        let allow_palette_reconfigure = self.modes.allow_palette_reconfigure;
-        // The shell-integration nonce requirement is host
-        // policy. Byte-stream RIS (ESC c) must not clear it — otherwise a rogue
-        // program writes `\x1b c` then forges OSC 133/633 prompt/command markers
-        // without a nonce (shell_nonce_gate_ok returns true once the flag is
-        // false). `Terminal::reset()` already preserves this; the two reset paths
-        // had drifted, defeating exactly the anti-spoofing control.
-        let require_shell_integration_nonce = self.modes.require_shell_integration_nonce;
-        // Capability toggle, not runtime negotiation state: byte-stream RIS must
-        // not let a program re-enable a kitty protocol the host declared
-        // unsupported (mirrors Terminal::reset()).
-        let kitty_keyboard_enabled = self.modes.kitty_keyboard_enabled;
-        // Host/config-derived display state with no wire sequence to restore it:
-        // CJK ambiguous-width policy + OS light/dark appearance (see Terminal::reset).
-        let ambiguous_width_double = self.modes.ambiguous_width_double;
-        let color_scheme = self.modes.color_scheme;
+        // RIS — delegates to shared reset_common_fields, which keeps the host's
+        // policy (`reset_modes`): a program's `ESC c` must not clear an `allow_*`
+        // bit or the shell-integration nonce requirement (it would then forge
+        // OSC 133/633 marks), nor toggle an input capability.
         // Note: CWD is not cleared on RIS as it represents actual filesystem state.
         let mut groups = super::super::ResetGroups {
             kitty_keyboard: self.kitty_keyboard,
@@ -467,21 +446,9 @@ impl TerminalHandler<'_> {
         // reset_common_fields, whose transient.reset() would clear it.
         self.transient.pending_parser_reset = true;
 
-        // Restore host policy flags that should not be affected by ESC c
-        //.
-        self.modes.allow_osc52_query = allow_osc52_query;
-        self.modes.allow_osc52_set = allow_osc52_set;
-        self.modes.allow_window_ops = allow_window_ops;
-        self.modes.allow_notifications = allow_notifications;
-        self.modes.allow_palette_reconfigure = allow_palette_reconfigure;
-        self.modes.require_shell_integration_nonce = require_shell_integration_nonce;
-        self.modes.kitty_keyboard_enabled = kitty_keyboard_enabled;
-        self.modes.ambiguous_width_double = ambiguous_width_double;
-        self.modes.color_scheme = color_scheme;
-
         // Restore the host-preferred default cursor style: reset_common_fields wiped
         // modes back to CursorStyle::default(), but the host's configured default must
-        // survive RIS (host preference, not app state, like the policy flags above).
+        // survive RIS (host preference, not app state, like the policy `reset_modes` keeps).
         self.modes.cursor_style = *self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
         self.modes.cursor_blink = self.modes.cursor_style.blinks();

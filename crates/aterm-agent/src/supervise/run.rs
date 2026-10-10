@@ -21,15 +21,14 @@
 //! point of the same turn (`Session::hold_for_report`). The worker's socket
 //! sees no extra request, and without the flag every line is byte-identical.
 //!
-//! A usage limit is a decision point `watch` handles alone (round 17,
-//! measured 2026-09-15 → 2026-09-17: one account's weekly limit stopped the
-//! manager and the worker at once, the watcher printed `EVENT limited` and
-//! ran out its budget, and nobody could act for two days). On `EVENT
-//! limited` the watcher never exits on a limit — a budget that would run out
-//! before a reset the notice named is stretched past it ([`Session::extend`])
-//! — and the turn-end policy types the continuation 150 s past the reset, a
-//! session's share of a minute later (the rules file's text with it), as at any other turn end it acts on
-//! (below); a limit the policy does not wait out (`resume_limits = false`)
+//! A usage limit is a decision point `watch` handles alone: one weekly limit
+//! can stop the manager and the worker at once, leaving nobody to act. On
+//! `EVENT limited` the watcher never exits on a limit — a budget that would
+//! run out before a reset the notice named is stretched past it
+//! ([`Session::extend`]) — and the turn-end policy types the continuation
+//! 150 s past the reset, a session's share of a minute later (the rules
+//! file's text with it), as at any other turn end it acts on (below); a
+//! limit the policy does not wait out (`resume_limits = false`)
 //! sets the worker's `attention` meta and, while the fabric is connected,
 //! posts `kind=control` mail to the manager ([`Session::escalate`], once an
 //! episode). The episode is
@@ -64,7 +63,7 @@
 //! escalated as `<program> <kind>: <subject> (<reason>)`, mailed only while the
 //! fabric is connected (`escalate.rs`). [`Session::run_hosted`] is the in-GUI
 //! host's entry: the same loop under [`SuperviseOpts::hosted`], ended by a stop
-//! flag (owner, 2026-09-23; 2026-09-24).
+//! flag.
 //!
 //! **The turn-end policy.** Every point where a worker's turn ended (idle, a
 //! question, a wall) is decided by the pure
@@ -225,18 +224,15 @@ impl CtlReply {
     /// [`Self::unserved`]).
     ///
     /// AND EXIT 75 ([`aterm_ctl::EXIT_REPLACED`], the client's own constant,
-    /// never a copy of its number), whatever its note says (round eight of
-    /// the update audit, finding 13): since its redial (2026-09-25, widened
-    /// by 53cba4dfd), `aterm-ctl` ends a request an update's Commit cut, and
-    /// that it does not ask again — an `await seq <n>` or `await inbox
-    /// since=` whose anchor names the old process, an armed wait, a `turn`, a
-    /// `post` — or that no successor answered at all, with that code and a
-    /// note in place of the old `server closed the connection without
-    /// responding`. Read as an answer, `aterm drive await-turn --reconnect-s`
-    /// and the `--mail` lane died at the first update instead of riding it
-    /// out. Nothing else exits 75, and a request that may have landed (a
-    /// `turn`, a `post`) is already ridden out as one that may have: the next
-    /// look reads the screen before it types again, and a lost `post` is
+    /// never a copy of its number), whatever its note says: `aterm-ctl` exits
+    /// so on a request an update's Commit cut and does not ask again —
+    /// an `await seq <n>` or `await inbox since=` whose anchor names the old
+    /// process, an armed wait, a `turn`, a `post` — or that no successor
+    /// answered at all. Read as an answer, `aterm drive await-turn
+    /// --reconnect-s` and the `--mail` lane would die at an update instead of
+    /// riding it out. Nothing else exits 75, and a request that may have
+    /// landed (a `turn`, a `post`) is ridden out as one that may have: the
+    /// next look reads the screen before it types again, and a lost `post` is
     /// never retried.
     pub fn lost(&self) -> bool {
         if self.ok() {
@@ -353,9 +349,9 @@ fn cut(line: &str) -> bool {
 /// the token on its next run), and `ERR main thread stalled <N>s;
 /// retry` (a verb that needs the window's main thread, refused before it was
 /// posted because the main thread has had no heartbeat for the stall bar while
-/// it had work, as on 2026-09-28, when the main thread was stuck in AppKit and
-/// such a verb would otherwise wait out its whole reply deadline). The last may
-/// also follow a verb's own prefix ([`turned_away`]).
+/// it had work — stuck in AppKit, say — so the verb does not wait out its whole
+/// reply deadline). The last may also follow a verb's own prefix
+/// ([`turned_away`]).
 const TURNED_AWAY: &[&str] = &[
     "ERR control server busy",
     "ERR auth",
@@ -597,17 +593,41 @@ struct ToldWait {
     unix: i64,
 }
 
+/// When the turn-end policy decides again at the point still showing, and
+/// why ([`Session::turn_end_due`], set by [`Session::set_due`]): the deadline
+/// on BOTH clocks — the `Instant` it was set as, and the unix millisecond that
+/// `Instant` named on the wall clock when it was set. It falls at the first
+/// to come ([`Session::due_at`]). Awake, they agree. A Mac's sleep stops the
+/// `Instant` (`CLOCK_UPTIME_RAW` does not count it) and never the wall
+/// clock: a wait set for a weekly reset ends at the reset however long the
+/// Mac slept, whether or not the wait saw it sleep ([`Session::check_slept`]
+/// starts its marks afresh at a new seq, and a repaint at the wake is one).
+/// The audit of 2026-10-09 found three tabs left 11.6-14.1 h past a weekly
+/// reset their `Instant` waits had slept through. A wall clock stepped back
+/// delays the wall time and never the `Instant`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Due {
+    /// The deadline as the `Instant` it was set as.
+    pub(super) at: Instant,
+    /// The same deadline on the wall clock, unix milliseconds, as it read
+    /// when the deadline was set ([`Session::unix_ms_of`]).
+    pub(super) unix_ms: i64,
+    /// Why: the policy's words.
+    pub(super) why: String,
+}
+
 /// The least time between two of the accounts' news that end a LATCHED
 /// session's wait ([`Session::account_edge`]): one more ask of a host that
 /// refused its relaunch, a minute at the soonest.
 const ACCOUNT_NEWS_EVERY: Duration = Duration::from_secs(60);
 
-/// How far the unix second of a told wait may drift from the loop's clock
-/// before it is told again. The loop's deadlines are `Instant`s, which on
-/// macOS do not advance while the machine sleeps, and the second told was
-/// read off the wall clock once: after a sleep of minutes the real try comes
-/// that much later than the second the tab shows. Whole-second flooring and a
-/// clock nudged by NTP move it by a second or two and are no news.
+/// How far the wall second of a wait's deadline ([`Due::unix_ms`]) may move
+/// from the second it was told as before it is told again
+/// ([`Session::tell_wait`]). The same `Instant` set again after a sleep
+/// names a later wall second (the policy's own pauses are `Instant`s, which
+/// a sleep stops), and that is news; the same `Instant` set again awake moves
+/// it by the milliseconds between the two clocks' reads, which rounding can
+/// turn into a second, and that is none.
 const WAIT_SKEW_S: u64 = 2;
 
 /// A host's part at the loop's idle points ([`SuperviseOpts::idle_host`]): the
@@ -622,9 +642,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// When the host will next want a point, if it already knows: a look it
     /// scheduled (the upgrade's short ladder after an unread look, 5 s then
     /// 15 s). The loop's wait ends there, so [`Self::wants`] is read at that
-    /// instant and not at its next [`WAIT_STEP`] wake (the live re-check of
-    /// 2026-10-01: unread looks 5 s apart were taken 21 s apart). The
-    /// default: never known ahead.
+    /// instant and not at its next [`WAIT_STEP`] wake (else unread looks 5 s
+    /// apart are taken 21 s apart). The default: never known ahead.
     fn wants_at(&self) -> Option<Instant> {
         None
     }
@@ -675,20 +694,30 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn can_restart(&self) -> bool {
         false
     }
-    /// Whether ending the agent now (the stall's remedy, `signal term|kill`)
-    /// would be followed by this host's relaunch on its own conversation:
-    /// [`Self::can_restart`] and a relaunch plan from what the host read
-    /// ([`crate::harness::relaunch::resumes_on_exit`]). Only then may a remedy
-    /// say "aterm relaunches it" instead of naming [`Self::resume_command`].
-    /// The default: none.
-    fn relaunches_on_exit(&self) -> bool {
-        false
+    /// Whether the explicit `restart` would be CARRIED for the agent now: the
+    /// host's one predicate for every word of a stall (aterm's
+    /// `restart_act::offered`: a snapshot whose relaunch brings back what the
+    /// act ends, [`crate::harness::relaunch::carries_restart`], the agent in
+    /// front, and the host's hand the one on the session). `[harness]
+    /// relaunch = false` does not limit it: it does not refuse a person's
+    /// explicit restart (ruling 1, 2026-10-08). `Some(promised)` where it
+    /// would: the frozen mail and the warning name that restart instead of
+    /// `signal term` and [`Self::resume_command`] — as the server's own words
+    /// do — and, only where `promised` (its exit relaunched on the agent's
+    /// own conversation, [`crate::harness::relaunch::resumes_on_exit`]: never
+    /// a Codex's), say "aterm relaunches it on its conversation". The
+    /// default: `None`.
+    fn restart_offered(&self) -> Option<bool> {
+        None
     }
     /// The loop holds for a stall the server published (`true`,
-    /// [`Session::hold_for_stall`]), or the stall lifted (`false`,
-    /// [`Session::thaw`]): an agent that exits while one is held was ended
-    /// by the stall's remedy (`signal term|kill`), and the host relaunches
-    /// it on its conversation (U1). The default ignores it.
+    /// [`Session::hold_for_stall`]), or one it held lifted (`false`,
+    /// [`Session::thaw`]). A NOTICE of what this loop saw, as it saw it — it
+    /// lags the stall (a thaw is seen at the loop's next look) and a run that
+    /// ends holding one never says it lifted — so it says nothing of how the
+    /// agent ended: whether an exit was the stall's remedy's (U1) is the
+    /// explicit restart's stamp, on disk before its signal, which aterm's
+    /// host looks up instead. The default ignores it.
     fn stalled(&self, held: bool) {
         let _ = held;
     }
@@ -699,6 +728,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// no, and the remedy stays a person's.
     fn relaunches_after_stall(&self) -> bool {
         false
+    }
+    /// The agent's process as the host last read it — the tab's foreground
+    /// group leader — which the stall's remedy names (`restart pid=<n>
+    /// if-stalled`, refused unless that very process still leads the tab).
+    /// The default: none, and the remedy names the tab's group.
+    fn agent_pid(&self) -> Option<u32> {
+        None
     }
     /// Nobody has asked the session anything, by the host's evidence: the
     /// conversation's record holds no prompt of a person's or orchestrator's
@@ -740,6 +776,19 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn limit_until(&self) -> Option<u64> {
         None
     }
+    /// THE AGENT'S OWN TRANSCRIPT, its tail: the last 256 KiB of the
+    /// conversation the Claude Code in the tab writes now, found from its
+    /// process as the footer finds it (its own `CLAUDE_CONFIG_DIR` or
+    /// `HOME`) — what confirms a wall read on its screen before the turn-end
+    /// policy acts on it ([`wall_confirm`], H6-HARNESS-1). `None`: no
+    /// transcript this host can read (no Claude Code, its process not
+    /// registered yet, its conversation not written yet, two of its id and
+    /// none in its project's own place, a file that cannot be read): then a
+    /// wall read under a tool's call is not acted on, and any other wall as
+    /// the screen reads it. The default reads none.
+    fn transcript_tail(&self) -> Option<String> {
+        None
+    }
 
     /// The reset a limit's words name, placed in the zone only the host knows:
     /// `text` is the notice's reset words ([`Phase::Limited`]'s `reset`), `now`
@@ -772,8 +821,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// restart (`claude --resume <id>` with its launch flags, a `--model` the
     /// conversation's record marks failed left off,
     /// [`crate::harness::upgrade_drive::resume_command_kept`]), or `None` when
-    /// the host read none. Named where this host would not relaunch the agent itself
-    /// ([`Self::relaunches_on_exit`]); never `claude --continue`, which picks
+    /// the host read none. Named where this host would not carry the explicit
+    /// restart ([`Self::restart_offered`]); never `claude --continue`, which picks
     /// the directory's newest conversation, possibly a sibling tab's. The
     /// default: none.
     fn resume_command(&self) -> Option<String> {
@@ -826,7 +875,7 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
 
     /// A RATING SURVEY THE LOOP CANNOT CLOSE, or its end (`None`): told once when
     /// it begins ([`StuckSurvey`], with the sentence the journal carries) and once
-    /// when the card leaves. Owner rule, 2026-09-28: it is a fact the owner may
+    /// when the card leaves. Owner rule: it is a fact the owner may
     /// act on (press `0` in that tab) but not a reason to mark the tab — the
     /// card blocks nothing the worker does — so the loop writes no attention for
     /// it. The host keeps a record and, once the card has stood an hour, one
@@ -1253,22 +1302,21 @@ fn tail_misses_the_live_rows(reader: &dyn ScreenReader, screen: &Screen) -> bool
 /// leaves the rows below it blank until the transcript fills it: on a pane
 /// taller than the tail, the tail can hold the prompt box's bottom rule, its
 /// footer and blank rows, or its caret row under a top rule the tail cut, and
-/// its `idle` was no evidence, so the host's idle-point step never ran (the
-/// review of 2026-09-26: 150x50, the REPL on rows 8-11). It can also hold
-/// the WHOLE composer, the cursor on its caret, and then its reader DOES
-/// decide — and an idle composer is the one reading whose meaning lies in the
-/// rows above it: the worker's last words, a rating card, a wall's notice,
-/// a question. That tail used to stand and be read once; the real card of
-/// 2026-10-01 (Claude Code 2.1.286, 144x53: card on rows 11-12, top rule on
-/// row 14, tail from row 13) showed what it cost: an idle composer, `EVENT
-/// idle` journaled, the card left up for good, nothing said above it
-/// (blind whenever the head row lies above the tail and the top rule at or
-/// under its first row: 18 probes of 18). A BOX the reader decides — an
-/// approval, a question, with the cursor on it — or a RUNNING turn is acted
-/// on from the rows the tail holds, pressed or waited on, and stands, read
-/// once ([`tail_misses_the_live_rows`]: the live subagent rm box of
-/// 2026-09-26 in the tail of a fresh 62-row pane, blank rows under it); the
-/// idle look that follows it reads the zone.
+/// its `idle` was no evidence, so the host's idle-point step never ran
+/// (measured at 150x50, the REPL on rows 8-11). It can also hold the WHOLE
+/// composer, the cursor on its caret, and then its reader DOES decide — but
+/// an idle composer is the one reading whose meaning lies in the rows above
+/// it: the worker's last words, a rating card, a wall's notice, a question.
+/// Read from the tail alone, a rating card above it (Claude Code 2.1.286,
+/// 144x53: card on rows 11-12, top rule on row 14, tail from row 13) was
+/// journaled as `EVENT idle` and left up for good — blind whenever the head
+/// row lies above the tail and the top rule at or under its first row. A
+/// BOX the reader decides — an approval, a question, with the cursor on it
+/// — or a RUNNING turn is acted on from the rows the tail holds, pressed or
+/// waited on, and stands, read once
+/// ([`tail_misses_the_live_rows`]: a subagent rm box in the tail of a fresh
+/// 62-row pane, blank rows under it); the idle look that follows it reads
+/// the zone.
 fn drawn_above_tail(reader: &dyn ScreenReader, screen: &Screen) -> bool {
     if screen.first == 0 || screen.rows.last().is_none_or(|r| !r.trim().is_empty()) {
         return false;
@@ -1303,9 +1351,8 @@ const WAIT_STEP: Duration = Duration::from_secs(20);
 /// break of background work ([`background_settle`]) ask for anyway. In every
 /// shipped binary the two are equal (asserted below), so this is
 /// [`WAIT_STEP`]. A development build that shortens the settle (the live
-/// suite, 2026-10-06) would otherwise hold a request 20 s that its settle no
-/// longer asks for: the activation test's notice waited out one whole step
-/// before its announcement, 20 s of its 32 s.
+/// suite) would otherwise hold a request a whole 20 s step its settle does
+/// not ask for.
 fn next_wait_step() -> Duration {
     WAIT_STEP.min(Duration::from_secs(crate::harness::upgrade::quiet_s()))
 }
@@ -1917,10 +1964,9 @@ enum Survey {
 
 /// The pauses before each try of the survey's `0` after one that did not
 /// dismiss it (the last for every try after), and from which failed try on
-/// the host is told (no tab is marked) — while the tries go on (the
-/// philosophy review of 2026-09-25: a `0` that did not take handed the
-/// survey over for good, the turn-end policy acts at no point with a survey
-/// open, and the session stopped being continued, silently).
+/// the host is told (no tab is marked) — while the tries go on: the turn-end
+/// policy acts at no point with a survey open, so a survey handed over for
+/// good would stop the session being continued, silently.
 const SURVEY_RETRY: [Duration; SURVEY_TRIES] = [
     Duration::from_secs(5),
     Duration::from_secs(30),
@@ -2530,11 +2576,11 @@ pub struct Session<'a, C: Ctl> {
     box_ask: Option<BoxAsk>,
     /// A fixed clock, Unix seconds (tests); `None` reads the system's.
     clock: Option<i64>,
-    /// Tests: how far the fixed clock runs ahead on each read after the
-    /// first, so a Mac's sleep can be staged between two reads
-    /// ([`Self::set_clock_step`]); the running total is `clock_skew`.
+    /// Tests: how far the fixed clock jumps ahead after its next read, so a
+    /// Mac's sleep can be staged between two reads ([`Self::set_clock_jump`]);
+    /// `clock_skew` is the jump once that read is made.
     #[cfg(test)]
-    clock_step: std::sync::atomic::AtomicI64,
+    clock_jump: std::sync::atomic::AtomicI64,
     #[cfg(test)]
     clock_skew: std::sync::atomic::AtomicI64,
     /// Tests: the instant the fixed clock starts RUNNING from, so it keeps
@@ -2546,6 +2592,11 @@ pub struct Session<'a, C: Ctl> {
     /// ([`Self::set_clock_at_ms`]); zero for [`Self::set_clock`].
     #[cfg(test)]
     clock_phase_ms: i64,
+    /// Tests: how long a hold for a person waits before the point is looked
+    /// at again, in place of the rest of their grace
+    /// ([`Self::set_person_hold_wait`]); `None`: the rest of their grace.
+    #[cfg(test)]
+    person_hold_wait: Option<Duration>,
     /// The local zone's offset, read once from `date` when first needed.
     local_offset: Option<i64>,
     /// A zone's offset by name at an instant ([`limit::zone_offset_at`]; a
@@ -2563,15 +2614,15 @@ pub struct Session<'a, C: Ctl> {
     turn_end: TurnEndState,
     /// When the turn-end policy decides again at the point still showing
     /// (its `WaitUntil`), and why — the deadline of the loop's wait for the
-    /// screen to move ([`Self::wait_for_next`]).
-    turn_end_due: Option<(Instant, String)>,
+    /// screen to move ([`Self::wait_for_next`]), on both clocks ([`Due`]).
+    turn_end_due: Option<Due>,
     /// The two clocks as the last step of the wait left them, and the point
     /// (its screen's `seq`) they were taken at: the marks of the Mac-slept
     /// check ([`Self::check_slept`]). They are the POINT's, not one call of
     /// [`Self::wait_for_next`]'s: a wait that ends on an owed look or a host
     /// wake and is entered again on the same point still sees the sleep that
-    /// went by between the calls (the review of the merged main). A new point
-    /// starts them afresh: its wait is decided after the sleep.
+    /// went by between the calls. A new seq starts them afresh. A sleep they
+    /// miss so delays no deadline ([`Due`]); it costs only the wake's settle.
     clock_marks: Option<(u64, Instant, i64)>,
     /// A restart the host could not make yet, in a row
     /// ([`Self::restart_agent`]): each next try waits longer.
@@ -2641,6 +2692,11 @@ pub struct Session<'a, C: Ctl> {
     /// The wall the loop waits on, kept while the screen
     /// shows only the agent's own background work ([`wall_memory`]).
     wall_memory: Option<wall_memory::WallMemory>,
+    /// The verdict the last decision's read gave the screen's wall
+    /// ([`wall_confirm`]: confirmed or refused, by the screen it was read
+    /// at), and the refusal last journaled.
+    wall_verdict: Option<wall_confirm::Verdict>,
+    wall_refused_said: Option<String>,
     /// What the approval policy takes from the supervisor's own process
     /// (the owner's home, uid and `$TMPDIR`; fixed in tests).
     approval_env: ApprovalEnv,
@@ -2917,8 +2973,8 @@ pub struct Session<'a, C: Ctl> {
     /// The host's last word on a memory restart was a REFUSAL
     /// (`restart_agent`'s `otherwise`: the escalation `the restart could not
     /// be made`), so the warning's verdict is the person's restart
-    /// ([`super::memory::Verdict::Person`]) as the badge says, never aterm's
-    /// (the review of 124976a15, 2026-09-29). Cleared ONLY by a restart made
+    /// ([`super::memory::Verdict::Person`]) as the badge says, never aterm's.
+    /// Cleared ONLY by a restart made
     /// (`restart_agent`'s `adopted`, any restart's; a memory restart's names
     /// aterm's at once, [`Self::memory_say`]): a refusal is mostly the
     /// agent's own launch (`refused:one-shot`, `refused:self`), which stands
@@ -2928,8 +2984,8 @@ pub struct Session<'a, C: Ctl> {
     /// and took it back at every point. Not on a measure no longer acted on,
     /// nor at the warning episode's end: at Claude Code's own banner nothing
     /// hands the point back or asks again, and the row promised aterm's
-    /// restart beside the badge until a person acted (the review of
-    /// 657f6333f, 2026-09-30). Pessimistic between, never false.
+    /// restart beside the badge until a person acted. Pessimistic between,
+    /// never false.
     memory_refused: bool,
     /// The wait last told to the host ([`IdleHost::waiting`]): `Some(None)`
     /// is a told `None`, `None` is nothing told yet. The wait is told again
@@ -2988,7 +3044,8 @@ pub struct Session<'a, C: Ctl> {
     /// ([`Self::note_status`]): nothing is pressed, typed or escalated until
     /// `status` is read again ([`Self::stall_look`], [`Self::stall_step`]).
     stall_suspect: bool,
-    /// This episode's stall has had its remedy, `signal term`
+    /// This episode's stall has had its remedy, the explicit `restart` (or
+    /// its warning)
     /// ([`Self::stall_remedy`]): never a second. Forgotten with the episode.
     stall_termed: bool,
     /// `[harness] human_grace_s`, for the remedy's own look at a person's
@@ -2997,9 +3054,11 @@ pub struct Session<'a, C: Ctl> {
     /// `[harness] stall_term_after_s`, the remedy's bound (`0`: never): the
     /// loop's policy, set as it starts.
     stall_term_after_s: u32,
-    /// `[harness] stall_term`: the remedy at the bound is `signal term`
-    /// (`true`), or by default a warning with the agent left running
-    /// ([`stall`]). Set as the loop starts.
+    /// `[harness] stall_term`: the remedy at the bound is the explicit
+    /// restart, `restart pid=<leader> if-stalled quiet=<grace>` (`true`; an
+    /// older server that does not know the verb, `signal term`), or by
+    /// default a warning with the agent left running ([`stall`]). Set as the
+    /// loop starts.
     stall_term: bool,
 }
 
@@ -3081,13 +3140,15 @@ impl<'a, C: Ctl> Session<'a, C> {
             box_ask: None,
             clock: None,
             #[cfg(test)]
-            clock_step: std::sync::atomic::AtomicI64::new(0),
+            clock_jump: std::sync::atomic::AtomicI64::new(0),
             #[cfg(test)]
             clock_skew: std::sync::atomic::AtomicI64::new(0),
             #[cfg(test)]
             clock_runs_from: None,
             #[cfg(test)]
             clock_phase_ms: 0,
+            #[cfg(test)]
+            person_hold_wait: None,
             local_offset: None,
             zone_offset: limit::zone_offset_at,
             codex_leads: crate::harness::upgrade_drive::leads_its_terminal,
@@ -3115,6 +3176,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             stuck_after: wall_memory::STUCK_AFTER,
             stuck_dialog: None,
             wall_memory: None,
+            wall_verdict: None,
+            wall_refused_said: None,
             approval_env: ApprovalEnv::of_process(),
             cwd: None,
             footer: None,
@@ -3278,13 +3341,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.local_offset_at = lookup;
     }
 
-    /// Tests: the fixed clock jumps `step` seconds ahead on every read after
-    /// the first — the wall clock of a Mac that sleeps between two steps of
-    /// the loop's wait, while the monotonic clock stands still.
+    /// Tests: the fixed clock jumps `jump` seconds ahead after its next read
+    /// — the wall clock of a Mac that sleeps between two steps of the loop's
+    /// wait, while the monotonic clock stands still. Once: the Mac wakes.
     #[cfg(test)]
-    pub(crate) fn set_clock_step(&self, step: i64) {
-        self.clock_step
-            .store(step, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn set_clock_jump(&self, jump: i64) {
+        self.clock_jump
+            .store(jump, std::sync::atomic::Ordering::SeqCst);
         self.clock_skew
             .store(0, std::sync::atomic::Ordering::SeqCst);
     }
@@ -3297,6 +3360,18 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     pub(crate) fn set_clock_running(&mut self) {
         self.clock_runs_from = Some(Instant::now());
+    }
+
+    /// Tests: a hold for a person ([`Self::held_for_person`]) is looked at
+    /// again after `wait`, not after the rest of their grace. The hold is
+    /// still decided on the whole grace, so a test stages a person well
+    /// inside it — only a hang, never a loaded machine, ages them out of it
+    /// before the decision — and the look that ends the hold reads their age
+    /// from the next `status`, as the look at the grace's end does, with no
+    /// grace waited out in real time.
+    #[cfg(test)]
+    pub(crate) fn set_person_hold_wait(&mut self, wait: Duration) {
+        self.person_hold_wait = Some(wait);
     }
 
     /// Tests: a zone table in place of `date`.
@@ -3741,8 +3816,10 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// ([`Self::usage_probe`], [`Self::usage_panel_look`]): the panel stands
     /// where the composer was, is the harness's own doing and none of the
     /// worker's, and its rule and header are on rows 2 and 3 of the grid —
-    /// above any tail. The outage's books are [`Self::call`]'s, as for every
-    /// request.
+    /// above any tail. A wall's decision reads the whole screen so for the
+    /// call a tail can cut off above the wall
+    /// ([`Self::under_call_on_screen`]). The outage's books are
+    /// [`Self::call`]'s, as for every request.
     pub(super) fn grid(&mut self) -> Result<Screen, Fail> {
         let r = self.call(&["text", "--json"])?;
         if !r.ok() {
@@ -3982,11 +4059,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             // policy's back-off — with the look that closes it never
             // reached while it moves. Such a read is handed to the look as
             // it is ([`Self::usage_panel_look`], which makes no decision on
-            // it). With no panel owed — always, where no probe is ever
-            // claimed — this is the test it was. Nor while a limit reset's
-            // step is owed ([`ResetStep`]): its pending lines stand where the
-            // composer was, under a dialog's title, and are the look's to
-            // read ([`Self::reset_look`]).
+            // it). Nor while a limit reset's step is owed ([`ResetStep`]):
+            // its pending lines stand where the composer was, under a
+            // dialog's title, and are the look's to read
+            // ([`Self::reset_look`]).
             let writing = !settled
                 && !matches!(phase, Phase::Busy | Phase::Prompt)
                 && reader.composer(&screen.rows).is_none()
@@ -4019,11 +4095,11 @@ impl<'a, C: Ctl> Session<'a, C> {
                     false
                 }
             };
-            // A wall the loop waited on whose rows have left
-            // the screen (a scroll back through the transcript, a local
-            // command's output under it) while only the agent's own background
-            // work holds it busy: the point is the wall still, and the
-            // standing wait goes on. A live turn ends the memory.
+            // A wall the loop waited on whose rows have left the screen (a
+            // scroll back through the transcript, a local command's output
+            // under it) while only the agent's own background work holds it
+            // busy: the point is the wall still, and the standing wait goes
+            // on. A live turn ends the memory.
             if phase == Phase::Busy && !writing {
                 if let Some(w) = self.remembered_wall(reader, &screen.rows) {
                     return Ok(Turn {
@@ -4045,6 +4121,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             // live turn.)
             if !writing && !switch_break && reader.background_wait(&screen.rows).is_none() {
                 self.turn_end.took();
+                // A refused wall's episode is over: met again at a later
+                // point, it is said again ([`Self::say_wall_refused`]).
+                self.wall_refusal_over();
             }
             // A break of the agent's own background work is offered to the
             // host; whatever it types there, the wait below is for the screen
@@ -4118,8 +4197,8 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
                 // The agent's memory past its ceiling while it works: a
                 // warning, said once an episode (and again when its verdict
-                // changes); any restart waits for the
-                // turn's idle point, and only the Mac's trouble makes one.
+                // changes); any restart waits for the turn's idle point, and
+                // only the Mac's trouble makes one.
                 // A restart refused at an earlier point still names the
                 // person's ([`Self::memory_refused`]): the next idle point
                 // asks again, and is mostly refused the same (a launch-bound
@@ -4589,8 +4668,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         );
         let mut open_wall = None;
         // The typing budget is the session's, not this loop's: the acts a
-        // previous loop on it typed within the window count (lane B2's
-        // review — a loop re-spawned by its host started with a fresh six).
+        // previous loop on it typed within the window count, so a loop
+        // re-spawned by its host does not start with a fresh budget.
         if !std::mem::replace(&mut self.turn_end_seeded, true)
             && let Some(path) = self.ledger_path.as_deref()
         {
@@ -4603,12 +4682,11 @@ impl<'a, C: Ctl> Session<'a, C> {
                 .map(Duration::from_millis)
                 .collect();
             self.turn_end.seed_acts(&ages, Instant::now());
-            // The usage act a previous loop made at the wall
-            // this one attaches to (a new window, a seamless update, a fault:
-            // a new loop every one to ten hours on tab 1) is this loop's own
-            // last try — its next is the back-off from THAT act, not a second
-            // `keep going` the moment it attaches. Not one typed into an
-            // account the session has since LEFT
+            // The usage act a previous loop made at the wall this one
+            // attaches to (a new window, a seamless update, a fault) is this
+            // loop's own last try — its next is the back-off from THAT act,
+            // not a second `keep going` the moment it attaches. Not one typed
+            // into an account the session has since LEFT
             // ([`approvals::usage_attempt_at`]).
             let resumed = approvals::usage_attempt_at(path, self.sid.as_deref());
             if let Some(ago) = resumed
@@ -4624,9 +4702,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             if let Some(ts) = resumed {
                 self.turn_end.seed_account_resumed(ts.div_euclid(1000));
             }
-            // The wall an earlier loop waited on, when the
-            // screen shows none of its rows (the scroll that hid it, then
-            // the update that applied): waited on still (seeded below).
+            // The wall an earlier loop waited on, when the screen shows none
+            // of its rows (the scroll that hid it, then the update that
+            // applied): waited on still (seeded below).
             open_wall = approvals::open_wall(path, self.sid.as_deref());
             // A model switch an earlier loop made is switched back at its
             // reset by this one.
@@ -4898,8 +4976,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         // ([`Self::probe_shut`]): the point printed again has its line again.
         if worked {
             self.probe_said = None;
-        }
-        if worked {
             let redrawn = !saw.live
                 && turn.phase == Phase::Prompt
                 && state.handed.as_deref()
@@ -5054,7 +5130,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             // of did. Nothing is pressed or reported.
             turn
         } else {
-            let point =
+            let mut point =
                 match self.auto_read(turn, opts, allow, &mut state.approved, *deadline, review)? {
                     Step::Again { settle } => {
                         state.handed = None;
@@ -5084,6 +5160,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 TurnEndAction::Nothing
             };
+            // A limit whose wall the transcript refused is an idle point
+            // ([`Self::refused_limit`]): no episode, no limit's escalation.
+            self.refused_limit(&mut point);
             // `--mail`: an idle point waits for the worker's report of this
             // turn first; a folded one reads no report from the screen (the
             // mail IS what was said).
@@ -5396,11 +5475,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             // digit hook takes a digit while the worker reads busy — is read from the vendor's
             // code (`zu` enables itself on the card's own mount, not on the turn) and was
             // observed on 2.1.286 (over a streaming turn, a background shell, a woken turn); so
-            // a `0` that did not take is followed by no second one
-            // from a busy read: the idle look at the turn's end carries the ladder (5 s, 30 s,
-            // 2 min, 10 min) exactly as it did before the busy path existed, and a hook that
-            // is not armed under load costs one `0` and its backspace, not a cycle for as long
-            // as a workflow runs.
+            // a `0` that did not take is followed by no second one from a busy read: the idle
+            // look at the turn's end carries the ladder (5 s, 30 s, 2 min, 10 min), and a hook
+            // that is not armed under load costs one `0` and its backspace, not a cycle for as
+            // long as a workflow runs.
             Survey::Retry { .. } if busy => return Ok(false),
             Survey::Retry { tries: n, .. } => tries = n,
             Survey::Said if left => {
@@ -5986,23 +6064,20 @@ impl<C: Ctl> Session<'_, C> {
     /// fixed clock in tests (whole seconds, plus the phase
     /// [`Self::set_clock_at_ms`] gives it), else the system's.
     ///
-    /// NOT WHOLE SECONDS (2026-10-02). Converted against [`Self::now_unix`],
-    /// which truncates, a reset placed at `U` became an `Instant` at `U` plus
-    /// the sub-second phase of the read that made it, and its journal stamp
-    /// lost the phase of the read that printed it; the two phases differ
-    /// whenever a second turns between them, so one placement was journaled
-    /// as two `until=`s a second apart (`a_wall_waited_on_is_waited_on_
-    /// still_when_its_rows_scroll_out_of_view`, red 3 times in 61 recorded
-    /// runs, every time on a loaded machine).
+    /// NOT WHOLE SECONDS: converted against [`Self::now_unix`], which
+    /// truncates, a reset placed at `U` would become an `Instant` carrying the
+    /// sub-second phase of the read that made it while its journal stamp drops
+    /// the phase of the read that prints it; whenever a second turns between
+    /// the two, one placement is journaled as two `until=`s a second apart.
     fn now_unix_ms(&self) -> i64 {
         #[cfg(test)]
         if let Some(fixed) = self.clock {
             use std::sync::atomic::Ordering::SeqCst;
-            let step = self.clock_step.load(SeqCst);
+            let jump = self.clock_jump.load(SeqCst);
             let run = self.clock_runs_from.map_or(0, |from| {
                 i64::try_from(from.elapsed().as_millis()).unwrap_or(0)
             });
-            let secs = fixed + self.clock_skew.fetch_add(step, SeqCst);
+            let secs = fixed + self.clock_skew.swap(jump, SeqCst);
             return secs * 1000 + self.clock_phase_ms + run;
         }
         self.clock
@@ -6361,12 +6436,13 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             next_wait_step()
         };
-        // A Mac that slept through the wait. `Instant` does
-        // not count sleep and the wall clock does: when the wall clock has
+        // A Mac that slept through the wait. `Instant` does not count sleep
+        // and the wall clock does: the policy's deadline falls at its wall
+        // time all the same ([`Self::due_at`]), and when the wall clock has
         // run ahead of the monotonic one by more than a minute between two
-        // steps, every deadline the policy set in `Instant`s is late by that
-        // much, and the point is decided again NOW, on the reset the clock
-        // reads afresh ([`Self::wall_reset_at`] keeps it as unix time).
+        // steps, a deadline the sleep carried past is decided again after the
+        // wake's settle, the sessions of one account spread
+        // ([`Self::woke`]).
         if self
             .clock_marks
             .is_none_or(|(at, _, _)| at != seen.screen.seq)
@@ -6437,13 +6513,9 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(None);
             }
             self.tell_wait(opts);
-            let due = self
-                .turn_end_due
-                .as_ref()
-                .map(|(at, _)| *at)
-                .into_iter()
-                .chain(self.look_at)
-                .min();
+            // The policy's deadline read against both clocks at every step:
+            // a wall clock a sleep carried past it ends the wait now.
+            let due = self.due_at().into_iter().chain(self.look_at).min();
             let until = due.map_or(*deadline, |t| t.min(*deadline));
             // A look the host scheduled ends this step, not the wait: the
             // step's wake reads [`IdleHost::wants`] again at the top. One
@@ -6474,10 +6546,10 @@ impl<C: Ctl> Session<'_, C> {
                         // letters above the box, so a person (or the manager)
                         // answering it, or a row the main thread prints over
                         // a subagent's box, would read as the box answered
-                        // and asked again every step (measured by the review
-                        // of 63f891a38: two asks for one ticked checkbox, on
-                        // a held question's 2 s steps). Every other box is
-                        // read again only when its row leaves.
+                        // and asked again every step (measured: two asks for
+                        // one ticked checkbox, on a held question's 2 s
+                        // steps). Every other box is read again only when its
+                        // row leaves.
                         Wait::TimedOut => {
                             if let Some(request) = request.as_deref() {
                                 let screen = self.screen()?;
@@ -6529,10 +6601,11 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Tell the host the loop's next try ([`IdleHost::waiting`]): the deadline
-    /// of the policy's wait when it moved since last told, as unix seconds on
-    /// the loop's clock. No wait is told once as `None`, so a tab drops the
-    /// last try's time. A told wait is told again if its second drifts from
-    /// the wall clock (sleep stops `Instant`s; [`WAIT_SKEW_S`]).
+    /// of the policy's wait when it moved since last told, as the unix second
+    /// it falls at ([`Due::unix_ms`]: a sleep does not move it). No wait is
+    /// told once as `None`, so a tab drops the last try's time. The same
+    /// `Instant` set again at a wall second more than [`WAIT_SKEW_S`] from the
+    /// one told is told again.
     fn tell_wait(&mut self, opts: &SuperviseOpts) {
         // Only a wall's retry wait is a next try
         // ([`super::policy::turn_end::is_retry_wait`]): the check that the
@@ -6540,31 +6613,24 @@ impl<C: Ctl> Session<'_, C> {
         let due = self
             .turn_end_due
             .as_ref()
-            .filter(|(_, why)| super::policy::turn_end::is_retry_wait(why))
-            .map(|(at, why)| (*at, why));
-        let now = Instant::now();
-        let unix = |at: Instant| {
-            self.now_unix()
-                + i64::try_from(at.saturating_duration_since(now).as_secs()).unwrap_or(0)
-        };
+            .filter(|d| super::policy::turn_end::is_retry_wait(&d.why));
+        let unix = |d: &Due| turn_end_loop::nearest_s(d.unix_ms, 0);
         let told = match (self.wait_told, due) {
             (Some(None), None) => return,
-            // A fixed clock (tests) does not run, so it cannot disagree with
-            // the loop's.
-            (Some(Some(t)), Some((at, _)))
-                if t.at == at
-                    && (self.clock.is_some() || unix(at).abs_diff(t.unix) <= WAIT_SKEW_S) =>
-            {
+            (Some(Some(t)), Some(d)) if t.at == d.at && unix(d).abs_diff(t.unix) <= WAIT_SKEW_S => {
                 return;
             }
-            _ => due.map(|(at, _)| ToldWait { at, unix: unix(at) }),
+            _ => due.map(|d| ToldWait {
+                at: d.at,
+                unix: unix(d),
+            }),
         };
         let Some(host) = opts.idle_host.as_ref() else {
             return;
         };
-        let plan = due.zip(told).map(|((_, why), t)| WaitPlan {
+        let plan = due.zip(told).map(|(d, t)| WaitPlan {
             at_unix: t.unix,
-            why: why.clone(),
+            why: d.why.clone(),
         });
         self.wait_told = Some(told);
         host.waiting(plan);
@@ -6697,7 +6763,7 @@ impl<C: Ctl> Session<'_, C> {
     /// the Mac in trouble, this agent the largest) at an IDLE point the last
     /// reading judged without one ([`Self::memory_seen`] `None`) — a wall's
     /// own idle point and a limit notice included, which may stand for days
-    /// (the review of 2026-09-29) — is an edge: the point is decided again at
+    /// — is an edge: the point is decided again at
     /// once (`true`), where the turn-end reading carries the memory wall and
     /// the policy asks the host for its restart — so an agent the Mac's
     /// trouble came to while it sat idle is not left until its next turn
@@ -7309,8 +7375,7 @@ fn survey_event_line(seq: u64, sid: Option<&str>, block: &aterm_phase::SurveyBlo
     }
 }
 
-/// ` kind=<word>` for any card but the session survey (whose lines stay as they
-/// were), else nothing.
+/// ` kind=<word>` for any card but the session survey, else nothing.
 fn survey_kind_word(kind: aterm_phase::SurveyKind) -> String {
     if kind == aterm_phase::SurveyKind::Session {
         String::new()
@@ -7574,14 +7639,10 @@ fn push_words_above(key: &mut String, above: &[String]) {
 }
 
 /// The review key of the BOX `p`, read on `rows`: WHAT IT ASKS, never how it
-/// is laid out. The key before this one counted the drawing — the box's rows
-/// verbatim, its focus marker and countdown with them, the parsed command
-/// (whose split from its description moves with a wrap) and the last rows
-/// above it, one by one — so a redraw of the SAME box read as the box
-/// answered and a new one raised: `CLEARED` then `ESCALATED` 7 s apart, the
-/// manager asked again, at seq 94641/95788 of 2026-09-25 (the journal kept no
-/// screens; a re-wrap from a resize, a moved focus or a reflow above is
-/// inferred). Four lines:
+/// is laid out. A key that counts the drawing (rows verbatim, focus marker,
+/// countdown, a command split that moves with a wrap) reads a redraw of the
+/// SAME box as the box answered and a new one raised: `CLEARED` then
+/// `ESCALATED`, the manager asked again. Four lines:
 ///
 /// 1. `prompt <kind> <whole|cut>`, and ` form=<single|multi|preview|review|
 ///    unknown>` for a question dialog: the kind the reader named, and
@@ -7599,8 +7660,7 @@ fn push_words_above(key: &mut String, above: &[String]) {
 ///    rule or a `╌` divider whose length follows the width. What the box
 ///    asks is in it whole: another command, another diff, another note,
 ///    another option's label is another digest — two Edit boxes on one path
-///    with different diffs are two points, where the parsed prompt alone
-///    (whose content for a file box is its path) merged them.
+///    with different diffs are two points.
 /// 4. WHAT CAME RIGHT BEFORE IT: for a box read whole, the last
 ///    [`ABOVE_LETTERS`] letters of the transcript above the pending call's
 ///    echo ([`before_the_echo`]: the vendor's own rows right over the box,
@@ -7629,7 +7689,7 @@ fn push_words_above(key: &mut String, above: &[String]) {
 /// above what the reader took for the box — line 4 is the words of the last
 /// [`KEY_ROWS`] non-blank rows above its span, one per line, as for any other
 /// point, and such a box redrawn with another window of it visible is a new
-/// point, as before.
+/// point.
 ///
 /// The residuals. Two boxes that differ only in whitespace (`rm -rf /tmp/x /`
 /// and `rm -rf /tmp/x/`), drawn back to back with no busy read between them
@@ -7637,10 +7697,10 @@ fn push_words_above(key: &mut String, above: &[String]) {
 /// the first: no form that holds across a wrap can keep a token boundary (a
 /// soft wrap consumes the space, and a hard one inserts none). A pane so
 /// short that fewer than [`ABOVE_LETTERS`] letters stand above a whole box's
-/// echo reads a row scrolling in at its top as a new point, as the key before
-/// did. And a box looked at again while it stands (after an outage, say)
-/// whose transcript above its echo moved — the main thread printing over a
-/// subagent's box — is a new point, as it was before this key.
+/// echo reads a row scrolling in at its top as a new point. And a box looked
+/// at again while it stands (after an outage, say) whose transcript above its
+/// echo moved — the main thread printing over a subagent's box — is a new
+/// point.
 /// The key only ever passes over a point already handed over; it never
 /// causes a press.
 fn box_key(p: &aterm_phase::PromptV2, rows: &[String]) -> String {
@@ -7713,9 +7773,9 @@ fn box_key(p: &aterm_phase::PromptV2, rows: &[String]) -> String {
 /// 2.1.283's layout a command of 44 letters or more leaves nothing else in
 /// [`ABOVE_LETTERS`] (64, less the 20 of `Running N shell commands`), so the
 /// same command asked again after it failed — the worker's output and its
-/// next words appended above the new echo — read as the box asked before,
-/// and was never asked (the review of 63f891a38, measured on the 2.1.283
-/// capture with a 55-letter `cargo test`; the incident's rm has 42). For a
+/// next words appended above the new echo — would read as the box asked
+/// before, and never be asked (measured on the 2.1.283 capture with a
+/// 55-letter `cargo test`). For a
 /// subagent's box the group is the main thread's spinner row (`✻ Waiting for
 /// 1 background agent to finish`), which nothing in the box repeats either.
 fn before_the_echo(above: &[String]) -> &[String] {
@@ -7750,8 +7810,8 @@ fn is_layout(c: char) -> bool {
 /// to `await gone`, and only a read sets them apart. A command, a url, a
 /// question opens with what it asks, so another request under the same row
 /// is not the case this read exists for: those are read again when their row
-/// leaves, as before it. (A command long enough that two share a whole first
-/// row is not seen until that row leaves: no worse than before this read.)
+/// leaves. (A command long enough that two share a whole first row is not
+/// seen until that row leaves.)
 ///
 /// Left out, each because it moves while the SAME request stands: the
 /// options — the focus marker, a `Tab to amend` text typed into one, a
@@ -7956,6 +8016,8 @@ mod reset_loop;
 mod stall;
 #[path = "turn_end_loop.rs"]
 mod turn_end_loop;
+#[path = "wall_confirm.rs"]
+mod wall_confirm;
 #[path = "wall_memory.rs"]
 mod wall_memory;
 /// The composer's cursor-row guard, for `aterm drive task`'s nudge too, and

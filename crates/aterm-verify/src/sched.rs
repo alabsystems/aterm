@@ -14,10 +14,8 @@
 //!   (cargo takes a file lock), they just queue — so "running them concurrently"
 //!   would buy nothing and cost the ability to reason about the run. Stages in a
 //!   lane run in declared order, one at a time. Tippy has its own target dir
-//!   (`target-tippy`), the L0 gate has its own workspace, the libc oracle owns
-//!   its nested workspace's two target dirs, and the conformance suites' RELEASE
-//!   artifact has `target/conformance-release` — a directory under `target/`
-//!   whose cargo lock is nevertheless its own — so all are real lanes that
+//!   (`target-tippy`), the L0 gate has its own workspace and the libc oracle owns
+//!   its nested workspace's two target dirs, so all are real lanes that
 //!   genuinely overlap the main lane's compile.
 //!
 //! * An EXCLUSIVE stage runs with nothing else in flight. The measuring tests
@@ -28,10 +26,9 @@
 //!   keeps a ported stage's decision identical to the sequential one.
 //!
 //! * An AFTER-LANES stage (2026-09-13; the test run) also waits for every
-//!   stage of the lanes it names, and an AFTER-STAGES stage (2026-10-03; the
-//!   MEASURE tier's release build on a host too small to overlap it,
-//!   [`crate::plan::measure_overlap`]; since 2026-10-04 the trust lane on a
-//!   host with no room beside the land tier's builds,
+//!   stage of the lanes it names, and an AFTER-STAGES stage (the trust lane,
+//!   held behind the land tier's builds, test run and doctests — since
+//!   2026-10-04 on a host short of memory, since 2026-10-09 on every host,
 //!   [`crate::plan::trust_overlap`]; since 2026-10-05 the doctests, which
 //!   await the test compile from a lane of their own,
 //!   [`crate::plan::Lane::Doctests`]) for every stage it names — except
@@ -49,9 +46,8 @@
 //!
 //! That rule cannot deadlock, given what [`check_after_lanes`] enforces: an
 //! awaited stage is never exclusive and never in the awaiting stage's own
-//! lane; if it waits itself, on lanes or stages (since 2026-10-04: the trust
-//! lane awaiting the release build that awaits the land tier's builds; since
-//! 2026-10-05 also the test run, which awaits the driver lane), every stage it
+//! lane; if it waits itself, on lanes or stages (since 2026-10-05: the test
+//! run, which awaits the driver lane, awaited by the trust lane), every stage it
 //! awaits is declared before the awaiting stage, or is awaited by the awaiting
 //! stage too and waits on nothing; and every stage of its lane declared
 //! between the two waits on nothing. "Nothing" there discounts a wait on a
@@ -665,12 +661,11 @@ mod tests {
                 crate::Scope::crate_only("aterm-grid"),
                 crate::Scope::changed("main", vec![], true),
             ] {
-                // The small host (the release build and the trust lane await
-                // named stages), the unread host (the same waits) and the big
-                // host (nothing waits on stages); and the 8 GiB host with
-                // 3.5 GiB wired, whose land-tier builds chain one behind
-                // another, and with 3 GiB wired, whose tippy awaits the test
-                // compile (`crate::plan::land_builds`).
+                // The small, unread and big hosts (the trust lane awaits
+                // named stages on each: `crate::plan::trust_overlap`); and
+                // the 8 GiB host with 3.5 GiB wired, whose land-tier builds
+                // chain one behind another, and with 3 GiB wired, whose tippy
+                // awaits the test compile (`crate::plan::land_builds`).
                 const GIB: u64 = crate::disk::GIB;
                 for (ram, usable) in [
                     (Some(8 * GIB), None),
@@ -917,7 +912,7 @@ mod tests {
         assert!(check_after_lanes(&specs).is_err());
         // Accepted once the waiter awaits fmt too, fmt waits on nothing and
         // no awaited stage queues behind the one that waits (the trust lane
-        // awaiting the release build and its land builds): here atpkg, the
+        // awaiting the test run and its driver rows): here atpkg, the
         // driver lane's last row before the barrier…
         let mut specs = plan_shape();
         specs[atpkg].after_stages = vec![StageId::Formatting];

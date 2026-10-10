@@ -16,22 +16,21 @@
 //! # The one automatic grant: below the floor, build caches, oldest first
 //!
 //! [`auto_plan`] is the only removal nobody names at the moment it happens:
-//! when free space is below `disk.auto_free_gib` ([`DEFAULT_AUTO_FREE_GIB`],
-//! decided 2026-09-25 under the owner's standing direction), the host's tick
+//! when free space is below `disk.auto_free_gib` ([`DEFAULT_AUTO_FREE_GIB`]),
+//! the host's tick
 //! reclaims the removable [`Class::CargoTargets`] rows — each still behind its
 //! witness and [`guard`] — and nothing of any other class. Above the floor,
 //! or on a free figure nobody could read, it plans nothing. Below it, in
-//! LEAST-RECENTLY-USED order (decided 2026-09-28: at the idle window alone
-//! the tick freed nothing, measured 2026-09-27 and -28, because every agent
-//! builds in its checkout daily):
+//! LEAST-RECENTLY-USED order (at the idle window alone the tick freed
+//! nothing, because every agent builds in its checkout daily):
 //!
 //! 1. every IDLE profile's `incremental/` (unwritten for `target_stale_days`)
 //!    in each witnessed build directory, through [`target::reclaim`] — all of
-//!    them, as before: they are the least recently used there are;
+//!    them: they are the least recently used there are;
 //! 2. then, free space measured again before each, the build directories
 //!    whose OWNER IS GONE, WHOLE, the longest unwritten first
 //!    ([`Witness::OwnerGone`], through [`target::reclaim_whole`];
-//!    `disk.dead_build_dirs`, on by default, decided 2026-10-01): an ended
+//!    `disk.dead_build_dirs`, on by default): an ended
 //!    Claude Code session's scratch build — no running Claude Code names the
 //!    session in its own registry, nothing of it written for
 //!    [`Config::quiet_s`] (`target_stale_days`, at least a day) — or a cells
@@ -170,8 +169,8 @@
 //! free space is back, a locked or just-built one is never taken, and a
 //! re-measure that never rises stops it once the counted bytes cover what
 //! was short). The re-measure is the host's `statvfs` (the verb's `df`). A
-//! drill on a scratch APFS volume (2026-09-30, the harness audit's Disk
-//! bullet) saw each unlink there at once and the pass stop `by=measured`;
+//! drill on a scratch APFS volume saw each unlink there at once and the
+//! pass stop `by=measured`;
 //! with the caches made clones of a kept file it stopped `by=counted`. A
 //! local snapshot holding the blocks keeps the figure low the same way, and
 //! since an APFS clone's shared blocks are counted although the clone keeps
@@ -264,9 +263,8 @@ pub const MAX_HOGS: usize = 5;
 /// GONE goes WHOLE ([`Witness::OwnerGone`]) — a Claude Code session's scratch
 /// build once no running Claude Code names the session and nothing of it
 /// was written for the quiet window ([`Config::quiet_s`]), or a cells cache
-/// of a removed checkout. Decided 2026-10-01 under the owner's standing
-/// direction (measured: 45 GB of ended sessions' scratch builds and 26 GB of
-/// orphaned cells on a volume at 3-6 GB free). `false`: such a directory is
+/// of a removed checkout (measured: 45 GB of ended sessions' scratch builds
+/// and 26 GB of orphaned cells on a volume at 3-6 GB free). `false`: such a directory is
 /// any other, its idle and least-recently-used `incremental/` only.
 pub const DEFAULT_DEAD_BUILD_DIRS: bool = true;
 

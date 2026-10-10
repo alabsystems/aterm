@@ -324,20 +324,37 @@ pub fn console_pet_z_order_model() -> Model {
 ///   before that frame — its cell metrics changed (a font step, a DPI
 ///   change) or its pane left the glass (closed, zoomed away): no pixels of
 ///   the old body are left to fade, so no ghost is spent and the replacement
-///   fades in alone.
+///   fades in alone. The new surface's world judges a ghost on its glass,
+///   and where that world cannot see the old body's cells at all (a tall
+///   screen whose caret is far from it) the ghost keeps the verdict its own
+///   surface gave it: still a crossfade. `Refuse` is the one guarantee that
+///   forbids a ghost on glass that is still there: the world it would fade
+///   in protects the cells under it (an image, a selection, an expanded
+///   row) or certifies nothing there — the new surface's on the same glass,
+///   or after a `Shift` the pane the focus left, at the boundary. No ghost
+///   is drawn there, and its presence is not lost (`dipped`): the arriver
+///   carries it, so the cat stands at its new station at the presence the
+///   user saw instead of vanishing to its ramp's floor.
 /// * `Blind` — the next observation is incoherent (a stale snapshot, a resize
 ///   frame). The body on glass is held lit in place; `BlindLong` is a blind
 ///   run past the visibility hold's bound, which fades it out.
 ///
-/// `Return` is a second `Replace` inside a crossfade, to a surface a ghost of
+/// `Return` is a second `Replace` inside a crossfade: to a surface a ghost of
 /// this cat is still fading on — a quick toggle between two panes, two tabs
-/// or two screens. The boundary is dark, as every replacement's is; after it
-/// the seat the cat comes back to never `restarted`: ONE body there, whose
-/// presence never falls below what the user saw — an arriver standing where
-/// its own ghost still fades adopts it and continues.
+/// or two screens — or on to a third (a quick cycle across three panes,
+/// with ghosts still fading in the two the focus left). The boundary is
+/// dark, as every replacement's is; after it the seat the cat comes back to
+/// never `restarted`: ONE body there, in the look the user saw (its pose and
+/// facing), whose presence never falls below what the user saw — an arriver
+/// standing where its own ghost still fades adopts it and continues.
 /// `Spend` is the crossfade running out: no ghost leaves glass while its
 /// arriver is below full presence (`tail`) — each ghost's envelope runs on
-/// the arriver's ramp and reaches zero on the frame the arriver is full.
+/// the arriver's ramp and reaches zero on the frame the arriver is full, in
+/// whichever pane it fades; a ghost cut at the second boundary leaves
+/// glass early too. `Handoff` puts the breed handoff's `leaver` on glass
+/// beside the body before the seam — the old coat running off or fading in
+/// place — and it is this cat too: carried across the boundary, stopped
+/// where it was drawn, it fades on the arriver's ramp like every ghost.
 ///
 /// `hit` is the petting target, which is the drawn body's pixels: a seam
 /// withdraws it until a frame draws a body again.
@@ -357,9 +374,17 @@ pub fn console_pet_z_order_model() -> Model {
 /// ramp's floor at its seat — beside its own ghost still fading there (a
 /// split pane: two cats, the presence the eye sees dipping before it
 /// recovers), or after that ghost was cut at the boundary (the same glass: a
-/// tab, a screen). `OwnClock=1` is the ghost life shipped until then: a
-/// ghost carried across the second boundary kept its old clock and left
-/// glass while the restarted arriver was still coming up. Tier-1 in
+/// tab, a screen); an adopting arriver that changed pose in place (the rule
+/// until 2026-10-08) restarted the look the same way. `OwnClock=1` is the
+/// ghost life shipped until then: a ghost carried across the second
+/// boundary kept its old clock and left glass while the restarted arriver
+/// was still coming up — as a ghost on a pane the focus left two switches
+/// ago did, cut at the second boundary when the owner kept one own glass
+/// (until 2026-10-08). `Cull=1` is the refusal shipped until 2026-10-08: a
+/// ghost refused over protected cells took its presence with it, and the
+/// arriver stood alone at its ramp's floor. `LeaverCut=1` is the leaver
+/// shipped until 2026-10-08: the boundary dropped it, and it left glass in
+/// one frame while its arriver was still coming up. Tier-1 in
 /// aterm-effects'
 /// `pet_coordinate_seams.rs` drives the real
 /// `CompanionOwner` over a real `Terminal` through each seam and replays the
@@ -373,6 +398,8 @@ pub fn pet_surface_seam_model() -> Model {
             const PaneCut = 0;
             const Restart = 0;
             const OwnClock = 0;
+            const Cull = 0;
+            const LeaverCut = 0;
             var drawn = 0;
             // 0 none, 1 regrid, 2 replace, 3 blind.
             var seam = 0;
@@ -389,9 +416,15 @@ pub fn pet_surface_seam_model() -> Model {
             var restarted = 0;
             var spent = 0;
             var tail = 0;
+            var refused = 0;
+            var dipped = 0;
+            var leaver = 0;
 
             action Draw when (drawn == 0) {
                 drawn = 1; lit = 1; hit = 1;
+            }
+            action Handoff when (drawn == 1 && seam == 0 && leaver == 0) {
+                leaver = 1;
             }
             action Regrid when (drawn == 1 && seam == 0) {
                 seam = 1; hit = 0;
@@ -406,6 +439,9 @@ pub fn pet_surface_seam_model() -> Model {
             }
             action Lose when (seam == 2 && ticked == 0 && lost == 0) {
                 lost = 1;
+            }
+            action Refuse when (seam == 2 && ticked == 0 && lost == 0 && refused == 0) {
+                refused = 1;
             }
             action Blind when (drawn == 1 && seam == 0) {
                 seam = 3;
@@ -428,6 +464,8 @@ pub fn pet_surface_seam_model() -> Model {
                 };
                 ghost = if seam == 2 && lost == 0 && shifted == 1 && PaneCut == 1 {
                     0
+                } else if seam == 2 && lost == 0 && refused == 1 {
+                    0
                 } else if seam == 2 && lost == 0 {
                     1 - Buggy
                 } else if seam == 2 {
@@ -438,14 +476,25 @@ pub fn pet_surface_seam_model() -> Model {
                 ghost_moved = if seam == 2 && lost == 1 { Buggy } else { 0 };
                 moved = 0;
                 restarted = if returned == 1 && (Buggy == 1 || Restart == 1) { 1 } else { 0 };
+                dipped = if seam == 2 && lost == 0 && refused == 1 && (Buggy == 1 || Cull == 1) {
+                    1
+                } else {
+                    0
+                };
             }
             action Return when (seam == 2 && ticked == 1 && lost == 0 && returned == 0 && spent == 0) {
-                returned = 1; ticked = 0;
+                returned = 1; ticked = 0; refused = 0;
                 lit = Buggy; hit = Buggy; ghost = 0;
             }
             action Spend when (seam == 2 && ticked == 1 && lost == 0 && spent == 0) {
                 spent = 1;
-                tail = if returned == 1 && (Buggy == 1 || OwnClock == 1) { 1 } else { 0 };
+                tail = if returned == 1 && (Buggy == 1 || OwnClock == 1) {
+                    1
+                } else if leaver == 1 && (Buggy == 1 || LeaverCut == 1) {
+                    1
+                } else {
+                    0
+                };
             }
             action BlindLong when (seam == 3 && ticked == 1 && long == 0) {
                 long = 1;
@@ -459,7 +508,7 @@ pub fn pet_surface_seam_model() -> Model {
             invariant ReplaceIsDarkAtTheBoundary:
                 if seam == 2 && ticked == 0 { lit == 0 } else { lit <= 1 };
             invariant ReplaceCrossfades:
-                if seam == 2 && ticked == 1 && lost == 0 {
+                if seam == 2 && ticked == 1 && lost == 0 && refused == 0 {
                     lit == 1 && ghost == 1
                 } else {
                     ghost <= 1
@@ -472,6 +521,7 @@ pub fn pet_surface_seam_model() -> Model {
             invariant ReturnContinuesOneBody:
                 if returned == 1 && ticked == 1 { restarted == 0 } else { restarted <= 1 };
             invariant GhostLeavesAtFullPresence: tail == 0;
+            invariant RefusedGhostHandsOver: dipped == 0;
         }
     }
 }

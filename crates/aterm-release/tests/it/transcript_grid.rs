@@ -188,11 +188,10 @@ fn a_wrapped_list_item_hangs_under_its_marker() {
 
 /// NOTHING is printed after the errand.
 ///
-/// The trap has to be the last thing on the screen when the wait begins. It used to be
-/// followed by `step("", "waiting for the certificate to appear…")`, and that sentence in
-/// that position reads as permission to go to the portal and collect whatever is in the
-/// list — which is exactly the act the trap exists to prevent, and exactly what happened
-/// in the field, at the cost of one of five permanent certificate slots.
+/// The trap has to be the last thing on the screen when the wait begins: a "waiting for
+/// the certificate to appear…" line after it read as permission to collect whatever the
+/// portal listed — the act the trap prevents — and cost one of five permanent
+/// certificate slots in the field.
 ///
 /// Asserted over the SOURCE of `await_then_install`, because the harm is a call site: a
 /// test over `errand_lines`' contents cannot see a `step` added below the loop.

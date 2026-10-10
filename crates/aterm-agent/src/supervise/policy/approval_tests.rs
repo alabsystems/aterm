@@ -488,13 +488,13 @@ fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
     assert!(reason(&on_screen(&read, &with(&unread, ctx()))).contains("not read"));
 }
 
-/// UNDER ZSH ONLY A PLAIN LINE IS A PROVEN READ (decided 2026-09-30; the
-/// audit's "the zsh sweeps are exhaustive only over the forms tried"): a read
-/// the classifier clears but that expands something — a parameter, a brace, a
-/// quoted backslash — is a person's under `approve = "safe"` when the Bash
-/// tool may run zsh, and pressed all the same under full power with the
-/// reason kept as `unproven`. The same lines are proven reads where the tool
-/// runs bash (the negative control), and a plain read is proven under zsh.
+/// UNDER ZSH ONLY A PLAIN LINE IS A PROVEN READ (the zsh sweeps are exhaustive
+/// only over the forms tried): a read the classifier clears but that expands
+/// something — a parameter, a brace, a quoted backslash — is a person's under
+/// `approve = "safe"` when the Bash tool may run zsh, and pressed all the same
+/// under full power with the reason kept as `unproven`. The same lines are
+/// proven reads where the tool runs bash (the negative control), and a plain
+/// read is proven under zsh.
 #[test]
 fn under_zsh_only_a_plain_line_is_a_proven_read() {
     let zsh = zsh_startup("", "");
@@ -1187,8 +1187,8 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         "/etc/hosts",
         "/usr/share/dict/words",
         "/opt/homebrew/etc/x.conf",
-        "~/aterm-h-b2/README.md",
-        "~/ay/src/lib.rs",
+        "~/Developer/aterm-h-b2/README.md",
+        "~/Developer/ay/src/lib.rs",
         "/private/tmp/claude-502/scratch/x.log",
     ] {
         let d = on_screen(&read_box(ok), &ctx());
@@ -1198,6 +1198,8 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     // profile, another user's, a server's key directory.
     for outside in [
         "~/notes/todo.md",
+        // A checkout outside the developer root is under no default trust root.
+        "~/aterm/README.md",
         "~/.zsh_history",
         "/Users/_owner/Library/Application Support/Google/Chrome/Default/Cookies",
         "/Users/_other/aterm/x",
@@ -1211,19 +1213,19 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     assert!(approved(&d).is_none(), "{d:?}");
     // Under an allowed root, a secret is still refused.
     for secret in [
-        "~/aterm/.env",
-        "~/aterm/.env.local",
-        "~/aterm/deploy/server.KEY",
-        "~/aterm/.ssh/config",
-        "~/ay/x/.npmrc",
-        "$HOME/trust-x/.pypirc",
-        "~/aterm/credentials.json",
+        "~/Developer/aterm/.env",
+        "~/Developer/aterm/.env.local",
+        "~/Developer/aterm/deploy/server.KEY",
+        "~/Developer/aterm/.ssh/config",
+        "~/Developer/ay/x/.npmrc",
+        "~/Developer/trust-x/.pypirc",
+        "~/Developer/aterm/credentials.json",
         "/private/tmp/claude-502/a.sock.token",
         "/private/tmp/claude-502/.zsh_history",
         "/etc/ssl/private/server.key",
-        "~/aterm/id_ed25519",
-        "~/aterm/.gcloud/gcloud/x",
-        "~/aterm/.vault-token",
+        "~/Developer/aterm/id_ed25519",
+        "~/Developer/aterm/.gcloud/gcloud/x",
+        "~/Developer/aterm/.vault-token",
     ] {
         let d = on_screen(&read_box(secret), &ctx());
         assert!(reason(&d).contains("secret"), "{secret}: {d:?}");
@@ -1252,7 +1254,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     assert!(approved(&on_screen(&read_box("/etc/hosts"), &none(ctx()))).is_none());
     // The same judgement on 2.1.292's layout, which the reader once took the
     // first dashed rule for the path of: every Read escalated.
-    for ok in ["/etc/hosts", "~/ay/src/lib.rs"] {
+    for ok in ["/etc/hosts", "~/Developer/ay/src/lib.rs"] {
         for rows in [read_call_box(ok), read_call_box_2_1_284(ok)] {
             let d = on_screen(&rows, &ctx());
             assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{ok}: {d:?}");
@@ -1260,7 +1262,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     }
     for (path, why) in [
         ("~/notes/todo.md", "allowed root"),
-        ("~/aterm/.env", "secret"),
+        ("~/Developer/aterm/.env", "secret"),
         ("/etc/ssl/private/server.key", "secret"),
     ] {
         let d = on_screen(&read_call_box(path), &ctx());
@@ -1286,10 +1288,10 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         assert_eq!((rule, subject), (RULE_READ_OUTSIDE_CWD, whole.as_str()));
         assert_eq!(guarded(guard, &rows), [format!(" Read({whole})")], "{view}");
         for secret in [
-            "~/aterm/.env",
+            "~/Developer/aterm/.env",
             "/etc/ssl/cert.pem",
             "/etc/ssl/private/server.key",
-            "~/ay/x/.npmrc",
+            "~/Developer/ay/x/.npmrc",
         ] {
             let d = on_screen(&read_call_box(&format!("{secret}{view}")), &ctx());
             assert!(reason(&d).contains("secret"), "{secret}{view}: {d:?}");
@@ -1314,7 +1316,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     // `~` needs a home to resolve against.
     let mut homeless = ctx();
     homeless.home = None;
-    assert!(approved(&on_screen(&read_box("~/aterm/x"), &homeless)).is_none());
+    assert!(approved(&on_screen(&read_box("~/Developer/aterm/x"), &homeless)).is_none());
 }
 
 // --- the folder-trust dialog -------------------------------------------------
@@ -1386,7 +1388,7 @@ fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     unknown.cwd_known = false;
     assert!(reason(&on_screen(&rows, &unknown)).contains("cwd unknown"));
     let mut rootless = ctx();
-    rootless.set_trust_roots(&["~/aterm*".to_string()], 502);
+    rootless.set_trust_roots(&["~/Developer/aterm*".to_string()], 502);
     assert!(reason(&on_screen(&rows, &rootless)).contains("no trust root"));
     assert!(reason(&on_screen(&rows, &none(ctx()))).contains("approve = \"none\""));
 }
@@ -1824,15 +1826,14 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
 /// first opens a confirmation whose yes is `Yes, use my reset` (READ in the
 /// 2.1.286 and 2.1.287 bundles; no such box has been captured on a screen).
 /// Each spends a reset ([`spends`]: the reader's own anchors and the wider
-/// words, one rule), so each is a purchase ([`buys`]) and [`allow_once`] —
-/// the pick full power makes for every kind with no rule of its own — never
-/// takes it: with the yes, the grant row or the weekly row read as a
-/// one-shot allow or as a plain yes, the box is answered by the option that
-/// waits (`No, keep it`, [`RULE_NO_SPEND`]). Before 2026-10-02 the pick was
-/// the yes. On the dialog itself, at every level with the key off, the wait
-/// row is chosen and never either reset row. And whatever a rule arrives at
-/// is checked last ([`never_spends`]): a pick that takes an option by its
-/// role alone (a held message's one delivery) is handed over where that
+/// words, one rule), so each is a purchase ([`buys`]) and [`allow_once`] — the
+/// pick full power makes for every kind with no rule of its own — never takes
+/// it: with the yes, the grant row or the weekly row read as a one-shot allow
+/// or as a plain yes, the box is answered by the option that waits (`No, keep
+/// it`, [`RULE_NO_SPEND`]). On the dialog itself, at every level with the key
+/// off, the wait row is chosen and never either reset row. And whatever a rule
+/// arrives at is checked last ([`never_spends`]): a pick that takes an option
+/// by its role alone (a held message's one delivery) is handed over where that
 /// option spends a reset. NEGATIVE CONTROLS: a refusal and a plain yes buy
 /// nothing; the same box with a plain `Yes` in the reset's place is still
 /// allowed once; the last check passes every other choice through unchanged,
@@ -2061,16 +2062,16 @@ fn no_reset_left(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A RESET CONFIRMATION IS NEVER ANSWERED YES by the rules every box gets,
-/// at any level and with the reset's key on or off (its Enter is the loop's
-/// own step, never a decision here): full power answers it with the option
-/// that waits — `No, keep it`, by focus and Enter, [`RULE_NO_SPEND`] — and
-/// the safe rules and `approve = "none"` hand it over. With its title row
-/// OFF THE SCREEN it is not read whole ([`head_unread`]) and no level presses
-/// anything on it: before 2026-10-02 full power answered such a box by its
-/// options alone, `Yes, use my reset` under `allow-once@v1`. Over the
-/// reader's COMPOSED screens (never captured): the confirmation as it opens,
-/// wrapped at 60 columns, with the early line, and with the cursor on the no.
+/// A RESET CONFIRMATION IS NEVER ANSWERED YES by the rules every box gets, at
+/// any level and with the reset's key on or off (its Enter is the loop's own
+/// step, never a decision here): full power answers it with the option that
+/// waits — `No, keep it`, by focus and Enter, [`RULE_NO_SPEND`] — and the safe
+/// rules and `approve = "none"` hand it over. With its title row OFF THE SCREEN
+/// it is not read whole ([`head_unread`]) and no level presses anything on it
+/// (full power once answered such a box by its options alone, `Yes, use my
+/// reset`). Over the reader's COMPOSED screens (never captured): the
+/// confirmation as it opens, wrapped at 60 columns, with the early line, and
+/// with the cursor on the no.
 ///
 /// AND SO IT IS WITH ITS YES REWORDED (READ: the server's payload may replace
 /// any text of the box): read whole, the box is the confirmation by any part
@@ -2327,12 +2328,20 @@ fn the_default_context_has_decision_ones_roots() {
     assert_eq!(
         trust,
         [
-            "/Users/_owner/aterm*",
-            "/Users/_owner/ay*",
-            "/Users/_owner/trust*",
+            "/Users/_owner/Developer/aterm*",
+            "/Users/_owner/Developer/ay*",
+            "/Users/_owner/Developer/trust*",
             "/private/tmp/claude-502"
         ]
     );
+    // A worktree under the developer root is trusted; the same name in the bare
+    // home is not.
+    let held = |p: &str| {
+        let comps = abs_components(p).expect("abs");
+        c.trust_roots.iter().any(|r| r.holds(&comps))
+    };
+    assert!(held("/Users/_owner/Developer/aterm-wt/src"));
+    assert!(!held("/Users/_owner/aterm/src"));
     let read: Vec<&str> = c.read_roots.iter().map(ScratchRoot::label).collect();
     assert_eq!(
         read[4..],
@@ -3286,8 +3295,7 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
 /// loop, a target outside scratch, an unassigned variable, a box outside
 /// bypass) is approved with its one-shot `Yes` under [`RULE_RM_BREAKER_WARN`],
 /// the reason kept as its `unproven` warning, under the judged row's guard; a
-/// proven one keeps [`RULE_RM_BREAKER`]. Negative controls, each a person's
-/// (owner, 2026-09-29):
+/// proven one keeps [`RULE_RM_BREAKER`]. Negative controls, each a person's:
 /// `rm_breaker_ask = true` ([`ctx`]), `approve = "none"`, every other breaker
 /// kind, and a refused Bash box that is no rm breaker (a write). The user's
 /// own ask rule is handed over before any level
@@ -3888,10 +3896,13 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
         502,
         None,
     );
-    let safe = ApprovalCtx {
+    let mut safe = ApprovalCtx {
         approve: Approve::Safe,
         ..own.clone()
     };
+    // The captured folder sits in the bare home, under no default trust root: name
+    // it, so what refuses the press is the backstop's options, not the root.
+    safe.set_trust_roots(&["~/aterm*".to_string()], 502);
     let d = on_screen(&backstop, &safe);
     assert!(reason(&d).contains("options are not exactly"), "{d:?}");
     let d = on_screen(&backstop, &own);
@@ -4211,13 +4222,13 @@ fn full_power_presses_a_card_mode_tool_box() {
 /// A box taller than the pane (an rm box in a 14-row pane, heredocs, an 80-row
 /// Edit diff, Claude Code 2.1.287's read-outside dialog in an 80x18 pane,
 /// MEASURED) is not read whole, and no level presses an option of it: each is
-/// escalated naming the missing title row. The read-outside dialog's tail was
-/// pressed by full power until 2026-10-02 — its `1. Yes, and keep allowing
-/// any reads …`, a standing grant Claude Code saves. The one answer a cut box
-/// gets is the decline of a foot flagging a removal in bypass
-/// ([`RULE_TALL_BOX`]), at every level that answers. A question with its top
-/// cut is escalated at every level. Controls: each drawn whole is pressed
-/// under its judged row, and a cut box over a composer is no box.
+/// escalated naming the missing title row (the read-outside dialog's tail is
+/// `1. Yes, and keep allowing any reads …`, a standing grant Claude Code
+/// saves). The one answer a cut box gets is the decline of a foot flagging a
+/// removal in bypass ([`RULE_TALL_BOX`]), at every level that answers. A
+/// question with its top cut is escalated at every level. Controls: each drawn
+/// whole is pressed under its judged row, and a cut box over a composer is no
+/// box.
 #[test]
 fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
     let tail = |r: &[String], n: usize| r[r.len() - n..].to_vec();
@@ -5372,7 +5383,7 @@ fn scratch_repo(tag: &str) -> PathBuf {
 }
 
 fn scratch_git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = aterm_uds::spawnfd::command("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -5772,7 +5783,7 @@ fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
 /// sends to a person (an ask rule, one over auto mode, a hook, read off the
 /// box's reason block) is never pressed at any level, bypass included; it is
 /// the person's, with the reason said. Negative control: the same box without
-/// the reason block gets full power's one-shot allow (owner, 2026-09-25).
+/// the reason block gets full power's one-shot allow.
 #[test]
 fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
     // The 2.1.282 capture, and six MEASURED on 2.1.287 (2026-10-01, the real
@@ -6323,8 +6334,7 @@ fn the_model_picker_is_answered_only_for_the_harness_restore() {
 
 /// The paused goal's box is answered only for the upgrade's own resume: with
 /// [`ApprovalCtx::goal_resume`], the focused `Resume goal` is pressed by focus
-/// and Enter under `goal-resume@v1`, guarded on its row. Negative controls
-/// (owner, 2026-09-28):
+/// and Enter under `goal-resume@v1`, guarded on its row. Negative controls:
 /// nothing owed (a person's own `codex resume`) escalates, as does focus moved
 /// to `Leave paused`, which is never pressed.
 #[test]

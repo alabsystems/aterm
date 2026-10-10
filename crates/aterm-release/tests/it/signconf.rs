@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the release-credentials profile + the Dev-ID refusal preflights
-//! (release spec §6 `sign.rs`, absorbing the retired tools/release-conf.sh +
-//! apps/aterm-mac/notarize.sh — both deleted with the shell pipeline, named
-//! here for provenance only):
+//! (release spec §6 `sign.rs`):
 //!   * the ONE credentials profile named by `--release-credentials`;
 //!   * the ported stat refusals (ownership + group/other-writable), proven
 //!     against real fixture files with bad modes;
@@ -50,9 +48,8 @@ fn a_group_or_other_readable_profile_is_refused() {
 
 #[test]
 fn a_missing_profile_is_a_hard_error_not_a_silent_none() {
-    // INVERTS the old `absent_conf_is_ok_none_not_an_error`. An absent conf used to
-    // mean "unsigned is fine", which is exactly how v0.16.0 shipped unsigned. A path
-    // that was named and does not exist is a mistake, and says so.
+    // An absent conf read as "unsigned is fine" is how v0.16.0 shipped unsigned.
+    // A path that was named and does not exist is a mistake, and says so.
     let err = sign::ReleaseCredentials::load(std::path::Path::new(
         "/nonexistent/aterm-release-credentials.toml",
     ))

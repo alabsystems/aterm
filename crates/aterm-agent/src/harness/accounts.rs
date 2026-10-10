@@ -95,15 +95,15 @@
 //!   that was not made back ([`Strike::NotMoved`]), strikes a candidate that
 //!   answered with a wall or a lost login ([`strike`]) and proves one that
 //!   served a turn ([`prove`]). THE MOVE AHEAD OF A LIMIT AND THE `/usage`
-//!   PROBE (`[harness] accounts = "early"`; slice 5,
+//!   PROBE (`[harness] accounts = "early"`;
 //!   `docs/SPEC-claude-accounts-probe-2026-10-01.md`): this module's side of
-//!   both is here — [`advise_past_probe`] (what a due probe stands in front
-//!   of: the advice a host hands on beside [`Advice::Probe`], and the one
-//!   its commit re-asks), the claim and its spacing ([`claim_probe`],
-//!   [`probe_held`], [`PROBE_APART_S`]) and [`note_sample`]. WHICH OF IT A
-//!   HOST CALLS is that host's module's to say (aterm-gui `harness_host.rs`)
-//!   and the handoff's (`docs/HANDOFF-claude-accounts-2026-10-01.md`), not
-//!   this one's. THE LIMIT RESET (`[harness] limit_reset`, off as shipped;
+//!   both is [`advise_past_probe`] (what a due probe stands in front of: the
+//!   advice a host hands on beside [`Advice::Probe`], and the one its commit
+//!   re-asks), the claim and its spacing ([`claim_probe`], [`probe_held`],
+//!   [`PROBE_APART_S`]) and [`note_sample`]. WHICH OF IT A HOST CALLS is
+//!   that host's module's to say (aterm-gui `harness_host.rs`) and the
+//!   handoff's (`docs/HANDOFF-claude-accounts-2026-10-01.md`), not this
+//!   one's. THE LIMIT RESET (`[harness] limit_reset`, off as shipped;
 //!   `docs/SPEC-claude-accounts-resets-2026-10-02.md`): this module's side
 //!   is who may claim one ([`reset_allowed`]: this machine's own login, and
 //!   no other login on record as run), the one attempt a wall
@@ -368,8 +368,8 @@ pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// three cloud providers, a unix socket, a proxy), which
 /// [`ProcessLogin::of_env`] reads from that list and does not copy.
 ///
-/// Each literal was READ in the 2.1.286 bundle's strings (2026-10-01), and
-/// that is all that is claimed of it:
+/// Each literal was READ in the 2.1.286 bundle's strings, and that is all
+/// that is claimed of it:
 ///
 /// * `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
 ///   `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` and `CLAUDE_CODE_OAUTH_TOKEN` are
@@ -411,8 +411,8 @@ pub const CREDENTIAL_KEYS: &[&str] = &[
 
 /// THE VARIABLES OF THE VENDOR'S `profile` SOURCE, which its token chain
 /// asks AHEAD of the stored login (`… → apiKeyHelper → profile →
-/// claude.ai`). READ in the 2.1.286 and the 2.1.287 bundles' strings
-/// (2026-10-01), the same code in both, and that is all that is claimed:
+/// claude.ai`). READ in the 2.1.286 and the 2.1.287 bundles' strings, the
+/// same code in both, and that is all that is claimed:
 ///
 /// * `ANTHROPIC_PROFILE` names a profile outright
 ///   (`process.env.ANTHROPIC_PROFILE?.trim()`).
@@ -916,11 +916,10 @@ pub fn append_rows(existing: &str, rows: &[(&str, Class, Option<&str>)]) -> Resu
 /// still signed in ([`Auth`]).
 ///
 /// A DIRECTORY THAT EXISTS IS NOT A LOGIN. `accounts add` makes the row's
-/// directory before anybody has signed in under it, and counted by its
-/// existence that row read `unseen` — fresh — and was the report's `next:`
-/// and a rotation's candidate with no login behind it (the live check of
-/// 2026-10-02). It is listed, and not enrolled, until the vendor's flow has
-/// written its home there.
+/// directory before anybody has signed in under it; counted by its
+/// existence, that row would read `unseen` (fresh) and be the report's
+/// `next:` and a rotation's candidate with no login behind it. It is listed,
+/// and not enrolled, until the vendor's flow has written its home there.
 #[must_use]
 pub fn enrolled(roster: &Roster) -> BTreeSet<String> {
     roster
@@ -3121,7 +3120,7 @@ fn advise_with(
 }
 
 // ---------------------------------------------------------------------------
-// 6. The ledger event
+// 5. The ledger event
 // ---------------------------------------------------------------------------
 
 /// What a ledger row records.
@@ -3319,7 +3318,7 @@ impl Event {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Transactions — pure edits of a `State`, answering the ledger's rows
+// 6. Transactions — pure edits of a `State`, answering the ledger's rows
 // ---------------------------------------------------------------------------
 
 /// The record of `label`, made if absent. `None` for a label no roster
@@ -4986,7 +4985,7 @@ impl Store {
 }
 
 // ---------------------------------------------------------------------------
-// 8. The recorder (design §5, "What counts as an observation"; §12 slice 2)
+// 8. The recorder (design §5, "What counts as an observation")
 // ---------------------------------------------------------------------------
 
 /// What became of one call of the recorder ([`record_wall`]). A host logs it

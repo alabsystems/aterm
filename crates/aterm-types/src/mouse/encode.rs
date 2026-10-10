@@ -173,11 +173,15 @@ pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
 pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release: bool) -> Vec<u8> {
     // Release signalling is FORMAT-specific, so it is decided here where the
     // actual output form is known: legacy single-byte forms (X10/UTF-8/urxvt)
-    // replace the low button bits with 3 (identity lost, per xterm); SGR keeps
+    // replace the button with 3 (identity lost, per xterm); SGR keeps
     // the button identity and uses the 'm' final byte instead. Callers pass
     // the ORIGINAL button — substituting earlier would leak the legacy
-    // button-3 into the SGR fallback (#7473).
-    let legacy_cb = if release { (cb & !0b11) | 3 } else { cb };
+    // button-3 into the SGR fallback (#7473). The release keeps only the
+    // modifier bits (Shift 4, Alt 8, Ctrl 16; motion 32 is never set here):
+    // the extension bits 64 and 128 name the button, so a thumb button's
+    // release kept as 128|3 read as a button-11 PRESS. xterm's
+    // `BtnCode(-1)` sends 3 for every legacy release.
+    let legacy_cb = if release { (cb & 0b0011_1100) | 3 } else { cb };
     match encoding {
         // X10 encoding uses single bytes for coordinates (max 223 + 32 = 255).
         // Out-of-range coordinates are CLAMPED by `encode_x10`; the framing
@@ -192,6 +196,34 @@ pub fn encode_mouse(cb: u8, col: u16, row: u16, encoding: MouseEncoding, release
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thumb button's legacy release is button 3 with the modifier bits
+    /// only: kept as 128|3 it read as a button-11 press (xterm's
+    /// `BtnCode(-1)`). SGR keeps the button and says `m`.
+    #[test]
+    fn a_thumb_buttons_legacy_release_is_button_three() {
+        let back = 128;
+        assert_eq!(
+            encode_mouse(back, 10, 5, MouseEncoding::X10, true),
+            [0x1b, b'[', b'M', 32 + 3, 43, 38]
+        );
+        assert_eq!(
+            encode_mouse(back | 16, 10, 5, MouseEncoding::X10, true),
+            [0x1b, b'[', b'M', 32 + 16 + 3, 43, 38]
+        );
+        assert_eq!(
+            encode_mouse(back, 10, 5, MouseEncoding::Urxvt, true),
+            b"\x1b[35;11;6M"
+        );
+        assert_eq!(
+            encode_mouse(back, 10, 5, MouseEncoding::Sgr, true),
+            b"\x1b[<128;11;6m"
+        );
+        assert_eq!(
+            encode_mouse(back, 10, 5, MouseEncoding::X10, false),
+            [0x1b, b'[', b'M', 32 + 128, 43, 38]
+        );
+    }
 
     #[test]
     fn x10_basic() {

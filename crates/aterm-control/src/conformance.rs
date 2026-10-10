@@ -1583,6 +1583,37 @@ mod tests {
         );
     }
 
+    /// `wait <ms>` reads its `<ms>` strictly: a tail that is not a whole number of
+    /// milliseconds is the usage line. Read leniently it became the 30 s default,
+    /// so `wait 2s` waited up to fifteen times what was asked — here, with a
+    /// command already complete, it answered that completion as if `<ms>` had
+    /// been fine. The empty tail and a number (held at 600 s) still wait.
+    #[test]
+    fn a_wait_ms_that_is_not_a_number_is_the_usage_line() {
+        let host = MemoryHost::new(0);
+        host.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07true\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        for tail in ["2s", "1.5", "-1", "0x10", "5 6", "timeout=5"] {
+            assert_eq!(
+                selection::cmd_wait(&host, 0, tail),
+                "ERR usage: wait [<ms>]\n",
+                "`wait {tail}`"
+            );
+        }
+        for tail in ["", "0", "99999999999"] {
+            let reply = selection::cmd_wait(&host, 0, tail);
+            assert!(reply.starts_with("OK complete "), "`wait {tail}`: {reply}");
+        }
+        assert_eq!(
+            crate::wire::wait_ms("99999999999"),
+            Some(crate::wire::WAIT_MAX_MS)
+        );
+        assert_eq!(
+            crate::wire::wait_ms(" 5"),
+            None,
+            "the caller trims, not the reader"
+        );
+    }
+
     /// `blocks`/`blocktext` over real OSC-133 content, so `check_blocks` sees a
     /// non-empty block list.
     #[test]

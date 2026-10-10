@@ -193,7 +193,7 @@ fn disk_cold_load_cleans_orphan_compact_temp_file() {
     assert_eq!(cold.get_line(14).unwrap().unwrap().to_string(), "P2-Line4");
 }
 
-/// Regression (round 12): a FAILED compaction must not leave the tier with
+/// Regression: a FAILED compaction must not leave the tier with
 /// mmap=None. compact() drops the mmap up front and only re-establishes it on
 /// success; on any error before the rename it must re-map the original file so
 /// cold reads keep working (mirroring write_back_truncation's recovery). Here we
@@ -226,7 +226,7 @@ fn failed_compaction_keeps_cold_reads_working() {
 
     // The mmap must have been re-established on the failed-compact path: reads of
     // the surviving pages (still at their original offsets in the untouched file)
-    // keep working. Before the fix these returned "no memory map available".
+    // keep working instead of failing with "no memory map available".
     assert_eq!(
         cold.get_line(0).unwrap().unwrap().to_string(),
         "P6-Line0",

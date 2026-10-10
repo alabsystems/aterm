@@ -52,10 +52,9 @@ fn probe(shape: &str, window: &str, extra: &[&str]) {
     match out.status.code() {
         Some(0) => eprintln!("spin[{shape}]: {report}"),
         Some(1) => panic!(
-            "SPIN CONFORMANCE FAILED [{shape}]: an IDLE instance banked past-deadline arms — \
-             the event loop is arming wakes at instants its own observation gate has already \
-             passed, which is the 200 kHz spin class that cost the owner 79% CPU and a 335 ms \
-             input p99 (docs/RELEASE-PROOF-DISCIPLINE.md).\n  {report}\n--- probe stderr ---\n{stderr}"
+            "SPIN CONFORMANCE FAILED [{shape}]: an idle instance armed wakes past its own \
+             observation gate (the spin class, docs/RELEASE-PROOF-DISCIPLINE.md).\n  \
+             {report}\n--- probe stderr ---\n{stderr}"
         ),
         // The probe decided nothing: the message opens with the gate's COULD
         // NOT RUN sentinel, never a finding and never green (the MEASURE

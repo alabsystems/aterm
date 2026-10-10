@@ -10,21 +10,24 @@
 //! gate's own headless smoke (`aterm-verify` `smoke_stages.rs` `bring_up`)
 //! reports red. Here both PANIC with the log tail, as the smoke fails them.
 //!
-//! A headless instance opens no window, but it is NOT free of WindowServer: on
-//! macOS there is no display-free winit backend, so `--headless` builds the
-//! real AppKit event loop (`headless_activation.rs`), and an idle instance drew
-//! a WindowServer preflight within three seconds (AGENTS.md rule 5, measured
-//! 2026-09-26). So a login with NO GUI session — an ssh shell, a CI box — is
-//! an environment this boot can meet: AppKit then logs its refusal to connect
-//! ([`window_server_refused`]), and a child that exits with that in its log is
-//! a `SKIP` naming it. Every other early exit still fails.
+//! A headless instance opens no window, and it is no WindowServer client. Until
+//! 2026-09-26 it was one on macOS: `--headless` built the real AppKit event
+//! loop, and an idle instance drew a WindowServer preflight within three
+//! seconds (AGENTS.md rule 5) — so for that while a login with NO GUI session
+//! (an ssh shell, a CI box) made AppKit log its refusal to connect, and a child
+//! that exited with that in its log was a `SKIP`. Headless now runs winit's
+//! display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`: no
+//! `NSApplication`, no connection), so that refusal in a child's log means the
+//! instance ASKED for the connection — a door reopened
+//! ([`window_server_refused`]) — and the boot FAILS naming it, never skips.
+//! `window_server_census_live_headless.rs` reads the same fact out of tccd's
+//! log wherever a GUI session exists.
 //!
 //! A `SKIP` (`None`, announced on stderr) is kept for refusals that happen
 //! before or around the launch and say nothing about the product: no scratch
 //! base short enough for `sun_path`, a log file that cannot be created, a
-//! `spawn` that fails, a control-socket `bind` the OS refuses with
-//! `EPERM`/`EACCES` (a sandboxed runner), and AppKit's refused WindowServer
-//! connection (above).
+//! `spawn` that fails, and a control-socket `bind` the OS refuses with
+//! `EPERM`/`EACCES` (a sandboxed runner).
 //!
 //! Each file keeps its own scratch prefix (so parallel test binaries never
 //! share a directory), its own launch arguments and its own readiness extras;
@@ -130,25 +133,33 @@ fn bind_refused_by_the_os(log: &str) -> bool {
     })
 }
 
-/// Whether the log shows AppKit refusing the WindowServer connection at
-/// startup — CoreGraphics' own words when the process has no GUI session to
-/// join (an ssh login, a CI box): an environment refusal, not a product
-/// failure. Read over the WHOLE log: the line comes first, well before the
-/// tail a crash leaves.
+/// Whether the log shows CoreGraphics refusing a WindowServer connection — its
+/// own words when a process with no GUI session to join (an ssh login, a CI
+/// box) asks for one. Read over the WHOLE log: the line comes first, well
+/// before the tail a crash leaves.
 fn window_server_refused(log: &str) -> bool {
     log.contains("FAILED TO establish the default connection to the WindowServer")
         || log.contains("_CGSDefaultConnection() is NULL")
 }
 
-/// The environment refusal a dead or never-ready child's log names, if any:
-/// the OS refusing the socket's `bind`, or AppKit refusing WindowServer.
-fn environment_refusal(log: &Path, tail: &str) -> Option<&'static str> {
-    if bind_refused_by_the_os(tail) {
-        return Some("the OS refused the control socket's bind");
-    }
+/// A dead or never-ready child whose log shows it ASKED for a WindowServer
+/// connection fails the boot, naming the door (module doc): a headless
+/// instance never asks, so the refusal is the product's, not the login's.
+fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     let whole = std::fs::read_to_string(log).unwrap_or_default();
-    window_server_refused(&whole)
-        .then_some("AppKit could not connect to the WindowServer (a login with no GUI session)")
+    assert!(
+        !window_server_refused(&whole),
+        "aterm --headless asked for a WindowServer connection (CoreGraphics logged its refusal: \
+         this login has no GUI session). A headless process never opens one — on macOS it runs \
+         winit's display-free loop, with no NSApplication (AGENTS.md rule 5) — so a code path \
+         reached AppKit or CoreGraphics: a door, not the environment. Log tail:\n{tail}"
+    );
+}
+
+/// The environment refusal a dead or never-ready child's log names, if any:
+/// the OS refusing the socket's `bind`.
+fn environment_refusal(tail: &str) -> Option<&'static str> {
+    bind_refused_by_the_os(tail).then_some("the OS refused the control socket's bind")
 }
 
 /// [`boot_with`] with `args` as the extra launch arguments and no readiness
@@ -230,11 +241,12 @@ pub fn boot_with(
 /// Wait for a spawned headless instance — `inst`, whose child `child` reaches —
 /// to listen on `sock` and satisfy `ready`: `true` once it does, `false`
 /// (announced `SKIP`) when its log names an environment refusal (the OS refused
-/// the socket's `bind`, or AppKit refused the WindowServer connection). A child that
-/// exits first, or one not ready within the budget, PANICS with the tail of
-/// `log` — the product failed to start (module doc) — and `inst`'s own drop
-/// reaps it. For a test that launches its instances itself (several sharing
-/// one scratch world, an explicit socket path); [`boot_with`] uses it too.
+/// the socket's `bind`). A child that exits first, or one not ready within the
+/// budget, PANICS with the tail of `log` — the product failed to start (module
+/// doc), and one whose log shows it asked for a WindowServer connection says so
+/// — and `inst`'s own drop reaps it. For a test that launches its instances
+/// itself (several sharing one scratch world, an explicit socket path);
+/// [`boot_with`] uses it too.
 pub fn await_ready<T>(
     inst: &mut T,
     child: impl Fn(&mut T) -> &mut Child,
@@ -246,7 +258,8 @@ pub fn await_ready<T>(
         match child(inst).try_wait() {
             Ok(Some(status)) => {
                 let tail = log_tail(log);
-                if let Some(why) = environment_refusal(log, &tail) {
+                fail_if_it_asked_for_the_window_server(log, &tail);
+                if let Some(why) = environment_refusal(&tail) {
                     eprintln!("SKIP: {why}; log tail:\n{tail}");
                     return false;
                 }
@@ -264,7 +277,8 @@ pub fn await_ready<T>(
         std::thread::sleep(POLL_GAP);
     }
     let tail = log_tail(log);
-    if let Some(why) = environment_refusal(log, &tail) {
+    fail_if_it_asked_for_the_window_server(log, &tail);
+    if let Some(why) = environment_refusal(&tail) {
         eprintln!("SKIP: {why}; log tail:\n{tail}");
         return false;
     }

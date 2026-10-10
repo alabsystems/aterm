@@ -65,7 +65,8 @@
 //!
 //! With the `test-support` feature (dev-dependencies only), [`notice_once`]
 //! and [`trust_service_silent`]: a test that needs `trustd` to answer asks
-//! once per binary, and skips with one line on stderr when it does not.
+//! once per binary, and skips with one line on stderr when it does not;
+//! [`disk_image_service_silent`] does the same for an `hdiutil` that timed out.
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -78,7 +79,10 @@ use std::time::{Duration, Instant};
 #[cfg(any(test, feature = "test-support"))]
 mod silent;
 #[cfg(any(test, feature = "test-support"))]
-pub use silent::{CODESIGN_HANG, SKIPPED, notice_once, sign_ad_hoc, trust_service_silent};
+pub use silent::{
+    CODESIGN_HANG, DISK_IMAGE_SKIPPED, SKIPPED, disk_image_service_silent, notice_once,
+    sign_ad_hoc, trust_service_silent,
+};
 
 /// Every in-process call in this process that can wait on macOS's `trustd`:
 /// the TLS certificate evaluation, the PTY keeper's peer and on-disk code

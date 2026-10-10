@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **ZSH'S Ctrl-R SEARCH LAYS NO BAND** (2026-09-23 — the owner's
-//! screenshot, the shipped default Rainbow Kitty: `user@… aterm % ` with the
-//! history entry `claude --dangerously-skip-permissions`, Ctrl-R, `clad`
-//! typed, the search failing at `d`. Row R shows the prompt line with the
-//! match, the block caret on the `c` of `claude`; row R+1 shows `failing
-//! bck-i-search: clad_`. A dithered band slab sat on row R+1 right of `clad`
-//! — over zle's `_` and the blank after it, reaching a little below the row —
-//! and a thin stub on row R under the `rm` of `aterm`, directly above it,
-//! where nothing was typed).
+//! **ZSH'S Ctrl-R SEARCH LAYS NO BAND** (the owner's screenshot, the shipped
+//! default Rainbow Kitty: `user@… aterm % ` with the history entry `claude
+//! --dangerously-skip-permissions`, Ctrl-R, `clad` typed, the search failing at
+//! `d`. Row R shows the prompt line with the match, the block caret on the `c`
+//! of `claude`; row R+1 shows `failing bck-i-search: clad_`. A dithered band
+//! slab sat on row R+1 right of `clad` — over zle's `_` and the blank after it,
+//! reaching a little below the row — and a thin stub on row R under the `rm` of
+//! `aterm`, directly above it, where nothing was typed).
 //!
 //! THE BYTES. zle draws the incremental search's STATUS row below the line
 //! and walks the caret back up onto the MATCH. Every key's redisplay is ONE
@@ -101,39 +100,23 @@
 //! `out`: the hot edge, sparks), per pixel, folded to cells — beside the live
 //! ribbon cells, the glyph under each, and the admission ring.
 //!
-//! PINNED: the owner's whole-read shape (no ink on the match row, nothing
-//! under or right of the `_`, each echo refused `program-row`), the match
-//! that hops, forward or back (no ink on its row, each hop refused
-//! `program-row`), the entry switch shaped like a soft wrap, bash's retreat,
-//! the fewest-bytes minibuffer, the longer search and the forget that keeps
-//! its keys from paying for the move after it, the wrapped match fed as the
-//! host feeds it, and typeahead into the minibuffer; with their controls — plain
-//! prompt typing lights and retires on schedule, typing after leaving the
-//! search lights each key's own cell, a parked caret's own echo and a wide
-//! glyph's (glyph-less, so unknown) still light, a hidden caret's echo is
-//! judged alike on every path, Claude Code's and Codex's composers are
-//! refused nothing, and nothing outlives the idle ceiling. Measured before
-//! the minibuffer gate (`ac5b4c144`, the host feeding the anchor alone): the
-//! bare take laid cells under `_` at (R+1, 15..17) and (R+1, 26), inked at
-//! or right of the `_` on 488 of its frames, and put hot edge on row R at
-//! cols 15-17 and 24-26; each echo was `licensed key` and the `d`
-//! `no-credits`; the longer search laid cells under `_` at six columns of
-//! its status row; the wrapped take laid (2, 17..19) under `_` — and still
-//! does with the gate but without the host's glyph; the minimal minibuffer
-//! laid its `_` cells. Measured before the landing gate (`06abe1777`): every
-//! hop take laid (R, 34) under `-`, and `hop2` also (R, 38) under `hello`'s
-//! `l` and (R, 35..37) between, each hop judged `no-credits`. Measured on
-//! `8c1c2f52d` (both gates, before the flushed park's witness and the soft
-//! wrap's prefix): `backhop`'s held retreat flushed `licensed key` and laid
-//! (R, 38) under `hello`'s first `l`, bash's laid (R, 31); `multiline`'s
-//! switch passed as a soft wrap, `licensed key`, and laid (R, 35) under
-//! `cd /d`'s `d`. A read torn inside ONE zle redisplay (a remote zsh, a
-//! redisplay past the tty's chunk) can present the match's own glyph at the
-//! caret as a key's echo: that lay is RECALLED once zle prints its status
-//! row and the caret rests behind it — shortened, not refused
-//! (RAINBOW-PATH-V3 §8 D-13). The recall's laws pass; the zero-ink laws are
-//! kept as ignored latent rows with their residual (measured before the
-//! recall, 2026-09-30: lays on row R lived about 2 s).
+//! PINNED: the owner's whole-read shape (no ink on the match row, nothing under
+//! or right of the `_`, each echo refused `program-row`), the match that hops,
+//! forward or back (no ink on its row, each hop refused `program-row`), the
+//! entry switch shaped like a soft wrap, bash's retreat, the fewest-bytes
+//! minibuffer, the longer search and the forget that keeps its keys from paying
+//! for the move after it, the wrapped match fed as the host feeds it, and
+//! typeahead into the minibuffer; with their controls — plain prompt typing
+//! lights and retires on schedule, typing after leaving the search lights each
+//! key's own cell, a parked caret's own echo and a wide glyph's (glyph-less, so
+//! unknown) still light, a hidden caret's echo is judged alike on every path,
+//! Claude Code's and Codex's composers are refused nothing, and nothing
+//! outlives the idle ceiling. A read torn inside ONE zle redisplay (a remote
+//! zsh, a redisplay past the tty's chunk) can present the match's own glyph at
+//! the caret as a key's echo: that lay is RECALLED once zle prints its status
+//! row and the caret rests behind it — shortened, not refused (RAINBOW-PATH-V3
+//! §8 D-13). The recall's laws pass; the zero-ink laws are kept as ignored
+//! latent rows with their residual.
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};

@@ -28,6 +28,9 @@
 // imported here, no private key ever crossing a machine boundary. Apple permits no
 // automated path to a Developer ID certificate, so this is the shortest one it allows.
 mod apple;
+// The release's bundle, built ONCE and kept in the release cache by what it was built
+// as: what MEASURE judges and what the cut signs a byte copy of.
+mod artifact;
 mod buildplan;
 mod bundle;
 mod changelog;
@@ -49,7 +52,14 @@ mod manifest_out;
 // channel release, drive the atpkg-keys join in-process, audit the Apple/token stack.
 mod provision;
 mod publish;
+// `ship release`: the ONE release command — a journaled, resumable step machine over
+// the cutter's own judges, the publication engine and the cut.
+mod release;
+mod release_steps;
 mod sign;
+// The source a release builds, made from git objects into a per-clone cache, its
+// dependencies vendored and checked against Cargo.lock, digested and re-verified.
+mod snapshot;
 // The whole-tree Trust lane's facts and their ONE judge: the lane's end, the
 // cutter's and `ship check`'s TRUST gate, and `ship trust verdict` for the
 // release scripts (FACTS, NOT VERDICTS).

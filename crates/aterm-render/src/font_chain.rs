@@ -39,7 +39,8 @@
 //!
 //! What is NOT claimed: "no code point is ever tofu". Coverage depends on the
 //! installed fonts; a code point nothing covers MUST resolve to `.notdef`, and
-//! [`kani_proofs::notdef_is_reachable_and_honest`] keeps that side non-vacuous.
+//! `tests/font_chain_conservation.rs` (`chain_laws_hold_over_the_complete_input_space`,
+//! over the whole 16384-case input space) keeps that side non-vacuous.
 
 use crate::FaceId;
 
@@ -95,8 +96,9 @@ impl Tier {
 
 /// The chain-narrowing policy: two INDEPENDENT switches plus the code point's
 /// Unicode presentation. Keeping them separate fields (never one merged flag) is
-/// the fix the tofu bug demanded, and `kani_proofs::sealing_never_hides_an_io_free_tier`
-/// is what holds them apart.
+/// the fix the tofu bug demanded, and P4 of `tests/font_chain_conservation.rs`
+/// (with `the_laws_catch_the_shipped_seal_regression`, its mutant) is what holds
+/// them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainPolicy {
     /// The E1 host switch (`Renderer::set_runtime_font_discovery`): `false` means
@@ -431,191 +433,5 @@ impl DecisionCells {
                 _ => None,
             },
         }
-    }
-}
-
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the resolution-chain
-/// laws over the FULL symbolic coverage/policy domain. CONFIG-FREE (no
-/// `#[kani::unwind]` / `#[kani::stub]` / `#[kani::solver]`, no loops, no heap),
-/// so `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh` discharges them.
-///
-/// Bounds and why they are complete, not a sample: the chain has exactly
-/// [`Tier::COUNT`] = 8 tiers, so coverage is an 8-bit symbolic vector (2^8);
-/// the lazy-parse state is 2 bits (2^2); the policy is 4 bools (2^4). 16384
-/// states — the WHOLE input space of the decision, with no abstraction gap on
-/// the policy side. The abstraction is only "a face either covers a code point
-/// or it does not", which is exactly what every real probe returns.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::{
-        BitProbe, ChainPolicy, DecisionCells, Resolution, RuntimeLane, Tier, io_free_mask,
-        reachable_mask, resolve_chain, slot_for_source,
-    };
-
-    fn any_policy() -> ChainPolicy {
-        ChainPolicy {
-            runtime_discovery: kani::any(),
-            sealed: kani::any(),
-            wants_emoji: kani::any(),
-            prefers_symbol: kani::any(),
-        }
-    }
-
-    fn any_covered() -> u8 {
-        // `Tier::COUNT` is 8, so every `u8` is a coverage vector.
-        const _: () = assert!(Tier::COUNT == 8);
-        kani::any()
-    }
-
-    fn any_pending() -> u8 {
-        let pending: u8 = kani::any();
-        kani::assume(pending < 4);
-        pending
-    }
-
-    /// P1 CONSERVATION — `.notdef` is returned ONLY IF no tier the policy admits
-    /// covers the code point. This alone is the proof that would have caught the
-    /// U+276F tofu: sealed + `RuntimeEmbedded` covered + `.notdef` returned is a
-    /// counterexample.
-    #[kani::proof]
-    fn notdef_only_when_no_reachable_tier_covers() {
-        let covered = any_covered();
-        let policy = any_policy();
-        let mut probe = BitProbe::new(covered, any_pending());
-        if resolve_chain(&mut probe, policy) == Resolution::Notdef {
-            kani::assert(
-                covered & reachable_mask(policy) == 0,
-                "gave up on a code point some reachable tier covers",
-            );
-        }
-    }
-
-    /// P1' — a PROVISIONAL `.notdef` is returned only while a lazy face is
-    /// actually parsing, and a give-up is never returned while one is (the
-    /// give-up would otherwise be memoized against a chain that is still growing).
-    #[kani::proof]
-    fn provisional_iff_a_lazy_parse_is_in_flight() {
-        let covered = any_covered();
-        let pending = any_pending();
-        let policy = any_policy();
-        let mut probe = BitProbe::new(covered, pending);
-        let r = resolve_chain(&mut probe, policy);
-        if r == Resolution::Provisional {
-            kani::assert(pending != 0, "provisional without a parse in flight");
-        }
-        if r == Resolution::Notdef {
-            kani::assert(pending == 0, "gave up while a lazy face was still parsing");
-        }
-    }
-
-    /// P2 TOTALITY / ORDERING — every tier is consulted at most once, strictly in
-    /// declared order, and the walk terminates within [`Tier::COUNT`] probes.
-    #[kani::proof]
-    fn each_tier_is_consulted_at_most_once_in_order() {
-        let mut probe = BitProbe::new(any_covered(), any_pending());
-        let _ = resolve_chain(&mut probe, any_policy());
-        kani::assert(probe.ordered, "a tier was re-probed or probed out of order");
-        kani::assert(
-            probe.calls as usize <= Tier::COUNT,
-            "the chain walk exceeded its tier count",
-        );
-    }
-
-    /// P3 (a) KEY/RASTER AGREEMENT — the record a resolution writes is the record
-    /// the rasterizer reads back from the key it emits.
-    #[kani::proof]
-    fn every_key_names_the_record_the_rasterizer_reads() {
-        let mut probe = BitProbe::new(any_covered(), any_pending());
-        let r = resolve_chain(&mut probe, any_policy());
-        if let Some(slot) = r.recovery_slot() {
-            kani::assert(
-                slot_for_source(r.key_source()) == Some(slot),
-                "the key's face recovers from a different record than the resolution wrote",
-            );
-        }
-    }
-
-    /// P3 (b) LANE-AGNOSTIC RECOVERY — a decision recorded on EITHER runtime lane
-    /// is recoverable by `parts_for`. The pre-fix reader saw only `decisions`, so
-    /// the sealed (embedded) lane's decision was lost and the glyph drew `.notdef`
-    /// under a `RuntimeFallback`-labelled key.
-    #[kani::proof]
-    fn a_recorded_runtime_decision_is_always_recoverable() {
-        let face: u8 = kani::any();
-        kani::assume(face < 4);
-        let embedded: bool = kani::any();
-        let lane = if embedded {
-            RuntimeLane::EmbeddedDecisions
-        } else {
-            RuntimeLane::Decisions
-        };
-        let mut cells = DecisionCells::default();
-        cells.record(lane, Some(face));
-        kani::assert(
-            cells.parts_for() == Some(face),
-            "a recorded runtime decision was not recoverable by the rasterizer",
-        );
-    }
-
-    /// P4 SEAL MONOTONICITY (mask form) — sealing may narrow the chain, but a
-    /// sealed give-up implies NO I/O-free tier covered the code point. Under a
-    /// sealed policy this is P1 restricted to the tiers the seal cannot touch, and
-    /// it is exactly the obligation the shipped bug violated.
-    #[kani::proof]
-    fn sealing_never_hides_an_io_free_tier() {
-        let covered = any_covered();
-        let pending = any_pending();
-        let base = any_policy();
-        let sealed = ChainPolicy {
-            sealed: true,
-            ..base
-        };
-        let mut probe = BitProbe::new(covered, pending);
-        if resolve_chain(&mut probe, sealed) == Resolution::Notdef {
-            kani::assert(
-                covered & io_free_mask(sealed) == 0,
-                "sealing turned a code point an I/O-free tier covers into `.notdef`",
-            );
-        }
-    }
-
-    /// P4 SEAL MONOTONICITY (differential form) — for the SAME code point, if the
-    /// sealed chain gives up then the unsealed chain either gave up too, or only
-    /// resolved through the pathname lane the seal legitimately closes. Nothing
-    /// else may be lost by sealing.
-    #[kani::proof]
-    fn sealing_only_costs_the_pathname_lane() {
-        let covered = any_covered();
-        let pending = any_pending();
-        let base = any_policy();
-        let unsealed = ChainPolicy {
-            sealed: false,
-            ..base
-        };
-        let sealed = ChainPolicy {
-            sealed: true,
-            ..base
-        };
-        let before = resolve_chain(&mut BitProbe::new(covered, pending), unsealed);
-        let after = resolve_chain(&mut BitProbe::new(covered, pending), sealed);
-        if after == Resolution::Notdef {
-            kani::assert(
-                before == Resolution::Notdef
-                    || before == Resolution::Runtime(RuntimeLane::Decisions),
-                "sealing downgraded a resolved code point to `.notdef`",
-            );
-        }
-    }
-
-    /// NON-VACUITY — `.notdef` IS reachable (the honest miss), so the proofs above
-    /// are not trivially true of a resolver that never gives up.
-    #[kani::proof]
-    fn notdef_is_reachable_and_honest() {
-        let policy = any_policy();
-        let mut probe = BitProbe::new(0, 0);
-        kani::assert(
-            resolve_chain(&mut probe, policy) == Resolution::Notdef,
-            "a code point NOTHING covers must still resolve to `.notdef`",
-        );
     }
 }

@@ -25,6 +25,20 @@ fn u16_from_usize(value: usize) -> u16 {
     value.try_into().unwrap_or(u16::MAX)
 }
 
+/// A cell an early-wrap hole can still be: a blank (space) that is no half of
+/// a wide glyph and no complex cluster. Its colours do not matter, since xterm
+/// blanks the hole with the current background (BCE).
+#[inline]
+fn is_wrap_hole_blank(cell: &Cell) -> bool {
+    use super::CellFlags;
+    cell.char_data() == u16::from(b' ')
+        && !cell.flags().intersects(
+            CellFlags::WIDE
+                .union(CellFlags::WIDE_CONTINUATION)
+                .union(CellFlags::COMPLEX),
+        )
+}
+
 /// A single row of terminal cells.
 pub struct Row {
     /// Cell storage.
@@ -60,6 +74,27 @@ aterm_types::bitflags! {
         /// propagated by Row::set; cleared by clear()/erase(). Lets
         /// extract_row_extras skip the per-cell style_id scan on plain rows.
         const HAS_STYLE_ID = 1 << 6;
+        /// The row's last cell is an early-wrap hole: a width-2 glyph that
+        /// could not start there wrapped to the next row and left the cell
+        /// unwritten (xterm blanks it with the current background). Ghostty
+        /// calls the cell a `spacer_head`, Alacritty a
+        /// `LEADING_WIDE_CHAR_SPACER`. It is not content: a rewrap that rejoins
+        /// the row with its continuation drops this one cell and nothing else,
+        /// so a space or glyph a program really wrote in the last column is
+        /// kept ([`Row::has_early_wrap_hole`]).
+        ///
+        /// Set where a hole is made: the write path's early wrap
+        /// (`Grid::blank_wide_wrap_tail`), the visible rewrap's chunker when it
+        /// backs a chunk off a wide glyph, and a row filled from a history
+        /// [`Line`](aterm_scrollback::Line) that ends one cell short (a line
+        /// stores content only, so its hole is the cell it leaves unfilled).
+        /// Cleared by a write into the last cell (a glyph, a wide glyph's
+        /// spacer, a `Row::set`, a fill run, a DECFRA glyph) and by a shift of
+        /// it (ICH/DCH), and by every whole-row clear/erase/reset; a width
+        /// change without rewrap drops it. An erase of the cell (DECERA, or
+        /// ECH and EL, which also end the soft wrap there) keeps it: the hole
+        /// stays a hole, blanked again.
+        const EARLY_WRAP_HOLE = 1 << 7;
         /// Mask of DEC line attribute flags (DECDWL/DECDHL).
         ///
         /// Erase operations clear character content but keep these line
@@ -205,6 +240,48 @@ impl Row {
         }
     }
 
+    /// Is this row's last cell an early-wrap hole
+    /// ([`RowFlags::EARLY_WRAP_HOLE`])? The flag must be set and the cell must
+    /// still hold the blank the wrap left: a glyph written there since (by any
+    /// path) makes it content again.
+    #[must_use]
+    #[inline]
+    pub fn has_early_wrap_hole(&self) -> bool {
+        self.flags.contains(RowFlags::EARLY_WRAP_HOLE)
+            && self.cells.last().is_some_and(is_wrap_hole_blank)
+    }
+
+    /// Record (or forget) that this row's last cell is an early-wrap hole.
+    /// Not a visual change, so the row is not marked dirty.
+    #[inline]
+    pub(crate) fn set_early_wrap_hole(&mut self, hole: bool) {
+        if hole {
+            self.flags |= RowFlags::EARLY_WRAP_HOLE;
+        } else {
+            self.flags -= RowFlags::EARLY_WRAP_HOLE;
+        }
+    }
+
+    /// How many cells this row contributes to its logical line when the next
+    /// row continues it (soft wrap): autowrap filled it to its last column, so
+    /// every cell is content, blanks included, except a recorded early-wrap
+    /// hole. Single-width rows only; the caller checks the continuation.
+    #[must_use]
+    #[inline]
+    pub(crate) fn continued_len(&self) -> u16 {
+        self.cols()
+            .saturating_sub(u16::from(self.has_early_wrap_hole()))
+    }
+
+    /// A write that lands on the last cell (`end`, exclusive, reaches the row
+    /// end) fills an early-wrap hole: the cell is content from now on.
+    #[inline]
+    fn note_write_through(&mut self, end: usize) {
+        if end >= self.cells.len() {
+            self.flags -= RowFlags::EARLY_WRAP_HOLE;
+        }
+    }
+
     /// Check if this row is dirty (needs re-render).
     #[cfg(test)]
     #[must_use]
@@ -344,6 +421,7 @@ impl Row {
             .min(self.cells.len());
         if end > start {
             self.flags |= RowFlags::DIRTY;
+            self.note_write_through(end);
         }
         // `fixup_wide_chars_in_range` can clear a wide continuation at `end`,
         // one past the returned slice, when the last covered cell is a WIDE
@@ -394,6 +472,7 @@ impl Row {
                 new_flags |= RowFlags::HAS_STYLE_ID;
             }
             self.flags |= new_flags;
+            self.note_write_through(usize::from(col) + 1);
             true
         } else {
             false
@@ -416,6 +495,9 @@ impl Row {
     /// applies for narrow bulk writes; the wide lanes call
     /// `fixup_wide_chars_in_range` directly.
     pub fn settle_len_after_wide_run(&mut self, end_col: u16) {
+        // The run's unchecked writes skip `note_write_through`; a run that
+        // reached the last cell wrote over any early-wrap hole there.
+        self.note_write_through(usize::from(end_col));
         self.update_len(end_col);
         let len = self.len as usize;
         if len > 0 && self.cells.get(len - 1).is_some_and(Cell::is_empty) {
@@ -493,7 +575,9 @@ impl Row {
             }
         }
 
-        self.flags |= RowFlags::DIRTY;
+        // The old last cell is no longer the last: a recorded early-wrap hole
+        // names a cell this width does not end on.
+        self.flags = (self.flags | RowFlags::DIRTY) - RowFlags::EARLY_WRAP_HOLE;
     }
 
     /// Get a mutable iterator over all cells.
@@ -572,7 +656,7 @@ pub(crate) struct RowSnapshot {
 
 impl RowSnapshot {
     pub(crate) fn heap_memory_used(&self) -> usize {
-        self.cells.len() * std::mem::size_of::<Cell>()
+        self.cells.len().saturating_mul(std::mem::size_of::<Cell>())
     }
 }
 
@@ -581,11 +665,8 @@ mod clear;
 mod fmt;
 mod write;
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 mod style_id_write;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod kani_proofs;

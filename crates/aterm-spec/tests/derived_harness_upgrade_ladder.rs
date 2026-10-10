@@ -4,21 +4,20 @@
 use aterm_spec::derive::{harness_upgrade_ladder_liveness, harness_upgrade_ladder_model};
 use aterm_spec::{interp, verify};
 
-/// THE LIVE UPGRADE'S LADDER (the owner's decision of 2026-09-28): every
+/// THE LIVE UPGRADE'S LADDER: every
 /// floor holds at every rung — never over a draft, a box, a keystroke within
 /// 20 s or running work of this client's own — a look at a pause the ladder
 /// counts from Settled never waits for a screen that only repainted, and a
 /// turn in ANOTHER session on the same daemon holds the client only until
 /// its screen has placed it there, which it never does under a goal of its
-/// own (the second review of 2026-09-28: the goal's own turns run unseen,
-/// and the rule that placed through them ended the client mid-goal), nor for
-/// a subagent's turn or a root's with no other Codex attached (the third
-/// review: the owner's tab's own subagents, taken for another session's).
-/// Each invariant is caught by its own
-/// `Buggy` member, and each dead action ALONE by an invariant — the audit
-/// `aterm-gui`'s `spec_xref_closure` runs (`verify::audit_dead_negative_controls`:
-/// the first cut's liveness-only mutants failed it). Tier-1 against the real
-/// gate is in aterm-agent's `harness::upgrade_drive` ladder tests.
+/// own (the goal's own turns run unseen, and the rule that placed through
+/// them ended the client mid-goal), nor for a subagent's turn or a root's
+/// with no other Codex attached (a tab's own subagents, taken for another
+/// session's).
+/// Each invariant is caught by its own `Buggy` member, and each dead action
+/// ALONE by an invariant — the audit `aterm-gui`'s `spec_xref_closure` runs
+/// (`verify::audit_dead_negative_controls`). Tier-1 against the real gate is
+/// in aterm-agent's `harness::upgrade_drive` ladder tests.
 #[test]
 fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
     let model = harness_upgrade_ladder_model();
@@ -145,9 +144,8 @@ fn the_ladder_keeps_every_floor_and_counts_a_quiet_looking_pause() {
     assert!(model.fire("Look", &mut goal));
     assert!(model.fire("Look", &mut goal));
     assert!(model.action_enabled("Move", &goal), "placed");
-    // A SUBAGENT of this client's conversation (the owner's daemon of
-    // 2026-09-28) — or any turn the lane never places: its turn never
-    // draws, the looks go on reading the screen still, and it holds the move
+    // A SUBAGENT of this client's conversation — or any turn the lane never
+    // places: its turn never draws, the looks go on reading the screen still, and it holds the move
     // through any number of them, placed never; the pin waits for it too.
     // Ended, the move is back.
     let mut sub = land.clone();

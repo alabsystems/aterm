@@ -67,6 +67,74 @@ pub(crate) fn note_selection_custody(t: &mut Terminal, kept: bool) {
     });
 }
 
+/// The grid column a selection gesture anchors at for the pointer over
+/// pane-local viewport cell `(row, col)`, and, on a doubled line, which half of
+/// that character the pointer is over.
+///
+/// A DEC double-width or double-height line (DECDWL/DECDHL) is drawn at twice
+/// the advance, so grid column `c` covers screen cells `2c` and `2c + 1`: the
+/// pointer over screen cell `col` is over character `col / 2`, on its left half
+/// when `col` is even. Every selection gesture maps the pointer through here,
+/// so a drag highlights and copies the characters it covered. The line size is
+/// read as the frame reads it (`Grid::row` of the viewport row). PTY mouse
+/// reports keep the screen cell.
+pub(crate) fn pointer_char(term: &Terminal, row: u16, col: u16) -> (u16, Option<SelectionSide>) {
+    use aterm_core::grid::LineSize;
+    match term.grid().row(row).map(aterm_core::grid::Row::line_size) {
+        Some(LineSize::DoubleWidth | LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom) => {
+            let side = if col.is_multiple_of(2) {
+                SelectionSide::Left
+            } else {
+                SelectionSide::Right
+            };
+            (col / 2, Some(side))
+        }
+        _ => (col, None),
+    }
+}
+
+/// The selection anchor a pointer on viewport cell (`row`, `col`) makes, with
+/// its half-cell `side`: the LOGICAL cell under it, since the selection, the
+/// copy, the word rules and find all read the grid in logical order and the
+/// frame paints each cell at its logical column
+/// (`RenderInput::selection_hit`). On a BiDi-reordered row the painted
+/// column is not the logical one, and on a right-to-left cell the halves swap
+/// (its visual left half is its logical end), as VTE does. Identity, side
+/// included, on every left-to-right cell.
+///
+/// `col` is the grid column the frame paints under the pointer: any other
+/// pointer→cell mapping (a double-width line's halving) happens before this
+/// call, never after it, since the permutation is over painted grid columns.
+pub(crate) fn pointer_anchor(
+    t: &Terminal,
+    row: u16,
+    col: u16,
+    side: SelectionSide,
+) -> (u16, SelectionSide) {
+    let (logical, rtl) = t.viewport_cell_logical(row, col);
+    let side = match (rtl, side) {
+        (true, SelectionSide::Left) => SelectionSide::Right,
+        (true, SelectionSide::Right) => SelectionSide::Left,
+        (_, side) => side,
+    };
+    (logical, side)
+}
+
+/// [`pointer_anchor`] for a press already in selection rows (`sel_row`, the
+/// viewport row minus `display_offset`).
+fn pointer_anchor_at_sel_row(
+    t: &Terminal,
+    sel_row: i32,
+    col: u16,
+    side: SelectionSide,
+) -> (u16, SelectionSide) {
+    let viewport_row = i64::from(sel_row) + i64::try_from(t.grid().display_offset()).unwrap_or(0);
+    match u16::try_from(viewport_row) {
+        Ok(row) => pointer_anchor(t, row, col, side),
+        Err(_) => (col, side),
+    }
+}
+
 /// Map a winit mouse button to the engine's [`aterm_types::mouse::MouseButton`]
 /// for an [`InputEvent::MouseButton`].
 ///
@@ -90,6 +158,110 @@ pub(crate) fn winit_mouse_button(b: WinitMouseButton) -> Option<aterm_types::mou
         WinitMouseButton::Back => Some(MouseButton::Back),
         WinitMouseButton::Forward => Some(MouseButton::Forward),
         WinitMouseButton::Other(_) => None,
+    }
+}
+
+/// The buttons indexed by [`aterm_types::mouse::MouseButton::slot`]: xterm's
+/// `FirstBitN` order (1, 2, 3, then 8 and 9), the order a held chord names its
+/// button in.
+const BUTTONS_BY_SLOT: [aterm_types::mouse::MouseButton; 5] = [
+    aterm_types::mouse::MouseButton::Left,
+    aterm_types::mouse::MouseButton::Middle,
+    aterm_types::mouse::MouseButton::Right,
+    aterm_types::mouse::MouseButton::Back,
+    aterm_types::mouse::MouseButton::Forward,
+];
+
+/// The button a motion report names while the buttons in `reported` (a
+/// `1 << slot()` mask) are held: the LOWEST, as xterm's
+/// `EMIT_BUTTON(FirstBitN(mouse_button))` names it (left, middle, right, then
+/// the thumb buttons). Derived from the mask rather than set per press, so
+/// releasing one button of a chord leaves the other named and its drag still
+/// reported under DEC 1002, instead of motion carrying the no-button code 1002
+/// drops.
+pub(crate) fn held_button(reported: u8) -> Option<aterm_types::mouse::MouseButton> {
+    BUTTONS_BY_SLOT
+        .into_iter()
+        .find(|button| reported & (1 << button.slot()) != 0)
+}
+
+/// Forget `button`'s press in window state `ws`: its reported bit and owner go,
+/// and the held button is re-derived from what is still down.
+pub(crate) fn forget_reported_button(
+    ws: &mut crate::WindowState,
+    button: aterm_types::mouse::MouseButton,
+) {
+    ws.reported_buttons &= !(1 << button.slot());
+    ws.button_owners[usize::from(button.slot())] = None;
+    ws.held_mouse_button = held_button(ws.reported_buttons);
+}
+
+/// The session a held button's press went to, and the cell (in that session's
+/// own grid) and sub-cell pixel last sent to it. Kept per button in
+/// [`crate::WindowState::button_owners`] so the button's drag motion and release
+/// pair with its press after a tab or pane switch moves the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ButtonOwner {
+    pub(crate) session: u64,
+    pub(crate) cell: (u16, u16),
+    pub(crate) px_off: crate::input::PixelOffset,
+}
+
+/// Where one pointer event goes in a window; see
+/// [`App::pointer_route`] and [`App::owner_route`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerRoute {
+    /// The focused pane, at the pane-local cell `last_mouse_cell` holds (clamped
+    /// into it, so a drag that crosses a divider keeps addressing it).
+    Front,
+    /// Another visible terminal pane of the window, at that pane's own cell.
+    Pane { session: u64, cell: (u16, u16) },
+    /// No terminal program: the pointer is over a native pane, or the session a
+    /// held button's press went to is no longer on the glass.
+    Nowhere,
+}
+
+/// A planned leaf's content rect as whole cells `(row_off, col_off, rows, cols)`:
+/// the rounding [`App::focused_pane_rect`] has always applied, shared so every
+/// pane's cells are derived alike.
+fn leaf_cell_rect(rect: crate::tab_model::LogicalRect) -> (u16, u16, u16, u16) {
+    (
+        rect.origin.y.round().max(0.0) as u16,
+        rect.origin.x.round().max(0.0) as u16,
+        (rect.size.height.round() as u16).max(1),
+        (rect.size.width.round() as u16).max(1),
+    )
+}
+
+/// Whether window cell `(row, col)` lies inside the pane rect
+/// `(row_off, col_off, rows, cols)`.
+fn rect_contains((ro, co, rows, cols): (u16, u16, u16, u16), (row, col): (u16, u16)) -> bool {
+    (ro..ro.saturating_add(rows)).contains(&row) && (co..co.saturating_add(cols)).contains(&col)
+}
+
+/// Window cell `(row, col)` in the pane rect `(row_off, col_off, rows, cols)`'s
+/// own grid, CLAMPED into it.
+fn cell_in_rect((row, col): (u16, u16), (ro, co, rows, cols): (u16, u16, u16, u16)) -> (u16, u16) {
+    (
+        row.saturating_sub(ro).min(rows.saturating_sub(1)),
+        col.saturating_sub(co).min(cols.saturating_sub(1)),
+    )
+}
+
+/// Record that `cell`/`px_off` (in `session`'s own grid) was just sent to
+/// `session`, on every held button whose press went to it, so a release
+/// synthesized later lands where that program last saw the pointer.
+fn note_owner_cell(
+    ws: &mut crate::WindowState,
+    session: u64,
+    cell: (u16, u16),
+    px_off: crate::input::PixelOffset,
+) {
+    for owner in ws.button_owners.iter_mut().flatten() {
+        if owner.session == session {
+            owner.cell = cell;
+            owner.px_off = px_off;
+        }
     }
 }
 
@@ -874,14 +1046,230 @@ impl App {
         }
         self.active_visible_leaf_plan(wid)
             .and_then(|plan| plan.leaf(plan.focused).map(|leaf| leaf.rect))
-            .map_or((0, 0, ws.rows, ws.cols), |rect| {
-                (
-                    rect.origin.y.round().max(0.0) as u16,
-                    rect.origin.x.round().max(0.0) as u16,
-                    (rect.size.height.round() as u16).max(1),
-                    (rect.size.width.round() as u16).max(1),
-                )
+            .map_or((0, 0, ws.rows, ws.cols), leaf_cell_rect)
+    }
+
+    /// Whether terminal `session` is window `wid`'s front (focused) terminal.
+    pub(crate) fn session_is_front(&self, wid: WindowId, session: u64) -> bool {
+        self.front_terminal(wid)
+            .is_some_and(|front| front.session == session)
+    }
+
+    /// The content rect `(row_off, col_off, rows, cols)`, in window cells, of the
+    /// visible pane of window `wid`'s active tab that shows terminal `session`;
+    /// `None` when no visible pane does (a background tab, a sibling hidden by
+    /// zoom, a closed pane, a session another window shows).
+    pub(crate) fn visible_session_rect(
+        &self,
+        wid: WindowId,
+        session: u64,
+    ) -> Option<(u16, u16, u16, u16)> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        plan.leaves
+            .iter()
+            .find(|leaf| {
+                self.view_store
+                    .get(leaf.view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    == Some(session)
             })
+            .map(|leaf| leaf_cell_rect(leaf.rect))
+    }
+
+    /// Where a pointer event other than a release goes in window `wid` (a hover
+    /// or drag step, a wheel notch, a non-left press). A release goes to its own
+    /// press's owner instead ([`Self::owner_route`]).
+    ///
+    /// With no gesture in flight: to the pane UNDER the pointer, at that pane's
+    /// own cell, as kitty (`window_for_event`), WezTerm and tmux (`send -M -t=`)
+    /// route it. `last_mouse_cell` is clamped into the FOCUSED pane so that a
+    /// drag begun there keeps addressing it across a divider; with nothing in
+    /// flight that clamp handed the focused pane's program an edge cell the
+    /// pointer was never on, and scrolled ITS history under a wheel aimed at a
+    /// sibling.
+    ///
+    /// With a reported button held: to the session the held button's press
+    /// went to ([`Self::owner_route`] of the lowest held button, the one motion
+    /// names), wherever the pointer is. A press can now belong to a sibling, so
+    /// the held gesture is that sibling's: its drag steps, a second button of
+    /// its chord and a wheel notch during it all reach the program that has the
+    /// first press, never the focused pane at a clamped edge cell.
+    ///
+    /// [`PointerRoute::Front`] wherever the front path is still the answer: a
+    /// modal or the tab menu (whose gates the front path runs), the front
+    /// pane's own local gesture (a selection, a divider drag), a single visible
+    /// pane, the pointer inside the focused pane, or on a divider (kitty's
+    /// fallback to the active window). [`PointerRoute::Nowhere`] over a native
+    /// pane: no terminal program is under the pointer. `focused` is the focused
+    /// pane rect when the caller has already planned it.
+    pub(crate) fn pointer_route(
+        &self,
+        wid: WindowId,
+        focused: Option<(u16, u16, u16, u16)>,
+    ) -> PointerRoute {
+        let Some(ws) = self.windows.get(&wid) else {
+            return PointerRoute::Front;
+        };
+        if ws.overlay_open() || ws.tab_menu.is_some() || ws.selecting || ws.divider_drag.is_some() {
+            return PointerRoute::Front;
+        }
+        if ws.reported_buttons != 0 {
+            let owner = ws
+                .held_mouse_button
+                .and_then(|button| ws.button_owners[usize::from(button.slot())]);
+            return self.owner_route(wid, owner);
+        }
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return PointerRoute::Front;
+        }
+        let window_cell = ws.last_mouse_window_cell;
+        let focused = focused.unwrap_or_else(|| self.focused_pane_rect(wid));
+        if rect_contains(focused, window_cell) {
+            return PointerRoute::Front;
+        }
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return PointerRoute::Front;
+        };
+        let Some(leaf) = plan.leaf_at(crate::tab_model::LogicalPoint {
+            x: f32::from(window_cell.1),
+            y: f32::from(window_cell.0),
+        }) else {
+            return PointerRoute::Front;
+        };
+        if leaf.view == plan.focused {
+            return PointerRoute::Front;
+        }
+        match self
+            .view_store
+            .get(leaf.view)
+            .copied()
+            .and_then(crate::tab_model::View::terminal_session)
+        {
+            Some(session) if self.pool.get(session).is_some() => PointerRoute::Pane {
+                session,
+                cell: cell_in_rect(window_cell, leaf_cell_rect(leaf.rect)),
+            },
+            _ => PointerRoute::Nowhere,
+        }
+    }
+
+    /// Where an event of a gesture already in flight goes: to the session the
+    /// button's press went to (`owner`), at the pointer's cell in that session's
+    /// pane, clamped as the focused pane's is so a drag that leaves the pane keeps
+    /// addressing its edge. kitty sends a tracked drag's motion and release to the
+    /// window the press went to (`tracked_drag_in_window`). [`PointerRoute::Front`]
+    /// when the owner is the front pane or none was recorded;
+    /// [`PointerRoute::Nowhere`] when it is no longer on the glass, whose release
+    /// [`Self::settle_hidden_button_owners`] already wrote.
+    fn owner_route(&self, wid: WindowId, owner: Option<ButtonOwner>) -> PointerRoute {
+        let Some(owner) = owner else {
+            return PointerRoute::Front;
+        };
+        if self.session_is_front(wid, owner.session) {
+            return PointerRoute::Front;
+        }
+        let Some(window_cell) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
+            return PointerRoute::Nowhere;
+        };
+        self.visible_session_rect(wid, owner.session)
+            .map_or(PointerRoute::Nowhere, |rect| PointerRoute::Pane {
+                session: owner.session,
+                cell: cell_in_rect(window_cell, rect),
+            })
+    }
+
+    /// Hand a pointer event to its route: the front path, the visible pane it
+    /// names (pinned through [`Self::input_to_session`], which presents a pointer
+    /// event in any visible pane of `wid`), or nowhere.
+    fn send_pointer(&mut self, wid: WindowId, route: PointerRoute, ev: InputEvent) {
+        match route {
+            PointerRoute::Front => {
+                self.input(wid, ev, Source::Human);
+            }
+            PointerRoute::Pane { session, .. } => {
+                self.input_to_session(
+                    wid,
+                    ev,
+                    Source::Human,
+                    Some(session),
+                    crate::app_input::PressPhase::Initial,
+                );
+            }
+            PointerRoute::Nowhere => {}
+        }
+    }
+
+    /// Release every held button whose press went to a session the window no
+    /// longer shows, then forget it. Called from `sync_window`, where every tab
+    /// switch, pane close, zoom and migration converges.
+    ///
+    /// The release is the one the person's eventual button-up would have been,
+    /// written now to the program that got the press, at the cell last sent to
+    /// it, under that session's own lock (`write_ui_report`, the route a tab
+    /// switch's focus report takes). Without it that program stays mid-drag (vim
+    /// visual drag, tmux pane select), and the button-up lands on the new front,
+    /// which never saw the press. kitty ends a tracked drag the same way when its
+    /// window goes. No modifiers: none were pressed with this release. A button
+    /// whose owner is still visible (a pane-focus move inside a split) keeps it:
+    /// its motion and release still reach it through [`Self::owner_route`].
+    pub(crate) fn settle_hidden_button_owners(&mut self, wid: WindowId) {
+        let Some((reported, owners)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.reported_buttons != 0)
+            .map(|ws| (ws.reported_buttons, ws.button_owners))
+        else {
+            return;
+        };
+        let mut released = Vec::new();
+        for button in BUTTONS_BY_SLOT {
+            let slot = usize::from(button.slot());
+            let Some(owner) = owners[slot] else {
+                continue;
+            };
+            if reported & (1 << slot) == 0
+                || self.visible_session_rect(wid, owner.session).is_some()
+            {
+                continue;
+            }
+            if let Some(session) = self.pool.get(owner.session) {
+                crate::app_input::write_ui_report(
+                    &session.term,
+                    &session.ctx.modes,
+                    &session.ctx.sink,
+                    &InputEvent::MouseButton {
+                        button,
+                        pressed: false,
+                        row: owner.cell.0,
+                        col: owner.cell.1,
+                        mods: 0,
+                        click_count: 1,
+                        side: SelectionSide::Left,
+                        block: false,
+                        suppress_copy_on_select: false,
+                        px_off: owner.px_off,
+                    },
+                );
+            }
+            released.push(button);
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            for button in released {
+                forget_reported_button(ws, button);
+            }
+        }
+    }
+
+    /// Re-derive window `wid`'s pane-local pointer cell (`last_mouse_cell`) from
+    /// its window cell and the focused pane's rect, clamped as
+    /// `refresh_mouse_cell` clamps it. For a front change with the pointer still,
+    /// after which the stored cell names a place in the pane focus left.
+    pub(crate) fn rederive_pointer_cell(&mut self, wid: WindowId) {
+        let rect = self.focused_pane_rect(wid);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.last_mouse_cell = cell_in_rect(ws.last_mouse_window_cell, rect);
+        }
     }
 
     /// `true` when the pointer's last WINDOW cell lies INSIDE the focused pane's
@@ -900,8 +1288,7 @@ impl App {
         let Some((wr, wc)) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
             return false;
         };
-        let (ro, co, prows, pcols) = self.focused_pane_rect(wid);
-        (ro..ro.saturating_add(prows)).contains(&wr) && (co..co.saturating_add(pcols)).contains(&wc)
+        rect_contains(self.focused_pane_rect(wid), (wr, wc))
     }
 
     /// Header hit testing uses the unclamped pixel position. Padding and the
@@ -1299,7 +1686,7 @@ impl App {
         if self.finish_divider_drag(wid)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
-            ws.held_mouse_button = None;
+            ws.held_mouse_button = held_button(ws.reported_buttons);
         }
         if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             // A settle is housekeeping on a HUMAN drag whose release was swallowed
@@ -1307,10 +1694,9 @@ impl App {
             // suppressed here (false).
             self.finish_selection(wid, false);
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.held_mouse_button = None;
                 // Clear the LEFT reported bit like the release path does, so a later
-                // non-reporting press can't leak an orphan release (`1` = Left).
-                ws.reported_buttons &= !1u8;
+                // non-reporting press can't leak an orphan release.
+                forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
             }
         }
     }
@@ -1464,9 +1850,8 @@ impl App {
         y: f64,
     ) -> MouseCellMapping {
         let (row, col) = self.pixel_to_cell_with(wid, geom, x, y);
-        let pane_rect @ (ro, co, prows, pcols) = self.focused_pane_rect(wid);
-        let lr = row.saturating_sub(ro).min(prows.saturating_sub(1));
-        let lc = col.saturating_sub(co).min(pcols.saturating_sub(1));
+        let pane_rect = self.focused_pane_rect(wid);
+        let (lr, lc) = cell_in_rect((row, col), pane_rect);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_mouse_window_cell = (row, col);
             ws.last_mouse_cell = (lr, lc);
@@ -1664,6 +2049,16 @@ impl App {
                         .band_hit_at(wid, x, y)
                         .is_some_and(|target| self.band_press_acts(wid, target))
                 {
+                    // NOT WHILE PARKED (ruling 441 (i)), as `notice` is not
+                    // (round-seven update audit, finding 32; `take_notice`):
+                    // the band crossed to the successor in the carry the park
+                    // captured, and a press here would be undone at Commit
+                    // while its side effects stood. Refused before any press
+                    // is spent.
+                    if self.update_handoff_parked() {
+                        let line = aterm_messages::wire::switching_reply();
+                        return Err(line.strip_prefix("ERR ").unwrap_or(&line).to_string());
+                    }
                     aterm_messages::wire::spend_press(&mut self.wire_gate, Instant::now())
                         .map_err(|line| line.strip_prefix("ERR ").unwrap_or(&line).to_string())?;
                 }
@@ -3454,6 +3849,24 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             return;
         }
+        // THE MESSAGE BAND AND THE PRESENCE ROW are chrome (design §3.4,
+        // ruling 441 (h)), like the strip, the header and a light: there is
+        // no terminal under them. A plain hover has lit its chip
+        // (`track_band_hover` above) and takes the band's cursor — the hand
+        // where a press acts, else the arrow — and never becomes a terminal
+        // mouse report (a band pixel clamps to grid row 0, and a program
+        // tracking any motion read a phantom hover on its top row). A
+        // gesture begun in content keeps its capture across it, as across
+        // the header.
+        if self.band_hit_at(wid, x, y).is_some()
+            && !self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
+        {
+            self.update_hover_cursor_with(wid, geom, parked, None);
+            return;
+        }
         // POINTER PURSUIT (wave 3): the brain is its own motion sensor, but it
         // only senses on a TICK — and with the frame lane released, mouse
         // motion alone never produced one, so the pet could not see a toy
@@ -3516,15 +3929,16 @@ impl App {
         // `MouseMove { buttons != 3 }` in a batch). The seam also updates
         // last_mouse_cell/last_mouse_side, so both sources keep that state in sync.
         let mods = self.mouse_modifiers(wid);
-        // The X10 button code of the held button (Left=0/Middle=1/Right=2), or `3`
-        // (no button held) for a true hover. `encode_mouse_motion` ORs in the 32
-        // motion bit, so a drag in 1002/1003 reports the held button correctly and
-        // a button-less hover still reports 3 (which 1002 drops, as it should).
+        // The X10 button code of the held button (the lowest held, `held_button`),
+        // or `3` (no button held) for a true hover. `encode_mouse_motion` ORs in
+        // the 32 motion bit, so a drag in 1002/1003 reports the held button
+        // correctly and a button-less hover still reports 3 (which 1002 drops, as
+        // it should).
         let buttons = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.held_mouse_button)
-            .map_or(3u8, |b| b.code());
+            .map_or(3u8, |button| button.code());
         // Remember the sub-cell offset so a follow-up button press / wheel notch
         // (winit delivers no pixel position on those) reports the same pixel the
         // pointer last hovered, under DEC 1016.
@@ -3548,33 +3962,51 @@ impl App {
         // the pending key's licence. The seam still runs for every motion that
         // has work: a tracking app's report, or a live selection drag
         // (`drag_selection`).
-        let tracking = self
-            .front_terminal(wid)
-            .and_then(|front| self.pool.get(front.session))
+        //
+        // WHERE THE MOTION GOES (`pointer_route`). A held button's drag goes to
+        // the session its press went to, so a tab or pane switch mid-drag does
+        // not hand the new front a drag it never pressed; the front's own
+        // selection drag stays the front's; a hover with nothing held goes to
+        // the pane UNDER the pointer. The tracking read is that session's
+        // mirror.
+        let route = self.pointer_route(wid, Some(mapped_cell.pane_rect));
+        let (session, (row, col)) = match route {
+            // PANE-LOCAL cells, CLAMPED to the focused pane's grid: the seam drives
+            // `drag_selection` with them AND reports them to the PTY, both in the
+            // FOCUSED pane's grid, not window coordinates, or a non-top-left split
+            // selects/reports the wrong cells; the clamp keeps a divider-crossing
+            // drag inside the pane. (ro,co)==(0,0) for a single pane / top-left
+            // pane → byte-identical to before.
+            PointerRoute::Front => (
+                self.front_terminal(wid).map(|front| front.session),
+                (lr, lc),
+            ),
+            PointerRoute::Pane { session, cell } => (Some(session), cell),
+            PointerRoute::Nowhere => (None, (lr, lc)),
+        };
+        let tracking = session
+            .and_then(|session| self.pool.get(session))
             .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
+        if let (Some(session), Some(ws)) = (session, self.windows.get_mut(&wid)) {
+            note_owner_cell(ws, session, (row, col), px_off);
+        }
         if !tracking && !self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.last_mouse_side = side;
             }
             return;
         }
-        self.input(
+        self.send_pointer(
             wid,
+            route,
             InputEvent::MouseMove {
                 buttons,
-                // PANE-LOCAL cells, CLAMPED to the focused pane's grid: the seam writes
-                // these into `last_mouse_cell`, drives `drag_selection`, AND reports them
-                // to the PTY — all of which must be in the FOCUSED pane's grid, not window
-                // coordinates, or a non-top-left split selects/reports the wrong cells; the
-                // clamp keeps a divider-crossing drag inside the pane. (ro,co)==(0,0) for a
-                // single pane / top-left pane → byte-identical to before.
-                row: lr,
-                col: lc,
+                row,
+                col,
                 mods,
                 side,
                 px_off,
             },
-            Source::Human,
         );
     }
 
@@ -3592,8 +4024,10 @@ impl App {
         let Some(fws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let sel_row = {
+        let (sel_row, col) = {
             let mut term = term_lock(&term);
+            let (col, doubled_side) = pointer_char(&term, row, col);
+            let side = doubled_side.unwrap_or(fws.last_mouse_side);
             // SELECTION CUSTODY — a drag is a `UserSelect` PRODUCER, not merely an
             // extender. Every gesture arm below re-issues `start_selection` on each
             // pointer move with NO state test, and `start_selection` sets `InProgress`
@@ -3603,6 +4037,10 @@ impl App {
             // before recording it; the argument was false both times.
             let selection_before = term.text_selection().has_selection();
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            // The hovered cell as a logical anchor (BiDi: the painted column
+            // is not the logical one; see `pointer_anchor`). Everything below,
+            // the press-cell test after the lock included, is logical.
+            let (col, side) = pointer_anchor(&term, row, col, side);
             // SELECTION CUSTODY Phase 2: re-derive the gesture ORIGIN from the LIVE
             // selection each move, instead of trusting `GestureOrigin.row`.
             //
@@ -3641,7 +4079,7 @@ impl App {
             match fws.gesture {
                 None => {
                     term.text_selection_mut()
-                        .update_selection(sel_row, col, fws.last_mouse_side);
+                        .update_selection(sel_row, col, side);
                 }
                 // Triple-click drag: whole LOGICAL lines from the origin line to
                 // the hovered line. Rebuilt from the origin each move so the
@@ -3706,7 +4144,7 @@ impl App {
             if !selection_before && term.text_selection().has_selection() {
                 note_selection_custody(&mut term, true);
             }
-            sel_row
+            (sel_row, col)
         };
         if (sel_row, col) != fws.sel_press_cell {
             fws.sel_dragged = true;
@@ -3859,9 +4297,19 @@ impl App {
         else {
             return;
         };
-        let sel_row = i32::from(row) - term_lock(&term).grid().display_offset() as i32;
+        let (sel_row, col, doubled_side) = {
+            let term = term_lock(&term);
+            let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            let (col, doubled_side) = pointer_char(&term, row, col);
+            (sel_row, col, doubled_side)
+        };
         let now = Instant::now();
-        self.extend_selection_to(wid, sel_row, col);
+        let side = doubled_side.unwrap_or_else(|| {
+            self.windows
+                .get(&wid)
+                .map_or(SelectionSide::Left, |ws| ws.last_mouse_side)
+        });
+        self.extend_selection_to(wid, sel_row, col, side);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_press = Some((now, (sel_row, col)));
             ws.click_count = 1;
@@ -3888,7 +4336,11 @@ impl App {
             return 1;
         };
         let (row, col) = ws.last_mouse_cell;
-        let sel_row = i32::from(row) - term_lock(&term).grid().display_offset() as i32;
+        let (sel_row, col) = {
+            let term = term_lock(&term);
+            let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            (sel_row, pointer_char(&term, row, col).0)
+        };
         let now = Instant::now();
         ws.click_count = match ws.last_press {
             Some((t, cell))
@@ -3904,9 +4356,16 @@ impl App {
     }
 
     /// Shift-click: extend an EXISTING non-empty selection so the pressed cell
-    /// becomes its new endpoint (side by cell half), then complete it again.
-    /// Returns false (no-op) when there is nothing to extend.
-    pub(crate) fn extend_selection_to(&mut self, wid: WindowId, sel_row: i32, col: u16) -> bool {
+    /// becomes its new endpoint (`side`: the half of the character the pointer
+    /// is over), then complete it again. Returns false (no-op) when there is
+    /// nothing to extend.
+    pub(crate) fn extend_selection_to(
+        &mut self,
+        wid: WindowId,
+        sel_row: i32,
+        col: u16,
+        side: SelectionSide,
+    ) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
@@ -3914,11 +4373,15 @@ impl App {
             return false;
         };
         let mut term = term_lock(&terminal.term);
+        // The pressed cell as a logical anchor (BiDi; see `pointer_anchor`):
+        // `col` and `side` arrive in painted columns, a doubled line already
+        // halved (`pointer_char`).
+        let (col, side) = pointer_anchor_at_sel_row(&term, sel_row, col, side);
         let sel = term.text_selection_mut();
         if !sel.has_selection() || sel.is_empty() {
             return false;
         }
-        sel.extend_selection(sel_row, col, ws.last_mouse_side);
+        sel.extend_selection(sel_row, col, side);
         sel.complete_selection();
         true
     }
@@ -3937,16 +4400,19 @@ impl App {
         else {
             return;
         };
-        let (start, end) = {
+        let (start, end, col) = {
             let mut term = term_lock(&term);
-            let cells = control::select_word(&mut term, sel_row, col);
+            // The word under the pointer is found in logical order (BiDi; see
+            // `pointer_anchor`), and the press cell is kept logical for the drag.
+            let (col, _) = pointer_anchor_at_sel_row(&term, sel_row, col, SelectionSide::Left);
+            let (start, end) = control::select_word(&mut term, sel_row, col);
             // PRESS CUSTODY: the double-click PRESS is where the highlight comes into
             // existence. `arm_gesture_drag` below pre-sets `sel_dragged`, so the
             // RELEASE eventually records a `UserSelect` — but that is the end of the
             // gesture, and until it arrives the record named an event that did not
             // make this selection.
             note_selection_custody(&mut term, true);
-            cells
+            (start, end, col)
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.gesture = Some(GestureOrigin {
@@ -3975,13 +4441,15 @@ impl App {
         else {
             return;
         };
-        let (first_row, last_row, end_col) = {
+        let (first_row, last_row, end_col, col) = {
             let mut term = term_lock(&term);
             let (first_row, last_row) = control::select_line(&mut term, sel_row);
             // PRESS CUSTODY: as for the double-click above — the press that made the
             // highlight records it, not only the release that ends the gesture.
             note_selection_custody(&mut term, true);
-            (first_row, last_row, term.cols().saturating_sub(1))
+            // The press cell in the logical columns the drag compares against.
+            let (col, _) = pointer_anchor_at_sel_row(&term, sel_row, col, SelectionSide::Left);
+            (first_row, last_row, term.cols().saturating_sub(1), col)
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.gesture = Some(GestureOrigin {
@@ -4033,15 +4501,21 @@ impl App {
             return;
         };
         let (row, col) = ws.last_mouse_cell;
-        let sel_row = {
+        let (sel_row, col) = {
             let mut term = term_lock(&term);
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            // A doubled line halves the column first (`pointer_char`); then the
+            // press anchors before the painted cell under it: its logical start,
+            // or on a right-to-left cell its logical end (BiDi; `pointer_anchor`
+            // maps painted grid columns).
+            let (col, _) = pointer_char(&term, row, col);
+            let (col, side) = pointer_anchor(&term, row, col, SelectionSide::Left);
             term.text_selection_mut()
-                .start_selection(sel_row, col, SelectionSide::Left, kind);
+                .start_selection(sel_row, col, side, kind);
             // Inside the SAME guard as the mutation, so no PTY-reader output can
             // land between the selection appearing and the record naming it.
             note_selection_custody(&mut term, true);
-            sel_row
+            (sel_row, col)
         };
         ws.selecting = true;
         ws.sel_dragged = false;
@@ -4460,13 +4934,23 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
+            // THE BAND IS CHROME (design §3.4, ruling 441 (g)), in a mixed tab
+            // too: a press on its rows, or on a question banner over them, is
+            // the band's, taken by `press_band_at` below for either front —
+            // never a focus click, a divider drag or a light in the pane whose
+            // top row the band pixel clamps to (a body press over the
+            // unfocused Settings half focused that pane and pressed nothing,
+            // after `pointer click` had spent a band press on it).
+            let on_band = self.band_banner_at(wid, px, py).is_some()
+                || self.band_hit_at(wid, px, py).is_some();
+            let in_content = !on_band && self.strip_col_at(wid, px, py).is_none();
             // A Claude Code light in a terminal pane of this mixed tab is a
             // light, not a focus click — the first press toggles it, as it
             // does in a terminal-only tab (`crate::claude_lights`).
-            if self.strip_col_at(wid, px, py).is_none() && self.press_claude_light(wid) {
+            if in_content && self.press_claude_light(wid) {
                 return;
             }
-            if self.strip_col_at(wid, px, py).is_none()
+            if in_content
                 && (self.begin_divider_drag_with_plan(wid, Some(&plan))
                     || self.focus_pane_under_pointer_from_plan(wid, &plan))
             {
@@ -4684,6 +5168,17 @@ impl App {
                 return;
             }
         }
+        // A non-left press goes where `pointer_route` says: over an UNFOCUSED
+        // pane with nothing held, that pane's program decides, from its own
+        // tracking mode, whether the button is reported, and gets it at its own
+        // cell; with a reported button held, the held gesture's owner gets it as
+        // the next button of its chord. The LEFT press stays the focus click it
+        // has always been (below), so it never routes here.
+        let press_route = if pressed && button != WinitMouseButton::Left {
+            self.pointer_route(wid, None)
+        } else {
+            PointerRoute::Front
+        };
         // MIDDLE-CLICK PASTE (X11 PRIMARY): when no app is tracking the mouse, a
         // middle press pastes the PRIMARY selection (the X convention) through
         // `App::paste_primary_into` — the same asynchronous pipeline + pastejacking
@@ -4694,14 +5189,20 @@ impl App {
         // owner — and raw `self.input(…Paste…)` skipped the multi-line-paste
         // guard). When tracking is ON it falls through to the mouse-report
         // encoding below so TUIs still receive the button. X11 only.
+        //
+        // The decision and the paste are about ONE pane, the one under the
+        // pointer (`press_route`): a press its program does not take pastes into
+        // it, focused first (`front_pane_for_local_press`), and over a native
+        // pane nothing is pasted at all.
         #[cfg(target_os = "linux")]
         if pressed && button == WinitMouseButton::Middle {
             let tracking = self
-                .front_terminal(wid)
-                .map(|terminal| terminal.term.clone())
+                .route_term(wid, press_route)
                 .is_some_and(|t| term_lock(&t).mouse_tracking_enabled());
             if !tracking {
-                self.paste_primary_into(wid);
+                if self.front_pane_for_local_press(wid, press_route) {
+                    self.paste_primary_into(wid);
+                }
                 return;
             }
         }
@@ -4762,9 +5263,12 @@ impl App {
             let over_strip = self.strip_col_at(wid, px, py).is_some();
             let gesture_on = self.config.right_click_or_default()
                 == crate::app_config::RightClickGesture::CopyPaste;
-            let term = self
-                .front_terminal(wid)
-                .map(|terminal| terminal.term.clone());
+            // The pane the press is about (`press_route`): the one under the
+            // pointer. Its program says whether the button is reported, its
+            // selection is what Copy takes, and Paste lands in it, so the
+            // decision and the action never name two different panes. `None`
+            // over a native pane: nothing to report to, copy or paste into.
+            let term = self.route_term(wid, press_route);
             // One lock window for both facts AND the selection text: deciding
             // on a cheap "is there a selection" probe and re-extracting later
             // would materialize the selection twice (multi-ms on a huge
@@ -4859,6 +5363,9 @@ impl App {
                     return;
                 }
                 RightPressPlan::Copy => {
+                    if !self.front_pane_for_local_press(wid, press_route) {
+                        return;
+                    }
                     if let (Some(text), Some(t)) = (selection, term.as_ref()) {
                         // Copy, then clear-and-repaint even if the clipboard is
                         // momentarily held by another process (conhost clears
@@ -4875,7 +5382,9 @@ impl App {
                     return;
                 }
                 RightPressPlan::Paste => {
-                    self.paste_clipboard_into(wid);
+                    if self.front_pane_for_local_press(wid, press_route) {
+                        self.paste_clipboard_into(wid);
+                    }
                     return;
                 }
                 // Tracking ON or gesture off: fall through — the seam reports
@@ -4961,7 +5470,7 @@ impl App {
                 }
             } else if self.finish_divider_drag(wid) {
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.held_mouse_button = None;
+                    ws.held_mouse_button = held_button(ws.reported_buttons);
                 }
                 return;
             }
@@ -5042,12 +5551,11 @@ impl App {
                 // control-verb-injected gestures via the `App::input` seam.
                 self.finish_selection(wid, false);
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.held_mouse_button = None;
                     // Also clear the LEFT (selection) button's reported bit — this branch
                     // returns before the generic press/release bookkeeping below, so the
                     // bit set by the tracking-OFF press would otherwise stay stuck and a
-                    // later non-reporting press could leak an orphan release (`1` = Left).
-                    ws.reported_buttons &= !1u8;
+                    // later non-reporting press could leak an orphan release.
+                    forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
                 }
                 return;
             }
@@ -5055,41 +5563,37 @@ impl App {
         let Some(button) = winit_mouse_button(button) else {
             return;
         };
-        // Track the held button so a subsequent motion report (tracking ON) carries
-        // it instead of the hover code. Set on press, cleared on release; harmless
-        // when tracking is OFF (the motion then takes the local selection path and
-        // never reads this).
         // Per-button "press was reported" bit, so a release pairs with its OWN press
         // (a two-button chord under mouse tracking keeps both releases). Keyed on the
         // DENSE `slot()`, never on `code()`: the thumb buttons' wire codes are 128/129,
         // so the old `1 << (code & 7)` would alias Back onto Left's bit and Forward
         // onto Middle's — a thumb release would clear a live drag's press bit and
         // orphan its release.
+        let slot = usize::from(button.slot());
         let bit = 1u8 << (button.slot() & 7);
-        let was_reported = self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.reported_buttons & bit != 0);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.held_mouse_button = if pressed { Some(button) } else { None };
-            if pressed {
-                ws.reported_buttons |= bit;
-            } else {
-                ws.reported_buttons &= !bit;
-            }
-        }
-        // A RELEASE whose PRESS never produced a report must not emit an orphan release
-        // to a mouse-tracking app — press/release must stay paired. The split-pane
-        // focusing press (above) returns early WITHOUT setting the bit or reporting, so
-        // its release would otherwise leak a lone button-up. Skip a release whose press
-        // bit was never set; a genuine (or chorded) press always reports its release.
-        if !pressed && !was_reported {
+        let (was_reported, owner) = self.windows.get(&wid).map_or((false, None), |ws| {
+            (ws.reported_buttons & bit != 0, ws.button_owners[slot])
+        });
+        // WHERE THE BUTTON GOES: a press to `press_route` (the pane under the
+        // pointer when it begins nothing there, else the front); a release to the
+        // session its press went to, wherever the front has moved since.
+        let route = if pressed {
+            press_route
+        } else {
+            self.owner_route(wid, owner)
+        };
+        // A non-left press with no terminal program under the pointer (a native
+        // pane) is no one's: it is never the focused pane's at a clamped cell.
+        if pressed && route == PointerRoute::Nowhere {
             return;
         }
-        let (row, col) = self
-            .windows
-            .get(&wid)
-            .map_or((0, 0), |ws| ws.last_mouse_cell);
+        let (row, col) = match route {
+            PointerRoute::Pane { cell, .. } => cell,
+            _ => self
+                .windows
+                .get(&wid)
+                .map_or((0, 0), |ws| ws.last_mouse_cell),
+        };
         let mods = self.mouse_modifiers(wid);
         let side = self
             .windows
@@ -5103,6 +5607,35 @@ impl App {
             .map_or(crate::input::PixelOffset::CELL_ORIGIN, |ws| {
                 ws.last_mouse_px_off
             });
+        // Track the held buttons so a later motion report (tracking ON) names one
+        // instead of the hover code, and each press's session so its drag and
+        // release follow it. Harmless when tracking is OFF (the motion then takes
+        // the local selection path and never reads these).
+        let pressed_into = match route {
+            PointerRoute::Pane { session, .. } => Some(session),
+            _ => self.front_terminal(wid).map(|front| front.session),
+        };
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            if pressed {
+                ws.reported_buttons |= bit;
+                ws.button_owners[slot] = pressed_into.map(|session| ButtonOwner {
+                    session,
+                    cell: (row, col),
+                    px_off,
+                });
+                ws.held_mouse_button = held_button(ws.reported_buttons);
+            } else {
+                forget_reported_button(ws, button);
+            }
+        }
+        // A RELEASE whose PRESS never produced a report must not emit an orphan release
+        // to a mouse-tracking app — press/release must stay paired. The split-pane
+        // focusing press (above) returns early WITHOUT setting the bit or reporting, so
+        // its release would otherwise leak a lone button-up. Skip a release whose press
+        // bit was never set; a genuine (or chorded) press always reports its release.
+        if !pressed && !was_reported {
+            return;
+        }
         // Snapshot the block-select intent (held Alt/Option) HERE, at build time,
         // into event DATA — so the seam's selection-type decision is source-blind
         // (it reads `block`, never `self.mods`). A controller sends `block=1` for
@@ -5114,8 +5647,9 @@ impl App {
         // report (tracking ON, real `mods` — kills a) or runs the local selection
         // gesture (tracking OFF), dispatching on `click_count` (kills b) at `side`
         // (kills i) with type from `block`. Both sources share that machinery.
-        self.input(
+        self.send_pointer(
             wid,
+            route,
             InputEvent::MouseButton {
                 button,
                 pressed,
@@ -5131,8 +5665,44 @@ impl App {
                 suppress_copy_on_select: false,
                 px_off,
             },
-            Source::Human,
         );
+    }
+
+    /// Make the pane a LOCAL press gesture was decided for the front before it
+    /// acts there: the right-click copy/paste (`right_click = "copy_paste"`) and
+    /// X11's middle-click PRIMARY paste, which a program under the pointer that
+    /// does not track the mouse leaves to aterm. Over an unfocused pane that pane
+    /// is focused, as a left press focuses it: Windows Terminal's `TermControl`
+    /// takes focus on any pointer press and kitty's `handle_button_event`
+    /// switches to the window under any press, and what a paste starts the
+    /// person finishes at the keyboard, in the pane that got it. `false` when
+    /// there is no pane to act on: a native pane under the pointer, or a focus
+    /// that would not move.
+    fn front_pane_for_local_press(&mut self, wid: WindowId, route: PointerRoute) -> bool {
+        match route {
+            PointerRoute::Front => true,
+            PointerRoute::Pane { session, .. } => {
+                self.focus_pane_under_pointer(wid) && self.session_is_front(wid, session)
+            }
+            PointerRoute::Nowhere => false,
+        }
+    }
+
+    /// The terminal a pointer route addresses: the front's, or the named pane's.
+    fn route_term(
+        &self,
+        wid: WindowId,
+        route: PointerRoute,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Terminal>>> {
+        match route {
+            PointerRoute::Front => self
+                .front_terminal(wid)
+                .map(|terminal| terminal.term.clone()),
+            PointerRoute::Pane { session, .. } => {
+                self.pool.get(session).map(|owner| owner.term.clone())
+            }
+            PointerRoute::Nowhere => None,
+        }
     }
 
     /// Normalize ONE winit wheel delta into whole notches: the axis, its
@@ -5324,7 +5894,15 @@ impl App {
                     || connection_map
                     || self.active_native_view(wid).is_some())
             {
-                self.track_precise_scroll(wid, dy_px);
+                // The band belongs to the pane under the pointer, as the whole
+                // rows below do (`pointer_route`).
+                match self.pointer_route(wid, None) {
+                    PointerRoute::Front => self.track_precise_scroll(wid, dy_px, None),
+                    PointerRoute::Pane { session, .. } => {
+                        self.track_precise_scroll(wid, dy_px, Some(session));
+                    }
+                    PointerRoute::Nowhere => {}
+                }
             }
             return;
         };
@@ -5386,10 +5964,19 @@ impl App {
                 return;
             }
         }
-        let (row, col) = self
-            .windows
-            .get(&wid)
-            .map_or((0, 0), |ws| ws.last_mouse_cell);
+        // A wheel over an UNFOCUSED pane is that pane's — its program's report at
+        // its own cell, or its own scrollback — never the focused pane's at a
+        // clamped edge cell; during a held button's gesture it is that gesture
+        // owner's; over a native pane it is no terminal's (`pointer_route`).
+        let route = self.pointer_route(wid, None);
+        let (row, col) = match route {
+            PointerRoute::Pane { cell, .. } => cell,
+            PointerRoute::Front => self
+                .windows
+                .get(&wid)
+                .map_or((0, 0), |ws| ws.last_mouse_cell),
+            PointerRoute::Nowhere => return,
+        };
         let mods = self.mouse_modifiers(wid);
         let px_off = self
             .windows
@@ -5415,8 +6002,9 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.wheel_precise_px = track_px;
         }
-        self.input(
+        self.send_pointer(
             wid,
+            route,
             InputEvent::Wheel {
                 dir,
                 lines,
@@ -5425,7 +6013,6 @@ impl App {
                 mods,
                 px_off,
             },
-            Source::Human,
         );
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.wheel_precise_px = None;
@@ -5466,7 +6053,7 @@ impl App {
     /// Reduced motion has no sub-row band (an animation-class effect; whole
     /// rows still arrive through the seam and snap), and is checked BEFORE the
     /// probe so it never pays the lock.
-    fn track_precise_scroll(&mut self, wid: WindowId, dy_px: f64) {
+    fn track_precise_scroll(&mut self, wid: WindowId, dy_px: f64, pane: Option<u64>) {
         use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
         // The SAME gate the whole-row glide resolves (`effect_policy`: OS Reduce
         // Motion, `motion = "reduced"`, an unfocused window — never the
@@ -5474,13 +6061,15 @@ impl App {
         if !self.smooth_scroll_animates(wid) {
             return;
         }
-        let Some(front) = self.front_terminal_mirror(wid) else {
+        // The pane under the pointer (`pane`), else the front.
+        let Some(session) = pane.or_else(|| self.front_terminal(wid).map(|front| front.session))
+        else {
             return;
         };
-        let Some(modes) = self
+        let Some((term, modes)) = self
             .pool
-            .get(front.session)
-            .map(|owner| owner.ctx.modes.clone())
+            .get(session)
+            .map(|owner| (owner.term.clone(), owner.ctx.modes.clone()))
         else {
             return;
         };
@@ -5490,11 +6079,10 @@ impl App {
         // same pixels also bank toward the whole rows the ruling-238 route in
         // `input_wheel` applies. The bank alone carries the finger; a band
         // left from before the rewrap settles now.
-        if self.rewrap_in_flight(front.session) {
+        if self.rewrap_in_flight(session) {
             self.release_scroll_track(wid);
             return;
         }
-        let term = front.term;
         let mods = self.mouse_modifiers(wid);
         // Tier 1 honours exactly the lock-free half of the seam's bypass: Shift
         // reserves the wheel for the terminal on every screen; Alt's bypass is
@@ -5578,10 +6166,17 @@ impl App {
         // clause) — cancel any in-flight wheel glide so its eased tail cannot
         // scroll the viewport back away from the prompt. M1b: drop any banked
         // sub-row residual and any elastic-overscroll bounce too, so the
-        // jump-to-live is whole-row.
-        ws.scroll_glide = None;
-        ws.overscroll = None;
-        ws.scroll_frac_px = 0;
+        // jump-to-live is whole-row. Only the FRONT pane's: a glide the wheel
+        // started on another, unfocused pane keeps running.
+        if ws
+            .scroll_glide
+            .as_ref()
+            .is_none_or(|glide| std::sync::Arc::ptr_eq(&glide.term, &term))
+        {
+            ws.scroll_glide = None;
+            ws.overscroll = None;
+            ws.scroll_frac_px = 0;
+        }
         let scrolled = {
             let mut term = term_lock(&term);
             // Also at offset 0 when the reader aimed up while a rewrap held the
@@ -5892,6 +6487,7 @@ mod pointer_license_tests {
                     key: Key::Character('a'),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human,
@@ -5980,7 +6576,13 @@ mod pointer_license_tests {
                         app.pointer_cmd(PointerAction::Move { row: 2, col })
                             .unwrap();
                     }
-                    let reported = mode == 1003 && (controller || !same_pixel);
+                    // Only a move to a NEW cell reports, for either source: the
+                    // seam reports motion once per position (xterm: "reported only
+                    // if the mouse pointer has moved to a different character
+                    // cell"), so a controller's move onto the cell the fixture's
+                    // pointer already reported is as byte-silent as the person's
+                    // same-pixel event, and preserves the licence the same way.
+                    let reported = mode == 1003 && !same_pixel;
                     let bytes = read_input(&mut reader);
                     assert_eq!(
                         bytes.is_empty(),
@@ -6096,7 +6698,7 @@ mod tests {
     use super::{
         PointerAction, WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection,
     };
-    use aterm_core::selection::SelectionType;
+    use aterm_core::selection::{SelectionSide, SelectionType};
 
     /// A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
     /// letter + backslashes after the authority slot), so tests built on one
@@ -10502,8 +11104,75 @@ mod tests {
         // A completed selection is one the user can act on: extending it works,
         // which is exactly what an InProgress zombie refuses.
         assert!(
-            app.extend_selection_to(wid, 0, 10),
+            app.extend_selection_to(wid, 0, 10, SelectionSide::Right),
             "the settled selection is extendable — the InProgress zombie was not"
+        );
+    }
+
+    /// On a DEC double-width line (DECDWL) each character is drawn two cells
+    /// wide, so the pointer column is halved before a gesture anchors: a drag
+    /// over the screen cells `HELLO` covers (0-9) copies `HELLO`, and a
+    /// double-click on the `W` drawn at screen cell 12 selects `WORLD`.
+    #[test]
+    fn a_selection_on_a_double_width_line_takes_the_characters_under_the_pointer() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(b"\x1b#6HELLO WORLD\r\nplain text");
+
+        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+        app.begin_selection(wid, SelectionType::Simple);
+        app.drag_selection(wid, 0, 9);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("HELLO"),
+            "a drag over the cells HELLO is drawn in"
+        );
+        app.finish_selection(wid, true);
+
+        app.seam_left_press(wid, 0, 12, 2, false);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("WORLD"),
+            "a double-click on the W drawn at screen cell 12"
+        );
+        app.finish_selection(wid, true);
+
+        // Shift-click on the right half of the `O` drawn at screen cells 8-9,
+        // with the pointer on the left half of screen cell 9: the extension
+        // takes the `O`, as the drag's endpoint would.
+        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+        app.begin_selection(wid, SelectionType::Simple);
+        app.drag_selection(wid, 0, 3);
+        app.finish_selection(wid, true);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("HE"),
+            "precondition: a selection to extend"
+        );
+        let ws = app.windows.get_mut(&wid).expect("window");
+        ws.last_mouse_cell = (0, 9);
+        ws.last_mouse_side = SelectionSide::Left;
+        app.shift_extend_press(wid);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("HELLO"),
+            "a shift-click on the right half of the O"
+        );
+
+        // A single-width row keeps its cells.
+        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (1, 0);
+        app.begin_selection(wid, SelectionType::Simple);
+        app.drag_selection(wid, 1, 5);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("plain")
         );
     }
 
@@ -11866,4 +12535,187 @@ mod tests {
             "the hand stood over a band row that presses nothing"
         );
     }
+
+    // ---- ruling 441 (g, h, i): the pointer verb and the band as chrome
+
+    /// Ruling 441 (g) — design §3.4 and `press_band`'s doc: the band is
+    /// chrome, "a press on it never reaches the terminal underneath", and a
+    /// body press is its Details press (the row read, Settings ▸ Messages at
+    /// it). In a mixed split (Settings | terminal, the terminal focused) the
+    /// band's row over the unfocused Settings half is still the band's: the
+    /// canonical tree's focus click, divider drag and light never take it.
+    #[test]
+    fn a_band_press_over_a_mixed_splits_other_pane_presses_the_band() {
+        use crate::message_band::{BandHover, HoverTarget};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        assert!(
+            app.focused_session_id(wid).is_some(),
+            "premise: the terminal half is focused"
+        );
+        let id = app.post_message(toolchain_row());
+        assert_eq!(app.message_band_rows, 1);
+        let col = u16::try_from(band_row(&app, wid).title.0).unwrap();
+        assert_eq!(
+            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col }),
+            Ok(Some((-1, col)))
+        );
+        assert_eq!(
+            app.windows[&wid].band_hover,
+            Some(BandHover {
+                row: 0,
+                target: HoverTarget::Body
+            }),
+            "premise: the body is lit — its press is the band's Details"
+        );
+        let before = app.focused_session_id(wid);
+        assert!(app.pointer_cmd(PointerAction::Click).is_ok());
+        let after = app.focused_session_id(wid);
+        let now = std::time::Instant::now();
+        let left = (0..10)
+            .take_while(|_| aterm_messages::wire::spend_press(&mut app.wire_gate, now).is_ok())
+            .count();
+        assert!(
+            app.messages.live(id).is_some_and(|l| l.seen),
+            "the band's Details press never happened: the click focused the pane under the band \
+             (focused session {before:?} -> {after:?}, route now {:?}, presses left {left} of 10)",
+            settings_route(&app, wid)
+        );
+        assert_eq!(
+            settings_route(&app, wid),
+            Some(crate::native_settings::SettingsRoute::Messages),
+            "Settings \u{25b8} Messages opens at the row"
+        );
+    }
+
+    /// Ruling 441 (h) — design §3.4: the band, like the strip, the pane
+    /// header and a Claude light, is chrome with no terminal underneath;
+    /// hovering it lights the chip and writes nothing to the PTY. With
+    /// any-motion tracking on (`?1003h`, SGR), a band hover sends no
+    /// `ESC[<35;…M` report. Control: grid motion does report. Unix-pinned:
+    /// the PTY's input is read back through a socket pair.
+    #[cfg(unix)]
+    #[test]
+    fn band_hover_never_reports_motion_to_the_front_program() {
+        use std::io::{ErrorKind, Read};
+        use std::os::unix::net::UnixStream;
+        fn read(reader: &mut UnixStream) -> Vec<u8> {
+            let mut all = Vec::new();
+            let mut bytes = [0; 256];
+            loop {
+                match reader.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => all.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("reading input: {e}"),
+                }
+            }
+            all
+        }
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut app = crate::App::headless_for_test_with_sink(std::sync::Arc::new(
+            aterm_session::sink::SinkWriter::new_owned(writer.into()),
+        ));
+        let wid = crate::WindowId(0);
+        app.post_message(toolchain_row());
+        assert_eq!(app.message_band_rows, 1);
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        crate::term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
+        let _ = read(&mut reader);
+        let col = u16::try_from(band_row(&app, wid).title.0 + 2).unwrap();
+        app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
+            .unwrap();
+        app.pointer_cmd(PointerAction::MoveChrome {
+            up: 1,
+            col: col + 1,
+        })
+        .unwrap();
+        assert!(
+            app.windows[&wid].band_hover.is_some(),
+            "premise: the band row is lit"
+        );
+        let bytes = read(&mut reader);
+        assert!(
+            bytes.is_empty(),
+            "a band hover reached the program as a mouse report: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        // Control: motion over the grid is reported.
+        app.pointer_cmd(PointerAction::Move { row: 3, col: 5 })
+            .unwrap();
+        let grid = read(&mut reader);
+        assert!(grid.starts_with(b"\x1b[<35;"), "{grid:?}");
+    }
+
+    /// Ruling 441 (i) — round-seven update audit finding 32 (`take_notice`):
+    /// while a seamless update has parked the process, a press would be
+    /// undone at Commit, so every `notice` answers the switching reply; ruling
+    /// 373 makes `pointer click` the second route to the same capsule
+    /// presses. Parked, the click is refused the same way, spends nothing and
+    /// presses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_pointer_click_on_a_capsule_while_parked_is_refused() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let id = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::PRIVACY,
+                aterm_messages::Severity::Info,
+                "File access not confirmed",
+            )
+            .action(aterm_messages::Intent::OpenSystemPane {
+                pane: "full-disk-access".into(),
+            })
+            .action(aterm_messages::Intent::NotNow {
+                decision: aterm_messages::Decision::FileAccess,
+            }),
+        );
+        assert_eq!(app.message_band_rows, 1);
+        let not_now = band_row(&app, wid)
+            .capsules
+            .iter()
+            .find(|c| c.action == aterm_messages::ActionIndex(1))
+            .expect("the Not now capsule")
+            .col
+            + 1;
+        let col = u16::try_from(not_now).unwrap();
+        assert!(
+            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
+                .is_ok()
+        );
+        app.pending_update_handoff = Some(crate::messages_host::tests::parked());
+        let reply = app.pointer_cmd(PointerAction::Click);
+        let live = app.messages.live(id).is_some();
+        let pressed = acted(&app, id);
+        assert_eq!(
+            reply,
+            Err(aterm_messages::wire::switching_reply()
+                .strip_prefix("ERR ")
+                .unwrap()
+                .to_string()),
+            "parked, the click is not refused (row live: {live}, acted: {pressed:?})"
+        );
+        assert!(live, "the question stands");
+        assert_eq!(pressed, None, "nothing was pressed");
+        // And it spent none of the ten presses.
+        let now = std::time::Instant::now();
+        for k in 0..10 {
+            assert!(
+                aterm_messages::wire::spend_press(&mut app.wire_gate, now).is_ok(),
+                "press {k}: the refused click spent one"
+            );
+        }
+    }
 }
+
+#[cfg(all(test, unix))]
+#[path = "app_mouse_pointer_route_tests.rs"]
+mod pointer_route_tests;
+
+#[cfg(test)]
+#[path = "app_mouse_bidi_tests.rs"]
+mod bidi_selection_tests;

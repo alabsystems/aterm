@@ -45,6 +45,7 @@ impl Row {
             return false;
         }
         self.cells[col_usize].set_char(c);
+        self.note_write_through(col_usize + 1);
         if col >= self.len {
             self.len = col.saturating_add(1);
         } else if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
@@ -123,6 +124,7 @@ impl Row {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags);
         }
+        self.note_write_through(col_usize + 1);
         if col >= self.len {
             self.len = col.saturating_add(1);
         } else if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
@@ -195,6 +197,7 @@ impl Row {
         let actual = end - start;
 
         self.cells[start..end].fill(template);
+        self.note_write_through(end);
 
         // Update len and flags.
         let end_col = u16_from_usize(end);
@@ -271,7 +274,7 @@ impl Row {
     ///
     /// Returns `true` if the write succeeded, `false` if out of bounds.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn write_wide_char(
         &mut self,
         col: u16,
@@ -333,6 +336,7 @@ impl Row {
                 Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
 
+        self.note_write_through(col_usize + 2);
         if col + 1 >= self.len {
             self.len = col.saturating_add(2);
         } else if old_len > 0 && self.cells[old_len - 1].is_empty() {

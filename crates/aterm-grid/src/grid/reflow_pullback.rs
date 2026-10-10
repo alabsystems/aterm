@@ -96,23 +96,10 @@ impl Grid {
                 self.styles(),
             );
             let row = &self.storage.rows[hist + i];
-            // A belt row whose successor is a wrap continuation was filled to
-            // its last column by autowrap, so its trailing blank cells are
-            // content, except when the continuation opens with a wide cell: that
-            // char early-wrapped and left the last cell unwritten.
-            let successor = self.storage.rows.get(hist + i + 1);
-            let len = if row.line_size() == LineSize::SingleWidth
-                && successor.is_some_and(super::Row::is_wrapped)
-            {
-                // A successor opening wide leaves exactly one unwritten cell;
-                // real trimmed spaces before it still materialize.
-                let hole = successor
-                    .and_then(|r| r.as_slice().first())
-                    .is_some_and(super::Cell::is_wide);
-                row.cols() - u16::from(hole)
-            } else {
-                row.len()
-            };
+            // Read as a history row is: a belt row its successor continues
+            // keeps every cell but a recorded early-wrap hole.
+            let len =
+                super::scrollback_reflow::history_row_len(row, self.storage.rows.get(hist + i + 1));
             lines.push(Self::row_to_line_with_stored_extras_at_len(
                 row, &extracted, len,
             ));
@@ -232,14 +219,16 @@ impl Grid {
             .row
             .saturating_add(row_u16(pull))
             .min(max_row);
+        // The saved cursor is not clamped (DECRC clamps what it reads): one on
+        // a blank row the fill pushed off the bottom stays past the grid, as a
+        // trimmed row's slot does.
         if self.storage.saved_cursor.valid {
             self.storage.saved_cursor.cursor.row = self
                 .storage
                 .saved_cursor
                 .cursor
                 .row
-                .saturating_add(row_u16(pull))
-                .min(max_row);
+                .saturating_add(row_u16(pull));
         }
 
         // History lost its newest suffix, so older lines' absolute keys shift.

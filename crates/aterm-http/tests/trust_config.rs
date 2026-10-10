@@ -67,9 +67,8 @@ fn an_unparseable_ca_bundle_is_refused_rather_than_silently_empty() {
 
     // A key where a certificate should be. The PEM label is ASSEMBLED rather
     // than written out, because `tools/grep_guard.sh`'s B6 check greps the whole
-    // tracked tree for private-key headers and a literal one here would trip it.
-    // The guard is right and stays as it is; this is the documented way round
-    // it (see `crates/atpkg-keys`, which does the same).
+    // tracked tree for private-key headers and a literal one here would trip it
+    // (`crates/atpkg-keys` does the same).
     let wrong_label = format!(
         "-----BEGIN {label}-----\nQUJD\n-----END {label}-----\n",
         label = "PRIVATE KEY"

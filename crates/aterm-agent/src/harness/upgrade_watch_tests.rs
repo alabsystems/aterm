@@ -531,7 +531,7 @@ fn no_hands_instance(
 struct TabOne {
     dir: crate::supervise::ScratchDir,
     opts: Opts,
-    agent: std::process::Child,
+    agent: aterm_uds::spawnfd::Child,
     sf: SessionFile,
     asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     targets: Targets,
@@ -1177,14 +1177,13 @@ fn looked(s: &aterm_spec::interp::State) -> Vec<(&'static str, i64)> {
 ///   faults a limit past), holds the announced round's clock to the reset and
 ///   leaves the move clock where it was: a limit before its reset is a
 ///   record (ruling 307).
-/// * (b) AT AN IDLE POINT THE LOOP NEVER TAKES — THE GAP CLOSED ON 2026-09-29
-///   (`RecordedWordStands`): the read would ask again (`would-announce`) and
-///   nothing holds its point, so the look records [`upgrade::NEXT_POINT`] over
-///   the word `background` — aterm's own class, "nothing holds it now" — and
-///   clears the processes a look that waited named. NEGATIVE CONTROL: the
-///   machine main was until that day (the `keep` latch) leaves `background`,
-///   and the record kept saying "held by its own work" of a move that waits
-///   only for a point. (The machine's announced round is at its last ask, so
+/// * (b) AT AN IDLE POINT THE LOOP NEVER TAKES (`RecordedWordStands`): the
+///   read would ask again (`would-announce`) and nothing holds its point, so
+///   the look records [`upgrade::NEXT_POINT`] over the word `background` —
+///   aterm's own class, "nothing holds it now" — and clears the processes a
+///   look that waited named. NEGATIVE CONTROL: the `keep` latch's machine
+///   leaves `background`, and the record keeps saying "held by its own work"
+///   of a move that waits only for a point. (The machine's announced round is at its last ask, so
 ///   its read gives up where this one, at its first, asks again: both acts,
 ///   and both find the point open.)
 /// * (c) A ROUND THAT GAVE UP AND HAS RESTED, AT THE WALL: the watch re-arms
@@ -1298,8 +1297,8 @@ fn the_real_watch_is_the_derived_look() {
         "{:?}",
         row.stall_words(NOW_28TH)
     );
-    // NEGATIVE CONTROL: the look main had until 2026-09-29 (the `keep` latch)
-    // leaves `background`: the record kept its own work.
+    // NEGATIVE CONTROL: the `keep` latch's look leaves `background`: the
+    // record keeps its own work.
     let kept = fire(&today, "Watch", &with_latch(&before, "keep"));
     assert_eq!(kept["cause"], 0, "the old look");
     assert_ne!(
@@ -1354,12 +1353,11 @@ fn the_real_watch_is_the_derived_look() {
 }
 
 /// The watch reads the limit at the second it is GIVEN, its read included —
-/// never the wall clock's (until 2026-10-04 the read asked the wall clock, and
-/// every watch here handed [`NOW_28TH`] read the limit as over once the real
-/// clock passed [`RESETS`]). The same tab one, watched before its reset and
-/// past it: before, `limited` and the round's clock held to the reset; past
-/// it, neither, whatever the wall clock says. And the thread's clock is the
-/// wall's again after.
+/// never the wall clock's (else every watch here handed [`NOW_28TH`] reads the
+/// limit as over once the real clock passes [`RESETS`]). The same tab one,
+/// watched before its reset and past it: before, `limited` and the round's
+/// clock held to the reset; past it, neither, whatever the wall clock says.
+/// And the thread's clock is the wall's again after.
 #[test]
 fn the_watch_reads_the_limit_at_the_second_it_is_given() {
     let before = TabOne::new("t1c-clock-before", "2.1.283");

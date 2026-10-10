@@ -1274,17 +1274,15 @@ pub struct StageRefusal {
     /// person asks (`aterm pkg install <p>`, `aterm pkg update --retry`); the archive
     /// is kept beside it so that retry costs no download.
     pub held: bool,
-    /// The atpkg version that reached the verdict ([`CLIENT_VERSION`]). A memo binds
-    /// only the client that wrote it: a verdict about "these bytes, this row" is also a
+    /// The atpkg version that reached the verdict (the running build's,
+    /// [`aterm_types::version::app_version`]). A memo binds only the client that
+    /// wrote it: a verdict about "these bytes, this row" is also a
     /// verdict by THIS extractor and THIS fold, and the one fix a held row can ever get
     /// on the client side ships as a new atpkg — which must then be allowed one attempt.
     /// Empty from a memo written before the field existed, which therefore binds
     /// nothing once, and is re-recorded with the version on its next verdict.
     pub client: String,
 }
-
-/// The version of the atpkg reaching a verdict — [`StageRefusal::client`].
-pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl StageRefusal {
     /// The cooldown this record's attempt count buys — ZERO for a first refusal, then
@@ -1330,7 +1328,7 @@ impl StageRefusal {
         !self.sha256.is_empty()
             && self.sha256.eq_ignore_ascii_case(sha256)
             && self.tree_root.eq_ignore_ascii_case(tree_root)
-            && self.client == CLIENT_VERSION
+            && self.client == aterm_types::version::app_version()
             && (self.signer || self.held || now_unix < self.retry_after())
     }
 }
@@ -1469,7 +1467,7 @@ fn write_stage_refusal(
         RefusalKind::Cooldown => {}
     }
     body.push_str("\nclient=");
-    body.push_str(CLIENT_VERSION);
+    body.push_str(aterm_types::version::app_version());
     // One line: the reader takes the `why=` line whole.
     body.push_str("\nwhy=");
     let one_line: String = why
@@ -2704,7 +2702,7 @@ mod tests {
             attempts,
             signer: false,
             held: false,
-            client: CLIENT_VERSION.into(),
+            client: aterm_types::version::app_version().into(),
         };
         // THE FIRST RETRY IS FREE: one mismatch can be a truncated transfer, and the next
         // pass must still be able to find the publisher's repair. From the second
@@ -2758,9 +2756,10 @@ mod tests {
         // ANOTHER CLIENT'S VERDICT BINDS NOTHING: the fix a held row can get on the
         // client side ships as a new atpkg, which must be allowed its one attempt — and
         // a memo written before the field existed (empty client) is that case too.
+        let another = format!("{}+another", aterm_types::version::app_version());
         assert!(
             !StageRefusal {
-                client: "0.0.0".into(),
+                client: another.clone(),
                 ..memo(2)
             }
             .binds("aa", "bb", 1_000),
@@ -2786,7 +2785,7 @@ mod tests {
         assert!(!held.binds("dd", "bb", 1_000), "a re-cut pin releases it");
         assert!(
             !StageRefusal {
-                client: "0.0.0".into(),
+                client: another,
                 ..held.clone()
             }
             .binds("aa", "bb", 1_000),
@@ -2807,7 +2806,7 @@ mod tests {
             attempts: 1,
             signer: true,
             held: false,
-            client: CLIENT_VERSION.into(),
+            client: aterm_types::version::app_version().into(),
         };
         assert!(
             m.binds("aa", "BB", 1_000),
@@ -2842,7 +2841,7 @@ mod tests {
         let m = stage_refusal(&build).unwrap();
         assert!(m.signer);
         assert!(!m.held, "a signer memo is its own kind, not a hold");
-        assert_eq!(m.client, CLIENT_VERSION);
+        assert_eq!(m.client, aterm_types::version::app_version());
         assert_eq!((m.attempts, m.why.as_str()), (1, "signer refused: x"));
         assert!(m.binds("aa", "bb", i64::MAX));
         record_stage_refusal(&build, "aa", "bb", "asset sha256 mismatch", 2_000).unwrap();
@@ -2881,7 +2880,8 @@ mod tests {
         assert_eq!(m.attempts, 1);
         assert!(!m.held, "a sha256 mismatch cools down; it is not held");
         assert_eq!(
-            m.client, CLIENT_VERSION,
+            m.client,
+            aterm_types::version::app_version(),
             "the memo names the client that wrote it"
         );
         let text = std::fs::read_to_string(&marker).unwrap();

@@ -8,8 +8,9 @@
 //! [`hex_token`] instead of reading `/dev/urandom` itself: an unbounded
 //! `fs::read` of a device that never reaches EOF grows its buffer until memory
 //! runs out. Here the read is bounded by construction (`getentropy(2)`, else
-//! `read_exact` into the caller's fixed buffer), the hex encoding is proved
-//! total, exact and injective by the `rand_kani_proofs` harnesses, and
+//! `read_exact` into the caller's fixed buffer), the hex encoding is checked
+//! exact and injective over every byte value
+//! (`tests::hex_encode_is_exact_lowercase_and_injective`), and
 //! `tools/grep_guard.sh` check B4 (a stage of `tools/verify.sh`) fails if a
 //! quoted `/dev/urandom` literal appears outside this module and
 //! aterm-tempfile's twin.
@@ -35,8 +36,9 @@ pub fn hex_token<const N: usize>() -> io::Result<String> {
 /// Lowercase-hex encode a fixed-size byte array: exactly `2N` chars out for
 /// `N` bytes in, most-significant nibble first.
 ///
-/// A nibble-table loop rather than `format!("{b:02x}")`, so trust-mc can model
-/// it; the `rand_kani_proofs` harnesses prove it total, exact and injective.
+/// A nibble-table loop rather than `format!("{b:02x}")`, so the Trust verifier
+/// can model it; `tests::hex_encode_is_exact_lowercase_and_injective` checks it
+/// exact and injective over every byte value.
 #[cfg_attr(trust_verify, trust::skip)] // idiomatic allocation panic (String::with_capacity/push); hex indexing is provably < 16
 pub fn hex_encode<const N: usize>(bytes: &[u8; N]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -117,4 +119,48 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_encode;
+
+    /// Every token and nonce is `hex_encode` of CSPRNG bytes, so two distinct
+    /// inputs must never print alike. Each output byte pair depends on its
+    /// input byte alone, so every byte value is the whole domain: each encodes
+    /// to two lowercase-hex chars that an independent decoder
+    /// (`u8::from_str_radix`) maps back, and a longer input is the
+    /// concatenation of its bytes' pairs, `2N` chars for `N` bytes.
+    #[test]
+    fn hex_encode_is_exact_lowercase_and_injective() {
+        let pair = |b: u8| hex_encode(&[b]);
+        let mut seen = std::collections::BTreeSet::new();
+        for b in 0..=u8::MAX {
+            let hex = pair(b);
+            assert_eq!(hex.len(), 2, "{b:#04x}");
+            assert!(
+                hex.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+                "{b:#04x} -> {hex:?} is not lowercase hex"
+            );
+            assert_eq!(u8::from_str_radix(&hex, 16), Ok(b), "{hex:?} decodes back");
+            assert!(seen.insert(hex), "{b:#04x} prints like another byte");
+        }
+        assert_eq!(hex_encode(&[]), "");
+        // Every byte value at every position of the two widths the workspace
+        // mints (8: the tempfile suffix, 16: the handoff nonce).
+        fn concat<const N: usize>() {
+            for pos in 0..N {
+                for b in 0..=u8::MAX {
+                    let mut bytes = [0x5a; N];
+                    bytes[pos] = b;
+                    let want: String = bytes.iter().map(|&x| hex_encode(&[x])).collect();
+                    assert_eq!(want.len(), 2 * N);
+                    assert_eq!(hex_encode(&bytes), want, "N={N} pos={pos} b={b:#04x}");
+                }
+            }
+        }
+        concat::<8>();
+        concat::<16>();
+    }
 }

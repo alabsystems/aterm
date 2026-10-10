@@ -7,8 +7,9 @@ description: Use whenever you are about to build, check, test, lint, format or r
 # Rust in aterm: the default is the Trust toolchain
 
 aterm installs the ALab **verified** Rust toolchain beside stock Rust, and on this
-machine it is **the default**. Stock `cargo`/`rustc` is not blocked and still runs; a
-reply that used it says so, and why.
+machine it is **the default**. Stock `cargo`/`rustc` still runs — except inside a
+Trust source checkout (below), where a `cargo`/`rustc` that is not Trust is refused; a
+reply that used stock says so, and why.
 
 The default holds **in every repository, including one whose `rust-toolchain.toml`
 pins a stock channel**. The spellings to write — in a command, and in a prompt for
@@ -75,19 +76,32 @@ Which verbs take a lane is not uniform, so measure rather than assume: `build`,
 `clean`, `update` take no lane — `--unverified` there is refused (*`--unverified` is
 valid only for a Targo compilation command*), so run those bare.
 
-Inside an aterm session, typing a bare `cargo …` prints the `targo` spelling targo
-accepts for your exact command — both lanes for `build`/`check`/`test`, `targo
---unverified …` for `run`/`doc`/`install`…, plain `targo …` for `metadata`/`tree`/
-`fmt`…, `targo tippy …` for `cargo clippy` — and then runs upstream. `cargo +<stock
-channel> …` (and `rustfmt +1.97.1 …`, `rustc +stable …`) prints the same spelling
-and that the channel moves only rustup's proxies, then runs as named. That
-printout is the answer; `[reroute] announce = false` in aterm.toml silences it if
-you have decided.
+Inside an aterm session, typing a bare `cargo …` names what `cargo` resolves to here
+(`-> Trust 7d5533b2, via rustup trust …`, or `-> STOCK cargo 1.97.1 …; not Trust`),
+prints the `targo` spelling targo accepts for your exact command — both lanes for
+`build`/`check`/`test`, `targo --unverified …` for `run`/`doc`/`install`…, plain
+`targo …` for `metadata`/`tree`/`fmt`…, `targo tippy …` for `cargo clippy` — and then
+runs it. `cargo +<stock channel> …` (and `rustfmt +1.97.1 …`, `rustc +stable …`)
+prints the same spelling and that the channel moves only rustup's proxies, then runs
+as named. That printout is the answer; `[reroute] announce = false` in aterm.toml
+silences it if you have decided.
+
+Inside a **Trust source checkout** — an `x.py` beside a `src/stage0` saying
+`compiler_dist_channel=trust` — a `cargo` or `rustc` that is not Trust (stock, pinned,
+`+<channel>`, or not known to be Trust) does not run: exit 2, the Trust spelling of
+your command, and nothing on stdout. A stock compiler there would build part of Trust.
+The same holds for a `cargo`/`rustc` a tool spawns there by name — a cargo subcommand,
+an xtask, a build script — even beneath a Trust cargo that was allowed to run. Running
+the stock cargo by its path, or `rustup run <tc> cargo`, does not get round it: that
+cargo runs `rustc` by name, and that rustc is refused in turn. A compiler run by its own
+path, or handed to cargo as `RUSTC`, is not looked up by name, so aterm does not judge
+it; it is still stock Rust building Trust. Retype it the Trust way; a session started
+with `aterm --no-reroute` is where stock runs there, with the reason in your reply.
 
 If a guard in your setup **refuses a stock command before it runs**, the refusal
 carries the Trust spelling of it: retype it that way. Only when stock Rust is
-genuinely required — a cross target the Trust sysroot does not carry, a check that
-exists to test the public stock-Rust build — put `ATERM_STOCK_REASON='<why>'` in
+genuinely required — a cross target the Trust sysroot does not carry, a lane the
+repo labels `STOCK EXCEPTION` or `PUBLIC BOUNDARY` — put `ATERM_STOCK_REASON='<why>'` in
 front of the command and say why in your reply. A stock pin alone is not such a
 reason. To check a command before you run it or write it into another agent's
 prompt, `aterm pkg lane -- <command>` reads it the way the shell would: exit 2 and
@@ -145,5 +159,10 @@ build with targo.
   and an explicit `--target` strips the config from host units.
 * `aterm pkg doctor` says whether the machine is actually blocked, and names the
   fix when it is.
+* Building **Trust itself** never takes stock Rust (owner, 2026-09-29): its stage0
+  is the seed trust's `src/stage0` pins — in a trust checkout `python3
+  scripts/recreate_bootstrap.py --stage 2 --require-seed --fresh-seed
+  --no-register`, then `scripts/promote-toolchain.sh` — never `--genesis`, a stock
+  `rustc` in `[build]`, or another checkout's copied `bootstrap.toml`.
 
 The compiler answers for itself: `trustc -Vv`, `targo --unverified --version`.

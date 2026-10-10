@@ -3,16 +3,11 @@
 
 //! Autorelease-pool nesting — D2's arming.
 //!
-//! W1 shipped `AutoreleasePool::new()` as a SAFE constructor under this
-//! comment, promoted verbatim from `aterm-gpu/src/metal/ffi.rs:238`:
-//!
-//! > Pools are strictly nested because this type is neither `Send` nor
-//! > cloneable and the token never escapes.
-//!
-//! Neither `!Send` nor `!Clone` implies LIFO drop order. This file runs the
-//! four safe lines that refute it — in a CHILD PROCESS, because what they do is
-//! kill the process — and then shows the same shape written as scopes, which is
-//! the only form the crate now offers without `unsafe`.
+//! Neither `!Send` nor `!Clone` implies LIFO drop order, so a safe
+//! `AutoreleasePool::new()` would be unsound. This file runs the four lines
+//! that break nesting — in a CHILD PROCESS, because they kill the process — and
+//! then the same shape written as scopes, the only form the crate offers
+//! without `unsafe`.
 
 #![cfg(target_os = "macos")]
 
@@ -31,11 +26,9 @@ const SIGABRT: i32 = 6;
 #[test]
 fn an_out_of_order_pop_is_fatal_which_is_why_new_is_unsafe() {
     if std::env::var_os(CHILD).is_some() {
-        // The judge's counterexample, verbatim except for the `unsafe` the fix
-        // added — which is the fix: this is no longer expressible in safe Rust.
-        // SAFETY: deliberately VIOLATED. The whole point of this child process
-        // is to execute the misuse the old safe API allowed and let the
-        // Objective-C runtime say what it thinks of it.
+        // This misuse is why `new` is `unsafe`.
+        // SAFETY: deliberately VIOLATED. This child process executes the
+        // misuse and lets the Objective-C runtime report it.
         unsafe {
             let outer = AutoreleasePool::new();
             let inner = AutoreleasePool::new();

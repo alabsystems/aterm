@@ -31,7 +31,6 @@ fn scrollback_cold_memory_used() {
 
     // Verify cold tier has data
     assert!(sb.cold_line_count() > 0);
-    // Cold tier should now have compressed data
     assert!(sb.cold_memory_used() > 0);
 }
 

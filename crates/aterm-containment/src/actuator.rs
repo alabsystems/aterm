@@ -476,8 +476,8 @@ mod tests {
     /// Build the sandbox-exec argv the launcher builds: `sandbox-exec -p <sbpl>
     /// <prog> <args...>`. Mirrors the wrap done in `aterm-pty::spawn_shell`.
     #[cfg(target_os = "macos")]
-    fn sandbox_wrap(sbpl: &str, prog: &str, args: &[&str]) -> std::process::Command {
-        let mut cmd = std::process::Command::new(crate::sbpl::SANDBOX_EXEC_PATH);
+    fn sandbox_wrap(sbpl: &str, prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
+        let mut cmd = aterm_uds::spawnfd::command(crate::sbpl::SANDBOX_EXEC_PATH);
         cmd.arg("-p").arg(sbpl).arg(prog).args(args);
         cmd
     }
@@ -964,7 +964,7 @@ mod tests {
                 ),
             ],
         )
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .expect("run zsh under the Containment profile");
         let zsh_stderr = String::from_utf8_lossy(&zsh.stderr).into_owned();
@@ -1047,7 +1047,7 @@ mod tests {
             &shell,
             &["-l", "-i", "-c", "echo ok"],
         )
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .expect("run the login shell under the Containment profile");
         assert!(
@@ -1148,7 +1148,7 @@ mod tests {
         if aterm_uds::deadline::trust_service_silent() {
             return;
         }
-        struct Target(std::process::Child);
+        struct Target(aterm_uds::spawnfd::Child);
         impl Drop for Target {
             fn drop(&mut self) {
                 let _ = self.0.kill();
@@ -1185,7 +1185,7 @@ mod tests {
             String::from_utf8_lossy(&signed.stderr)
         );
         let target = Target(
-            std::process::Command::new(&sleeper)
+            aterm_uds::spawnfd::command(&sleeper)
                 .arg("60")
                 .spawn()
                 .expect("start the target"),
@@ -1205,8 +1205,8 @@ mod tests {
                 ],
             )
             .env(TASK_PORT_TARGET, target.0.id().to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
             .expect("run the probe child");
             // BOUNDED. A `task_for_pid` that macOS answers with the
@@ -1313,10 +1313,11 @@ mod tests {
     }
 
     /// PROOF 8 (LAUNCH BROKERS, FULL generated Containment profile) — a contained
-    /// process gets no port to Launch Services or the Apple Events daemon, each of
-    /// which starts or drives a process that does not inherit the sandbox (`open`
-    /// of a `.command` file, a scripted app). CONTROL: under `(allow default)`
-    /// alone every lookup succeeds, so the refusal is the profile's.
+    /// process gets no port to Launch Services, the Apple Events daemon or the
+    /// `ServiceManagement` daemon, each of which starts, drives or registers a
+    /// process that does not inherit the sandbox (`open` of a `.command` file, a
+    /// scripted app, a login item). CONTROL: under `(allow default)` alone every
+    /// lookup succeeds, so the refusal is the profile's.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_launch_brokers_denied() {
@@ -1365,6 +1366,101 @@ mod tests {
             "DENY FAILED: under the Containment profile every launch-broker lookup must be \
              refused; got {contained:?} for {:?}",
             crate::sbpl::DENIED_LAUNCH_BROKERS
+        );
+    }
+
+    /// What tells [`preference_write_probe_child`] to probe.
+    #[cfg(target_os = "macos")]
+    const PREFERENCE_PROBE: &str = "ATERM_PREFERENCE_WRITE_PROBE";
+
+    /// Re-entered by PROOF 9 under a profile: asks the sandbox, for this
+    /// process, whether it may write a user preference domain — the question
+    /// the preferences daemon asks before it writes `~/Library/Preferences` on
+    /// a caller's behalf — and prints the answer (`PREFERENCE_WRITE <rc>`, 0 =
+    /// allowed). It only asks; no preference is written. Run alone it does
+    /// nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "PROOF 9's probe child; runs only when that proof re-enters it"]
+    fn preference_write_probe_child() {
+        /// `SANDBOX_FILTER_PREFERENCE_DOMAIN` from `<sandbox/private.h>`.
+        const SANDBOX_FILTER_PREFERENCE_DOMAIN: libc::c_int = 6;
+        unsafe extern "C" {
+            fn sandbox_check(
+                pid: libc::pid_t,
+                operation: *const libc::c_char,
+                filter: libc::c_int,
+                ...
+            ) -> libc::c_int;
+        }
+        if std::env::var_os(PREFERENCE_PROBE).is_none() {
+            return;
+        }
+        // SAFETY: both strings are NUL-terminated literals; `sandbox_check`
+        // reads them and the pid, and writes nothing.
+        let rc = unsafe {
+            sandbox_check(
+                std::process::id().cast_signed(),
+                c"user-preference-write".as_ptr(),
+                SANDBOX_FILTER_PREFERENCE_DOMAIN,
+                c"com.example.aterm-containment-probe".as_ptr(),
+            )
+        };
+        println!("PREFERENCE_WRITE {rc}");
+    }
+
+    /// PROOF 9 (PREFERENCE WRITES, FULL generated Containment profile) — the
+    /// preferences daemon writes `~/Library/Preferences` outside the sandbox for
+    /// whoever asks, so the file-write confinement alone left every preference
+    /// domain writable from inside. Under the profile the sandbox must refuse
+    /// `user-preference-write`. CONTROL: under the base profile alone (no write
+    /// confinement) the same question is answered "allowed", so the refusal is
+    /// the confinement's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_preference_writes_denied() {
+        let exe = std::env::current_exe().expect("this test binary");
+        let probe = |profile: &str| {
+            let exe = exe.to_str().expect("utf8 test binary path");
+            let out = sandbox_wrap(
+                profile,
+                exe,
+                &[
+                    "--exact",
+                    "actuator::tests::preference_write_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            )
+            .env(PREFERENCE_PROBE, "1")
+            .output()
+            .expect("run the probe child");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stdout
+                .lines()
+                .find_map(|line| line.split_once("PREFERENCE_WRITE "))
+                .map(|(_, rc)| rc.trim().to_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no PREFERENCE_WRITE line from the probe child; stdout={stdout:?} stderr={:?}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                })
+        };
+
+        let control = probe(crate::sbpl::BASE_PROFILE);
+        assert_eq!(
+            control, "0",
+            "CONTROL: without the write confinement a preference write must be allowed, \
+             or the denial below proves nothing"
+        );
+        let contained = probe(&containment_profile());
+        assert_ne!(
+            contained, "0",
+            "WRITE CONFINEMENT FAILED: under the Containment profile the sandbox allows \
+             user-preference-write, so the preferences daemon writes ~/Library/Preferences \
+             for the contained shell"
         );
     }
 

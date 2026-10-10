@@ -121,9 +121,11 @@ pub fn label_is_ours(label: &str, own: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1)
 }
 
-/// `aterm keeper <args>`.
+/// `aterm keeper <args>`. `version`: the running build's version, which a
+/// served keeper reports (WELCOME, status) and a status client says at HELLO —
+/// the binary's, handed in because this crate links nothing that knows it.
 #[must_use]
-pub fn main_entry(args: Vec<OsString>) -> ExitCode {
+pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let first = args.first().map(|a| a.to_string_lossy().into_owned());
     if matches!(first.as_deref(), None | Some("-h" | "--help" | "help")) {
         print!("{USAGE}");
@@ -147,10 +149,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         }
     };
     match parsed.verb.as_str() {
-        "serve" => serve(&parsed),
-        "status" => status(&parsed),
-        "start" => start(&parsed),
-        "stop" => stop(&parsed),
+        "serve" => serve(&parsed, version),
+        "status" => status(&parsed, version),
+        "start" => start(&parsed, version),
+        "stop" => stop(&parsed, version),
         other => {
             eprintln!("aterm keeper: unknown verb {other:?}; run `aterm keeper --help`");
             ExitCode::from(2)
@@ -167,7 +169,7 @@ fn default_socket() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn serve(args: &Args) -> ExitCode {
+fn serve(args: &Args, version: &str) -> ExitCode {
     let identity = match Identity::for_self(args.identity) {
         Ok(i) => i,
         Err(why) => {
@@ -197,7 +199,7 @@ fn serve(args: &Args) -> ExitCode {
              check it once an update removes this build"
         );
     }
-    let exit = serve_as(args, identity, exe.as_deref());
+    let exit = serve_as(args, identity, exe.as_deref(), version);
     // Nothing checks this keeper once it stops serving: its copy goes with it.
     if let Some(copy) = own_copy {
         let _ = std::fs::remove_dir_all(copy);
@@ -207,7 +209,12 @@ fn serve(args: &Args) -> ExitCode {
 
 /// Serve as the keeper of `exe`, the executable it was started as.
 #[cfg(unix)]
-fn serve_as(args: &Args, identity: Identity, exe: Option<&std::path::Path>) -> ExitCode {
+fn serve_as(
+    args: &Args,
+    identity: Identity,
+    exe: Option<&std::path::Path>,
+    version: &str,
+) -> ExitCode {
     // The socket, label and relaunch bundle are the build's it was started
     // as, never its copy's.
     let Some(socket) = args
@@ -226,7 +233,7 @@ fn serve_as(args: &Args, identity: Identity, exe: Option<&std::path::Path>) -> E
         socket,
         identity,
         relaunch,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: version.to_string(),
         test_drop_custody: false,
     };
     let mut server = match crate::server::Server::bind(config) {
@@ -254,25 +261,25 @@ fn serve_as(args: &Args, identity: Identity, exe: Option<&std::path::Path>) -> E
 // Off Unix only these stubs exist, and `main_entry` answers `macOS only`
 // before it reaches them.
 #[cfg(not(unix))]
-fn serve(_args: &Args) -> ExitCode {
+fn serve(_args: &Args, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
     ExitCode::FAILURE
 }
 
 #[cfg(not(unix))]
-fn status(_args: &Args) -> ExitCode {
+fn status(_args: &Args, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
     ExitCode::FAILURE
 }
 
 #[cfg(not(unix))]
-fn start(_args: &Args) -> ExitCode {
+fn start(_args: &Args, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
     ExitCode::FAILURE
 }
 
 #[cfg(not(unix))]
-fn stop(_args: &Args) -> ExitCode {
+fn stop(_args: &Args, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
     ExitCode::FAILURE
 }
@@ -323,11 +330,11 @@ impl NoKeeper {
     }
 }
 
-/// Ask the keeper on `socket` for its status.
+/// Ask the keeper on `socket` for its status, as a client of build `version`.
 #[cfg(unix)]
-fn ask(socket: &std::path::Path, identity: &Identity) -> Result<String, NoKeeper> {
+fn ask(socket: &std::path::Path, identity: &Identity, version: &str) -> Result<String, NoKeeper> {
     crate::client::KeeperClient::connect(socket, identity, Duration::from_secs(2))
-        .and_then(|c| c.status())
+        .and_then(|c| c.status(version))
         .map_err(|e| NoKeeper::of(&e))
 }
 
@@ -452,7 +459,7 @@ fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn start(args: &Args) -> ExitCode {
+fn start(args: &Args, version: &str) -> ExitCode {
     let label = match chosen_label(args, "start") {
         Ok(label) => label,
         Err(code) => return code,
@@ -483,7 +490,7 @@ fn start(args: &Args) -> ExitCode {
         }
     };
     let log = crate::job::log_path(&socket);
-    let answer = ask(&socket, &own);
+    let answer = ask(&socket, &own, version);
     let existing = log.exists().then_some(log.as_path());
     let own_place = label == crate::job::own_place().label
         && default_socket().as_deref() == Some(socket.as_path());
@@ -526,7 +533,7 @@ fn start(args: &Args) -> ExitCode {
     // launchd starts the job asynchronously: wait (bounded) for it to answer.
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(10) {
-        if ask(&socket, &own).is_ok() {
+        if ask(&socket, &own, version).is_ok() {
             println!("keeper=running label={label} socket={}", socket.display());
             return ExitCode::SUCCESS;
         }
@@ -547,7 +554,7 @@ fn start(args: &Args) -> ExitCode {
 const STOP_WAIT: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
-fn stop(args: &Args) -> ExitCode {
+fn stop(args: &Args, version: &str) -> ExitCode {
     let label = match chosen_label(args, "stop") {
         Ok(label) => label,
         Err(code) => return code,
@@ -561,7 +568,7 @@ fn stop(args: &Args) -> ExitCode {
                 .flatten()
                 .and_then(|sock| {
                     let own = Identity::for_self(args.identity).ok()?;
-                    let status = ask(&sock, &own).ok()?;
+                    let status = ask(&sock, &own, version).ok()?;
                     Some((sock, status_pid(&status)))
                 });
             let (line, ok) = stop_absent_line(
@@ -673,7 +680,7 @@ fn await_end(
 }
 
 #[cfg(unix)]
-fn status(args: &Args) -> ExitCode {
+fn status(args: &Args, version: &str) -> ExitCode {
     let place = crate::job::own_place();
     let own_socket = default_socket();
     let Some(socket) = args.sock.clone().or_else(|| own_socket.clone()) else {
@@ -696,7 +703,7 @@ fn status(args: &Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match ask(&socket, &identity) {
+    match ask(&socket, &identity, version) {
         Ok(text) => {
             println!("{text}");
             println!("label={} job={job}", place.label);

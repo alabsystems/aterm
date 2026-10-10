@@ -150,8 +150,9 @@ impl TerminalHandler<'_> {
             // DECCOLM - 132 Column Mode (DEC private mode ?3)
             "?3" => Some(DecrqssPayload::Full(self.decrqss_deccolm())),
 
-            // Grapheme Cluster Mode (xterm private mode ?2027)
-            "?2027" => Some(DecrqssPayload::Full(self.decrqss_grapheme_cluster())),
+            // Grapheme Cluster Mode (?2027): permanently reset, as DECRQM
+            // answers (`handle_decrqm`).
+            "?2027" => Some(DecrqssPayload::Full("?2027l".to_string())),
 
             // Unknown mnemonic
             _ => None,
@@ -559,19 +560,6 @@ impl TerminalHandler<'_> {
             "?3h".to_string()
         } else {
             "?3l".to_string()
-        }
-    }
-
-    /// Generate Grapheme Cluster Mode response.
-    ///
-    /// Reports whether grapheme cluster mode is active. Xterm private mode ?2027:
-    /// - `?2027h` (set): grapheme cluster mode active
-    /// - `?2027l` (reset): legacy character-by-character mode
-    fn decrqss_grapheme_cluster(&self) -> String {
-        if self.modes.grapheme_cluster_mode {
-            "?2027h".to_string()
-        } else {
-            "?2027l".to_string()
         }
     }
 }

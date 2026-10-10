@@ -79,7 +79,7 @@ pub(crate) const KEY_MANAGED: &str = "toolchain.managed";
 /// pass stays silent.
 pub(crate) const HEAVY_PASS_BYTES: u64 = 250_000_000;
 /// The prefix of a machine-settings item's key: `toolchain.machine.`
-/// plus the item's first word (`universal-control`, `spotlight-noindex`).
+/// plus the item's first word (`universal-control`).
 pub(crate) const KEY_MACHINE_PREFIX: &str = "toolchain.machine.";
 
 /// Cap on a sanitized failure reason inside a row.
@@ -721,7 +721,66 @@ pub(crate) fn managed_current_for(
     hook: HookDialect,
 ) -> Option<Message> {
     let (title, detail) = managed_current_words_for(text, tabs, unhooked, hook)?;
-    Some(record(Severity::Success, title, detail).key(KEY_MANAGED))
+    // A program the pass could not check, or that is not its vendor's head, is no
+    // success: the title says so, and the mark is a plain record's.
+    let severity = if managed_items(text)
+        .iter()
+        .all(|item| item.standing.is_none())
+    {
+        Severity::Success
+    } else {
+        Severity::Info
+    };
+    Some(record(severity, title, detail).key(KEY_MANAGED))
+}
+
+/// One program of the managed-current wire text: `<name> <version> (<standing>)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedItem {
+    /// atpkg's name (`claude`).
+    pub(crate) name: String,
+    /// Its version, empty when the wire names none.
+    pub(crate) version: String,
+    /// `None` while it is its vendor's head (`(<Vendor> latest)`, an older atpkg's
+    /// `(build <N>)`, or no parenthesis); else what is said of it instead: `not checked`
+    /// ([`atpkg::cli::NOT_CHECKED`]) for a vendor the pass could not reach, `failed to
+    /// update` for a refused or failed landing, else atpkg's own word (`held`, `yanked`).
+    pub(crate) standing: Option<String>,
+}
+
+/// The managed-current wire text, item by item ([`ManagedItem`]); an item with no name is
+/// dropped. The one reader of the wire: the words, the record's severity and the version
+/// the live upgrade's rows are counted against all read it here.
+pub(crate) fn managed_items(text: &str) -> Vec<ManagedItem> {
+    text.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|item| {
+            // `<name> <version> (<Vendor> latest)`, or an older atpkg's `(build <N>)`:
+            // version and parenthesis are each optional on the wire, so a bare name
+            // still renders.
+            let (head, paren) = match item.split_once('(') {
+                Some((head, rest)) => (head.trim(), rest.trim_end_matches(')').trim()),
+                None => (item, ""),
+            };
+            let mut words = head.split_whitespace();
+            let name = words.next()?.to_string();
+            let version = words.next().unwrap_or_default().to_string();
+            let standing =
+                if paren.is_empty() || paren.ends_with(" latest") || paren.starts_with("build ") {
+                    None
+                } else if paren == "failed" || paren == "refused" {
+                    Some("failed to update".to_string())
+                } else {
+                    Some(sanitize_for_tty(paren, NAME_CAP))
+                };
+            Some(ManagedItem {
+                name,
+                version,
+                standing,
+            })
+        })
+        .collect()
 }
 
 /// How the live tabs stand against the programs the managed-current record
@@ -736,15 +795,15 @@ pub(crate) struct TabsBehind {
     /// live upgrade is not moving: never told to type into (it is a prompt
     /// there), told to source the hook once the agent exits.
     pub(crate) frozen_agents: usize,
-    /// Running Claude Code sessions the live upgrade moves onto the version
-    /// this record names, on their own (its relaunch line sources the hook too,
-    /// so a frozen tab among them heals with the move). Never a stalled one, and
-    /// never one moving to another version.
+    /// Running Claude Code sessions RUNNING A BUILD OLDER than the version this
+    /// record names that the live upgrade moves on, on their own (its relaunch
+    /// line sources the hook too, so a frozen tab among them heals with the
+    /// move), whatever version their row targets. Never a stalled one.
     pub(crate) agents_behind: usize,
-    /// Running Claude Code sessions behind that version that will not move on
-    /// their own: stalled (the band has a row for each), or held by the owner's
-    /// `--defer`/`--skip`. They keep the title at "installed" and are pointed at
-    /// `--status`.
+    /// Running Claude Code sessions running a build older than that version
+    /// that will not move on their own: stalled (the band has a row for each),
+    /// or held by the owner's `--defer`/`--skip`. They keep the title at
+    /// "installed" and are pointed at `--status`.
     pub(crate) agents_held: usize,
     /// Live tabs with no adoption mark whose shell's PATH was measured, two jobs
     /// in a row, to put a foreign `claude`/`codex` first
@@ -756,15 +815,12 @@ pub(crate) struct TabsBehind {
 /// The version the managed-current wire text gives `name`
 /// (`claude 2.1.282 (Anthropic latest); codex …`), or `None` when it names
 /// none. What the live upgrade's rows are matched against, so the record
-/// counts only the sessions moving onto the build it announces.
+/// counts the sessions running a build older than the one it announces.
 pub(crate) fn managed_version(text: &str, name: &str) -> Option<String> {
-    text.split(';').map(str::trim).find_map(|item| {
-        let head = item.split_once('(').map_or(item, |(head, _)| head.trim());
-        let mut words = head.split_whitespace();
-        (words.next()? == name)
-            .then(|| words.next().map(str::to_string))
-            .flatten()
-    })
+    managed_items(text)
+        .into_iter()
+        .find(|item| item.name == name && !item.version.is_empty())
+        .map(|item| item.version)
 }
 
 /// The managed-current entry's words from the wire text, or `None` for an empty
@@ -813,36 +869,59 @@ pub(crate) fn managed_current_words_for(
     hook: HookDialect,
 ) -> Option<(String, String)> {
     let frozen_tabs = tabs.frozen_shells;
+    // EVERY MANAGED PROGRAM IS NAMED (audit 2026-10-09: a pass that could not reach
+    // Anthropic said `Codex 0.160.0 is current · ready in every aterm tab`, Claude Code
+    // left out): the ones at their vendor's head first, then each other one with what
+    // is said of it instead (`Claude Code 2.1.287 not checked`). The parenthesis
+    // itself is not shown.
     let mut names: Vec<String> = Vec::new();
-    for item in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        // `<name> <version> (<Vendor> latest)`, or an older atpkg's `(build
-        // <N>)`: version and parenthesis are each optional on the wire, so a
-        // bare name still renders. The parenthesis is not shown.
-        let head = item.split_once('(').map_or(item, |(head, _)| head.trim());
-        let mut words = head.split_whitespace();
-        let name = words.next().unwrap_or_default();
-        let version = words.next().unwrap_or_default();
-        let display = match name {
+    let mut not_current: Vec<String> = Vec::new();
+    // How many of those no check reached lately, and how many atpkg gives
+    // another word (`held`, `failed to update`).
+    let (mut unchecked, mut otherwise) = (0_usize, 0_usize);
+    for item in managed_items(text) {
+        let display = match item.name.as_str() {
             "claude" => "Claude Code",
             "codex" => "Codex",
             other => other,
         };
-        names.push(if version.is_empty() {
+        let named = if item.version.is_empty() {
             sanitize_for_tty(display, NAME_CAP)
         } else {
-            sanitize_for_tty(&format!("{display} {version}"), NAME_CAP + 24)
-        });
+            sanitize_for_tty(&format!("{display} {}", item.version), NAME_CAP + 24)
+        };
+        match item.standing {
+            None => names.push(named),
+            Some(standing) => {
+                if standing == atpkg::cli::NOT_CHECKED {
+                    unchecked += 1;
+                } else {
+                    otherwise += 1;
+                }
+                not_current.push(format!("{named} {standing}"));
+            }
+        }
     }
     // The programs as a person knows them, with versions, and that they are
     // current; or, while an agent session still runs an older build of one,
     // that they are installed ("current" would claim the sessions are too).
     let lagging = tabs.agents_behind + tabs.agents_held > 0;
-    let title = match (names.as_slice(), lagging) {
-        ([], _) => return None,
-        ([one], false) => format!("{one} is current"),
-        ([head @ .., last], false) => format!("{} and {last} are current", head.join(", ")),
-        ([one], true) => format!("{one} installed"),
-        ([head @ .., last], true) => format!("{} and {last} installed", head.join(", ")),
+    let current = match (names.as_slice(), lagging) {
+        ([], _) => None,
+        ([one], false) => Some(format!("{one} is current")),
+        ([head @ .., last], false) => Some(format!("{} and {last} are current", head.join(", "))),
+        ([one], true) => Some(format!("{one} installed")),
+        ([head @ .., last], true) => Some(format!("{} and {last} installed", head.join(", "))),
+    };
+    let others = match not_current.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        [head @ .., last] => Some(format!("{} and {last}", head.join(", "))),
+    };
+    let title = match (current, others) {
+        (None, None) => return None,
+        (Some(said), None) | (None, Some(said)) => said,
+        (Some(current), Some(others)) => format!("{current}; {others}"),
     };
     let title = sanitize_for_tty(&title, 120);
     let mut pieces: Vec<String> = Vec::new();
@@ -854,6 +933,30 @@ pub(crate) fn managed_current_words_for(
         pieces.push(clause.to_string());
     } else if frozen_tabs == 0 && tabs.frozen_agents == 0 && tabs.shadowed == 0 {
         pieces.push(READY_IN_EVERY_TAB.to_string());
+    }
+    // Not checked is not "not current": the vendor's channel was not read, so
+    // nothing is known either way, and doctor still shows the row its last
+    // check left (`… — Anthropic latest`). It is said as that fact, with no
+    // pointer at a page that contradicts it (review of 2026-10-09).
+    if unchecked > 0 {
+        pieces.push(
+            if unchecked == 1 {
+                "not checked: its vendor was not reached lately, so a newer build may be out"
+            } else {
+                "not checked: their vendors were not reached lately, so newer builds may be out"
+            }
+            .to_string(),
+        );
+    }
+    if otherwise > 0 {
+        pieces.push(
+            if otherwise == 1 {
+                "`aterm pkg doctor` says why it is not current"
+            } else {
+                "`aterm pkg doctor` says why they are not current"
+            }
+            .to_string(),
+        );
     }
     // "On its own", not "at its next turn end": the live upgrade starts at a
     // quiet moment, and a goal-mode session's turns never end (owner, 2026-09-28).
@@ -925,8 +1028,7 @@ pub(crate) fn managed_current_words_for(
 }
 
 /// `machine-settings:`: the machine-level settings a pass changed per doctor,
-/// as atpkg lists them: `spotlight-noindex 73 dir(s) migrated;
-/// universal-control disabled`. One Info record per item
+/// as atpkg lists them: `universal-control disabled`. One Info record per item
 /// ([`machine_setting_words`]), in wire order, none on glass: the change and its
 /// undo are on Settings ▸ Security's "This Mac" card
 /// (`PackagesService::note_machine_change`), the log and `appstatus`. Each item
@@ -961,10 +1063,7 @@ pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
 /// default policy turns it off again at the next window or the day's first
 /// terminal session) and the revert command, byte-identical to
 /// [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`] (atpkg's `doctor_line` says the
-/// same); `spotlight-noindex N dir(s) migrated` → "Spotlight now skips N build
-/// folders", whose detail is what a person acts on: the rename, and that cargo
-/// still builds there. An unknown item is its own title, verbatim, with no
-/// detail.
+/// same). An unknown item is its own title, verbatim, with no detail.
 pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
     let item = sanitize_for_tty(item, 80);
     let (title, detail) = if item == atpkg::machine::UNIVERSAL_CONTROL_ENTRY {
@@ -975,14 +1074,6 @@ pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
                 atpkg::machine::UNIVERSAL_CONTROL_REVERT
             ),
         )
-    } else if let Some(count) = spotlight_noindex_count(&item) {
-        (
-            format!(
-                "Spotlight now skips {count} build {}",
-                if count == 1 { "folder" } else { "folders" }
-            ),
-            "renamed with a .noindex suffix; cargo still builds there".to_string(),
-        )
     } else {
         (item.clone(), String::new())
     };
@@ -992,13 +1083,110 @@ pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
     )
 }
 
-/// The N of `spotlight-noindex N dir(s) migrated`, when the item is that.
-fn spotlight_noindex_count(item: &str) -> Option<u64> {
-    item.strip_prefix("spotlight-noindex ")?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+// ---------------------------------------------------------------------------
+// Foreign tools: what atpkg leaves alone, as a line of the exceptions digest.
+// ---------------------------------------------------------------------------
+
+/// One thing a pass's look found that aterm leaves alone, as atpkg named it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Foreign {
+    /// The seam (`trust`) or the managed program a copy stands before.
+    pub(crate) name: String,
+    /// The entry or copy that is not aterm's.
+    pub(crate) path: String,
+    /// atpkg's fix sentence.
+    pub(crate) fix: String,
+}
+
+/// A `foreign:` line's body (`seam none`, `path trust /u/bin/trustdoc — type …`) as its
+/// look's scope ([`atpkg::cli::FOREIGN_SEAM`], [`atpkg::cli::FOREIGN_PATH`]) and what
+/// it found; `None` for a scope this build does not know. An item naming no fix is
+/// dropped: with nothing for the owner to do it is no exception (review of 2026-10-09).
+/// atpkg's text is untrusted: each field is control-stripped and capped.
+pub(crate) fn foreign_report(body: &str) -> Option<(&'static str, Vec<Foreign>)> {
+    let (scope, rest) = body.trim().split_once(' ')?;
+    let scope = [atpkg::cli::FOREIGN_SEAM, atpkg::cli::FOREIGN_PATH]
+        .into_iter()
+        .find(|s| *s == scope)?;
+    let rest = rest.trim();
+    if rest == atpkg::cli::FOREIGN_NONE {
+        return Some((scope, Vec::new()));
+    }
+    let items = rest
+        .split("; ")
+        .filter_map(|item| {
+            let (head, fix) = item.split_once(" \u{2014} ")?;
+            let fix = sanitize_for_tty(fix.trim(), DETAIL_LINE_CAP);
+            let (name, path) = head.trim().split_once(' ')?;
+            (!fix.is_empty()).then(|| Foreign {
+                name: sanitize_for_tty(name, NAME_CAP),
+                path: sanitize_for_tty(path.trim(), DETAIL_LINE_CAP),
+                fix,
+            })
+        })
+        .collect();
+    Some((scope, items))
+}
+
+/// The digest entry for what ONE LOOK of a pass named that aterm leaves alone
+/// ([`foreign_report`]): a fact that needs the owner's look but not now — aterm never
+/// changes a link or a copy it did not lay, so only the owner ends it — with atpkg's
+/// own fix for each, one line apiece under Details (the last counting the rest past
+/// [`aterm_messages::exceptions::MORE_LINES`]). One entry per look, keyed by its scope
+/// (`toolchain.seam.foreign`, `toolchain.path.foreign`) whatever it names, so each
+/// look raises, re-words and ends its own (`App::note_foreign_tools`); filed for a
+/// month when dismissed — a link of the owner's own is commonly their choice.
+pub(crate) fn foreign_tools_entry(
+    scope: &str,
+    items: &[Foreign],
+) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::exceptions::{Entry, Family, MORE_LINES};
+    use aterm_messages::need::{Reason, Resurface, Then, Why};
+    let seam = scope == atpkg::cli::FOREIGN_SEAM;
+    let line = |f: &Foreign| {
+        let fact = if seam {
+            format!(
+                "rustup's {} toolchain is {}, not aterm's link",
+                f.name, f.path
+            )
+        } else {
+            format!("{} runs before the managed {}", f.path, f.name)
+        };
+        format!("{fact}: {}", f.fix)
+    };
+    let mut entry = Entry::new(
+        Family::Toolchain,
+        scope,
+        "foreign",
+        if seam {
+            "Rustup's toolchain link is not aterm's"
+        } else {
+            "Foreign tools run before ALab tools"
+        },
+        Why::OnlyYou(Reason::new(
+            "aterm never changes a link or a copy it did not lay",
+        )),
+        Then::step("Fix each one as its line under Details says"),
+    )
+    .resurface(Resurface::CHOICE);
+    let shown = if items.len() > MORE_LINES {
+        MORE_LINES - 1
+    } else {
+        items.len()
+    };
+    for item in &items[..shown] {
+        entry = entry.more(line(item));
+    }
+    if shown < items.len() {
+        entry = entry.more(format!(
+            "{} more: `aterm pkg doctor` names each",
+            items.len() - shown
+        ));
+    }
+    entry.log_line(format!(
+        "toolchain-foreign scope={scope} items={}",
+        items.len()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,7 +1571,7 @@ mod tests {
             .unwrap(),
             live_of(snapshot_words(Some(&snap(true)), None, false)).0,
         ];
-        let machine = machine_settings("universal-control disabled; spotlight-noindex 2 dir(s)");
+        let machine = machine_settings("universal-control disabled; something-new tuned");
         for m in &machine {
             assert_eq!(m.actions, vec![security()], "{}", m.title);
         }
@@ -2094,6 +2282,62 @@ mod tests {
         assert_eq!(appnotice(tags::UPDATE, "x").tag, tags::UPDATE);
     }
 
+    /// A PROGRAM THE PASS COULD NOT CHECK IS NAMED, never left out (audit
+    /// 2026-10-09: a pass whose claude check failed on curl 56 recorded `Codex
+    /// 0.160.0 is current · ready in every aterm tab`, a success that named
+    /// one of the two programs): the title says it was not checked, and the
+    /// mark is a plain record's. Not checked is not "not current", so the
+    /// detail says what is known and points nowhere (review of 2026-10-09:
+    /// `aterm pkg doctor` still shows the last check's `Anthropic latest`). A
+    /// failed landing reads as one, and atpkg's other words (`held`) as
+    /// written, with doctor named for why.
+    /// NEGATIVE CONTROL: both at their vendor's head are current, a success.
+    #[test]
+    fn a_program_the_pass_could_not_check_is_named_and_no_success() {
+        let words = |wire: &str| managed_current(wire, 0, true, HookDialect::Zsh).unwrap();
+        let m = words("claude 2.1.287 (not checked); codex 0.160.0 (OpenAI latest)");
+        assert_eq!(
+            m.title,
+            "Codex 0.160.0 is current; Claude Code 2.1.287 not checked"
+        );
+        assert_eq!(
+            m.detail,
+            vec![
+                "ready in every aterm tab \u{b7} not checked: its vendor was not reached \
+                 lately, so a newer build may be out"
+            ]
+        );
+        assert_eq!(m.severity, Severity::Info, "no success");
+        let m = words("claude 2.1.287 (failed); codex 0.160.0 (held)");
+        assert_eq!(
+            m.title,
+            "Claude Code 2.1.287 failed to update and Codex 0.160.0 held"
+        );
+        assert!(
+            m.detail[0].ends_with("says why they are not current"),
+            "{:?}",
+            m.detail
+        );
+        let m = words("claude 2.1.287 (not checked); codex 0.160.0 (held)");
+        assert_eq!(
+            m.detail,
+            vec![
+                "ready in every aterm tab \u{b7} not checked: its vendor was not reached \
+                 lately, so a newer build may be out \u{b7} `aterm pkg doctor` says why it is \
+                 not current"
+            ],
+            "doctor is named for the held one alone"
+        );
+        assert_eq!(
+            managed_version("claude 2.1.287 (not checked)", "claude").as_deref(),
+            Some("2.1.287"),
+            "its build is still the one the rows are counted against"
+        );
+        let m = words("claude 2.1.287 (Anthropic latest); codex 0.160.0 (OpenAI latest)");
+        assert_eq!(m.title, "Claude Code 2.1.287 and Codex 0.160.0 are current");
+        assert_eq!(m.severity, Severity::Success);
+    }
+
     #[test]
     fn the_managed_and_machine_records_carry_their_words() {
         let m = managed_current(
@@ -2153,14 +2397,8 @@ mod tests {
             "an empty body records nothing"
         );
 
-        let rows = machine_settings("spotlight-noindex 12 dir(s) migrated");
+        let rows = machine_settings("universal-control disabled");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].title, "Spotlight now skips 12 build folders");
-        assert_eq!(
-            rows[0].detail,
-            ["renamed with a .noindex suffix; cargo still builds there"],
-            "the mechanism behind the plain title (ruling 261)"
-        );
         assert_eq!(rows[0].severity, Severity::Info);
         assert_eq!(
             rows[0].glyph.ch(),
@@ -2170,7 +2408,7 @@ mod tests {
         assert_eq!(rows[0].hold, Hold::LogOnly);
         assert_eq!(
             rows[0].key.as_deref(),
-            Some("toolchain.machine.spotlight-noindex")
+            Some("toolchain.machine.universal-control")
         );
     }
 
@@ -2677,14 +2915,13 @@ mod tests {
     /// unknown item is its own title, verbatim; each item has its own key.
     #[test]
     fn machine_settings_record_one_entry_per_item_in_wire_order() {
-        let rows = machine_settings(
-            "spotlight-noindex 1 dir(s) migrated; something-new tuned; universal-control disabled",
-        );
+        let rows =
+            machine_settings("older-thing done; something-new tuned; universal-control disabled");
         let titles: Vec<&str> = rows.iter().map(|m| m.title.as_str()).collect();
         assert_eq!(
             titles,
             [
-                "Spotlight now skips 1 build folder",
+                "older-thing done",
                 "something-new tuned",
                 "ALab tools turned off Universal Control",
             ],
@@ -2694,7 +2931,7 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "toolchain.machine.spotlight-noindex",
+                "toolchain.machine.older-thing",
                 "toolchain.machine.something-new",
                 "toolchain.machine.universal-control",
             ],

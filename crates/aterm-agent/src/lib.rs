@@ -513,9 +513,8 @@ impl<S: Read + Write> RelayClient<S> {
     /// aterm hosting the session went away under the forward before it
     /// answered, and the connection closes after it: the same fact as a direct
     /// connection's end of file, and read as one (`UnexpectedEof`, naming the
-    /// host), so every caller that rides out a hang-up rides this out too
-    /// (round eight of the update audit, finding 12). Only where a reply
-    /// begins: a body row reads as whatever it says.
+    /// host), so every caller that rides out a hang-up rides this out too.
+    /// Only where a reply begins: a body row reads as whatever it says.
     fn read_reply(&mut self) -> std::io::Result<String> {
         let line = self.read_line()?;
         match aterm_types::control_verbs::host_gone(&line) {
@@ -1209,8 +1208,8 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        absolute path is outside the secrets list (.ssh, .aws,
                        Keychains, *.pem, .env, *.token, …); and the folder-
                        trust dialog when its folder is exactly the session's cwd
-                       and lies under a trust root (~/aterm*, ~/ay*, $HOME/trust*,
-                       /private/tmp/claude-*). Those rules decide first under
+                       and lies under a trust root (~/Developer/aterm*,
+                       ~/Developer/ay*, ~/Developer/trust*, /private/tmp/claude-*). Those rules decide first under
                        \"all\" too, so a proven read keeps its rule in the
                        ledger. \"none\" answers nothing. A person's keystroke
                        within `human_grace_s` (the server's `status
@@ -1244,8 +1243,8 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        and while `status input=stalled|stopped` a
                        `watch` (or the window's host) presses nothing,
                        withdraws its badge and waits (the window's host then
-                       relaunches an agent the stall's `signal term|kill`
-                       ended); any other `ERR` stops the loop.
+                       relaunches an agent its explicit `restart` ended);
+                       any other `ERR` stops the loop.
                        Every decision is one row of the approval ledger,
                        <aterm state>/drive/<sid>.jsonl (rule, outcome, the
                        command's sha256 and its first 4 KiB, the reason, the
@@ -2309,14 +2308,10 @@ mod tests {
     }
 
     /// THE HOST THAT WENT AWAY UNDER A FORWARD IS THE CONNECTION CLOSING, NOT
-    /// AN ANSWER (round eight of the update audit, finding 12). A forwarding
-    /// aterm's last line, `ERR gone pid=<host> sock=<its socket>`, says the
-    /// aterm that held the session went away before it answered — the same
-    /// fact as a direct connection's EOF. Read as a reply, it was the server's
-    /// refusal: the supervisor's persistent client stopped on it (`Fail::Hard`)
-    /// where it rides out a hang-up, and `aterm drive` read it as an `ERR`.
-    /// Every read sees it as the connection that closed, saying whose. FAILS
-    /// WITHOUT THE FIX: `request_line` returns the line.
+    /// AN ANSWER. A forwarding aterm's last line, `ERR gone pid=<host>
+    /// sock=<its socket>`, is the same fact as a direct connection's EOF; read
+    /// as a refusal, the supervisor stopped (`Fail::Hard`) where it rides out a
+    /// hang-up. Every read sees it as the connection that closed, saying whose.
     #[test]
     fn relay_client_reads_the_host_gone_line_as_the_connection_closing() {
         let mut client = RelayClient::new(RecordingTransport::new(

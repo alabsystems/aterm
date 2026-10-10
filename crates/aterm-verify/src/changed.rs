@@ -199,7 +199,7 @@ fn parent_dir(path: &str) -> &str {
 /// The workspace member owning a repo-relative path: nearest ancestor manifest,
 /// accepted only if its package is a member.
 ///
-/// A path no member owns (`docs/`, `tools/`, `scripts/`, and the non-member
+/// A path no member owns (`docs/`, `tools/`, and the non-member
 /// manifests under `tools/` and `crates/*/fuzz/`) contributes NO crate — those
 /// are covered by the whole-tree guard/gate stages, which run unchanged in every
 /// mode. The walk never consults the repo-root manifest: it is virtual, and a
@@ -720,10 +720,10 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
 /// The merge-base of HEAD and `base`, and every path changed since it
 /// ([`crate::identity::changes_since`], the listing the gate's identity reads):
 /// tracked changes INCLUDING the working tree (the `--changed` tier exists to
-/// be run BEFORE the commit), untracked non-ignored files, and the edits an
-/// assume-unchanged or skip-worktree flag hides (2026-09-13: without them a
-/// flagged crate's edit selected 0 crates and went VERIFY: PASS). `Err` says
-/// which read failed.
+/// be run BEFORE the commit), untracked files no tracked `.gitignore` ignores,
+/// and the edits an assume-unchanged or skip-worktree flag hides (2026-09-13:
+/// without them a flagged crate's edit selected 0 crates and went VERIFY:
+/// PASS). `Err` says which read failed.
 fn changed_paths(
     root: &Path,
     path_env: &OsStr,
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn a_path_no_member_owns_contributes_no_crate() {
-        // docs/, tools/, scripts/ and the repo root are covered by the whole-tree
+        // docs/, tools/ and the repo root are covered by the whole-tree
         // guard stages, which run unchanged in every mode.
         let m = members(&["aterm-grid"]);
         let names = m.names();
@@ -1307,7 +1307,7 @@ mod tests {
         for p in [
             "docs/PROCESS.md",
             "tools/grep_guard.sh",
-            "scripts/verify-kani-proofs.sh",
+            "tools/verify.sh",
             "README.md",
             ".gitignore",
         ] {

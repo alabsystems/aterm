@@ -22,14 +22,61 @@ fn classes_resolve_and_unknown_names_are_nil() {
     unsafe { assert_eq!(class_name(class(c"NSString")), c"NSString") };
 }
 
+/// Every Rust string survives the trip exactly, including the two characters a
+/// C-string or byte-order-mark reading loses: U+0000 (a pasted `a\0b` read
+/// back as `a`) and a leading U+FEFF (which `initWithBytes:length:encoding:`
+/// strips as a BOM).
 #[test]
-fn ns_string_round_trips_utf8_including_non_ascii() {
+fn ns_string_round_trips_every_rust_string_exactly() {
     autoreleasepool(|_| {
-        for s in ["", "hello", "héllo wörld", "🌊 kitty ⬆️", "line\nbreak"] {
+        for s in [
+            "",
+            "hello",
+            "héllo wörld",
+            "🌊 kitty ⬆️",
+            "line\nbreak",
+            "a\0b",
+            "\0",
+            "\u{FEFF}leading",
+            "\u{FEFF}",
+        ] {
             let obj = ns_string(s).expect("NSString from &str");
+            // SAFETY: `-length` is `-(NSUInteger)` on a live NSString.
+            let len: usize = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+                f(obj.id(), sel!(length))
+            };
+            assert_eq!(len, s.encode_utf16().count(), "NSString built from {s:?}");
             // SAFETY: `obj` holds a live +1 NSString.
             assert_eq!(unsafe { ns_string_to_rust(obj.id()) }, s);
         }
+    });
+}
+
+/// An `NSString` can hold an unpaired surrogate (a pasteboard or text-input
+/// string cut mid-pair), which no Rust `String` can: it reads back as U+FFFD
+/// with the rest of the text intact, not as an empty string.
+#[test]
+fn an_unpaired_surrogate_reads_as_a_replacement_character() {
+    autoreleasepool(|_| {
+        let units: [u16; 4] = [0x61, 0xD83C, 0x62, 0xDF0A];
+        // SAFETY: `+alloc` returns a +1 instance that
+        // `-initWithCharacters:length:` (`@32@0:8r^S16Q24`) consumes, reading
+        // `units.len()` code units during the call and returning +1 or nil.
+        let obj = unsafe {
+            let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
+            let raw = alloc(class(c"NSString"), sel!(alloc));
+            let init: unsafe extern "C-unwind" fn(Id, Sel, *const u16, usize) -> Id = msg();
+            Obj::from_owned(init(
+                raw,
+                sel!(initWithCharacters:length:),
+                units.as_ptr(),
+                units.len(),
+            ))
+        }
+        .expect("NSString from UTF-16");
+        // SAFETY: `obj` holds a live +1 NSString.
+        assert_eq!(unsafe { ns_string_to_rust(obj.id()) }, "a\u{FFFD}b\u{FFFD}");
     });
 }
 

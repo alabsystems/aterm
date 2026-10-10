@@ -838,6 +838,7 @@ mod tests {
             mods: Modifiers::empty(),
             event_type: KeyEventType::Press,
             base_layout: None,
+            layout_text: None,
         };
         assert!(app.rename_input_event(wid, &key(NamedKey::ArrowLeft)));
         assert!(app.rename_input_event(wid, &key(NamedKey::Backspace)));
@@ -868,6 +869,7 @@ mod tests {
                 mods: Modifiers::empty(),
                 event_type: KeyEventType::Press,
                 base_layout: None,
+                layout_text: None,
             }
         ));
         assert_eq!(app.rename_edit_session(wid), None);

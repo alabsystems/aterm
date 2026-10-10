@@ -608,16 +608,29 @@ static WIDTH_LEVEL2: [u8; 7104] = [
     0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x5A,
 ];
 
+/// Hangul Jamo Extended-B vowels (U+D7B0..U+D7C6) and finals
+/// (U+D7CB..U+D7FB): `Hangul_Syllable_Type` V and T, which join the syllable
+/// their leading consonant starts (UAX #29 GB6-GB8) and so take no cell of
+/// their own, like U+1160..U+11FF. The generated table gives them EAW N
+/// (one cell); glibc, unicode-width and wcwidth give them 0.
+const fn is_extended_b_vowel_or_final(cp: u32) -> bool {
+    matches!(cp, 0xD7B0..=0xD7C6 | 0xD7CB..=0xD7FB)
+}
+
 /// Character display width: 0 (zero-width), 1 (narrow), or 2 (wide).
 ///
 /// The table covers U+0000..U+2FFFF. Beyond it, CJK Extensions G/H
 /// (U+30000..U+323AF) are wide, plane 14 (U+E0000..U+E0FFF) is zero-width,
-/// and everything else is narrow.
+/// and everything else is narrow. Hangul Jamo Extended-B vowels and finals
+/// are zero-width (`is_extended_b_vowel_or_final`).
 /// Ambiguous-width characters return 1 (narrow) in this function;
 /// use `char_width_cjk` for CJK mode where ambiguous = 2.
 #[inline]
 pub const fn char_width(c: char) -> usize {
     let cp = c as u32;
+    if is_extended_b_vowel_or_final(cp) {
+        return 0;
+    }
     if cp >= 0x30000 {
         // CJK Unified Ideographs Extension G (U+30000-U+3134A) and
         // Extension H (U+31350-U+323AF) are East Asian Width "W".
@@ -651,6 +664,9 @@ pub const fn char_width(c: char) -> usize {
 #[inline]
 pub const fn char_width_cjk(c: char) -> usize {
     let cp = c as u32;
+    if is_extended_b_vowel_or_final(cp) {
+        return 0;
+    }
     if cp >= 0x30000 {
         // CJK Unified Ideographs Extension G/H are wide.
         if cp <= 0x323AF {

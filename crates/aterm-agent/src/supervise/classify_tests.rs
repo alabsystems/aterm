@@ -878,9 +878,8 @@ fn split_segments_sees_every_separator() {
 
 /// A command substitution is a word of the command around it and its body a
 /// command line of its own; a command whose name is unreadable cannot be
-/// cleared (`R=rm; $R -rf /usr`). Every line of
-/// [`MEASURED_SUBSTITUTION_BYPASSES`] was once classified read-only, because
-/// the splitter cut lines at each `$(` and backtick.
+/// cleared (`R=rm; $R -rf /usr`). [`MEASURED_SUBSTITUTION_BYPASSES`] holds
+/// lines a splitter cutting at each `$(` and backtick called read-only.
 #[test]
 fn a_substitution_is_a_word_of_the_command_around_it() {
     for (cmd, reason) in MEASURED_SUBSTITUTION_BYPASSES {
@@ -888,8 +887,7 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert_eq!(v.reason, *reason, "{cmd:?}");
     }
-    // The peer's own lines: each was refused on main too, and now each
-    // says why in the law's words.
+    // An unreadable command name is refused with its own reason.
     for (cmd, name) in [
         ("R=rm; $R -rf /usr", "$R"),
         ("R=rm; ${R} -rf $HOME", "${R}"),
@@ -1611,12 +1609,12 @@ fn zsh_probe(dir: &std::path::Path, script: &str, secs: u32) -> Option<Result<St
     }
     let secs_arg = secs.to_string();
     let script = format!("{script}\nprint -r -- {ZSH_PROBE_DONE}");
-    let out = std::process::Command::new(perl)
+    let out = aterm_uds::spawnfd::command(perl)
         .args(["-e", ZSH_PROBE_RUNNER, &secs_arg, zsh, "-f", "-c", &script])
         .current_dir(dir)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .expect("zsh runs");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1669,10 +1667,7 @@ fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
 /// experiment, 164 s for a first read of `$userdirs`, which walks the user
 /// database (`getpwent`, an XPC round trip to opendirectoryd) as slowly as
 /// the machine is busy while none of the walk's processes runs, so not
-/// even "a minute in which nothing could run" is a hang. The wall-clock
-/// alarm this replaced bounded a 16-name probe's WHOLE run, ~1,100
-/// processes, which a loaded gate starved past 120 s ("having printed 0
-/// lines": a group with no hit prints nothing).
+/// even "a minute in which nothing could run" is a hang.
 #[cfg(unix)]
 const ZSH_HANG_S: u32 = 1800;
 
@@ -1682,8 +1677,8 @@ const ZSH_HANG_S: u32 = 1800;
 /// machine) and records that it did, and a shell forked from it never
 /// asks again. A non-interactive zsh keeps no entry of the answer, so an
 /// experiment's `${userdirs:=v}` finds the same empty table either way
-/// and only the round trips go: one per value the experiment tries (five
-/// a test run), now one per walk.
+/// and only the round trips go: one per walk instead of one per value the
+/// experiment tries.
 #[cfg(unix)]
 const ZSH_WALK_WARM: &str = ": ${#userdirs}; ";
 
@@ -1762,19 +1757,31 @@ fn zsh_walk(
 }
 
 /// A [`zsh_walk`]'s `list` over every name `zsh -f` declares, then
-/// `extra`: each word that is a name, in that order.
+/// `extra`: each word that is a name, in that order, but a READONLY TIED
+/// parameter, which zsh 5.9 declares one pair of: `zsh_eval_context` and
+/// `ZSH_EVAL_CONTEXT`. zsh refuses any assignment to one before it
+/// evaluates the value, so no experiment can measure one, and a refused
+/// prefix assignment (`ZSH_EVAL_CONTEXT=v :`) aborts `/bin/zsh`:
+/// `save_params` keeps a readonly special itself as its saved copy, and
+/// the error path's `restore_params` hands the setter the parameter's own
+/// storage as the new value, so the setter frees the live array, whose
+/// elements are the static strings `toplevel`, `eval`, … ("pointer being
+/// freed was not allocated", SIGABRT). The arithmetic walk's `NAME=v :`
+/// wrote two `zsh-*.ips` crash reports a run that way until 2026-10-09.
 #[cfg(unix)]
 fn zsh_declared_then(extra: &[&str]) -> String {
     format!(
         "for n in ${{(ou)${{(k)parameters}}}} {}; do \
-           [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] && names+=($n); \
+           [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* \
+              && $parameters[$n] != *readonly*tied* ]] && names+=($n); \
          done; ",
         extra.join(" ")
     )
 }
 
 /// [`zsh_walk`] judges every name once — the declared ones and `extra`,
-/// a name in both, or twice in `extra`, walked once — and returns the
+/// a name in both, or twice in `extra`, walked once, a readonly tied one
+/// ([`zsh_declared_then`]) never — and returns the
 /// experiment's hits in walk order; its floor counts every name listed,
 /// a name listed twice twice. Negative controls: a walk that ends early,
 /// one that skips a verdict, one that prints a line of its own, one that
@@ -1785,9 +1792,16 @@ fn zsh_declared_then(extra: &[&str]) -> String {
 #[test]
 fn a_zsh_walk_judges_every_name_once() {
     let dir = std::path::Path::new("/");
-    let extra = ["PATH", "ZZ_NOT_DECLARED", "ZZ_NOT_DECLARED", "not-a-name"];
+    let extra = [
+        "PATH",
+        "ZZ_NOT_DECLARED",
+        "ZZ_NOT_DECLARED",
+        "not-a-name",
+        "zsh_eval_context",
+    ];
     let list = zsh_declared_then(&extra);
-    let hit = "print .; [[ $n == (PATH|ZZ_NOT_DECLARED) ]] && hit=1";
+    let hit =
+        "print .; [[ $n == (PATH|ZZ_NOT_DECLARED|zsh_eval_context|ZSH_EVAL_CONTEXT) ]] && hit=1";
     let Some(hits) = zsh_walk(dir, "", &list, 100, hit) else {
         return;
     };
@@ -2130,10 +2144,8 @@ fn zsh_parameters_it_runs_are_the_measured_ones() {
 /// run. Its reads run their real programs, never [`ZSH_READ_SHIMS`]:
 /// what a newer zsh does around a program it starts is part of what it
 /// audits. IGNORED BY DEFAULT: it measures a vendor tool (macOS's
-/// `/bin/zsh`), not aterm. It was 47 s alone, 465 s niced at load 22-45
-/// (35955c219) and 960 s at load 90 when [`zsh_walk`] ran a probe per 16
-/// names one by one; as one probe it is ~15,900 processes and ~24 s of
-/// CPU (35 s at a load of 30, measured 2026-09-30). The sample above runs
+/// `/bin/zsh`), not aterm: ~15,900 processes and ~24 s of CPU (35 s at a
+/// load of 30, measured 2026-09-30). The sample above runs
 /// every time; run this one whenever zsh itself changes (a macOS update)
 /// and before editing the hazard lists above:
 /// `targo --unverified test -p aterm-agent --lib -- --ignored every_zsh_parameter`.
@@ -2652,7 +2664,7 @@ fn a_brace_glued_to_a_word_closes_the_group() {
     }
 }
 
-/// THE PLAIN GRAMMAR (decided 2026-09-30): the reads a worker writes
+/// THE PLAIN GRAMMAR: the reads a worker writes
 /// every hour are plain, and every form the zsh sweeps found — each one a
 /// command zsh ran while a check called the line a read — is not, by the
 /// character that opens it rather than by a rule of its own. So is any

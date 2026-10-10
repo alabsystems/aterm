@@ -846,6 +846,10 @@ fn fold<D: AsRef<[u8]>>(
 ) -> Replay {
     let mut term = Terminal::new(header.height.max(1), header.width.max(1));
     term.set_alt_archive_enabled(false);
+    // The live engine's console-host posture, from the policy it resizes
+    // under: a ConPTY session honors conhost's `?9001h`, which decides how an
+    // orphaned alternate screen is left.
+    term.set_console_host_posture(engine.policy);
     if seed_alt {
         term.process(b"\x1b[?1049h");
     }
@@ -1693,6 +1697,50 @@ mod tests {
                 ResizePolicy::Native,
             )
         }
+    }
+
+    /// An audit folds the engine the session ran, console-host posture
+    /// included. A ConPTY tab's live engine honors conhost's `?9001h`
+    /// (`apply_pty_keyboard_posture`), so a killed pager's alternate screen
+    /// is left the conhost way at the shell's next `133;A`. The replay, folded
+    /// under `ResizePolicy::ConPty`, must leave it the same way, or every such
+    /// Windows tab reads `unfaithful`. The native run is the control: the same
+    /// recording on a Unix tab lays the screen out differently, so the ConPTY
+    /// run exercises the conhost layout.
+    #[test]
+    fn an_audit_replays_the_console_host_posture_of_its_policy() {
+        let (cols, rows) = (40u16, 10u16);
+        let mut chunks: Vec<Vec<u8>> = vec![
+            b"\x1b[?9001h\x1b[?1004h".to_vec(),
+            b"history 1\r\nhistory 2\r\nC:\\>less file\r\n\x1b[?1049h\x1b[H\x1b[2J".to_vec(),
+        ];
+        for i in 1..rows {
+            chunks.push(format!("pager {i}\r\n").into_bytes());
+        }
+        chunks.push(b"\x1b]133;D;-1\x07\x1b]133;A\x07C:\\>".to_vec());
+        let mut cursors = Vec::new();
+        for policy in [ResizePolicy::ConPty, ResizePolicy::Native] {
+            let mut rec = Rec::new(cols, rows, false);
+            rec.live.set_console_host_posture(policy);
+            for chunk in &chunks {
+                rec.out(0.01, chunk);
+            }
+            let screen = rec.screen();
+            let report = analyze(
+                &rec.header,
+                &rec.events,
+                Some(&screen),
+                &DriftArgs::default(),
+                policy,
+            );
+            assert_eq!(report.fidelity, Some(true), "{policy:?}: {report:?}");
+            assert_eq!(report.cursor_live, screen.cursor, "{policy:?}");
+            cursors.push(screen.cursor);
+        }
+        assert_ne!(
+            cursors[0], cursors[1],
+            "the recording must reach the conhost layout"
+        );
     }
 
     /// A Claude-shaped 8-row full repaint: synchronized, `ESC[2J`, every row by

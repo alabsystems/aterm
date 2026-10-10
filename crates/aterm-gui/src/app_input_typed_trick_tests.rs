@@ -18,6 +18,7 @@ fn chord(character: char, mods: Modifiers) -> InputEvent {
         key: Key::Character(character),
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -27,6 +28,7 @@ fn named(named: NamedKey) -> InputEvent {
         key: Key::Named(named),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -203,6 +205,7 @@ fn shift_enter_submits_the_line_like_enter() {
             key: Key::Named(NamedKey::Enter),
             mods: Modifiers::SHIFT,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         Source::Human,

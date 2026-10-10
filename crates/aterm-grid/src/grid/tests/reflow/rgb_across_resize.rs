@@ -6,11 +6,10 @@
 //!
 //! The dense RGB ring is what the renderer reads for every ring-stored truecolor
 //! cell. A resize that does not rebuild the extras by column reflow (same size,
-//! rows only, every alternate-screen resize) used to drop it through
-//! `invalidate_rings` without harvesting it, so the cell kept its "RGB overflow"
-//! flag and lost its value: every truecolor foreground and background on screen
-//! fell to the theme default until the program next drew it. The harvest
-//! (`migrate_rgb_ring_to_extras`) copies the ring into the persistent map first.
+//! rows only, every alternate-screen resize) drops the ring in
+//! `invalidate_rings`; unless `migrate_rgb_ring_to_extras` harvests it first, the
+//! cell keeps its "RGB overflow" flag but loses its value and falls to the theme
+//! default until the program redraws it.
 //!
 //! Each row `n` is labelled `R<n>` and painted in a colour that names `n`, so a
 //! row keeps its colour if and only if its own colour follows it wherever the

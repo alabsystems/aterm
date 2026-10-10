@@ -29,16 +29,14 @@ mod iter;
 mod rect;
 mod tracker;
 
-#[cfg(kani)]
-pub(crate) use display_offset::DisplayOffsetDamage;
 pub(crate) use display_offset::compute_display_offset_damage;
 pub use iter::{BitsetRowIterator, DamageBoundsIterator, DamagedRowIterator};
 pub use rect::LineDamageBounds;
 pub use tracker::{DamageTracker, RowDamageBounds};
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub use iter::MergedDamageIterator;
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub use rect::DamageRect;
 
 #[cfg(test)]
@@ -47,9 +45,6 @@ mod property_tests;
 mod tests;
 #[cfg(test)]
 mod tests_display_offset;
-
-#[cfg(kani)]
-mod proofs;
 
 /// Damage state for the terminal grid.
 #[derive(Debug, Clone, Default)]
@@ -64,7 +59,7 @@ pub enum Damage {
 
 impl Damage {
     /// Create a new damage tracker with partial tracking.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[must_use]
     pub fn new(rows: u16) -> Self {
         Damage::Partial(DamageTracker::new(rows))
@@ -198,7 +193,7 @@ impl Damage {
     }
 
     /// Iterate over merged damage rectangles (fewer GPU draw calls).
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn iter_merged(&self, rows: u16, cols: u16) -> MergedDamageIterator<'_> {
         MergedDamageIterator::new(self, rows, cols)
     }

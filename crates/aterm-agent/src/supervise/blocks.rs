@@ -8,10 +8,14 @@
 //! A head row, found by what it starts with:
 //! * `❯` in column 0, then whitespace: the user's turn ([`BlockKind::User`]);
 //! * `⏺` (or `●`; never the session survey) in column 0: the worker's message
-//!   ([`BlockKind::Message`]) or a tool row ([`BlockKind::Tool`]): a call
-//!   (`⏺ Bash(…`, one to three capitalised words run into `(`, or an `(MCP)`
-//!   tool), one of Claude Code's notices (`NOTICE_HEADS`), or a head whose
-//!   `⎿` output is on the next row and which does not end like a sentence;
+//!   ([`BlockKind::Message`]) or a tool row ([`BlockKind::Tool`]): a call as
+//!   the phase reader reads one ([`is_tool_call`]: `⏺ Bash(…`, one to three
+//!   capitalised words run into `(`, an MCP tool `⏺ <server> - <title>
+//!   (MCP)(…)`, an integration's `⏺ Claude in Chrome[<tool>](…)`), one of
+//!   Claude Code's notices (`NOTICE_HEADS`), or a head whose `⎿` output is
+//!   on the next row and which does not end like a sentence;
+//! * a shell-mode command in column 0 (`! cmd`, or `❯ !cmd`): a tool row, its
+//!   output under it, never the person's words;
 //! * a spinner glyph in column 0: a done row ending a turn
 //!   ([`BlockKind::Done`]) or a status row still in flight
 //!   ([`BlockKind::Status`]);
@@ -22,7 +26,7 @@
 //! are a block of their own: the worker's words when indented two columns
 //! like a message's, a tool's output otherwise.
 
-use super::phase::{is_done_row, is_glyph_row, is_survey};
+use super::phase::{is_done_row, is_glyph_row, is_survey, is_tool_call};
 
 /// What a block is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,9 @@ fn is_prose_row(row: &str) -> bool {
 /// The kind of block row `i` opens, or `None` when it continues the one above.
 fn head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
     let row = rows[i].as_str();
+    if !row.starts_with(['⏺', '●']) && is_tool_call(row) {
+        return Some(BlockKind::Tool);
+    }
     if row
         .strip_prefix('❯')
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
@@ -197,37 +204,17 @@ fn head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
 }
 
 /// Whether the `⏺` row at `i` is a tool call or a notice, not the worker's
-/// words (see the module doc).
+/// words (see the module doc). A call is the phase reader's
+/// ([`is_tool_call`]): one reader of "a call" for both, so a report and the
+/// wall placement never disagree about whose words a `⎿` block holds.
 fn is_tool_head(rows: &[String], i: usize) -> bool {
     let text = rows[i].trim_start_matches(['⏺', '●']).trim_start();
-    if NOTICE_HEADS.iter().any(|h| text.starts_with(h)) || text.contains("(MCP)") {
-        return true;
-    }
-    if is_call_head(text) {
+    if NOTICE_HEADS.iter().any(|h| text.starts_with(h)) || is_tool_call(&rows[i]) {
         return true;
     }
     rows.get(i + 1)
         .is_some_and(|next| next.trim_start().starts_with('⎿'))
         && !text.trim_end().ends_with(['.', '!', '?', ':'])
-}
-
-/// `Name(` or `Two Words(`: one to three words, each a capital letter then
-/// letters, digits, `_` or `-`, run straight into `(`.
-fn is_call_head(text: &str) -> bool {
-    let Some(open) = text.find('(') else {
-        return false;
-    };
-    let name = &text[..open];
-    if name.is_empty() || name.ends_with(' ') || name.chars().count() > 40 {
-        return false;
-    }
-    let words: Vec<&str> = name.split(' ').collect();
-    words.len() <= 3
-        && words.iter().all(|w| {
-            w.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                && w.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        })
 }
 
 /// A collapsed tool group: two spaces, then clauses joined by `, ` — each a
@@ -505,6 +492,46 @@ mod tests {
         let tools = rows(&["⏺ Bash(ls)", "  ⎿  a", "  Ran 1 shell command"]);
         assert!(view_rows(&tools, View::Final).is_empty());
         assert!(view_rows(&tools, View::Messages).is_empty());
+    }
+
+    /// ONE READER OF "A CALL" (H6-HARNESS-1, 2026-10-08): every row
+    /// aterm-phase's [`super::super::phase::is_tool_call`] takes for a call
+    /// opens a tool block here — the rows Claude Code 2.1.294 draws for an
+    /// MCP call (verbose output) and for a shell-mode command among them,
+    /// measured in `tools/real-claude-lab` — so `--messages` never prints a
+    /// command's output as anybody's words.
+    #[test]
+    fn the_calls_the_phase_reader_reads_open_tool_blocks() {
+        for row in [
+            "⏺ Bash(cargo test)",
+            "⏺ mcp__github__get_issue(issue_number: 7)",
+            "⏺ github - get_issue (MCP)(owner: \"acme\", issue_number: 7)",
+            "⏺ github - ping (MCP)",
+            "⏺ ticket desk - get_issue (MCP)(owner: \"acme\")",
+            "⏺ Web Search(\"aterm\")",
+            "⏺ Claude in Chrome[get_page_text](tabId: 1)",
+            "! cat notes.txt",
+            "❯ !cat notes.txt",
+        ] {
+            assert!(super::super::phase::is_tool_call(row), "{row}");
+            assert_eq!(
+                kinds(&["⏺ Done.", row, "  ⎿  out"]),
+                [(BlockKind::Message, 0), (BlockKind::Tool, 1)],
+                "{row}"
+            );
+        }
+        let r = rows(&[
+            "❯ check the notes",
+            "",
+            "! cat notes.txt",
+            "  ⎿  Not logged in · Please run /login",
+            "",
+            "⏺ Read them.",
+        ]);
+        assert_eq!(
+            view_rows(&r, View::Messages),
+            rows(&["❯ check the notes", "", "⏺ Read them."])
+        );
     }
 
     /// Rows above the first head: a message's tail (its head scrolled off)

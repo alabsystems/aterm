@@ -327,6 +327,45 @@ mod tests {
         assert_eq!(bulk_run(&[0xF8, 0x80]).1, 0); // 0xF8 is not a valid lead
     }
 
+    /// THE FIRST SEQUENCE IS THE SHIPPED SCALAR ORACLE'S, FOR EVERY INPUT
+    /// CLASS. Every lead byte x every second byte x third and fourth bytes over
+    /// the representatives of every class the decoder tells apart (ASCII, the
+    /// continuation range's edges and the `0x90`/`0xA0` splits that decide
+    /// overlongs, surrogates and the plane bound, a lead, `0xFF`): when
+    /// `Parser::decode_multibyte_char` takes a valid first sequence, the bulk
+    /// lane consumes at least it and its first char is the oracle's; when the
+    /// oracle takes nothing, the bulk lane consumes and emits nothing, so the
+    /// caller's scalar boundary step always makes progress.
+    #[test]
+    fn bulk_first_sequence_matches_scalar_for_every_lead_and_continuation_class() {
+        const CLASSES: [u8; 10] = [0x00, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF];
+        for lead in 0..=u8::MAX {
+            for second in 0..=u8::MAX {
+                for third in CLASSES {
+                    for fourth in CLASSES {
+                        let input = [lead, second, third, fourth];
+                        let mut out: ArrayVec<char, RUN_CAP> = ArrayVec::new();
+                        let consumed = bulk_decode_run(&input, &mut out);
+                        let oracle = (0xC0..=0xF7)
+                            .contains(&lead)
+                            .then(|| crate::Parser::decode_multibyte_char(lead, &input[1..]))
+                            .flatten();
+                        match oracle {
+                            Some((c, continuations)) => {
+                                assert!(consumed > continuations, "{input:02x?}");
+                                assert_eq!(out.as_slice().first(), Some(&c), "{input:02x?}");
+                            }
+                            None => {
+                                assert_eq!(consumed, 0, "{input:02x?}");
+                                assert!(out.is_empty(), "{input:02x?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Exhaustive-ish differential fuzz: random byte buffers, bulk vs the scalar
     /// reference must agree on (chars, consumed) for every one.
     #[test]

@@ -10,81 +10,81 @@ use super::*;
 use super::{emit::*, seam::*, spawn::*};
 use crate::cursor_trail::{CursorTrail, TrailConfig};
 
-/// Band moves and the Codex composer: `cursor_glow/tests/band_move.rs`.
+/// Band moves and the Codex composer.
 mod band_move;
-/// The beam style: `cursor_glow/tests/beam.rs`.
+/// The beam style.
 mod beam;
-/// Cold program motion stays dark: `cursor_glow/tests/cold_motion.rs`.
+/// Cold program motion stays dark.
 mod cold_motion;
-/// The comet style: `cursor_glow/tests/comet.rs`.
+/// The comet style.
 mod comet;
-/// Backspace and kill: the poof, the steam and their licences: `cursor_glow/tests/erase.rs`.
+/// Backspace and kill: the poof, the steam and their licences.
 mod erase;
-/// The fire style: meteors, the EMBERFORGE thermal laws, the forge field: `cursor_glow/tests/fire.rs`.
+/// The fire style: meteors, the EMBERFORGE thermal laws, the forge field.
 mod fire;
-/// The byte-exact deletion and flat-spelling goldens: `cursor_glow/tests/goldens.rs`.
+/// The byte-exact deletion and flat-spelling goldens.
 mod goldens;
-/// Typing heat and the laser, sparkle and laser bursts: `cursor_glow/tests/heat_and_laser.rs`.
+/// Typing heat and the laser, sparkle and laser bursts.
 mod heat_and_laser;
-/// The Ink wrap seam trace: `cursor_glow/tests/ink_wrap_seam.rs`.
+/// The Ink wrap seam trace.
 mod ink_wrap_seam;
-/// Delivered inserts: `cursor_glow/tests/insert.rs`.
+/// Delivered inserts.
 mod insert;
-/// Insert witnesses, receipts and spinner rows: `cursor_glow/tests/insert_witness.rs`.
+/// Insert witnesses, receipts and spinner rows.
 mod insert_witness;
-/// The licence seam and its derived-model conformance: `cursor_glow/tests/licence.rs`.
+/// The licence seam and its derived-model conformance.
 mod licence;
-/// Light is born on a move, fades to empty, and keeps its invariants: `cursor_glow/tests/lifecycle.rs`.
+/// Light is born on a move, fades to empty, and keeps its invariants.
 mod lifecycle;
-/// Shared momentum and the composed-pane folds: `cursor_glow/tests/momentum.rs`.
+/// Shared momentum and the composed-pane folds.
 mod momentum;
-/// The park: Ink's rewrite observed as two sync brackets: `cursor_glow/tests/park.rs`.
+/// The park: Ink's rewrite observed as two sync brackets.
 mod park;
-/// The phaser band and coalesced echo sweeps: `cursor_glow/tests/phaser.rs`.
+/// The phaser band and coalesced echo sweeps.
 mod phaser;
-/// The rainbow kitty ribbon: `cursor_glow/tests/rainbow.rs`.
+/// The rainbow kitty ribbon.
 mod rainbow;
-/// Wrap re-anchors, bridged moves and box growth: `cursor_glow/tests/reanchor.rs`.
+/// Wrap re-anchors, bridged moves and box growth.
 mod reanchor;
-/// The resident-state cap and its derived model: `cursor_glow/tests/resident_cap.rs`.
+/// The resident-state cap and its derived model.
 mod resident_cap;
-/// The review's findings on the stall, fold and park: `cursor_glow/tests/review.rs`.
+/// The review's findings on the stall, fold and park.
 mod review;
-/// Landing rings and halo culling: `cursor_glow/tests/rings.rs`.
+/// Landing rings and halo culling.
 mod rings;
 /// The seam's licence-class laws (one-shots spend once, a glyph supersedes
 /// nothing whose echo is owed, one kill one `Kill`, a held park is a wake
 /// source).
 mod seam_laws;
-/// Typing sound cues and the key-time ledger: `cursor_glow/tests/sound.rs`.
+/// Typing sound cues and the key-time ledger.
 mod sound;
-/// The stall: keys typed into a stalled event loop: `cursor_glow/tests/stall.rs`.
+/// The stall: keys typed into a stalled event loop.
 mod stall;
-/// The fold after a stall: `cursor_glow/tests/stall_fold.rs`.
+/// The fold after a stall.
 mod stall_fold;
-/// Fresh-ink pop, the typing wake and the `trail` status row: `cursor_glow/tests/status.rs`.
+/// Fresh-ink pop, the typing wake and the `trail` status row.
 mod status;
-/// The stray a fresh hint licenses: `cursor_glow/tests/stray.rs`.
+/// The stray a fresh hint licenses.
 mod stray;
-/// Style-switch crossfades, the non-fire crown and pooled bolts: `cursor_glow/tests/style_switch.rs`.
+/// Style-switch crossfades, the non-fire crown and pooled bolts.
 mod style_switch;
-/// Glyph tint and light-theme ink: `cursor_glow/tests/tint.rs`.
+/// Glyph tint and light-theme ink.
 mod tint;
-/// Trail Packs (the `GlowStyle::Custom` data path): `cursor_glow/tests/trail_pack.rs`.
+/// Trail Packs (the `GlowStyle::Custom` data path).
 mod trail_pack;
-/// Typed stamps across gestures, hidden carets and program rows: `cursor_glow/tests/typed_stamps.rs`.
+/// Typed stamps across gestures, hidden carets and program rows.
 mod typed_stamps;
-/// Unknown-width inserts and their orphan keys: `cursor_glow/tests/unknown_insert.rs`.
+/// Unknown-width inserts and their orphan keys.
 mod unknown_insert;
-/// Rainbow kitty v2 at the seam: `cursor_glow/tests/v2_seam.rs`.
+/// Rainbow kitty v2 at the seam.
 mod v2_seam;
-/// The wake census at the seam: `cursor_glow/tests/wake_census.rs`.
+/// The wake census at the seam.
 mod wake_census;
-/// The water style: `cursor_glow/tests/water.rs`.
+/// The water style.
 mod water;
-/// The ribbon's witness rows and the exact-key credit ring: `cursor_glow/tests/witness.rs`.
+/// The ribbon's witness rows and the exact-key credit ring.
 mod witness;
-/// The word move sounds every time: `cursor_glow/tests/word_nav.rs`.
+/// The word move sounds every time.
 mod word_nav;
 
 fn ms(n: u64) -> Duration {
@@ -167,8 +167,7 @@ fn geom() -> Geom {
 fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     GlowConfig {
         enabled,
-        // The SPECTRUM face — v0.28's shipped default, and the one the
-        // whole-frame golden pins for `classic`.
+        // The SPECTRUM face, which the whole-frame golden pins for `classic`.
         classic_mono: false,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0
@@ -642,45 +641,8 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
 /// styles (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`).
 /// The four kitty rows are pinned by
 /// `rainbow_kitty_is_byte_identical_to_the_seam_era_v2`, so any drift is a
-/// decision.
-///
-/// NOT RE-BAKED AT THE 0.86 CANDIDATE'S FINAL CATCH-UP WITH MAIN
-/// (2026-09-15), and that is a measurement, not an omission. These four
-/// kitty numbers are the candidate's, set when Rainbow Path v3 last
-/// caught up with main; the catch-up before the cut moved none of them.
-/// Main's incoming round carries this table with the SAME four kitty
-/// rows it had at the merge base — every commit in it is a refactor, a
-/// doc, a simplification or a test, and none moved a v2 byte — so the
-/// candidate's numbers are the only ones that ever described the merged
-/// tree, and the three-way merge kept them because only one side had
-/// moved. Read off THIS tree's own run to confirm it rather than assume
-/// it: all twelve rows green, `checked == 4` (the pin is not vacuous),
-/// and the eight non-kitty rows green under
-/// `the_other_nine_styles_are_byte_identical_with_v2_unconditional` —
-/// the control that says the other nine trail styles did not move
-/// either.
-///
-/// **RE-BAKED 2026-09-16 — THE CROSSING'S SHARE CAP.** All four kitty
-/// rows moved and the eight non-kitty rows held. The cause is the ONE
-/// SPECTRUM's table and nothing in this file:
-/// [`crate::spectrum::SPECTRUM_CROSSING_SHARE_CAP`] holds the green→blue
-/// leg to `167` of the table's `510` steps so that yellow keeps its share
-/// of the arc, which re-spends every leg and so moves every entry of
-/// `SPECTRUM_LUT` from index `50` on. Every quad a rainbow emitter writes
-/// moves with it. That is the change, not a side effect of one, and no
-/// smaller re-bake exists: a kitty row IS the arc's bytes.
-///
-/// THE CONTROLS THAT HELD, read off this tree's own run:
-///
-/// * the eight non-kitty rows of this table are unchanged to the bit, and
-///   `the_other_nine_styles_are_byte_identical_with_v2_unconditional` is
-///   green over them — the other trail styles do not read the arc;
-/// * `licensed_typed_parity`'s nine-style golden moved **only entry 2**
-///   (RainbowKitty); the other eight are byte-identical, which is that
-///   test's own non-vacuity control and it still separates them;
-/// * `checked == 4`, so the pin is not vacuous, and
-///   `the_flat_spelling_collapses_every_comet_branch_byte_for_byte`'s own
-///   `assert_ne!` still separates the flat body from the default one.
+/// decision. A kitty row is the arc's bytes: any change to
+/// `crate::spectrum`'s table moves all four.
 ///
 /// THE RE-BAKE LAW. A v2 change that moves a kitty byte re-reads exactly
 /// the kitty rows it moves — and the flat spelling's twins,
@@ -693,60 +655,6 @@ fn deletion_script(cfg: &GlowConfig, g: Geom, reduced: bool) -> u64 {
 /// the other rows and holds these. Every past re-bake — what moved, the
 /// numbers before and after, which control held — is in `git log -L` on
 /// this table and in CHANGELOG.md.
-///
-/// (MERGE, 0.86: main's re-bake law above SUPERSEDES the candidate's
-/// running list of every past bake, which stood here and is now git's —
-/// `git log -L` on this table still reads it, entry for entry, and the
-/// law states what each entry had to show. The candidate loses no claim
-/// by it: the one paragraph a bake must leave behind is the current
-/// one, and that is the paragraph above. The table's name for the flat
-/// twins is `FLAT_GOLDENS`, not `PRE_COMET_GOLDENS` — see its doc.)
-/// **RE-BAKED 2026-09-15 (the four kitty rows only), AND THE REASON IS
-/// THE ARC ITSELF.** `crate::spectrum`'s table moved: the green→blue
-/// crossing's authored roof, its four pacing knots and — the part that
-/// moves every entry — its exemption from the perceptual pace were
-/// deleted as the retired no-cyan ruling's last machinery, so all seven
-/// anchors landed at new indices (`[0, 63, 142, 258, 394, 471, 510]` ->
-/// `[0, 50, 112, 204, 419, 479, 510]`) and every kitty row that reads a
-/// colour off the arc folds a different byte. The eight non-kitty rows
-/// are UNCHANGED, which is this pin doing its job: the deletion reached
-/// the rainbow family and nothing else.
-/// **RE-BAKED 2026-09-16, THE EXHAUST (§33), and the four kitty rows
-/// stand where its last law left them.** The round's laws in order —
-/// `Stardust::sow_exhaust` (one transient grain per key), the sky's share
-/// `rk::stardust::STREAM_SHARE_CW` 0.35 → 1.05, the blank-frontier clamp
-/// reading the band's row off the flight's own pixels, the grain yielding
-/// within `rk::stardust::EXHAUST_HEADROOM` of the cap, and the grain
-/// needing the cell behind the caret proved blank — moved dark, light and
-/// underline; **reduced never moved**, which is the decomposition: the
-/// exhaust's first gate is `cfg.reduced_motion` and the slipstream is a
-/// position law `Star::pos` ignores under it. The last two laws moved
-/// underline (and, for the headroom, dark) alone: the script's ~28 cps
-/// tail sits in the headroom band, and under `underline` every grain was
-/// a sub-cell twitch behind the just-echoed glyph. Each was decomposed
-/// by switching it off and reading the previous number. The eight
-/// non-kitty rows never moved. See `FLAT_GOLDENS` for the same bakes.
-/// **RE-BAKED 2026-09-21: ribbon quads carry a per-column gradient**
-/// (`GlowQuad::color2` — `ribbon_beam` samples the colour at each slab's
-/// two edges and the quad ramps between them, so a whole-cell slab is no
-/// longer a flat block; the coverage is still the slab's centre sample).
-/// A gradient quad folds a THIRD damage word carrying its right edge, so
-/// all four kitty rows move (dark `13_957_692_697_408_025_534` →
-/// `383_721_728_202_092_274`, light `16_474_978_137_331_214_836` →
-/// `5_202_336_454_404_496_754`, underline `11_627_668_675_227_657_479`
-/// → `544_488_007_139_041_733`, reduced `11_365_708_919_978_438_696` →
-/// `13_592_174_565_784_071_210`); the eight non-kitty rows fold flat
-/// quads whose two words are the pre-gradient pair bit for bit, and
-/// `the_other_nine_styles_are_byte_identical_with_v2_unconditional` held
-/// them unchanged on the same run.
-/// **RE-BAKED 2026-09-30: a typed lay schedules the tick that judges it**
-/// (`CursorGlow::TORN_REST_S`, the torn-redisplay recall): 32 ms after
-/// each typed echo the engine asks for one wake to see where the caret
-/// rests. Only the reduced row moved (`13_592_174_565_784_071_210` →
-/// `8_179_550_295_111_973_776`): the others already ask for frame
-/// cadence, which is earlier. Decomposed: with the wake arm and its
-/// `is_active` term removed the row reads its previous number, so the
-/// move is the deadline reading and no light; the script recalls nothing.
 const DELETION_GOLDENS: [(&str, u64); 12] = [
     ("Lumen dark", 1_264_411_311_373_267_895),
     ("Phaser dark", 2_726_566_909_586_900_035),
@@ -772,76 +680,12 @@ const DELETION_GOLDENS: [(&str, u64); 12] = [
 ///
 /// These rows move with [`DELETION_GOLDENS`] on every change that is NOT
 /// a comet branch — the seam feeds both spellings the same events, and
-/// the landing, the attach, the boundary law and the soft end stand
-/// under the flat body too — and hold when only a comet branch changes.
-/// Re-read them whenever the kitty rows are re-baked; the history is in
-/// `git log -L` on this table.
-///
-/// THE TABLE IS NO LONGER A TIME CAPSULE, and that is why it is named
-/// `FLAT_GOLDENS` and not `PRE_COMET_GOLDENS`. These four stopped being
-/// the bytes of the tree as it stood before the comet landed, because
-/// the v3 merge moves laws the flag does not gate: the phrase rest
-/// (0.75 s → 0.90 s of grace at the floor), the erase/kill phrase hold,
-/// the per-row retract target and the overlay wake on its flight clock.
-/// The FLAG'S OWN CLAIM is unchanged and still measured here — under it
-/// the four rows fold to THESE numbers, under the default body to four
-/// others — so the comet's A/B gate is still byte-exact.
-///
-/// RE-BAKED 2026-09-15 WITH [`DELETION_GOLDENS`], AND FOR ITS ONE
-/// REASON. The green→blue re-pace ([`rk::ribbon::CROSS_PACE`]) is not a
-/// comet branch — the flag gates the comet profile, the vivid rail and
-/// the from-the-hand wipe, not WHICH STOP a walk position resolves to —
-/// so all four flat rows move with the four default ones, which is
-/// exactly what the paragraph above says must happen. Measured the same
-/// way: with the walk forced to the identity these four read
-/// `13_180_914_282_442_234_019`, `16_869_065_810_935_775_429`,
-/// `6_565_210_254_762_879_397` and `6_253_451_302_876_110_283` — the
-/// bytes v0.86.0 shipped, to the bit — so the walk is the whole of the
-/// move here too. The `assert_ne!` control in
-/// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` is
-/// green over the new numbers: the comet body still folds every one of
-/// these four rows somewhere else, so the collapse is still a
-/// measurement and not a vacuous pin.
-///
-/// (The catch-up note below is kept for the history it records.)
-///
-/// NOT RE-BAKED AT THE 0.86 CANDIDATE'S FINAL CATCH-UP WITH MAIN
-/// (2026-09-15), for the same measured reason [`DELETION_GOLDENS`]
-/// was not: main's incoming round moved no byte of either spelling, so
-/// these four stand where the candidate's last catch-up left them.
-/// Confirmed on this tree's own run, not assumed — all four fold to
-/// these numbers under the flag, and the `assert_ne!` control below is
-/// green over them, so the collapse the table pins is still a
-/// measurement and not a vacuous pin.
-///
-/// (MERGE, 0.86: main's two paragraphs at the head are its statement of
-/// this table and are kept verbatim but for the name; the candidate's
-/// rename and its reason are kept because the code uses `FLAT_GOLDENS`
-/// and "pre-comet" is no longer true of these bytes.)
-///
-/// RE-BAKED 2026-09-16 WITH THE DEFAULT ROWS, THE EXHAUST (§33). The
-/// exhaust is a STARDUST population and the flat spelling is a RIBBON
-/// BODY, so the two are orthogonal: every law of the round moves the
-/// same rows here as on [`DELETION_GOLDENS`] (dark, light and underline
-/// for the exhaust and the sky's share; underline alone for the frontier
-/// clamp and the blank-cell gate; dark and underline for the headroom),
-/// with reduced byte-identical on both tables throughout. The
-/// `assert_ne!` control in
-/// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` is
-/// green over every bake: the comet body still folds all four rows
-/// somewhere else, so the collapse is a measurement and not a vacuous
-/// pin.
-/// **RE-BAKED 2026-09-21: ribbon quads carry a per-column gradient** (the
-/// same cause as [`DELETION_GOLDENS`]'s bake of that date — the flat
-/// spelling collapses the comet BODY, not the colour walk, so its slabs
-/// ramp too): dark `14_766_156_058_099_546_727` →
-/// `17_890_278_511_770_188_755`, light `15_009_626_345_715_177_661` →
-/// `6_430_388_712_169_283_571`, underline `18_121_524_929_398_043_921` →
-/// `15_379_506_098_573_732_577`, reduced `9_256_275_961_493_287_119` →
-/// `3_073_631_414_449_164_399`. The `assert_ne!` control still holds.
-/// **RE-BAKED 2026-09-30 with [`DELETION_GOLDENS`]** (the typed lay's
-/// rest wake): reduced `3_073_631_414_449_164_399` →
-/// `12_943_034_956_261_997_624`, the other three unchanged.
+/// the landing, the attach, the boundary law, the soft end and the colour
+/// walk stand under the flat body too — and hold when only a comet branch
+/// changes. Re-read them whenever the kitty rows are re-baked; the history
+/// is in `git log -L` on this table. Older docs call it `PRE_COMET_GOLDENS`;
+/// it was renamed because laws the flag does not gate have since moved these
+/// bytes away from the pre-comet tree's.
 const FLAT_GOLDENS: [(&str, u64); 4] = [
     ("RainbowKitty dark", 17_890_278_511_770_188_755),
     ("RainbowKitty light", 6_430_388_712_169_283_571),

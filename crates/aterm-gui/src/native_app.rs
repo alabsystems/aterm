@@ -2249,8 +2249,11 @@ pub(crate) enum AppEffect {
     /// Open the log directory (Settings ▸ Messages' "Open Log Folder") — `aterm.log`,
     /// `messages.log`, `packages.log` and the crash reports side by side. The host
     /// resolves the directory itself and opens it through NSWorkspace: no shell, no
-    /// Terminal, no path from the view.
-    OpenLogFolder,
+    /// Terminal, no path from the view. It answers `ExternalOpenFinished`, so the
+    /// page can say a failure (ruling 441 (t)).
+    OpenLogFolder {
+        reply: ReplyToken<ExternalOpenOutcome>,
+    },
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
 }
@@ -2439,8 +2442,11 @@ impl UpdateCx<'_> {
         self.effects.push(AppEffect::OpenPackagesLog);
     }
 
-    pub(crate) fn open_log_folder(&mut self) {
-        self.effects.push(AppEffect::OpenLogFolder);
+    pub(crate) fn open_log_folder(&mut self) -> OperationId {
+        let reply = self.view_reply();
+        let operation = reply.operation;
+        self.effects.push(AppEffect::OpenLogFolder { reply });
+        operation
     }
 
     pub(crate) fn clipboard(&mut self, request: ClipboardRequest) -> OperationId {

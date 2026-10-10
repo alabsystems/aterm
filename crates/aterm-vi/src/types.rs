@@ -5,16 +5,11 @@
 //! Vi mode types: motions, coordinates, search state, and marks.
 //! Independent of the grid implementation.
 
-#[cfg(not(kani))]
 use std::collections::HashMap;
 
 use aterm_types::BufferCommand;
 
-/// Vi marks storage — uses VerifyMap (BTreeMap-based) under Kani to avoid
-/// CCRandomGenerateBytes FFI issue from HashMap's RandomState (#5889).
-#[cfg(kani)]
-type ViMarksMap = aterm_types::verification::stubs::VerifyMap<char, ViPoint>;
-#[cfg(not(kani))]
+/// Vi marks storage.
 type ViMarksMap = HashMap<char, ViPoint>;
 
 // ---------------------------------------------------------------------------
@@ -23,11 +18,12 @@ type ViMarksMap = HashMap<char, ViPoint>;
 
 /// A scrollback-aware point for vi mode navigation.
 ///
-/// Row 0 is the top of the visible screen; negative rows index into
+/// Row 0 is the top of the live screen at every display offset (the window
+/// draws the point at `line + display_offset`); negative rows index into
 /// scrollback, so motions treat screen and scrollback uniformly.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Default)]
 pub struct ViPoint {
-    /// Logical line: 0 = visible top, negative = scrollback.
+    /// Logical line: 0 = live screen top, negative = scrollback.
     pub line: i32,
     /// Column (0-indexed).
     pub col: u16,

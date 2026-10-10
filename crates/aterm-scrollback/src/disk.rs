@@ -16,11 +16,7 @@ use super::line::{Line, MAX_DECODE_PAGE_LINES};
 use crate::mmap::MmapMut;
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(not(kani))]
 use std::collections::HashMap;
-// Under Kani, BTreeMap avoids unsupported CCRandomGenerateBytes FFI from HashMap's hasher seed.
-#[cfg(kani)]
-use std::collections::BTreeMap as HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +26,7 @@ struct CacheEntry {
     last_access: u64,
     /// Byte cost of this cached page (== the amount added to `cache_bytes` on
     /// insert), stored so eviction can subtract it exactly and keep the running
-    /// `cache_bytes` sum consistent (Kani `cache_byte_limit_respected`, post-cond 3).
+    /// `cache_bytes` sum consistent (`disk_cold_cache_byte_limit_is_enforced`).
     bytes: usize,
 }
 
@@ -64,8 +60,8 @@ pub struct DiskColdTier {
     /// alongside `cache_size` so a malicious `.dtrm` with a few huge (up to the
     /// 64 MiB per-page decompression cap) pages cannot pin `cache_size × 64 MiB`
     /// of decompressed lines resident — the cold read cache is deliberately
-    /// excluded from the tier memory budget, so this is its only byte bound. The
-    /// Kani proof `cache_byte_limit_respected` models this eviction.
+    /// excluded from the tier memory budget, so this is its only byte bound
+    /// (`disk_cold_cache_byte_limit_is_enforced`).
     cache_byte_limit: usize,
     /// Running total of cached decompressed-page bytes; maintained ==
     /// Σ `CacheEntry::bytes` at every cache mutation (insert/evict/clear).
@@ -546,7 +542,3 @@ mod front_truncation;
 
 #[path = "disk_compaction.rs"]
 mod compaction;
-
-#[cfg(kani)]
-#[path = "disk_kani.rs"]
-mod proofs;

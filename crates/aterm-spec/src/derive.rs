@@ -63,9 +63,7 @@
 //! scalar (bounded integers and booleans), so function- or array-valued state
 //! needs an `Expr` extension first; bounds are finite; and a single-action model
 //! must not name its action `Append`, which clashes with a `ty` Sequences builtin.
-//! (`ty trace validate` checks `Next` on every transition, not only the first,
-//! as re-verified against the `ty` 0.10.0 source on 2026-06-18; pinning `Init`
-//! to each predecessor keeps each transition independently checkable.)
+//! (`ty trace validate` checks `Next` on every transition, not only the first.)
 
 use std::collections::BTreeMap;
 
@@ -250,11 +248,8 @@ impl Expr {
         trust_verify,
         trust::contract_panic(message_contains = "InRange (`lo..hi`) is set-valued")
     )]
-    // NO skip: `eval` VERIFIES. It is a recursive model-checker evaluator over a
-    // `Box<Expr>` tree — historically the workspace's hardest function — and it now
-    // discharges (aterm-spec gate CONDITIONAL-PASS, exit 0: 0 failed, 0 unknown) with
-    // eval's only rows being the 3 INTENTIONAL model-type-error `panic!` arms
-    // (annotated above), which land in the non-blocking contract-panic ledger column.
+    // NO skip: `eval` verifies. Its only rows are the 3 intentional
+    // model-type-error `panic!` arms annotated above (contract-panic ledger column).
     pub fn eval(&self, env: &BTreeMap<&'static str, i64>) -> Value {
         match self {
             Expr::Int(i) => Value::Int(*i),
@@ -265,11 +260,9 @@ impl Expr {
                 Some(v) => *v,
                 None => panic!("unbound identifier `{n}` in model evaluation"),
             }),
-            // `wrapping_add`/`wrapping_sub`: a spec-model interpreter must be TOTAL on
-            // every syntactically valid Expr (an overflow is a spec-arithmetic modelling
-            // fact to observe, not a runtime abort), matching `Model::successors`, which
-            // already uses `wrapping_add` for the same reason. This makes `eval`
-            // panic-free arithmetic-wise, so the whole function discharges without a skip.
+            // Wrapping: the interpreter must be TOTAL on every valid Expr (an
+            // overflow is a modelling fact to observe, not an abort), as in
+            // `Model::successors`; this keeps `eval` panic-free without a skip.
             Expr::Add(a, b) => Value::Int(a.eval(env).as_int().wrapping_add(b.eval(env).as_int())),
             Expr::Sub(a, b) => Value::Int(a.eval(env).as_int().wrapping_sub(b.eval(env).as_int())),
             Expr::Gt(a, b) => Value::Bool(a.eval(env).as_int() > b.eval(env).as_int()),
@@ -318,9 +311,7 @@ impl Expr {
         }
     }
 
-    /// Render as a TLA+ expression. `prime` marks state-variable references with a
-    /// trailing `'` (used on action right-hand sides? no — RHS reads pre-state, so
-    /// `prime` is false there; it exists for completeness of variable rendering).
+    /// Render as a TLA+ expression.
     // Skip: recursive TLA+ rendering — String allocs + the `Extend`/format
     // absent-body class. Spec-model machinery, same tier as `eval`.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -338,8 +329,7 @@ impl Expr {
             // executable twin (the exact drift this module promises cannot happen). So
             // parenthesize the RHS of a subtraction when it is itself an Add/Sub. Only
             // this position needs it: `+`'s operands and `-`'s LEFT operand are all
-            // associativity-safe, and comparisons bind looser, so no committed model's
-            // rendered output changes (no golden-string test regresses).
+            // associativity-safe, and comparisons bind looser.
             Expr::Sub(a, b) => {
                 let rhs = b.to_tla();
                 let rhs = if matches!(**b, Expr::Add(..) | Expr::Sub(..)) {
@@ -575,30 +565,23 @@ impl Model {
     }
 
     /// The evaluation environment for `state`: the model's constants, then the
-    /// state's variables on top (so a state variable SHADOWS a same-named
-    /// constant — exactly the order the by-name entry points have always used).
+    /// state's variables on top (a state variable SHADOWS a same-named constant).
     ///
     /// Public because the env is a pure function of `(consts, pre-state)`, so it
-    /// is IDENTICAL across every action and every invariant evaluated at one
-    /// state. A driver that evaluates many of them at one state — the BFS in
-    /// [`crate::interp`] — builds it once here and passes it to
-    /// [`Model::successors_in`] / `Invariant::expr.eval`, instead of paying a
-    /// fresh `BTreeMap` allocation plus a full re-insert per (state, action) and
-    /// per (state, invariant). One full-registry BMC sweep built ~1.6M throwaway
-    /// maps this way (~109k states x ~8.9 actions + ~5.8 invariants); hoisting it
-    /// takes the sweep from 2.54 s to 0.75 s in release, byte-identical results.
+    /// is IDENTICAL across every action and invariant evaluated at one state. The
+    /// BFS in [`crate::interp`] builds it once per state and passes it to
+    /// [`Model::successors_in`] / `Invariant::expr.eval`; per-(state, action)
+    /// rebuilding cost a full-registry BMC sweep 2.54 s against 0.75 s (release).
     // Skip: the audited `BTreeMap` clone/entry alloc class of `init_state`.
     // Model-derivation machinery, same tier as `successors`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn eval_env(&self, state: &BTreeMap<&'static str, i64>) -> BTreeMap<&'static str, i64> {
-        // The state's map copied whole (a structural clone compares no keys),
-        // then each constant the state does not bind. The same map as the
-        // constants collected and then extended by the state: a state variable still shadows a
-        // same-named constant, and of two same-named constants the LAST still
-        // wins (hence the reverse walk with `or_insert`). Building it the other
-        // way round re-inserted every state variable by name, string-comparing
-        // it against a dozen others, and `memcmp` led the profile of every
-        // by-name walk (2026-10-06).
+        // The state's map cloned whole (a structural clone compares no keys),
+        // then each constant the state does not bind. A state variable shadows a
+        // same-named constant, and of two same-named constants the LAST wins
+        // (hence the reverse walk with `or_insert`). Inserting the state into the
+        // constants instead string-compares every variable, and that `memcmp`
+        // led the profile of every by-name walk.
         let mut env = state.clone();
         for (k, v) in self.consts.iter().rev() {
             env.entry(*k).or_insert(*v);
@@ -629,15 +612,9 @@ impl Model {
     /// so validating it strictly checks that `Next` admits the real
     /// `prev -> next` transition.
     ///
-    /// Open since 2026-10-01. It was PARAMETERIZED — `Init == v = v_init` with a
-    /// CONSTANT `<var>_init` per variable, which [`Model::transition_cfg`] pinned
-    /// to `prev` — and on step 0 that is the same tautology `TRUE` is, since the
-    /// trace's step 0 and the pin were both rendered from `prev`. Actions, `Next`
-    /// and `vars` come from the one shared renderer, and `<var>_init` appeared
-    /// only in `Init`, so step 1 is judged exactly as before. What the pin cost
-    /// was a cfg per `prev`: aterm-agent's footer suite handed `ty` 2,688
-    /// distinct cfgs for one byte-identical spec, where the open form needs one
-    /// per `(model, overrides)`.
+    /// Open rather than pinned to `prev`: the trace's step 0 already fixes the
+    /// pre-state, and an open `Init` needs one cfg per `(model, overrides)`
+    /// instead of one per `prev` (aterm-agent's footer suite needed 2,688).
     pub fn transition_spec(&self) -> String {
         let const_names: Vec<String> = self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
         self.render(&const_names, "TRUE")
@@ -735,13 +712,12 @@ impl Model {
     /// detection ON (`CHECK_DEADLOCK TRUE`) — the liveness twin of the safety
     /// configs, for request/reply "wedge" models (e.g. the forward handshake).
     ///
-    /// This closes the gap the original audit documented: the safety models
-    /// verify reachable-bad-STATE properties, but a blocking-call deadlock (the
+    /// Safety models check reachable bad STATES, but a blocking-call deadlock (the
     /// `drain_buffered` `fill_buf` hang — server parked reading more input while
     /// the client is parked awaiting the reply) is a two-party all-blocked wedge
     /// that only `CHECK_DEADLOCK` catches. The default `to_cfg`/`to_cfg_with` keep
-    /// `CHECK_DEADLOCK FALSE`, so the 14 existing models — which legitimately stop
-    /// at bounded `MaxSeq`/`MaxN` terminals — are untouched.
+    /// `CHECK_DEADLOCK FALSE`, since most models legitimately stop at bounded
+    /// `MaxSeq`/`MaxN` terminals.
     ///
     /// DISCIPLINE (empirically enforced by `ty`): a model checked this way MUST
     /// give every legitimate work-complete terminal an explicit guarded
@@ -894,18 +870,11 @@ impl Model {
         // `fire` selects). An empty choice list collapses the product to none.
         let mut acc: Vec<BTreeMap<&'static str, i64>> = vec![state.clone()];
         for (var, vals) in choices {
-            // Deterministic update (`var' = expr`, the overwhelming majority —
-            // the registry averages 3.18 updates per action): exactly one
-            // candidate, so this step multiplies the product by 1. Write it into
-            // every accumulated state IN PLACE rather than cloning the whole
-            // accumulator into a fresh `Vec` and dropping the old one — an
-            // action with k deterministic updates used to build and discard k
-            // maps to produce 1 successor. Result is identical: `insert` on the
-            // existing map yields exactly what clone-then-insert did (`BTreeMap`
-            // orders by KEY, not insertion), and accumulator order is preserved
-            // 1:1, so successor ORDER — which `fire` reads as the canonical
-            // lower-bound representative — is unchanged. Worth -20% on a
-            // full-registry BMC sweep on top of the `eval_env` hoist.
+            // Deterministic update (`var' = expr`, the overwhelming majority):
+            // exactly one candidate, so write it into every accumulated state IN
+            // PLACE instead of cloning the accumulator (-20% on a full-registry
+            // BMC sweep). Accumulator order is preserved, so the successor `fire`
+            // reads as the canonical representative is unchanged.
             if let [only] = vals[..] {
                 for s in &mut acc {
                     s.insert(var, only);
@@ -963,8 +932,6 @@ impl Model {
         let Some(act) = self.actions.iter().find(|a| a.name == action) else {
             panic!("no action `{action}` in model `{}`", self.name)
         };
-        // One spelling of "the evaluation environment" for every entry point —
-        // see `eval_env`; this is the same consts-then-state map as before.
         let env = self.eval_env(state);
         act.guard
             .as_ref()
@@ -1006,8 +973,8 @@ impl Model {
 }
 
 // ---- The model catalog: the *_model() data constructors, split by family ----
-// (pure code motion). The `pub use` re-exports keep every existing
-// `crate::derive::*_model` path — and the xref registry — compiling unchanged.
+// The `pub use` re-exports keep every `crate::derive::*_model` path (and the
+// xref registry) flat.
 mod models_agent_verdict;
 mod models_atpkg_contention_release;
 mod models_atpkg_flip_quiet;
@@ -1083,6 +1050,7 @@ mod models_session;
 mod models_subscribe_announcement;
 mod models_supervise;
 mod models_supervise_accounts;
+mod models_text_selection_lifecycle;
 mod models_title_summary;
 mod models_trust_facts;
 mod models_typed_rekey;
@@ -1154,8 +1122,9 @@ pub use models_harness_goal::*;
 pub use models_harness_host::{
     harness_codex_exit_witness_model, harness_commit_owed_model, harness_exit_record_model,
     harness_handoff_claim_model, harness_leave_model, harness_relaunch_on_exit_model,
-    harness_restored_carry_model, harness_restored_first_attempt_model, harness_upgrade_age_model,
-    harness_upgrade_look_model, harness_worker_lifecycle_model,
+    harness_restart_stamp_liveness, harness_restart_stamp_model, harness_restored_carry_model,
+    harness_restored_first_attempt_model, harness_upgrade_age_model, harness_upgrade_look_model,
+    harness_worker_lifecycle_model,
 };
 pub use models_harness_policy_writer::{
     harness_policy_one_writer_liveness, harness_policy_one_writer_model,
@@ -1216,6 +1185,7 @@ pub use models_supervise_accounts::{
     supervisor_limit_reset_claim_liveness, supervisor_limit_reset_confirmation_liveness,
     supervisor_limit_reset_model, supervisor_usage_probe_liveness, supervisor_usage_probe_model,
 };
+pub use models_text_selection_lifecycle::text_selection_lifecycle_model;
 pub use models_title_summary::*;
 pub use models_trust_facts::trust_facts_reuse_model;
 pub use models_typed_rekey::typed_rekey_model;
@@ -1260,9 +1230,7 @@ pub use models_update_window_show::native_update_window_show_model;
 /// threaded through, so the emitted TLA+ is whatever the author wants — six of the
 /// introspection models (M1 dispatch, M2 relay, S1 registry, the forward-handshake
 /// liveness twin, F1 info-flow, and publish ordering) are byte-identical instances
-/// of these generators. The seventh, reply fidelity, was one until its model gained
-/// `DialFail` (a failure before delivery, which the two-stage shape cannot state)
-/// and is now a hand-written `ty_model!`.
+/// of these generators.
 ///
 /// The classes (the recurring shapes of the hand-built models): lifecycle/no-leak,
 /// gated-completeness, happens-before, teardown-clears, two-stage-leak (info-flow),
@@ -1514,13 +1482,8 @@ pub mod props {
             expr: int(1),
         });
         // Conjoin `flag = 0` over every flag. `reduce` yields `None` only for an
-        // empty flag list; the empty conjunction is logically TRUE (`AND() ≡ TRUE`,
-        // and the invariant `gate=0 \/ AND(flag=0)` then degenerates to TRUE), so
-        // `unwrap_or_else(|| bool_lit(true))` is the mathematically-correct total
-        // completion. Every caller supplies a non-empty flag list, so on all real
-        // inputs this is identical to the former `.expect(...)` — but the total
-        // form carries no panic obligation, discharging the Trust L0 panic-freedom
-        // check that `expect` leaves unmodeled in default mode.
+        // empty flag list, whose conjunction is TRUE, so the total completion is
+        // exact and carries no panic obligation (Trust L0), unlike `expect`.
         let closed = p
             .flags
             .iter()
@@ -1773,9 +1736,8 @@ mod tests {
     use crate::tla_check::TlaSpec;
 
     /// Guard the brittle `.replace()` in `to_cfg_deadlock_with`: the deadlock cfg
-    /// flips CHECK_DEADLOCK to TRUE, and the DEFAULT cfg path stays FALSE (so the
-    /// 14 existing models that rely on FALSE are untouched). If `to_cfg_with`'s
-    /// literal ever changes, this fails loudly rather than silently no-op'ing.
+    /// flips CHECK_DEADLOCK to TRUE and the default cfg stays FALSE. If
+    /// `to_cfg_with`'s literal changes, this fails instead of silently no-op'ing.
     #[test]
     fn deadlock_cfg_flips_the_line() {
         let m = forward_handshake_model();
@@ -1846,8 +1808,7 @@ mod tests {
         let tla = ring_model().to_tla();
         // Spot-check the mechanical translation (<= => =<, if => IF/THEN/ELSE).
         // The MODULE lines here and below pin the kernel family's derived twins
-        // by name (Evict.tla is `Ring`; Kernel, Subscribe, Snapshot, Transact),
-        // as the deleted tests/derived_coverage.rs did.
+        // by name (Evict.tla is `Ring`; Kernel, Subscribe, Snapshot, Transact).
         assert!(tla.contains("---- MODULE Ring ----"), "{tla}");
         assert!(tla.contains("CONSTANT MaxSeq, Cap, Buggy"), "{tla}");
         assert!(tla.contains("VARIABLES seq, lo"), "{tla}");

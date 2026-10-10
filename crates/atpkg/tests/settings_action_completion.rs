@@ -36,9 +36,9 @@ fn run_with_deadline(
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)
-        // No root-key env var, and there is no longer one to set: the anchor is the
-        // compiled-in paper-master keyset (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`
-        // via `atpkg::PKG_TRUST_ANCHORS`) and nothing ambient can supply or swap it.
+        // No root-key env var: the anchor is the compiled-in paper-master keyset
+        // (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS` via `atpkg::PKG_TRUST_ANCHORS`)
+        // and nothing ambient can supply or swap it.
         .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -86,16 +86,10 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
     // Check & Update short-circuits cleanly on an empty store after the config
     // admission returns defaults; it must not wait for a FIFO writer.
     //
-    // THE PROPERTY UNDER TEST IS TERMINATION, not the exit code, and that distinction
-    // now matters — but NOT for the reason this comment used to give. (It said the
-    // tree ships with `PAPER_MASTER_PUBKEYS` empty; it has been armed since
-    // 2026-08-15, so `update` reaches the network path rather than refusing as inert.
-    // The property under test is TERMINATION either way.) The old text: the manager is
-    // INERT and `update` refuses (nonzero) instead of no-op-ing (zero). Either way the
-    // child must exit promptly — the GUI clears its busy state on the child exiting, and
-    // a hang is what strands Settings. `run_with_deadline` panics if it does not, so
-    // reaching this line IS the assertion; asserting a specific code here would only pin
-    // whether the fleet happens to be armed.
+    // THE PROPERTY UNDER TEST IS TERMINATION, not the exit code: the GUI clears its busy
+    // state on the child exiting, and a hang is what strands Settings.
+    // `run_with_deadline` panics if it does not exit, so reaching this line IS the
+    // assertion; a specific code would only pin whether the fleet happens to be armed.
     let update = run_with_deadline(&home, &config_home, &registry, &["update"]);
     assert!(
         update.code().is_some(),
@@ -163,15 +157,13 @@ fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) 
 
 /// A FLAG IS NEVER A PROGRAM NAME — and, above all, never a DURABLE one.
 ///
-/// `atpkg install --help` used to resolve `"--help"` against the signed index, fail, and
-/// write `[programs.--help]` into `status.toml`, where nothing removed it: `atpkg doctor`
-/// then reported a fully healthy ten-program toolset as incomplete for the life of the
-/// machine. Measured on a real install before the fix. `atpkg uninstall --version` was the
-/// worse half — it matched nothing, took the clean-success path, cleared adoption, printed
-/// "uninstalled --version" and exited 0.
+/// Replays a recorded bug: `atpkg install --help` resolved `"--help"` against the signed
+/// index and wrote `[programs.--help]` into `status.toml`, where nothing removed it, so
+/// `atpkg doctor` reported a healthy toolset as incomplete forever; `atpkg uninstall
+/// --version` cleared adoption and exited 0.
 ///
-/// The durable half is what this test really pins. An exit code is a moment; a poisoned
-/// record is forever, and it is read back by a diagnostic that other repos key on.
+/// The durable half is what this test really pins: an exit code is a moment; a poisoned
+/// record is forever, and `doctor` reads it back.
 #[test]
 fn subverb_flags_never_become_program_names() {
     let tmp = scratch("flag-guard");
@@ -205,12 +197,8 @@ fn subverb_flags_never_become_program_names() {
 
     // An unrecognized flag is refused as a flag — never resolved as a program.
     //
-    // Asserts the PROPERTY, not one wording. `abc261556` reworded this refusal from
-    // "--nonsense is not a program name — it is a flag" to "unknown option ... for
-    // `atpkg <verb>`" (plus the accepted list), which serves the same purpose better —
-    // and this test, pinned to the old literal, went red on main for it. What must hold
-    // is that the refusal NAMES the spelling it rejected and the verb it rejected it for,
-    // so the user can tell what was wrong; the sentence around them is free to improve.
+    // Asserts the PROPERTY, not one wording: the refusal NAMES the spelling it rejected
+    // and the verb it rejected it for; the sentence around them is free to change.
     for verb in ["install", "update", "uninstall"] {
         let (code, err) = run_capture(&home, &config_home, &registry, &[verb, "--nonsense"]);
         assert_eq!(code, 2, "atpkg {verb} --nonsense exits 2");

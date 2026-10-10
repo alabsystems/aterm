@@ -603,7 +603,7 @@ fn the_status_row_names_who_owns_the_block_cursor() {
     let broken = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
-            fill: 0x00F8_E1E1, // measured on the glass, pre-fix
+            fill: 0x00F8_E1E1, // measured on the glass
             base: Some(0x00FF_0000),
         }),
         ..quiet

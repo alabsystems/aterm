@@ -94,6 +94,41 @@ fn eintr() -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
 }
 
+/// Whether the failed `read(2)` just made is one to try again: a signal
+/// (`EINTR`), or a non-blocking descriptor with nothing ready (`EAGAIN`) — the
+/// master is non-blocking, and a stdin that came in non-blocking is the same.
+fn retry_later() -> bool {
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EINTR | libc::EAGAIN)
+    )
+}
+
+/// The most input the session holds for a program that is not reading it
+/// before it stops reading its own stdin (see [`run`]): far past any tty input
+/// queue, so typing and pasting into a program that reads never touch it.
+const INPUT_BACKLOG_MAX: usize = 64 * 1024;
+
+/// Hand the program as much of `pending` as its tty input queue has room for,
+/// without ever parking: a full queue leaves the rest for the next turn of the
+/// loop. A master that refuses input for good (the program side is gone) drops
+/// it — the read of the master then ends the session.
+fn feed_input(master: libc::c_int, pending: &mut std::collections::VecDeque<u8>) {
+    while !pending.is_empty() {
+        let (front, _) = pending.as_slices();
+        match aterm_pty::write_some_nonparking(master, front) {
+            aterm_pty::NonParkWrite::Wrote(n) => {
+                pending.drain(..n.min(front.len()));
+            }
+            aterm_pty::NonParkWrite::WouldBlock => return,
+            aterm_pty::NonParkWrite::Closed | aterm_pty::NonParkWrite::Fatal(_) => {
+                pending.clear();
+                return;
+            }
+        }
+    }
+}
+
 /// Whether `poll(2)` says a stream fd must be read now.
 ///
 /// Includes `POLLHUP` without `POLLIN`: platforms report the buffered tail and
@@ -125,10 +160,33 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
             on_winch as extern "C" fn(libc::c_int) as usize,
         )
     };
+    // Until the line above, `SIGWINCH` was at its default — ignored — so a
+    // resize since the spawn read the host's size (containment, the PATH dirs,
+    // the fork and exec all ran in between) was dropped. Now that the handler
+    // sees every later one, catch up once: when the host's grid is no longer
+    // the PTY's, the first turn of the loop applies it. An unmoved grid sends
+    // the program nothing, as before.
+    if aterm_pty::size(master) != Some(host_winsize()) {
+        GOT_WINCH.store(true, Ordering::Relaxed);
+    }
 
     let mut bytes_in: u64 = 0;
     // The first output written through marks a healthy start (`on_first_shell_output`).
     let mut spoke = false;
+
+    // Input waits HERE, never in `write(2)`. A program that is not reading
+    // (busy printing, `sleep`, a stopped job) leaves its tty input queue full,
+    // and a write into a full queue parks until it reads; a loop parked there
+    // stops reading the program's OUTPUT, so a program that is printing parks
+    // too and neither ever moves again: no output, no resize, no keystroke
+    // read. So the master is non-blocking, the input it has no room for is
+    // held in `pending` while the output keeps flowing, and stdin is not read
+    // while `pending` holds [`INPUT_BACKLOG_MAX`]: the rest waits in the host's
+    // own terminal, never in this process's memory. Should the fcntl fail (it
+    // cannot on a live master), writes park as they always did.
+    let _ = aterm_pty::set_nonblocking(master, true);
+    let mut pending: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut stdin_open = true;
 
     let mut fds = [
         libc::pollfd {
@@ -151,6 +209,16 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut nws) };
         }
 
+        fds[0].fd = if stdin_open && pending.len() < INPUT_BACKLOG_MAX {
+            libc::STDIN_FILENO
+        } else {
+            -1
+        };
+        fds[1].events = if pending.is_empty() {
+            libc::POLLIN
+        } else {
+            libc::POLLIN | libc::POLLOUT
+        };
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         if n < 0 {
             if eintr() {
@@ -168,19 +236,20 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
                     buf.len(),
                 )
             };
-            if r < 0 && eintr() {
+            if r < 0 && retry_later() {
                 // retry next iteration
             } else if r <= 0 {
-                fds[0].fd = -1; // input closed; let the shell run to its own exit
+                stdin_open = false; // input closed; let the shell run to its own exit
             } else {
-                write_all(master, &buf[..r as usize]);
+                pending.extend(&buf[..r as usize]);
             }
         }
+        feed_input(master, &mut pending);
 
         // shell output -> host terminal (passthrough).
         if poll_must_read(fds[1].revents) {
             let r = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if r < 0 && eintr() {
+            if r < 0 && retry_later() {
                 continue;
             }
             if r <= 0 {
@@ -398,6 +467,239 @@ mod tests {
         );
         assert_eq!(run(shell, false), 0);
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "once, however much it said");
+    }
+
+    /// Input the program is not reading never stops its output. The session
+    /// is handed far more typed-ahead input than a tty input queue holds while
+    /// the program it runs writes thousands of lines and never reads: the
+    /// driver must keep passing the output through and return the program's
+    /// own exit status. A driver that parks writing input into the full queue
+    /// stops reading the output, so the program parks writing it and neither
+    /// ever moves. Runs in a re-exec of this test binary whose stdin is a pipe
+    /// holding the input; a minute is the hang detector.
+    #[test]
+    fn input_the_program_never_reads_does_not_stop_its_output() {
+        const CHILD: &str = "ATERM_TEST_DRIVER_UNREAD_INPUT";
+        const LINES: usize = 4000;
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::input_the_program_never_reads_does_not_stop_its_output",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let mut child =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .stdin(aterm_uds::spawnfd::Stdio::piped())
+                    .stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .stderr(aterm_uds::spawnfd::Stdio::piped())
+                    .spawn()
+                    .expect("re-exec the test binary");
+            // 256 KiB of complete lines: far past any tty input queue.
+            let mut stdin = child.stdin.take().expect("stdin");
+            let feeder = std::thread::spawn(move || {
+                let line = [b"typed-ahead input nobody reads".as_slice(), b"\n"].concat();
+                for _ in 0..(256 * 1024 / line.len()) {
+                    if stdin.write_all(&line).is_err() {
+                        return;
+                    }
+                }
+            });
+            let drain = |mut from: Box<dyn Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut all = Vec::new();
+                    let _ = from.read_to_end(&mut all);
+                    all
+                })
+            };
+            let stdout = drain(Box::new(child.stdout.take().expect("stdout")));
+            let stderr = drain(Box::new(child.stderr.take().expect("stderr")));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("try_wait") {
+                    break Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let _ = feeder.join();
+            let out = stdout.join().expect("stdout drain");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&stderr.join().expect("stderr drain"))
+            );
+            let status = status.unwrap_or_else(|| {
+                panic!(
+                    "the session hung: the program's output stopped behind input it never \
+                     reads ({} bytes passed through)",
+                    out.len()
+                )
+            });
+            assert!(status.success(), "the re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the re-exec ran no test:\n{text}"
+            );
+            let last = format!("out{}", LINES - 1);
+            assert!(
+                String::from_utf8_lossy(&out).contains(&last),
+                "the program's last line never passed through"
+            );
+            return;
+        }
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("i=0; while [ $i -lt {LINES} ]; do echo out$i; i=$((i+1)); done; exit 5"),
+        ];
+        let shell = aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        assert_eq!(
+            run(shell, false),
+            5,
+            "the session returns the program's status"
+        );
+    }
+
+    /// A resize of the host terminal that lands before the driver is
+    /// listening still reaches the program. The session reads the host size
+    /// for the spawn, then sets up for tens of milliseconds (containment, the
+    /// PATH dirs, the fork and exec) with `SIGWINCH` at its default, ignored —
+    /// so a window manager laying out a just-opened terminal resizes it inside
+    /// that window, the signal is dropped, and the program keeps the stale size
+    /// until the next resize. Here the host terminal is a PTY this re-exec puts
+    /// on its stdout, resized after the program is up and before [`run`]; the
+    /// program waits for a `SIGWINCH` and prints the size it then reads. Its
+    /// wait is bounded at a minute, the hang detector.
+    #[test]
+    fn a_resize_before_the_driver_listens_reaches_the_program() {
+        const CHILD: &str = "ATERM_TEST_DRIVER_EARLY_RESIZE";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::a_resize_before_the_driver_listens_reaches_the_program",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .output()
+                .expect("re-exec the test binary");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "the re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the re-exec ran no test:\n{text}"
+            );
+            return;
+        }
+        // The host terminal: a PTY whose slave is this process's stdout, so
+        // `host_winsize` reads it, and whose master this test resizes and
+        // drains like the window around a real session would.
+        let (host, host_slave) = aterm_pty::open_pty_pair().expect("host pty");
+        aterm_pty::resize(host, 30, 100);
+        // SAFETY: duplicating descriptors this test owns: the harness's stdout
+        // is kept aside for its result line, and the host slave takes its place.
+        let harness_stdout = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(harness_stdout >= 0, "keep the harness's stdout");
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::dup2(host_slave, libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        aterm_pty::close_fd(host_slave);
+        let drained = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = aterm_pty::read(host, &mut buf);
+                if n <= 0 {
+                    return all;
+                }
+                all.extend_from_slice(&buf[..n as usize]);
+                if String::from_utf8_lossy(&all).contains("SIZE ") {
+                    return all;
+                }
+            }
+        });
+
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "trap 'echo SIZE $(stty size); exit 0' WINCH; echo READY; i=0; \
+             while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; \
+             echo SIZE $(stty size) unchanged; exit 3"
+                .to_string(),
+        ];
+        let (rows, cols) = host_winsize();
+        assert_eq!((rows, cols), (30, 100), "the spawn reads the host's size");
+        let shell = aterm_pty::spawn_shell_with_pid(
+            rows,
+            cols,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        // The program is up, with its WINCH trap set.
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        while !String::from_utf8_lossy(&seen).contains("READY") {
+            let n = aterm_pty::read(shell.master, &mut buf);
+            assert!(n > 0, "the program ended before it was up");
+            seen.extend_from_slice(&buf[..n as usize]);
+        }
+        // The host terminal is resized before the driver listens.
+        aterm_pty::resize(host, 40, 120);
+        let code = run(shell, false);
+        // The harness's own stdout back for its result line; that also closes
+        // the host's last slave, so the drain ends even if nothing matched.
+        // SAFETY: duplicating a descriptor this test owns onto stdout.
+        unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
+        let out = drained.join().expect("host drain");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("SIZE 40 120"),
+            "the program never learned the host's new size: {text:?}"
+        );
+        assert_eq!(code, 0, "the program saw the resize: {text:?}");
     }
 
     #[test]

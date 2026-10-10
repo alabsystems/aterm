@@ -283,7 +283,7 @@ fn look_seen(
 
 /// Whose turn a model state's `work` 2 is — a turn this screen never draws
 /// and the lane never places: a subagent of this tab's own conversation
-/// (the owner's shape of 2026-09-28), another session's subagent, or a root
+/// (the owner's shape), another session's subagent, or a root
 /// no tab shows with this TUI the daemon's only client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Hidden {

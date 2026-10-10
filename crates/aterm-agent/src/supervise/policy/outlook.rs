@@ -7,8 +7,8 @@
 //!
 //! [`ExceptionKind`] names the points only a person can answer (owner,
 //! 2026-09-28: *"there needs to be some clear reason why the user must be
-//! engaged and what the user should do"*); the module that raises them with
-//! their why and their one action is `exception` (a later commit).
+//! engaged and what the user should do"*); [`super::exception`] raises them
+//! with their why and their one action.
 
 use aterm_phase::wall::WallKind;
 

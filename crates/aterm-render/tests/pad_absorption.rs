@@ -19,7 +19,7 @@
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `PadAbsorption` derived model (`aterm_spec::derive::pad_absorption_model`)
 //!   carries `ExactCover` / `PadsFloor` / `NearEvenSplit` / `Maximal`.
-//!   `cargo test -p aterm-spec`
+//!   `targo --unverified test -p aterm-spec`
 //!   (`derived_pad_absorption_proves_and_catches_lopsided_split`) runs the REAL
 //!   `ty` binary over the whole bounded lattice: it PROVES the four invariants
 //!   at `Buggy=0` and CATCHES the lopsided all-remainder-on-one-edge split at
@@ -31,9 +31,6 @@
 //!   entire domain (model ↔ code can't drift), PLUS the placement law for
 //!   `place_frame_bands` (content byte-identical at the band offset — zero
 //!   scaling — bands exactly the theme background).
-//!
-//! The full-bit-width arithmetic twin lives in `aterm-render`'s
-//! `pad_split_kani` trust-mc harnesses (`verify.sh --full`).
 
 use aterm_render::{band_offset, band_offset_y, pad_split, place_frame_bands};
 use aterm_spec::derive::pad_absorption_model;
@@ -42,7 +39,9 @@ use aterm_spec::derive::pad_absorption_model;
 /// spanning tiny (1 px — degenerate) through typical glyph boxes (7..=17) to
 /// large (24), pads through the `pad_for_scale` range and beyond.
 const PADS: &[usize] = &[0, 1, 2, 3, 4, 7, 8];
-const CELLS: &[usize] = &[1, 2, 3, 5, 7, 8, 9, 10, 16, 17, 24];
+/// `0` is the degenerate cell box a broken font can report: every window is
+/// then below the domain, and must still get a one-cell grid.
+const CELLS: &[usize] = &[0, 1, 2, 3, 5, 7, 8, 9, 10, 16, 17, 24];
 
 /// THE INVARIANT (the same four properties `ty` model-checks abstractly in
 /// aterm-spec), exhaustive over every window size up to 12 columns past the
@@ -60,8 +59,14 @@ fn pad_split_exact_cover_maximal_floor_near_even() {
                     s.cells >= 1,
                     "cells must never be 0 (w={w} pad={pad} cell={cell})"
                 );
-                if w < 2 * pad + cell {
-                    continue; // below the proven domain
+                if w < 2 * pad + cell.max(1) {
+                    // Below the domain (a zero cell box included) the grid pins
+                    // to exactly one cell, which the presents then crop, centred.
+                    assert_eq!(
+                        s.cells, 1,
+                        "below the domain the grid pins to one cell (w={w} pad={pad} cell={cell})"
+                    );
+                    continue;
                 }
                 // Exact cover: no pixel scaled or dropped.
                 assert_eq!(

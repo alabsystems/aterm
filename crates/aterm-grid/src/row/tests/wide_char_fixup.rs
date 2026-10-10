@@ -872,3 +872,146 @@ fn delete_chars_fill_shrinks_len_on_deleted_wide_head_at_tail() {
         "len must shrink to 2, not stay stale-high at 3"
     );
 }
+
+/// The early-wrap hole's life: recorded on a row whose last cell is the blank
+/// a wide glyph skipped, it stays a hole only while that cell holds the blank.
+/// A write into the last cell (any write lane), a width change without
+/// rewrap and a whole-row clear end it; a glyph that reaches the cell some
+/// other way makes it content without touching the flag.
+#[test]
+fn an_early_wrap_hole_lasts_until_its_cell_is_written() {
+    use crate::{Cell, CellFlags, PackedColor};
+
+    let hole_row = || {
+        let (pages, mut row) = make_row(4);
+        row.write_char(0, 'a');
+        row.set_early_wrap_hole(true);
+        assert!(row.has_early_wrap_hole(), "fixture");
+        (pages, row)
+    };
+    let (_p, mut row) = hole_row();
+    assert!(!row.write_char(4, ' '), "past the row: nothing written");
+    assert!(row.has_early_wrap_hole(), "a write elsewhere keeps it");
+    row.write_char(3, ' ');
+    assert!(!row.has_early_wrap_hole(), "a printed space is content");
+
+    let (_p, mut row) = hole_row();
+    let packed = Cell::convert_colors(PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG);
+    row.write_char_packed(3, ' ', packed, CellFlags::empty());
+    assert!(!row.has_early_wrap_hole(), "the packed lane");
+
+    let (_p, mut row) = hole_row();
+    row.fill_cell_run(2, 2, Cell::new(' '));
+    assert!(!row.has_early_wrap_hole(), "the run lane");
+
+    let (_p, mut row) = hole_row();
+    let _ = row.cells_mut_with_fixup(1, 3);
+    assert!(!row.has_early_wrap_hole(), "the bulk lane");
+
+    let (_p, mut row) = hole_row();
+    row.set(3, Cell::new('x'));
+    assert!(!row.has_early_wrap_hole(), "a glyph in the cell is content");
+
+    let (_p, mut row) = hole_row();
+    row.set(3, Cell::new(' '));
+    assert!(
+        !row.has_early_wrap_hole(),
+        "a blank `Row::set` puts there too"
+    );
+
+    let (mut pages, mut row) = hole_row();
+    // SAFETY: `pages` outlives `row` in this test.
+    unsafe { row.resize(6, &mut pages) };
+    assert!(!row.has_early_wrap_hole(), "a width change without rewrap");
+
+    let (_p, mut row) = hole_row();
+    row.clear();
+    assert!(!row.has_early_wrap_hole(), "a whole-row clear");
+}
+
+/// Every lane that rewrites a hole's cell other than by erasing it ends the
+/// hole, also when it leaves a blank there: a wide glyph over the cell whose
+/// head a narrow glyph then overwrites (the spacer is blanked), a wide run,
+/// ICH shifting a printed space into the cell, DCH shifting the hole left and
+/// filling the cell, a DECFRA glyph a DECERA erases later. Left set, the flag
+/// would let the next rewrap drop that blank, a cell the screen shows inside
+/// its line. A bounded shift that stops short of the row end, a DECERA blank
+/// fill and an erase of the cell leave the hole a hole.
+#[test]
+fn an_early_wrap_hole_ends_when_its_cell_is_rewritten_with_a_blank() {
+    use crate::{Cell, CellFlags, PackedColor};
+
+    let packed = Cell::convert_colors(PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG);
+    // `ab ` and the hole: column 2 holds a printed space.
+    let hole_row = || {
+        let (pages, mut row) = make_row(4);
+        row.write_char(0, 'a');
+        row.write_char(1, 'b');
+        row.write_char(2, ' ');
+        row.set_early_wrap_hole(true);
+        assert!(row.has_early_wrap_hole(), "fixture");
+        (pages, row)
+    };
+
+    let (_p, mut row) = hole_row();
+    assert!(row.write_wide_char_packed(2, '\u{6587}', packed, CellFlags::empty()));
+    row.write_char(2, 'x');
+    assert_eq!(row.get(3).map(Cell::char_data), Some(u16::from(b' ')));
+    assert!(
+        !row.has_early_wrap_hole(),
+        "the wide glyph's spacer was written there"
+    );
+
+    let (_p, mut row) = hole_row();
+    // SAFETY: columns 2 and 3 exist; one glyph on a fresh boundary.
+    unsafe { row.write_wide_char_packed_no_fixup(2, '\u{6587}', packed, CellFlags::empty()) };
+    row.settle_len_after_wide_run(4);
+    row.mark_has_wide_chars();
+    row.write_char(2, 'x');
+    assert_eq!(row.get(3).map(Cell::char_data), Some(u16::from(b' ')));
+    assert!(!row.has_early_wrap_hole(), "the wide run lane");
+
+    let (_p, mut row) = hole_row();
+    row.insert_chars(0, 1);
+    assert_eq!(row.get(3).map(Cell::char_data), Some(u16::from(b' ')));
+    assert!(
+        !row.has_early_wrap_hole(),
+        "ICH shifted the printed space in"
+    );
+
+    let (_p, mut row) = hole_row();
+    row.delete_chars_fill(0, 1, Cell::EMPTY);
+    assert!(!row.has_early_wrap_hole(), "DCH filled the cell");
+
+    let (_p, mut row) = hole_row();
+    row.insert_chars_bounded_fill(0, 1, 4, Cell::EMPTY);
+    assert!(!row.has_early_wrap_hole(), "a bounded ICH to the row end");
+
+    let (_p, mut row) = hole_row();
+    row.delete_chars_bounded_fill(0, 1, 4, Cell::EMPTY);
+    assert!(!row.has_early_wrap_hole(), "a bounded DCH to the row end");
+
+    let (_p, mut row) = hole_row();
+    row.insert_chars_bounded_fill(0, 1, 3, Cell::EMPTY);
+    row.delete_chars_bounded_fill(0, 1, 3, Cell::EMPTY);
+    assert!(
+        row.has_early_wrap_hole(),
+        "a shift inside a right margin leaves the last cell alone"
+    );
+
+    let (_p, mut row) = hole_row();
+    row.clear_range_with(3, 4, Cell::new('x'));
+    row.clear_range_with(3, 4, Cell::new(' '));
+    assert!(
+        !row.has_early_wrap_hole(),
+        "a DECFRA glyph was content, and erasing it leaves a blank, not a hole"
+    );
+
+    let (_p, mut row) = hole_row();
+    row.clear_range_with(2, 4, Cell::new(' '));
+    assert!(row.has_early_wrap_hole(), "a DECERA blank fill erases");
+
+    let (_p, mut row) = hole_row();
+    row.erase_chars(3, 1);
+    assert!(row.has_early_wrap_hole(), "an erase blanks the hole again");
+}

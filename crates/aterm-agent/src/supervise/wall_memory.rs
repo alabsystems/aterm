@@ -223,6 +223,7 @@ impl<C: Ctl> Session<'_, C> {
                 reset: open.reset,
                 row: 0,
                 placement: aterm_phase::Placement::Gutter,
+                under_call: false,
             },
             saved: Some(open.reset_unix),
         });
@@ -264,10 +265,10 @@ impl StuckRung {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// The CANARY for a screen no reader names (the review of
-    /// 2026-09-29): the loop reads a screen by its words, and a build that
-    /// words a wall or a turn's end differently reads `busy` for as long as a
-    /// shell runs: the 4 h 44 m of 2026-09-28, silently, again. The one witness the words
+    /// The CANARY for a screen no reader names: the loop reads a screen by
+    /// its words, and a build that words a wall or a turn's end differently
+    /// reads `busy` for as long as a shell runs (4 h 44 m once, silently).
+    /// The one witness the words
     /// do not depend on is Claude Code's OWN terminal title: it animates while
     /// the agent works and rests on `✳` when it does not (measured on tab 1: `✳`
     /// from 12:19:10 to 17:03:52 — the whole stall — and an animation for the

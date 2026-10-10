@@ -197,8 +197,10 @@ impl EdgeTable {
     /// presents. `nonce` is the destination's current launch nonce, so the edge
     /// fails closed across a restart.
     // Skip: `HashMap::insert` can formally panic on capacity overflow,
-    // unreachable for a table bounded by live sessions; the key's derived
-    // Hash/Eq is panic-free. Audited-alloc class; verify-only.
+    // unreachable: one row per grant, each an Owner's request (rows are not
+    // bounded by live sessions — a wire grant mints one per call; resource
+    // hunt 2026-10-09, C1); the key's derived Hash/Eq is panic-free.
+    // Audited-alloc class; verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn grant(
         &mut self,

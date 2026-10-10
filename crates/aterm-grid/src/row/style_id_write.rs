@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! StyleId-based write methods for Row (test and Kani only; production stores
-//! inline colours).
+//! StyleId-based write methods for Row (test only; production stores inline
+//! colours).
 
 use super::super::CellFlags;
 use super::super::cell::Cell;

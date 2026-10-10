@@ -4163,13 +4163,18 @@ fn dial_verb_gate_rejects_non_owner_and_malformed_names() {
 
 /// Which requests move to a wait lane (`control_lanes.rs`): those that park on an
 /// event or hand the connection to a relay. Every read, keystroke and `subscribe`
-/// is request-lane work.
+/// that flips to push here is request-lane work; a `subscribe` to one session
+/// another instance hosts is relayed for the whole subscription, a wait, in every
+/// spelling the relay follows. Only an Owner-class connection is relayed.
 #[test]
 fn wait_requests_are_the_ones_that_park_or_relay() {
     let store = session_store::new_store();
     let local = registered_session(0, -1, b"");
     let local_sid = local.ctx.self_id.as_str().to_string();
     store.write().unwrap().register(local);
+    let remote_sid = SessionId::generate();
+    let remote_sid = remote_sid.as_str();
+    let edge = Scope::Edge(aterm_session::EdgeToken::generate());
     for line in [
         "await seq 5 timeout 20000",
         "@. await agent busy,idle timeout=300",
@@ -4180,12 +4185,39 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "inbox get @42",
         "dial work",
         "@s-not-hosted-here text",
+        // The selector-second grammar: relayed to the instance that hosts it,
+        // under any spelling `graph/<sid>` resolves (a path; another case on a
+        // case-insensitive volume) — classed a wait wherever it is relayed.
+        &format!("subscribe @{remote_sid} events"),
+        &format!("subscribe  @{remote_sid} events"),
+        &format!("subscribe @./{remote_sid} events"),
+        &format!("subscribe @S-{} events", &remote_sid[2..]),
         // Settles 60 ms and folds the whole recording (`cast drift`).
         "cast drift",
         &format!("@{local_sid} cast drift max_runs=4"),
     ] {
-        assert!(is_wait_request(line, &store), "{line:?} parks or relays");
+        assert!(
+            is_wait_request(line, Scope::Owner, &store),
+            "{line:?} parks or relays"
+        );
     }
+    // An Edge is never relayed, so a line naming another instance's session is
+    // refused at once on a request lane; what parks still parks.
+    for line in [
+        "@s-not-hosted-here text",
+        &format!("subscribe @{remote_sid} events"),
+    ] {
+        assert!(
+            !is_wait_request(line, edge, &store),
+            "{line:?} from an Edge is refused, never relayed"
+        );
+    }
+    assert!(is_wait_request("await seq 5 timeout 20000", edge, &store));
+    assert!(is_wait_request(
+        "@s-not-hosted-here await seq 5",
+        edge,
+        &store
+    ));
     for line in [
         "version",
         "text --json tail=40",
@@ -4193,6 +4225,17 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "key enter",
         "send hello",
         "subscribe @. screen",
+        // The bridge's and fleet's watch-everything subscription, a session
+        // this instance hosts, and a list: each flips to push here.
+        "subscribe @* events,sessions",
+        &format!("subscribe @{local_sid} events"),
+        &format!("subscribe @{local_sid},@{remote_sid} events"),
+        "subscribe @42 events",
+        "subscribe @ events",
+        "subscribe events",
+        // A leading selector this instance hosts runs the verb here, whatever
+        // the subscribe names.
+        &format!("@{local_sid} subscribe @{remote_sid} events"),
         "inbox",
         "inbox get 3",
         "inbox seen 3 handled",
@@ -4204,7 +4247,7 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "cast frames count=4",
     ] {
         assert!(
-            !is_wait_request(line, &store),
+            !is_wait_request(line, Scope::Owner, &store),
             "{line:?} is request-lane work"
         );
     }
@@ -4660,6 +4703,7 @@ fn key_and_ctrl_grammar() {
             key,
             mods,
             base_layout,
+            layout_text: None,
             event_type,
         }))
     };
@@ -4736,6 +4780,7 @@ fn key_and_ctrl_grammar() {
                 key: ch('c'),
                 mods: M::CTRL,
                 base_layout: None,
+                layout_text: None,
                 event_type: T::Press,
             })),
         ),
@@ -5138,6 +5183,22 @@ fn proxy_forward_plan_owner_only_op_scoped_and_nonce_guarded() {
         presented(&splan),
         format!("TOKEN {read_hex} subscribe @. cells,bytes every-frame\n")
     );
+    // The rewrite replaces the selector, wherever it starts: the streams that
+    // follow it reach the child whole.
+    let spaced = format!("subscribe  @{} cells", child.as_str());
+    let spaced_plan = proxy_forward_plan(&spaced, Scope::Owner, &store, &dir).expect("forwards");
+    assert_eq!(
+        presented(&spaced_plan),
+        format!("TOKEN {read_hex} subscribe @. cells\n")
+    );
+    // Every relay holds its lane for as long as it lives, so each line that
+    // forwards is a wait (`is_wait_request`), never request-lane work.
+    for relayed in [&line, &kline, &sline, &spaced] {
+        assert!(
+            is_wait_request(relayed, Scope::Owner, &store),
+            "{relayed:?} is relayed, so it is a wait"
+        );
+    }
 
     // Edge scope cannot escalate to a child.
     assert!(
@@ -5228,18 +5289,42 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
         presented(&splan),
         format!("TOKEN cafe0123 subscribe @{} cells,bytes\n", sid.as_str())
     );
-
-    // Edge scope must NOT reach a sibling.
+    // `graph/<sid>` is joined verbatim, so a path spelling reaches the same
+    // entry and is relayed too.
+    let pline = format!("subscribe @./{} cells", sid.as_str());
     assert!(
-        proxy_forward_plan(
-            &line,
-            Scope::Edge(aterm_session::EdgeToken::generate()),
-            &store,
-            &dir
-        )
-        .is_none(),
-        "edge scope must not forward to a sibling",
+        proxy_forward_plan(&pline, Scope::Owner, &store, &dir).is_some(),
+        "a path spelling of the sid reaches its entry"
     );
+    // A relay holds its lane for as long as it lives (a subscription's, for
+    // `subscribe`), so each line that forwards is a wait, never request-lane
+    // work that eight watchers of another window's sessions would fill.
+    for relayed in [&line, &kline, &sline, &pline] {
+        assert!(
+            is_wait_request(relayed, Scope::Owner, &store),
+            "{relayed:?} is relayed, so it is a wait"
+        );
+    }
+
+    // `@*` is this instance's live target set (the bridge's and fleet's
+    // subscription), never one session: an entry named `*` relays it nowhere.
+    crate::proxy::write_graph_entry(&dir, &SessionId::new("*"), &sib_sock_str, &nonce);
+    let all = "subscribe @* events,sessions";
+    assert!(
+        proxy_forward_plan(all, Scope::Owner, &store, &dir).is_none(),
+        "`subscribe @*` stays local"
+    );
+    assert!(!is_wait_request(all, Scope::Owner, &store));
+
+    // Edge scope must NOT reach a sibling, so its line is no wait either.
+    let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+    for relayed in [&line, &sline] {
+        assert!(
+            proxy_forward_plan(relayed, edge, &store, &dir).is_none(),
+            "edge scope must not forward to a sibling",
+        );
+        assert!(!is_wait_request(relayed, edge, &store));
+    }
 
     // A non-op verb (identity/privilege) never crosses processes.
     let gline = format!("@{} whoami", sid.as_str());
@@ -6434,6 +6519,7 @@ fn shipping_front_paste_event_drives_editor_minibuffer_then_buffer() {
                 key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Escape,),
                 mods: aterm_types::keyboard::Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             },
             Source::Controller,
@@ -7792,7 +7878,9 @@ fn required_op_classifies_each_verb() {
     // The signal class, and two fine ops carved out of Read/Write: `settings`
     // rewrites durable config and `copy` exfiltrates to the OS clipboard, neither
     // reachable by an inherited read/write edge.
-    assert_set(Some(Op::Signal), vec!["signal"], "Signal set");
+    // `restart` ends the tab's agent (its stamp first, then SIGTERM, then the
+    // act's SIGKILL for a survivor): the signal class, as `signal` is.
+    assert_set(Some(Op::Signal), vec!["signal", "restart"], "Signal set");
     assert_set(Some(Op::ConfigWrite), vec!["settings"], "ConfigWrite set");
     assert_set(Some(Op::ClipboardWrite), vec!["copy"], "ClipboardWrite set");
     // None (OpClass::Owner): privilege/identity + build-meta verbs, gated before the
@@ -9981,7 +10069,8 @@ fn a_refused_handshake_is_recorded_by_kind_through_the_denials_it_is_given() {
         let (mut client, server) = CtlStream::pair().unwrap();
         client.write_all(format!("{first}\n").as_bytes()).unwrap();
         let mut reader = control_lanes::lane_reader(&server, Vec::new());
-        let got = authenticate_connection(&server, &mut reader, TOKEN, active, &denials);
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let got = authenticate_connection(&server, &mut reader, TOKEN, active, &denials, deadline);
         if got.is_none() {
             let mut reply = String::new();
             BufReader::new(&client).read_line(&mut reply).unwrap();
@@ -10453,6 +10542,59 @@ fn a_session_opts_into_at_most_the_topic_bound() {
             && spec.detail.contains(full.trim_end()),
         "{}",
         spec.detail
+    );
+}
+
+/// Ruling 441 (j): a `messages` row's `state=` is [`aterm_messages::wire::state_word`]
+/// (design §5.1, ruling 175) — `held`, `live`, `review`, or how the row retired
+/// ([`aterm_messages::Retired::as_word`]; ruling 267 named `quit`). The verb's
+/// help is the grammar a client validates against, so it lists every word. The
+/// retirements are walked by an exhaustive `match`: a new `Retired` fails to
+/// compile here until it joins the walk, and so the check.
+#[test]
+fn the_messages_help_lists_every_state_word() {
+    use aterm_messages::{MessageId, Outcome, Retired};
+    fn after(prev: Option<&Retired>) -> Option<Retired> {
+        let by = MessageId::from_raw(1).expect("a valid id");
+        match prev {
+            None => Some(Retired::Folded),
+            Some(Retired::Folded) => Some(Retired::Stale),
+            Some(Retired::Stale) => Some(Retired::Unseen),
+            Some(Retired::Unseen) => Some(Retired::Superseded { by }),
+            Some(Retired::Superseded { .. }) => Some(Retired::Resolved(Outcome::Ok)),
+            Some(Retired::Resolved(Outcome::Ok)) => Some(Retired::Resolved(Outcome::Warn)),
+            Some(Retired::Resolved(Outcome::Warn)) => Some(Retired::Dismissed),
+            Some(Retired::Dismissed) => Some(Retired::Answered {
+                label: "Not now".into(),
+            }),
+            Some(Retired::Answered { .. }) => Some(Retired::Evicted),
+            Some(Retired::Evicted) => Some(Retired::Carried),
+            Some(Retired::Carried) => Some(Retired::Withdrawn),
+            Some(Retired::Withdrawn) => Some(Retired::Recorded),
+            Some(Retired::Recorded) => Some(Retired::Quit),
+            Some(Retired::Quit) => None,
+        }
+    }
+    let spec = aterm_types::control_verbs::VERBS
+        .iter()
+        .find(|v| v.name == "messages")
+        .expect("the messages verb");
+    let help = spec.help_line();
+    let grammar = help
+        .split("state=<")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .expect("a state= grammar");
+    let listed: Vec<&str> = grammar.split('|').collect();
+    let retired: Vec<Retired> = std::iter::successors(after(None), |r| after(Some(r))).collect();
+    let missing: Vec<&str> = ["held", "live", "review"]
+        .into_iter()
+        .chain(retired.iter().map(Retired::as_word))
+        .filter(|word| !listed.contains(word))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`messages` prints state={missing:?}, which its help's grammar omits: {grammar}"
     );
 }
 
@@ -13062,6 +13204,67 @@ fn ready_verb_reports_prompt_executing_and_exit() {
     );
 }
 
+/// The wait family reads `<ms>` one way ([`aterm_control::wire::wait_ms`]): a
+/// whole number of milliseconds, or the verb's usage line. `ready`, `await` and
+/// `await momentum` read it leniently, so `ready 2s` or `await … timeout=1.5`
+/// waited the 30 s default — here, on a surface already settled, each answered
+/// as if `<ms>` were fine — where `turn` and `await consent` refused it.
+#[test]
+fn the_wait_family_refuses_an_ms_that_is_not_one() {
+    use std::time::Instant;
+
+    use control_session::cmd_await_momentum;
+
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let registry = subscribe::new_registry();
+    // A fresh prompt: `ready` and `await gone` both answer at once when asked well.
+    crate::term_lock(&h.term).process(b"\x1b]133;A\x07$ ");
+    let ready = |tail: &str| cmd_ready(&h.term, &store, 0, &h.ctx, tail, &registry);
+    let await_ = |tail: &str| cmd_await(&h.term, &store, 0, &h.ctx, tail, &registry);
+    let dark = || Ok((0.0, Instant::now()));
+    let momentum = |tail: &str| cmd_await_momentum(&h.term, &store, 0, tail, &registry, &dark);
+
+    for tail in ["2s", "timeout=2s", "1.5", "-1", "5 6", "timeout="] {
+        assert_eq!(
+            ready(tail),
+            "ERR usage: ready [<ms>|timeout=<ms>]\n",
+            "`ready {tail}`"
+        );
+    }
+    for tail in ["", "2000", "timeout=2000"] {
+        assert_eq!(ready(tail), "OK ready prompt\n", "`ready {tail}`");
+    }
+
+    for tail in [
+        "gone xyzzy timeout=2s",
+        "gone xyzzy timeout 1.5",
+        "gone xyzzy timeout=-1",
+    ] {
+        assert!(
+            await_(tail).starts_with("ERR usage: await "),
+            "`await {tail}`"
+        );
+    }
+    for tail in [
+        "gone xyzzy",
+        "gone xyzzy timeout=2000",
+        "gone xyzzy timeout 2000",
+    ] {
+        assert!(await_(tail).starts_with("OK gone "), "`await {tail}`");
+    }
+
+    for tail in ["momentum 0.3 timeout=2s", "momentum 0.3 timeout 1.5"] {
+        assert_eq!(
+            momentum(tail),
+            "ERR usage: await momentum <floor 0..=1> [timeout <ms>]\n",
+            "`await {tail}`"
+        );
+    }
+    assert_eq!(momentum("momentum 0.3 timeout=2000"), "OK momentum 0.00\n");
+}
+
 /// `ready` for a plain shell (no OSC-133) settles on a stable `content_seq`: with no
 /// in-flight block it returns `OK ready idle` once output stops changing across the
 /// settle window.
@@ -13560,6 +13763,7 @@ fn the_typed_turn_s_only_signature_is_its_even_cadence() {
         key,
         mods,
         base_layout,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     // The paste verb's `\n` spelling is the text's own here: `\` `n` are
@@ -17682,6 +17886,7 @@ fn a_person_fenced_write_is_refused_after_a_persons_key_through_the_app_seam() {
         key: Key::Named(NamedKey::ArrowDown),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let _ = app.input(crate::WindowId(0), down, Source::Human);

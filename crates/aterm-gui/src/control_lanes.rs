@@ -5,6 +5,24 @@
 //! not. Supervised agent tabs each hold a persistent `RelayCtl` that is idle
 //! most of the time, so a connection must not pin a thread while idle.
 //!
+//! **A lane never waits on its peer.** It is given a connection only with a
+//! WHOLE request in hand — the line, and the body a frame announces (the
+//! handshake: its line) — and it writes the answer without waiting for the peer
+//! to read it. Everything else a peer can make a lane wait for is the PARKER's,
+//! multiplexed in its one `poll(2)`: the rest of a handshake, line or frame it
+//! began, and the part of an answer it has not read yet. Before (measured on a
+//! headless instance), eight peers that never finished their `AUTH` line (no
+//! token needed), stopped mid-line or mid-frame, or did not read a large answer
+//! (`help --full`, 190 KB) held all eight request lanes, and every other client
+//! was answered `ERR control server busy; retry` for as long as they liked; a
+//! deadline on each wait only made them reconnect when it ran out (eight such
+//! peers still left 0 of 50 fresh requests answered over 100 s), and a write
+//! bound cut off a pager that paused and was outlived by a reader taking a byte
+//! at a time. The exceptions are the waits that ARE the request: a relay, which
+//! carries its peer's bytes both ways on a wait lane, and a guarded artifact's
+//! handoff, written and acknowledged under `ARTIFACT_HANDOFF_TIMEOUT` — at most
+//! `ARTIFACT_HANDOFF_LIMIT` (four) at once, so never every request lane.
+//!
 //! **Where a connection is, at any moment — exactly one of:**
 //!
 //! * on a request lane (`CONTROL_WORKERS` fixed threads), authenticating or
@@ -30,10 +48,18 @@
 //!   is one `aterm drive --dial` relay each, and while such waits stayed on their
 //!   request lane the budget's four places turned the fifth relay away with most
 //!   of the wait lanes free.
-//! * PARKED ([`Parker`], one thread): authenticated, idle between requests,
-//!   nothing buffered. One `poll(2)` over every parked descriptor; a connection
-//!   that turns readable goes back to the request lanes' queue, and one whose
-//!   peer hung up with nothing to read is closed right there.
+//! * PARKED ([`Parker`], one thread): between requests — idle, or waiting on
+//!   its peer: for the rest of its next request (a handshake not yet whole
+//!   included), or to take the rest of its last answer ([`Outbox`]). One
+//!   `poll(2)` over every parked descriptor: `POLLOUT` while an answer is
+//!   owed (nothing more is read until it is delivered, so a connection holds at
+//!   most one answer, and of its requests no more than the next one needs and
+//!   one read past it), `POLLIN` otherwise, reading what arrives into
+//!   [`Conn::carry`]. A connection whose next request is whole goes
+//!   back to the request lanes' queue (a frame's header goes back before its
+//!   body: see [`LaneService::frame_header`]); one whose peer hung up with
+//!   nothing left to serve, or whose handshake is not whole when its
+//!   `AUTH_READ_TIMEOUT` (from admission) runs out, is closed right there.
 //! * on the subscription pool (unchanged: a `subscribe` flips it to push).
 //!
 //! **Admission.** A fresh connection gets `ERR control server busy; retry`
@@ -43,7 +69,8 @@
 //! capacity, so an idle connection always has a place to park and never keeps
 //! a lane (which would also starve the resumes queued behind it). The cap
 //! bounds open connections, not requests, and leaves most descriptors to tabs
-//! and files.
+//! and files; it is also what a peer that keeps connections open costs —
+//! idle, half-sent or unread alike — never a lane.
 //!
 //! **If the parker fails.** Every parked connection lives in the parker, so a
 //! parker that died would strand them all — every supervisor loop and every
@@ -59,19 +86,23 @@
 //! handed to a thread that is gone.
 //!
 //! **What is kept.** Per-connection request ORDER: one owner at a time; a
-//! connection moves only between requests; it parks only with nothing left in
-//! its read buffer (a pipelined next request already buffered is served where it
-//! is); and a wait that moves takes what its lane had read past it along, served
-//! first where it lands, before anything more is read from the socket. The auth
+//! connection moves only between requests; it parks only without a whole
+//! request in hand (a pipelined next request already whole is served where it
+//! is), taking what it holds of the next one along in [`Conn::carry`]; a wait
+//! that moves takes what its lane had read past it along, served first where it
+//! lands, before anything more is read from the socket; and an answer is
+//! delivered whole, in order, before the next request is read. The auth
 //! and uid checks (the listener's, and the handshake on the first lane). Claims
 //! bound to a connection (`meta set supervisor` without `ttl=`) stay bound across
 //! every move and are released when the connection ends, however it ends — the
 //! release is a drop guard ([`ConnTenure`]), so a lane's panic or the parker's
 //! close releases them too. The cut `RelayCtl`'s interrupter makes (a client-side
 //! `shutdown`) reads, wherever the connection is, as the hang-up it always was.
-//! Every queue is bounded and every thread count is capped. Without a parker (off
-//! unix, one that could not start, or one that stopped) an idle connection stays
-//! on its lane and the connection bound is the lanes', exactly as before.
+//! Every queue is bounded and every thread count is capped. Without a parker
+//! (off unix, one that could not start, or one that stopped) a lane reads and
+//! writes its connection waiting, an idle connection stays on its lane, and the
+//! connection bound is the lanes', exactly as before (a handshake still has
+//! `AUTH_READ_TIMEOUT` from the lane's pick-up to be whole).
 //!
 //! Derived model: `aterm_spec::derive::control_lane_tenure_model` (a running
 //! parker's lanes; a stopped parker's fallback is the design it rejects, on
@@ -82,12 +113,16 @@ use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 #[cfg(unix)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use aterm_uds::CtlStream;
 
-use super::{BoundedDispatch, Scope, ServeDisposition, read_authenticated_request_line};
+use super::{
+    AUTH_READ_TIMEOUT, BoundedDispatch, MAX_REQUEST_LINE, Scope, ServeDisposition, announced_body,
+    decode_request_line, read_authenticated_request_line,
+};
 
 /// What a lane serves a connection's requests with: the control server in the
 /// window ([`super::ControlWorkerContext`]), a stub in the scheduling tests.
@@ -99,14 +134,27 @@ pub(super) trait LaneService: Send + Sync {
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
     ) -> Option<(Scope, Option<String>)>;
-    /// Serve one authenticated request. `None` keeps the connection.
+    /// Serve one authenticated request, writing its answer into `out` (the
+    /// lane delivers it, without waiting for the peer to read it). `reader`
+    /// holds the whole request: its line was read from it, and the body a
+    /// frame announces is in it. `None` keeps the connection.
     fn serve_line(
         &self,
         line: String,
         scope: Scope,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
+        out: &mut Vec<u8>,
     ) -> Option<ServeDisposition>;
+    /// A frame's header `line` has arrived, and not all of the body it
+    /// announces: act on the header now, as the input boundary it is, while the
+    /// parker waits for the body (the request is served whole once it has come,
+    /// header and all). `false` refuses the frame, its answer in `out`: the
+    /// connection closes once that is delivered. Nothing to act on by default.
+    fn frame_header(&self, line: &str, scope: Scope, out: &mut Vec<u8>) -> bool {
+        let _ = (line, scope, out);
+        true
+    }
     /// Whether `line` belongs on a wait lane (see the module doc).
     fn is_wait(&self, line: &str, scope: Scope) -> bool;
     /// Take over a connection that flipped to push.
@@ -139,8 +187,157 @@ pub(super) struct LaneLimits {
 #[cfg(unix)]
 const PARKER_PANICS_IN_A_ROW: usize = 3;
 
-/// The read buffer a lane serves a connection through (`BufReader::new`'s).
+/// The read buffer a lane serves a connection through (`BufReader::new`'s),
+/// and the most read from a peer at once while a request is gathered.
 const READ_BUFFER: usize = 8 * 1024;
+
+/// What a connection's unread bytes hold of the request at their head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Held {
+    /// Not yet its line.
+    Partial,
+    /// A frame's header line (this many bytes, its newline not counted), and
+    /// not yet all of the body it announces.
+    Header(usize),
+    /// A whole request — its line and the body it announces — or a line longer
+    /// than any request may be, which the lane reads only to refuse.
+    Whole,
+}
+
+/// What `buffered` holds of the request at its head: the wire's grammar, so
+/// a lane and the parker agree on when a request is whole. Before the
+/// handshake only its line counts: a verb folded into it is the connection's
+/// first request, judged when the lane unfolds it.
+pub(super) fn held(buffered: &[u8], authenticated: bool) -> Held {
+    let scan = &buffered[..buffered.len().min(MAX_REQUEST_LINE + 1)];
+    let Some(end) = scan.iter().position(|byte| *byte == b'\n') else {
+        return if buffered.len() > MAX_REQUEST_LINE {
+            Held::Whole
+        } else {
+            Held::Partial
+        };
+    };
+    if !authenticated {
+        return Held::Whole;
+    }
+    let body = announced_body(&decode_request_line(buffered[..end].to_vec()));
+    if buffered.len() - (end + 1) >= body {
+        Held::Whole
+    } else {
+        Held::Header(end)
+    }
+}
+
+/// Whether `buffered` holds what a lane serves next: a whole request, or a
+/// frame's header nobody has acted on yet.
+fn servable(buffered: &[u8], authenticated: bool, header_done: bool) -> bool {
+    match held(buffered, authenticated) {
+        Held::Whole => true,
+        Held::Header(_) => !header_done,
+        Held::Partial => false,
+    }
+}
+
+/// A connection's answers on their way to its peer, from the first byte the
+/// peer has not taken yet. A lane writes a request's answer here and delivers
+/// what the peer takes at once; the parker delivers the rest as the peer makes
+/// room. Nothing more is read from the connection until it is all delivered.
+#[derive(Default)]
+pub(super) struct Outbox {
+    bytes: Vec<u8>,
+    sent: usize,
+    /// Close the connection once the answer is delivered: its request ended it.
+    then_close: bool,
+}
+
+impl Outbox {
+    /// Whether some of the answer is still the peer's to take.
+    fn owed(&self) -> bool {
+        self.sent < self.bytes.len()
+    }
+
+    /// Deliver what the peer takes: `Ok(true)` once all of it is out,
+    /// `Ok(false)` when a non-blocking socket has no room left. A blocking
+    /// socket that reports no room (a write timeout) fails.
+    fn deliver(&mut self, stream: &CtlStream, nonblocking: bool) -> std::io::Result<bool> {
+        let mut writer = stream;
+        while self.owed() {
+            match writer.write(&self.bytes[self.sent..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => self.sent += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // A large answer's buffer is not kept for the next one.
+        if self.bytes.capacity() > 8 * READ_BUFFER {
+            self.bytes = Vec::new();
+        } else {
+            self.bytes.clear();
+        }
+        self.sent = 0;
+        Ok(true)
+    }
+}
+
+/// What gathering a request from a peer, without waiting, came to (only a
+/// parker's lanes gather: unix).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Gathered {
+    /// The bytes hold what was asked for.
+    Enough,
+    /// Not yet, and nothing more is there to read now.
+    Short,
+    /// The peer sends no more (end of file).
+    Ended,
+    /// The connection failed.
+    Broken,
+}
+
+/// Read what the peer has sent into `carry`, until `enough(carry)` or nothing
+/// more is there. The socket must not block (a parked one does not; a lane's
+/// is switched for the call: [`without_waiting`]).
+#[cfg(unix)]
+fn gather(stream: &CtlStream, carry: &mut Vec<u8>, enough: impl Fn(&[u8]) -> bool) -> Gathered {
+    let mut reader = stream;
+    let mut chunk = [0u8; READ_BUFFER];
+    loop {
+        if enough(carry) {
+            return Gathered::Enough;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return Gathered::Ended,
+            Ok(read) => carry.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Gathered::Short;
+            }
+            Err(_) => return Gathered::Broken,
+        }
+    }
+}
+
+/// Run `io` with `stream` non-blocking, then make it block again (the mode a
+/// lane serves in). `O_NONBLOCK`, not `MSG_DONTWAIT`: Darwin's `send` ignores
+/// the flag on an `AF_UNIX` socket and blocks (measured on Darwin 25.6).
+#[cfg(unix)]
+fn without_waiting<T>(stream: &CtlStream, io: impl FnOnce() -> T) -> std::io::Result<T> {
+    stream.set_nonblocking(true)?;
+    let done = io();
+    stream.set_nonblocking(false)?;
+    Ok(done)
+}
+
+/// Every unread byte `reader` holds, taken out of it.
+fn unread(reader: &mut LaneReader<'_>) -> Vec<u8> {
+    let bytes = reader.buffer().to_vec();
+    reader.consume(bytes.len());
+    bytes
+}
 
 /// How every lane reads a connection's requests: through one buffer that
 /// starts with the bytes an earlier lane had already read past the wait that
@@ -241,11 +438,19 @@ pub(super) struct Conn {
     /// `None` until the handshake on its first lane.
     scope: Option<Scope>,
     tenure: ConnTenure,
-    /// The bytes a request lane had already read past the wait it moved to a
-    /// wait lane — the requests pipelined behind it — read first where it lands
-    /// ([`lane_reader`]). Empty everywhere else: every lane takes it as it
-    /// starts, and a connection parks only with nothing buffered.
+    /// Bytes read from the peer and not served yet, read first wherever the
+    /// connection lands ([`lane_reader`]): the requests a request lane had read
+    /// past the wait it moved to a wait lane, or what has come of the next
+    /// request while it is not whole (the parker adds to it as more arrives).
     carry: Vec<u8>,
+    /// The part of its last answer the peer has not taken yet.
+    reply: Outbox,
+    /// The frame header at the head of [`Self::carry`] has been acted on
+    /// ([`LaneService::frame_header`]): only its whole body wakes it now.
+    header_done: bool,
+    /// Until the handshake: when the parker drops the connection if its first
+    /// line is still not whole (`AUTH_READ_TIMEOUT` from admission).
+    expires: Option<Instant>,
     /// Held from parking until a request lane takes it back.
     parked: Option<Slot>,
     /// Held from admission until the connection ends (or flips to push). Last,
@@ -294,7 +499,8 @@ impl Conn {
     }
 
     /// A request lane takes a resumed connection back: its parking slot is
-    /// free again.
+    /// free again, and its socket blocks again (a parked one does not). `false`
+    /// when it cannot be made to: the lane closes it.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -303,8 +509,16 @@ impl Conn {
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
-    fn take_back(&mut self) {
+    fn take_back(&mut self) -> bool {
         self.parked = None;
+        #[cfg(unix)]
+        {
+            self.stream.set_nonblocking(false).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
 }
 
@@ -325,7 +539,8 @@ enum Lane {
 enum Here {
     Closed,
     Subscribe(String, Scope),
-    /// Idle, nothing buffered: park it.
+    /// Between requests — idle, or waiting on its peer for the rest of its
+    /// next request or to take the rest of its answer: park it.
     #[cfg_attr(not(unix), allow(dead_code))]
     Idle,
     /// A wait read on a request lane: move it, with what the lane had read past
@@ -357,7 +572,7 @@ struct Parker {
     /// keeping its connection.
     inbox: Mutex<Option<Vec<Conn>>>,
     /// Whether the parker still polls: `inbox.is_some()`, readable without the
-    /// lock by admission and [`Lanes::parkable`].
+    /// lock by admission and [`Lanes::parker_runs`].
     running: AtomicBool,
     /// The write end of the parker's bell (non-blocking): a byte wakes its poll.
     bell: std::os::unix::net::UnixStream,
@@ -378,6 +593,9 @@ pub(super) struct Lanes {
     #[cfg(unix)]
     parker: OnceLock<Arc<Parker>>,
     service: OnceLock<Arc<dyn LaneService>>,
+    /// How long a fresh connection has to make its handshake line whole
+    /// (milliseconds): `AUTH_READ_TIMEOUT`, short in the tests.
+    handshake_ms: AtomicU64,
     /// The negative control's switch ([`Self::keep_pipelined_waits`]).
     #[cfg(test)]
     pipelined_waits_stay: std::sync::atomic::AtomicBool,
@@ -419,9 +637,24 @@ impl Lanes {
             #[cfg(unix)]
             parker: OnceLock::new(),
             service: OnceLock::new(),
+            handshake_ms: AtomicU64::new(
+                u64::try_from(AUTH_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            ),
             #[cfg(test)]
             pipelined_waits_stay: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Give fresh connections `lifetime` to make their handshake line whole
+    /// (the tests' short one).
+    #[cfg(test)]
+    pub(super) fn set_handshake_lifetime(&self, lifetime: Duration) {
+        let ms = u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX);
+        self.handshake_ms.store(ms, Ordering::Release);
+    }
+
+    fn handshake_lifetime(&self) -> Duration {
+        Duration::from_millis(self.handshake_ms.load(Ordering::Acquire))
     }
 
     /// Start the request lanes and the parker. Returns the number of request
@@ -556,14 +789,20 @@ impl Lanes {
                             service: Arc::clone(self.service()),
                         },
                         carry: Vec::new(),
+                        reply: Outbox::default(),
+                        header_done: false,
+                        expires: Some(Instant::now() + self.handshake_lifetime()),
                         parked: None,
                         _open: open,
                     };
                     self.drive(conn, None, Lane::Rpc);
                 }
                 Job::Resume(mut conn) => {
-                    conn.take_back();
-                    self.drive(conn, None, Lane::Rpc);
+                    if conn.take_back() {
+                        self.drive(conn, None, Lane::Rpc);
+                    } else {
+                        conn.close();
+                    }
                 }
             }) {
                 aterm_log::warn!("control worker recovered after a connection panic");
@@ -669,9 +908,10 @@ impl Lanes {
                 Here::Idle => match self.park(conn) {
                     Ok(()) => return,
                     Err(back) => {
-                        // Its next request is read here, blocking; parking is
-                        // tried again once that request is answered.
-                        conn = back;
+                        // Its answer is delivered and its next request read
+                        // here, waiting; parking is tried again once that
+                        // request is answered.
+                        conn = *back;
                         may_park = false;
                         may_defer = true;
                     }
@@ -690,6 +930,13 @@ impl Lanes {
     }
 
     /// Serve `conn` on this lane until it must leave it (see [`Here`]).
+    ///
+    /// While a parker can take the connection (`may_park`, or once a request
+    /// has been served here), the lane never waits on its peer: it delivers
+    /// what the peer takes of an answer now and parks the rest, and it serves
+    /// only a request that is whole, parking a connection whose next one is
+    /// not. Once a park was refused (a parker that stopped), the next request
+    /// is read and answered here, waiting, as without a parker.
     fn serve_here(
         &self,
         conn: &mut Conn,
@@ -704,6 +951,9 @@ impl Lanes {
             scope,
             tenure,
             carry,
+            reply,
+            header_done,
+            expires,
             ..
         } = conn;
         let stream: &CtlStream = stream;
@@ -712,32 +962,82 @@ impl Lanes {
         // hangs up (`super::caller_hung_up`).
         let _hangup = super::ServingFd::enter(stream);
         let mut reader = lane_reader(stream, std::mem::take(carry));
+        let mut served = false;
         let scope = match *scope {
             Some(scope) => scope,
             None => {
+                // The handshake is read once its line is whole; until then the
+                // parker holds the connection, for the rest of its lifetime.
+                if may_park && self.parker_runs() {
+                    match gather_here(stream, &mut reader, |buffered| {
+                        held(buffered, false) == Held::Whole
+                    }) {
+                        // Whole, or all the peer will send: read it either way.
+                        Gathered::Enough | Gathered::Ended => {}
+                        Gathered::Short => {
+                            *carry = unread(&mut reader);
+                            return Here::Idle;
+                        }
+                        Gathered::Broken => return Here::Closed,
+                    }
+                }
                 let Some((authenticated, inline)) = service.authenticate(stream, &mut reader)
                 else {
                     return Here::Closed;
                 };
                 *scope = Some(authenticated);
-                // A bare `TOKEN` line is only an acknowledgement.
-                pending = inline.filter(|verb| !verb.is_empty());
+                *expires = None;
+                // A verb folded into the handshake is the first request: put at
+                // the head of what is buffered, it is judged whole or not and
+                // served like any other. A bare `TOKEN` line is only an
+                // acknowledgement.
+                if let Some(verb) = inline.filter(|verb| !verb.is_empty()) {
+                    let mut head = verb.into_bytes();
+                    head.push(b'\n');
+                    head.extend_from_slice(&unread(&mut reader));
+                    reader = lane_reader(stream, head);
+                }
                 authenticated
             }
         };
-        let mut served = false;
         loop {
-            let line = match pending.take() {
-                Some(line) => line,
-                None => {
-                    if (may_park || served) && reader.buffer().is_empty() && self.parkable(stream) {
+            let parking = (may_park || served) && self.parker_runs();
+            // The last answer goes out first, and nothing more is read until the
+            // peer has taken it all: what it does not take now, the parker
+            // delivers as it makes room.
+            if reply.owed() {
+                match deliver_here(stream, reply, parking) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        *carry = unread(&mut reader);
                         return Here::Idle;
                     }
-                    match read_authenticated_request_line(&mut reader) {
-                        Some(line) => line,
-                        None => return Here::Closed,
+                    Err(_) => return Here::Closed,
+                }
+            }
+            if reply.then_close {
+                return Here::Closed;
+            }
+            let line = match pending.take() {
+                Some(line) => line,
+                None if parking => {
+                    match next_request(stream, &mut reader, scope, header_done, reply, &*service) {
+                        Next::Line(line) => line,
+                        Next::Park => {
+                            *carry = unread(&mut reader);
+                            return Here::Idle;
+                        }
+                        Next::Refused => {
+                            reply.then_close = true;
+                            continue;
+                        }
+                        Next::Closed => return Here::Closed,
                     }
                 }
+                None => match read_authenticated_request_line(&mut reader) {
+                    Some(line) => line,
+                    None => return Here::Closed,
+                },
             };
             // A wait read on a request lane moves to a wait lane when it can —
             // with whatever this lane had read past it, so a request pipelined
@@ -753,20 +1053,21 @@ impl Lanes {
                 }
                 inline = self.take_inline();
                 if inline.is_none() {
-                    if refuse_wait(stream).is_err() {
-                        return Here::Closed;
-                    }
+                    refuse_wait(&mut reply.bytes);
                     may_defer = true;
                     served = true;
                     continue;
                 }
             }
             may_defer = true;
-            let disposition = service.serve_line(line, scope, stream, &mut reader);
+            let disposition =
+                service.serve_line(line, scope, stream, &mut reader, &mut reply.bytes);
             drop(inline);
+            served = true;
             match disposition {
-                None => served = true,
-                Some(ServeDisposition::Close) => return Here::Closed,
+                None => {}
+                // Closed once its answer is delivered.
+                Some(ServeDisposition::Close) => reply.then_close = true,
                 Some(ServeDisposition::Subscribe { line, scope }) => {
                     return Here::Subscribe(line, scope);
                 }
@@ -823,29 +1124,19 @@ impl Lanes {
         false
     }
 
-    /// Whether an idle connection could park now: a parker runs, and the
-    /// connection has nothing to read yet (parking it would only bounce it
-    /// straight back).
-    #[cfg(unix)]
-    fn parkable(&self, stream: &CtlStream) -> bool {
-        self.parker_runs() && !readable_now(stream)
-    }
-
     #[cfg(not(unix))]
-    fn parkable(&self, _stream: &CtlStream) -> bool {
-        false
+    fn park(&self, conn: Conn) -> Result<(), Box<Conn>> {
+        Err(Box::new(conn))
     }
 
-    #[cfg(not(unix))]
-    fn park(&self, conn: Conn) -> Result<(), Conn> {
-        Err(conn)
-    }
-
-    /// Park an idle connection. The open-connection bound is the parker's
-    /// capacity, so a slot is always free here while the parker runs; the check
-    /// stays, and a refusal keeps the connection on its lane, as before — as
-    /// does a parker that has stopped (read under the inbox's lock, so no
-    /// connection is handed over after its last look).
+    /// Park a connection between requests: idle, or waiting on its peer for
+    /// the rest of its next request or to take the rest of its last answer. Its
+    /// socket stops blocking (the parker never waits on one descriptor). The
+    /// open-connection bound is the parker's capacity, so a slot is always free
+    /// here while the parker runs; the check stays, and a refusal keeps the
+    /// connection on its lane, as before — as does a parker that has stopped
+    /// (read under the inbox's lock, so no connection is handed over after its
+    /// last look), or a socket that cannot be made non-blocking.
     #[cfg(unix)]
     #[cfg_attr(
         test,
@@ -871,21 +1162,20 @@ impl Lanes {
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
-    fn park(&self, mut conn: Conn) -> Result<(), Conn> {
+    fn park(&self, mut conn: Conn) -> Result<(), Box<Conn>> {
         let Some(parker) = self.parker.get() else {
-            return Err(conn);
+            return Err(Box::new(conn));
         };
         let mut inbox = parker.inbox.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(waiting) = inbox.as_mut() else {
-            return Err(conn);
+            return Err(Box::new(conn));
         };
         let Some(slot) = Slot::take(&parker.parked, self.limits.open) else {
-            return Err(conn);
+            return Err(Box::new(conn));
         };
-        debug_assert!(
-            conn.carry.is_empty(),
-            "a connection parks with nothing buffered"
-        );
+        if conn.stream.set_nonblocking(true).is_err() {
+            return Err(Box::new(conn));
+        }
         conn.parked = Some(slot);
         waiting.push(conn);
         drop(inbox);
@@ -988,7 +1278,9 @@ impl Lanes {
 
     /// The parker's loop: one `poll(2)` over every parked connection and the
     /// bell, over the `parked` set [`Self::parker_thread`] keeps across a
-    /// restart. Returns only when it cannot poll, saying why; every pass it
+    /// restart — `POLLOUT` for one whose peer owes it room for an answer,
+    /// `POLLIN` for the rest, and no longer than until the first handshake runs
+    /// out. Returns only when it cannot poll, saying why; every pass it
     /// completes zeroes `panics`.
     #[cfg(unix)]
     fn parker_loop(
@@ -1013,17 +1305,22 @@ impl Lanes {
             });
             fds.extend(parked.iter().map(|conn| libc::pollfd {
                 fd: conn.stream.as_raw_fd(),
-                events: libc::POLLIN,
+                events: if conn.reply.owed() {
+                    libc::POLLOUT
+                } else {
+                    libc::POLLIN
+                },
                 revents: 0,
             }));
             let Ok(count) = libc::nfds_t::try_from(fds.len()) else {
                 return format!("{} descriptors are too many to poll", fds.len());
             };
+            let timeout = until_a_handshake_expires(parked, Instant::now());
             // SAFETY: `fds` is an initialized, exclusively borrowed array of
             // `count` pollfds, and every descriptor in it is owned by `listen`
             // or by a `Conn` in `parked`, both alive across the call. -1 waits
             // until a descriptor is ready or a signal interrupts.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
             if ready < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1034,18 +1331,20 @@ impl Lanes {
             }
             #[cfg(test)]
             parker.fault();
-            // Readiness of the connections this poll watched. Downward, so a
-            // `swap_remove` only moves an entry already looked at.
+            // Readiness of the connections this poll watched, and the
+            // handshakes that ran out. Downward, so a `swap_remove` only moves
+            // an entry already looked at.
+            let now = Instant::now();
             for index in (0..parked.len()).rev() {
                 let events = fds[index + 1].revents;
-                if events == 0 {
+                if events == 0 && !parked[index].expires.is_some_and(|at| at <= now) {
                     continue;
                 }
                 let conn = parked.swap_remove(index);
                 // A panic here is this connection's alone: the unwind closes
                 // it, and the parker goes on with the rest.
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.wake(conn, events)
+                    self.wake(conn, events, now)
                 })) {
                     Ok(Some(conn)) => parked.push(conn),
                     Ok(None) => {}
@@ -1063,20 +1362,31 @@ impl Lanes {
         }
     }
 
-    /// Act on what woke a parked connection; `Some` hands it back to stay
-    /// parked.
+    /// Act on what woke a parked connection (`events`, or its handshake's time
+    /// running out at `now`); `Some` hands it back to stay parked.
     #[cfg(unix)]
-    fn wake(&self, conn: Conn, events: libc::c_short) -> Option<Conn> {
-        match wake_kind(&conn.stream, events) {
-            Wake::Request => {
+    fn wake(&self, mut conn: Conn, events: libc::c_short, now: Instant) -> Option<Conn> {
+        let step = if events & libc::POLLNVAL != 0 {
+            Step::Close
+        } else if events == 0 {
+            Step::Stay
+        } else if conn.reply.owed() {
+            conn.deliver_parked()
+        } else {
+            conn.gather_parked()
+        };
+        match step {
+            Step::Serve => {
                 self.resume(conn);
                 None
             }
-            Wake::HungUp => {
+            Step::Stay if !conn.expires.is_some_and(|at| at <= now) => Some(conn),
+            // Closed: its peer hung up, its connection failed, it asked to be
+            // once answered, or its handshake did not come whole in time.
+            Step::Close | Step::Stay => {
                 close_parked(conn);
                 None
             }
-            Wake::Spurious => Some(conn),
         }
     }
 
@@ -1101,6 +1411,156 @@ impl Lanes {
             }
         }
     }
+}
+
+/// What a lane found for its connection's next request.
+enum Next {
+    /// A whole request, its line read (the body it announces is buffered).
+    Line(String),
+    /// Not whole yet, and nothing more there now: the parker gathers the rest.
+    Park,
+    /// A frame's header was refused, its answer in the outbox: close.
+    Refused,
+    /// Nothing more will come, or the connection failed.
+    Closed,
+}
+
+/// The connection's next request, without waiting for its peer: served from
+/// what `reader` holds once it is whole, with what the peer has already sent
+/// gathered in first. A frame's header is acted on as soon as it is whole
+/// ([`LaneService::frame_header`]), before its body is waited for.
+fn next_request<'a>(
+    stream: &'a CtlStream,
+    reader: &mut LaneReader<'a>,
+    scope: Scope,
+    header_done: &mut bool,
+    reply: &mut Outbox,
+    service: &dyn LaneService,
+) -> Next {
+    loop {
+        match held(reader.buffer(), true) {
+            Held::Whole => {
+                *header_done = false;
+                return read_authenticated_request_line(reader).map_or(Next::Closed, Next::Line);
+            }
+            Held::Header(end) if !*header_done => {
+                let line = decode_request_line(reader.buffer()[..end].to_vec());
+                if !service.frame_header(&line, scope, &mut reply.bytes) {
+                    return Next::Refused;
+                }
+                *header_done = true;
+            }
+            Held::Header(_) | Held::Partial => {}
+        }
+        let done = *header_done;
+        match gather_here(stream, reader, |buffered| servable(buffered, true, done)) {
+            Gathered::Enough => {}
+            Gathered::Short => return Next::Park,
+            // All the peer will send is here: what it left is served as it is (a
+            // last line with no newline; a frame cut short closes), and an
+            // empty end is the end.
+            Gathered::Ended if reader.buffer().is_empty() => return Next::Closed,
+            Gathered::Ended => {
+                *header_done = false;
+                return read_authenticated_request_line(reader).map_or(Next::Closed, Next::Line);
+            }
+            Gathered::Broken => return Next::Closed,
+        }
+    }
+}
+
+/// [`gather`] into what `reader` holds, on a lane: the socket is non-blocking
+/// for the call only.
+#[cfg(unix)]
+fn gather_here<'a>(
+    stream: &'a CtlStream,
+    reader: &mut LaneReader<'a>,
+    enough: impl Fn(&[u8]) -> bool,
+) -> Gathered {
+    let mut bytes = unread(reader);
+    let gathered =
+        without_waiting(stream, || gather(stream, &mut bytes, enough)).unwrap_or(Gathered::Broken);
+    *reader = lane_reader(stream, bytes);
+    gathered
+}
+
+/// No parker runs off unix, so no lane gathers without waiting.
+#[cfg(not(unix))]
+fn gather_here(
+    _stream: &CtlStream,
+    _reader: &mut LaneReader<'_>,
+    _enough: impl Fn(&[u8]) -> bool,
+) -> Gathered {
+    unreachable!("a lane gathers only while a parker runs")
+}
+
+/// Deliver the outbox from a lane: what the peer takes now when the parker can
+/// have the rest (`parking`), else all of it, waiting.
+fn deliver_here(stream: &CtlStream, reply: &mut Outbox, parking: bool) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    if parking {
+        return without_waiting(stream, || reply.deliver(stream, true))?;
+    }
+    let _ = parking;
+    reply.deliver(stream, false)
+}
+
+/// What the parker does with a connection it looked at.
+#[cfg(unix)]
+enum Step {
+    /// Its next request (or a frame's header) is whole: back to the lanes.
+    Serve,
+    /// Keep it parked.
+    Stay,
+    Close,
+}
+
+#[cfg(unix)]
+impl Conn {
+    /// Deliver what the peer has room for of the answer it is owed.
+    fn deliver_parked(&mut self) -> Step {
+        match self.reply.deliver(&self.stream, true) {
+            Ok(false) => Step::Stay,
+            Ok(true) if self.reply.then_close => Step::Close,
+            // Delivered: the next request may be whole already (read behind
+            // the answer); otherwise the parker waits for it.
+            Ok(true) if servable(&self.carry, self.scope.is_some(), self.header_done) => {
+                Step::Serve
+            }
+            Ok(true) => Step::Stay,
+            Err(_) => Step::Close,
+        }
+    }
+
+    /// Read what has come of the next request.
+    fn gather_parked(&mut self) -> Step {
+        let (authenticated, header_done) = (self.scope.is_some(), self.header_done);
+        match gather(&self.stream, &mut self.carry, |buffered| {
+            servable(buffered, authenticated, header_done)
+        }) {
+            Gathered::Enough => Step::Serve,
+            Gathered::Short => Step::Stay,
+            // The peer sends no more: a lane serves what it left (and then
+            // reads the end), or there is nothing left to serve.
+            Gathered::Ended if !self.carry.is_empty() => Step::Serve,
+            Gathered::Ended | Gathered::Broken => Step::Close,
+        }
+    }
+}
+
+/// How long the parker may wait before the first handshake it holds runs
+/// out: a `poll(2)` timeout in milliseconds, rounded up so it never wakes
+/// early; -1 (no limit) when every connection it holds has authenticated.
+#[cfg(unix)]
+fn until_a_handshake_expires(parked: &[Conn], now: Instant) -> libc::c_int {
+    parked
+        .iter()
+        .filter_map(|conn| conn.expires)
+        .min()
+        .map_or(-1, |at| {
+            let left = at.saturating_duration_since(now).as_millis();
+            libc::c_int::try_from(left.saturating_add(1)).unwrap_or(libc::c_int::MAX)
+        })
 }
 
 /// Move what lanes handed the parker into its polled set.
@@ -1135,7 +1595,7 @@ impl Parker {
 /// budget spent — is answered with the busy reply, at once: nothing was
 /// served, and the client may send it again. The connection stays (it parks,
 /// idle, like any answered one, or serves what is pipelined behind the wait);
-/// only a failed write ends it.
+/// only a failed delivery ends it.
 #[cfg_attr(
     test,
     aterm_spec::refines(
@@ -1144,10 +1604,8 @@ impl Parker {
         project = "aterm_gui::control::control_lanes::conformance::project"
     )
 )]
-fn refuse_wait(stream: &CtlStream) -> std::io::Result<()> {
-    let mut writer = stream;
-    writer.write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes())?;
-    writer.flush()
+fn refuse_wait(out: &mut Vec<u8>) {
+    out.extend_from_slice(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
 }
 
 /// A parked connection's peer hung up with nothing left to read: closed where
@@ -1163,62 +1621,6 @@ fn refuse_wait(stream: &CtlStream) -> std::io::Result<()> {
 )]
 fn close_parked(conn: Conn) {
     conn.close();
-}
-
-/// What woke a parked connection.
-#[cfg(unix)]
-enum Wake {
-    /// Bytes to read (maybe with a hang-up behind them): serve them.
-    Request,
-    /// The peer is gone and there is nothing to read.
-    HungUp,
-    /// Nothing after all: stay parked.
-    Spurious,
-}
-
-#[cfg(unix)]
-fn wake_kind(stream: &CtlStream, events: libc::c_short) -> Wake {
-    use std::os::fd::AsRawFd;
-
-    if events & libc::POLLNVAL != 0 {
-        return Wake::HungUp;
-    }
-    let mut byte = 0u8;
-    // SAFETY: `stream` is borrowed across the call and `byte` is one writable
-    // byte. MSG_PEEK leaves the byte for the lane that reads the request.
-    let peeked = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            std::ptr::addr_of_mut!(byte).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    match peeked {
-        n if n > 0 => Wake::Request,
-        0 => Wake::HungUp,
-        _ => match std::io::Error::last_os_error().kind() {
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => Wake::Spurious,
-            _ => Wake::HungUp,
-        },
-    }
-}
-
-/// Whether the connection already has something to read (or has hung up), so
-/// parking it would only bounce it straight back.
-#[cfg(unix)]
-fn readable_now(stream: &CtlStream) -> bool {
-    use std::os::fd::AsRawFd;
-
-    let mut fd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one initialized pollfd over a descriptor `stream` keeps open;
-    // a zero timeout never blocks.
-    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-    ready != 0
 }
 
 /// The serving thread's view of the connection it carries, which a

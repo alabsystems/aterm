@@ -5,7 +5,7 @@
 //! Capability enums for the three axes.
 //!
 //! A higher discriminant means more access; the discriminants are pinned by the
-//! tests below and relied on by the `kani_proofs` harnesses.
+//! tests below and by `policy.rs`'s `test_numeric_policy_table`.
 //!
 //! Readers: `network` selects the Seatbelt profile
 //! ([`crate::sbpl::profile_for`]); `fs` scopes its file rules and moves

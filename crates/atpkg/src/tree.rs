@@ -276,6 +276,44 @@ fn walk(
     Ok(())
 }
 
+/// The relpath slot ([`rel_line_bytes`]) of every line [`tree_root`] folds under `root`,
+/// sorted as the lines are: each regular file and each symlink, recursively, read from
+/// the directory listings alone. No file is opened and no link is followed (a link to a
+/// directory is a name, never a descent, as in [`walk`]). Any other entry that is not a
+/// directory is listed too, so a name nobody folded is a mismatch here, never a skip.
+///
+/// What a stage holds its fold's names against
+/// ([`crate::extract::TreeAccumulator::require_spelled_back`]): the name is the one slot
+/// of a line the stage hands to the filesystem rather than computing itself, and a
+/// filesystem may store it under other bytes.
+///
+/// # Errors
+/// The listing's I/O errors.
+pub(crate) fn line_names(root: &Path) -> io::Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    collect_line_names(root, root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// The recursion of [`line_names`].
+fn collect_line_names(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Result<()> {
+    for child in std::fs::read_dir(dir)? {
+        let child = child?;
+        let path = child.path();
+        // `DirEntry::file_type` does not follow a link.
+        if child.file_type()?.is_dir() {
+            collect_line_names(root, &path, out)?;
+        } else {
+            let rel = path.strip_prefix(root).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
+            })?;
+            out.push(rel_line_bytes(rel));
+        }
+    }
+    Ok(())
+}
+
 /// Render the masked permission bits in octal: minimal digits, no leading zeros, so `0`
 /// renders as `"0"` and `0o644` as `"644"`. The declared-mode record beside a build
 /// (`store::write_declared_modes`) spells its numbers the same way.

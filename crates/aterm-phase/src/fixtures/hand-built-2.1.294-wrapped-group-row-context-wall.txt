@@ -1,0 +1,13 @@
+# claude-code 2.1.294 · HAND-BUILT by the review of H6-HARNESS-1 pass 2 (2026-10-08) from two measured screens of a private headless aterm 46 columns wide: the collapsed group row as Claude Code wraps it there (`  Searched for 2 patterns, read 1 file (ctrl+o` / `  to expand)`, measured) and the context wall row it draws under a collapsed group at that width (`  ⎿  Context limit reached · /compact or`, measured under `  Read 1 file (ctrl+o to expand)`); the two were not captured on one screen
+❯ toolstart
+
+  Searched for 2 patterns, read 1 file (ctrl+o
+  to expand)
+  ⎿  Context limit reached · /compact or
+
+✻ Cogitated for 3s · done 8:50 AM
+
+──────────────────────────────────────────────
+❯
+──────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← fo…

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use aterm_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use aterm_types::text_shaping::AmbiguousWidth;
 
 use crate::bitmap::SparseBitmap;
 
@@ -14,7 +15,7 @@ use super::bloom::BloomFilter;
 use super::iterators::{
     CandidateSource, SearchMatchIterator, SearchMatchReverseIterator, next_literal_match,
 };
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use super::types::SearchResult;
 use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
 use crate::grapheme::{
@@ -198,6 +199,10 @@ pub struct SearchIndex {
     eviction_occurred: bool,
     /// Guards the one-time `aterm_log` warning emitted on first eviction.
     first_eviction_warned: bool,
+    /// How wide the grid draws an East Asian Ambiguous character in the lines
+    /// indexed here (the terminal's `ambiguous_width` policy): every column a
+    /// match reports is measured under it.
+    pub(super) ambiguous_width: AmbiguousWidth,
 }
 
 /// Convert a line number to u32 for `SparseBitmap` storage.
@@ -231,7 +236,7 @@ fn insert_posting(
 /// intersection uses `&a & &b` (borrowed on both sides) which constructs the
 /// result directly. Only when there is exactly one list does a clone occur,
 /// because we need an owned bitmap for downstream consumers (#7375).
-#[cfg(any(test, kani))]
+#[cfg(test)]
 fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
     #[cfg(test)]
     OWNED_INTERSECTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
@@ -501,6 +506,7 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
+            ambiguous_width: AmbiguousWidth::Single,
         }
     }
 
@@ -562,7 +568,29 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
+            ambiguous_width: AmbiguousWidth::Single,
         }
+    }
+
+    /// Measure columns under the terminal's `ambiguous_width` policy: with
+    /// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`,
+    /// `°`) takes two columns, as the grid draws it. Lines already indexed are
+    /// re-measured, so every match is in the one frame.
+    pub fn set_ambiguous_width(&mut self, ambiguous: AmbiguousWidth) {
+        if ambiguous == self.ambiguous_width {
+            return;
+        }
+        self.ambiguous_width = ambiguous;
+        for (line, text) in &self.lines {
+            self.column_maps
+                .insert(*line, ColumnMap::new(text, ambiguous));
+        }
+    }
+
+    /// The `ambiguous_width` policy columns are measured under.
+    #[must_use]
+    pub fn ambiguous_width(&self) -> AmbiguousWidth {
+        self.ambiguous_width
     }
 
     /// Index a line at a specific line number.
@@ -629,7 +657,7 @@ impl SearchIndex {
             }
         }
 
-        let column_map = ColumnMap::new(text_ref);
+        let column_map = ColumnMap::new(text_ref, self.ambiguous_width);
         self.lines.insert(line_num, text.into_owned());
         self.column_maps.insert(line_num, column_map);
         self.first_cached_line = self.first_cached_line.min(line_num);
@@ -904,7 +932,7 @@ impl SearchIndex {
     /// Returns `None` when no matches are possible (a trigram is missing or the
     /// query yields no posting lists), and `Some(bitmap)` with the intersection
     /// otherwise. Caller is responsible for ensuring `query` has 3+ bytes.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     fn intersect_trigrams(&self, query: &str) -> Option<SparseBitmap> {
         let mut posting_lists = self.posting_lists(query)?;
         if posting_lists.is_empty() {
@@ -980,7 +1008,7 @@ impl SearchIndex {
     ///
     /// Returns line numbers that might contain the query.
     /// Results may include false positives but never false negatives.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn search(&self, query: &str) -> impl Iterator<Item = u32> + '_ + use<'_> {
         let bytes = query.as_bytes();
 
@@ -1107,7 +1135,7 @@ impl SearchIndex {
     /// exceeds the new cap.
     ///
     /// [`index_line`]: Self::index_line
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn set_max_cached_lines(&mut self, max: usize) {
         self.max_cached_lines = max.max(1);
     }
@@ -1631,7 +1659,7 @@ impl SearchIndex {
             let col_map = match self.column_maps.get(&line_num) {
                 Some(cm) => cm,
                 None => {
-                    fallback = ColumnMap::new(text);
+                    fallback = ColumnMap::new(text, self.ambiguous_width);
                     &fallback
                 }
             };
@@ -1728,7 +1756,7 @@ impl SearchIndex {
                     let col_map = match self.column_maps.get(&line_num) {
                         Some(cm) => cm,
                         None => {
-                            fallback = ColumnMap::new(text);
+                            fallback = ColumnMap::new(text, self.ambiguous_width);
                             &fallback
                         }
                     };
@@ -1755,7 +1783,7 @@ impl SearchIndex {
                     let col_map = match self.column_maps.get(&line_num) {
                         Some(cm) => cm,
                         None => {
-                            fallback = ColumnMap::new(text);
+                            fallback = ColumnMap::new(text, self.ambiguous_width);
                             &fallback
                         }
                     };
@@ -1944,7 +1972,7 @@ impl SearchIndex {
             let col_map = match self.column_maps.get(&line_num) {
                 Some(map) => map,
                 None => {
-                    fallback = ColumnMap::new(text);
+                    fallback = ColumnMap::new(text, self.ambiguous_width);
                     &fallback
                 }
             };
@@ -2106,7 +2134,7 @@ impl SearchIndex {
             let col_map = match self.column_maps.get(&line_num) {
                 Some(map) => map,
                 None => {
-                    fallback = ColumnMap::new(text);
+                    fallback = ColumnMap::new(text, self.ambiguous_width);
                     &fallback
                 }
             };
@@ -2197,7 +2225,7 @@ impl SearchIndex {
             let col_map = match self.column_maps.get(&line_num) {
                 Some(cm) => cm,
                 None => {
-                    fallback = ColumnMap::new(text);
+                    fallback = ColumnMap::new(text, self.ambiguous_width);
                     &fallback
                 }
             };
@@ -2260,7 +2288,7 @@ impl SearchIndex {
             let col_map = match self.column_maps.get(&line_num) {
                 Some(cm) => cm,
                 None => {
-                    fallback = ColumnMap::new(text);
+                    fallback = ColumnMap::new(text, self.ambiguous_width);
                     &fallback
                 }
             };

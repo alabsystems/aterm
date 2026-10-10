@@ -4126,274 +4126,128 @@ fn plist_bundle_version_reads_only_the_string_bound_to_the_key() {
     );
     assert_eq!(plist_bundle_version("<plist/>"), None);
 }
-/// Build a directory `scan` will recognize as cargo output by its `RustcInfo` evidence:
-/// `.rustc_info.json` and `debug/`, no `CACHEDIR.TAG` (the shape a real target dir had).
-#[cfg(target_os = "macos")]
-fn cargo_target(parent: &Path, name: &str) -> PathBuf {
-    let dir = parent.join(name);
-    std::fs::create_dir_all(dir.join("debug")).unwrap();
-    std::fs::write(dir.join(".rustc_info.json"), b"{}\n").unwrap();
-    std::fs::write(dir.join("debug/libay.rlib"), b"0123456789").unwrap();
-    dir
-}
-
-/// The Spotlight warning says how far the UNATTENDED PASS reaches. The pass renames
-/// only a target dir beside a Cargo.toml (`noindex::apply_under`, `require_repo`); a
-/// free-standing one — an env var's, a build system's — is skipped on every pass. The
-/// line splits the count and NAMES the free ones, in each of the three shapes.
-#[cfg(target_os = "macos")]
-#[test]
-fn spotlight_warning_separates_the_pass_reach_from_free_standing_dirs() {
-    let l = layout("reach");
-    install(&l, "ay", 19);
-    let home = synthetic_home("reach");
-    let manifest = "[package]\nname = \"a\"\nversion = \"0.0.0\"\n";
-    // Beside a Cargo.toml: the pass's to migrate.
-    std::fs::create_dir_all(home.join("repo-a")).unwrap();
-    std::fs::write(home.join("repo-a/Cargo.toml"), manifest).unwrap();
-    cargo_target(&home.join("repo-a"), "target");
-    // Free-standing: nothing beside it names it, so nothing the pass can re-point.
-    let free = cargo_target(&home.join("scratch"), "tgt");
-    let path = std::env::join_paths([l.bin_dir()]).unwrap();
-    let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
-    let run = || {
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let ok = run_with(
-            &l,
-            Some(&home),
-            Some(&path),
-            now,
-            None,
-            "doctor",
-            &Probes::default(),
-            &mut out,
-            &mut err,
-        );
-        (ok, String::from_utf8_lossy(&out).into_owned())
-    };
-
-    // Mixed: one of each.
-    let (ok, out) = run();
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(&format!(
-            "doctor: warn — 2 of 2 cargo target dir(s) under {} are indexed by Spotlight",
-            home.display()
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(
-            "aterm migrates the 1 beside a Cargo.toml once a day, at the first window or \
-             terminal session; the other 1 is free-standing"
-        ),
-        "{out}"
-    );
-    assert!(
-        out.contains(&free.display().to_string()),
-        "the free-standing dir must be NAMED, not counted: {out}"
-    );
-    assert!(
-        out.contains("`aterm pkg noindex apply <dir>` by name"),
-        "the free one has a verb, and it is the by-name one: {out}"
-    );
-    assert!(
-        out.contains("aterm pkg noindex apply --all"),
-        "the pass's own verb stays named: {out}"
-    );
-
-    // All free: the pass will never move any of them, and the line must say so
-    // instead of promising a migration that never comes.
-    std::fs::remove_file(home.join("repo-a/Cargo.toml")).unwrap();
-    let (ok, out) = run();
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("NONE is beside a Cargo.toml, so aterm never renames any of them"),
-        "{out}"
-    );
-    assert!(
-        out.contains(&free.display().to_string())
-            && out.contains(&home.join("repo-a/target").display().to_string()),
-        "both free-standing dirs are named: {out}"
-    );
-    // AND NO REMEDY THAT CANNOT REACH THEM. `--all` walks with `require_repo`, so
-    // offering it here — one clause after saying the pass renames none of these —
-    // is a guaranteed no-op that leaves the warning standing.
-    assert!(
-        !out.contains("apply --all"),
-        "a remedy that skips every dir named must not be offered: {out}"
-    );
-    assert!(
-        out.contains("`aterm pkg noindex apply <dir>` by name"),
-        "the reach clause still names the verb that DOES reach them: {out}"
-    );
-
-    // All in repos: no free-standing clause at all.
-    std::fs::write(home.join("repo-a/Cargo.toml"), manifest).unwrap();
-    std::fs::write(home.join("scratch/Cargo.toml"), manifest).unwrap();
-    let (ok, out) = run();
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(
-            "aterm migrates them once a day, at the first window or terminal session \
-             (every one is beside a Cargo.toml)"
-        ),
-        "{out}"
-    );
-    assert!(!out.contains("free-standing"), "{out}");
-    assert!(
-        out.contains("now: `aterm pkg machine apply`"),
-        "with dirs the pass can reach, the remedy is the pass's own verb: {out}"
-    );
-    assert!(out.contains("apply --all"), "{out}");
-}
-
-/// A Spotlight-exposed target dir is a WARNING and exit stays 0.
-///
-/// `mds` grinding build output amplified a WindowServer watchdog kill, and a rename
-/// removes it, so doctor says it out loud. But it is NOT structural — every installed
-/// tool still runs — and the scan is a name-based
-/// heuristic over a depth-limited walk, so counting it as a problem would be doctor
-/// inventing a fault from evidence it did not measure. The only thing that measures
-/// exclusion is `noindex verify`, which WRITES a probe file; doctor never mutates, so
-/// doctor never probes — it names the verb instead. This pins all three: the words, the
-/// stream (`out`, never `err`), and the exit code.
-#[cfg(target_os = "macos")]
-#[test]
-fn spotlight_exposed_build_output_warns_but_exit_zero() {
-    let l = layout("indexed");
-    install(&l, "ay", 19);
-    // The label must not contain the word the assertions grep for: several other doctor
-    // lines print $HOME, and a home named "spotlight" would satisfy them vacuously.
-    let home = synthetic_home("indexed");
-    std::fs::create_dir_all(home.join("repo-a")).unwrap();
-    std::fs::write(
-        home.join("repo-a/Cargo.toml"),
-        b"[package]\nname = \"a\"\nversion = \"0.0.0\"\n",
-    )
-    .unwrap();
-    let exposed = cargo_target(&home.join("repo-a"), "target");
-    cargo_target(&home.join("repo-b"), "target.noindex");
-    let path = std::env::join_paths([l.bin_dir()]).unwrap();
-    let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
-    let run = || {
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let ok = run_with(
-            &l,
-            Some(&home),
-            Some(&path),
-            now,
-            None,
-            "doctor",
-            &Probes::default(),
-            &mut out,
-            &mut err,
-        );
-        (
-            ok,
-            String::from_utf8_lossy(&out).into_owned(),
-            String::from_utf8_lossy(&err).into_owned(),
-        )
-    };
-
-    let (ok, out, err) = run();
-    assert!(
-        ok,
-        "an indexed target dir is advisory, never structural:\n{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "doctor: warn — 1 of 2 cargo target dir(s) under {} are indexed by Spotlight",
-            home.display()
-        )),
-        "{out}"
-    );
-    // The remedy names the verb that APPLIES (what the pass runs) and the verb that
-    // MEASURES, because doctor itself never probes and never renames.
-    for want in [
-        "aterm pkg noindex apply --all",
-        "[machine] spotlight_noindex",
-        "aterm pkg noindex verify <dir>",
-        "can stall WindowServer",
-    ] {
-        assert!(out.contains(want), "{want:?} missing from:\n{out}");
-    }
-    // Bytes come from `noindex::human_size` → `cost::human_bytes`, never hand-rolled:
-    // cli.rs's source guards reject a `1e9` or a `{:.1} GB` anywhere in production code.
-    // 13 B is the whole synthetic tree — `.rustc_info.json` plus one 10-byte artifact.
-    assert!(
-        out.contains(&format!("({})", crate::cost::human_bytes(13))),
-        "the exposed size must be rendered through cost::human_bytes:\n{out}"
-    );
-    assert!(
-        !err.to_lowercase().contains("spotlight"),
-        "nothing here is a FAIL, so nothing here belongs on stderr:\n{err}"
-    );
-
-    // Once the exposed one is hidden too, the same check says `ok` — and still exit 0.
-    std::fs::rename(&exposed, exposed.with_file_name("target.noindex")).unwrap();
-    let (ok, out, _) = run();
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(&format!(
-            "doctor: ok — 2 cargo target dir(s) under {} are hidden from Spotlight",
-            home.display()
-        )),
-        "{out}"
-    );
-    // `ok` here is `exclusion_of` reading the NAME — doctor never probes. Saying so is
-    // the difference between this line and the 189 inert `.metadata_never_index`
-    // markers: the day macOS changes the `.noindex` behaviour, an unqualified `ok` is a
-    // confident false success on every run.
-    assert!(
-        out.contains("that is what the NAMES say")
-            && out.contains("aterm pkg noindex verify <dir>"),
-        "the ok line must name its provenance and the verb that MEASURES:\n{out}"
-    );
-
-    let _ = std::fs::remove_dir_all(&l.prefix);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// A home with no cargo output says NOTHING about Spotlight.
-///
-/// Silence is the answer for a check that does not apply to this machine — the same
-/// discipline as the `rustup` block. A "not applicable" line on every `doctor` run of a
-/// non-Rust Mac is noise that trains people to skim the report, which is the one
-/// failure mode a diagnostic cannot recover from. Portable on purpose: off macOS
-/// `noindex::scan` returns an empty, `complete` scan, so this asserts the no-`cfg`
-/// call site really is a clean no-op there.
-#[test]
-fn a_home_without_build_output_says_nothing_about_spotlight() {
-    let l = layout("indexed-quiet");
-    install(&l, "ay", 19);
-    let home = synthetic_home("indexed-quiet");
+/// One `doctor` run over `home` with `probes`: whether it was healthy, and its stdout.
+fn doctor_over(l: &Layout, home: &Path, probes: &Probes) -> (bool, String) {
     let path = std::env::join_paths([l.bin_dir()]).unwrap();
     let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     let ok = run_with(
-        &l,
-        Some(&home),
+        l,
+        Some(home),
         Some(&path),
         now,
         None,
         "doctor",
-        &Probes::default(),
+        probes,
         &mut out,
         &mut err,
     );
-    let out = String::from_utf8_lossy(&out).into_owned();
-    let err = String::from_utf8_lossy(&err).into_owned();
+    (ok, String::from_utf8_lossy(&out).into_owned())
+}
+
+/// THE `devroot` ROW: a checkout under `$HOME` outside `~/Developer` is named with the
+/// verb that moves it — a NOTE while there is no `~/Developer` (a Mac that keeps its code
+/// elsewhere is not unhealthy), a WARNING once there is — advisory either way, so the exit
+/// stays healthy; once it is inside, the row says every checkout is. It says what to do
+/// about Spotlight, never that the root is skipped (the `spotlight:` row measures that).
+/// Dot-folders and `Library` are never read. macOS only: the root is a Spotlight
+/// arrangement.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_devroot_row_names_checkouts_outside_the_root() {
+    let l = layout("devroot");
+    install(&l, "ay", 19);
+    let home = synthetic_home("devroot");
+    std::fs::create_dir_all(home.join("proj/.git")).unwrap();
+    let (ok, out) = doctor_over(&l, &home, &Probes::default());
     assert!(ok, "{out}");
-    for text in [&out, &err] {
-        assert!(
-            !text.to_lowercase().contains("spotlight"),
-            "a machine with no build output must hear nothing:\n{text}"
-        );
-    }
+    assert!(
+        out.contains("doctor: note — devroot: 1 git checkout outside ~/Developer (~/proj)"),
+        "no ~/Developer yet: a note\n{out}"
+    );
+    std::fs::create_dir_all(home.join("Developer/inside/.git")).unwrap();
+    std::fs::create_dir_all(home.join(".hidden/repo/.git")).unwrap();
+    std::fs::create_dir_all(home.join("Library/repo/.git")).unwrap();
+    let (ok, out) = doctor_over(&l, &home, &Probes::default());
+    assert!(ok, "a checkout outside the root is advisory:\n{out}");
+    assert!(
+        out.contains(
+            "doctor: warn — devroot: 1 git checkout outside ~/Developer (~/proj) — \
+             ~/Developer is the one folder to add to System Settings \u{25b8} Spotlight \
+             \u{25b8} Search Privacy (`spotlight:` measures whether Spotlight skips it); now: \
+             `aterm pkg devroot`"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("kept out of Spotlight"),
+        "the row never says what only the measurement can:\n{out}"
+    );
+    std::fs::rename(home.join("proj"), home.join("Developer/proj")).unwrap();
+    let (ok, out) = doctor_over(&l, &home, &Probes::default());
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("doctor: ok — devroot: all 2 git checkouts under ~ are in ~/Developer"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("spotlight:"),
+        "a report that does not measure says nothing about Spotlight:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// THE `spotlight` ROW decides from the MEASURED verdict alone: excluded is `ok`, indexed
+/// is a `warn` whose fix is the one owner action (the Search Privacy list), an
+/// unmeasured answer is a `note` that never claims either — and none of them is a
+/// failure.
+#[test]
+fn the_spotlight_row_decides_from_the_measured_verdict() {
+    use crate::devroot::Spotlight;
+    use crate::noindex::{Unmeasured, Verdict};
+    let l = layout("spotlight-row");
+    install(&l, "ay", 19);
+    let home = synthetic_home("spotlight-row");
+    let with = |s: Spotlight| Probes {
+        spotlight: Some(s),
+        ..Probes::default()
+    };
+    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(Verdict::Excluded)));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("doctor: ok — spotlight: ~/Developer is skipped by Spotlight (measured"),
+        "{out}"
+    );
+    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(Verdict::Indexed)));
+    assert!(ok, "an indexed root is advisory, never structural:\n{out}");
+    assert!(
+        out.contains(
+            "doctor: warn — spotlight: Spotlight indexes ~/Developer (measured: the probe was \
+             found) — fix: add ~/Developer to System Settings \u{25b8} Spotlight \u{25b8} \
+             Search Privacy"
+        ),
+        "{out}"
+    );
+    let unknown = Verdict::Unknown(Unmeasured::ControlNeverIndexed { waited_secs: 20 });
+    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(unknown)));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("doctor: note — spotlight: unknown — the control was not indexed"),
+        "{out}"
+    );
+    let (_, out) = doctor_over(&l, &home, &with(Spotlight::NoRoot));
+    assert!(
+        out.contains("doctor: note — spotlight: ~/Developer does not exist yet"),
+        "{out}"
+    );
+    let (_, out) = doctor_over(
+        &l,
+        &home,
+        &with(Spotlight::Measured(Verdict::NotApplicable)),
+    );
+    assert!(!out.contains("spotlight:"), "no Spotlight, no row:\n{out}");
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -4405,7 +4259,6 @@ fn a_workspace_policy_the_installed_targo_refuses_is_a_problem_that_names_the_cu
     let home = synthetic_home("wspolicy");
     let path = std::env::join_paths([l.bin_dir()]).unwrap();
     let probes = Probes {
-        provenance_attr: crate::provenance::PROVENANCE_XATTR,
         workspace: Some(WorkspacePolicyProbe {
             workspace: PathBuf::from("/work/ty"),
             policy: WorkspacePolicy::UnknownField {
@@ -4454,7 +4307,6 @@ fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
     let local = home.join("trust-d3866677");
     std::fs::create_dir_all(&local).unwrap();
     let mut probes = Probes {
-        provenance_attr: crate::provenance::PROVENANCE_XATTR,
         workspace: Some(WorkspacePolicyProbe {
             workspace: PathBuf::from("/work/aterm"),
             policy: WorkspacePolicy::Accepted,
@@ -5584,105 +5436,6 @@ fn the_trust_table_is_found_on_the_nearest_ancestor_manifest() {
     assert_eq!(workspace_with_trust_table(&plain), None);
 }
 
-/// Installed files that still carry the tag — anywhere the heal reaches: a bundle's
-/// `bin/`, a nested directory of it, a shim, the rustup view — are ONE warning line,
-/// exit 0, at most 160 characters, naming the count, what it breaks and `aterm pkg
-/// repair`. A clean store says nothing about the tag at all. Minted with a synthetic
-/// `user.*` attribute:
-/// `com.apple.provenance` cannot be set by hand, and a test process may itself be
-/// tracked, so the negative half uses an attribute nothing set rather than the real one.
-#[cfg(target_os = "macos")]
-#[test]
-fn tagged_installed_files_are_one_short_warning_and_exit_zero() {
-    let l = layout("provenance");
-    install(&l, "trust", 8590);
-    install(&l, "ay", 8256);
-    let trust_exe = l.build_dir("trust", 8590).join("bin/trust");
-    let shim = l.bin_dir().join("trust");
-    let nested = l.build_dir("trust", 8590).join("libexec").join("helper");
-    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
-    std::fs::write(&nested, b"#!/bin/sh\n").unwrap();
-    let view = crate::seam::view_dir(&l, "trust")
-        .join("bin")
-        .join("trustc");
-    std::fs::create_dir_all(view.parent().unwrap()).unwrap();
-    std::fs::write(&view, b"trustc").unwrap();
-    assert!(
-        trust_exe.is_file() && shim.is_file(),
-        "fixture laid the tool and its shim"
-    );
-    let home = synthetic_home("provenance");
-    let path = std::env::join_paths([l.bin_dir()]).unwrap();
-    let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
-    let run = |attr: &'static str| {
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let probes = Probes {
-            provenance_attr: attr,
-            ..Probes::default()
-        };
-        let ok = run_with(
-            &l,
-            Some(&home),
-            Some(&path),
-            now,
-            None,
-            "doctor",
-            &probes,
-            &mut out,
-            &mut err,
-        );
-        (
-            ok,
-            String::from_utf8_lossy(&out).into_owned(),
-            String::from_utf8_lossy(&err).into_owned(),
-        )
-    };
-
-    // Clean: not a word about the tag.
-    let (ok, out, _) = run("user.aterm.probe");
-    assert!(ok);
-    assert!(
-        !out.contains("com.apple.provenance") && !out.contains("macOS tag"),
-        "{out}"
-    );
-
-    for tagged in [&trust_exe, &shim, &nested, &view] {
-        crate::provenance::set_xattr_for_test(tagged, "user.aterm.probe", b"1").unwrap();
-    }
-    let (ok, out, err) = run("user.aterm.probe");
-    assert!(
-        ok,
-        "a tagged file is advisory, never structural:\n{out}\n{err}"
-    );
-    let lines: Vec<&str> = out.lines().filter(|l| l.contains("macOS tag")).collect();
-    assert_eq!(lines.len(), 1, "ONE line, however many roots:\n{out}");
-    let line = lines[0];
-    assert_eq!(
-        line,
-        "doctor: warn — 4 installed files still carry a macOS tag (com.apple.provenance) \
-         that release builds refuse. fix: aterm pkg repair"
-    );
-    assert!(line.chars().count() <= 160, "{line}");
-    assert!(err.is_empty(), "warnings go to out, never err:\n{err}");
-
-    // One file: the singular.
-    let scan = crate::provenance::Scan {
-        carriers: vec![trust_exe.clone()],
-        total: 9,
-    };
-    assert!(
-        provenance_line(&scan).starts_with("warn — 1 installed file still carries a macOS tag")
-    );
-
-    // An attribute nothing set: no line.
-    let (ok, out, _) = run("user.aterm.absent");
-    assert!(ok);
-    assert!(!out.contains("macOS tag"), "{out}");
-    let _ = std::fs::remove_dir_all(&l.prefix);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
 /// WHAT THIS BUILD IGNORES, WARNED: a `[packages] prefix` naming
 /// another store stops unattended installs until the line goes, and a retired opt-out
 /// still exported switches nothing off — each is a `warn` naming the fix, and neither
@@ -6118,11 +5871,29 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
 /// under the same verdict.
 #[test]
 fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
-    let spotlight = "doctor: warn — 18 of 49 cargo target dir(s) under /Users//x are \
-         indexed by Spotlight (at least 37.0 GiB) — `mds` grinding build output was one of \
-         the two amplifiers behind a watchdog kill; the other 13 are free-standing, which \
-         aterm cannot re-point — re-point that, then `aterm pkg noindex apply <dir>` by \
-         name — now: `aterm pkg machine apply` (or `aterm pkg noindex apply --all`)";
+    // The longest row a real report carries: the developer root's, with checkouts past
+    // the ones it names.
+    let home = std::path::PathBuf::from("/Users//x");
+    let survey = crate::devroot::Survey {
+        root: crate::devroot::root(&home),
+        root_is: crate::devroot::RootIs::Folder,
+        outside: ["aterm", "aterm-wa-devroot", "trust", "ay", "publication"]
+            .map(|name| crate::devroot::Checkout {
+                path: home.join(name),
+                common: home.join(name).join(".git"),
+                linked: false,
+            })
+            .to_vec(),
+        inside: Vec::new(),
+        home,
+    };
+    let row = crate::devroot::devroot_row(&survey);
+    assert_eq!(row.level, crate::devroot::Level::Warn);
+    let devroot = format!("doctor: warn \u{2014} devroot: {}", row.text);
+    assert!(
+        devroot.chars().count() > SHORT_ROW,
+        "the row must be cut: {devroot}"
+    );
     let path_row = "doctor: warn — managed bin/ is not on PATH here; a new aterm shell \
          adds it, or add: export PATH=\"$PATH:/Users//someone-with-a-long-name/Library/\
          Application Support/aterm/pkg/bin\"";
@@ -6145,9 +5916,9 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     let report = format!(
         "doctor: this atpkg is 0.91.0 at /x\n\
          doctor: ok — prefix /p\n\
-         doctor: warn — 1252 installed files still carry a macOS tag. fix: aterm pkg repair\n\
+         doctor: warn — no index update pass has completed yet — run: aterm pkg update\n\
          doctor: note — Trust builds use the ay pinned inside the trust bundle\n\
-         {spotlight}\n\
+         {devroot}\n\
          doctor: 12 program(s) active\n\
          doctor: healthy\n"
     );
@@ -6159,12 +5930,13 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     );
     assert_eq!(
         lines[1],
-        "doctor: warn — 1252 installed files still carry a macOS tag. fix: aterm pkg repair"
+        "doctor: warn — no index update pass has completed yet — run: aterm pkg update"
     );
     assert_eq!(
         lines[2],
-        "doctor: warn — 18 of 49 cargo target dir(s) under /Users//x are indexed by \
-         Spotlight (at least 37.0 GiB) — run `aterm pkg machine apply`"
+        "doctor: warn — devroot: 5 git checkouts outside ~/Developer (~/aterm, \
+         ~/aterm-wa-devroot, $HOME/trust, +2 more) — run `aterm pkg devroot`",
+        "the fact and its next step survive the cut"
     );
     assert_eq!(
         lines[3],
@@ -6183,7 +5955,7 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     let all = present(&report, "", "doctor", Detail::Everything).joined();
     assert!(all.starts_with("doctor: working — 12 program(s)"), "{all}");
     assert!(
-        all.contains("doctor: ok — prefix /p") && all.contains(spotlight),
+        all.contains("doctor: ok — prefix /p") && all.contains(&devroot),
         "{all}"
     );
     assert!(!all.contains("doctor: healthy"), "{all}");

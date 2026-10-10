@@ -310,9 +310,9 @@ impl RgbColorRing {
     /// Heap bytes held by the (lazily allocated) fg/bg planes.
     #[inline]
     fn heap_bytes(&self) -> usize {
-        let fg = self.fg.as_deref().map_or(0, |p| p.len() * 4);
-        let bg = self.bg.as_deref().map_or(0, |p| p.len() * 4);
-        fg + bg
+        let fg = self.fg.as_deref().map_or(0, |p| p.len().saturating_mul(4));
+        let bg = self.bg.as_deref().map_or(0, |p| p.len().saturating_mul(4));
+        fg.saturating_add(bg)
     }
 
     /// Compute flat array index from (external_row, col).
@@ -1815,11 +1815,19 @@ impl CellExtras {
     /// Calculate total memory used.
     #[must_use]
     pub(crate) fn memory_used(&self) -> usize {
-        let base =
-            std::mem::size_of::<Self>() + self.data.capacity() * std::mem::size_of::<CellCoord>();
-        let extras_mem: usize = self.data.values().map(CellExtra::memory_used).sum();
+        // Saturating throughout, as in `Grid::memory_used`.
+        let base = std::mem::size_of::<Self>().saturating_add(
+            self.data
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CellCoord>()),
+        );
+        let extras_mem = self
+            .data
+            .values()
+            .map(CellExtra::memory_used)
+            .fold(0, usize::saturating_add);
         let rgb_mem = self.rgb_ring.as_ref().map(|r| r.heap_bytes()).unwrap_or(0);
-        base + extras_mem + rgb_mem
+        base.saturating_add(extras_mem).saturating_add(rgb_mem)
     }
 
     /// Number of valid (non-stale) extras entries.

@@ -430,7 +430,7 @@ fn dark_text_cols(h: &Host, i: usize) -> Vec<usize> {
 #[test]
 fn typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit() {
     // Each take replays on its own host and clock, so the 36 run on the
-    // binary's threads (`par_map`, 2026-10-05: 2.7 s on one thread alone);
+    // binary's threads (`par_map`);
     // the first failing take in this order raises its own panic.
     let takes: Vec<(Shape, usize, u64)> = SHAPES
         .into_iter()

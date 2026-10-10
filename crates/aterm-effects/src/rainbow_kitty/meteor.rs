@@ -259,9 +259,9 @@ impl LandingWalk {
 }
 
 /// The landing's ink: the band's hot ink ([`hot_edge_ink`]) at folded arc
-/// position `t`, with the crossing's chroma given back ([`BED_SAT_FLOOR`], so
-/// the green→blue seam is the band's teal) and lifted through its own hue to
-/// one heat.
+/// position `t` at full chroma (the arc is S 1.00, so the green→blue seam is
+/// the band's teal; [`BED_SAT_FLOOR`] guards an off-arc read) and lifted
+/// through its own hue to one heat.
 ///
 /// The burst is additive light over the text, the lane the band's hot edge
 /// lives in, so it takes the hot edge's table rather than the bed's (which is

@@ -15,7 +15,7 @@ use aterm_lexicon::Lexicon;
 
 /// An INCOHERENT observation: the cells were extracted before a scroll the
 /// facts already saw (`base_y` disagrees), the shape of a snapshot a present
-/// reused. A sub-row scroll offset is no longer one: the renderer translates
+/// reused. A sub-row scroll offset is not one: the renderer translates
 /// the grid band and the pet's sprite together (`PetWorld::observe`).
 fn stale_snapshot(input: &mut aterm_core::render::RenderInput) {
     input.base_y += 1;
@@ -194,7 +194,7 @@ fn a_single_incoherent_observation_does_not_commission_a_far_trip() {
     assert_eq!(before.alpha, 255);
     s.incoherent = true;
     let unknown = s.tick();
-    // HELD, NOT CUT (2026-10-01): the body already on glass stays exactly
+    // HELD, NOT CUT: the body already on glass stays exactly
     // where the last certified frame judged it, at the same opacity — the
     // visibility hold's unknown — and is never moved by a map it cannot read.
     assert_eq!(

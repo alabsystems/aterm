@@ -845,26 +845,7 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
         said(&format!("atpkg: {SEED_UNUSABLE_MARKER}{unserved}")).as_deref(),
         Some("No ALab build is published for this machine's processor yet.")
     );
-    assert_eq!(
-        said(&format!(
-            "atpkg: {}",
-            machine_settings_line(&[spotlight_entry(3)])
-        ))
-        .as_deref(),
-        Some("Changed this Mac's settings: hid 3 Rust build folder(s) from Spotlight.")
-    );
     // Universal Control's change has its own line beside the marker, with the revert.
-    let both = format!(
-        "atpkg: {}",
-        machine_settings_line(&[
-            crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string(),
-            spotlight_entry(3)
-        ])
-    );
-    assert_eq!(
-        said(&both).as_deref(),
-        Some("Changed this Mac's settings: hid 3 Rust build folder(s) from Spotlight.")
-    );
     let alone = format!(
         "atpkg: {}",
         machine_settings_line(&[crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()])
@@ -876,6 +857,7 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
         LOCK_ACQUIRED_MARKER,
         GROUP_ABORTED_MARKER,
         SHADOWED_MARKER,
+        FOREIGN_MARKER,
         MANAGED_CURRENT_MARKER,
         MACHINE_STATE_MARKER,
         SEED_BUSY_MARKER,
@@ -1160,11 +1142,15 @@ fn verb_hint_matches_dispatch() {
     // machine channels the GUI adds to its spawns, stripped before verb dispatch.
     for (verb, flags) in [
         ("list", &["--porcelain"][..]),
-        ("relocate", &["--sign", "--advisory"][..]),
-        // Both of `noindex`'s flags are subcommand-specific, which is precisely why
-        // the usage line has to name them: a reader who cannot see that `--depth`
-        // belongs to `scan` learns it from a usage error instead.
-        ("noindex", &["--depth", "--dry-run", "--all"][..]),
+        (
+            "relocate",
+            &["--sign", "--advisory", "--donor-root", "--lineage-dormant"][..],
+        ),
+        (
+            "lineage",
+            &["--lineage-dormant", "--compiler", "--from"][..],
+        ),
+        ("devroot", &["--all"][..]),
     ] {
         let usage = verb_usage(verb).expect("visible option parser has usage");
         for flag in flags {
@@ -2421,14 +2407,12 @@ fn never_checked_is_data_until_a_pass_has_succeeded() {
 }
 
 // `machine-settings:` is the contract line the GUI parses for its ledger entries:
-// entries `; `-separated, the Spotlight count as `spotlight-noindex N dir(s)
-// migrated`, Universal Control as `universal-control disabled`; nothing printed for
-// an empty pass (the callers check).
+// entries `; `-separated, Universal Control as `universal-control disabled`; nothing
+// printed for an empty pass (the callers check).
 #[test]
-fn machine_write_failure_is_explicit_without_losing_partial_changes() {
+fn machine_write_failure_is_explicit() {
     use crate::machine::UniversalControlOutcome;
-    let spotlight = spotlight_entry(2);
-    let mut entries = vec![spotlight.clone()];
+    let mut entries: Vec<String> = Vec::new();
     let failure =
         record_universal_control_outcome(UniversalControlOutcome::WriteFailed, &mut entries)
             .expect("a failed write must be reported even when the verb exits 0");
@@ -2442,14 +2426,8 @@ fn machine_write_failure_is_explicit_without_losing_partial_changes() {
             "Universal Control could not be disabled for this host — the preference write did not land (`aterm pkg doctor` reads the keys)"
         )
     );
-    assert_eq!(
-        entries.as_slice(),
-        std::slice::from_ref(&spotlight),
-        "the successful action survives"
-    );
-    assert_eq!(
-        machine_settings_line(&entries),
-        "machine-settings: spotlight-noindex 2 dir(s) migrated",
+    assert!(
+        entries.is_empty(),
         "a failed Universal Control write cannot mint its success event"
     );
     for outcome in [
@@ -2457,7 +2435,7 @@ fn machine_write_failure_is_explicit_without_losing_partial_changes() {
         UniversalControlOutcome::AlreadyDisabled,
     ] {
         assert!(record_universal_control_outcome(outcome, &mut entries).is_none());
-        assert_eq!(entries.as_slice(), std::slice::from_ref(&spotlight));
+        assert!(entries.is_empty());
     }
     // The genuine success arm remains distinct and carries its revert.
     let success =
@@ -2466,10 +2444,7 @@ fn machine_write_failure_is_explicit_without_losing_partial_changes() {
     assert!(success.contains(crate::machine::UNIVERSAL_CONTROL_REVERT));
     assert_eq!(
         entries,
-        [
-            spotlight,
-            crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()
-        ]
+        [crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()]
     );
 }
 
@@ -2478,155 +2453,9 @@ fn machine_write_failure_is_explicit_without_losing_partial_changes() {
 #[test]
 fn the_machine_settings_marker_is_byte_stable() {
     assert_eq!(MACHINE_SETTINGS_MARKER, "machine-settings: ");
-    assert_eq!(spotlight_entry(73), "spotlight-noindex 73 dir(s) migrated");
-    assert_eq!(
-        machine_settings_line(&[
-            spotlight_entry(73),
-            crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()
-        ]),
-        "machine-settings: spotlight-noindex 73 dir(s) migrated; universal-control disabled"
-    );
     assert_eq!(
         machine_settings_line(&[crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()]),
         "machine-settings: universal-control disabled"
-    );
-    // The automatic pass's log filter: what it changed, plus every skip the user has
-    // to act on — never the routine not-a-repo / live-build / not-applicable skips
-    // or already-excluded rows. A crate whose cargo config cannot be pointed is
-    // skipped (nothing renamed) on EVERY pass; before 2026-09-12 that was silent
-    // there forever (review of audit K11).
-    {
-        use crate::noindex::Applied;
-        let skip = |reason: &str| Applied::Skipped {
-            path: PathBuf::from("/h/p/target"),
-            reason: reason.to_string(),
-        };
-        let printed: Vec<String> = render_applied(&[
-            skip(
-                "/h/p/.cargo/config.toml could not be edited into valid TOML — point \
-                 cargo at /h/p/target.noindex yourself — nothing was renamed",
-            ),
-            skip(
-                "/h/p/target.noindex already exists and is never merged into — remove or \
-                 rename it, then re-run",
-            ),
-            skip(
-                "not beside a Cargo.toml — its pointer is an env var this cannot \
-                 re-point; `aterm pkg noindex apply <dir>` migrates it by name",
-            ),
-            skip("a build holds /h/p/target/debug/.cargo-lock — retried next pass"),
-            skip("not applicable"),
-            skip("not applicable — Spotlight is a macOS index"),
-            Applied::AlreadyExcluded(PathBuf::from("/h/q/target.noindex")),
-        ])
-        .into_iter()
-        .filter(|l| noindex_pass_prints(l))
-        .collect();
-        assert_eq!(printed.len(), 2, "{printed:#?}");
-        assert!(printed[0].starts_with("skipped /h/p/target — "));
-        assert!(printed[0].contains("could not be edited into valid TOML"));
-        assert!(printed[1].contains("already exists and is never merged into"));
-    }
-    // The apply renderer over one of each outcome. Its sentences are prose; what a
-    // reader acts on is pinned: every outcome names its own path, a git checkout keeps
-    // its symlink instead of a config edit, and the summary counts each kind.
-    use crate::noindex::{Applied, ConfigNote, ExcludeNote, Pointer};
-    let lines = render_applied(&[
-        Applied::Migrated {
-            from: PathBuf::from("/r/target"),
-            to: PathBuf::from("/r/target.noindex"),
-            config: ConfigNote::Written(PathBuf::from("/r/.cargo/config.toml")),
-            discarded: false,
-        },
-        Applied::Migrated {
-            from: PathBuf::from("/g/target"),
-            to: PathBuf::from("/g/target.noindex"),
-            config: ConfigNote::Linked {
-                link: PathBuf::from("/g/target"),
-                exclude: ExcludeNote::Added(PathBuf::from("/g/.git/info/exclude")),
-                link_exclude: ExcludeNote::AlreadyIgnored,
-            },
-            discarded: false,
-        },
-        Applied::Migrated {
-            from: PathBuf::from("/h/target"),
-            to: PathBuf::from("/h/target.noindex"),
-            config: ConfigNote::Linked {
-                link: PathBuf::from("/h/target"),
-                exclude: ExcludeNote::AlreadyIgnored,
-                link_exclude: ExcludeNote::NotIgnored(
-                    "the link shows as untracked, as the directory did".into(),
-                ),
-            },
-            discarded: false,
-        },
-        Applied::Migrated {
-            from: PathBuf::from("/d/target"),
-            to: PathBuf::from("/d/target.noindex"),
-            config: ConfigNote::Linked {
-                link: PathBuf::from("/d/target"),
-                exclude: ExcludeNote::Added(PathBuf::from("/d/.git/info/exclude")),
-                link_exclude: ExcludeNote::Added(PathBuf::from("/d/.git/info/exclude")),
-            },
-            discarded: false,
-        },
-        Applied::AlreadyExcluded(PathBuf::from("/s/target.noindex")),
-        Applied::Skipped {
-            path: PathBuf::from("/t/target"),
-            reason: "a build holds /t/target/debug/.cargo-lock — retried next pass".into(),
-        },
-    ]);
-    for from in [
-        "/r/target",
-        "/g/target",
-        "/h/target",
-        "/d/target",
-        "/t/target",
-    ] {
-        assert!(
-            lines.iter().any(|l| l.contains(from)),
-            "{from} is named: {lines:#?}"
-        );
-    }
-    assert!(
-        lines.iter().any(|l| l.contains("/s/target.noindex")),
-        "{lines:#?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("migrated /g/target") && l.contains("symlink /g/target")),
-        "{lines:#?}"
-    );
-    assert_eq!(
-        lines.last().map(String::as_str),
-        Some("4 migrated, 1 already excluded, 1 skipped")
-    );
-    // Dry run: the summary says so, whatever the outcomes were.
-    let lines = render_applied(&[
-        Applied::Planned {
-            from: PathBuf::from("/g/target"),
-            to: PathBuf::from("/g/target.noindex"),
-            pointer: Pointer::Symlink,
-            discards: false,
-        },
-        Applied::Planned {
-            from: PathBuf::from("/r/target"),
-            to: PathBuf::from("/r/target.noindex"),
-            pointer: Pointer::Config(PathBuf::from("/r/.cargo/config.toml")),
-            discards: false,
-        },
-        Applied::Planned {
-            from: PathBuf::from("/f/free"),
-            to: PathBuf::from("/f/free.noindex"),
-            pointer: Pointer::None,
-            discards: false,
-        },
-    ]);
-    assert!(lines.iter().any(|l| l.contains("/f/free")), "{lines:#?}");
-    assert_eq!(
-        lines.last().map(String::as_str),
-        Some("3 would migrate, 0 already excluded, 0 skipped (dry run)")
     );
 }
 
@@ -2639,28 +2468,70 @@ fn the_shadowed_and_managed_current_markers_are_byte_stable() {
     assert_eq!(MANAGED_CURRENT_MARKER, "managed-current: ");
     assert_eq!(LOCK_WAITING_MARKER, "lock-waiting: ");
     assert_eq!(LOCK_ACQUIRED_MARKER, "lock-acquired: ");
+    assert_eq!(NOT_CHECKED, "not checked");
+    assert_eq!(FOREIGN_MARKER, "foreign: ");
+    assert_eq!(
+        foreign_line(FOREIGN_SEAM, &[]),
+        "foreign: seam none",
+        "a look that found nothing says so"
+    );
+    assert_eq!(
+        foreign_line(
+            FOREIGN_PATH,
+            &[
+                ForeignItem {
+                    name: "trust".into(),
+                    path: "/u/.local/bin/trustdoc".into(),
+                    fix: "type alab-trustdoc for the managed one".into(),
+                },
+                ForeignItem {
+                    name: "gh".into(),
+                    path: "/u/odd; dir/gh".into(),
+                    fix: "type alab-gh for the managed one".into(),
+                },
+            ]
+        ),
+        "foreign: path trust /u/.local/bin/trustdoc — type alab-trustdoc for the managed one; \
+         gh /u/odd, dir/gh — type alab-gh for the managed one",
+        "items split back whole: a `; ` inside a field is written `, `"
+    );
     assert_eq!(
         managed_current_line(&[]),
         None,
-        "omitted when nothing qualifies"
+        "omitted when no agent program is installed"
     );
+    let agent = |name: &str, version: &str, standing: &str| ManagedAgent {
+        name: name.into(),
+        version: version.into(),
+        standing: standing.into(),
+    };
     assert_eq!(
         managed_current_line(&[
-            ("claude".into(), "2.1.281".into(), "Anthropic".into()),
-            ("codex".into(), "0.156.0".into(), "OpenAI".into()),
+            agent("claude", "2.1.281", "Anthropic latest"),
+            agent("codex", "0.156.0", "OpenAI latest"),
         ])
         .as_deref(),
         Some("managed-current: claude 2.1.281 (Anthropic latest); codex 0.156.0 (OpenAI latest)")
+    );
+    assert_eq!(
+        managed_current_line(&[
+            agent("claude", "2.1.281", NOT_CHECKED),
+            agent("codex", "0.156.0", "OpenAI latest"),
+        ])
+        .as_deref(),
+        Some("managed-current: claude 2.1.281 (not checked); codex 0.156.0 (OpenAI latest)")
     );
 }
 
 /// THE MANAGED-CURRENT LINE NAMES VENDOR PROGRAMS (design §1.7): an agent program whose
 /// active vendor build's row says it is the vendor's latest, and whose twin is that
-/// build, is listed by version and source — never a store id, never an index pin; a
-/// kept row, a row for another build, a vendor this run could not reach, and a missing
-/// twin each leave it out. Every exit of the vendor lane says it — the update pass
-/// whatever its index lane did (stopped, or with member failures) and `update
-/// <program>`, the path `claude update` takes.
+/// build, is listed by version and source — never a store id, never an index pin. One
+/// whose vendor this run could not reach, or no check has reached for a day, is listed
+/// `not checked`, and a kept row by its own word (audit 2026-10-09: an unreached
+/// Anthropic left the line naming Codex alone, read as every program current); a row
+/// for another build and a missing twin each leave it out. Every exit of the vendor lane
+/// says it — the update pass whatever its index lane did (stopped, or with member
+/// failures) and `update <program>`, the path `claude update` takes.
 #[cfg(unix)]
 #[test]
 fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
@@ -2708,35 +2579,47 @@ fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
         managed_current_line(&managed_current_entries(&layout, &none, now)).as_deref(),
         Some("managed-current: claude 2.1.281 (Anthropic latest)")
     );
-    // Unreachable this run: the row is an older check's, so the line says nothing.
+    // Unreachable this run: the row is an older check's, so the line says so — never
+    // leaves the program out, which read as the others being all there is.
     let unreached = std::collections::BTreeSet::from([String::from("claude")]);
     assert_eq!(
-        managed_current_entries(&layout, &unreached, now),
-        Vec::new()
+        managed_current_line(&managed_current_entries(&layout, &unreached, now)).as_deref(),
+        Some("managed-current: claude 2.1.281 (not checked)")
     );
-    // Nor when the last check that reached the vendor is more than a day old.
+    // Nor current when the last check that reached the vendor is more than a day old.
     assert_eq!(
-        managed_current_entries(&layout, &none, now + 24 * 60 * 60 + 1),
-        Vec::new(),
+        managed_current_line(&managed_current_entries(
+            &layout,
+            &none,
+            now + 24 * 60 * 60 + 1
+        ))
+        .as_deref(),
+        Some("managed-current: claude 2.1.281 (not checked)"),
         "a stale check"
     );
-    for (state, installed) in [
-        (
+    // A kept row says its own word, reached or not.
+    record_status(
+        &layout,
+        "claude",
+        row(
             crate::state::vendor_kept("2.1.281", "held by local pin"),
             claude,
         ),
-        (
-            crate::state::vendor_managed("2.1.280", "Anthropic"),
-            claude - 1,
-        ),
-    ] {
-        record_status(&layout, "claude", row(state.clone(), installed), "x".into());
+        "x".into(),
+    );
+    for unchecked in [&none, &unreached] {
         assert_eq!(
-            managed_current_entries(&layout, &none, now),
-            Vec::new(),
-            "{state}"
+            managed_current_line(&managed_current_entries(&layout, unchecked, now)).as_deref(),
+            Some("managed-current: claude 2.1.281 (held)")
         );
     }
+    // A row for another build is not what runs: nothing.
+    let other = row(
+        crate::state::vendor_managed("2.1.280", "Anthropic"),
+        claude - 1,
+    );
+    record_status(&layout, "claude", other, "x".into());
+    assert_eq!(managed_current_entries(&layout, &none, now), Vec::new());
     record_status(
         &layout,
         "claude",
@@ -2876,6 +2759,52 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// THE SEAM RE-ASSERTION NAMES A FOREIGN RUSTUP ENTRY FOR THE WINDOW (review of
+/// 2026-10-09: removing the pass's `foreign: seam` line failed no test, so the window's
+/// entry could silently stop being raised or cleared): every re-assertion ends with
+/// its [`FOREIGN_MARKER`] line — the foreign `trust` entry with
+/// [`crate::seam::DETACH_FIX`] — and leaves the entry alone. NEGATIVE CONTROL: once the
+/// entry is gone, and with no rustup home at all, the line says `none`.
+#[cfg(unix)]
+#[test]
+fn the_seam_reassertion_names_a_foreign_entry_on_the_foreign_line() {
+    let layout = temp_layout("seamforeign");
+    let build = layout.build_dir("trust", 6808);
+    std::fs::create_dir_all(build.join("bin")).unwrap();
+    std::fs::create_dir_all(build.join("lib").join("rustlib")).unwrap();
+    crate::activate::atomic_symlink(&build, &crate::seam::store_current(&layout)).unwrap();
+    let rustup = layout.prefix.join("rustup-home");
+    std::fs::create_dir_all(crate::seam::toolchains_dir(&rustup)).unwrap();
+    let elsewhere = layout.prefix.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let seam = crate::seam::seam_path(&rustup, "trust");
+    std::os::unix::fs::symlink(&elsewhere, &seam).unwrap();
+    let _ = take_markers_said();
+    reassert_rustup_seam_at(&layout, Some(&rustup));
+    assert_eq!(
+        take_markers_said(),
+        vec![format!(
+            "atpkg: foreign: seam trust {} — {}",
+            seam.display(),
+            crate::seam::DETACH_FIX
+        )]
+    );
+    assert_eq!(std::fs::read_link(&seam).unwrap(), elsewhere, "left alone");
+    std::fs::remove_file(&seam).unwrap();
+    reassert_rustup_seam_at(&layout, Some(&rustup));
+    assert_eq!(
+        take_markers_said(),
+        vec!["atpkg: foreign: seam none".to_string()],
+        "the entry gone: the window ends its entry"
+    );
+    reassert_rustup_seam_at(&layout, None);
+    assert_eq!(
+        take_markers_said(),
+        vec!["atpkg: foreign: seam none".to_string()],
+        "no rustup home: nothing can stand there"
+    );
+}
+
 /// `atpkg which` (design S6) and the SHADOW reconcile (design S5), over a real store:
 /// a managed shim answers `managed <build> — pinned by index <N>` with the shim → store
 /// resolution; a foreign copy AHEAD of the managed bin/ turns that into `SHADOWED by
@@ -2985,6 +2914,19 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
                 crate::state::shadowed(6808, &foreign_alias)
             )
         );
+        // The pass still says the shadow, but a shadow with no fix is no exception:
+        // the window's foreign line names nothing (review of 2026-10-09: the entry's
+        // "fix each one" pointed at a line that named no fix). The NEGATIVE CONTROL is
+        // the fixed shadow below, which the line names.
+        let _ = take_markers_said();
+        assert_eq!(
+            reconcile_shadowed(&layout, 41, Some(&ahead)),
+            vec!["trust".to_string()]
+        );
+        assert!(
+            take_markers_said().contains(&"atpkg: foreign: path none".to_string()),
+            "a shadow with no fix is not on the foreign line"
+        );
         std::fs::remove_file(&foreign_alias).unwrap();
     }
     // The containment is ANCHORED: an `alab-<x>` that resolves into a `store/<x>/…`
@@ -3028,9 +2970,19 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     let before = crate::status::read(&layout).unwrap().programs["trust"]
         .state
         .clone();
+    let _ = take_markers_said();
     assert_eq!(
         reconcile_shadowed(&layout, 41, Some(&ahead)),
         vec!["trust".to_string()]
+    );
+    // …and names it for the window, with the fix the line beside it says (audit
+    // 2026-10-09: the prose alone reached no one).
+    assert!(
+        take_markers_said().contains(&format!(
+            "atpkg: foreign: path trust {} — type alab-trust for the managed one",
+            local.join("trust").display()
+        )),
+        "the foreign line names the copy and its fix"
     );
     let recorded = crate::status::read(&layout).unwrap();
     assert_eq!(recorded.programs["trust"].state, before, "never recorded");
@@ -3061,6 +3013,11 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         "up to date".into(),
     );
     assert!(reconcile_shadowed(&layout, 41, Some(&managed_only)).is_empty());
+    assert_eq!(
+        take_markers_said(),
+        vec!["atpkg: foreign: path none".to_string()],
+        "a look that finds nothing says so, so the window can end what it no longer sees"
+    );
     assert_eq!(
         crate::status::read(&layout).unwrap().programs["trust"].state,
         crate::state::managed(6808, 41)
@@ -3168,9 +3125,16 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         "agents/ first: the managed copy runs, through the twin: {managed}"
     );
     // The pass: nothing shadowed, the managed row recorded, the tail printed.
+    let _ = take_markers_said();
     assert!(
         !reconcile_shadowed(&layout, 41, Some(&no_agents)).contains(&"claude".to_string()),
         "an agent program with a current twin is never on the shadowed marker"
+    );
+    assert!(
+        take_markers_said()
+            .iter()
+            .any(|l| l.starts_with("atpkg: foreign: path ") && !l.contains(" claude ")),
+        "nor on the foreign line: nothing there is the owner's to fix"
     );
     assert!(
         !crate::status::read(&layout)
@@ -5423,7 +5387,6 @@ fn a_copied_command_left_in_place_keeps_repair_from_saying_done() {
     let l = temp_layout("repair-leftover-healthy");
     let d19 = seed_ready_build(&l, "ay", 19);
     activate_seeded(&l, "ay", &d19);
-    let _ = crate::provenance::test_bind::faked();
     assert_eq!(
         repair_store(&l, &[]),
         ExitCode::SUCCESS,
@@ -5435,76 +5398,6 @@ fn a_copied_command_left_in_place_keeps_repair_from_saying_done() {
         "healthy, but a copy is still in place"
     );
     let _ = std::fs::remove_dir_all(&empty.prefix);
-    let _ = std::fs::remove_dir_all(&l.prefix);
-}
-
-/// REPAIR IS THE HEAL (2026-09-24). The `<build>.tracked-install` records the retired
-/// untracked lanes wrote — one beside a superseded build, one beside the live one —
-/// made repair exit 1 for ever on m7. Repair now clears the tag, sweeps both records,
-/// and exits 0 because nothing stays tagged.
-///
-/// The one door test on the REAL heal ([`crate::provenance::test_bind::real`]): it
-/// asserts the files come out clean, which only a launchd job can make them.
-#[cfg(unix)]
-#[test]
-fn repair_clears_the_tag_and_sweeps_the_retired_records() {
-    let _real = crate::provenance::test_bind::real();
-    let _ = crate::provenance::test_bind::faked();
-    let l = temp_layout("repair-tag-records");
-    let d18 = seed_ready_build(&l, "ay", 18);
-    let d19 = seed_ready_build(&l, "ay", 19);
-    activate_seeded(&l, "ay", &d19);
-    let records = [
-        d18.with_file_name("18.tracked-install"),
-        d19.with_file_name("19.tracked-install"),
-    ];
-    for record in &records {
-        std::fs::write(record, "tracked-install v1\nwhy=the untracked lane ran\n").unwrap();
-    }
-    // Whatever this test process wrote is tagged exactly when it is tracked; the heal
-    // clears it either way.
-    assert_eq!(repair_store(&l, &[]), ExitCode::SUCCESS);
-    for record in &records {
-        assert!(!record.exists(), "{} swept", record.display());
-    }
-    assert!(
-        crate::provenance::scan_roots(
-            &crate::provenance::store_roots(&l),
-            crate::provenance::PROVENANCE_XATTR
-        )
-        .carriers
-        .is_empty(),
-        "nothing repair reaches carries the tag"
-    );
-    assert!(
-        crate::provenance::test_bind::faked().is_empty(),
-        "the real heal ran, not the stand-in"
-    );
-    let _ = std::fs::remove_dir_all(&l.prefix);
-}
-
-/// REPAIR HEALS AN EMPTY STORE TOO (2026-09-24). With nothing installed, `bin/`'s
-/// pending stubs and `reroute/`'s stubs still stand, and doctor counts a tagged one with
-/// `aterm pkg repair` as its fix — so the "no programs installed" answer runs the heal
-/// like every other, where it used to return before it and leave the tag for good.
-#[cfg(unix)]
-#[test]
-fn repair_of_an_empty_store_still_heals() {
-    let l = temp_layout("repair-empty-heal");
-    std::fs::create_dir_all(l.bin_dir()).unwrap();
-    std::fs::write(l.bin_dir().join("ty"), "#!/bin/sh\n").unwrap();
-    let _ = crate::provenance::test_bind::faked();
-    assert!(
-        crate::list_installed(&l).is_empty(),
-        "the fixture installs nothing"
-    );
-    assert_eq!(repair_store(&l, &[]), ExitCode::SUCCESS);
-    let heals = crate::provenance::test_bind::faked();
-    assert_eq!(heals.len(), 1, "one store heal: {heals:?}");
-    assert!(
-        heals[0].0.contains(&l.bin_dir()),
-        "over the stubs' bin/: {heals:?}"
-    );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -5987,85 +5880,6 @@ fn a_lost_agent_shim_is_named_and_not_run() {
         "{line}"
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
-}
-
-/// A UNIT TEST OF A DOOR DOES NOT DRIVE LAUNCHD (2026-09-23). Every store-changing door
-/// ends in the store heal, and a tracked test process (an agent's shell) tags every
-/// file it writes, so every pass, install, seed or repair a unit test ran submitted one
-/// real launchd job. Under test the heal is a scan-only stand-in unless the test opts
-/// in ([`crate::provenance::test_bind`]): the door hands it exactly the store roots,
-/// it answers what the real heal would have cleared, and the files keep their tag —
-/// nothing ran that could clear it. Under an untracked test process there is nothing
-/// to clear and the tag half is vacuous, and said so.
-#[cfg(unix)]
-#[test]
-fn a_door_under_test_ends_in_the_scan_only_heal() {
-    let l = temp_layout("door-scan-only-heal");
-    let d19 = seed_ready_build(&l, "ay", 19);
-    activate_seeded(&l, "ay", &d19);
-    let _ = crate::provenance::test_bind::faked();
-    assert_eq!(repair_store(&l, &[]), ExitCode::SUCCESS);
-    let roots = crate::provenance::store_roots(&l);
-    let faked = crate::provenance::test_bind::faked();
-    assert_eq!(
-        faked.len(),
-        1,
-        "one heal, at the end of the door: {faked:?}"
-    );
-    assert_eq!(faked[0].0, roots, "handed exactly the store roots");
-    let now = crate::provenance::scan_roots(&roots, crate::provenance::PROVENANCE_XATTR);
-    eprintln!(
-        "this test process tagged {} store file(s)",
-        faked[0].1.carriers.len()
-    );
-    assert_eq!(
-        now.carriers, faked[0].1.carriers,
-        "every file the stand-in found tagged still is: no job ran"
-    );
-    let _ = std::fs::remove_dir_all(&l.prefix);
-}
-
-/// EVERY DOOR THAT LEAVES THE STORE CHANGED CLEARS THE TAG, AND SAYS NOTHING ON STDOUT
-/// (2026-09-23). The pass-end line that listed tagged builds on stdout for the window to
-/// turn into a Warn row is gone; each of these doors ends in the silent heal instead, and
-/// the heal's own words go only to the log.
-#[test]
-fn every_store_changing_door_ends_in_the_silent_heal() {
-    fn body_of(src: &'static str, signature: &str) -> &'static str {
-        let start = src.find(signature).expect("the function");
-        let end = src[start..]
-            .find("\n}\n")
-            .map(|i| start + i)
-            .expect("its closing brace");
-        &src[start..end]
-    }
-    let src = include_str!("cli.rs");
-    for door in [
-        "fn run_update_pass(",
-        "fn install_toolset(",
-        "fn cmd_seed(",
-        "fn cmd_install_with(",
-        "fn rollback_in(",
-        "fn cmd_update_one(",
-    ] {
-        assert!(
-            body_of(src, door).contains("let _ = heal_store_provenance("),
-            "{door} does not end in the heal"
-        );
-    }
-    assert!(
-        body_of(src, "fn repair_store(")
-            .matches("repair_heal(layout)")
-            .count()
-            == 2,
-        "repair heals whether or not anything is installed"
-    );
-    assert!(body_of(src, "fn repair_heal(").contains("crate::provenance::heal_store(layout)"));
-    let heal = body_of(src, "fn heal_store_provenance(");
-    assert!(
-        !heal.contains("println!") && !heal.contains("eprintln!"),
-        "the heal speaks only through the log: {heal}"
-    );
 }
 
 /// REPAIR KEEPS WHAT THE BUILD EXPORTS (2026-09-23). `relay_shims` laid every shim
@@ -6924,12 +6738,12 @@ fn status_writers_heal_an_unreadable_record() {
 
 /// THE `[machine]` SETTINGS DO NOT RIDE THE PASS (Phase 3, 2026-09-22; replacing the
 /// 2026-09-14/15 laws that ran them at the top of every pass, above the lock). Their
-/// $HOME walk (up to 60,000 directories / 3 s) and `defaults` cost every pass and every
-/// `claude update` child; they now run from their own verb, which the window and the
-/// session call on their schedule, and at a pass's DISPATCH EDGE only when the table
-/// changed (`tests/machine_edge.rs` drives that, and that a pass under a private state
-/// root carries none). The verbs that may carry an edit are the long passes, never a
-/// quick mutator.
+/// `defaults` writes (and, until 2026-10-09, a $HOME walk of up to 60,000 directories)
+/// cost every pass and every `claude update` child; they now run from their own verb,
+/// which the window and the session call on their schedule, and at a pass's DISPATCH EDGE
+/// only when the table changed (`tests/machine_edge.rs` drives that, and that a pass under
+/// a private state root carries none). The verbs that may carry an edit are the long
+/// passes, never a quick mutator.
 #[test]
 fn only_the_long_passes_carry_a_changed_machine_table() {
     for verb in ["install", "seed", "update"] {
@@ -6943,189 +6757,6 @@ fn only_the_long_passes_carry_a_changed_machine_table() {
     }
 }
 
-/// WHAT AN APPLY MUST RETRY: a live build it skipped and a migration that failed. A
-/// directory that was already excluded, migrated, or declined for a reason no retry
-/// changes (not beside a Cargo.toml) leaves nothing to retry.
-#[test]
-fn an_apply_is_finished_only_when_nothing_is_left_to_retry() {
-    use crate::noindex::Applied;
-    let p = std::path::PathBuf::from("/h/repo/target");
-    let excluded = Applied::AlreadyExcluded(p.clone());
-    let declined = Applied::Skipped {
-        path: p.clone(),
-        reason: "not beside a Cargo.toml — its pointer is an env var".into(),
-    };
-    assert!(spotlight_apply_finished(&[excluded.clone(), declined]));
-    assert!(spotlight_apply_finished(&[]));
-    let live = Applied::Skipped {
-        path: p.clone(),
-        reason: format!(
-            "{}{} — retried next pass",
-            crate::noindex::HELD_BY_BUILD,
-            p.join("debug/.cargo-lock").display()
-        ),
-    };
-    assert!(live.held_by_build(), "{live:?}");
-    assert!(!spotlight_apply_finished(&[excluded.clone(), live]));
-    let failed = Applied::Failed {
-        path: p,
-        reason: "rename refused".into(),
-    };
-    assert!(!spotlight_apply_finished(&[excluded, failed]));
-}
-
-/// A pass that moved nothing and failed nothing reports from the walk it made: its scan's
-/// counts, and nothing left to migrate — every exposed dir it left was a refusal a dry run
-/// refuses identically. A pass that moved something walks again, because the pre-apply
-/// scan no longer describes the disk.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_census_after_an_apply_is_the_scan_unless_something_moved() {
-    use crate::noindex::{Applied, Budget, CACHEDIR_TAG_SIGNATURE, ConfigNote, DOCTOR_DEPTH};
-    let home = crate::testdir::dir("atpkg-census-after-apply-");
-    // One repo whose target dir is exposed by name.
-    let repo = home.join("repo");
-    let target = repo.join("target");
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-    std::fs::write(
-        target.join("CACHEDIR.TAG"),
-        format!("{CACHEDIR_TAG_SIGNATURE}\n# cargo\n"),
-    )
-    .unwrap();
-    let scan = crate::noindex::scan(&home, DOCTOR_DEPTH, &Budget::DOCTOR);
-    assert_eq!(
-        scan.counts(),
-        (1, 0),
-        "precondition: one exposed target dir"
-    );
-    // Nothing moved (say, a live build refused it): the scan is the answer, and
-    // nothing is left for an apply to do. The pass's rows about its own links are no
-    // exposed dir: a tree a build held while it was to be moved back, and a link the
-    // pass did not lay ([`crate::noindex::apply_under_scan`]).
-    let refused = vec![
-        Applied::Skipped {
-            path: target.clone(),
-            reason: "a build holds it".into(),
-        },
-        Applied::Skipped {
-            path: home.join("old/target"),
-            reason: "a build holds /h/old/target.noindex/debug/.cargo-lock — retried next \
-                     pass"
-                .into(),
-        },
-        Applied::Skipped {
-            path: home.join("hand/target"),
-            reason: "git status shows `?? target`, and this is not the link the pass laid".into(),
-        },
-    ];
-    let ledger = crate::noindex::Ledger::at(home.join(".noindex.ledger"));
-    let census = spotlight_after_apply(&home, &scan, &refused, &ledger);
-    assert_eq!(
-        (
-            census.exposed,
-            census.hidden,
-            census.would_migrate,
-            census.complete
-        ),
-        (1, 0, 0, true)
-    );
-    assert_eq!(
-        census.open,
-        OpenSplit {
-            busy: 1,
-            ..OpenSplit::default()
-        },
-        "the dir a build held is counted as busy, not as free-standing or refused"
-    );
-    // Something moved: the disk changed under the scan, so the census walks again
-    // and reports what is there now.
-    let hidden = repo.join("target.noindex");
-    std::fs::rename(&target, &hidden).unwrap();
-    let moved = vec![Applied::Migrated {
-        from: target.clone(),
-        to: hidden.clone(),
-        config: ConfigNote::Untouched("test".into()),
-        discarded: false,
-    }];
-    let census = spotlight_after_apply(&home, &scan, &moved, &ledger);
-    assert_eq!(
-        (census.exposed, census.hidden, census.would_migrate),
-        (0, 1, 0),
-        "after the move the record must say hidden, from a fresh walk"
-    );
-}
-
-/// `atpkg machine`'s Spotlight sentence says WHY each exposed dir stays open, from the
-/// dry run's own reasons — never a guess between causes it can tell apart — and, with the
-/// switch off, that the switch is the reason.
-#[test]
-fn the_machine_spotlight_line_names_why_each_dir_stays_open() {
-    use crate::noindex::Applied;
-    let p = std::path::PathBuf::from;
-    let mut open = OpenSplit::default();
-    for o in [
-        Applied::Skipped {
-            path: p("/h/free/target"),
-            reason: "not beside a Cargo.toml — its pointer is an env var".into(),
-        },
-        Applied::Skipped {
-            path: p("/h/busy/target"),
-            reason: "a build holds /h/busy/target/debug/.cargo-lock — retried next pass".into(),
-        },
-        Applied::Failed {
-            path: p("/h/taken/target"),
-            reason: "/h/taken/target.noindex already exists".into(),
-        },
-        Applied::AlreadyExcluded(p("/h/done/target")),
-    ] {
-        open.count(&o);
-    }
-    assert_eq!(
-        open,
-        OpenSplit {
-            free_standing: 1,
-            busy: 1,
-            refused: 1
-        }
-    );
-    let census = SpotlightCensus {
-        exposed: 5,
-        hidden: 2,
-        would_migrate: 2,
-        open,
-        complete: true,
-    };
-    assert_eq!(
-        spotlight_census_line("/h", &census, true),
-        "5 cargo target dir(s) under /h open to Spotlight: 2 an apply hides, 1 \
-         free-standing (`aterm pkg noindex apply <dir>` by name), 1 in a running build \
-         (the next apply retries it), 1 refused (`aterm pkg noindex apply <dir>` says \
-         why); 2 hidden"
-    );
-    // Only the non-zero parts.
-    let only = SpotlightCensus {
-        exposed: 2,
-        hidden: 0,
-        would_migrate: 2,
-        open: OpenSplit::default(),
-        complete: false,
-    };
-    assert_eq!(
-        spotlight_census_line("/h", &only, true),
-        "2 cargo target dir(s) under /h open to Spotlight: 2 an apply hides; 0 hidden — \
-         at least; the scan hit its budget"
-    );
-    // Switch off: the switch is why they are open, whatever an apply could do.
-    let off = spotlight_census_line("/h", &census, false);
-    assert_eq!(
-        off,
-        "5 cargo target dir(s) under /h open to Spotlight, 2 hidden — [machine] \
-         spotlight_noindex = false leaves them"
-    );
-    assert!(!off.contains("free-standing"), "{off}");
-}
-
 /// `atpkg machine apply` with nothing changed names the one cause it saw.
 #[test]
 fn machine_apply_says_why_nothing_changed() {
@@ -7136,58 +6767,18 @@ fn machine_apply_says_why_nothing_changed() {
     );
     assert_eq!(
         say(MachineApply {
-            both_off: true,
+            left_alone: true,
             ..MachineApply::default()
         }),
-        "nothing changed — [machine] switches both settings off"
-    );
-    let busy = |n| OpenSplit {
-        busy: n,
-        ..OpenSplit::default()
-    };
-    assert_eq!(
-        say(MachineApply {
-            open: busy(2),
-            ..MachineApply::default()
-        }),
-        "nothing changed — 2 cargo target dir(s) stay open: 2 in a running build (the next \
-         apply retries it)"
-    );
-    // Free-standing dirs and a walk cut at its budget are not "already applied".
-    assert_eq!(
-        say(MachineApply {
-            open: OpenSplit {
-                free_standing: 1,
-                ..OpenSplit::default()
-            },
-            walk_cut: true,
-            ..MachineApply::default()
-        }),
-        "nothing changed — 1 cargo target dir(s) stay open: 1 free-standing (`aterm pkg \
-         noindex apply <dir>` by name); the walk stopped at its budget"
-    );
-    assert_eq!(
-        say(MachineApply {
-            walk_cut: true,
-            ..MachineApply::default()
-        }),
-        "nothing changed — the walk stopped at its budget; `aterm pkg noindex apply --all` \
-         walks further"
+        "nothing changed — [machine] universal_control = \"leave\""
     );
     assert_eq!(
         say(MachineApply {
             failed: true,
-            open: busy(1),
+            left_alone: true,
             ..MachineApply::default()
         }),
         "nothing changed — a change did not land"
-    );
-    assert_eq!(
-        say(MachineApply {
-            no_home: true,
-            ..MachineApply::default()
-        }),
-        "nothing changed — there is no home directory to walk for build output"
     );
 }
 
@@ -7309,7 +6900,7 @@ fn the_same_directory_under_another_spelling_is_the_real_home() {
     let _ = std::fs::remove_dir_all(&t);
 }
 
-/// A CONFIG THAT DOES NOT PARSE CHANGES NOTHING. Both `[machine]` defaults ACT, so
+/// A CONFIG THAT DOES NOT PARSE CHANGES NOTHING. The `[machine]` default ACTS, so
 /// "malformed ⇒ defaults" meant a typo three tables away silently re-enabled what the
 /// owner had switched off. The refusal is first — before the home question — because
 /// it is the cheaper one and the one the owner can fix.
@@ -7322,8 +6913,7 @@ fn an_unreadable_config_refuses_before_anything_is_measured() {
     let reason = machine_refusal(&unreadable).expect("an unreadable config refuses");
     assert!(reason.contains("does not parse"), "{reason}");
     assert!(reason.contains("aterm pkg machine apply"), "{reason}");
-    // And it refuses even though the resolved values look like the defaults.
-    assert!(unreadable.spotlight_noindex());
+    // And it refuses even though the resolved value looks like the default.
     assert_eq!(
         unreadable.universal_control(),
         crate::config::UniversalControlPolicy::Off
@@ -7349,130 +6939,72 @@ fn machine_grammar_is_exact() {
     assert!(verb_usage("machine").is_some_and(|u| u.contains("apply")));
 }
 
-/// The `noindex` grammar, as a table: the default subcommand (`scan`), the default
-/// root (the cwd — left `None` by the parser so it stays pure), the default depth,
-/// and the part actually worth pinning — a flag on the WRONG subcommand is a usage
-/// error, not a silent ignore.
-///
-/// A table rather than a run, because the alternative is discovering this grammar by
-/// invoking a verb whose `verify` form waits 20 seconds on Spotlight and whose
-/// `migrate` form renames a directory.
+/// The `noindex` grammar: `verify <dir>`, the one form left; everything else is a usage
+/// error, never a silent default. A table rather than a run: `verify` waits up to 40
+/// seconds on Spotlight.
 #[test]
 fn noindex_grammar_is_exact() {
     let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    let job = |s: &str| parse_noindex(&argv(s)).ok();
-    let scan = |root: Option<&str>, depth: usize| {
-        Some(NoindexJob::Scan {
-            root: root.map(ToOwned::to_owned),
-            depth,
-        })
-    };
-    // Bare `noindex` is a scan of the cwd at the verb's own depth — the subcommand
-    // and the root are both optional, and `scan` is the default.
-    assert_eq!(job(""), scan(None, crate::noindex::VERB_DEPTH));
-    assert_eq!(job("scan"), scan(None, crate::noindex::VERB_DEPTH));
-    assert_eq!(job("/src"), scan(Some("/src"), crate::noindex::VERB_DEPTH));
-    assert_eq!(job("scan /src --depth 2"), scan(Some("/src"), 2));
-    assert_eq!(job("--depth 2 /src"), scan(Some("/src"), 2));
     assert_eq!(
-        job("verify /src/target"),
-        Some(NoindexJob::Verify {
-            dir: String::from("/src/target")
-        })
-    );
-    assert_eq!(
-        job("migrate /src/target --dry-run"),
-        Some(NoindexJob::Migrate {
-            dir: String::from("/src/target"),
-            dry_run: true
-        })
-    );
-    // A directory named like a subcommand is still a directory once the subcommand
-    // slot is filled.
-    assert_eq!(
-        job("migrate scan"),
-        Some(NoindexJob::Migrate {
-            dir: String::from("scan"),
-            dry_run: false
-        })
-    );
-    // `apply`: `--all` (the doctor's scan) or any number of directories, dry-runnable.
-    assert_eq!(
-        job("apply --all"),
-        Some(NoindexJob::Apply {
-            all: true,
-            dirs: vec![],
-            dry_run: false
-        })
-    );
-    assert_eq!(
-        job("apply --all --dry-run"),
-        Some(NoindexJob::Apply {
-            all: true,
-            dirs: vec![],
-            dry_run: true
-        })
-    );
-    assert_eq!(
-        job("apply /a/target /b/target"),
-        Some(NoindexJob::Apply {
-            all: false,
-            dirs: vec![String::from("/a/target"), String::from("/b/target")],
-            dry_run: false
-        })
+        parse_noindex(&argv("verify /src/target")).ok(),
+        Some(String::from("/src/target"))
     );
     for wrong in [
-        // `apply` wants --all or directories, never both, never neither, no --depth.
-        "apply",
-        "apply --all /a",
-        "apply /a --depth 2",
-        "apply --all --depth 2",
-        "scan --all",
-        "migrate /d --all",
-        // A flag on the wrong subcommand: refused, never accepted-and-ignored. The
-        // ignored spelling would answer "nothing would change" about a form that
-        // changes nothing anyway — true, and the wrong answer to what was asked.
-        "scan --dry-run",
-        "verify /d --dry-run",
-        "verify /d --depth 3",
-        "migrate /d --depth 3",
-        // The operand these two cannot do without. There is no sensible default
-        // directory to rename or probe.
+        "",
         "verify",
-        "migrate",
-        // `--depth` wants a number in range and says so, rather than falling back to
-        // the default: `--depth 0` would walk nothing and report a clean tree.
-        "--depth",
-        "--depth 0",
-        "--depth 33",
-        "--depth six",
-        // Unknown flags and second operands are errors, not leftovers.
-        "--json",
-        "scan /a /b",
+        "verify /a /b",
+        "verify --dry-run",
+        "scan",
+        "scan /src",
+        "migrate /src/target",
+        "apply --all",
+        "/src",
+        "--depth 3",
     ] {
         assert!(
             parse_noindex(&argv(wrong)).is_err(),
-            "`atpkg noindex {wrong}` must be a usage error, not a silent default"
+            "`atpkg noindex {wrong}` must be a usage error"
         );
     }
+    assert!(
+        !NAME_TAKING_VERBS
+            .iter()
+            .any(|(name, _)| *name == "noindex" || *name == "devroot"),
+        "noindex and devroot read args[1] as a subcommand, not a program name"
+    );
 }
 
-/// `noindex`'s `args[1]` is a SUBCOMMAND, not a program name, so it must stay out of
-/// [`NAME_TAKING_VERBS`] exactly as `relocate` does. In that table the dispatch edge
-/// refuses any unlisted `-`-leading first operand before the verb body runs, so
-/// `atpkg noindex --depth 3` would die as "unknown option for `atpkg noindex`" while
-/// `--depth` is a documented flag of the verb — the same shape as the audit finding
-/// where `--elevate` was real, documented, and invisible at the edge.
+/// The `devroot` grammar: bare is the plan, `move` wants `--all` OR checkouts (never
+/// nothing: it moves nothing unasked), `verify` takes nothing more.
 #[test]
-fn noindex_owns_its_own_flags_at_the_dispatch_edge() {
-    assert!(
-        !NAME_TAKING_VERBS.iter().any(|(name, _)| *name == "noindex"),
-        "noindex reads args[1] as a subcommand, not a program name"
+fn devroot_grammar_is_exact() {
+    use crate::devroot::Selection;
+    let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    let job = |s: &str| parse_devroot(&argv(s)).ok();
+    assert_eq!(job(""), Some(DevrootJob::Plan));
+    assert_eq!(job("verify"), Some(DevrootJob::Verify));
+    assert_eq!(job("move --all"), Some(DevrootJob::Move(Selection::All)));
+    assert_eq!(
+        job("move /h/a /h/b"),
+        Some(DevrootJob::Move(Selection::Named(vec![
+            std::path::PathBuf::from("/h/a"),
+            std::path::PathBuf::from("/h/b")
+        ])))
     );
-    assert!(
-        parse_noindex(&[String::from("--depth"), String::from("3")]).is_ok(),
-        "a leading flag is the verb's own business"
-    );
+    for wrong in [
+        "move",
+        "move --all /h/a",
+        "move /h/a --all",
+        "move --dry-run",
+        "verify /h/a",
+        "plan",
+        "--all",
+    ] {
+        assert!(
+            parse_devroot(&argv(wrong)).is_err(),
+            "`atpkg devroot {wrong}` must be a usage error"
+        );
+    }
 }
 
 /// `--help` must ANSWER, never act. `gc --help` used to reclaim the rollback
@@ -7558,12 +7090,16 @@ fn store_lock_verb_roster_is_exact() {
         "verify-index",
         "verify-pkg",
         "relocate",
+        // `lineage` reads a toolchain or a staged tree; `stamp` writes one file into a
+        // staged tree the packer owns — never under <prefix>.
+        "lineage",
         // `noindex` writes nothing under <prefix> — its probe file is removed by a
-        // Drop guard and its one rename lives inside the tree the user named — so a
-        // storage-hygiene scan never queues behind an install.
+        // Drop guard — so a measurement never queues behind an install.
         "noindex",
-        // `machine` writes a per-host preference and renames build output in the
-        // user's own trees; nothing under <prefix> moves.
+        // `devroot` moves checkouts under $HOME and probes the root; nothing under
+        // <prefix> moves.
+        "devroot",
+        // `machine` writes a per-host preference; nothing under <prefix> moves.
         "machine",
         // `lease` lays one file under `<prefix>/leases/` for the life of the command it
         // runs — beside the store, never in it — and must lease a toolchain while a
@@ -14055,8 +13591,11 @@ fn a_vendor_not_reached_for_a_day_is_no_longer_called_latest() {
     );
     let none = std::collections::BTreeSet::new();
     assert_eq!(
-        managed_current_entries(&layout, &none, world_now_plus_a_day()),
-        Vec::new()
+        managed_current_entries(&layout, &none, world_now_plus_a_day())
+            .iter()
+            .map(|a| a.standing.as_str())
+            .collect::<Vec<_>>(),
+        vec![NOT_CHECKED]
     );
     // Reached again: latest again.
     f.offline.set(false);

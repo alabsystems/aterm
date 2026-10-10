@@ -460,8 +460,7 @@ fn key_time_click_fires_at_the_key_and_mutes_its_own_echo() {
         "one character must click exactly once"
     );
 
-    // The NEXT advance has no credit behind it — it clicks at the echo,
-    // byte-identically to the pre-seam behaviour.
+    // The NEXT advance has no credit behind it, so it clicks at the echo.
     let out_echo = t0 + Duration::from_millis(60);
     glow.note_synthetic_typed(out_echo, 1);
     glow.tick(Some((2, 2)), out_echo, &c, g, &mut out);

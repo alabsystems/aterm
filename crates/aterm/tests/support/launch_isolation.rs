@@ -41,7 +41,7 @@ pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
 /// alone, and the window's agent supervisor off ([`HARNESS_OFF`]).
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
-                              [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n\
+                              [machine]\nuniversal_control = \"leave\"\n\
                               [harness]\nenabled = false\n";
 
 /// [`CONFIG_OFF`]'s last table: Settings ▸ Harness off. The window supervises every
@@ -138,6 +138,15 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
 }
 
 pub fn apply(cmd: &mut Command, root: &Path) {
+    // Isolated from this process's descriptors as well, before any hook a caller
+    // adds: the launch holds its stdio (the lifeline on stdin) and nothing else.
+    // A std child under the pinned seal keeps any descriptor another test thread
+    // had open unflagged at the spawn — a pipe between its `pipe()` and its
+    // `F_SETFD` — and an instance holds it as long as its test runs.
+    {
+        use aterm_uds::spawnfd::InheritNothing as _;
+        cmd.inherit_nothing();
+    }
     // The aterm under test is a fresh build whose first exec can wait out the
     // system's code-policy check for over a minute: run that file once,
     // unclocked, before the caller's clock starts (`aterm_spec::wait::first_exec`).

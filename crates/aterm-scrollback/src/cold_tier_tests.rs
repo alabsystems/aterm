@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for in-memory cold tier — extracted from `tier_tests.rs` (#2100).
+//! Tests for the in-memory cold tier.
 
 use super::*;
 use crate::Line;
@@ -189,10 +189,8 @@ fn truncate_back_lines_aborts_on_corrupt_boundary_page() {
         let old_bytes = page.compressed.len();
         page.compressed = vec![0x28, 0xB5, 0x2F, 0xFD];
         cold.bytes_used = cold.bytes_used.saturating_sub(old_bytes) + page.compressed.len();
-        // Same intent as the former direct `last_page_cache = None` write: drop
-        // every cached decompressed page so the next read re-decompresses the
-        // corrupted bytes. The cache is now multi-slot, so go through the
-        // single invalidation helper.
+        // Drop every cached decompressed page so the next read decodes the
+        // corrupted bytes.
         cold.clear_cache();
     }
     let compressed_after_corruption = cold.compressed_size();

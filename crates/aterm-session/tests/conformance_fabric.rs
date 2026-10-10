@@ -9,14 +9,8 @@
 //! (a `Buggy` variant reaches a violation), and — for the gate — bound to the REAL
 //! shipping `decide_edge` with a non-vacuous negative control (Tier-1 conformance).
 //!
-//! ## Verification status (honest, per AGENTS.md)
-//!
-//! The EXHAUSTIVE TLA+ Tier-0 model-check (`assert_model_checks`/
-//! `assert_proves_and_catches`) is **authored-pending-build**: the `ty` binary is not
-//! on PATH in this environment, so the all-states check cannot be claimed to have
-//! run. What DOES run here, with no external tool, is (a) `to_tla()` rendering of the
-//! derived spec and (b) the interpreter-driven proves/catches below — the model's
-//! transition semantics executed in Rust — plus the Tier-1 binding to real code.
+//! The interpreter tests and the Tier-1 binding always run; the exhaustive
+//! `ty check` at the end runs only where `ty` is installed (`ty_escalation`).
 
 use aterm_session::{EdgeDecision, EdgeTable, EdgeToken, LaunchNonce, Op, SessionId, decide_edge};
 use aterm_spec::derive::Model;
@@ -166,9 +160,8 @@ fn decide_edge_conforms_to_fail_closed_gate_with_negative_control() {
 //
 // Abstraction: a frame of `Frame` bytes is written one accepted chunk at a time;
 // `written` accumulates accepted bytes, `lost` accumulates dropped tail. The fixed
-// `write_some` loop never drops (`lost` stays 0). The `Buggy` variant models the OLD
-// `write_all`, which `break`-dropped the unwritten tail on a short write — caught by
-// NoLoss.
+// `write_some` loop never drops (`lost` stays 0). The `Buggy` variant drops the
+// unwritten tail on a short write — caught by NoLoss.
 // ---------------------------------------------------------------------------
 
 fn sink_no_loss_model() -> Model {
@@ -222,7 +215,7 @@ fn sink_no_loss_proves_and_buggy_tail_drop_is_caught() {
     }
     assert_eq!(steps, 4, "all Frame=4 bytes are written, none lost");
 
-    // CATCHES: the old silent-tail-drop (write_all break-on-short-write) violates NoLoss.
+    // CATCHES: dropping the tail on a short write violates NoLoss.
     let b = sink_no_loss_model_buggy();
     let mut bs = b.init_state();
     assert!(b.fire("Step", &mut bs));
@@ -233,15 +226,10 @@ fn sink_no_loss_proves_and_buggy_tail_drop_is_caught() {
 }
 
 // ===========================================================================
-// Tier-0 IN TRUST — the SAME `ty_model!`-derived specs, now exhaustively
-// model-checked by the real Trust-bundled `ty` (`aterm pkg install ty`). This is
-// the "TLA+ spec auto-generated from code and linked to it, model-checked by
-// Trust" guarantee: the model is Rust, `to_tla()` emits the spec, `ty check`
-// proves the invariant over the WHOLE bounded state space, and the Buggy=1 cfg
-// MUST yield a counterexample — so the invariant is non-trivial AND catches the
-// real defect. VERIFICATION GATE (honesty ratchet, batteries-on, see
-// `aterm_spec::verify`): verification is always required — an absent Trust `ty` FAILS
-// the test with the install hint (`aterm pkg install ty`).
+// Tier-0 in Trust: the same `ty_model!` specs, exhaustively checked by `ty`
+// (`aterm pkg install ty`). `ty check` proves the invariant over the whole
+// bounded state space at Buggy=0 and must find a counterexample at Buggy=1.
+// Without `ty`, `ty_escalation` prints a notice and the test returns.
 // ===========================================================================
 
 use std::path::PathBuf;

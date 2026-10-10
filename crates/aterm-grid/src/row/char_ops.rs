@@ -16,7 +16,7 @@ impl Row {
     ///
     /// Cells that would be shifted past the end of the row are discarded.
     /// This implements the ICH (Insert Character) operation.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn insert_chars(&mut self, col: u16, count: u16) {
         self.insert_chars_fill(col, count, Cell::EMPTY);
     }
@@ -76,6 +76,8 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
+        // The shift rewrote the last cell: an early-wrap hole there is gone.
+        self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
             // No prior content was shifted. With an EMPTY fill the row stays
             // empty and `len` is unchanged; a BCE (non-empty) fill writes visible
@@ -158,6 +160,8 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
+        // The shift rewrote the last cell: an early-wrap hole there is gone.
+        self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
             // No content beyond the cursor was shifted. With an EMPTY fill the
             // row stays empty; a BCE (non-empty) fill writes visible blanks at the
@@ -256,6 +260,8 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
+        // A shift through the row end rewrote the last cell.
+        self.note_write_through(rb);
         // Recalculate len since bounded insert may have changed content extent
         self.recalculate_len_up_to(self.cells.len());
     }
@@ -320,6 +326,8 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
+        // A shift through the row end rewrote the last cell.
+        self.note_write_through(rb);
         // Recalculate len since bounded delete may have changed content extent
         self.recalculate_len_up_to(self.cells.len());
     }

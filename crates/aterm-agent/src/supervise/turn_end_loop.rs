@@ -79,6 +79,7 @@ use super::super::policy::turn_end::{
     RULE_MODEL_RESTORE, RULE_USAGE_PROBE, RULE_WIND_DOWN, Restart, StoodBy, Then, WIND_DOWN_BOUND,
     WindDown, WindEvent, WindPhase, decide_turn_end, wind_phase_word,
 };
+use super::wall_confirm::Check;
 use super::*;
 use crate::harness::accounts::Sample;
 use crate::harness::usage::{
@@ -292,7 +293,7 @@ pub(super) fn capped_rules(line: &str) -> String {
 /// second `now_ms` falls in, moved by its own milliseconds plus `ahead_ms`,
 /// rounded half away from that second. On a whole-second clock (a test's) that
 /// is the second plus `ahead_ms` rounded half away from zero.
-fn nearest_s(now_ms: i64, ahead_ms: i64) -> i64 {
+pub(super) fn nearest_s(now_ms: i64, ahead_ms: i64) -> i64 {
     let off = now_ms.rem_euclid(1000).saturating_add(ahead_ms);
     let whole = i64::try_from(off.unsigned_abs().saturating_add(500) / 1000).unwrap_or(i64::MAX);
     now_ms
@@ -304,10 +305,56 @@ impl<C: Ctl> Session<'_, C> {
     /// `t` on the loop's clock as unix seconds, the nearest, against the
     /// clock to the millisecond ([`Self::now_unix_ms`]).
     pub(super) fn unix_of(&self, t: Instant) -> i64 {
+        let (now_ms, ahead) = self.ms_ahead(t);
+        nearest_s(now_ms, ahead)
+    }
+
+    /// `t` on the loop's clock as unix MILLISECONDS ([`Self::unix_of`] to the
+    /// millisecond): the wall time a deadline names ([`Due::unix_ms`]).
+    pub(super) fn unix_ms_of(&self, t: Instant) -> i64 {
+        let (now_ms, ahead) = self.ms_ahead(t);
+        now_ms.saturating_add(ahead)
+    }
+
+    /// The wall clock now (unix milliseconds) and how many milliseconds
+    /// `t` lies ahead of now on the monotonic clock (negative: behind).
+    fn ms_ahead(&self, t: Instant) -> (i64, i64) {
         let now = Instant::now();
         let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
         let ahead = if t >= now { ms(t - now) } else { -ms(now - t) };
-        nearest_s(self.now_unix_ms(), ahead)
+        (self.now_unix_ms(), ahead)
+    }
+
+    /// Stand `at` (on the loop's clock) as the policy's deadline at the point
+    /// still showing ([`Self::turn_end_due`]), and why: kept on both clocks
+    /// ([`Due`]), its wall time read now.
+    pub(super) fn set_due(&mut self, at: Instant, why: impl Into<String>) {
+        self.turn_end_due = Some(Due {
+            at,
+            unix_ms: self.unix_ms_of(at),
+            why: why.into(),
+        });
+    }
+
+    /// When the policy's deadline falls ([`Due`]), on the loop's clock now:
+    /// its `Instant` — unless the wall clock has run ahead of the monotonic
+    /// one since it was set by more than a sleep ([`super::slept_through`]),
+    /// when it is the wall time it named, now behind or nearer. The
+    /// milliseconds between the two clocks' reads never move it, so an
+    /// awake wait never falls a moment before its `Instant` and is decided
+    /// twice. `None`: nothing waited on.
+    pub(super) fn due_at(&self) -> Option<Instant> {
+        let due = self.turn_end_due.as_ref()?;
+        let wall = self.instant_of_ms(due.unix_ms);
+        // How much sooner the wall clock reads the deadline than the
+        // monotonic one: the sleep since it was set.
+        let ahead =
+            i64::try_from(due.at.saturating_duration_since(wall).as_secs()).unwrap_or(i64::MAX);
+        Some(if super::slept_through(ahead, 0) {
+            wall
+        } else {
+            due.at
+        })
     }
 
     /// `t` on the loop's clock as a UTC stamp, for the journal (a `t` already
@@ -419,8 +466,14 @@ impl<C: Ctl> Session<'_, C> {
     /// itself, whatever part of a second the read fell in. The ONE way a
     /// unix time becomes an `Instant` here; [`Self::unix_of`] is its inverse.
     pub(super) fn instant_of(&self, unix: i64) -> Instant {
+        self.instant_of_ms(unix.saturating_mul(1000))
+    }
+
+    /// [`Self::instant_of`] for a unix MILLISECOND ([`Self::unix_ms_of`]'s
+    /// inverse). A time further back than the monotonic clock reaches is now.
+    pub(super) fn instant_of_ms(&self, unix_ms: i64) -> Instant {
         let now = Instant::now();
-        let delta = unix.saturating_mul(1000).saturating_sub(self.now_unix_ms());
+        let delta = unix_ms.saturating_sub(self.now_unix_ms());
         let d = Duration::from_millis(delta.unsigned_abs());
         if delta >= 0 {
             now + d
@@ -1023,7 +1076,7 @@ impl<C: Ctl> Session<'_, C> {
             .turn_end
             .wind()
             .is_some_and(|w| w.said.contains(&"background"));
-        let due = self.turn_end_due.as_ref().map(|(t, _)| *t);
+        let due = self.due_at();
         let worked = match &mut self.switch_break {
             Some(b) => {
                 if b.phase != phase {
@@ -1300,14 +1353,47 @@ impl<C: Ctl> Session<'_, C> {
     /// the API's reach ([`IdleHost::reach`]), remembered as
     /// [`Self::reach_seen`]; everywhere else nothing is asked, and it is
     /// forgotten.
+    ///
+    /// A DECISION's read: the screen's wall is checked against the session's
+    /// transcript here ([`Self::confirm_wall`], [`Check::Decide`]). The
+    /// point read again for the loop's books after its act is
+    /// [`Self::turn_end_reread`].
     pub(super) fn turn_end_reading(
         &mut self,
         screen: &Screen,
         worked: Option<Duration>,
         opts: &SuperviseOpts,
     ) -> TurnEndReading {
+        self.turn_end_reading_as(screen, worked, opts, Check::Decide)
+    }
+
+    /// The reading of a point ALREADY DECIDED, for the loop's books after
+    /// its act — what the act was taken at, the restart made or waited for:
+    /// its wall as the decision's read judged it at that screen
+    /// ([`Check::AsDecided`]). The transcript, moved on by the act itself
+    /// (the carry-on typed, the relaunched conversation), is not asked again:
+    /// asked, it refused the wall just acted on.
+    pub(super) fn turn_end_reread(
+        &mut self,
+        screen: &Screen,
+        opts: &SuperviseOpts,
+    ) -> TurnEndReading {
+        self.turn_end_reading_as(screen, None, opts, Check::AsDecided)
+    }
+
+    fn turn_end_reading_as(
+        &mut self,
+        screen: &Screen,
+        worked: Option<Duration>,
+        opts: &SuperviseOpts,
+        check: Check,
+    ) -> TurnEndReading {
         let reader = self.reader(&screen.rows);
         let mut reading = reader.read(&screen.rows, Some(screen.cursor_col));
+        // The screen's wall acted on only where the session's transcript
+        // confirms it (H6-HARNESS-1): refused, the point is an ordinary turn
+        // end — before anything below reads the wall.
+        self.confirm_wall(&mut reading, screen, opts, check);
         // The wall waited on, remembered while its rows are
         // out of view; another wall or an idle screen ends it.
         self.wall_memory_step(reader, &screen.rows, &mut reading, screen.seq);
@@ -1327,7 +1413,7 @@ impl<C: Ctl> Session<'_, C> {
                 // session rule in the past, and the `keep going` it was
                 // answered with — held by Claude Code, no turn, no busy read —
                 // left that placement standing: typed again every 30 minutes
-                // until the reset (2026-10-01, 24 lines). Once an act.
+                // until the reset. Once an act.
                 let answered = self
                     .turn_end
                     .untaken_act(Instant::now())
@@ -1592,13 +1678,12 @@ impl<C: Ctl> Session<'_, C> {
     /// Claude Code 2.1.280 and 2.1.281). The cursor's ROW is not trusted: a
     /// window that re-gridded twice in a millisecond leaves an
     /// alternate-screen program's rows one higher than it drew them and its
-    /// cursor on the row below the prompt (the render incident of
-    /// 2026-09-28: tab 1's screen sat so for hours, through exactly the idle
-    /// stretch a wall is), and read by the row, Claude's own suggestion was a
-    /// person's draft and the wall's act became a bare Enter on ghost text
-    /// instead of `keep going`. A second row of text is a draft. A `cell` the
+    /// cursor on the row below the prompt (seen live for hours, through
+    /// exactly the idle stretch a wall is), and read by the row, Claude's own
+    /// suggestion was a person's draft and the wall's act became a bare
+    /// Enter on ghost text instead of `keep going`. A second row of text is a draft. A `cell` the
     /// server does not answer reads as the placeholder where the cursor
-    /// stands on the caret row, as before, and as a DRAFT anywhere else:
+    /// stands on the caret row, and as a DRAFT anywhere else:
     /// nothing is typed over text that may be a person's. `composer` is the
     /// region the reader already read off `screen` ([`aterm_phase::Reading::composer`]).
     pub(super) fn composer_draft(
@@ -1765,12 +1850,13 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let screen = self.screen()?;
-        let turn = self.turn_of(screen);
+        let mut turn = self.turn_of(screen);
         if self.review_key(&turn) != self.review_key(seen) {
             return Ok(());
         }
         self.account_round();
         let mut r = self.turn_end_reading(&turn.screen, None, opts);
+        self.refused_limit(&mut turn);
         self.host_held = r.upgrading;
         let now = Instant::now();
         self.person_for_the_hold(&mut r, now)?;
@@ -1821,6 +1907,8 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let seq = point.screen.seq;
+        // A wall the transcript did not confirm, journaled once.
+        self.say_wall_refused(review);
         // The point a person alone can answer, said once per change.
         self.sync_exception(seq, review);
         // What Codex's save-then-wait switch and its sandbox check left to
@@ -1868,14 +1956,14 @@ impl<C: Ctl> Session<'_, C> {
                 );
             }
             TurnEndAction::WaitUntil { until, why } => {
-                let said = self.turn_end_due.as_ref().is_some_and(|(t, _)| t == until);
+                let said = self.turn_end_due.as_ref().is_some_and(|d| d.at == *until);
                 if !said {
                     review.note(&format!(
                         "WAITING seq={seq} until={} {why}",
                         self.stamp_in(*until)
                     ));
                 }
-                self.turn_end_due = Some((*until, why.clone()));
+                self.set_due(*until, why.clone());
                 return Ok(());
             }
             TurnEndAction::Type { text, rule_id } | TurnEndAction::Accept { text, rule_id } => {
@@ -1923,7 +2011,7 @@ impl<C: Ctl> Session<'_, C> {
         if !typed {
             return Ok(());
         }
-        let r = self.turn_end_reading(&point.screen, None, opts);
+        let r = self.turn_end_reread(&point.screen, opts);
         self.turn_end.acted(&action, &r, Instant::now());
         // The switch's `/goal resume` at its reset over the live upgrade's
         // pause: the upgrade's resume, made by the switch, on its record, so
@@ -2095,7 +2183,7 @@ impl<C: Ctl> Session<'_, C> {
                 // the next warning names aterm's restart again
                 // ([`Self::memory_refused`]).
                 self.memory_refused = false;
-                let r = self.turn_end_reading(&point.screen, None, opts);
+                let r = self.turn_end_reread(&point.screen, opts);
                 let now = Instant::now();
                 self.turn_end.restarted(why, true, &r, now);
                 // A host that typed the carry-on inside its restart typed a
@@ -2249,7 +2337,7 @@ impl<C: Ctl> Session<'_, C> {
             // count, and nothing is typed blind at a wall a relaunch on the
             // fallback answers as soon as the agent's own jobs end.
             (Some("wait"), Some(step)) => {
-                let r = self.turn_end_reading(&point.screen, None, opts);
+                let r = self.turn_end_reread(&point.screen, opts);
                 let due = r
                     .reset_at
                     .map(|at| at + self.turn_end.timing.grace_for(r.program) + r.jitter);
@@ -2260,7 +2348,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             _ => {
                 self.restart_waits = 0;
-                let r = self.turn_end_reading(&point.screen, None, opts);
+                let r = self.turn_end_reread(&point.screen, opts);
                 // The memory's `otherwise` still replaces the wall's own act
                 // even when this read is no longer acted on: the next measure
                 // not acted on hands the point back ([`Self::memory_edge`]).
@@ -2314,16 +2402,21 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The Mac woke from a sleep the wait went through: the
-    /// wait the policy stands on is late by the sleep — its deadline is an
-    /// `Instant` — so it is decided again [`WAKE_SETTLE`] (and the session's
-    /// share of [`WAKE_SPREAD`]) from now, on the reset the unix clock reads
-    /// afresh ([`Self::wall_reset_at`]). ONLY where a wait stands: a point
-    /// with nothing waited on (an escalated one, a question) is decided again
-    /// by nothing here, or its ask would be posted twice
-    /// ([`Self::reach_edge`]'s rule).
+    /// The Mac woke at `wall_now` (unix seconds) from a sleep the wait went
+    /// through. A deadline the sleep carried past ([`Due::unix_ms`], its wall
+    /// time) would fall at once ([`Self::due_at`]); it is decided again
+    /// [`WAKE_SETTLE`] (and the session's share of [`WAKE_SPREAD`]) from now
+    /// instead, on the reset the unix clock reads afresh
+    /// ([`Self::wall_reset_at`]). A deadline still ahead falls at its wall time
+    /// as it stands. ONLY where a wait stands: a point with nothing waited on
+    /// (an escalated one, a question) is decided again by nothing here, or its
+    /// ask would be posted twice ([`Self::reach_edge`]'s rule).
     pub(super) fn woke(&mut self, seq: u64, wall_now: i64, review: &mut dyn Review) {
-        if self.turn_end_due.is_none() {
+        if self
+            .turn_end_due
+            .as_ref()
+            .is_none_or(|d| d.unix_ms > wall_now.saturating_mul(1000))
+        {
             return;
         }
         let share = self.sid.as_deref().map_or(Duration::ZERO, |sid| {
@@ -2334,7 +2427,7 @@ impl<C: Ctl> Session<'_, C> {
             "WAITING seq={seq} until={} the Mac woke: deciding again",
             self.stamp_in(at)
         ));
-        self.turn_end_due = Some((at, "the Mac woke".to_string()));
+        self.set_due(at, "the Mac woke");
     }
 
     /// A restart that must wait: decided again after the next pause of
@@ -2365,7 +2458,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.stamp_in(until)
             ));
         }
-        self.turn_end_due = Some((until, why));
+        self.set_due(until, why);
         Ok(())
     }
 
@@ -2512,7 +2605,7 @@ impl<C: Ctl> Session<'_, C> {
     /// The point decided again [`REDECIDE_AFTER_SKIP`] from now
     /// ([`Self::turn_end_now`], on the deadline of the loop's own wait).
     fn redecide_soon(&mut self, why: &str) {
-        self.turn_end_due = Some((Instant::now() + REDECIDE_AFTER_SKIP, why.to_string()));
+        self.set_due(Instant::now() + REDECIDE_AFTER_SKIP, why);
     }
 
     /// Text this policy wrote and did not submit: escalated (the worker's
@@ -2792,10 +2885,9 @@ impl<C: Ctl> Session<'_, C> {
     /// screen still moving when [`SETTLE_CAP`] ran out) shows no caret row at
     /// all. That read returned here with the suggestion already FILLED —
     /// nothing pressed, nothing journaled, nothing escalated — and the fill
-    /// waited out the draft path's grace, minutes on (the narrow-composer lane
-    /// of 2026-09-24, found by reading this code; the fenced write's twin was
-    /// measured live). It is read once more after one more settle — a second
-    /// bounded read on the [`REACTION_WAIT`] design, not a loop — and a
+    /// waited out the draft path's grace, minutes on. It is read once more
+    /// after one more settle — a second bounded read on the
+    /// [`REACTION_WAIT`] design, not a loop — and a
     /// composer still missing then is journaled `SKIPPED` and nothing more is
     /// pressed (no read showed the fill, so none is claimed).
     fn accept_suggestion(
@@ -2902,8 +2994,7 @@ const PANEL_STUCK: &str = "The /usage panel did not close\nPress Esc in this tab
 
 /// What the host is told, once, when the probe's `/usage` was written into
 /// the composer and its Enter was not ([`IdleHost::inform`]: a record — no
-/// badge, no attention, no ask. The house rule that alerts have a class,
-/// ruled for this text on 2026-10-02: the probe's own words left typed are
+/// badge, no attention, no ask: the probe's own words left typed are
 /// no state a person is needed for NOW, so they are taken out of the
 /// escalation every other typed act's leftover gets,
 /// [`Session::left_typed`]). The state on its first line; beneath it, what
@@ -3113,8 +3204,8 @@ impl<C: Ctl> Session<'_, C> {
     /// and for a claim the host refused its own word after it (`gate=claim
     /// host=<word>`). SAID, not only journaled: the line is in the session's
     /// journal and, for a hosted loop, in its host's log beside the advice
-    /// that asked for the probe — where the live check of 2026-10-02 looked
-    /// for it and found nothing, in seven sessions that typed no `/usage`.
+    /// that asked for the probe — where a person looking for why no `/usage`
+    /// was typed reads, and a journal-only line was found by nobody.
     ///
     /// Nothing where the roster did not say a probe is due at this screen
     /// ([`Self::probe_advised`]), and nothing a second time at one point
@@ -3221,7 +3312,8 @@ impl<C: Ctl> Session<'_, C> {
         if self.reader(&screen.rows).program() != aterm_phase::Program::Claude {
             return Ok(Some(ProbeGate::NotClaude));
         }
-        let reading = self.turn_end_reading(screen, None, opts);
+        // The point was decided: its wall as the decision judged it.
+        let reading = self.turn_end_reread(screen, opts);
         if let Some(gate) = self
             .turn_end
             .probe_gate(&reading, &opts.policy, Instant::now())
@@ -3515,10 +3607,11 @@ impl<C: Ctl> Session<'_, C> {
     /// from.
     ///
     /// TEXT WRITTEN AND NOT SUBMITTED IS A RECORD, NEVER AN ESCALATION
-    /// ([`ProbeTyped::Not`]'s `left`; the ruling of 2026-10-02 under the
-    /// house rule that alerts have a class — the spec's row for this exit,
-    /// and this code until then, escalated it as every other fenced write's
-    /// leftover is, [`Self::left_typed`]):
+    /// ([`ProbeTyped::Not`]'s `left`; alerts have a class, so this is not
+    /// escalated as every other fenced write's leftover is,
+    /// [`Self::left_typed`] — a ruling against the spec's row T for this exit
+    /// in `docs/SPEC-claude-accounts-probe-2026-10-01.md`, which still says
+    /// escalate):
     /// the journal's `SKIPPED … typed, not submitted: <why>` and one record
     /// through [`IdleHost::inform`] ([`USAGE_LEFT`]). No attention is set,
     /// no ask posted, no badge kept: nothing here is a state a person is
@@ -3676,11 +3769,10 @@ impl<C: Ctl> Session<'_, C> {
     /// [if-human=<n>] if-gen=<the judged read> if=<its caret row> enter`),
     /// journaled under the probe's rule, and BOOKED NOWHERE in the policy —
     /// no [`TurnEndState::acted`], no `CONTINUED`, no `typed` row under the
-    /// act's rule. Until 2026-10-02 it went as the act: `CONTINUED …
-    /// /usage` was said, one of the hour's continuations was spent on it,
-    /// and the worker — which does no work for a `/usage` — was read as a
-    /// short turn not taken, so its real continuation waited out
-    /// [`TurnEndTiming::take_within`] and a step of the back-off.
+    /// act's rule. Booked as the act, it would spend one of the hour's
+    /// continuations, and the worker — which does no work for a `/usage` —
+    /// would read as a short turn not taken, so its real continuation would
+    /// wait out [`TurnEndTiming::take_within`] and a step of the back-off.
     ///
     /// The panel the Enter opens is the harness's and owed
     /// ([`Self::probe_owes`], from the text): the next look closes it with
@@ -3729,7 +3821,7 @@ impl<C: Ctl> Session<'_, C> {
                 // a typed act is given to be taken. One that took moves the
                 // screen first, and the close sets its own.
                 let due = Instant::now() + self.turn_end.timing.take_within;
-                self.turn_end_due = Some((due, "the accounts probe's text was sent".to_string()));
+                self.set_due(due, "the accounts probe's text was sent");
             }
             None if r.skipped_person() || r.skipped_changed() => {
                 skipped("a person keyed or the screen moved before Enter", review);

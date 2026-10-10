@@ -39,6 +39,8 @@
 //! `try_refresh_search_index`); the differential tests compare against
 //! `legacy_results`, a from-scratch oracle.
 
+use aterm_types::text_shaping::AmbiguousWidth;
+
 use super::Terminal;
 use crate::search::{DEFAULT_MAX_CACHED_LINES, TerminalSearch};
 
@@ -64,6 +66,10 @@ pub(crate) struct CachedSearchIndex {
     /// forcing the full rebuild; height-only changes move rows between history
     /// and visible without moving keys, so they stay refreshable.
     cols: u16,
+    /// The `ambiguous_width` policy the index measures columns under. A live
+    /// switch moves no `content_gen` (it reflows nothing), so it is part of the
+    /// hit key: the next search re-measures every row under the new policy.
+    ambiguous_width: AmbiguousWidth,
     /// Absolute row of the oldest retained line at (re)build time. Retention only
     /// advances it; a decrease means renumbering (full rebuild).
     hist_base: usize,
@@ -99,12 +105,14 @@ impl Terminal {
         // The renumber epoch is part of the hit key: a Kitty unscroll shifts
         // older rows' keys without necessarily moving `content_seq`.
         let key_epoch = self.grid.history_renumber_epoch();
+        let key_ambiguous = self.ambiguous_width();
 
         let hit = match &self.search_index {
             Some(cached) => {
                 cached.alt_screen == key_alt
                     && cached.content_gen == key_gen
                     && cached.history_renumber_epoch == key_epoch
+                    && cached.ambiguous_width == key_ambiguous
             }
             None => false,
         };
@@ -143,6 +151,7 @@ impl Terminal {
                 absolute_row_revision: revision,
                 history_renumber_epoch: key_epoch,
                 cols,
+                ambiguous_width: key_ambiguous,
                 hist_base,
                 visible_base,
                 indexed_end,
@@ -171,7 +180,8 @@ impl Terminal {
     ///   only drops the oldest rows (`hist_base` monotone). Every refresh
     ///   re-feeds from `min(previous, current visible base)`, so a row that
     ///   changed classification is re-fed in its new form (visible via
-    ///   `get_line_text`, history via `line_text_bounded`, as the build does).
+    ///   `written_line_text`, history via `line_text_bounded`, as the build
+    ///   does).
     /// - `drop_history_below` removes the evicted prefix with fresh-build
     ///   semantics.
     /// - No internal cap eviction fires on either path: the guards require an
@@ -201,6 +211,8 @@ impl Terminal {
                 && cached.absolute_row_revision == revision
                 && cached.history_renumber_epoch == renumber_epoch
                 && cached.cols == cols
+                // Every row is re-measured under a new ambiguous-width policy.
+                && cached.ambiguous_width == self.ambiguous_width()
                 // Retention only advances; a retreat means renumbering (a
                 // re-attached offloaded reflow can grow scrollback back; its width
                 // change also fences, but this guard stands on its own).
@@ -250,7 +262,7 @@ impl Terminal {
         let rows = self.rows();
         index.index_numbered_content_owned((0..rows).map(|r| {
             let absolute_row = visible_base.saturating_add(usize::from(r));
-            let text = self.get_line_text(i32::from(r), None).unwrap_or_default();
+            let text = self.written_line_text(i32::from(r)).unwrap_or_default();
             (absolute_row, text)
         }));
         Some(index)
@@ -264,7 +276,7 @@ impl Terminal {
         let scrollback = grid.scrollback_lines();
         let rows = self.rows();
 
-        let mut search = TerminalSearch::new();
+        let mut search = TerminalSearch::new().with_ambiguous_width(self.ambiguous_width());
 
         // History 0..scrollback at absolute oldest + i, via the dense history
         // walk (`Grid::history_lines_from`, item `i` == `get_history_line(i)`,
@@ -294,12 +306,14 @@ impl Terminal {
         }));
 
         // Visible rows 0..rows at absolute oldest + scrollback + r, via the
-        // combining-aware `get_line_text` so accents and ZWJ clusters survive.
-        // Streamed like the history.
+        // combining-aware `written_line_text` so accents and ZWJ clusters
+        // survive. Read as written, trailing blanks kept, as each history line
+        // stores its row: a row's matches must not change when it scrolls off
+        // (`foo$`, a query ending in spaces). Streamed like the history.
         let vis_base = hist_base.saturating_add(scrollback);
         search.index_numbered_content_owned((0..rows).map(|r| {
             let absolute_row = vis_base.saturating_add(usize::from(r));
-            let text = self.get_line_text(i32::from(r), None).unwrap_or_default();
+            let text = self.written_line_text(i32::from(r)).unwrap_or_default();
             (absolute_row, text)
         }));
 
@@ -352,7 +366,7 @@ pub(crate) mod tests {
         let oldest = grid.oldest_absolute_row();
         let scrollback = grid.scrollback_lines();
         let rows = t.rows() as usize;
-        let mut search = TerminalSearch::new();
+        let mut search = TerminalSearch::new().with_ambiguous_width(t.ambiguous_width());
         let history: Vec<String> = (0..scrollback)
             .map(|i| {
                 grid.get_history_line(i)
@@ -363,7 +377,7 @@ pub(crate) mod tests {
         let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
         search.index_visible_content(hist_base, &history);
         let visible: Vec<String> = (0..rows)
-            .map(|r| t.get_line_text(r as i32, None).unwrap_or_default())
+            .map(|r| t.written_line_text(r as i32).unwrap_or_default())
             .collect();
         let vis_base = hist_base.saturating_add(scrollback);
         search.index_visible_content(vis_base, &visible);
@@ -439,6 +453,192 @@ pub(crate) mod tests {
             .iter()
             .map(|m| (m.line, m.start_col, m.len()))
             .collect()
+    }
+
+    /// A line's matches do not change when it scrolls from the screen into
+    /// history: both are read as written, trailing blanks kept, so `foo$` and
+    /// a query ending in the spaces the program printed answer the same in
+    /// either place (absolute rows do not move on a scroll). The same holds for
+    /// every reader: the full build, the refresh that serves a search after
+    /// more output, and the budgeted search.
+    #[test]
+    fn a_rows_matches_do_not_change_when_it_scrolls_into_history() {
+        let regex = |t: &mut Terminal, pat: &str| -> Vec<(usize, usize, usize)> {
+            let res = t
+                .indexed_search()
+                .search_results_opts(pat, false, true)
+                .expect("search ok");
+            res.matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect()
+        };
+        let budgeted = |t: &mut Terminal, pat: &str| -> Vec<(usize, usize, usize)> {
+            let step = t
+                .search_budgeted(pat, false, true, None, 100)
+                .expect("budgeted search");
+            assert!(step.complete, "one step covers the fixture");
+            step.results
+                .matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect()
+        };
+        let mut t = Terminal::new(6, 20);
+        t.process(b"foo   \r\nbar \x1b[41m  \x1b[0m\r\nbaz\r\nfoo");
+        assert_eq!(
+            t.grid().scrollback_lines(),
+            0,
+            "precondition: all on screen"
+        );
+        let queries = ["foo$", "bar$", "foo  ", "bar   "];
+        let on_screen: Vec<_> = queries.iter().map(|q| regex(&mut t, q)).collect();
+        assert_eq!(
+            on_screen[2],
+            vec![(0, 0, 5)],
+            "the spaces the program printed are on the line: {on_screen:?}"
+        );
+        assert_eq!(
+            on_screen[0],
+            vec![(3, 0, 3)],
+            "only the line that ends at `foo` ends at `foo`"
+        );
+        let budgeted_on_screen: Vec<_> = queries.iter().map(|q| budgeted(&mut t, q)).collect();
+        assert_eq!(budgeted_on_screen, on_screen, "the budgeted search");
+        assert_eq!(
+            t.abs_row_text(0).as_deref(),
+            Some("foo   "),
+            "a match's snippet is the line it came from"
+        );
+
+        // More output, still on the screen: the refresh re-reads the rows.
+        let refreshes = t.search_index_refreshes();
+        t.process(b"\r\nqux");
+        let refreshed: Vec<_> = queries.iter().map(|q| regex(&mut t, q)).collect();
+        assert!(
+            t.search_index_refreshes() > refreshes,
+            "precondition: a refresh served it"
+        );
+        assert_eq!(refreshed, on_screen, "the refreshed index");
+
+        t.process(b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        assert!(
+            t.grid().scrollback_lines() >= 4,
+            "precondition: every fixture line is history now"
+        );
+        let in_history: Vec<_> = queries.iter().map(|q| regex(&mut t, q)).collect();
+        assert_eq!(in_history, on_screen);
+        let budgeted_in_history: Vec<_> = queries.iter().map(|q| budgeted(&mut t, q)).collect();
+        assert_eq!(budgeted_in_history, on_screen, "the budgeted search");
+        assert_eq!(t.abs_row_text(0).as_deref(), Some("foo   "), "the snippet");
+    }
+
+    /// A terminal whose `ambiguous_width` policy is `"wide"`.
+    fn wide_terminal(rows: u16, cols: u16) -> Terminal {
+        let mut t = Terminal::new(rows, cols);
+        t.apply_config(&crate::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        t
+    }
+
+    /// With `ambiguous_width = "wide"` the grid draws an East Asian Ambiguous
+    /// character in two cells, and find reports the cells the match is drawn
+    /// in, one-shot and budgeted: `foo` after two arrows is in cells 4-6, after
+    /// three box-drawing dashes in cells 7-9.
+    #[test]
+    fn find_measures_ambiguous_characters_as_the_grid_draws_them() {
+        let mut t = wide_terminal(4, 20);
+        t.process("→→foo bar\r\n─── foo".as_bytes());
+        assert!(
+            t.grid().is_wide_continuation_at(0, 3) && t.grid().is_wide_continuation_at(1, 5),
+            "precondition: the grid draws them wide"
+        );
+        assert_eq!(cached_results(&mut t, "foo"), vec![(0, 4, 3), (1, 7, 3)]);
+        assert_eq!(legacy_results(&t, "foo"), cached_results(&mut t, "foo"));
+        let budgeted = t
+            .search_budgeted("foo", false, false, None, 100)
+            .expect("budgeted search");
+        assert!(budgeted.complete);
+        let budgeted: Vec<_> = budgeted
+            .results
+            .matches
+            .iter()
+            .map(|m| (m.line, m.start_col, m.len()))
+            .collect();
+        assert_eq!(budgeted, vec![(0, 4, 3), (1, 7, 3)]);
+    }
+
+    /// A live switch to `"wide"` moves no content generation, so the refresh
+    /// that serves the next search must not keep the narrow index: a line
+    /// written after the switch is measured as the grid drew it.
+    #[test]
+    fn a_live_switch_to_wide_ambiguous_width_is_not_served_from_the_narrow_index() {
+        let mut t = Terminal::new(4, 20);
+        t.process(b"plain foo\r\n");
+        assert_eq!(cached_results(&mut t, "foo"), vec![(0, 6, 3)]);
+        t.apply_config(&crate::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        t.process("→→foo".as_bytes());
+        assert_eq!(cached_results(&mut t, "foo"), vec![(0, 6, 3), (1, 4, 3)]);
+    }
+
+    /// A live switch with no new output moves no content generation, and no
+    /// cache serves an answer measured under the old policy: the cached index,
+    /// a resumed budgeted search and the summary each answer as a fresh build
+    /// under the policy now in force (which measures every row, see
+    /// `Terminal::ambiguous_width`).
+    #[test]
+    fn a_live_switch_with_no_new_output_is_not_served_from_a_cache() {
+        let mut t = Terminal::new(4, 20);
+        t.process("→→foo\r\nx\r\nfoo".as_bytes());
+        let narrow = cached_results(&mut t, "foo");
+        let step = t
+            .search_budgeted("foo", false, false, None, 100)
+            .expect("budgeted search");
+        assert!(step.complete, "precondition: a completed budgeted scan");
+        let partial = t
+            .search_budgeted("foo", false, false, None, 1)
+            .expect("budgeted search");
+        let cursor = partial.cursor.expect("precondition: a scan in flight");
+
+        t.apply_config(&crate::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        let fresh = legacy_results(&t, "foo");
+        assert_ne!(fresh, narrow, "precondition: the policy moves a match");
+        assert_eq!(cached_results(&mut t, "foo"), fresh, "the cached index");
+
+        let resumed = t
+            .search_budgeted("foo", false, false, Some(cursor), 100)
+            .expect("budgeted search");
+        assert!(
+            resumed.reset,
+            "the in-flight scan restarts under the new policy"
+        );
+
+        let mut t = Terminal::new(4, 20);
+        t.process("→→foo\r\nx\r\nfoo".as_bytes());
+        let step = t
+            .search_budgeted("foo", false, false, None, 100)
+            .expect("budgeted search");
+        assert!(step.complete, "precondition: a completed budgeted scan");
+        t.apply_config(&crate::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        let summary: Vec<_> = t
+            .search_summary_results("foo", false, false)
+            .expect("summary")
+            .matches
+            .iter()
+            .map(|m| (m.line, m.start_col, m.len()))
+            .collect();
+        assert_eq!(summary, fresh, "the summary");
     }
 
     /// Two identical searches with no content change return identical results

@@ -823,18 +823,12 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        // THE BOUND IS A HANG DETECTOR, not a guess at "prompt". What this pins
-        // is that EOF on a LIVE child's stdout ends the stream instead of waiting
-        // the child out — so the one thing the number has to do is separate
-        // "returned on EOF" from "waited for the child". The child sleeps five
-        // minutes; a regression therefore returns at five minutes or later, and
-        // any return inside a minute (AGENTS.md's hang detector) can only have
-        // come from the EOF. The history of this bound is why it is written this
-        // way: 3 s against 1 s failed in a full `cargo test --workspace` on a box
-        // running several builds, and 30 s against 5 s still failed at load 51 (a
-        // return after 7.64 s, measured 2026-09-24) — each time a budget for the
-        // scheduler's mood was charged to the property. The child's five minutes
-        // are only ever paid when the test FAILS.
+        // THE BOUND IS A HANG DETECTOR, not a latency budget: EOF on a LIVE
+        // child's stdout must end the stream instead of waiting the child out.
+        // The child sleeps five minutes, so a regression returns at five
+        // minutes or later and any return inside a minute (AGENTS.md's hang
+        // detector) came from the EOF; tighter bounds failed under load. The
+        // five minutes are paid only when the test FAILS.
         const CHILD_LIFETIME_S: u64 = 300;
         aterm_tempfile::stand_in(
             &script,

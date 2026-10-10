@@ -8,10 +8,7 @@
 //!
 //! **THE BUDGET-SCALE KNOB** of the release-only perf gates
 //! (`tests/cursor_bench.rs` and `tests/rainbow_kitty_v2_frame_cost.rs`): the
-//! ONE knob both read, and its pure parse. The parse is pinned in exactly one
-//! binary, `cursor_bench`, which has no counting allocator;
-//! `rainbow_kitty_v2_frame_cost` installs a counting global allocator (tallied
-//! per thread) and does not repeat that pin.
+//! ONE knob both read.
 //!
 //! **THE RIBBON HOST'S PIECES**: the owner's rainbow-kitty config and a grid's
 //! geometry; the frame hold's samples as `app_render.rs` takes them from a
@@ -59,12 +56,11 @@ pub fn budget_scale() -> f64 {
     parse_budget_scale(std::env::var(BUDGET_SCALE_VAR).ok().as_deref())
 }
 
-/// The scale's parse, kept pure so it can be pinned without touching the
-/// process environment: unset, empty, unparsable, non-finite and non-positive
+/// The scale's parse: unset, empty, unparsable, non-finite and non-positive
 /// spellings all mean `1.0` — a typo widens nothing. The floor that keeps a
 /// tiny scale from asserting `p50 ≤ 0 µs` lives in [`scaled_budget_us`].
 #[allow(dead_code)]
-pub fn parse_budget_scale(raw: Option<&str>) -> f64 {
+fn parse_budget_scale(raw: Option<&str>) -> f64 {
     raw.and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s > 0.0)
         .unwrap_or(1.0)
@@ -380,14 +376,10 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
 /// run, the first panic in `items`' order is re-raised with its own
 /// payload, as the serial loop would have raised it.
 ///
-/// WHY (2026-09-30, the merge gate's env: `RUST_TEST_THREADS=7`,
-/// `TRAIL_LAWS_FULL=1`): a law that swept its replays one after another was
-/// one thread's wall while the binary's other threads sat idle. Measured
-/// back to back, old and new binaries alternated: `moves_are_followed`
-/// 47.6–50.3 s → 12.3–12.5 s, `zsh_isearch_band` 25.9–26.2 s → 4.9–5.1 s,
-/// `walk_continuity_census` 21.9 s → 3.9–4.8 s,
-/// `busy_status_rows_keep_their_brand` 19.5–19.6 s → 7.4–7.5 s — the same
-/// instructions retired (±0.1 %), so the same work, spread.
+/// WHY: a serial sweep is one thread's wall while the binary's other threads
+/// idle. Under the merge gate's `RUST_TEST_THREADS=7`, serial → pooled:
+/// `moves_are_followed` ~49 s → 12.4 s, `zsh_isearch_band` ~26 s → 5 s,
+/// with the same instructions retired (±0.1 %).
 #[allow(dead_code)]
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};

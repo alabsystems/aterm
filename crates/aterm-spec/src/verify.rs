@@ -3,8 +3,7 @@
 // Author: Andrew Yates
 
 //! The single shared **verification gate** for aterm's conformance and spec-link
-//! tests — the honesty ratchet, TWO-TIER since 2026-07-06 (VERIFY-1, owner
-//! decision).
+//! tests — the honesty ratchet, TWO-TIER (VERIFY-1).
 //!
 //! ## The two tiers
 //!
@@ -32,12 +31,9 @@
 //! `aterm pkg install --default-set`, or one at a time (`aterm pkg install ty`) —
 //! and nothing here is built from source. [`find_ty`]/[`find_trust_ir`]/[`find_ay`]
 //! discover each through the atpkg store's shim (`<prefix>/bin/<tool>`), then on
-//! `PATH`. That is the whole order: the `$HOME/trust/first-party` cargo builds, the
-//! `$HOME/trust/build` bootstrap stages and the standalone `~/ay` checkout were probed
-//! FIRST until 2026-09-24, a month after they were retired from the delivery
-//! (2026-08-29) — and on m3 a `$HOME/trust/first-party/trust-ir` 0.2.0 from 2026-08-17
-//! was shadowing the store's 0.14.0 on every spec-link run. A developer who wants
-//! their own build points the shim at it: `aterm pkg link <tool> <checkout>`. The
+//! `PATH`. That is the whole order: no source checkout or bootstrap stage is
+//! probed, because a stale one would shadow the store's build. A developer who
+//! wants their own build points the shim at it: `aterm pkg link <tool> <checkout>`. The
 //! store is looked for under this ACCOUNT's home (`getpwuid_r`, never `$HOME`,
 //! which a test process moves — `home_dirs` says what that cost); `PATH`, and on
 //! Windows `%HOME%`/`%USERPROFILE%` and `%LOCALAPPDATA%`, are the only
@@ -45,9 +41,7 @@
 //!
 //! ## The tier names the binary it ran
 //!
-//! Which binary answered used to be invisible: a passing check named no binary,
-//! and the path reached output only inside a failure panic. Discovery now writes
-//! one line straight to stderr (not through `eprintln!`, which libtest swallows
+//! Discovery writes one line straight to stderr (not through `eprintln!`, which libtest swallows
 //! for a passing test) the first time it resolves each tool in a process, and
 //! AGAIN whenever the build it resolves to changes mid-process:
 //!
@@ -60,17 +54,13 @@
 //! one package version. `caps=` is what `ty capabilities --json` advertised, so
 //! the line names the protocol that answered.)
 //!
-//! **The line names the build actually used.** "The build it resolves to" is
-//! the chosen path plus its identity (`BinaryIdentity`): length, mtime, device, inode
-//! and ctime, followed through a wrapper script to the file it `exec`s. So a
-//! discovery that sees an `aterm pkg` update repoint the store shim, a tool
-//! rebuilt in place, a yank, or a PATH wrapper whose target alone was replaced
-//! prints a fresh line, ending `changed mid-process (was …)`. Until 2026-10-01
-//! the line was printed once per tool per process: after a mid-process change
-//! every later check ran another build while the only line in the log still
-//! named the first. A wrapper whose exec target does not read statically
-//! (computed from `$0` or a variable, conditional, through `env`) is the limit:
-//! its line says so, and its `built`/`bytes` are the script's own.
+//! **The line names the build actually used.** "The build it resolves to" is the chosen path plus
+//! its identity (`BinaryIdentity`): length, mtime, device, inode and ctime, followed through a
+//! wrapper script to the file it `exec`s. So a discovery that sees an `aterm pkg` update repoint
+//! the store shim, a tool rebuilt in place, a yank, or a PATH wrapper whose target alone was
+//! replaced prints a fresh line, ending `changed mid-process (was …)`. A wrapper whose exec target
+//! does not read statically (computed from `$0` or a variable, conditional, through `env`) is the
+//! limit: its line says so, and its `built`/`bytes` are the script's own.
 //!
 //! Every discovery, [`find_ty`] included, resolves afresh on every call, so
 //! the first call after a change is the one that prints its line. The `ty`
@@ -82,8 +72,9 @@
 //! `capabilities` spawn per build; each bounded by `PROBE_HANG`), and per
 //! discovery a few `stat`s and a 256-byte head read per candidate plus a
 //! two-byte read of the chosen file; store copies are described from the
-//! filesystem alone, never by running them. [`locate_ty`]/[`locate_ay`]/[`locate_trust_ir`] return the same
-//! answer as a [`Located`] for a caller that wants the tier programmatically.
+//! filesystem alone, never by running them. [`locate_ty`]/[`locate_ay`]/
+//! [`locate_trust_ir`] return the same answer as a [`Located`] for a caller that
+//! wants the tier programmatically.
 //!
 //! ## Caller idioms
 //!
@@ -105,8 +96,8 @@
 //! let Some(ty) = aterm_spec::verify::ty_escalation("Thing .tla check") else { return };
 //! ```
 //!
-//! The LEGACY hard-require form [`ay`] still exists for a gate that must never
-//! run tool-less (the `ay` certificate test is the one in-tree caller).
+//! The hard-require form [`ay`] is for a gate that must never run tool-less (the `ay` certificate
+//! test is the one in-tree caller).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -129,17 +120,13 @@ use crate::interp;
 /// `--version`, build time and size, and every managed store copy it shadowed
 /// (the module doc, "The tier names the binary it ran").
 ///
-/// Discovered afresh on every call, never cached: the answer is the build the
-/// store's shim forwards to NOW. The store tier answers the RESOLVED build
-/// (`store/ty/<build>/bin/ty`), and an `aterm pkg` update, link or yank rewrites
-/// only the shim and leaves the old build on disk, so the per-process cache this
-/// replaced (re-checked with `exists()` alone) kept a superseded build, and
-/// after a yank a yanked one, for the rest of the process (reproduced on main
-/// 2026-10-01: a shim repointed at a REJECTING build was never asked, and the
-/// old build's accept hid the TIER DISAGREEMENT). A call is a few `stat`s, a
-/// shim read and a PATH walk, about 65 µs (2026-09-29), beside the `ty` run that
-/// follows. Every call also takes the answer's [`BinaryIdentity`], so the call
-/// that first sees another build is the one that prints its line.
+/// Discovered afresh on every call, never cached: the answer is the build the store's shim forwards
+/// to NOW. The store tier answers the RESOLVED build (`store/ty/<build>/bin/ty`), and an `aterm
+/// pkg` update, link or yank rewrites only the shim and leaves the old build on disk, so a cache
+/// would keep a superseded or yanked build for the rest of the process (and an old build's accept
+/// would hide a TIER DISAGREEMENT). A call is a few `stat`s, a shim read and a PATH walk, about 65
+/// µs, beside the `ty` run that follows. Every call also takes the answer's [`BinaryIdentity`], so
+/// the call that first sees another build is the one that prints its line.
 #[must_use]
 pub fn find_ty() -> Option<PathBuf> {
     locate_ty().map(|l| l.path)
@@ -305,29 +292,24 @@ fn unix_store_bin_dir(home: &Path) -> PathBuf {
     }
 }
 
-/// A shim is trusted only when it FORWARDS to a real file: a symlink an older
-/// atpkg laid, or the `#!/bin/sh` exec stub atpkg lays today.
+/// A shim is trusted only when it FORWARDS to a real file: a symlink, or the
+/// `#!/bin/sh` exec stub atpkg lays.
 ///
-/// Today's shape is the stub (`atpkg::platform::unix` writes one on purpose:
+/// atpkg lays the stub on purpose (`atpkg::platform::unix`:
 /// `targo` refuses a symlinked `current_exe`, so a shim `exec`s the store file
 /// at its real path). Its target is the first trimmed line that reads
 /// `exec '<path>' "$@"` — the same rule as atpkg's own
 /// `platform::parse_sh_shim_target`, which every store answer (`which`, gc,
 /// `prune_stale_shims`) is built on, including a routed shim whose guard line
-/// starts with `[` and so never matches. Until 2026-09-23 this probe accepted
-/// ONLY a symlink, so it answered `None` for every shim atpkg had laid since
-/// the stubs replaced the links (measured on m3: 0 of 62 `bin/` entries are
-/// symlinks) and the store tier never answered at all.
+/// starts with `[` and so never matches.
 ///
-/// A TOMBSTONE must still read as ABSENT: atpkg disables a yanked or
-/// below-floor build by replacing the shim with a failing notice script
-/// (`atpkg::activate::install_tombstone_shim`) that carries no `exec` line, and
-/// the pending-program stub `exec`s `"$ATPKG"`, never a quoted literal path.
-/// Neither parses, so neither can satisfy discovery — and because this probe
-/// runs before the PATH search, a revoked build would otherwise SHADOW a
-/// working tool the developer already has on PATH (adversarial review
-/// 2026-07-30). Anything that is not a symlink or a readable regular file of
-/// at most 64 KiB (atpkg's own bound) — a directory, a FIFO — is absent too.
+/// A TOMBSTONE must still read as ABSENT: atpkg disables a yanked or below-floor build by replacing
+/// the shim with a failing notice script (`atpkg::activate::install_tombstone_shim`) that carries
+/// no `exec` line, and the pending-program stub `exec`s `"$ATPKG"`, never a quoted literal path.
+/// Neither parses, so neither can satisfy discovery — and because this probe runs before the PATH
+/// search, a revoked build would otherwise SHADOW a working tool the developer already has on PATH.
+/// Anything that is not a symlink or a readable regular file of at most 64 KiB (atpkg's own bound)
+/// — a directory, a FIFO — is absent too.
 ///
 /// The answer is the RESOLVED target — what the shim would exec — never the
 /// shim. The target must be an absolute path to a regular file (a GC'd store
@@ -391,16 +373,12 @@ fn exe_name(bin: &str) -> String {
 /// On Unix that is THIS ACCOUNT's home ([`account_home`]), never the process's
 /// `$HOME`. A test process moves its `$HOME`: aterm-gui's handoff fixtures
 /// point it at a scratch directory while they live, so discovery that read it
-/// looked for the store under the scratch, missed, and took whatever `PATH`
-/// offered — or nothing (measured 2026-10-01 under load: beside `seamless`,
-/// `spec_xref`'s first discovery took `ty` and `trust-ir` off `PATH` in every
-/// run, where alone it took the store's; with the tools only in the store,
-/// `ty` was NOT FOUND in every run, and the escalation tests that needed it
-/// passed without running). The account's home is the same answer for every
-/// thread for the life of the process, and it is where the account's atpkg
-/// laid its store — so a process STARTED with a synthetic `$HOME` finds that
-/// store too, where it used to fall through to `PATH`. `$HOME` answers only
-/// when the account cannot be resolved.
+/// would miss the store and take whatever `PATH` offered — or nothing, and the
+/// escalation tests that needed `ty` would pass without running. The account's
+/// home is the same answer for every thread for the life of the process, and it
+/// is where the account's atpkg laid its store, so a process STARTED with a
+/// synthetic `$HOME` finds that store too. `$HOME` answers only when the account
+/// cannot be resolved.
 ///
 /// Windows: `%HOME%`, then `%USERPROFILE%`. Native Windows shells set only
 /// `USERPROFILE`; Git Bash sets `HOME`, sometimes as a POSIX-style `/c/…` path
@@ -504,11 +482,8 @@ fn path_search_in(exe: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathB
 }
 
 // ---------------------------------------------------------------------------
-// PROVENANCE: the escalation tier names the binary it ran. Measured 2026-09-23
-// on m3, before discovery lost its developer-tree tiers: every derived-model
-// check ran a bootstrap `$HOME/trust/build/host/stage1/bin/ty` and every spec-link
-// a first-party trust-ir 0.2.0 while the managed store held 0.14.0 — a stale
-// override nothing reported. Discovery prints one line naming the binary, its
+// PROVENANCE: the escalation tier names the binary it ran, so a stale override
+// cannot answer unreported. Discovery prints one line naming the binary, its
 // tier, its `--version`, its build time and size, and every other managed-store
 // copy — the first time it resolves each tool in a process, and again whenever
 // the [`BinaryIdentity`] it resolves to changes.
@@ -929,9 +904,8 @@ fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
 /// HANG DETECTOR, not a latency budget. The answer is cached for the rest of
 /// the process (an empty [`ty_caps`] set sends every case to a process of its
 /// own), so a bound a loaded machine can exceed turns one slow first exec
-/// into a permanent loss. Measured 2026-10-02: the first exec of a fresh
-/// script on macOS took over five seconds at load 80-100, and two pool tests
-/// of the gate's baseline run failed on exactly that.
+/// into a permanent loss. Measured: the first exec of a fresh script on macOS
+/// took over five seconds at load 80-100.
 const PROBE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `<bin> <args>`'s output, or `None` if it cannot start or does not finish
@@ -1008,19 +982,16 @@ const CAP_BUDGET_SELF: &str = "check-budget-self-v1";
 /// What the `ty` at `ty` says it guarantees (`ty capabilities --json`), probed
 /// ONCE per build per process and cached.
 ///
-/// WHY (2026-10-01, docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md
-/// A8): store builds of one `ty` release share a version string, so a protocol
-/// is detected by the capability the build advertises, never by `--version`.
-/// A `ty` older than the command answers `unrecognized subcommand` with exit 2,
-/// which is the empty set — and so is every other failure to answer: an empty
-/// set is the per-process behaviour every `ty` supports. Keyed by the path AND
-/// its [`BinaryIdentity`], not a single value: [`find_ty`] re-resolves on every
-/// call (an `aterm pkg` update moves it to another build mid-run), and neither
-/// a build at another path nor a `ty` rebuilt in place (or behind an unchanged
-/// wrapper) may inherit its predecessor's answer — the `caps=` its provenance
-/// line prints is this answer, so a stale one would name another build's
-/// protocol. (Until 2026-10-01 the key was the path alone, and a `ty` rebuilt
-/// in place kept the first answer for the rest of the process.)
+/// WHY (docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md A8): store builds of one `ty`
+/// release share a version string, so a protocol is detected by the capability the build
+/// advertises, never by `--version`. A `ty` older than the command answers `unrecognized
+/// subcommand` with exit 2, which is the empty set — and so is every other failure to answer: an
+/// empty set is the per-process behaviour every `ty` supports. Keyed by the path AND its
+/// [`BinaryIdentity`], not a single value: [`find_ty`] re-resolves on every call (an `aterm pkg`
+/// update moves it to another build mid-run), and neither a build at another path nor a `ty`
+/// rebuilt in place (or behind an unchanged wrapper) may inherit its predecessor's answer — the
+/// `caps=` its provenance line prints is this answer, so a stale one would name another build's
+/// protocol.
 // Skip: a cached subprocess probe. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 fn ty_caps(ty: &Path) -> Vec<String> {
@@ -1323,15 +1294,9 @@ fn change_note(prev: &ProvenanceKey, now: Option<&Located>, home: Option<&Path>)
 /// that changes the [`ProvenanceKey`]. The hundreds of other discoveries in a
 /// suite stay silent and spawn nothing.
 ///
-/// Until 2026-10-01 this printed ONCE per tool per process, so a run that
-/// crossed an `aterm pkg` update or a rebuild logged only the first build
-/// while every later check ran another (found by the spec-performance wave-3
-/// review).
-///
 /// Written straight to the process's stderr handle rather than via
 /// `eprintln!`: libtest captures the print macros for a PASSING test and
-/// throws the text away, which is exactly why the success lines never told
-/// anyone which `ty` ran. A direct handle write is not captured, so the line
+/// throws the text away. A direct handle write is not captured, so the line
 /// reaches the developer's terminal and the gate's stage log on a green run.
 // Skip: fs probes, subprocesses, a stderr write. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1350,7 +1315,7 @@ fn report_provenance_on_change(
         homes,
         store_bin,
         |path| {
-            // A8 (2026-10-01): the protocol that will answer, so every
+            // A8: the protocol that will answer, so every
             // transcript and receipt names it (per-process for `caps=none`,
             // `--cases` for a `ty` advertising `trace-cases-v1`).
             let caps = if bin == "ty" {
@@ -1454,9 +1419,8 @@ fn unreached_store_note(bin: &str) -> String {
 ///
 /// Only the HEAD is read. The marker sits on the stub's second line, and the
 /// real tool is big (ty is ~157 MB in the store on m3, trust's bundled ty ~165
-/// MB), so reading the whole file — which this did until 2026-09-24 — cost a
-/// full read of every candidate and, with the store copies now described too,
-/// hundreds of megabytes per tool per test process.
+/// MB), so reading the whole file would cost hundreds of megabytes per tool per
+/// test process.
 // Skip: bounded file read. Build-tooling discovery.
 #[cfg_attr(trust_verify, trust::skip)]
 fn is_pending_stub(cand: &Path) -> bool {
@@ -1519,7 +1483,7 @@ fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// The ESCALATION tier (VERIFY-1, owner decision 2026-07-06): EXTERNAL-tool
+// The ESCALATION tier (VERIFY-1): EXTERNAL-tool
 // analyses run only where their tool is installed. The notice is one prominent
 // line naming exactly what did not run and how to enable it — never silent, and
 // never claimed as a discharged check. Same-model agreement is required only for
@@ -1638,17 +1602,15 @@ pub struct NotRun {
     pub model: &'static str,
 }
 
-/// Run `ty check` on a derived model's generated spec + cfg; panics on failure
-/// (with the generated TLA for diagnosis). `cfg` overrides come pre-rendered.
+/// Run `ty check` on a derived model's generated spec + cfg (`cfg` overrides
+/// come pre-rendered); panics if `ty` cannot run.
+///
+/// Returns (verdict, evidence): whether `ty check` exited 0, plus a rendered
+/// transcript naming the exact binary and its full output — so a TIER
+/// DISAGREEMENT panic identifies WHICH `ty` build said what.
 // Skip: shells out to `ty` and renders its output (absent std format/io
 // bodies + the closure it drives). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-/// Returns (verdict, evidence): whether `ty check` exited 0, plus a rendered
-/// transcript naming the exact binary and its full output — so a TIER
-/// DISAGREEMENT panic identifies WHICH `ty` build said what (the 2026-07-20
-/// `derived_native_tab_identity` disagreement was undiagnosable precisely
-/// because the panic carried neither the binary path nor its output; the
-/// culprit turned out to be transient toolchain drift, not the model).
 fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, String) {
     let dir = scratch_dir("aterm-tier", m.name);
     std::fs::create_dir_all(&dir).expect("mk tempdir");
@@ -1679,10 +1641,7 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// same model at once would otherwise share the directory, and each writes its
 /// spec and cfg, runs its own `ty` and removes the directory afterwards — so
 /// one test's cfg (a `Buggy = 0` prove arm, say) could be read by the other's
-/// `ty` (a `Buggy = 1` catch arm), or deleted under it. A real torn-cfg
-/// incident first fixed this for `validate_transition_tiered`; one binary per
-/// test file made the rest rare, and a suite binary that runs a whole crate's
-/// files in one process makes it ordinary.
+/// `ty` (a `Buggy = 1` catch arm), or deleted under it.
 // Skip: formats a path from the process id and a counter (absent std format
 // bodies). Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1698,186 +1657,87 @@ fn scratch_dir(kind: &str, model: &str) -> PathBuf {
 /// The flags EVERY `ty check` of a derived model carries.
 ///
 /// **Reduction off** (`--no-auto-por`, `--no-auto-symmetry`). The escalation
-/// tier's job is to walk the SAME bounded space the interpreter walked, not a
-/// cheaper one. Partial-order and symmetry reduction are speed features, and
-/// speed is not what this tier buys: the largest model in the registry has 1712
-/// reachable states, so the whole sweep costs seconds either way. What reduction
-/// DOES cost is the only thing that makes two tiers worth running —
-/// comparability. A reduced run explores a representative subset by design, so
-/// its state count carries no information, and [`assert_same_space_explored`]
-/// (the check that caught this) could not be written at all.
+/// tier must walk the SAME bounded space the interpreter walked, not a cheaper
+/// one: a reduced run explores a representative subset by design, so its state
+/// count carries no information and [`assert_same_space_explored`] could not be
+/// written. The largest registered model has 1712 reachable states, so the
+/// whole sweep costs seconds either way.
 ///
-/// It is not hypothetical. A `ty` built 2026-07-02 explored ONE state of
-/// `RainbowJumpBurstLifecycle`'s 128 with reduction on and reported "No errors
-/// found (exhaustive)" — a false proof at the committed config, and a missing
-/// counterexample at `Buggy = 1`, which is the only reason it surfaced at all.
-/// The model's stutter action (`SlowJump`, a self-loop that writes nothing)
-/// formed a singleton ample set whose only successor is the expanding state, and
-/// that build predated `ty`'s own C3 cycle proviso by four days. Two other
-/// models (`NativeConfigTransaction` 1662/1712, `CursorCatCurseWince` 30/36)
-/// were under-exploring the same way, silently, because a prove-only model has
-/// no catch half to fail.
-///
-/// **That was written as past tense and it should not have been.** Re-measured
-/// 2026-08-06 against the binary [`find_trust_bin`] actually selects on this
-/// machine — `$HOME/trust/first-party/ty/target/release/ty`, `tla 0.10.0` — all
-/// three are STILL under-explored by exactly the old amounts
-/// (`RainbowJumpBurstLifecycle` 1/128, `NativeConfigTransaction` 1662/1712,
-/// `CursorCatCurseWince` 30/36), and it is worse than a coverage gap: at
-/// `Buggy = 1`, where `NoLostFadePayload` is violated three steps from `Init`,
-/// that build prints `No errors found (exhaustive)` and exits 0. A FALSE PROOF,
-/// under a `Soundness mode: Sound` banner. The trigger is the same singleton
-/// ample set — drop the stutter action from `Next` and the full 128 states
-/// appear. A 2026-07-20 bootstrap stage build on the same disk is correct
-/// (`POR: 0/127 states reduced`), but `find_trust_bin` probed the first-party
-/// path first and therefore always took the broken one (it probes neither
-/// since 2026-09-24).
-///
-/// So this is not a historical note and not a belt-and-braces flag. It is the
-/// only thing standing between this workspace and a checker that answers
-/// "proved" about spaces it never entered — which is exactly why every `ty
-/// check` in the workspace arms through [`arm_whole_space_check`], and why
-/// nothing here may assume the binary is new.
+/// It is not hypothetical. A `ty` build (`tla 0.10.0`) whose ample-set
+/// reduction predated `ty`'s C3 cycle proviso explored ONE state of
+/// `RainbowJumpBurstLifecycle`'s 128 with reduction on — the stutter action
+/// `SlowJump` formed a singleton ample set — and at `Buggy = 1`, where
+/// `NoLostFadePayload` is violated three steps from `Init`, printed `No errors
+/// found (exhaustive)` and exited 0 under a `Soundness mode: Sound` banner. A
+/// FALSE PROOF. `NativeConfigTransaction` (1662/1712) and `CursorCatCurseWince`
+/// (30/36) under-explored the same way. Nothing here may assume the binary is
+/// new, which is why every `ty check` in the workspace arms through this fn.
 ///
 /// **`--initial-capacity 8192`** — tell `ty` these models are small. Left to
-/// itself it pre-allocates fingerprint storage for a spec that might have
-/// millions of states: measured on `NativeTabIdentity` (399 reachable states),
-/// peak RSS was 4.25 GB unset versus 17 MB with the hint. 8192 is 4x the largest
-/// model; the hash set still grows on its own, so the hint bounds nothing and
-/// under-sizing it cannot truncate a search.
-///
-/// That footprint is what made the suite FLAKY rather than merely wasteful:
-/// ~4 GB per concurrent `ty` collides with the auto-detected memory ceiling,
-/// which is itself a function of how many `ty`/`cargo`/`rustc` processes are
-/// alive, so a run could be handed a share too small to start in.
+/// itself it pre-allocates fingerprint storage for millions of states:
+/// measured on `NativeTabIdentity` (399 reachable states), peak RSS was 4.25 GB
+/// unset versus 17 MB with the hint. 8192 is 4x the largest model; the hash set
+/// still grows on its own, so under-sizing it cannot truncate a search. The
+/// 4 GB footprint also collided with `ty`'s load-dependent memory ceiling:
 /// `NativeTabIdentity` stopped at 1 of 399 states with "memory limit reached"
-/// AND EXIT 0 — a truncated run that an exit-status-only verdict books as a
-/// proof. That is the likeliest reading of the 2026-07-20
-/// `derived_native_tab_identity` "transient toolchain drift" note above: not
-/// drift, a ceiling that moved with the load.
+/// AND EXIT 0 (now refused by [`ty_output`]).
 ///
-/// **`--backend interpreter`** — the same "these models are small" argument, one
-/// layer down. `ty`'s trust-codegen backend became the default engine under AUTO
-/// selection, and it compiles every action to native code before exploring: on
-/// `NativeTabIdentity` that is 9 actions and 17 invariants compiled to walk 399
-/// states, 18.5s wall / 52s CPU against 0.58s interpreted, for the identical
-/// verdict and the identical count. Native codegen pays for itself somewhere
-/// north of a million states; none of these models are within three orders of
-/// magnitude of that.
+/// **`--backend interpreter`** — `ty`'s trust-codegen backend compiles every
+/// action before exploring: on `NativeTabIdentity` 18.5 s wall / 52 s CPU
+/// against 0.58 s interpreted, for the identical verdict and count. Native
+/// codegen pays for itself north of a million states; none of these models are
+/// within three orders of magnitude of that. The engines are two
+/// implementations inside one checker, not two oracles, so this is a speed
+/// choice; the independent check is the interpreter tier here, held by
+/// [`assert_same_space_explored`].
 ///
-/// It buys less on the suite than that ratio suggests — 266s to 228s — and the
-/// reason is worth writing down so nobody re-measures it hoping for more. With
-/// the spawns serialised (as they were until 2026-10-01), suite wall-clock was
-/// ~390 runs times the PER-PROCESS cost, and what dominated that was a fixed
-/// ~0.55s floor no backend choice can touch. **That floor was mis-attributed
-/// here for a month** — this doc used to
-/// blame "`ty`'s own startup: ~0.5s before it reads the spec" and concluded
-/// "only spawning `ty` fewer times could" fix it. Both halves are false, and
-/// measurement says so: `ty --version` returns in under 10ms, and the SAME spec
-/// with `--bfs-only` finishes in 0.03s. The 0.55s was the fused CDEMC symbolic
-/// lane, and it is now switched off below.
+/// **`--bfs-only`** — the pure explicit-state lane, not the fused BFS+symbolic
+/// (CDEMC) default. Over 639 real comparisons (all 125 registry models at
+/// `Buggy = 0` and `1`, the same with `CHECK_DEADLOCK TRUE`, the
+/// `--strict-vacuity` sweep and the 14 hand-written `aterm-spec-models` specs)
+/// every fused run's winner was BFS, the symbolic lanes concluded nothing, and
+/// the two lanes agreed byte-for-byte on every fact a transcript is read for:
+/// exit status, `States found:`, `Soundness mode`, `Search completeness`, the
+/// `Deadlock reached` and `dead action(s) (never fired):` wording, and `is
+/// violated`. Only the clean-run wording differs (BFS prints the `No errors
+/// found (exhaustive)` `examples/trust_models.rs` tests for). The fused lane cost
+/// a fixed ~0.55 s per spawn, ~400 spawns per gate; `ty --version` returns in
+/// under 10 ms.
 ///
-/// **`--bfs-only`** — run the pure explicit-state BFS lane, not `ty`'s fused
-/// BFS+symbolic (CDEMC) default.
+/// Completeness is structural: every cfg here is a finite bounded machine,
+/// INVARIANT-only (`Model::to_cfg`; `Model::to_tla` emits no fairness), and an
+/// exhaustive BFS of a finite space IS the complete proof of a safety
+/// invariant. The one other kind, a LIVENESS cfg (`Liveness::to_cfg_with`,
+/// checked by [`liveness_proves_and_catches_tiered`]), builds the whole finite
+/// graph and runs the fair-cycle search on it; checked, not assumed: on
+/// `NativeUpdateApplyLadder`'s `TheLadderLands` both lanes prove it over the
+/// interpreter's 3080 states and reject each of its four mutants alike.
 ///
-/// The fused default races explicit BFS against PDR / BMC / k-induction and
-/// takes the first definitive answer. For the models in this workspace the
-/// symbolic half has never once supplied that answer: over **639 real
-/// comparisons** — all 125 `xref::model_registry()` models at `Buggy = 0` and
-/// `Buggy = 1`, the same 250 again with `CHECK_DEADLOCK TRUE`, the 125-model
-/// `--strict-vacuity` sweep the `aterm-gui` gate runs, and the 14 hand-written
-/// `aterm-spec-models` specs — every fused run reported `Winner: BFS
-/// (explicit-state)`, and the symbolic lanes reported `[ay-kind] k-induction
-/// inconclusive` and `MODEL-UNCONFIRMED … rejected by mandatory strict
-/// certification`. 0.55s per spawn to conclude nothing, ~400 times per
-/// `tools/verify.sh` run.
+/// **`--workers 1`** — these spaces are small; at one worker `ty` also skips
+/// the pilot's second walk. The parallelism that pays is the test binary's own
+/// threads, each running its own `ty`. Over 559 checks replayed one by one:
+/// 57.1 s -> 40.1 s, with identical exit status, `States found` and violation
+/// lines.
 ///
-/// It is not weaker, and that is the only question that mattered. Across those
-/// 639 comparisons the two lanes agree byte-for-byte on every fact this
-/// workspace reads out of a transcript: exit status, `States found:` (the input
-/// to [`assert_same_space_explored`]), `Soundness mode: Sound`, `Search
-/// completeness: exhaustive`, the `Deadlock reached` wording
-/// `deadlock_free_and_catches_tiered` matches, the `dead action(s) (never
-/// fired):` set `audit_dead_negative_controls` parses, and `is violated`. ZERO
-/// differences. The one text that does change is the clean-run wording, and it
-/// changes toward correctness: fused prints "No error has been found", BFS
-/// prints "No errors found (exhaustive)" — the string
-/// `examples/trust_models.rs` has always tested for and, under the fused
-/// default, never saw.
+/// **`--force`** — bypass `ty`'s PATH-keyed check cache. A fail-closed flag, not
+/// a speed one: `aterm-spec-models`' `model_check.rs` checks the checked-in
+/// `specs/*.tla` at a stable path, and a repeat run would replay `Cache hit:
+/// PASS` with a `States found:` line every parser here takes for fresh
+/// evidence — a cached verdict for the ISOLATION family standing in for a walk.
+/// Cost: a 7 ms replay becomes a 20 ms re-derivation.
 ///
-/// The completeness argument is structural, not empirical. Every model `.cfg`
-/// this workspace hands `ty` is over a finite bounded machine, and all but one
-/// kind are INVARIANT-only (`Model::to_cfg` emits CONSTANT / SPECIFICATION /
-/// INVARIANT / CHECK_DEADLOCK and nothing else; `Model::to_tla` emits `Spec ==
-/// Init /\ [][Next]_vars` with no fairness conjunct; the 14 hand-written specs
-/// match). An exhaustive BFS of a finite reachable space IS the complete proof
-/// of a safety invariant — there is no obligation left for a symbolic lane to
-/// discharge. And a symbolic-only verdict could not be credited here anyway:
-/// [`assert_same_space_explored`] demands a `States found:` count equal to the
-/// interpreter's walk, which only the BFS lane produces.
+/// The ceiling is deliberately NOT pinned with `--memory-limit`: `ty`'s limit
+/// probe is not purely per-process, so a small explicit ceiling trips on a busy
+/// machine even at 17 MB of own RSS. Shrinking the footprint is the fix.
 ///
-/// The one other kind is a LIVENESS cfg (`Liveness::to_cfg_with`: a `PROPERTY
-/// []<>goal` under a `<name>Spec` that conjoins `WF_vars`/`SF_vars`, checked by
-/// [`liveness_proves_and_catches_tiered`]). The explicit-state lane is complete
-/// for it too: the whole finite state graph is built and the fair-cycle search
-/// runs on it. That was checked rather than assumed, twice: on a `WF_vars`-fair
-/// spec with a violated `<>(done)` both lanes print the identical four-state
-/// counterexample and exit 1; and on `NativeUpdateApplyLadder`'s
-/// `TheLadderLands` (2026-09-27, `ty` 0.13.0) both lanes prove it over the
-/// interpreter's 3080 states and reject each of its four isolated mutants with
-/// the same temporal violation over the same state count.
-///
-/// **`--force`** — bypass `ty`'s local check cache. Load-bearing, and NOT a
-/// speed flag: it is a fail-closed re-derivation flag that closes a hole that
-/// exists today, before this patch. The cache is PATH-keyed (verified: identical
-/// spec bytes in a fresh directory always miss), so the drivers that write a
-/// per-PID temp dir never hit it — but `aterm-spec-models`' `model_check.rs`
-/// checks the CHECKED-IN `specs/*.tla` at a stable repo path, and on a repeat
-/// run `ty` replays `Cache hit: PASS` in 7ms, complete with a
-/// `States found: 512` line that every parser in this file will take for fresh
-/// evidence. That is a cached security verdict for the ISOLATION family
-/// (Sandbox, PathConfine, ForkExec …) standing in for an exhaustive walk. It is
-/// the same shape as the false proof this whole arming exists to prevent, so it
-/// is refused the same way. Measured cost of refusing it: the ISOLATION specs go
-/// from a 7ms replay to a 20ms genuine re-derivation.
-///
-/// This is a SPEED choice, not a trust one, and it is worth being explicit about
-/// which: the native and interpreted engines are two implementations inside the
-/// same checker, not two independent oracles, so picking one buys no confidence
-/// the other would have. The independent check is the interpreter tier in this
-/// crate, and the thing that makes it independent is
-/// [`assert_same_space_explored`] — which holds either way.
-///
-/// The ceiling is deliberately NOT pinned with `--memory-limit`. Pinning it was
-/// tried and made things worse under exactly the load it was meant to fix:
-/// `ty`'s limit probe is not purely per-process, so a small explicit ceiling
-/// trips on a busy machine even when this run's own RSS is 17 MB — the same
-/// false stop, now pinned on. Shrinking the footprint is the fix; the ceiling
-/// was only ever a symptom of it.
-/// PUBLIC because there is more than one `ty` driver in this workspace, and the
-/// only way two drivers cannot disagree about what "armed" means is for there to
-/// be one place that says it.
-///
-/// That is not a style preference; it is the fix for a real escape. The
-/// `spec_xref_closure` gate in `aterm-gui` built its own `ty` command and simply
-/// did not carry these flags, so it ran the whole registry with partial-order
-/// reduction ON while every doc here described reduction as off. On
-/// `RainbowJumpBurstLifecycle` that reduced 128 reachable states to **1**
-/// (`POR: 1/1 states reduced (100.0%)`), which meant four of its six actions
-/// never fired and `--strict-vacuity` reported them dead — a dead set that is an
-/// artifact of the reduction, not a property of the model. Anything reaching for
-/// `ty` on a derived model must arm it through here.
+/// PUBLIC so every `ty` driver in the workspace arms the same way: the
+/// `spec_xref_closure` gate in `aterm-gui` once built its own command without
+/// these flags and ran with reduction ON, reducing `RainbowJumpBurstLifecycle`
+/// to one state and reporting four of its six actions dead. Anything reaching
+/// for `ty` on a derived model must arm it through here.
 // Skip: argument plumbing for a subprocess. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
-    // ONE WORKER (2026-09-30): `ty` defaults to eight on these models, whose
-    // spaces are small; at one it also skips the pilot's second walk. The
-    // parallelism that pays is the test binary's own threads, each running a
-    // `ty` of its own ([`ty_output`] serialises nothing since 2026-10-01). Every
-    // check `derived_ring_ty` and `derived_harness_upgrade_progress` run, 559 of
-    // them replayed one by one at `--workers 1`: 57.1 s -> 40.1 s (the harness
-    // ladder's liveness 2.81 s -> 1.57 s), with the same exit status, `States
-    // found` and violation lines on all 559.
     cmd.arg("--no-auto-por")
         .arg("--no-auto-symmetry")
         .arg("--initial-capacity")
@@ -1918,15 +1778,11 @@ pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
 /// it `Unknown`). `a_stopped_search_is_an_err_never_a_pass` pins the
 /// classifier on a real stopped search.
 ///
-/// **No lock** (removed 2026-10-01). From 2026-09-23 every spawn here took an
-/// in-process mutex and a per-user `flock` on `<temp_dir>/aterm-ty-serial.lock`,
-/// so that no two `ty` runs could shrink each other's budget: about 95-100 s of
-/// serialised `ty` per gate, every test binary queued behind every other. It
-/// never covered the `cargo` and `rustc` that count in the same divisor, and
-/// with the guard it has no correctness role left: an armed check peaks at about
-/// 10 MB, so on 36 GiB the divisor alone needs roughly 2,800 live heavy
-/// processes to stop one, and if it ever does the result is a loud red, never a
-/// false green.
+/// **No lock.** Serialising spawns cost about 95-100 s per gate, never covered
+/// the `cargo` and `rustc` that count in the same divisor, and with the guard
+/// has no correctness role: an armed check peaks at about 10 MB, so on 36 GiB
+/// the divisor alone needs roughly 2,800 live heavy processes to stop one, and
+/// if it ever does the result is a loud red, never a false green.
 ///
 /// PUBLIC because the rule binds every `ty` driver in the workspace, not only
 /// the ones in this file: a driver that calls `Command::output()` itself is
@@ -1981,36 +1837,33 @@ pub(crate) fn ty_child(
 /// Run `ty` with a HOME of its own, whose check cache starts empty, and
 /// nothing taken from this process's `HOME`.
 ///
-/// EVERY `ty` CHILD GETS IT, a capable one too (2026-10-01). A `ty` with
+/// EVERY `ty` CHILD GETS IT, a capable one too. A `ty` with
 /// `check-no-cache-v1` reads and writes no check cache under `--force`, but
 /// its compiled-artifact cache, and whatever else it keeps under HOME, would
 /// still follow a test process's moving `HOME` (below), so the capability
 /// does not make the scratch HOME optional.
 ///
-/// WHY (measured 2026-09-30). `ty` keeps a check cache at `$HOME/.ty/cache.json`,
+/// WHY (measured). `ty` keeps a check cache at `$HOME/.ty/cache.json`,
 /// keyed by spec path, and reads and rewrites the whole file on every run, even
 /// under `--force`. Every spec here is written to a per-process temp dir, so no
 /// entry is ever read back, and the file only grows: 18.7 MB and 12,625 entries
 /// after one day of gates, and a three-state spec took 57.5 ms under it against
 /// 12.6 ms with an empty one — 45 ms per run, paid by every `ty` check on the
-/// box (`derived_ring_ty`'s 552 of them: 48 s against 32 s, then under the lock
-/// [`ty_output`] no longer takes).
+/// box (`derived_ring_ty`'s 552 of them: 48 s against 32 s).
 ///
 /// The compiled-artifact cache lives in that HOME too, named explicitly by
 /// `TY_CACHE_DIR` unless the caller already named one (the child inherits
-/// it). It used to be the process `HOME`'s, read at every spawn, and a test
-/// process moves its `HOME`: aterm-gui's handoff tests point it at a scratch
-/// directory and then remove it, so a `ty` another test thread started
-/// meanwhile put its cache under — and re-created — that scratch (2026-10-01).
-/// Nothing a verdict depends on is in that cache, and starting it cold costs
-/// nothing measurable (measured 2026-10-01 on two specs: 0.04 s and 0.18 s
-/// cold against 0.03 s and 0.21 s warm).
+/// it), never the process `HOME`'s: a test process moves its `HOME`
+/// (aterm-gui's handoff tests point it at a scratch directory and then remove
+/// it), so a `ty` another test thread started meanwhile would re-create that
+/// scratch. Nothing a verdict depends on is in that cache, and starting it cold
+/// costs nothing measurable (0.04 s and 0.18 s cold against 0.03 s and 0.21 s
+/// warm on two specs).
 ///
 /// Concurrent runs share the one HOME and can tear its `cache.json`. That costs
 /// nothing a verdict depends on: `ty` warns on stderr and starts from an empty
 /// cache when the load fails, a failed save only warns, and `--force` means no
-/// entry is ever read back (`ty`'s `cmd_check` load and save paths, read
-/// 2026-10-01).
+/// entry is ever read back (`ty`'s `cmd_check` load and save paths).
 // Skip: environment plumbing for a subprocess. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 fn with_scratch_ty_home(cmd: &mut Command) {
@@ -2034,25 +1887,10 @@ fn scratch_ty_env() -> Vec<(&'static str, std::path::PathBuf)> {
     env
 }
 
-/// The checker binary's AGE, for the evidence transcript.
-///
-/// `ty --version` reports a package version that does not move between builds,
-/// so it cannot tell a checker built today from one built a month ago — and on
-/// 2026-07-30 that distinction was the whole answer: the installed `ty` was four
-/// days older than the fix for the very reduction bug it was exhibiting. The
-/// mtime is the one cheap fact that would have said so on the first read.
-// Skip: filesystem metadata formatting. Verification tooling.
-#[cfg_attr(trust_verify, trust::skip)]
 /// The identity of the checker a transcript came from — path AND build stamp —
 /// so a gate panic names the binary an operator has to act on, not merely its
-/// output.
-///
-/// Diagnosing the 2026-08-06 red gate took four parallel investigations, and a
-/// good part of each was rediscovering, by hand, WHICH `ty` had produced the
-/// transcript in the panic. Every driver printed stdout+stderr and nothing about
-/// the process that wrote them. `--version` does not distinguish these builds
-/// (the broken one says `tla 0.10.0`, the correct one `ty 0.10.0`, both "0.10.0");
-/// the mtime does.
+/// output. `--version` does not distinguish builds of one package version; the
+/// mtime does.
 ///
 /// Safe to prepend to a transcript: [`ty_states_explored`] keys on a
 /// `States found:` line and the dead-action parsers on
@@ -2068,11 +1906,8 @@ pub fn ty_evidence_header(ty: &Path) -> String {
 /// reason [`ty_evidence_header`] exists one function up: a gate panic must name
 /// the binary an operator has to act on.
 ///
-/// The ay lane learned this on 2026-08-31, when `sparkle_v2` went red with
-/// `nova_budget_closed_form got=unknown` on an obligation unchanged since July
-/// and named no binary. FOUR ay builds were installed and discovery bound the
-/// one that disagreed (a stale 0.10.0; 0.5.0, 0.13.0 and 0.22.0 all discharged
-/// it). Unlike `ty`, ay names its OWN build on every solve
+/// Several ay builds can be installed at once, and a stale one can disagree
+/// about an unchanged obligation. Unlike `ty`, ay names its OWN build on every solve
 /// (`c ay.session.start … build.stamp=…`), so the bundle script records that
 /// per verdict — this header is the harness-level companion for the failures
 /// that never reach a solve at all (a missing script, a bundle that produced no
@@ -2084,7 +1919,7 @@ pub fn ay_evidence_header(ay: &Path) -> String {
     format!("ay binary: {} [{}]\n", ay.display(), ty_build_stamp(ay))
 }
 
-/// The build `ty` runs, for an evidence header: the mtime of the LAST file of
+/// The checker binary's AGE, for an evidence header: the mtime of the LAST file of
 /// its exec chain ([`binary_identity`]) — so a wrapper on `PATH` is stamped
 /// with the binary it forwards to, which is then named — or `mtime unknown`.
 // Skip: fs metadata + bounded reads + formatting. Verification tooling.
@@ -2129,16 +1964,15 @@ fn ty_states_explored(evidence: &str) -> Option<u64> {
 ///
 /// The two tiers already had to agree on the VERDICT. That is weaker than it
 /// looks, because "no errors found" is also what a checker says about a space
-/// it never entered — and on 2026-07-30 that is exactly what happened
-/// (`RainbowJumpBurstLifecycle`: interpreter 128 states, `ty` 1, both "clean").
+/// it never entered (`RainbowJumpBurstLifecycle` under reduction: interpreter
+/// 128 states, `ty` 1, both "clean").
 /// A verdict agreement between a real proof and a vacuous one is not evidence;
 /// it is a coincidence that reads like evidence.
 ///
 /// So the tiers must agree on the WORK as well as the answer. Both walk the
 /// whole reachable space of the same finite machine, and `to_cfg` emits no
 /// VIEW and no SYMMETRY, so with reduction off (see `ty_check_derived`) their
-/// state counts are not merely close — they are EQUAL, verified across all 114
-/// scalar models in `xref::model_registry()` at the time this landed.
+/// state counts are not merely close — they are EQUAL.
 ///
 /// Applies only to a clean verdict: a `Buggy = 1` run is SUPPOSED to stop at
 /// the first counterexample, so its count is legitimately smaller and is not
@@ -2247,9 +2081,7 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
 pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
     // `prove_and_catch` proves the `Buggy = 0` arm and catches the `Buggy = 1`
     // one, and hands back the state count of the committed arm it just proved —
-    // the `ty` tier's yardstick (see `assert_same_space_explored`). This used to
-    // be a second, identical `bmc` of the same arm; the walk is deterministic,
-    // so the count it produced was always this one.
+    // the `ty` tier's yardstick (see `assert_same_space_explored`).
     let interp_states = if m.fn_vars.is_empty() {
         Some(interp::prove_and_catch(m))
     } else {
@@ -2546,39 +2378,6 @@ fn assert_scalar(m: &Model, label: &str, caller: &str) {
     );
 }
 
-/// The machine-verified NEGATIVE-CONTROL criterion for `--strict-vacuity`'s
-/// dead-action class (the audited-exception mechanism of the `spec_xref_closure`
-/// gate, upgraded from a hand-maintained model-name list to a proof):
-///
-/// A derived model may carry actions that are DEAD at its committed config ONLY
-/// when every one of them is a genuine prove-and-catch mutant, which this fn
-/// verifies with the in-process interpreter:
-///
-/// 1. the model is scalar (the interpreter can actually verify it — a
-///    function-valued model gets NO dead-action relaxation, fail-closed);
-/// 2. the model declares the `Buggy` dial, committed to 0 (a dead action in a
-///    dial-less model has no catch config — it is a REAL vacuity);
-/// 3. `ty_reported_dead` agrees EXACTLY with the interpreter's own dead set at
-///    the committed config (tier agreement in BOTH directions: a `ty` verdict
-///    the interpreter contradicts fails, and — because the caller derives
-///    nothing from `ty`'s output alone — a parse/format drift that under-reports
-///    `ty`'s dead set also fails rather than silently passing);
-/// 4. the `Buggy = 1` baseline with ALL committed-dead actions removed still
-///    satisfies every invariant (otherwise an unrelated Buggy branch could
-///    supply the counterexample and make harmless dead actions look caught);
-/// 5. each dead action, added back ALONE to that safe baseline, FIRES somewhere
-///    in its reachable space (the mutant is independently exercisable — an
-///    action dead at BOTH configs is a REAL vacuity, e.g. a typo'd guard);
-/// 6. each isolated dead action makes that baseline violate an invariant (every
-///    negative control is independently caught, rather than sharing one global
-///    counterexample supplied by a different mutant).
-///
-/// Returns `Ok(n)` — the number of machine-verified negative controls (0 for a
-/// strictly non-vacuous model) — or `Err(reason)`; the caller's gate must stay
-/// RED on `Err`. Anything this fn cannot verify is a failure, never a waiver.
-// Skip: verification-harness driver over the interpreter tier (BTreeSet ops +
-// deliberate audit-failure strings). Not shipping runtime code.
-#[cfg_attr(trust_verify, trust::skip)]
 /// Refuse a `ty` dead set that was measured on a SMALLER space than the
 /// interpreter walked — the companion guard to [`arm_whole_space_check`], for
 /// any driver that reads a dead set out of a `ty` transcript.
@@ -2586,9 +2385,9 @@ fn assert_scalar(m: &Model, label: &str, caller: &str) {
 /// Arming and checking are two different obligations and only one of them
 /// survives a flag being dropped. `aterm-gui`'s gate hand-rolled its flags,
 /// omitted `--no-auto-por`, and got a dead set off a 1-state reduction of a
-/// 128-state model; nothing downstream could tell, because a dead set carries no
-/// record of the space it was measured on. It does now: pass the transcript here
-/// and a reduced run is a hard failure instead of four phantom dead actions.
+/// 128-state model; a dead set carries no record of the space it was measured
+/// on. Pass the transcript here and a reduced run is a hard failure instead of
+/// phantom dead actions.
 ///
 /// Deliberately separate from [`audit_dead_negative_controls`] rather than folded
 /// into its signature: the audit has a dozen call sites that pass a dead set from
@@ -2622,6 +2421,36 @@ pub fn assert_ty_saw_whole_space(m: &Model, evidence: &str, label: &str) {
     assert_same_space_explored(m, interp_states, evidence, label);
 }
 
+/// The machine-verified NEGATIVE-CONTROL criterion for `--strict-vacuity`'s
+/// dead-action class (the audited-exception mechanism of the `spec_xref_closure`
+/// gate, upgraded from a hand-maintained model-name list to a proof):
+///
+/// A derived model may carry actions that are DEAD at its committed config ONLY
+/// when every one of them is a genuine prove-and-catch mutant, which this fn
+/// verifies with the in-process interpreter:
+///
+/// 1. the model is scalar (the interpreter can actually verify it — a
+///    function-valued model gets NO dead-action relaxation, fail-closed);
+/// 2. the model declares the `Buggy` dial, committed to 0 (a dead action in a
+///    dial-less model has no catch config — it is a REAL vacuity);
+/// 3. `ty_reported_dead` agrees EXACTLY with the interpreter's own dead set at
+///    the committed config (tier agreement in BOTH directions: a `ty` verdict
+///    the interpreter contradicts fails, and — because the caller derives
+///    nothing from `ty`'s output alone — a parse/format drift that under-reports
+///    `ty`'s dead set also fails rather than silently passing);
+/// 4. the `Buggy = 1` baseline with ALL committed-dead actions removed still
+///    satisfies every invariant (otherwise an unrelated Buggy branch could
+///    supply the counterexample and make harmless dead actions look caught);
+/// 5. each dead action, added back ALONE to that safe baseline, FIRES somewhere
+///    in its reachable space (the mutant is independently exercisable — an
+///    action dead at BOTH configs is a REAL vacuity, e.g. a typo'd guard);
+/// 6. each isolated dead action makes that baseline violate an invariant (every
+///    negative control is independently caught, rather than sharing one global
+///    counterexample supplied by a different mutant).
+///
+/// Returns `Ok(n)` — the number of machine-verified negative controls (0 for a
+/// strictly non-vacuous model) — or `Err(reason)`; the caller's gate must stay
+/// RED on `Err`. Anything this fn cannot verify is a failure, never a waiver.
 pub fn audit_dead_negative_controls(m: &Model, ty_reported_dead: &[&str]) -> Result<usize, String> {
     if !m.fn_vars.is_empty() {
         return Err(format!(
@@ -3199,7 +3028,7 @@ pub fn validate_transition_tiered(
 /// process of each `ty` binary. `ty` is deterministic, so one checker given the
 /// same spec, cfg and trace always gives the same answer — and an exhaustive
 /// Tier-1 walk that replays each path from its start hands it the same
-/// transition over and over. Measured 2026-09-29 on aterm-agent's
+/// transition over and over. Measured on aterm-agent's
 /// conformance_footer_model: 466 s with `ty` installed, 50 s without, the
 /// difference a serialised `ty` process per transition. Every distinct
 /// transition is still validated by `ty`; the caller still asserts the two
@@ -3222,9 +3051,9 @@ fn ty_trace_verdict(
         cfg_text,
         trace_text,
         |checker, spec, cfg, trace| {
-            // A10 (2026-10-01): a `ty` advertising `trace-cases-v1` answers from one
-            // co-process per (checker, spec, cfg); anything that co-process fails to
-            // answer is answered here by one process for this case, exactly as before.
+            // A10: a `ty` advertising `trace-cases-v1` answers from one co-process
+            // per (checker, spec, cfg); anything that co-process fails to answer is
+            // answered here by one process for this case.
             checker
                 .and_then(|checker| cases_verdict(checker, model, spec, cfg, trace, label))
                 .unwrap_or_else(|| ty_trace_per_process(ty, model, spec, cfg, trace, label))
@@ -3236,24 +3065,21 @@ fn ty_trace_verdict(
 /// of what running it executes — the file itself and, through a wrapper script
 /// whose exec target reads statically, the binary at the end of that chain. So
 /// a PATH wrapper whose target alone was rebuilt or replaced is another
-/// checker, as a binary rewritten in place is. (Until 2026-10-02 the identity
-/// was the named file's alone, and such a wrapper kept its old verdicts and
-/// its old `--cases` co-process.)
+/// checker, as a binary rewritten in place is.
 type TyChecker = (PathBuf, BinaryIdentity);
 
 /// [`ty_trace_verdict`]'s memo: a verdict is replayed only for the same
 /// rendered bytes (never the model name, so a `Buggy` twin or a re-bounded copy
 /// that shares a name cannot borrow one) asked of THE SAME CHECKER — the path
-/// `ty` and the identity of what it runs ([`TyChecker`]). `run` answers anything else; it is handed the
-/// checker (`None` when `ty` cannot be stat'ed) so the co-process pool keys on
-/// the same one.
+/// `ty` and the identity of what it runs ([`TyChecker`]). `run` answers
+/// anything else; it is handed the checker (`None` when `ty` cannot be stat'ed)
+/// so the co-process pool keys on the same one.
 ///
-/// WHY the checker (review of 2026-09-29, reproduced on main 2026-10-01): an
-/// `aterm pkg` update, link or yank moves [`find_ty`] to another path, and a
-/// `ty` rebuilt or reinstalled in place keeps its path but not its identity. A
-/// key without the checker replayed one build's verdict for a step that should
-/// have been asked of the next: a shim repointed at a REJECTING build was never
-/// asked, so the TIER DISAGREEMENT it should have raised never fired. A binary
+/// WHY the checker: an `aterm pkg` update, link or yank moves [`find_ty`] to
+/// another path, and a `ty` rebuilt or reinstalled in place keeps its path but
+/// not its identity. A key without the checker would replay one build's verdict
+/// for a step that should be asked of the next, so a shim repointed at a
+/// REJECTING build would never raise its TIER DISAGREEMENT. A binary
 /// that cannot be stat'ed, or whose identity moved while `run` ran, is answered
 /// but never memoized: which build gave that answer is not known.
 // Skip: a Mutex-guarded map plus fs metadata (absent std bodies). Verification tooling.
@@ -3357,7 +3183,7 @@ type CasesSlot = std::sync::Arc<Mutex<Option<CasesChild>>>;
 /// The `--cases` co-process's verdict on one two-step trace, or `None` — and
 /// the caller answers this case with one `ty` process of its own.
 ///
-/// WHY (2026-10-01, A10 of docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md):
+/// WHY (A10 of docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md):
 /// one `ty trace validate` process costs ~6 ms of spawn and setup for
 /// microseconds of work, and the footer suite asks for 8,064 of them.
 /// `ty trace validate --spec S --config C --cases -` loads the spec and cfg
@@ -3452,7 +3278,7 @@ fn cases_verdict(
                 *held = None;
             }
             drop(held);
-            // A12 (2026-10-01): `class: "error"` says the question could not be
+            // A12: `class: "error"` says the question could not be
             // answered as asked (an evaluation failed, a label names no
             // action) — not that `Next` refutes the step. Read as a refusal it
             // would agree with an interpreter that refuses and pass. Enabled
@@ -3727,10 +3553,7 @@ impl Drop for CasesChild {
 /// # Panics
 ///
 /// If `prev` or `next` lacks a model variable. A projection that misses one is
-/// a harness bug, and no value invented for it here is a fact about the code:
-/// this used to write 0, and the mismatch surfaced only by accident — when the
-/// cfg's pinned `Init` (gone 2026-10-01) defaulted the same variable to a
-/// declared initial value other than 0.
+/// a harness bug, and no value invented for it here is a fact about the code.
 // Skip: the field-render chain drives closure bodies + `Extend`/format
 // (absent std bodies). Spec-harness trace emission, not runtime code.
 #[cfg_attr(trust_verify, trust::skip)]

@@ -4641,8 +4641,15 @@ impl LiveShell {
     /// and the exit it must take each end the wait the moment they happen.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// The shell holds its three pipes and nothing else of this process
+    /// (`inherit_nothing`; the callers' `Command`s are std's, built with the
+    /// hermetic [`ShellCommand`]): a std child under the pinned seal keeps any
+    /// descriptor another test thread had open unflagged at the spawn, and a
+    /// live shell would hold that pipe for as long as its test runs.
     fn spawn(label: &str, cmd: &mut Command) -> Self {
-        cmd.stdin(std::process::Stdio::piped())
+        use aterm_uds::spawnfd::InheritNothing as _;
+        cmd.inherit_nothing()
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = cmd

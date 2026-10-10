@@ -6,8 +6,7 @@
 //! `ATERM_RASTERIZER=fontdue` for the whole process (byte-exact GPU == CPU
 //! additive compositing is defined on the deterministic rasterizer), and a
 //! renderer any `gpu_suite` file built after that write would silently change
-//! rasterizer. `empty_channels_gpu` builds pairs through both constructors and
-//! already did so in one process of its own.
+//! rasterizer. `empty_channels_gpu` builds pairs through both constructors.
 //!
 //! `autotests = false`: see `gpu_suite.rs`. Run one file's tests with
 //! `targo --unverified test -p aterm-gpu --test gpu_fontdue -- <file>::`.

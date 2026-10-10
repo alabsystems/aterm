@@ -14,6 +14,7 @@ fn key(character: char) -> InputEvent {
         key: Key::Character(character),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -23,6 +24,7 @@ fn named(named: NamedKey) -> InputEvent {
         key: Key::Named(named),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -296,6 +298,7 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
                 key: Key::Named(aterm_types::keyboard::NamedKey::ArrowLeft),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             Source::Human,
@@ -923,6 +926,7 @@ fn queued_one_shot_licence_cases(stall: Duration, only: Option<(&str, &str, bool
         key,
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let cases: [(&str, InputEvent, DeliveredClass, bool); 6] = [
@@ -1183,6 +1187,7 @@ fn a_queued_key_release_publishes_no_receipt() {
         key,
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Release,
     };
     let pin = super::paste_order::pin_ordering_for_test(&sink);
@@ -1503,6 +1508,7 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
         key,
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     for (label, edit, secret) in cases {

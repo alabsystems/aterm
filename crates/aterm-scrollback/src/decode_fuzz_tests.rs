@@ -65,7 +65,8 @@ impl Lcg {
 /// LZ4 block decoder: fully attacker-controlled 4-byte size prefix +
 /// arbitrary "compressed" body. Exercises the size-prefix bounds check, the
 /// compression-bomb ratio gate, the back-reference offset validation, and the
-/// final size-mismatch check. Must always return Ok/Err, never panic.
+/// final size-mismatch check. Must always return Ok/Err, never panic, and an
+/// Ok is exactly the length the prefix claims.
 #[test]
 fn fuzz_lz4_decompress_never_panics() {
     let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15);
@@ -92,7 +93,10 @@ fn fuzz_lz4_decompress_never_panics() {
             }
         }
 
-        let _ = std::hint::black_box(lz4::decompress_size_prepended(&input));
+        if let Ok(out) = lz4::decompress_size_prepended(&input) {
+            let claim = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+            assert_eq!(out.len(), claim as usize, "{input:02x?}");
+        }
     }
 
     // A handful of explicit edge inputs the random stream rarely lands on.
@@ -104,7 +108,13 @@ fn fuzz_lz4_decompress_never_panics() {
         &[0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF], // garbage body
         &[0x01, 0x00, 0x00, 0x00], // claims 1 byte, no body
     ] {
-        let _ = std::hint::black_box(lz4::decompress_size_prepended(case));
+        let result = lz4::decompress_size_prepended(case);
+        if case.len() < 4 {
+            assert_eq!(result, Err(lz4::Lz4Error::InputTooShort), "{case:02x?}");
+        } else if let Ok(out) = result {
+            let claim = u32::from_le_bytes([case[0], case[1], case[2], case[3]]);
+            assert_eq!(out.len(), claim as usize, "{case:02x?}");
+        }
     }
 }
 

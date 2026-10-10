@@ -17,8 +17,7 @@
 //! two-step `ty trace validate` (does the model's `Next` admit a real
 //! `prev -> next` transition?).
 //!
-//! Promoted from `tests/introspection_bmc.rs` (owner decision 2026-07-06,
-//! VERIFY-1): the interpreter tier is now the DEFAULT discharge path for every
+//! The interpreter tier (VERIFY-1) is the DEFAULT discharge path for every
 //! derived-model obligation — a fresh clone verifies for real, with zero
 //! toolchain — and the external `ty` binary is the ESCALATION tier layered on
 //! top wherever it is installed (see [`crate::verify`]'s tiered helpers). The
@@ -44,8 +43,8 @@ pub type State = BTreeMap<&'static str, i64>;
 /// (sorted-name) order. Every state of one model binds the same variables —
 /// `init_state` binds them all and a successor only rewrites some — so the
 /// names add nothing to the identity; keyed with them, every set probe also
-/// string-compared each name (the interpreter's hottest cost, 2026-09-29:
-/// `memcmp` led a profile of `derived_harness_model_switch`'s interpreter run).
+/// string-compared each name (the interpreter's hottest cost: `memcmp` led a
+/// profile of `derived_harness_model_switch`'s interpreter run).
 fn state_key(s: &State) -> Vec<i64> {
     s.values().copied().collect()
 }
@@ -1108,9 +1107,9 @@ fn fair_indices(m: &Model, names: &[&str], kind: &str) -> Vec<usize> {
 /// with no way out. A LIVELOCK is neither: every state on it is legal and has
 /// successors — the terminal keeps producing output, the lane keeps retrying —
 /// and it simply never lands. A model whose environment can always act has no
-/// deadlock at all, so a livelock passes every check this module had. The
-/// 2026-09-23 update audit found exactly that shape in the shipped lane: a
-/// capture refusal re-filed as activity and retried every fifteen minutes,
+/// deadlock at all, so a livelock passes [`bmc`] and [`find_deadlock`]. The
+/// shipped update lane once had exactly that shape: a capture refusal re-filed
+/// as activity and retried every fifteen minutes,
 /// forever, while every model check stayed green.
 ///
 /// THE ALGORITHM. Explore the whole reachable graph (stutter steps dropped),

@@ -9,7 +9,7 @@
 //! more wait untaken, past that once the full queue has rested or on the
 //! owner's `--now`; and a give-up rests and re-arms (`upgrade::RETRY_S`). The
 //! Tier-1 bind of `harness_upgrade_limit_queue_model` (aterm-spec) closes the
-//! file (owner, 2026-09-27).
+//! file.
 
 use super::*;
 
@@ -447,8 +447,7 @@ fn a_session_whose_last_word_is_the_limit_is_not_asked_until_its_reset() {
 /// each waiting `limited` with nothing typed: a minute short of the grace; a
 /// limit row naming no reset (an API rate limit, its `REASK_S` long run out),
 /// where no reset is guessed; and the ask flow past the grace, where typing
-/// over a standing notice stays `HarnessUpgradeLimitQueue`'s decision
-/// (owner, 2026-09-29).
+/// over a standing notice stays `HarnessUpgradeLimitQueue`'s decision.
 #[cfg(unix)]
 #[test]
 fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
@@ -706,11 +705,10 @@ fn copies_rows(now: u64, marker: &str, copies: u64, last_ago: u64, went_on: Opti
 /// A notice a limit answered is typed again straight away at most
 /// [`upgrade::REQUEUE_MAX`] times before the model takes one (a limit row
 /// naming no reset is over by the transcript's word every [`REASK_S`] however
-/// long it stands, so re-typing alone would pile a copy up every half hour)
-/// (owner, 2026-09-27).
-/// With `1 + REQUEUE_MAX` copies in the conversation the queue is full, and the
-/// visit waits `queued`, nothing typed, its window held, for the model to write
-/// a row or for the queue's rest
+/// long it stands, so re-typing alone would pile a copy up every half hour).
+/// With `1 + REQUEUE_MAX` copies in the conversation the queue is full, and
+/// the visit waits `queued`, nothing typed, its window held, for the model to
+/// write a row or for the queue's rest
 /// ([`a_full_queue_rests_and_the_owners_word_types_one_more`]). When the
 /// session goes on, every copy is taken at once and the window opens at the
 /// model's row. Negative controls: one copy, and `REQUEUE_MAX`, are typed again
@@ -1840,7 +1838,7 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
 /// none goes before its rest has run. Negative controls: the owner's `Upgrade
 /// now` mid-rest types one more at once; once the model takes the copies, the
 /// next limit's full queue rests two hours again (the rest grows with unread
-/// copies only) (owner, 2026-09-27).
+/// copies only).
 #[test]
 fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
     let marker = ask_marker(1);

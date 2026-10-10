@@ -926,7 +926,7 @@ pub fn read_image_seq_model() -> Model {
 /// invariants over the whole bounded space; at `Buggy = 1` a drop closes the fd while
 /// clones remain and a subsequent `UseFd` latches the use-after-close, making both
 /// invariants reachable-false — `ty` finds the COUNTEREXAMPLE. So the derived model
-/// hosts BOTH halves; the hand `.tla` is no longer a second registered source.
+/// hosts BOTH halves.
 ///
 /// Invariants, both proven over the whole bounded space (`MaxClones = 3`, `Buggy=0`):
 ///   1. `NoUseAfterClose: ~usedAfterClose` — no holder ever uses the raw fd after it
@@ -2180,7 +2180,7 @@ pub fn session_id_claim_model() -> Model {
 
 /// WHO ANSWERS AN ADOPTED `@<sid>` WHILE A SEAMLESS UPDATE DECIDES (aterm-gui
 /// `control::publish_when_committed`, and `control::ambiguous_sid_refusal` over
-/// `identity_claim::live_holder`; the 2026-09-28 update 0.95 → 0.97).
+/// `identity_claim::live_holder`).
 ///
 /// `graph/<sid>` is the address every `@<sid>` client resolves. The dispatch
 /// refuses an id this process hosts when that entry names ANOTHER live process:
@@ -2194,7 +2194,7 @@ pub fn session_id_claim_model() -> Model {
 /// restart, and on rejected attempts a restart budget spent). Two layers close it,
 /// and the model carries both:
 ///
-/// * THE ORDER (round seven of the update audit): a successor publishes the
+/// * THE ORDER: a successor publishes the
 ///   carried entries only once the Commit has released its gate. While this
 ///   process owns a session, its address names no other process it could be
 ///   handed to — `CandidateNamedOnlyAfterCommit`.

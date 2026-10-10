@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D27 ADVERSARIAL REFUTATION (2026-10-07): attacks on the claim "a candidate
+//! D27 ADVERSARIAL REFUTATION: attacks on the claim "a candidate
 //! that loses any proved obligation, other than an audited retraction
 //! applicable to that candidate, is never admitted".
 //!
@@ -19,8 +19,8 @@
 //! repository read with replace refs and grafts ignored and a cut history refused,
 //! a fix held only while the candidate keeps its reproducer and no revert of it,
 //! the seal's commit required, and a count never standing for obligations.
-//! Section 7 (review 31, 2026-10-07) are attacks that got a candidate admitted
-//! on 08f84c266, through an aterm repository the ledger is committed in: a row
+//! Section 7 are attacks that got a candidate admitted on 08f84c266, through
+//! an aterm repository the ledger is committed in: a row
 //! applies only in the aterm tree it was audited in (but for the ledger itself)
 //! and at the site it was audited at (ledger v3).
 
@@ -1516,7 +1516,7 @@ fn holds_a_truncated_record_report_or_log_is_never_a_pass() {
 }
 
 // ===========================================================================
-// 7. THE TREE A ROW WAS AUDITED IN (review 31, 2026-10-07)
+// 7. THE TREE A ROW WAS AUDITED IN
 // ===========================================================================
 
 /// A trust repository: the seal S, the fix F (its reproducer), the candidate C.

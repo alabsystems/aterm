@@ -30,7 +30,7 @@
 //     `HeapAlloc`/`VirtualAlloc`/`malloc` from a C or C++ library (the D3D12
 //     runtime, the AMD driver, DirectWrite), thread stacks, loaded module images,
 //     and any file mapping. That is the whole GPU stack and most of the OS's own
-//     footprint. It is exactly the boundary this task wants: "application heap".
+//     footprint. What remains is the application heap.
 //   * the difference between live bytes and working set. Both are reported so the
 //     allocator's own retained-but-free arena is visible as the gap (the Linux
 //     note's §14 finding was that gap, not the live bytes).

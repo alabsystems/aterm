@@ -20,8 +20,8 @@ pub fn repo_root() -> PathBuf {
 ///
 /// This corpus IS the specification for the purposes of these tests: real
 /// manifests, real vendored manifests, real art assets, the real config files.
-/// `target/`, the root's `target-*` lane dirs and `.aterm-verify/` are skipped
-/// as build output and gate state, `.git/` because it is not source.
+/// [`corpus_skips`] names what is skipped: build output, gate state, `.git/`
+/// and recorded wire captures.
 pub fn corpus() -> Vec<PathBuf> {
     let out = corpus_under(&repo_root());
     assert!(

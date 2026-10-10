@@ -3450,6 +3450,8 @@ fn reopened_with_agent(
         session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
         cwd: "/b".into(),
         version: None,
+        home: None,
+        login: None,
         codex: None,
     };
     reopened
@@ -5167,10 +5169,9 @@ fn every_title_is_short_plain_and_states_what_happened() {
         )
         .expect("a record"),
     ]);
-    all.extend(tw::machine_settings(&format!(
-        "spotlight-noindex 73 dir(s) migrated; {}",
-        atpkg::machine::UNIVERSAL_CONTROL_ENTRY
-    )));
+    all.extend(tw::machine_settings(
+        atpkg::machine::UNIVERSAL_CONTROL_ENTRY,
+    ));
     for verb in [
         PackagesVerb::Check,
         PackagesVerb::Install,
@@ -5459,7 +5460,7 @@ fn every_lane_message() -> Vec<Message> {
         aterm_messages::waits::paste_row(3, 1, 1_100_000, 4_200_000, Duration::ZERO),
         aterm_messages::waits::rewrap_row(3, 1_200_000, 3_400_000, Duration::ZERO),
     ]);
-    all.extend(tw::machine_settings("spotlight-noindex 73 dir(s) migrated"));
+    all.extend(tw::machine_settings("universal-control disabled"));
     for verb in [
         PackagesVerb::Check,
         PackagesVerb::Install,

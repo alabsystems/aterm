@@ -11,6 +11,7 @@ mod event;
 mod event_handler;
 mod event_loop;
 mod ffi;
+mod headless;
 mod menu;
 mod monitor;
 mod observer;

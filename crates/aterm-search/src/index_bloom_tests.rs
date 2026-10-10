@@ -27,10 +27,11 @@ fn repeated_output_and_unchanged_refreshes_do_not_grow_the_filter() {
     assert_eq!(index.bloom.item_count(), inserted);
     assert_eq!(index.bloom.num_bits(), bits);
     assert!(bits <= 10_048, "row capacity cannot size the dictionary");
-    let previous_insert_calls = (text.len() - 2 + lower_fold(&text).len() - 2) * (2048 + 100 * 48);
+    let occurrence_insert_calls =
+        (text.len() - 2 + lower_fold(&text).len() - 2) * (2048 + 100 * 48);
     eprintln!(
-        "repeated_bloom: dictionary inserts={inserted}, previous occurrence inserts \
-         (excluding rebuilds)={previous_insert_calls}, filter bytes={}",
+        "repeated_bloom: dictionary inserts={inserted}, per-occurrence inserts \
+         (excluding rebuilds)={occurrence_insert_calls}, filter bytes={}",
         bits / 8
     );
     assert_eq!(index.search("agent_worker").count(), 2048);

@@ -234,7 +234,7 @@ impl ExtendedStyle {
 
     /// Convert CellFlags to StyleAttrs.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn cell_flags_to_style_attrs(flags: CellFlags) -> StyleAttrs {
         let mut attrs = StyleAttrs::empty();
         for &(cf, sa) in &Self::FLAG_ATTR_MAP {
@@ -300,11 +300,11 @@ aterm_types::bitflags! {
 // StyleTable struct and impl extracted to style_table.rs.
 #[path = "style_table.rs"]
 mod style_table;
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub use style_table::ExtendedStyleInfo;
 pub use style_table::StyleTable;
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 #[path = "style_test_helpers.rs"]
 mod style_test_helpers;
 #[cfg(test)]

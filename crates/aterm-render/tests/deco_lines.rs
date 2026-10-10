@@ -12,7 +12,7 @@
 //!   `DecoPhase` derived model (`aterm_spec::derive::deco_phase_model`)
 //!   carries the `PhasePure` invariant: the pattern phase counter equals a
 //!   ghost counter driven ONLY by absolute x, across arbitrarily placed cell
-//!   seams. `cargo test -p aterm-spec`
+//!   seams. `targo --unverified test -p aterm-spec`
 //!   (`derived_deco_phase_proves_and_catches_seam_reset`) runs the REAL `ty`
 //!   binary: it PROVES the invariant at `Buggy=0` and CATCHES the historical
 //!   per-cell phase restart at `Buggy=1` (counterexample required).
@@ -283,8 +283,8 @@ fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
 /// For EVERY style, every lattice geometry, and every cell partition of a run,
 /// per-cell emission covers the IDENTICAL pixel set as whole-run emission —
 /// the pattern's value at a pixel is a pure function of absolute x, so a cell
-/// seam cannot reset it. (The historical code restarted dash/dot/wave phase at
-/// every cell.)
+/// seam cannot reset it (the bug caught: restarting dash/dot/wave phase at
+/// every cell).
 #[test]
 fn pattern_rects_are_partition_invariant() {
     let styles = [

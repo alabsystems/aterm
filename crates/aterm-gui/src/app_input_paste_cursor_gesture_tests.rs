@@ -290,6 +290,7 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                         key: Key::Character('a'),
                         mods: Modifiers::empty(),
                         base_layout: None,
+                        layout_text: None,
                         event_type: KeyEventType::Press,
                     },
                     Source::Human
@@ -348,6 +349,7 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                         key: Key::Named(aterm_types::keyboard::NamedKey::Enter),
                         mods: Modifiers::empty(),
                         base_layout: None,
+                        layout_text: None,
                         event_type: KeyEventType::Press,
                     },
                     Source::Human
@@ -570,6 +572,7 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
                         key: Key::Character('k'),
                         mods: Modifiers::empty(),
                         base_layout: None,
+                        layout_text: None,
                         event_type: KeyEventType::Press,
                     },
                     Source::Human,
@@ -676,6 +679,7 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
                     key: Key::Character('k'),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human,

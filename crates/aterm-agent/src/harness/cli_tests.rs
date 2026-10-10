@@ -275,7 +275,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "usage --utc-offset 3600",
         "usage --state",
         "upgrade abc",
-        // The loop is gone: the window's host takes the steps, on a push.
+        // No loop: the window's host takes the steps, on a push.
         "upgrade --every 60",
         // accounts: an unknown form, a missing or extra operand.
         "accounts frob",
@@ -358,8 +358,7 @@ fn the_deleted_verbs_are_refused_by_name_and_point_at_the_engine() {
         assert!(parse(&words(kept)).is_ok(), "{kept}");
         assert!(!DELETED.contains(&kept));
     }
-    // `accounts` came back (2026-10-01); the verbs that would act on a
-    // session by hand did not.
+    // The verbs that would act on a session by hand stay refused.
     for gone in ["switch", "status"] {
         assert!(DELETED.contains(&gone), "{gone} is refused by name");
     }
@@ -1006,7 +1005,7 @@ fn scripted(stdout: String, code: i32, stderr: &str) -> Scripted {
     }
 }
 
-/// Claude Code's critical-memory banner (2026-09-24) is the engine's own
+/// Claude Code's critical-memory banner is the engine's own
 /// wall, `wall=memory`, and no limit: a restart ends it, not a wait, so it
 /// has no reset. Its words say `usage` and `continue`, and neither the wall
 /// table (it places the banner by position, never by phrase) nor the painted
@@ -2881,7 +2880,7 @@ fn live_holder(
     session: &str,
     tab: &str,
     version: &str,
-) -> std::process::Child {
+) -> aterm_uds::spawnfd::Child {
     live_holder_in(home, session, Some(tab), version)
 }
 
@@ -2893,8 +2892,8 @@ fn live_holder_in(
     session: &str,
     tab: Option<&str>,
     version: &str,
-) -> std::process::Child {
-    let mut park = std::process::Command::new(std::env::current_exe().expect("exe"));
+) -> aterm_uds::spawnfd::Child {
+    let mut park = aterm_uds::spawnfd::command(std::env::current_exe().expect("exe"));
     park.args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
         .env("UPGRADE_DRIVE_TEST_PARK", "1");
     match tab {
@@ -2902,9 +2901,9 @@ fn live_holder_in(
         None => park.env_remove("ATERM_PARENT_SESSION_ID"),
     };
     let mut child = park
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .spawn()
         .expect("the stand-in agent");
     let pid = child.id();
@@ -2918,7 +2917,7 @@ fn live_holder_in(
     });
     // The kernel's start time as Claude renders `procStart`: `ps` in the C
     // locale and UTC, whitespace squashed.
-    let start = std::process::Command::new("ps")
+    let start = aterm_uds::spawnfd::command("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
@@ -3009,8 +3008,7 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
             command: "𝔷".repeat(HELD_COMMAND_CHARS * 2),
         })
         .collect();
-    // Both flows' words (round eight, #4: the quiet flow's give-up says
-    // what comes next in its own, longer words).
+    // Both flows' words; the quiet flow's give-up is the longer.
     for quiet in [false, true] {
         let lead = super::super::upgrade_drive::gave_up_words(
             super::super::upgrade::Agent::Claude,
@@ -3135,7 +3133,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
 /// enabled` or `upgrade` off no window watches anything, and stderr names the
 /// switch as the reason. Negative controls: both switches on, nothing else is
 /// said; within the wake grace the record shows its last look; with no
-/// `unwatched` row no switch is named (owner, 2026-09-29).
+/// `unwatched` row no switch is named.
 #[cfg(unix)]
 #[test]
 fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
@@ -3894,9 +3892,9 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     }
 }
 
-/// A ROW JUST ADDED IS LISTED, NOT SIGNED IN (the live check of 2026-10-02:
-/// `accounts add` makes the login directory, the report read the row
-/// `unseen` and named it `next:` with no login behind it). With its
+/// A ROW JUST ADDED IS LISTED, NOT SIGNED IN (the regression: `accounts add`
+/// makes the login directory, and the report read the row `unseen` and named
+/// it `next:` with no login behind it). With its
 /// directory empty the row is `not-enrolled` in the report and its JSON, is
 /// never `next:`, and its reason names the line that signs it in; `accounts
 /// check` runs nothing for it; `accounts use` refuses it with that same

@@ -44,10 +44,8 @@
 //! `None`, the receipt carries no `build-config` line, and such a receipt
 //! serves no run as a base ([`crate::differential::tools_differ`]) — the same
 //! fail-closed shape as a receipt without `build-env`. The digest is git's
-//! blob id (`git hash-object --no-filters`), because it is the one id the
-//! release cutter can compute for the committed file without reading the
-//! disk: its MEASURE check requires the line to be exactly the tree's own
-//! config (`aterm-release`'s `gates::measure_report`).
+//! blob id (`git hash-object --no-filters`): the id git gives the file's bytes,
+//! so a committed config reads the same in every checkout of its commit.
 //!
 //! NO CALLER `--config`. The gate's children take no `--config` from the
 //! caller; the one it passes itself (the recording runner,

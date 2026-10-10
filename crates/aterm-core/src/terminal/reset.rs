@@ -55,6 +55,29 @@ impl ResetGroups<'_> {
     }
 }
 
+/// The modes a full reset leaves: power-on, except the HOST's policy. No escape
+/// sequence sets these, so none may clear them: a program's reset must not lift
+/// a fail-closed authorization (`allow_*`, the shell-integration nonce
+/// requirement), re-enable an input capability the host declared absent (kitty)
+/// or claim one it never declared (win32-input), or flip host display state it
+/// cannot set back (CJK ambiguous width, the OS appearance). The one list for
+/// both reset paths, which had drifted when each kept its own.
+fn reset_modes(prev: &TerminalModes) -> TerminalModes {
+    TerminalModes {
+        allow_osc52_query: prev.allow_osc52_query,
+        allow_osc52_set: prev.allow_osc52_set,
+        allow_window_ops: prev.allow_window_ops,
+        allow_notifications: prev.allow_notifications,
+        allow_palette_reconfigure: prev.allow_palette_reconfigure,
+        require_shell_integration_nonce: prev.require_shell_integration_nonce,
+        kitty_keyboard_enabled: prev.kitty_keyboard_enabled,
+        win32_input_enabled: prev.win32_input_enabled,
+        ambiguous_width_double: prev.ambiguous_width_double,
+        color_scheme: prev.color_scheme,
+        ..TerminalModes::new()
+    }
+}
+
 /// Reset shared terminal state.
 ///
 /// Core fields are passed individually for split borrows; grouped
@@ -79,7 +102,7 @@ pub(super) fn reset_common_fields(
 ) {
     // Capture before the modes reset below: it tells us what `alt_grid` holds.
     let was_alternate_screen = modes.alternate_screen;
-    *modes = TerminalModes::new();
+    *modes = reset_modes(modes);
     style.reset();
     charset.reset();
     // If on the alternate screen, `grid` currently points at the alt grid and
@@ -133,26 +156,8 @@ impl Terminal {
     /// we're already inside parser dispatch).
     pub fn reset(&mut self) {
         self.parser.reset();
-        // Preserve host-configured policy flags across reset — these are
-        // set by the embedding application, not by escape sequences, and
-        // a rogue program sending RIS should not escalate its privileges
-        // by clearing them.
-        let allow_osc52_query = self.modes.allow_osc52_query;
-        let allow_osc52_set = self.modes.allow_osc52_set;
-        let allow_window_ops = self.modes.allow_window_ops;
-        let allow_notifications = self.modes.allow_notifications;
-        let allow_palette_reconfigure = self.modes.allow_palette_reconfigure;
-        let require_shell_integration_nonce = self.modes.require_shell_integration_nonce;
-        // Capability toggle, not runtime negotiation state: RIS must not let a
-        // program re-enable a kitty protocol the host declared unsupported.
-        let kitty_keyboard_enabled = self.modes.kitty_keyboard_enabled;
-        // Host/config-derived display state with no escape sequence to restore it:
-        // ambiguous_width_double (CJK ambiguous-width policy, from config) and
-        // color_scheme (the OS light/dark appearance the host pushes in). A rogue
-        // program's RIS must not silently flip CJK width or the reported appearance
-        // — the app cannot itself put these back (no wire sequence exists).
-        let ambiguous_width_double = self.modes.ambiguous_width_double;
-        let color_scheme = self.modes.color_scheme;
+        // Host-configured policy survives: `reset_common_fields` keeps it
+        // (`reset_modes`).
         let mut groups = ResetGroups {
             kitty_keyboard: &mut self.kitty_keyboard,
             xterm_keyboard: &mut self.xterm_keyboard,
@@ -178,20 +183,9 @@ impl Terminal {
             &mut self.secure_keyboard_entry,
             &mut groups,
         );
-        // Restore the host policy saved above: a program must not escalate by
-        // resetting it.
-        self.modes.allow_osc52_query = allow_osc52_query;
-        self.modes.allow_osc52_set = allow_osc52_set;
-        self.modes.allow_window_ops = allow_window_ops;
-        self.modes.allow_notifications = allow_notifications;
-        self.modes.allow_palette_reconfigure = allow_palette_reconfigure;
-        self.modes.require_shell_integration_nonce = require_shell_integration_nonce;
-        self.modes.kitty_keyboard_enabled = kitty_keyboard_enabled;
-        self.modes.ambiguous_width_double = ambiguous_width_double;
-        self.modes.color_scheme = color_scheme;
         // Restore the host-preferred default cursor style: RIS wiped modes back to
         // CursorStyle::default(), but the host's configured default must survive a
-        // reset (it's host preference, not app state, like the policy flags above).
+        // reset (it's host preference, not app state, like the policy `reset_modes` keeps).
         self.modes.cursor_style = self.default_cursor_style;
         // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
         self.modes.cursor_blink = self.modes.cursor_style.blinks();

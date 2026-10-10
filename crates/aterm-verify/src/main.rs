@@ -55,6 +55,20 @@ fn main() {
         print!("{}", cli::usage());
         std::process::exit(0);
     }
+    // THE BYTES MEASURE JUDGES, digested before anything runs: a bundle that is
+    // not one is the caller's mistake, a usage error like a missing <APP>.
+    let measure_artifact = match parsed
+        .artifact
+        .as_deref()
+        .map(aterm_verify::MeasureArtifact::at)
+        .transpose()
+    {
+        Ok(a) => a,
+        Err(why) => {
+            eprintln!("verify: {why}");
+            std::process::exit(exit::USAGE);
+        }
+    };
 
     // Stage children lead process groups of their own, so the terminal's
     // Ctrl-C no longer reaches them: the gate forwards it, and SIGTERM/SIGHUP,
@@ -150,7 +164,7 @@ fn main() {
                 .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
         )
         .with_no_windows(parsed.no_windows)
-        .with_compile_qos(parsed.compile_qos)
+        .with_measure_artifact(measure_artifact)
         .with_baseline(parsed.baseline)
         .with_notes(identity::own_output_note(&excluded))
         .in_snapshot_of(snap.caller.clone(), snap.tree.clone(), snap.notes.clone())

@@ -112,6 +112,34 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
     assert_eq!(spent.len(), 1);
     assert!(!model.check_invariant("LostGlassSpendsNoGhost", &spent[0]));
     assert!(!model.check_invariant("GhostNeverDisplaced", &spent[0]));
+
+    // The world the ghost would fade in protects the cells under the old
+    // body (`Refuse`): no ghost there, and the arriver carries its presence —
+    // on the same glass, in the pane the focus left, and on a return.
+    for actions in [
+        &["Draw", "Replace", "Refuse", "Tick"][..],
+        &["Draw", "Replace", "Shift", "Refuse", "Tick"][..],
+        &["Draw", "Replace", "Tick", "Return", "Refuse", "Tick"][..],
+    ] {
+        let refused = run(&model, actions);
+        assert_eq!(
+            (refused["lit"], refused["ghost"], refused["dipped"]),
+            (1, 0, 0),
+            "{actions:?}: no ghost over protected cells, and no dip"
+        );
+    }
+    // As shipped until 2026-10-08 (`Cull`): the refused ghost took its
+    // presence with it, and the arriver stood alone at its ramp's floor.
+    let cull = interp::with_consts(&model, &[("Cull", 1)]);
+    let state = run(&model, &["Draw", "Replace", "Refuse"]);
+    let cut = cull.successors("Tick", &state);
+    assert_eq!(cut.len(), 1);
+    assert_eq!(cut[0]["dipped"], 1);
+    assert!(!model.check_invariant("RefusedGhostHandsOver", &cut[0]));
+    let Err((_, broken)) = interp::bmc(&cull) else {
+        panic!("Cull must break an invariant");
+    };
+    assert_eq!(broken, "RefusedGhostHandsOver");
 }
 
 #[test]
@@ -171,6 +199,40 @@ fn a_quick_return_continues_one_body_and_every_ghost_leaves_at_full_presence() {
     assert!(!model.check_invariant("GhostLeavesAtFullPresence", &early[0]));
     let Err((_, broken)) = interp::bmc(&own_clock) else {
         panic!("OwnClock must break an invariant");
+    };
+    assert_eq!(broken, "GhostLeavesAtFullPresence");
+}
+
+#[test]
+fn a_breed_leaver_crosses_a_boundary_and_leaves_at_full_presence() {
+    let model = pet_surface_seam_model();
+    let run = |m: &aterm_spec::derive::Model, actions: &[&str]| {
+        let mut state = m.init_state();
+        for action in actions {
+            assert!(m.fire(action, &mut state), "{action}");
+        }
+        state
+    };
+    for seam in [&["Replace"][..], &["Replace", "Shift"][..]] {
+        let crossed = [&["Draw", "Handoff"][..], seam, &["Tick"][..]].concat();
+        let state = run(&model, &crossed);
+        assert_eq!((state["lit"], state["ghost"]), (1, 1), "{crossed:?}");
+        let done = run(&model, &[&crossed[..], &["Spend"][..]].concat());
+        assert_eq!(done["tail"], 0, "{crossed:?}: the leaver fades on the ramp");
+    }
+    // As shipped until 2026-10-08 (`LeaverCut`): the boundary dropped the
+    // leaver, which left glass while its arriver was still coming up.
+    let leaver_cut = interp::with_consts(&model, &[("LeaverCut", 1)]);
+    let state = run(&model, &["Draw", "Handoff", "Replace", "Tick"]);
+    let cut = leaver_cut.successors("Spend", &state);
+    assert_eq!(cut.len(), 1);
+    assert_eq!(cut[0]["tail"], 1);
+    assert!(!model.check_invariant("GhostLeavesAtFullPresence", &cut[0]));
+    // A crossfade with no leaver was never cut.
+    let state = run(&leaver_cut, &["Draw", "Replace", "Tick", "Spend"]);
+    assert_eq!(state["tail"], 0);
+    let Err((_, broken)) = interp::bmc(&leaver_cut) else {
+        panic!("LeaverCut must break an invariant");
     };
     assert_eq!(broken, "GhostLeavesAtFullPresence");
 }

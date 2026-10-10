@@ -101,9 +101,8 @@ fn parse_csi_many_params() {
 
 #[test]
 fn parse_csi_kakoune_sgr() {
-    // Regression for the 16->24 MAX_PARAMS raise: Kakoune emits a 17-parameter
-    // SGR (truecolor fg + truecolor bg + attrs). At the old cap of 16 the 17th
-    // parameter was truncated and the styling dropped. It must now be retained.
+    // Kakoune emits a 17-parameter SGR (truecolor fg + bg + attrs); a cap of
+    // 16 truncated the 17th and dropped the styling.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -132,7 +131,7 @@ fn parse_csi_kakoune_sgr() {
 #[test]
 fn csi_fast_path_single_sequences() {
     // One sequence through `advance_fast` -> exactly one CSI dispatch of
-    // (params, intermediates, final). Each row was its own test.
+    // (params, intermediates, final).
     let rows: &[(&str, &[u8], &[u16], &[u8], u8)] = &[
         ("simple SGR", b"\x1b[31m", &[31], &[], b'm'),
         ("256-color fg", b"\x1b[38;5;196m", &[38, 5, 196], &[], b'm'),
@@ -333,4 +332,100 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_basic() {
     for input in mid_cases {
         assert_fast_parser_matches_basic(input);
     }
+}
+
+/// A parameter accumulates with saturating arithmetic and is clamped to
+/// `u16::MAX` when it closes: `ESC [ <digits> m` dispatches exactly
+/// `min(value, 65535)` on both paths for every digit repeated up to 24 times
+/// (far past `u32::MAX`), and for the values past `u32::MAX` that a wrapping
+/// accumulator would bring back small (`2^32` would read as 0, `2^32 + 5` as
+/// 5, `10 * 2^32` as 0).
+#[test]
+fn parameter_digits_saturate_and_finalize_clamps() {
+    let mut runs: Vec<String> = (0..=9u8)
+        .flat_map(|digit| (1..=24).map(move |run| char::from(b'0' + digit).to_string().repeat(run)))
+        .collect();
+    runs.extend(
+        [
+            "4294967296",
+            "4294967297",
+            "4294967301",
+            "8589934593",
+            "42949672960",
+        ]
+        .map(String::from),
+    );
+    for digits in &runs {
+        let value = digits.parse::<u128>().unwrap();
+        let expected = u16::try_from(value.min(u128::from(u16::MAX))).unwrap();
+        let sequence = format!("\x1b[{digits}m");
+        for fast in [false, true] {
+            let mut parser = Parser::new();
+            let mut sink = RecordingSink::default();
+            if fast {
+                parser.advance_fast(sequence.as_bytes(), &mut sink);
+            } else {
+                parser.advance(sequence.as_bytes(), &mut sink);
+            }
+            assert_eq!(
+                sink.csi_dispatches,
+                vec![(vec![expected], vec![], b'm')],
+                "fast={fast} {digits}"
+            );
+        }
+    }
+}
+
+/// `add_param_digit` and `finalize_param` over the edges of the accumulator:
+/// a digit multiplies and adds with saturation (exactly at and around
+/// `u32::MAX / 10`, where it starts to saturate), a `;` or `:` closes the
+/// parameter as `min(value, 65535)` and resets the accumulator, and
+/// `finalize_param` clamps every value from 0 to 70,000 and `u32::MAX` — and
+/// still resets when the list is full and the value is dropped.
+#[test]
+fn add_param_digit_saturates_and_finalize_param_clamps() {
+    let clamp = |value: u32| u16::try_from(value.min(u32::from(u16::MAX))).unwrap();
+    let edge = u32::MAX / 10;
+    let initials = [0, 1, u32::MAX].into_iter().chain(edge - 10..=edge + 10);
+    for initial in initials {
+        for byte in (b'0'..=b'9').chain([b';', b':']) {
+            let mut parser = Parser::new();
+            parser.current_param = initial;
+            parser.param_started = true;
+            parser.add_param_digit(byte);
+            if byte.is_ascii_digit() {
+                assert_eq!(
+                    parser.current_param,
+                    initial
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0')),
+                    "{initial} then {}",
+                    byte as char
+                );
+                assert!(parser.param_started);
+                assert!(parser.params.is_empty());
+            } else {
+                assert_eq!(parser.params.as_slice(), &[clamp(initial)][..]);
+                assert_eq!((parser.current_param, parser.param_started), (0, false));
+                assert_eq!(parser.last_was_colon, byte == b':');
+            }
+        }
+    }
+    for value in (0..=70_000).chain([u32::MAX]) {
+        let mut parser = Parser::new();
+        parser.current_param = value;
+        parser.param_started = true;
+        parser.finalize_param();
+        assert_eq!(parser.params.as_slice(), &[clamp(value)][..], "{value}");
+        assert_eq!((parser.current_param, parser.param_started), (0, false));
+    }
+    let mut full = Parser::new();
+    for _ in 0..crate::MAX_PARAMS {
+        full.params.push(1);
+    }
+    full.current_param = u32::MAX;
+    full.param_started = true;
+    full.finalize_param();
+    assert_eq!(full.params.len(), crate::MAX_PARAMS);
+    assert_eq!((full.current_param, full.param_started), (0, false));
 }

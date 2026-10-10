@@ -137,35 +137,48 @@ impl Terminal {
         self.main_grid().scrollback()
     }
 
-    /// Reclaimable bytes in the history store ([`Self::history_scrollback`]),
-    /// measured after the history grid's lazily-deferred rows are promoted
-    /// into the store, so the figure is what an eviction pass will see.
-    /// `None` when no tiered store is attached (a ring-only grid, or the
-    /// store detached for an off-thread reflow).
+    /// Reclaimable history bytes: the history store's budgeted bytes
+    /// ([`Self::history_scrollback`]), measured after the history grid's
+    /// lazily-deferred rows are promoted into the store so the figure is what
+    /// an eviction pass will see, plus the OSC 8 payload the grid's ring still
+    /// holds uncompressed ([`Grid::history_link_bytes`]), which a shed strips
+    /// with the store. `None` when no tiered store is attached (a ring-only
+    /// grid, or the store detached for an off-thread reflow).
+    ///
+    /// [`Grid::history_link_bytes`]: crate::grid::Grid::history_link_bytes
     pub fn history_scrollback_bytes(&mut self) -> Option<usize> {
-        self.history_grid_mut()
-            .scrollback_mut()
-            .map(|store| store.budgeted_memory_used())
+        let grid = self.history_grid_mut();
+        let store = grid.scrollback_mut()?.budgeted_memory_used();
+        Some(store + grid.history_link_bytes())
     }
 
     /// Evict the history store down to `keep(budget)` bytes, then restore its
     /// own `budget` so the tab can keep growing history. Used by the GUI's
     /// memory-pressure shed and aggregate-cap lane.
     ///
+    /// The lowered budget also lowers the history grid's link allowance (a
+    /// quarter of it, [`Grid::history_link_budget`]), so the OSC 8 payload its
+    /// ring holds uncompressed is stripped oldest-first with the store's
+    /// eviction: `after` is at most `keep(budget)` plus that quarter.
+    ///
     /// Acts on the store that holds the history, including while the alternate
     /// screen is up (see [`Self::history_scrollback`]), and reports the bytes
-    /// measured before and after. Budget-setter errors are not surfaced: the hot
-    /// tier may refuse to evict rows it is serving, and
-    /// [`HistoryShed::freed`] reports what was actually given back.
+    /// measured before and after, as [`Self::history_scrollback_bytes`] counts
+    /// them. Budget-setter errors are not surfaced: the hot tier may refuse to
+    /// evict rows it is serving, and [`HistoryShed::freed`] reports what was
+    /// actually given back.
     ///
     /// Returns `None` (and changes nothing) when no tiered store is attached.
+    ///
+    /// [`Grid::history_link_budget`]: crate::grid::Grid::history_link_budget
     pub fn shed_history_scrollback(
         &mut self,
         keep: impl FnOnce(usize) -> usize,
     ) -> Option<HistoryShed> {
-        let store = self.history_grid_mut().scrollback_mut()?;
+        let grid = self.history_grid_mut();
+        let store = grid.scrollback_mut()?;
         let budget = store.memory_budget();
-        let before = store.budgeted_memory_used();
+        let before = store.budgeted_memory_used() + grid.history_link_bytes();
         // `set_memory_budget` applies to both grid slots, reaching the parked
         // primary while alt is up; the alt grid has no tiered store.
         let _ = self.set_memory_budget(keep(budget));
@@ -173,7 +186,7 @@ impl Terminal {
         let after = self.history_scrollback().map_or(
             0,
             crate::scrollback::ScrollbackStorage::budgeted_memory_used,
-        );
+        ) + self.main_grid().history_link_bytes();
         Some(HistoryShed { before, after })
     }
 
@@ -260,6 +273,8 @@ impl Terminal {
             self.text_selection
                 .truncate_to_floor(self.grid.oldest_absolute_row(), live_top_abs);
         }
+        // A vi cursor on an evicted line rests on the oldest line kept.
+        self.vi_shift(0);
     }
 
     /// The retained scrollback line limit of the primary-content grid
@@ -361,6 +376,8 @@ impl Terminal {
         self.shell.current_mark = None;
         self.marks_state.marks.clear();
         self.marks_state.annotations.clear();
+        // A vi cursor in history rests on the screen.
+        self.vi_shift(0);
     }
 
     /// Scroll display by delta lines.

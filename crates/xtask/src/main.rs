@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! aterm's build-graph tasks. Four subcommands:
+//! aterm's build-graph tasks. Three subcommands:
 //!
-//!   * `harness-manifest`: `aterm_spec::harness_manifest` — every
-//!     `#[kani::proof] fn` under `crates/`, written to
-//!     `target/trust/harness-manifest.json` for `trust-ir spec-link`. aterm-gui's
-//!     `spec_xref_closure` runs it.
 //!   * `gate <verb>`: the checks the merge gate shells into this binary for
 //!     (`gate.rs`).
 //!   * `perf [--record]`: the perf measurements and the same-box trend ledger
@@ -25,16 +21,6 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str);
     match cmd {
-        Some("harness-manifest") => match write_harness_manifest() {
-            Ok(path) => {
-                eprintln!("xtask harness-manifest: wrote {}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("xtask harness-manifest FAILED: {e}");
-                ExitCode::FAILURE
-            }
-        },
         Some("gate") => gate::run(
             args.get(2).map(String::as_str),
             args.get(3..).unwrap_or_default(),
@@ -49,9 +35,8 @@ fn main() -> ExitCode {
         Some("verify") => verify(&args[2..]),
         _ => {
             eprintln!(
-                "usage: xtask <harness-manifest|gate <verb>|perf [--record]|verify [args…]>\n\
+                "usage: xtask <gate <verb>|perf [--record]|verify [args…]>\n\
                  \n\
-                 harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  gate <verb>       the merge gate's xtask checks: {}\n\
                  perf [--record]   measure against tools/golden (--record rewrites the baselines)\n\
                  verify [args…]    run tools/verify.sh (the `targo --unverified verify` alias)",
@@ -121,15 +106,4 @@ pub(crate) fn workspace_root() -> PathBuf {
         Some(root) => root.to_path_buf(),
         None => manifest.to_path_buf(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// harness-manifest
-// ---------------------------------------------------------------------------
-
-/// `aterm_spec::harness_manifest`, into `<root>/target/trust`, where
-/// `aterm-gui`'s `spec_xref_closure` reads it.
-fn write_harness_manifest() -> std::io::Result<PathBuf> {
-    let root = workspace_root();
-    aterm_spec::harness_manifest::write(&root, &root.join("target").join("trust"))
 }

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The one record of a Codex goal aterm paused, per tab (owner, 2026-09-28).
+//! The one record of a Codex goal aterm paused, per tab.
 //!
 //! A Codex in goal mode starts its next turn milliseconds after the last ends,
 //! so aterm pauses the goal (`/goal pause`, or Esc at a new turn's head),

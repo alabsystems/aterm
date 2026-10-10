@@ -1,81 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W13 — `aterm-gui`'s AppKit constants, `_Static_assert`ed against the SDK on
-//! BOTH arches. The replacement for the oracle that left with `objc2-app-kit`.
+//! `aterm-gui`'s AppKit constants, `_Static_assert`ed against the SDK on BOTH
+//! arches.
 //!
-//! # What this replaces, and why the replacement is stronger
+//! * **The authority is Apple's header**, not a third-party transcription.
+//! * **`x86_64` is covered.** Every row is a compile-time value, so compiling
+//!   the assertion for an arch is the measurement; no binary for that arch has
+//!   to run (this box cannot execute the compat slice). `NS_TEXT_ALIGNMENT_CENTER`'s
+//!   two `#[cfg]` arms are BOTH checked, each under the matching `#if`, and the
+//!   arm the gate selects is read out of the SOURCE.
+//! * **Coverage runs both ways off the SOURCE.** Every constant the parser finds
+//!   in `consts` must have a row, and every row must name a constant that is
+//!   really there.
 //!
-//! `crates/aterm-gui/src/appkit.rs` ended in `consts_tests`: 19 of its 20 ported
-//! constants compared at run time against the `objc2-app-kit` expression each
-//! had replaced. That test existed for a good reason — `NS_TEXT_ALIGNMENT_CENTER`
-//! had been "read twice" BY EYE, shipped as RIGHT alignment, and only an A/B
-//! pixel capture caught it — and it said outright that it could live only while
-//! `objc2-app-kit` was a dependency of `aterm-gui`. W13 ported the last file
-//! that made it one, so the oracle had to go with the crate.
+//! Why it matters: `NS_TEXT_ALIGNMENT_CENTER` once shipped as RIGHT alignment,
+//! caught only by a pixel capture, and `NS_COLOR_RENDERING_INTENT_PERCEPTUAL`
+//! was first written `1` (it is `3`) — wrong values no run-time test sees.
 //!
-//! It is replaced rather than dropped, and by a better instrument on four axes:
+//! [`winit_seam_constants.rs`](../winit_seam_constants.rs) is the twin over
+//! `vendor/winit`'s seam: same parser grammar, same probe, same coverage. Two
+//! differences:
 //!
-//! * **The authority is Apple's header, not a third-party crate's
-//!   transcription of it.** One fewer link in the chain that can be wrong.
-//! * **`x86_64` is covered.** Every row is a compile-time value, so COMPILING
-//!   the assertion for an arch is the measurement and no binary for that arch
-//!   has to run — which matters because this box cannot execute the compat
-//!   slice aterm ships, and `gate cells` has no `x86_64-apple-darwin` cell.
-//!   `NS_TEXT_ALIGNMENT_CENTER`'s two `#[cfg]` arms are BOTH checked, each
-//!   under the matching `#if`, and the ARM THE GATE SELECTS IS READ OUT OF THE
-//!   SOURCE rather than written into the table here.
-//! * **The three rows the old oracle could not reach are covered.** Two were
-//!   omitted; `NS_LINE_BREAK_BY_TRUNCATING_TAIL` was UNREACHABLE, because
-//!   `NSLineBreakMode` lives behind an `objc2-app-kit` feature `aterm-gui` does
-//!   not enable — so "EVERY PORTED CONSTANT, DIFFED AGAINST THE CRATE IT
-//!   REPLACED" was never achievable for that row. Against the SDK there is no
-//!   such gap.
-//! * **Coverage runs both ways off the SOURCE.** The old test was a hand-written
-//!   list of `assert_eq!`s, so a constant added without one was invisible to it.
-//!   Here every constant the parser finds in `consts` must have a row, and every
-//!   row must name a constant that is really there.
+//! 1. **The literal is PARENTHESISED in the assertion.** `|` binds LOOSER than
+//!    `==` in C, so `_Static_assert(SDK == 0x01 | 0x80, "")` is
+//!    `(SDK == 0x01) | 0x80` and a wrong value compiles (clang only warns
+//!    `-Wparentheses`). `NS_TRACKING_HOVER_IN_VISIBLE_RECT` and
+//!    `NS_VIEW_MIN_X_MARGIN_MAX_Y_MARGIN` are `|`-composed. The seam's probe is
+//!    parenthesised too, so it stays non-vacuous if one is added there.
+//! 2. **`#[cfg(target_arch)]` is part of the grammar.** Its gate is read from
+//!    the attribute above the declaration and turned into the matching `#if`,
+//!    so swapping the two arms fails here.
 //!
-//! It earned its place on its first row. `NS_COLOR_RENDERING_INTENT_PERCEPTUAL`
-//! was written `1` — the ordinal a reader guesses from the name's prominence —
-//! and the probe answered `expression evaluates to '3 == 1'` before a line of
-//! the port compiled. It is `NS_TEXT_ALIGNMENT_CENTER`'s shape exactly, in an
-//! enum whose enumerators carry no values, and no run-time test could have seen
-//! it: a wrong rendering intent produces a subtly different colour conversion of
-//! the titlebar snapshot, not a failure.
-//!
-//! # Its sibling, and the one thing this file does that the sibling does not
-//!
-//! [`winit_seam_constants.rs`](../winit_seam_constants.rs) is the same
-//! instrument over `vendor/winit`'s 42-constant seam, and this file is
-//! deliberately its twin: same parser grammar, same both-arches probe, same
-//! both-ways coverage. Two differences, and both are findings:
-//!
-//! 1. **The literal is PARENTHESISED in the assertion.** `_Static_assert(SDK ==
-//!    0x01 | 0x80 | 0x200, "")` parses as `_Static_assert((SDK == 0x01) | 0x80 |
-//!    0x200, "")`, because `|` binds LOOSER than `==` in C. That is not a
-//!    hypothetical: `NS_TRACKING_HOVER_IN_VISIBLE_RECT` and
-//!    `NS_VIEW_MIN_X_MARGIN_MAX_Y_MARGIN` are both `|`-composed here, and a
-//!    deliberately WRONG value for the first compiles cleanly unparenthesised
-//!    (clang emits `-Wparentheses` and exits 0) and fails as it should with the
-//!    parentheses. The seam has no compound literal today, so its probe is not
-//!    vacuous — but it would go vacuous the day one is added, silently, so it
-//!    is parenthesised too, in this same commit.
-//! 2. **`#[cfg(target_arch)]` is part of the grammar.** The seam has no
-//!    arch-split constant; `aterm-gui` has exactly one, and it is the row that
-//!    shipped wrong. Its gate is read from the attribute above the declaration
-//!    and turned into the matching `#if`, so a future edit that swaps the two
-//!    arms fails here rather than passing on the arch this box can run.
-//!
-//! # Why it lives in `aterm-objc` and not in `aterm-gui`
-//!
-//! `winit_seam_constants.rs` is here because `winit` is not a workspace member
-//! and `cargo test --workspace` never compiles a test inside it. `aterm-gui` IS
-//! a member, so that reason does not apply — but an integration test in
-//! `aterm-gui` links the whole `aterm-gui` library, which this file does not
-//! need: it reads its subject as TEXT and shells out to `clang`. Putting the
-//! two halves of one instrument side by side costs nothing and keeps them from
-//! drifting apart.
+//! It lives in `aterm-objc` beside its twin: it reads its subject as TEXT and
+//! shells out to `clang`, so it need not link the `aterm-gui` library.
 
 #![cfg(target_os = "macos")]
 
@@ -103,13 +61,13 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 // module it mirrors.
 #[rustfmt::skip]
 const ROWS: &[(&str, &str)] = &[
-    // ---- W2's originals ----
+    // ---- status item, modifiers, modal ----
     ("NS_VARIABLE_STATUS_ITEM_LENGTH",        "NSVariableStatusItemLength"),
     ("NS_EVENT_MODIFIER_FLAG_SHIFT",          "NSEventModifierFlagShift"),
     ("NS_EVENT_MODIFIER_FLAG_CONTROL",        "NSEventModifierFlagControl"),
     ("NS_EVENT_MODIFIER_FLAG_COMMAND",        "NSEventModifierFlagCommand"),
     ("NS_MODAL_RESPONSE_OK",                  "NSModalResponseOK"),
-    // ---- W7, the tab strip ----
+    // ---- the tab strip ----
     ("NS_LINE_CAP_STYLE_ROUND",               "NSLineCapStyleRound"),
     ("NS_TEXT_ALIGNMENT_LEFT",                "NSTextAlignmentLeft"),
     ("NS_TEXT_ALIGNMENT_CENTER",              "NSTextAlignmentCenter"),
@@ -134,11 +92,11 @@ const ROWS: &[(&str, &str)] = &[
     ),
     ("NS_WINDOW_TITLE_HIDDEN",                "NSWindowTitleHidden"),
     ("NS_LINE_BREAK_BY_TRUNCATING_TAIL",      "NSLineBreakByTruncatingTail"),
-    // ---- W13, the modal-alert subsystem ----
+    // ---- the modal-alert subsystem ----
     ("NS_EVENT_MASK_KEY_DOWN",                "NSEventMaskKeyDown"),
     ("NS_ALERT_FIRST_BUTTON_RETURN",          "NSAlertFirstButtonReturn"),
     ("NS_ALERT_SECOND_BUTTON_RETURN",         "NSAlertSecondButtonReturn"),
-    // ---- W13, the `chrome` introspection reader ----
+    // ---- the `chrome` introspection reader ----
     ("NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC",     "NSWindowToolbarStyleAutomatic"),
     ("NS_WINDOW_TOOLBAR_STYLE_EXPANDED",      "NSWindowToolbarStyleExpanded"),
     ("NS_WINDOW_TOOLBAR_STYLE_PREFERENCE",    "NSWindowToolbarStylePreference"),
@@ -146,7 +104,7 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_TOOLBAR_DISPLAY_MODE_DEFAULT",       "NSToolbarDisplayModeDefault"),
     ("NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL","NSToolbarDisplayModeIconAndLabel"),
     ("NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY",    "NSToolbarDisplayModeLabelOnly"),
-    // ---- W13, the titlebar snapshot ----
+    // ---- the titlebar snapshot ----
     ("NS_BITMAP_IMAGE_FILE_TYPE_PNG",         "NSBitmapImageFileTypePNG"),
     ("NS_COLOR_RENDERING_INTENT_PERCEPTUAL",  "NSColorRenderingIntentPerceptual"),
     // ---- the App Nap opt-out (Foundation's, reached through Cocoa.h) ----

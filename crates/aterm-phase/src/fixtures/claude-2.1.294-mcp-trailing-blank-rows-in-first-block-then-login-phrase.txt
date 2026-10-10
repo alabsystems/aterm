@@ -1,0 +1,22 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (H6-HARNESS-1 pass 6), `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an MCP result of two blocks, the first ending in a blank line (drawn as two blank rows right above the second block's column-2 row), the second a lost login's words; the reply after it empty
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ github - get_trailing (MCP)(n: 7)
+  ⎿  Issue 7: the parser drops a row
+
+
+  ⎿  Not logged in · Please run /login
+
+✻ Cooked for 3s · done 5:48 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                             21678 tokens

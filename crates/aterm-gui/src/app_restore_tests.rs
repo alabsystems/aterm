@@ -2189,6 +2189,8 @@ fn dead_agent() -> restore::AgentRestore {
         session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
         cwd: "/tmp".into(),
         version: Some("2.1.283".into()),
+        home: None,
+        login: None,
         codex: None,
     }
 }
@@ -2204,8 +2206,16 @@ fn leaf_hosting(shell: u64, agent: Option<restore::AgentRestore>) -> restore::Re
     ))
 }
 
+/// The Claude home and the login [`owed_relaunch`]'s agent ran under, as
+/// the host read them off its process.
+#[cfg(unix)]
+const OWED_HOME: &str = "/Users//me/lab home/.claude";
+#[cfg(unix)]
+const OWED_LOGIN: &str = "/Users//me/logins/work-2";
+
 /// The relaunch the supervisor host owes tab `tab`: its dead Claude Code
-/// agent and that agent's conversation.
+/// agent, that agent's conversation, and the Claude home and the login it
+/// ran under.
 #[cfg(unix)]
 fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
     aterm_agent::harness::relaunch::Snapshot {
@@ -2220,7 +2230,8 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
         version: None,
         codex: None,
         dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
-        login: None,
+        login: Some(OWED_LOGIN.into()),
+        home: Some(OWED_HOME.into()),
     }
 }
 
@@ -2440,9 +2451,15 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
 /// 2026-10-02), filled after the host's shutdown as `main_entry` fills
 /// it ([`App::fill_desk_agents`]).
 ///
+/// EACH WITH THE CLAUDE HOME AND THE LOGIN ITS AGENT RAN UNDER (2026-10-09):
+/// the owed snapshot's, which every one of the three used to drop, so the
+/// next launch, or the successor, relaunched it in the default home on the
+/// default account.
+///
 /// RED before the change: every handoff leaf said `agent: None`; before
 /// the journal's change, so did every leaf of its image; before round
-/// two, so did every leaf of the restart's quit layout.
+/// two, so did every leaf of the restart's quit layout; before
+/// 2026-10-09, each named the agent with no home and no login.
 #[cfg(unix)]
 #[test]
 fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
@@ -2472,11 +2489,22 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
         assert!(std::time::Instant::now() < deadline, "the first step");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    // Each leaf's agent: its pid, and that it names the home and the login
+    // its agent ran under.
     let agents = |layout: &restore::RestoreManifest| -> Vec<(Option<u64>, Option<u32>)> {
         layout
             .handed_off_leaves()
             .iter()
-            .map(|leaf| (leaf.local_id, leaf.agent.as_ref().map(|agent| agent.pid)))
+            .map(|leaf| {
+                let agent = leaf.agent.as_ref().inspect(|agent| {
+                    assert_eq!(
+                        (agent.home.as_deref(), agent.login.as_deref()),
+                        (Some(OWED_HOME), Some(OWED_LOGIN)),
+                        "the home and the login the agent ran under ride its leaf"
+                    );
+                });
+                (leaf.local_id, agent.map(|agent| agent.pid))
+            })
             .collect()
     };
     // The journal's real capture, through its writer thread.
@@ -2616,6 +2644,105 @@ fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
         commit_agent_carry(&live)
     );
     app.rollback_overlap(None, &[]);
+}
+
+/// A RELAUNCH ON EXIT OWED ACROSS A SUCCESSFUL COMMIT KEEPS THE CLAUDE HOME
+/// AND THE LOGIN ITS AGENT RAN UNDER (2026-10-09): the agent a worker's
+/// back-off owes a tab at the park (`Kept::owed`: a crash, a stall's
+/// remedy, the explicit restart — its snapshot read off the live process,
+/// home and login with it) is named on that tab's handoff leaf with both,
+/// through the layout's wire, and the successor's relaunch of it at its
+/// Commit (the same step a cold restore takes) plans its line with both. It
+/// came back in the default home on the default account before.
+///
+/// ITS CAUSE IS NOT CARRIED, by decision: the successor relaunches it as
+/// aterm's own end (`host`), as a failed Commit's rollback relaunches one
+/// stranded in this process — the restored queue's step, whose one try and
+/// at-once verdict are that cause's, from a process that did not read the
+/// exit; carried, it would change only the continuation's words and the
+/// record's label.
+///
+/// NEGATIVE CONTROL: owed with neither, the successor's line is today's.
+#[cfg(unix)]
+#[test]
+fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
+    use aterm_agent::harness::relaunch::{Snapshot, exit_line};
+    let successor_line = |owed: Snapshot| -> (Snapshot, Option<String>) {
+        let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+            std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+        );
+        let mut app = App::headless_for_test();
+        let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        let sid = {
+            let g = app.store.read().unwrap();
+            g.by_local(0).expect("registered").sid.as_str().to_string()
+        };
+        app.harness = Some(host.clone());
+        host.owe_for_test(
+            &sid,
+            Some(Snapshot {
+                tab: sid.clone(),
+                ..owed
+            }),
+        );
+        assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+        // What the successor reads: the handoff layout's wire.
+        let wire = app.capture_handoff_layout().to_toml().expect("the wire");
+        app.rollback_overlap(None, &[]);
+        let layout = restore::RestoreManifest::from_toml(&wire).expect("the successor reads it");
+        let carried = layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.agent)
+            .expect("the owed tab's leaf names its agent");
+        // The successor: the leaf's shell adopted, its Commit's carry.
+        let mut successor = App::headless_for_test();
+        successor.handoff_successor = true;
+        successor.restore_into_window(
+            WindowId(0),
+            window_of(vec![leaf_hosting(8, Some(*carried))]),
+        );
+        let adopted = *successor.pool.sessions.keys().max().expect("a session");
+        adopt_as(&mut successor, adopted, 8);
+        for (&id, pooled) in successor.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+        }
+        successor.queue_carried_restored_agents();
+        let mut handed = successor.take_restored_agents();
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (_, snap) = handed.remove(0);
+        // In a zsh, as the relaunch's plan reads the adopted shell's dialect.
+        let line = exit_line(&Snapshot {
+            dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
+            ..snap.clone()
+        });
+        (snap, line)
+    };
+    let program = "'/opt/claude/bin/claude' '--resume' '0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c'";
+    let (snap, line) = successor_line(owed_relaunch("s-old"));
+    assert_eq!(
+        (snap.home.as_deref(), snap.login.as_deref()),
+        (Some(OWED_HOME), Some(OWED_LOGIN))
+    );
+    assert_eq!(
+        line,
+        Some(format!(
+            " CLAUDE_CONFIG_DIR='{OWED_HOME}' CLAUDE_SECURESTORAGE_CONFIG_DIR={OWED_LOGIN} \
+             CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"
+        ))
+    );
+    // NEGATIVE CONTROL: an agent that had neither — today's line.
+    let (snap, line) = successor_line(Snapshot {
+        home: None,
+        login: None,
+        ..owed_relaunch("s-old")
+    });
+    assert_eq!((snap.home, snap.login), (None, None));
+    assert_eq!(
+        line,
+        Some(format!(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"))
+    );
 }
 
 /// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
@@ -3367,6 +3494,8 @@ impl Successor {
             session: Some(Self::CONVERSATION.into()),
             cwd: "/b".into(),
             version: Some("2.1.283".into()),
+            home: None,
+            login: None,
             codex: None,
         };
         desk.fill_agents(&|id| (id == 1).then(|| claude.clone()));

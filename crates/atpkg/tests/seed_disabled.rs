@@ -1,23 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A SEED WITHOUT THE INSTALL CONSENT ADOPTS NOTHING (2026-09-15, re-spelled
-//! 2026-09-23), at the real process edge.
+//! A SEED WITHOUT THE INSTALL CONSENT ADOPTS NOTHING, at the real process edge.
 //!
-//! `atpkg seed` used to write `<prefix>/adopted`, lay a pending stub for every
-//! default-set / agent / extra name under `bin/` and `agents/`, lay the reroute stubs
-//! and reassert the rustup seam, and only THEN notice that it was switched off. Every
-//! stub then promised a pass that the same switch refuses, and the durable adoption
-//! installed the whole set over the network the first tick after the switch was
-//! lifted. The switch this drives is the ONE install consent, `[packages] auto_install
-//! = false` in a scratch aterm.toml — the environment kill switch the test was first
-//! written against, `ATPKG_DISABLE`, is gone (R2: settings, not env vars), and the
-//! disabled-manager arm it reached is now only an unpinned build's. The store stays
-//! untouched — then, as the non-vacuity half, the SAME fixture with the default config
-//! adopts, so the first half cannot pass merely because the fixture never reaches the
-//! adoption line. (It also ran once "with a (placeholder) seal", through the
-//! `ATPKG_BUNDLED_SEED` seam; Phase 5 deleted the sealed-payload lane and the seam
-//! with it.)
+//! A seed that is switched off must notice before it writes `<prefix>/adopted`, lays a
+//! pending stub under `bin/` and `agents/`, lays the reroute stubs or reasserts the
+//! rustup seam: every stub would promise a pass the switch refuses, and the adoption
+//! would install the whole set the first tick after the switch was lifted. The switch is
+//! the ONE install consent, `[packages] auto_install = false` in a scratch aterm.toml.
+//! The store stays untouched — then, as the non-vacuity half, the SAME fixture with the
+//! default config adopts, so the first half cannot pass merely because the fixture never
+//! reaches the adoption line.
 //!
 //! NEVER THE REAL STORE OR MACHINE. HOME is a temp directory (so the default prefix
 //! and `~/.rustup` sit under it, and the machine-settings lane refuses a synthetic

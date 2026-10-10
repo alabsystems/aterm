@@ -10,8 +10,8 @@
 
 use std::fmt;
 
-/// Error type for LZ4 decompression failures. The Kani proofs (#7934) and
-/// regression tests `matches!` on these variants.
+/// Error type for LZ4 decompression failures. The regression tests (#7934)
+/// `matches!` on these variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lz4Error {
     /// Input is too short to contain valid data (shorter than the 4-byte
@@ -234,6 +234,57 @@ fn map_decompress_error(err: aterm_lz4::DecompressError) -> Lz4Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_size_prefix_empty_body_is_ok() {
+        // 4-byte prefix of 0 + 0-byte body = valid "empty" decode.
+        let r = decompress_size_prepended(&[0, 0, 0, 0]);
+        assert!(r.is_ok(), "empty claim + empty body must succeed: {r:?}");
+        assert_eq!(r.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn garbage_after_valid_prefix_errors_not_panics() {
+        // Prefix says "4 bytes", body is garbage. Must not panic.
+        for byte in 0u8..=255 {
+            let input = [4, 0, 0, 0, byte];
+            let _ = decompress_size_prepended(&input);
+        }
+    }
+
+    /// THE ANTI-DOS LAW ON THE WARM TIER'S ADVERSARIAL INPUT: whatever the
+    /// body, a decode that succeeds returns exactly the length its prefix
+    /// claims, so a peer cannot make the decoder emit more (or fewer) bytes
+    /// than it was told. Every claim 0..=16 × every body of 0, 1 or 2 bytes
+    /// (1.1M inputs) — the bodies the decoder can read a token, a literal and
+    /// a match offset from — and every input shorter than the prefix is
+    /// `InputTooShort`.
+    #[test]
+    fn small_claims_decode_to_their_claim_or_fail() {
+        let mut bodies: Vec<Vec<u8>> = vec![Vec::new()];
+        bodies.extend((0..=u8::MAX).map(|a| vec![a]));
+        for a in 0..=u8::MAX {
+            bodies.extend((0..=u8::MAX).map(|b| vec![a, b]));
+        }
+        let mut decoded = 0usize;
+        for claim in 0..=16u32 {
+            for body in &bodies {
+                let input = [&claim.to_le_bytes()[..], body].concat();
+                if let Ok(out) = decompress_size_prepended(&input) {
+                    assert_eq!(out.len(), claim as usize, "{input:02x?}");
+                    decoded += 1;
+                }
+            }
+        }
+        assert!(decoded > 0, "no input decoded: the law held vacuously");
+        for short in [&b""[..], b"\x00", b"\x00\x00", b"\xff\xff\xff"] {
+            assert_eq!(
+                decompress_size_prepended(short),
+                Err(Lz4Error::InputTooShort),
+                "{short:02x?}"
+            );
+        }
+    }
 
     #[test]
     fn test_decompress_too_short() {

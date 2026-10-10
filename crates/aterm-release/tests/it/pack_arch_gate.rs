@@ -5,37 +5,20 @@
 //!
 //! `tools/atpkg-pack.sh` writes `target = "<triple>"` into a manifest it then signs, and
 //! every client picks its artifact by that field. A signature proves the bytes were not
-//! altered; it says nothing about whether they are the architecture they claim. The lane
-//! has carried an arch gate for that since the macOS mislabel — under the comment "never
-//! trust the label, read the Mach-O" — but until 2026-09-18 it was written
+//! altered, not that they are the architecture they claim. The arch gate was once
+//! conditional on `lipo` (macOS-only), so on the Linux and Windows publishers it skipped
+//! with no message and signed an AArch64 ELF as `x86_64-unknown-linux-gnu`; the bundle
+//! lane had no arch gate at all, only a native smoke-exec that passes for whatever the
+//! builder is. A guard that cannot fail is worse than no guard, because it reads as
+//! coverage.
 //!
-//! ```text
-//! if [[ -n "$WANT_ARCH" ]] && command -v lipo >/dev/null 2>&1; then …
-//! ```
-//!
-//! and `lipo` ships with Xcode, on macOS, only. On the Linux publisher — the lane
-//! `tools/linux-auto-atpkg.sh` drives with `TRIPLE="$LINUX_TRIPLE"` — and on any Windows
-//! one, THE WHOLE LOOP WAS SKIPPED WITH NO MESSAGE. Measured on x86_64 Linux by handing
-//! the shipping script an AArch64 ELF with `TRIPLE=x86_64-unknown-linux-gnu`: it packed,
-//! wrote `pkg-stubprog-1.toml` claiming `target = "x86_64-unknown-linux-gnu"` over a
-//! payload that cannot exec on one, printed `PACK-SPEC` and exited 0. The `*)  WANT_ARCH=""`
-//! arm was a second such skip, for any triple the `case` did not name.
-//!
-//! `tools/atpkg-pack-bundle.sh` was worse: it packs a PRE-BUILT sysroot, has no `--target`
-//! anywhere to fall back on, and had NO arch gate on any OS — only fat-Mach-O thinning
-//! under `case "$TRIPLE" in *-apple-darwin)`, plus a per-bin smoke-exec that runs the bins
-//! NATIVELY on the builder and so passes for whatever the builder is (the same shape as the
-//! Linux release lane's `aterm --version`, which is how that lane shipped an AArch64 tarball
-//! under an x86_64 name).
-//!
-//! A guard that cannot fail is worse than no guard, because it reads as coverage. So the
-//! reader is now `od` over ELF, Mach-O (thin and fat) and PE — coreutils, present wherever
-//! bash is — and a missing reader, an unnameable triple and an empty file list are each a
-//! REFUSAL. This file is the half of that guard which runs where bash does not: pure text
-//! over committed files plus `atpkg::TARGETS`. The BEHAVIOUR is exercised against crafted
+//! So the reader is `od` over ELF, Mach-O (thin and fat) and PE — present wherever bash is
+//! — and a missing reader, an unnameable triple and an empty file list are each a
+//! REFUSAL. This file is the half of that guard which runs without bash: pure text over
+//! committed files plus `atpkg::TARGETS`. The behaviour is exercised against crafted
 //! object headers, and end to end against the shipping packer, by
-//! `tools/test-atpkg-pack-arch-gate.sh`, which `the_hermetic_suite_passes` below runs
-//! wherever there is a shell to run it in.
+//! `tools/test-atpkg-pack-arch-gate.sh`, which `the_hermetic_suite_passes`
+//! runs wherever there is a shell to run it in.
 
 use std::path::{Path, PathBuf};
 

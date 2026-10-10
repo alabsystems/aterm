@@ -43,20 +43,52 @@ pub enum AfterRestart {
     Command(String),
     /// The window's host relaunches it on its own conversation once the
     /// restart has ended it (`[harness] relaunch`): nothing for a person to
-    /// type ([`RELAUNCH_WORDS`]). Said only where that relaunch would come
+    /// type ([`RELAUNCH_WORDS`]), and the restart a remedy names is the
+    /// explicit one ([`restart_command`]), whose exit the host reads as the
+    /// restart's — a bare `signal term`'s reads as the agent's own. Said
+    /// only where that relaunch would come
     /// ([`super::relaunch::resumes_on_exit`]), since it replaces the command.
     Relaunch,
+    /// The window's host carries the explicit restart ([`restart_command`])
+    /// and brings back what it ends
+    /// ([`super::relaunch::carries_restart`]), but on what it cannot promise
+    /// in advance — a Codex: its thread where that has a rollout by then,
+    /// else a fresh start. The remedy names that restart and nothing after
+    /// it: neither [`RELAUNCH_WORDS`] nor a resume line a person would run
+    /// over the relaunch (review of `fix/restart-advice`, 2026-10-08: a
+    /// hosted Codex was promised its conversation).
+    Act,
 }
 
 /// What a remedy says in place of a command when the host relaunches the
 /// agent itself ([`AfterRestart::Relaunch`]).
 pub const RELAUNCH_WORDS: &str = "aterm relaunches it on its conversation";
 
+/// THE EXPLICIT RESTART a remedy names wherever the window's host relaunches
+/// the agent ([`AfterRestart::Relaunch`]; design of 2026-10-08): `restart
+/// pid=<pid> if-stalled` — the leader the stall was published for, else no
+/// `pid=` (the tab's foreground group) — and, with the tab's id `sid` (`@`
+/// or not), as a person runs it: `aterm ctl @<sid> restart pid=<pid>
+/// if-stalled`. Its stamp is written before its signal, so the exit is the
+/// restart's whoever reads it, and it ends a program that lives through its
+/// `SIGTERM` — where a bare `signal term`'s exit reads as the agent's own.
+#[must_use]
+pub fn restart_command(sid: Option<&str>, pid: Option<u32>) -> String {
+    let args = pid.map_or_else(
+        || "restart if-stalled".to_string(),
+        |pid| format!("restart pid={pid} if-stalled"),
+    );
+    match sid {
+        Some(sid) => format!("aterm ctl @{} {args}", sid.trim_start_matches('@')),
+        None => args,
+    }
+}
+
 /// WHICH LOGIN A RESUME TYPED BY HAND RUNS UNDER, for a session the harness
 /// relaunched under a login of its choosing (an account move,
 /// `docs/DESIGN-claude-accounts-2026-10-01.md` §6): the clause a remedy adds
 /// to the sentence that hands a person [`command`]. The command itself
-/// carries NO environment, by decision (2026-10-01):
+/// carries NO environment, by decision:
 ///
 /// * every surface that prints it has a hard budget — the tab's mark is 200
 ///   bytes, a remedy's sentence 90 characters — and steps down

@@ -68,10 +68,9 @@ fn geometry() -> Geom {
 }
 
 /// the rainbow kitty's hostile pre-decay fixture: a same-instant ping-pong SWEEP across 160
-/// distinct columns. The two-cell alternation above no longer saturates rainbow kitty —
-/// its cell-ownership dedup collapses revisits into ONE live spark per cell
-/// (exactly the stacking the audit caught), so alternating two cells now
-/// measures ~2 sparks. Sweeping distinct cells fills the resident spark store
+/// distinct columns. A two-cell alternation does not saturate rainbow kitty:
+/// its cell-ownership dedup collapses revisits into ONE live spark per cell,
+/// so it measures ~2 sparks. Sweeping distinct cells fills the resident spark store
 /// for real while the frozen clock keeps every emission on the cold path.
 fn saturated_sweep(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
     let config = config(style);
@@ -150,19 +149,10 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
 
 /// The frozen sweep's VACUITY floor is 3,600 quads: under it the fixture no
 /// longer exercises substantial geometry and its timing proves nothing.
-///
-/// RE-BASED 2026-09-27. The floor was 5,000 from `c754baa5f` (2026-08-29),
-/// when the sweep drew 5,584, and this ignored gate had been red on it — not
-/// on its timing — for four weeks. A first-parent bisection over
-/// `c754baa5f..facd8f805` puts the step at `5d1c440af` (2026-08-30), the merge
-/// that brought the tall band's redesign (a plateau above the row-boundary
-/// spine instead of an underline-shaped wash): 5,559 on its first parent,
-/// 4,041 on it. The fixture did not change there, and the seven readings the
-/// bisection took after it sit in 4,041-4,274 (4,273 on `facd8f805`, M5 Max,
-/// 4,226 under + 47 over). A changed band shape, not a sweep that stopped
-/// saturating — the hot-ribbon gate below reads 10,013 under quads the same
-/// day — so the floor follows the design: 3,600 is 11% under the lowest
-/// post-merge reading.
+/// The tall band's plateau shape (`5d1c440af`) draws 4,041-4,274 quads on
+/// this sweep (M5 Max), down from 5,584 under the old underline wash: a
+/// changed band shape, not a sweep that stopped saturating, so the floor
+/// follows the design. 3,600 is 11% under the lowest reading.
 #[test]
 #[ignore = "perf gate: run manually: --release --test effects_suite -- cursor_bench:: --ignored --nocapture --test-threads=1"]
 fn bench_cursor_rainbow_frozen_sweep_baseline() {
@@ -316,14 +306,14 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     // The no-jump body has a dedicated share. Crossing it means a supposedly
     // ordinary typing frame borrowed jump/overflow capacity. The share is
     // `RAINBOW_RIBBON_QUAD_BUDGET`, restated here because a `tests/` target
-    // cannot see it; it moved `1/2 -> 5/8` on 2026-08-31 so the cap stops
-    // shedding the TAIL of a long line (see the emitter's own note).
+    // cannot see it; 5/8 keeps the cap from shedding the TAIL of a long
+    // line (see the emitter's own note).
     assert!(
         max_under_quads * 8 <= 16_384 * 5,
         "hot retina ribbon exceeded its dedicated share ({max_under_quads} quads)"
     );
     // Timing remains a release-only smoke. The non-ignored work/capacity
-    // regression below owns deterministic enforcement. Five audit runs while
+    // regression above owns deterministic enforcement. Five runs while
     // another crate compiled measured stable medians of 268–434 µs but p90
     // scheduler tails of 511–839 µs; a 500 µs p90 therefore rejected healthy
     // work for unrelated CPU contention. Keep the CPU median under the 500 µs

@@ -242,6 +242,27 @@ pub(crate) struct AgentRestore {
     /// Its version, when it had registered one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// THE CLAUDE HOME IT RAN UNDER (2026-10-09; additive, absent tolerated,
+    /// written only when set): the raw `CLAUDE_CONFIG_DIR` of its own exec
+    /// environment, as the host read it while it ran
+    /// (`aterm_agent::harness::relaunch::Snapshot::home`). The relaunch after
+    /// aterm ended puts it back on its line as every live relaunch does
+    /// (`relaunch::required_env`): without it, an agent a wrapper or its own
+    /// command line started under another home came back on
+    /// `~/.claude.json`, in the first-run theme picker, never resuming
+    /// (measured live for the explicit restart, `b16490d3d`). An older
+    /// producer never writes it, and that leaf restores as it always did; an
+    /// older successor ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// THE LOGIN IT RAN UNDER, the same way: the raw
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`Snapshot::login`). Set and empty —
+    /// the default login NAMED — is written `""`, which is not the same line
+    /// as none. A leaf that names a home or a login is relaunched under
+    /// them, never under the roster's proven active account, which is for an
+    /// agent nothing says the login of (`harness_host::RestoredAgent::unread`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     /// A CODEX's run (its home, its mode, when it started): what its
     /// relaunch reads beside the thread `session` names. `None` for Claude
     /// Code — and a Codex whose run is lost is relaunched by no lane.
@@ -279,6 +300,8 @@ impl AgentRestore {
             session: snap.session,
             cwd: snap.cwd,
             version: snap.version,
+            home: snap.home,
+            login: snap.login,
             codex: snap.codex.map(|run| CodexRestore {
                 home: run.home.to_string_lossy().into_owned(),
                 embedded: run.embedded,
@@ -318,14 +341,18 @@ impl AgentRestore {
             // reads the shell's dialect itself when it runs; and not read here,
             // on the event loop, from a shell that just started.
             dialect: None,
-            // The login the agent ran under is not carried by the layout (no
-            // environment is), and none is read here, on the event loop. The
-            // host that relaunches it knows the snapshot is the layout's
-            // (`harness_host::RestoredAgent::cold`): where the owner listed
-            // two or more Claude Code accounts it carries the machine's
-            // proven active one, and with no roster nothing is added — the
-            // relaunch takes the reopened shell's own, as ever.
-            login: None,
+            // The login and the Claude home the agent ran under, as the
+            // layout carried them off the host's snapshot (nothing is read
+            // here, on the event loop): its relaunch line carries both, as a
+            // live relaunch's does. A leaf that names neither (an older
+            // build's, or an agent that had neither variable) adds nothing
+            // of its own: the host that relaunches it knows the snapshot is
+            // the layout's (`harness_host::RestoredAgent::unread`), and where
+            // the owner listed two or more Claude Code accounts it carries
+            // the machine's proven active one; with no roster the relaunch
+            // takes the reopened shell's own, as ever.
+            login: self.login,
+            home: self.home,
         }
     }
 }
@@ -5433,6 +5460,8 @@ metadata = "opaque=copy-me"
                 session: None,
                 cwd: remote.clone(),
                 version: None,
+                home: None,
+                login: None,
                 codex: None,
             }));
         }
@@ -5919,6 +5948,8 @@ metadata = "opaque=copy-me"
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
             cwd: "/Users//me/work".into(),
             version: Some("2.1.283".into()),
+            home: None,
+            login: None,
             codex: None,
         };
         let mut m = sample();
@@ -5966,6 +5997,7 @@ metadata = "opaque=copy-me"
             }),
             dialect: None,
             login: None,
+            home: None,
         };
         let mut m = sample();
         let mut next = 0;
@@ -6038,5 +6070,209 @@ metadata = "opaque=copy-me"
                 }
             }
         }
+    }
+
+    /// THE CLAUDE HOME AND THE LOGIN AN AGENT RAN UNDER RIDE ITS LEAF INTO
+    /// THE RELAUNCH AFTER ATERM ENDED (2026-10-09): what the host read off
+    /// its process (`Snapshot::home`, `::login`) goes onto the leaf
+    /// ([`AgentRestore::of`]), through every on-disk format a cold restore
+    /// reads — the layout's own codec (the quit's `session.toml`, the
+    /// seamless update's handoff layout) and the crash journal's image —
+    /// back into the reopened tab's snapshot ([`AgentRestore::snapshot`]),
+    /// and onto the line its relaunch plans
+    /// (`aterm_agent::harness::relaunch::exit_line`: `required_env`, as every
+    /// live relaunch's). The default login NAMED (set and empty) stays named.
+    /// NEGATIVE CONTROL: a leaf naming neither plans today's line, byte for
+    /// byte.
+    ///
+    /// AND BOTH WAYS ACROSS AN UPDATE: a leaf as 0.101.0 writes it (its
+    /// `AgentRestore`, frozen below) is what this build writes for an agent
+    /// with neither, and reads back as today — no home, no login, today's
+    /// line; and 0.101.0's reader takes a leaf naming both, ignoring them.
+    ///
+    /// RED with the fields left off the leaf (`of` and `snapshot` as before):
+    /// every format gives back neither, and the line is the plain one.
+    #[test]
+    fn a_restored_agents_home_and_login_ride_its_leaf_into_its_relaunch_line() {
+        use aterm_agent::harness::relaunch::{Snapshot, exit_line};
+        use aterm_agent::harness::upgrade::Dialect;
+        const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
+        const HOME: &str = "/Users//me/lab home/.claude";
+        const LOGIN: &str = "/Users//me/logins/work-2";
+
+        /// `AgentRestore` as 0.101.0 declares it
+        /// (`git show v0.101.0:crates/aterm-gui/src/restore.rs`): no home,
+        /// no login, and no `deny_unknown_fields`.
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct AgentRestore0101 {
+            pid: u32,
+            start: String,
+            program: String,
+            argv: Vec<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            session: Option<String>,
+            cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            version: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            codex: Option<CodexRestore>,
+        }
+        fn first_agent(node: &RestoredSplitTree) -> Option<AgentRestore> {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(t),
+                } => t.agent.as_deref().cloned(),
+                RestoredSplitTree::Leaf { .. } => None,
+                RestoredSplitTree::Split { first, second, .. } => {
+                    first_agent(first).or_else(|| first_agent(second))
+                }
+            }
+        }
+        fn number(node: &mut RestoredSplitTree, next: &mut u64) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(t),
+                } => {
+                    t.local_id = Some(*next);
+                    *next += 1;
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    number(first, next);
+                    number(second, next);
+                }
+            }
+        }
+
+        let ran = |home: Option<&str>, login: Option<&str>| Snapshot {
+            tab: "s-old".into(),
+            pid: 4242,
+            start: "Fri Oct  9 01:02:03 2026".into(),
+            shell: 4241,
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some(SESSION.into()),
+            cwd: "/work".into(),
+            version: Some("2.1.295".into()),
+            codex: None,
+            dialect: Some(Dialect::Zsh),
+            login: login.map(str::to_string),
+            home: home.map(str::to_string),
+        };
+        // The reopened tab's snapshot, read back from each on-disk format,
+        // in a zsh as the relaunch's plan reads the reopened shell's dialect.
+        let through = |snap: Snapshot| -> Vec<(&str, Snapshot)> {
+            let mut m = sample();
+            let mut next = 0;
+            for w in &mut m.windows {
+                for t in &mut w.restored_tabs {
+                    number(&mut t.root, &mut next);
+                }
+            }
+            let carried = AgentRestore::of(snap);
+            m.fill_agents(&|id| (id == 0).then(|| carried.clone()));
+            let layout = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
+            let header = crate::crash_journal::JournalHeader::now(7, false);
+            let (_, journal) = crate::crash_journal::decode(
+                &crate::crash_journal::encode(&m, &header).expect("the image"),
+            )
+            .expect("the journal reads");
+            [("layout", layout), ("crash journal", journal)]
+                .into_iter()
+                .map(|(format, m)| {
+                    let agent = m
+                        .windows
+                        .iter()
+                        .flat_map(|w| &w.restored_tabs)
+                        .find_map(|t| first_agent(&t.root))
+                        .expect("the leaf carries its agent");
+                    let back = agent.snapshot("s-new".into(), 6161);
+                    let back = Snapshot {
+                        dialect: Some(Dialect::Zsh),
+                        ..back
+                    };
+                    (format, back)
+                })
+                .collect()
+        };
+        let program = format!("'/opt/claude/bin/claude' '--resume' '{SESSION}'");
+        let plain = format!(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}");
+        for (format, back) in through(ran(Some(HOME), Some(LOGIN))) {
+            assert_eq!(
+                (back.home.as_deref(), back.login.as_deref()),
+                (Some(HOME), Some(LOGIN)),
+                "{format}"
+            );
+            assert_eq!(
+                exit_line(&back),
+                Some(format!(
+                    " CLAUDE_CONFIG_DIR='{HOME}' CLAUDE_SECURESTORAGE_CONFIG_DIR={LOGIN} \
+                     CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"
+                )),
+                "{format}: the home, then the login, on the line"
+            );
+        }
+        // The default login NAMED is carried named: a different line from none.
+        for (format, back) in through(ran(None, Some(""))) {
+            assert_eq!(
+                (back.home.as_deref(), back.login.as_deref()),
+                (None, Some("")),
+                "{format}"
+            );
+            assert_eq!(
+                exit_line(&back),
+                Some(format!(
+                    " CLAUDE_SECURESTORAGE_CONFIG_DIR='' CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 \
+                     {program}"
+                )),
+                "{format}"
+            );
+        }
+        // NEGATIVE CONTROL: neither — today's line, byte for byte.
+        for (format, back) in through(ran(None, None)) {
+            assert_eq!((&back.home, &back.login), (&None, &None), "{format}");
+            assert_eq!(
+                exit_line(&back).as_deref(),
+                Some(plain.as_str()),
+                "{format}"
+            );
+        }
+
+        // AS 0.101.0 WRITES IT: what this build writes for an agent with
+        // neither variable, byte for byte, and read back as today.
+        let old = AgentRestore0101 {
+            pid: 4242,
+            start: "Fri Oct  9 01:02:03 2026".into(),
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some(SESSION.into()),
+            cwd: "/work".into(),
+            version: Some("2.1.295".into()),
+            codex: None,
+        };
+        let written = aterm_toml::to_string(&old).expect("0.101.0's record");
+        assert_eq!(
+            aterm_toml::to_string(&AgentRestore::of(ran(None, None))).expect("this build's"),
+            written,
+            "an agent with neither is written as 0.101.0 writes it"
+        );
+        let read: AgentRestore = aterm_toml::from_str(&written).expect("this build reads it");
+        assert_eq!((&read.home, &read.login), (&None, &None));
+        let back = Snapshot {
+            dialect: Some(Dialect::Zsh),
+            ..read.snapshot("s-new".into(), 6161)
+        };
+        assert_eq!(exit_line(&back).as_deref(), Some(plain.as_str()));
+        // …and 0.101.0 reads this build's leaf naming both, ignoring them.
+        let both = aterm_toml::to_string(&AgentRestore::of(ran(Some(HOME), Some(LOGIN))))
+            .expect("this build's record");
+        assert!(
+            both.contains("home = ") && both.contains("login = "),
+            "{both}"
+        );
+        assert_eq!(
+            aterm_toml::from_str::<AgentRestore0101>(&both).expect("0.101.0 reads it"),
+            old
+        );
     }
 }

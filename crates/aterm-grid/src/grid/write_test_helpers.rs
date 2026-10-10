@@ -103,10 +103,12 @@ impl Grid {
         // Resolve any deferred wrap before writing
         self.resolve_pending_wrap();
 
-        // If we're at the last column, we need to wrap first
-        // (wide char can't start at last column)
+        // If we're at the last column, we need to wrap first (wide char can't
+        // start at last column), leaving the skipped cell as the production
+        // early wrap does: blanked and recorded as the row's early-wrap hole.
         let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
         if self.storage.cursor.col.saturating_add(1) >= effective_cols {
+            self.blank_wide_wrap_tail(effective_cols, crate::Cell::EMPTY);
             self.advance_autowrap_line();
         }
 

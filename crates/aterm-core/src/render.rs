@@ -1656,6 +1656,20 @@ pub struct RenderInput {
     /// for cells with diacritics (é, ñ, …). The renderer overlays each mark's
     /// glyph on the base so accents render.
     pub combining: Vec<Vec<(usize, Box<[char]>)>>,
+    /// Per-row BiDi visual→logical column map, parallel to
+    /// [`cells`](Self::cells): `visual_to_logical[r][v] == l` means the cell
+    /// painted at frame column `v` of row `r` is the one at frame column `l` in
+    /// logical (written) order. An empty or missing row, and any column past a
+    /// row's map, is the identity, which is every row of a pure-LTR frame.
+    ///
+    /// The engine fill records the permutation `apply_bidi_reorder` applied to
+    /// each row it reordered; a composed split row carries each pane's map at
+    /// that pane's columns, and a host that paints a row over (a band, a
+    /// panel) clears it. The selection is a LOGICAL range (copy reads the
+    /// grid), so [`Self::selection_hit`] tests `map[v]`, not `v`: what is
+    /// highlighted is what is copied. Rendered content: compared in
+    /// `PartialEq`, and a row whose map changed is dirty.
+    pub visual_to_logical: Vec<Vec<u16>>,
     /// Per-row DEC line size (DECDWL/DECDHL via `ESC # 3..6`), drawn scaled.
     /// `SingleWidth` is the default.
     ///
@@ -2165,6 +2179,7 @@ impl PartialEq for RenderInput {
             && self.selections == other.selections
             && self.clusters == other.clusters
             && self.combining == other.combining
+            && visual_to_logical_eq(&self.visual_to_logical, &other.visual_to_logical)
             && self.line_sizes == other.line_sizes
             && self.line_size_spans == other.line_size_spans
             && self.default_bg_spans == other.default_bg_spans
@@ -2191,6 +2206,16 @@ impl PartialEq for RenderInput {
 }
 
 impl Eq for RenderInput {}
+
+/// [`RenderInput::visual_to_logical`] equality by meaning: a missing row and an
+/// empty one are both the identity, so an engine fill (one entry per row) and
+/// a hand-built frame (none) compare equal when nothing is permuted.
+fn visual_to_logical_eq(a: &[Vec<u16>], b: &[Vec<u16>]) -> bool {
+    fn row(rows: &[Vec<u16>], r: usize) -> &[u16] {
+        rows.get(r).map_or(&[][..], Vec::as_slice)
+    }
+    (0..a.len().max(b.len())).all(|r| row(a, r) == row(b, r))
+}
 
 /// What [`RenderInput::apron_row`] was last extracted under: when a fill finds
 /// every term unchanged it keeps the row instead of re-reading history.
@@ -2373,6 +2398,7 @@ impl RenderInput {
         self.selections.clone_from(&source.selections);
         self.clusters.clone_from(&source.clusters);
         self.combining.clone_from(&source.combining);
+        self.visual_to_logical.clone_from(&source.visual_to_logical);
         self.line_sizes.clone_from(&source.line_sizes);
         self.line_size_spans.clone_from(&source.line_size_spans);
         self.default_bg_spans.clone_from(&source.default_bg_spans);
@@ -2476,6 +2502,7 @@ impl RenderInput {
             selections: Vec::new(),
             clusters: Vec::new(),
             combining: Vec::new(),
+            visual_to_logical: Vec::new(),
             line_sizes: Vec::new(),
             line_size_spans: Vec::new(),
             default_bg_spans: Vec::new(),
@@ -2634,6 +2661,9 @@ impl RenderInput {
         }
         self.clusters.drain(0..strip);
         self.combining.drain(0..strip);
+        // Lenient like `row_rev`: a frame built without maps has none to drain.
+        let maps = strip.min(self.visual_to_logical.len());
+        self.visual_to_logical.drain(0..maps);
         if self.row_rev.len() >= strip {
             self.row_rev.drain(0..strip);
         }
@@ -2706,6 +2736,10 @@ impl RenderInput {
         // exact-size so each splice shifts the tail exactly once.
         self.clusters.splice(0..0, (0..strip).map(|_| Vec::new()));
         self.combining.splice(0..0, (0..strip).map(|_| Vec::new()));
+        // Chrome rows are painted in logical order: identity maps, and every
+        // permuted terminal row's map moves down with its cells.
+        self.visual_to_logical
+            .splice(0..0, (0..strip).map(|_| Vec::new()));
         self.images.splice(0..0, (0..strip).map(|_| Vec::new()));
         self.line_sizes
             .splice(0..0, (0..strip).map(|_| LineSize::SingleWidth));
@@ -2849,6 +2883,40 @@ impl RenderInput {
         self.selection.has_selection() || !self.selections.is_empty()
     }
 
+    /// Frame row `frame_row`'s BiDi visual→logical map
+    /// ([`visual_to_logical`](Self::visual_to_logical)); empty when the row is
+    /// in logical order.
+    #[must_use]
+    #[inline]
+    pub fn visual_to_logical_row(&self, frame_row: usize) -> &[u16] {
+        self.visual_to_logical
+            .get(frame_row)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The logical frame column of the cell painted at (`frame_row`,
+    /// `frame_col`): `frame_col` itself unless BiDi reordered that row.
+    #[must_use]
+    #[inline]
+    pub fn logical_col(&self, frame_row: usize, frame_col: usize) -> usize {
+        self.visual_to_logical_row(frame_row)
+            .get(frame_col)
+            .map_or(frame_col, |&l| usize::from(l))
+    }
+
+    /// Where frame row `frame_row` paints the cell of logical column
+    /// `logical`, the inverse of [`Self::logical_col`]: `logical` itself
+    /// unless BiDi reordered that row. A caret kept in logical columns (the
+    /// copy-mode cursor) is painted here, on the cell it names.
+    #[must_use]
+    pub fn visual_col(&self, frame_row: usize, logical: usize) -> usize {
+        let map = self.visual_to_logical_row(frame_row);
+        u16::try_from(logical)
+            .ok()
+            .and_then(|l| map.iter().position(|&m| m == l))
+            .unwrap_or(logical)
+    }
+
     /// Which selection paints a frame-space cell, or `None` when unselected.
     ///
     /// The single renderer predicate: CPU and GPU pass the frame row/column,
@@ -2857,6 +2925,14 @@ impl RenderInput {
     /// empty it is the scalar test and answers `Some(0)`; otherwise it returns
     /// the first entry whose clip and selection accept the cell (pane clips are
     /// disjoint, so first is only).
+    ///
+    /// The selection is a logical range, so on a BiDi-reordered row the cell is
+    /// tested at its logical column ([`Self::logical_col`]) and the highlight
+    /// lands on exactly the cells the copy reads. The clip is a pane box, which
+    /// a row's permutation never leaves, so it is tested at the painted column.
+    /// The wide flags describe the painted cell and hold for its logical one
+    /// too: the reorder moves a wide glyph's lead and continuation as one
+    /// unit, lead first.
     #[must_use]
     #[inline]
     pub fn selection_hit(
@@ -2878,7 +2954,7 @@ impl RenderInput {
             let selection_row = i32::try_from(frame_row)
                 .unwrap_or(i32::MAX)
                 .saturating_sub(self.display_offset);
-            let Ok(selection_col) = u16::try_from(frame_col) else {
+            let Ok(selection_col) = u16::try_from(self.logical_col(frame_row, frame_col)) else {
                 return None;
             };
             return self
@@ -2889,7 +2965,7 @@ impl RenderInput {
         // Entry anchors are already in frame rows (pane origin + that pane's
         // `display_offset`), so no viewport projection applies here.
         let selection_row = i32::try_from(frame_row).unwrap_or(i32::MAX);
-        let Ok(selection_col) = u16::try_from(frame_col) else {
+        let Ok(selection_col) = u16::try_from(self.logical_col(frame_row, frame_col)) else {
             return None;
         };
         self.selections.iter().position(|entry| {
@@ -2933,6 +3009,12 @@ impl RenderInput {
     /// one column past `hi`. That cell is always inside the materialized prefix
     /// (widening needs the other half present in `cells`), so it is never the
     /// omitted tail cell this window exists to catch.
+    ///
+    /// The span is in logical columns. On a BiDi-reordered row the selected
+    /// cells of the materialized prefix may be painted anywhere in it, but the
+    /// reorder permutes only that prefix ([`Self::visual_to_logical`] is never
+    /// longer than the row), so past it logical and painted columns agree and
+    /// the window stays exact where the tail guards read it.
     #[must_use]
     pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
         self.selection_row_keys(frame_row)
@@ -5328,5 +5410,53 @@ mod host_row_prepend_tests {
             placed.cursor_glow_add[0].row, 2,
             "the negative control: the web frame under Placed keeps its old row"
         );
+    }
+    /// A BiDi row's visual→logical map is a per-row channel: the tab-strip
+    /// splice moves it down with the row's cells and the selection, so the
+    /// highlight stays on the cells that hold the selected logical columns.
+    /// The chrome rows get none.
+    #[test]
+    fn a_prepend_moves_each_bidi_row_map_with_its_row() {
+        use crate::selection::{SelectionSide, SelectionType};
+        let mut f = frame();
+        // Row 1 painted `a`, then a reversed two-cell run: logical 2 at visual 1.
+        f.visual_to_logical = vec![Vec::new(), vec![0, 2, 1], Vec::new(), Vec::new()];
+        f.selection
+            .start_selection(1, 2, SelectionSide::Left, SelectionType::Simple);
+        f.selection.update_selection(1, 2, SelectionSide::Right);
+        f.selection.complete_selection();
+        assert!(f.selection_contains_cell(1, 1, false, false));
+        assert!(!f.selection_contains_cell(1, 2, false, false));
+
+        let strip = 2;
+        let rows = vec![vec![RenderCell::default(); 3]; strip];
+        f.prepend_host_rows(
+            strip,
+            rows.iter().map(Vec::as_slice),
+            CH,
+            TOP,
+            &mut Vec::new(),
+            HostRowPixels::Placed,
+        );
+        assert!(f.visual_to_logical_row(0).is_empty() && f.visual_to_logical_row(1).is_empty());
+        assert_eq!(f.visual_to_logical_row(3), [0, 2, 1]);
+        assert!(
+            f.selection_contains_cell(3, 1, false, false),
+            "the highlight moved down with its row"
+        );
+        assert!(!f.selection_contains_cell(3, 2, false, false));
+    }
+
+    /// Equality reads the map by meaning: no entry and an empty entry are both
+    /// the identity, while two different orders of a row are different frames.
+    #[test]
+    fn frames_compare_bidi_maps_by_meaning() {
+        let plain = frame();
+        let mut filled = frame();
+        filled.visual_to_logical = vec![Vec::new(); 4];
+        assert!(plain == filled);
+        let mut reordered = frame();
+        reordered.visual_to_logical = vec![Vec::new(), vec![1, 0]];
+        assert!(plain != reordered);
     }
 }

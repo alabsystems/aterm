@@ -4,8 +4,6 @@
 
 //! Integration tests for `XtermKeyboardState` — Default vs new() divergence,
 //! disabled-state query response, and boundary clamping.
-//!
-//! Part of #3139: closes xterm keyboard test coverage gaps after extraction.
 
 use aterm_types::XtermKeyboardState;
 

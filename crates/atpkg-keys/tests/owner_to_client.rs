@@ -9,11 +9,9 @@
 //! `aterm_update_core::roster` for the release, `atpkg::flow::install` for the toolchain —
 //! and both accept, attributed to the same machine.
 //!
-//! That is the whole "one root" claim, executed rather than asserted. Before this change
-//! the two products had independent trust roots: the app updater's paper master and
-//! atpkg's own `PKG_ROOT_PUBKEY` (a key on disk) with a second delegation tier under it.
-//! There was no document an owner could revoke that stopped both. Now there is exactly one,
-//! and the last test in this file revokes it and watches both stop.
+//! That is the whole "one root" claim, executed rather than asserted: there is exactly one
+//! document an owner can revoke to stop both, and the last test in this file revokes it and
+//! watches both stop.
 //!
 //! Every step uses the shipping types on both sides — `atpkg_keys` on the owner side, the
 //! real client crates on the other. Nothing is re-implemented for the test, so a change
@@ -305,10 +303,8 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
 /// installs NOTHING. Every byte here is genuinely signed and would install under the real
 /// master — the only thing missing is the anchor.
 ///
-/// This is a FORK's state, and this tree's own before 2026-08-15. WRONG BEFORE: it called
-/// it "the shipped state of the tree (`pins::PAPER_MASTER_PUBKEYS` is `&[]`)", which the
-/// armed master made false. What it still describes exactly is what an unpinned build
-/// does: nothing — the test passes its own empty anchor and never reads `pins`.
+/// This is an unpinned FORK's state: the test passes its own empty anchor and never reads
+/// `pins`.
 #[test]
 fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
     let tmp = scratch("inert");
@@ -352,11 +348,9 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
         "the same bytes install under the pinned master"
     );
 
-    // And the SHIPPED anchor is ARMED (2026-08-15): the unpinned behaviour this test
-    // proves is exercised against the synthetic empty anchor above, not the tree's.
+    // And the SHIPPED anchor is ARMED: the unpinned behaviour above is exercised against
+    // the synthetic empty anchor, not the tree's.
     assert!(!atpkg::PKG_TRUST_ANCHORS.is_empty());
-    // The pure core, over the COMPILED anchor. (It once had to be the pure core because
-    // `manager_enabled()` also read `ATPKG_DISABLE`; that switch is gone, 2026-09-23.)
     assert!(atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS));
 }
 

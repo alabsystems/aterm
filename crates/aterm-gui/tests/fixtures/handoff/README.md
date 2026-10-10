@@ -34,10 +34,17 @@ release through this build's `take_incoming`. It asserts that:
   shown, in the order the manifest names it, at its carried geometry, with no
   scrollback, with how its command ended and with no link left to click. A
   desk whose producer carried none, which is every desk before v0.100.0,
-  shows none;
+  shows none. From v0.101.0 each held pane also keeps the session id it was
+  known by, its scrollback sidecar is taken at the depth it stamps, its
+  control carry crosses, and it says whether its failure had been seen;
 - each session's meta is reassembled as its parent recorded it (v0.95.0 on):
   the absolute row counters, whether an application colour diff rides it,
-  and the shell-integration phase, marks and completed-command count;
+  and the shell-integration phase, marks and completed-command count, and
+  (v0.101.0 on) whether the engine's in-flight output state rides it;
+- each session owes its program exactly the render debt its record carries
+  (v0.101.0 on: the rows the parent's engine owed a carried alternate
+  screen), and a session whose record carries none, which is every session
+  before v0.101.0, owes nothing;
 - the screen and layout digests equal what that release's parent committed to;
 - this build's adoption proof and its `ProofReady` and `Commit` frames match
   the parent's, byte for byte, over the recorded inputs;
@@ -97,8 +104,9 @@ lenient (law L3 of the 2026-09-22/23 audit).
 | `seamless-<pid>-<nonce>.s<id>.ctl` | Each session's control-carry sidecar, exactly as written. |
 | `seamless-<pid>-<nonce>.s<id>.hist` | Each session's history-carry sidecar, exactly as written (from v0.94.0, for a session whose history is deeper than its checkpoint carries). |
 | `seamless-<pid>-<nonce>.h<id>.heldgrid` / `.heldalt` | Each held pane's main and inactive grid sidecars, exactly as written (from v0.100.0, for a pane kept open after its command exited). |
+| `seamless-<pid>-<nonce>.h<id>.hist` / `.h<id>.ctl` | Each held pane's history-carry and control-carry sidecars, exactly as written (from v0.101.0). |
 | `s<id>.meta.json` | A copy of the meta JSON the manifest embeds for session `<id>`, extracted so it can be reviewed. The guard checks that it equals the embedded copy. |
-| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). From v0.97.0 the parent also records `park_carry_ceiling` (the ceiling the park captured under, from the successor's handoff policy), and each session row `rung` (the `CarryRung` the ladder carried it at: `full` or `stripped-links`, and on a policy desk `visible-only` or `repaint`) and `links_stripped` (how many of its lines lost their OSC 8 links), and from v0.98.0 `history_links_stripped` (how many lines of its `.hist` sidecar the export wrote with their OSC 8 links dropped). The policy desks (v0.97.0's, which `generator-v0.97.0-policy.rs.txt` wrote, and v0.98.0's, which `generator.rs.txt` wrote) add `repaint` (whether the producer flagged the session for a redraw) and `history_dropped` (the lines of its history this hop leaves behind, counted) on each row, and v0.98.0's parents record `park_carry_ceiling` as the policy's `visible` or `repaint`. The guard checks the v0.94.0 fields (`history_take`, `history_lost`, `fg_holder`) against the manifest and the sidecar's bytes, and against what this build takes and imports; the v0.95.0 fields against the checkpoint this build reassembles from the meta; and `repaint` and `history_dropped` against what this build adopts and imports (a row without them repaints nothing and drops nothing). It does not read `park_carry_ceiling`, `rung`, `links_stripped` or `history_links_stripped`. From v0.100.0 the parent also records each held pane (`[[held]]`): its `local_id`, `rows`, `cols`, `alt_grid` and how its command ended (`exit_code` or `exit_signal`), which the guard checks against what this build shows. |
+| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). From v0.97.0 the parent also records `park_carry_ceiling` (the ceiling the park captured under, from the successor's handoff policy), and each session row `rung` (the `CarryRung` the ladder carried it at: `full` or `stripped-links`, and on a policy desk `visible-only` or `repaint`) and `links_stripped` (how many of its lines lost their OSC 8 links), and from v0.98.0 `history_links_stripped` (how many lines of its `.hist` sidecar the export wrote with their OSC 8 links dropped). The policy desks (v0.97.0's, which `generator-v0.97.0-policy.rs.txt` wrote, and v0.98.0's, which `generator.rs.txt` wrote) add `repaint` (whether the producer flagged the session for a redraw) and `history_dropped` (the lines of its history this hop leaves behind, counted) on each row, and v0.98.0's parents record `park_carry_ceiling` as the policy's `visible` or `repaint`. The guard checks the v0.94.0 fields (`history_take`, `history_lost`, `fg_holder`) against the manifest and the sidecar's bytes, and against what this build takes and imports; the v0.95.0 fields against the checkpoint this build reassembles from the meta; and `repaint` and `history_dropped` against what this build adopts and imports (a row without them repaints nothing and drops nothing). It does not read `park_carry_ceiling`, `rung`, `links_stripped` or `history_links_stripped`. From v0.100.0 the parent also records each held pane (`[[held]]`): its `local_id`, `rows`, `cols`, `alt_grid` and how its command ended (`exit_code` or `exit_signal`), which the guard checks against what this build shows. From v0.101.0 each session row also records `output_state` (whether the meta carries the engine's in-flight output state) and, for a session that owes it, `render_debt` (`"<shift>,<pushed>"`), and each held pane `sid`, `history_take` (the lines its `.h<id>.hist` sidecar carries), `history_dropped`, `control` (whether it names a `.h<id>.ctl` sidecar) and `failure_seen`. The guard checks all of them but `history_dropped` against what this build adopts and shows (a row without `render_debt` owes nothing). |
 
 The bytes are unchanged with one exception. The manifest names each grid
 sidecar by its absolute path in the producer's private directory, and the
@@ -437,15 +445,11 @@ history as `generator.rs.txt` before v0.100.0's replaced it.
 The same twelve desks, written by v0.100.0's producer, and one desk for the
 shape v0.100.0 added. v0.99.0 has no directory: it was published as source
 only and never cut (`RELEASES.ledger` has no build for it), so no install runs
-its producer. `generator.rs.txt` is the v0.100.0 generator, the one that
-writes all thirteen desks, and the template for the next release; its header
-lists what changed from v0.98.0's. It ran once at the v0.100.0 tag
+its producer. The v0.100.0 generator, the one that writes all thirteen
+desks, is in git history as `generator.rs.txt` before v0.101.0's replaced it;
+its header lists what changed from v0.98.0's. It ran once at the v0.100.0 tag
 (6b38259f7da1) with `SOURCE_DATE_EPOCH=1790807622`, and v0.100.0's own
-consumer adopted every desk exactly. As a template it predates one API
-change: from 5afd825d6 on a policy read holds the whole file, `PolicyRead::Parsed(PolicyFile)`, whose
-top-level keys are `.legacy` and whose rescue for a build is
-`.for_build(build)`, so the next generator's `fx_park_policy` reads
-`file.legacy` where this one reads the parsed policy itself.
+consumer adopted every desk exactly.
 
 v0.100.0's policy read, capture ladder, worker order and history carry are
 v0.98.0's. What changed and reaches these bytes:
@@ -481,6 +485,106 @@ The new desk:
   layout names each pane by its id. The successor shows each read-only, with
   every link stripped; an older successor skips the list and keeps its
   placeholder, so no digest moves.
+
+## The v0.101.0 desks
+
+The same thirteen desks, written by v0.101.0's producer. No shape v0.101.0
+changed needs a desk of its own: each one is carried by a desk that already
+stands for it, so `REQUIRED_DESKS` is unchanged. `generator.rs.txt` is the
+v0.101.0 generator, the one that writes all thirteen desks, and the template
+for the next release; its header lists what changed from v0.100.0's. It ran
+once at the v0.101.0 tag (8ed1063a8dff) with `SOURCE_DATE_EPOCH=1791501389`
+and both commit pins, and v0.101.0's own consumer adopted every desk exactly,
+including each held pane's history import.
+
+v0.101.0's capture ladder, worker order and history carry for the handed
+sessions are v0.100.0's. Every handed session's grid, control and history
+sidecar is byte for byte the one v0.100.0 wrote. Every meta is v0.100.0's plus
+one key, except the wall-clock times in the shell marks (`*_time_ms`:
+`colour-and-shell` s0 and s1, `shell-integration` s0 and s1, `policy-visible`
+s1). What changed and reaches these bytes:
+
+- The output-state carry (round eight of the update audit, finding 502). The
+  meta carries the engine's in-flight output state (`output_state`: the REP
+  character, an SGR 58 underline colour, an open OSC 8 link, a VT52 address in
+  progress, a pending ZWJ, the XTPUSHSGR stack, the XTSAVE'd modes) to a
+  successor that reads it. Every session that printed anything has a REP
+  character, so all 41 sessions carry it, as the section on `output_state`
+  below foresaw. To such a successor an open link or a VT52 address is no
+  park hazard, and on the fork lane neither is a picture the carry swallows (a
+  kitty APC, an OSC 1337 image, a sixel string). `stalled-sequence` still
+  carries `OscString`, `CsiParam` and `SosPmApcString` in its meta.
+- The render debt (the render stream's R08). A record carries the rows the
+  engine owed a carried alternate screen (`render_debt = "<shift>,<pushed>"`).
+  `incident-55x149`'s Claude Code, resized in 1049 from 56 rows to 55 and
+  never fully redrawn, owes `-1,0`. That desk stands for the debt, and no
+  other session owes anything.
+- Held panes carry their scrollback and control carry (round eight, findings
+  21, 39 and 730, and U34). `held-pane`'s two panes now name a `.h<id>.hist`
+  sidecar (11 and 12 lines, none left behind) and a `.h<id>.ctl` sidecar. Each
+  manifest entry names both, the pane's `sid` and `failure_seen`. `make`'s
+  failure, in the tab in front, had been seen; vim's, in the tab behind it,
+  had not.
+- Every manifest carries a turn-id count (`next_turn_id`): the ids the process
+  minted plus the 4,096 the parent may still mint before it exits
+  (`TURN_ID_RESERVE`). That is 4,096 on a desk with no turns, and 4,137 where
+  v0.100.0's said 41. The control carry is spelled in the successor's words.
+- Each layout window and the window carry name the window's raw inner size
+  (`inner_px`). Here it is the frame a headless `App` of that build gives the
+  grid and its message band. The window carry also says when its messages
+  were captured (`messages_captured_unix_ms`). No window has a presence row.
+- The window carry's `next_message_id` is 1 where v0.100.0's was 0, on the
+  eleven desks with no update row. It is the headless `App`'s own carry
+  (`carried.next_message_id`), so this is the producer's change, not the
+  generator's. The two desks with an update row (`incident-55x149`,
+  `policy-visible`) still say 2. That row's title is a generator input and
+  names the successor, `Installing aterm v0.102.0`, where v0.100.0's named
+  v0.101.0.
+- The policy desks' successor seals its rescue as a `[[ranges]]` table naming
+  v0.101.0's build (1791501389), with its reason and the top-level hull. That
+  is the only shape a cut seals since 5afd825d6, and the generator asserts
+  `PolicyFile::parse_for_cut` accepts it. The producer reads the range and
+  parks under it.
+
+The producer also folds a desk past the layout's caps
+(`RestoreManifest::fold_into_caps`). No desk here is past them, so none is
+folded. Two fields stay empty on every desk: a record's `journal_key` (each
+desk's process wrote its own crash journal image) and a handoff leaf's
+`agent` (no desk owes a relaunch).
+
+The guard checks the new facts each `parent.toml` records: `output_state`
+and `render_debt` on every session, and each held pane's `sid`,
+`history_take`, `history_dropped`, `control` and `failure_seen`. It also runs
+this build's held import over the held panes' `.h<id>.hist` bytes, the way
+`App::restore_held_leaf` and the import worker run it
+(`assert_held_history_imports`). Every line the parent stamped must land in
+front of the held screen, cell for cell, with nothing lost, and with every
+link dropped, as on the screen. v0.101.0's own consumer kept those links
+clickable, so `h2.hist`'s two links and `h3.hist`'s one are checked against
+this build's consumer only.
+
+As a template, `generator.rs.txt` predates one API change. Since 08ec7b748
+(2026-10-08) the build stamp is `aterm_types::version::BuildStamp`, installed
+with `aterm_types::version::install`. `crate::build_info` no longer exports
+`BuildStamp` or `install_build_stamp`, so `fx_install_release_stamp` does not
+compile at a later tag. Rewrite it to install the new stamp. It has nine more
+fields, and each one is what the release's shipped binary stamps:
+
+- `app_version` is the tag's `[workspace.package] version`.
+  `crate::build_info::version()` reads it now, so it is what keeps
+  `producer_version` right.
+- `compiler_version_line`, `compiler_commit`, `compiler_host` and
+  `compiler_trust_version` come from the `trustc -vV` that built the release,
+  and `compiler_flavor` is `"t"`.
+- `build_profile`, `trust_verify` and `release_build` are set as the shipped
+  binary sets them: the `release` profile, its verification state and
+  `true`. About and `aterm ctl version` on that binary show them.
+
+The git fields and `build_number` come from the same three pins as before.
+
+`rendezvous.toml` is v0.100.0's transport: the same claim frame, grant header,
+body and descriptor order. Only the identity fields differ: the producer, the
+target, the birth record, the device terms and the proof over them.
 
 ## The rendezvous transport
 
@@ -534,14 +638,16 @@ For every release in `PINNED_RENDEZVOUS` it asserts that:
 Changing `CLAIM_MAGIC` to `ATRZ2C`, or pushing the Commit end before the
 readiness end, turns it red.
 
-All eight releases with fixtures are pinned: v0.91.0, v0.92.0, v0.93.0,
-v0.94.0, v0.95.0, v0.97.0, v0.98.0 and v0.100.0 (v0.96.0 and v0.99.0 were
-never cut). Each file was
+All nine releases with fixtures are pinned: v0.91.0, v0.92.0, v0.93.0,
+v0.94.0, v0.95.0, v0.97.0, v0.98.0, v0.100.0 and v0.101.0 (v0.96.0 and
+v0.99.0 were never cut). Each file was
 written by the capture at the end of `generator.rs.txt`, appended on its own to
 `seamless_carry_tests.rs` in a worktree at the tag and run with the tag's
-commit and ledger build number (step 3 below). Every API it uses is present
-from v0.91.0 on, so it needs no adapting; only the target, birth record,
-device terms and proof differ between the files.
+commit and ledger build number (step 3 below). Through v0.100.0 every API it
+used was present from v0.91.0 on. v0.101.0's parent also checks the
+dialler's code, so its `accept_claim` takes a `DialerCode`, and the capture
+passes `DialerCode::this_process()`. Only the target, birth record, device
+terms and proof differ between the files.
 
 ## Adding the next release's fixtures
 
@@ -559,8 +665,8 @@ Do this once for each release, after its tag exists (see docs/RELEASING.md,
   `seamless_fixture_tests.rs`, so keep them in their shape: one
   `("vX.Y.0", "<desk>")` pair per row. In `PINNED_DESKS` the release is the
   one whose fixtures hold the desk; in `REQUIRED_DESKS` it is the desk's
-  floor, the first release that must write it. `tools/release-preflight.sh`
-  asks the same questions before anything is staged.
+  floor, the first release that must write it. `targo --unverified ship release`
+  asks the cut's own gate before anything is staged.
 - `gates::handoff_fixture_guard_gate` runs the guard itself in the cut tree
   (`targo --unverified test -p aterm-gui --lib` filtered to
   `seamless::fixture_tests::`, in its own target directory), and refuses on a
@@ -595,22 +701,35 @@ shows whether they are in.
    `crates/aterm-gui/src/seamless_carry_tests.rs`, and adapt it to that
    release's API:
    - `fx_capture` must be that release's own capture path. The template
-     copies v0.100.0's: the pool walked in session-id order, each session
-     carried by `carry_for_wire_within` under the park's policy ceiling at the
-     budgets `App::capture_parked_screens` prices, a partial sequence no
-     carry holds or would only swallow carried only over a quiet PTY, every
-     session's control carry taken (without the differ's state below a rung
-     that keeps the screen), then `settle_wire_carries` over the pool, then
-     the held panes (`fx_capture_held`, `App::capture_held_screens`). The
-     repaint set is the sessions whose rung has `CarryRung::needs_repaint`.
-     If the release changed the capture, copy the change.
-   - `fx_write` must run the release's own steps in its order. In v0.100.0
-     (as in v0.98.0) that is the policy read (`fx_park_policy`, the
-     release's checked-in `publish/handoff-policy.toml` read out of a bundle),
-     the PTYs, the capture, the fork lane's history plan
-     (`HistoryPlan::deferred_under`), the worker's policy check, its layout
-     round trip, the control carry's export, the history carry's export and
-     `stamp_manifest`, `write_outgoing_with_held`, then the layout.
+     copies v0.101.0's fork lane. The pool is walked in session-id order.
+     Each session is carried by `carry_for_wire_within` under the park's
+     policy ceiling, at the budgets `App::capture_parked_screens` prices. A
+     partial sequence no carry holds, or one the carry would only swallow
+     that is not a picture, is carried only over a quiet PTY. Every session's
+     control carry is taken (without the differ's state below a rung that
+     keeps the screen), and so is the render debt of a carried alternate
+     screen. Then `settle_wire_carries` runs over the pool. Last come the
+     held panes (`fx_capture_held`, `App::capture_held_screens`), each with
+     its sid, its scrollback's fence and its control carry. The repaint set
+     is the sessions whose rung has `CarryRung::needs_repaint`. If the
+     release changed the capture, copy the change.
+   - `fx_write` must run the release's own steps in its order. In v0.101.0
+     that is:
+     1. the policy read (`fx_park_policy`: the release's checked-in
+        `publish/handoff-policy.toml` read out of a bundle, or a successor's
+        `[[ranges]]` rescue for a policy desk);
+     2. the PTYs, the capture, and the records stamped with the foreground
+        holders and render debts;
+     3. the layout, folded into the caps and committed
+        (`commit_handoff_layout`);
+     4. the fork lane's history plan (`HistoryPlan::deferred_under`, over
+        the handed sessions and the held panes);
+     5. the worker: its policy check, its layout round trip, the control
+        carry's export (`export_for`, with the turn-id count it writes as
+        `next_turn_id`), the history carry's export with the held panes'
+        exports taken out (`take_held`), and `stamp_manifest`;
+     6. `write_outgoing_with_held`, then the layout sidecar
+        (`handoff_diet::seal_layout`).
    - Give every record field and layout leaf field the release added a value
      that a real session would carry, and keep the generator's self-check
      passing.
@@ -628,34 +747,52 @@ shows whether they are in.
      `restored_tabs`, or take it from a real `capture_handoff_layout` on a
      headless `App`. Through v0.98.0 `fx_window` built `restored_tabs` only;
      from v0.100.0 it derives the mirrors and `show` from the tabs it is
-     given.
+     given, and from v0.101.0 each window's `inner_px` (`fx_inner_px`).
 3. Run the generator, still in the worktree:
 
    ```sh
    ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
+   ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
    SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
    ATERM_HANDOFF_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
      targo --unverified test -p aterm-gui --lib -- generate_handoff_fixtures --ignored
    ```
 
    It refuses a desk that the release's own capture would not park, or that
-   its own consumer would not adopt exactly. `ATERM_BUILD_GIT_COMMIT` keeps
-   `producer_commit` the release's commit: without it, the appended generator
-   makes the build read the tree as dirty and write `<commit>-dirty`. It
-   reaches no fixture byte except that `parent.toml` field. The tag is
-   annotated, so take the commit it points at
-   (`git rev-parse --short=12 'vX.Y.0^{commit}'`), not the tag object's own
-   sha.
-   `SOURCE_DATE_EPOCH` makes the build number the one the release was cut
-   with, so each manifest's `outgoing_build` is what the shipped binary
-   writes. Without it a dev build takes the tag commit's epoch instead.
+   its own consumer would not adopt exactly.
+
+   The three pins are the release's build stamp. Since 2026-10-05 the stamp
+   is the binary's (`crates/aterm/build.rs` emits it and `main` installs it).
+   This library's test binary reads a fixed test stamp instead (build
+   3000000000, commit `7e57b1d0c0de`), and no compile-time variable reaches
+   it. So the generator reads the pins at run time and installs what the
+   shipped binary's build script stamped from them
+   (`fx_install_release_stamp`, first, before anything reads provenance).
+   It refuses to run without them. At a tag that contains 08ec7b748, rewrite
+   `fx_install_release_stamp` for `aterm_types::version` first. The v0.101.0
+   section says how.
+   - The commit pins keep `producer_commit` the release's commit. They reach
+     no fixture byte except that `parent.toml` field and the rendezvous
+     record's target and the proof over it. The tag is annotated, so take the commit it points at
+     (`git rev-parse 'vX.Y.0^{commit}'`, and `--short=12` for the short
+     one), not the tag object's own sha.
+   - `SOURCE_DATE_EPOCH` makes the build number the one the release was cut
+     with. Each manifest's `outgoing_build` is then what the shipped binary
+     writes, and the wire caps and history export judge the hop from that
+     build.
+
+   A generator that predates the runtime stamp (v0.100.0's and older) takes
+   only the two compile-time pins, and run on a tag after 2026-10-05 it
+   writes the test stamp's build.
    Then write the release's `rendezvous.toml` with the rendezvous capture, the
    section at the end of `generator.rs.txt` (from `THE RENDEZVOUS TRANSPORT
-   CAPTURE` on). Append that section alone if the desk generator is not
-   appended, and run it the same way:
+   CAPTURE` on). Append that section alone, with `fx_rfc3339` and
+   `fx_install_release_stamp`, if the desk generator is not appended, and run
+   it the same way:
 
    ```sh
    ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
+   ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
    SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
    ATERM_RENDEZVOUS_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
      targo --unverified test -p aterm-gui --lib -- generate_rendezvous_fixture --ignored
@@ -681,36 +818,44 @@ shows whether they are in.
    git worktree remove --force ~/aterm-vX.Y.0.noindex
    ```
 
-## `render_debt` (additive, from the release after v0.98.0)
+## `render_debt` (additive, from v0.101.0)
 
 `SessionRecord::render_debt` (`"<shift>,<pushed>"`, the rows the outgoing engine
-owed the alternate screen) is a lenient additive record key: no shipped
-producer writes it, so EVERY desk above is a producer WITHOUT the key, and the
-guard adopts each of them with no debt (`Adopted::render_debt` is `None`, the
-successor owes the program nothing it was not told). The producer WITH the key
-is this build's own: `seamless_carry_tests::the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen`
-writes it through `write_outgoing`, reads it back through `take_incoming`, and
-holds its negative controls (a blank-on-purpose screen, the main screen, no
-key), and `manifests_cross_between_the_two_shapes_both_ways` holds that an
-older reader skips it. The first release that writes it adds a desk with a
-record carrying it to `PINNED_DESKS` like any other.
+owed the alternate screen) is a lenient additive record key. No producer
+before v0.101.0 writes it, so every desk of those releases is a producer
+WITHOUT the key, and the guard adopts each of them with no debt
+(`Adopted::render_debt` is `None`: the successor owes the program nothing it
+was not told). v0.101.0 is the first shipped producer WITH it:
+`v0.101.0/incident-55x149` carries `-1,0` for its Claude Code, its
+`parent.toml` records it, and the guard checks this build adopts exactly that
+debt. Every other session of that release records none and owes nothing.
+This build's own producer is held by
+`seamless_carry_tests::the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen`,
+which writes the key through `write_outgoing`, reads it back through
+`take_incoming`, and holds its negative controls (a blank-on-purpose screen,
+the main screen, no key). `manifests_cross_between_the_two_shapes_both_ways`
+holds that an older reader skips it.
 
-## `output_state` (additive, from the release after v0.100.0)
+## `output_state` (additive, from v0.101.0)
 
 `CheckpointMeta::output_state` (round eight of the update audit, finding 502:
 the REP character, an
 SGR 58 underline colour, an open OSC 8 link, a VT52 address in progress, a ZWJ
 waiting for its emoji, the XTPUSHSGR stack, the XTSAVE'd modes) is a lenient
-additive meta key: no shipped producer writes it, so every desk above
-restores with none of it, as those producers' successors always did. The
-producer WITH the key is this build's own:
-`seamless::f4_adoption_proof_asymmetry::the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest`
-writes it, reads it back through the strict parser and the screen digest, and
-holds the same meta without the key as its negative control. Every session that
-has printed anything writes it (its REP character), so the first release that
-carries it pins it in every desk with no desk of its own. Adapting the template:
-its capture asks `output_state_uncarried`, which that release renamed
-`output_state_in_flight` and asks only on a hop to an older successor
-(`WireCaps::carries_output_state`), as `App::capture_parked_screens` does.
-The PTY keeper's META never writes the key (`seamless::keeper_meta`), and a
-keeper recovery drops it from any META that has it (`recovered_checkpoint`).
+additive meta key. No producer before v0.101.0 writes it, so every desk of
+those releases restores with none of it, as those producers' successors always
+did. v0.101.0 is the first shipped producer WITH it. Every session that has
+printed anything writes it (its REP character), so every session of every
+v0.101.0 desk carries it, with no desk of its own. Each `parent.toml` session
+row records `output_state = true`, and the guard checks the checkpoint this
+build reassembles carries it.
+This build's own producer is held by
+`seamless::f4_adoption_proof_asymmetry::the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest`.
+It writes the key, reads it back through the strict parser and the screen
+digest, and holds the same meta without the key as its negative control.
+`App::capture_parked_screens` asks `output_state_in_flight` only on a hop to
+an older successor (`WireCaps::carries_output_state`). The generator's hop is
+to a successor that carries the state, so its capture never asks it. The PTY
+keeper's META never writes the key
+(`seamless::keeper_meta`), and a keeper recovery drops it from any META that
+has it (`recovered_checkpoint`).

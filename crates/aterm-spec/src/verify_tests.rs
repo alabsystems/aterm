@@ -11,8 +11,8 @@ use super::is_pending_stub;
 /// any `ty` process (it reports 7 MB at its first budget poll), so the
 /// walk stops there on any machine. Store `ty` 0.13.0, armed, stops
 /// `NativeDraftJournal` (43,770 reachable states) at 2,039 of them with
-/// EXIT 0 and a `Model checking stopped:` line, six runs of six
-/// (2026-10-01) — the shape a budget shrunk by concurrent processes takes.
+/// EXIT 0 and a `Model checking stopped:` line, six runs of six — the
+/// shape a budget shrunk by concurrent processes takes.
 /// A `ty` that exits 5 for it takes the other arm of the same guard.
 #[test]
 fn a_stopped_search_is_an_err_never_a_pass() {
@@ -271,8 +271,7 @@ use crate::ty_model;
 ///
 /// `ty_drivers_are_armed` proves every driver CALLS this function. Nothing
 /// proved what the function then emits, which is the half that actually
-/// arms anything: the 2026-08-06 red gate was a driver that emitted four
-/// of these five flags. An `assert!(contains)` per flag would let the list
+/// arms anything. An `assert!(contains)` per flag would let the list
 /// be quietly reordered or extended; an exact match makes any edit to the
 /// arming a deliberate, reviewed act.
 ///
@@ -529,12 +528,11 @@ impl Scratch {
     }
 }
 
-/// Store PRESENT, PATH empty. With no usable
-/// `ty` shim (m3's store lost its own-name `ty`/`ay` shims to a trust
-/// rollback, measured 2026-09-23) nothing is found, and the line names the
+/// Store PRESENT, PATH empty. With no usable `ty` shim (a store can lose its
+/// own-name `ty`/`ay` shims to a trust rollback) nothing is found, and the line names the
 /// store copy and WHY discovery missed it instead of implying the tool is
-/// not installed. With a live shim — today's exec stub, or an older
-/// symlink — the store tier answers and the line says so.
+/// not installed. With a live shim — the exec stub, or a symlink — the store
+/// tier answers and the line says so.
 #[cfg(unix)]
 #[test]
 fn provenance_store_present_names_the_unreached_copy() {
@@ -619,8 +617,8 @@ fn provenance_nothing_installed_is_a_plain_not_found() {
 
 /// THE order, pinned: the store shim beats PATH, and a developer tree under home
 /// — a first-party cargo build, a bootstrap stage, a standalone `~/ay` — is never
-/// a candidate (m3's stale first-party trust-ir 0.2.0 shadowed store 1123 until
-/// 2026-09-24). Another copy in the store is named beside the chosen one.
+/// a candidate (a stale one would shadow the store). Another copy in the store
+/// is named beside the chosen one.
 #[cfg(unix)]
 #[test]
 fn discovery_order_is_store_then_path_and_no_developer_tree() {
@@ -1145,9 +1143,7 @@ fn discover_in(
 /// wrapper takes over, and then ONLY the binary that wrapper execs is
 /// replaced. Each must print a fresh `VERIFY ESCALATION TIER` line naming
 /// the build now in use (its path, its size, and what it replaced), and a
-/// rediscovery that changes nothing must print nothing. Until 2026-10-01
-/// the first line was the only one: every check after the update ran
-/// another build than the log named.
+/// rediscovery that changes nothing must print nothing.
 #[cfg(unix)]
 #[test]
 fn provenance_is_reported_again_whenever_the_resolved_binary_changes() {
@@ -1500,7 +1496,7 @@ fn ty_capabilities_are_the_json_list_and_an_older_ty_has_none() {
 }
 
 /// The real probe over a `ty` that predates the command: store `ty` 0.13.0's
-/// exact answer (2026-10-01) is the empty set.
+/// exact answer is the empty set.
 #[cfg(unix)]
 #[test]
 fn an_older_ty_probes_as_no_capabilities() {
@@ -2015,8 +2011,7 @@ fn store_swap_steps(home: &Path) {
 /// reinstall, by rename: the old build's live child keeps its own file),
 /// the step already answered is asked again and a new step of the same
 /// (spec, cfg) goes to a child of the NEW build — never replayed from the
-/// old build's memo or asked of its live co-process (both were, until
-/// 2026-10-02, while the line already named the new build).
+/// old build's memo or asked of its live co-process.
 #[cfg(unix)]
 #[test]
 fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
@@ -2253,29 +2248,6 @@ fn ty_state_count_is_parsed_or_refused() {
     assert_eq!(ty_states_explored("  States found: many\n"), None);
 }
 
-/// REGRESSION (2026-07-30 FALSE PROOF): `ty` reported "No errors found
-/// (exhaustive)" for `RainbowJumpBurstLifecycle` after exploring ONE of its 128
-/// reachable states — its partial-order reduction formed a singleton ample
-/// set out of the model's stutter action, whose only successor is the
-/// expanding state, and the C3 cycle proviso failed to reject it. The
-/// verdicts agreed; the work behind them did not.
-///
-/// This pins the CONSEQUENCE rather than the cause: a smaller `ty` count is
-/// a false proof and must panic. The cause is fixed in `ty` itself, and this
-/// stays green either way — reduction is off for this driver, so a `ty`
-/// whose reduction regresses again cannot reach the gate through this door.
-/// REGRESSION (2026-08-06 RED GATE): `spec_xref_closure` hand-rolled its own
-/// `ty` flag list and omitted `--no-auto-por`, so it ran the whole registry
-/// with partial-order reduction ON. On `RainbowJumpBurstLifecycle` that was
-/// `POR: 1/1 states reduced (100.0%)` — 128 reachable states explored as 1 —
-/// and four of its six actions therefore "never fired". `--strict-vacuity`
-/// duly called them dead, and the tier comparison blew up on a dead set that
-/// was an artifact of the reduction.
-///
-/// The arming is now shared ([`arm_whole_space_check`]) so no driver can
-/// omit it, and this is the second lock: a dead set carries no record of the
-/// space it was measured on, so the transcript must be shown to have covered
-/// the whole thing before anything in it is believed.
 /// The guard must not fail OPEN on the one input that matters most: a clean
 /// `ty` verdict over a model the interpreter knows is violated.
 ///
@@ -2335,6 +2307,13 @@ fn the_ty_evidence_header_is_invisible_to_the_transcript_parsers() {
     assert_eq!(pick(&with).as_deref(), Some("Alpha, Beta"));
 }
 
+/// `spec_xref_closure` once hand-rolled its own `ty` flags without
+/// `--no-auto-por`, and on `RainbowJumpBurstLifecycle` (128 reachable states
+/// explored as 1) four of its six actions "never fired" — a dead set that was
+/// an artifact of the reduction. The arming is now shared
+/// ([`arm_whole_space_check`]); this is the second lock: a dead set carries no
+/// record of the space it was measured on, so the transcript must be shown to
+/// have covered the whole space before anything in it is believed.
 #[test]
 fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
     let m = ring_model();
@@ -2364,6 +2343,12 @@ fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
     );
 }
 
+/// A `ty` once reported "No errors found (exhaustive)" for
+/// `RainbowJumpBurstLifecycle` after exploring ONE of its 128 reachable states
+/// (a singleton ample set formed from the stutter action). The verdicts agreed;
+/// the work behind them did not. This pins the CONSEQUENCE rather than the
+/// cause: a smaller `ty` count is a false proof and must panic, whatever any
+/// `ty` build's reduction does.
 #[test]
 #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
 fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {

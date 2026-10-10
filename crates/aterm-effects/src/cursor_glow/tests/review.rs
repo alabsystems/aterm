@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The review's findings on the stall, fold and park.
+//! Credit and park laws for the in-flight press pool (stall, fold, park),
+//! each driven by a host shape.
 
 use super::*;
-
-// Credit and park laws for the in-flight press pool, each driven by a host
-// shape.
 
 /// A typed re-anchor spends the credit of the stamp it consumes, so a keyless
 /// +1 on the row afterwards finds an empty pool: refused, nothing laid, the
@@ -480,7 +478,7 @@ fn a_keyed_motion_pair_is_not_a_park_return() {
 /// A stall longer than the in-flight patience is refused: the patience is a
 /// bound, not a licence.
 #[test]
-fn a_stall_longer_than_the_patience_is_refused_as_before() {
+fn a_stall_longer_than_the_patience_is_refused() {
     let g = wide_geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
     let mut out = Vec::new();
@@ -761,8 +759,6 @@ fn a_glyph_echo_does_not_spend_the_enter_pressed_behind_it() {
 /// is gone). The arrow's twin — its own licensed move forgets at the
 /// MOVE — is the CONTROL in `seam_laws.rs`'s
 /// `a_glyph_echo_landing_after_an_arrow_is_the_glyphs_not_the_arrows`.
-///
-/// RED on 81dea89c8: four credits fund the keyless hop.
 #[test]
 fn a_kill_forgets_the_in_flight_presses_at_the_key() {
     let g = wide_geom();
@@ -1262,7 +1258,7 @@ fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice(
         ring_rows(&glow)
     );
     // CONTROL: the last-column glyph arrives WITH the fold (k3 and k4
-    // stall together): two cells from two presses, as before.
+    // stall together): two cells from two presses.
     let mut glow = CursorGlow::default();
     glow.tick(Some((11, 97)), t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 97, 1)));

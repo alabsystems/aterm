@@ -3,11 +3,8 @@
 
 //! Spec<->index coherence for the atpkg publish lane, enforced.
 //!
-//! Every rule here used to be operator discipline alone — prose in
-//! `tools/atpkg-programs.spec`'s header notes with no refusal anywhere. aterm
-//! has no CI by owner decision (tools/verify.sh); the merge contract's Test
-//! stage runs this file, so the discipline now fails a merge instead of a
-//! fleet. The invariants span artifacts nothing else compares:
+//! The merge contract's Test stage runs this file, so a broken rule fails a merge
+//! instead of a fleet. The invariants span artifacts nothing else compares:
 //!
 //!   * `tools/atpkg-programs.spec` — the committed table of the LIVE published
 //!     index's pins ("tracks the live index, never a wish"), and the program set
@@ -34,14 +31,8 @@
 //! The VENDOR-FETCHED members (codex, claude — followed on their vendors' own channels,
 //! `crates/atpkg/src/vendor_direct`) add three rules: their rows carry no flag, each
 //! stays pinned at a legacy index build no newer than the client's compiled legacy
-//! ceiling — the pin is a floor nothing re-authors (owner ruling 2026-09-23) — and the
-//! publish lane's host allow-list must equal the client's (`crates/atpkg/src/vendor.rs`).
-//! (The `-` build and the `vendor-direct` flag, which listed a program without pinning
-//! it, went on 2026-09-23; the pending gh/emacs rows and the OS-installed clt/brew rows,
-//! with the `extra` and `requires=` flags, went on 2026-09-24 — design 2026-09-22
-//! §5.3(b)/(c) — and so did the seed refresher whose `VENDOR_PROGRAMS` line exempted the
-//! vendor-fetched members from the seed pack lanes. With both, the authoring ceremony
-//! tools/atpkg-author-vendor.sh has no member left to author.)
+//! ceiling — the pin is a floor nothing re-authors — and the publish lane's host
+//! allow-list must equal the client's (`crates/atpkg/src/vendor.rs`).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -52,8 +43,8 @@ use std::path::{Path, PathBuf};
 /// note is the prose twin.
 const RUSTC_TUPLE: [&str; 4] = ["trust", "trust-ir", "trust-cg", "trust-vc"];
 
-/// The vendor-fetched members: the two agent CLIs, DEFAULT-SET members (2026-09-10 —
-/// aterm is their version manager), carrying NO flag. Each must be a spec row, and the
+/// The vendor-fetched members: the two agent CLIs, DEFAULT-SET members (aterm is
+/// their version manager), carrying NO flag. Each must be a spec row, and the
 /// set is exactly the client's compiled roster (`atpkg::stub::AGENT_PROGRAMS`).
 const VENDOR_AGENTS: [&str; 2] = ["codex", "claude"];
 
@@ -310,9 +301,10 @@ fn rustc_coherence_group_is_exactly_the_trust_tuple() {
 /// install gets (one-binary collapse: everything else is an argv0 symlink);
 /// `account` is the compiled-in default index owner behind
 /// `crate::discovery::resolve_account` (a development build's `[packages].account`
-/// config > this; a shipped binary reads this alone) — it must stay the PUBLIC alabsystems org or a tokenless
-/// fresh install can never reach an index (the `[workspace.package]`
-/// repository owner is the private staging repo, which 404s anonymously).
+/// config > this; a shipped binary reads this alone) — it must stay the PUBLIC
+/// alabsystems org or a tokenless fresh install can never reach an index (the
+/// `[workspace.package]` repository owner is the private staging repo, which 404s
+/// anonymously).
 #[test]
 fn workspace_metadata_pins_the_shipped_surface_and_public_account() {
     let root = repo_root();
@@ -391,9 +383,9 @@ fn vendor_members_carry_the_owner_decisions() {
              `extra`)",
             row.line_no
         );
-        // Owner direction 2026-09-08: the manifest-only releases of a vendor member
-        // ride the INDEX repo. A repo named after the vendor (`alabsystems/claude`)
-        // would be a Claude Code distribution channel in everything but bytes.
+        // The manifest-only releases of a vendor member ride the INDEX repo. A repo named
+        // after the vendor (`alabsystems/claude`) would be a Claude Code distribution
+        // channel in everything but bytes.
         assert_eq!(
             row.repo(&spec),
             "aterm",
@@ -557,12 +549,11 @@ fn vendor_direct_pin_problems(rows: &[SpecRow]) -> Vec<String> {
     problems
 }
 
-/// THE VENDOR-DIRECT PROGRAMS STAY PINNED, AS FLOORS (owner ruling 2026-09-23). A client
-/// carrying the vendor-direct lane never plans them from the index and holds the newer of
-/// an installed pin and the vendor's head; an older client keeps installing the pin. So
-/// each is an active row at a legacy index build: there is no `-` (listed, not pinned)
-/// grammar any more — the parser refuses it as the indexer does — and a vendor build id
-/// would ask the index to serve bytes it never carries.
+/// THE VENDOR-DIRECT PROGRAMS STAY PINNED, AS FLOORS. A client carrying the vendor-direct
+/// lane never plans them from the index and holds the newer of an installed pin and the
+/// vendor's head; an older client keeps installing the pin. So each is an active row at a
+/// legacy index build: a `-` (listed, not pinned) build is refused, as the indexer refuses
+/// it, and a vendor build id would ask the index to serve bytes it never carries.
 ///
 /// THE LEGACY CEILING (design §1.3) is at or above every one of those pins: an unread
 /// legacy build is replaced with no person asking only up to it, because every pin up to

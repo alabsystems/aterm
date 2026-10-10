@@ -6,9 +6,7 @@
 //!
 //! Each test populates cold tier data in session 1, drops, reloads via
 //! `with_config` in session 2, and exercises one cascading failure mode
-//! that was broken when `line_count` was hardcoded to 0.
-//!
-//! Extracted from disk_backed_tests.rs to stay under 1000 LOC.
+//! of a reload that sets `line_count` to 0.
 
 use super::*;
 
@@ -40,9 +38,9 @@ fn reload_from(cold_path: &std::path::Path) -> DiskBackedScrollback {
 
 /// Cold tier data is accessible after drop + reload from the same path.
 ///
-/// Regression test for #5928: `with_config` previously hardcoded `line_count: 0`,
-/// making all cold tier data invisible after reload because `get_line()` checks
-/// `idx >= self.line_count` and returns `Ok(None)`.
+/// Regression test for #5928: a `line_count` of 0 after reload makes all cold
+/// tier data invisible, because `get_line()` returns `Ok(None)` for
+/// `idx >= self.line_count`.
 #[test]
 fn disk_backed_cold_data_persists_on_reload() {
     let dir = aterm_tempfile::tempdir().unwrap();

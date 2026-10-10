@@ -1397,7 +1397,7 @@ fn a_key_queued_behind_an_unknown_insert_is_retired_with_the_hop_that_echoed_it(
     assert_eq!(glow.in_flight_tally().credits, 0);
 
     // CONTROL: the PRICED twin (`Cells(16)` + the key as +17) spends the
-    // key at the hop, as before.
+    // key at the hop.
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     let pre = pre_roll(&mut glow, 27, t0, &c, g);
@@ -1961,7 +1961,7 @@ fn the_glyph_before_a_cell_is_the_host_s_for_its_own_anchor_else_this_frame_s_pr
 /// Ctrl-R whose match hops). One `l` press and the caret hops twelve cells with
 /// `-` at the landing cell: declined `program-row`, nothing laid, the press
 /// forgotten. Controls: landing on the key's own glyph lays exactly the
-/// landing, and a count-only press lays it as before.
+/// landing, and a count-only press lays it.
 #[test]
 fn a_typed_re_anchor_lays_its_landing_only_under_a_live_press_s_glyph() {
     let g = wide_geom();
@@ -2019,7 +2019,7 @@ fn a_typed_re_anchor_lays_its_landing_only_under_a_live_press_s_glyph() {
     }
 }
 
-// ──────── the landing gate meets the composer's re-wraps (fix/trail-land) ────────
+// ──────── the landing gate meets the composer's re-wraps ────────
 
 /// The landing gate witnesses the cell a soft-wrapped caret lays. One `a`
 /// after no typing: the glyph is drawn at the row's last text column (3, 17)

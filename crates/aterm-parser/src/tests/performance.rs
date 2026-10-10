@@ -5,7 +5,7 @@
 //! Performance tests (O(n) verification via deterministic counters).
 //!
 //! These tests use loop iteration counters instead of wall-clock timing
-//! to verify O(n) complexity deterministically. See #1572.
+//! to verify O(n) complexity deterministically.
 
 use super::super::*;
 
@@ -33,7 +33,6 @@ fn parser_handles_pathological_input() {
         pathological.push(b'm');
     }
 
-    // Reset counter before measurement
     let _ = take_parser_loop_iterations();
 
     parser.advance_fast(&pathological, &mut sink);
@@ -73,7 +72,6 @@ fn parser_handles_large_osc() {
     osc.extend(std::iter::repeat_n(b'X', payload));
     osc.push(0x07); // BEL terminator
 
-    // Reset counter before measurement
     let _ = take_parser_loop_iterations();
 
     parser.advance_fast(&osc, &mut sink);
@@ -108,7 +106,6 @@ fn parser_linear_scaling() {
         let mut parser = Parser::new();
         let mut sink = NullSink;
 
-        // Reset counter before measurement
         let _ = take_parser_loop_iterations();
 
         parser.advance_fast(&data, &mut sink);

@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W3 P1 — the DECLARED side of an indirect struct return, driven.
+//! The DECLARED side of an indirect struct return, driven.
 //!
-//! # The gap this file closes
-//!
-//! W1 bound the SEND side of the indirect return: [`aterm_objc::msg`] reads the
-//! return type off the prototype and picks `objc_msgSend_stret` in a `const`
-//! block, and `tests/abi.rs` proves the threshold. The DECLARE side had ZERO
-//! evidence. Every method W2 moved onto `declare_class!` returns `void`, `BOOL`
-//! or `id`; `drawRect:` TAKES a `CGRect` and returns nothing. So no trampoline
-//! this crate has ever registered returned a struct by value, and the first one
-//! that will is `vendor/winit`'s
-//! `-firstRectForCharacterRange:actualRange:` — a 32-byte `NSRect` return
-//! beside a by-value `NSRange` and an `NSRange *` out-parameter.
+//! The SEND side is [`aterm_objc::msg`], which picks `objc_msgSend_stret` from
+//! the prototype's return type (`tests/abi.rs` proves the threshold). This file
+//! covers trampolines registered by `declare_class!` that return a struct by
+//! value, such as `vendor/winit`'s `-firstRectForCharacterRange:actualRange:` —
+//! a 32-byte `NSRect` return beside a by-value `NSRange` and an `NSRange *`
+//! out-parameter.
 //!
 //! # The premise this file REFUTES
 //!

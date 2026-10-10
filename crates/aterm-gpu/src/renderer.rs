@@ -3915,9 +3915,10 @@ pub struct WindowGpu {
     // cursor state and read-back pixels. A pixel-identical next frame
     // (`is_unchanged_frame`) re-presents these with no GPU work.
     pub(crate) gate_cache: Option<GpuGateCache>,
-    // Decoded inline-image LRU keyed by `(arc_ptr, fp_w, fp_h)` like the CPU
-    // `ImageCache`. Per window.
-    pub(crate) image_cache: GpuImageCache,
+    // Decoded inline images, keyed by `(arc_ptr, fp_w, fp_h)`: the CPU
+    // renderer's own cache type, so both decode and keep the same rasters by
+    // the same rules. Per window.
+    pub(crate) image_cache: aterm_render::ImageCache,
     // Video recording (`None` = off). Copies the exact presented swapchain
     // bytes, including swapchain-only passes, into a counted-drop ring.
     pub(crate) video: Option<crate::video_tap::VideoTap>,
@@ -4433,102 +4434,6 @@ impl WindowGpu {
     }
 }
 
-/// One decoded, footprint-scaled inline image ready for RGBA8 upload. Same
-/// `decode_placement` bytes as the CPU `DecodedImage`, so the GPU samples the
-/// pixels the CPU `blit_image_cell` copies.
-struct GpuDecodedImage {
-    /// Footprint pixel width (`cols * cell_w`).
-    w: u32,
-    /// Footprint pixel height (`rows * cell_h`).
-    h: u32,
-    /// `w * h * 4` straight-alpha RGBA bytes, or empty if the decode failed
-    /// (a cached negative result: the image draws nothing but is not re-decoded).
-    rgba: Vec<u8>,
-}
-
-/// Decoded-image LRU for the inline-image pass. Each entry holds a weak source
-/// identity plus the footprint. A weak handle pins the allocation address against
-/// reuse (ABA) without retaining the source byte buffer after grid/history owners
-/// drop it. The decoded-byte budget therefore covers the cache's image payload.
-#[derive(Default)]
-pub(crate) struct GpuImageCache {
-    /// `(weak image identity, fp_w, fp_h) -> decoded`, MRU at the back.
-    entries: Vec<(
-        std::sync::Weak<aterm_core::grid::extra::ImageData>,
-        usize,
-        usize,
-        GpuDecodedImage,
-    )>,
-    /// Sum of cached `rgba.len()`, the decoded-byte budget `put` enforces (same
-    /// policy as the CPU `ImageCache`). The byte budget is the memory bound; the
-    /// entry cap only bounds the probe scan.
-    bytes: usize,
-}
-
-impl GpuImageCache {
-    /// Entry-count ceiling, matching the CPU `ImageCache::MAX_ENTRIES`. Must hold
-    /// a frame's whole distinct visible set, or the sequential probe order in
-    /// `build_image_plane` misses every time. Bounds only the linear scan.
-    const MAX_ENTRIES: usize = 64;
-    /// Decoded-RGBA byte budget, matching the CPU `ImageCache::MAX_BYTES` and the
-    /// engine's `MAX_KITTY_STORE_BYTES`.
-    const MAX_BYTES: usize = 64 * 1024 * 1024;
-
-    /// Look up by allocation identity plus footprint, promoting to MRU on a hit.
-    /// Comparing a weak pointer never dereferences or upgrades an expired value.
-    fn get(
-        &mut self,
-        image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
-        fp_w: usize,
-        fp_h: usize,
-    ) -> Option<&GpuDecodedImage> {
-        let idx = self.entries.iter().position(|(a, w, h, _)| {
-            std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(image)) && *w == fp_w && *h == fp_h
-        })?;
-        let entry = self.entries.remove(idx);
-        self.entries.push(entry);
-        self.entries.last().map(|(_, _, _, v)| v)
-    }
-
-    /// Lookup without MRU promotion, for batch reads that borrow several entries
-    /// at once. The placements loop has already promoted them in order.
-    fn peek(
-        &self,
-        image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
-        fp_w: usize,
-        fp_h: usize,
-    ) -> Option<&GpuDecodedImage> {
-        self.entries
-            .iter()
-            .find(|(a, w, h, _)| {
-                std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(image)) && *w == fp_w && *h == fp_h
-            })
-            .map(|(_, _, _, v)| v)
-    }
-
-    /// Insert a decoded image (pinning only its source allocation address), evicting LRU entries
-    /// until both budgets fit, as the CPU `ImageCache::put` does. A single
-    /// over-budget image still inserts alone, so it is decoded once.
-    fn put(
-        &mut self,
-        image: std::sync::Arc<aterm_core::grid::extra::ImageData>,
-        fp_w: usize,
-        fp_h: usize,
-        value: GpuDecodedImage,
-    ) {
-        while !self.entries.is_empty()
-            && (self.entries.len() >= Self::MAX_ENTRIES
-                || self.bytes + value.rgba.len() > Self::MAX_BYTES)
-        {
-            let (_, _, _, evicted) = self.entries.remove(0);
-            self.bytes -= evicted.rgba.len();
-        }
-        self.bytes += value.rgba.len();
-        self.entries
-            .push((std::sync::Arc::downgrade(&image), fp_w, fp_h, value));
-    }
-}
-
 /// The per-frame inline-image texture: every distinct visible placement stacked
 /// vertically in one RGBA8 texture, plus a map from `(arc_ptr, fp_w, fp_h)` to
 /// its starting row. A covered cell samples `(cell_col*cw, image_y0 +
@@ -4542,7 +4447,9 @@ pub(crate) struct ImagePlane {
     /// Texture dims (texels) — the divisor for the sampled UVs.
     w: u32,
     h: u32,
-    /// `(arc_ptr, fp_w, fp_h) -> (y0_in_texture, fp_w, fp_h)` per placement.
+    /// `(arc_ptr, fp_w, fp_h) -> (y0_in_texture, raster_w, raster_h)` per
+    /// placement; the raster is the footprint unless that passes
+    /// `aterm_render::MAX_PLACEMENT_RASTER_PX`.
     /// FxHash: probed once per covered cell; layout comes from `order`, never
     /// map iteration.
     placements: FxHashMap<(usize, usize, usize), (u32, u32, u32)>,
@@ -7703,12 +7610,9 @@ impl GpuRenderer {
             // A row lists each cell's layers together, bottom first.
             for cell in row.chunk_by(|a, b| a.0 == b.0) {
                 for (depth, (_c, image)) in cell.iter().rev().enumerate() {
-                    let fp_w = image.image.cols as usize * cw;
-                    // Chrome-band lift: the strip band's raster is `band_lift_px`
-                    // taller than its footprint, the same term as the CPU
-                    // `blit_image_cell`.
-                    let fp_h =
-                        image.image.rows as usize * ch + usize::from(image.image.band_lift_px);
+                    // The CPU `blit_image_cell`'s footprint, chrome-band lift
+                    // included.
+                    let (fp_w, fp_h) = aterm_render::placement_footprint(&image.image, (cw, ch));
                     if fp_w == 0 || fp_h == 0 {
                         continue;
                     }
@@ -7741,6 +7645,14 @@ impl GpuRenderer {
             return;
         }
 
+        // The images this present shows are the decode cache's working set,
+        // decoded at sizes that fit it together — the CPU frame's rule over the
+        // same distinct placements, so both decode the same rasters.
+        win.image_cache.begin_frame(
+            order
+                .iter()
+                .map(|(image, fp_w, fp_h, _)| (image, *fp_w, *fp_h)),
+        );
         // Decode each distinct image (cached) and stack them top to bottom.
         // Failed decodes stay cached as negative results and emit no quad (the bg
         // shows through, as on the CPU). The plane is bounded on both axes by the
@@ -7754,18 +7666,15 @@ impl GpuRenderer {
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h, _) in &order {
             let key = (std::sync::Arc::as_ptr(image) as usize, *fp_w, *fp_h);
-            // One lookup: a hit is promoted to MRU once; a miss is decoded and
-            // `put` (which already leaves it MRU).
-            let (empty, iw, ih) = match win.image_cache.get(image, *fp_w, *fp_h) {
-                Some(d) => (d.rgba.is_empty(), d.w, d.h),
-                None => {
-                    // Decode directly from the live `Arc` we already hold — no grid re-scan.
-                    let d = decode_for_key(image, *fp_w, *fp_h);
-                    let facts = (d.rgba.is_empty(), d.w, d.h);
-                    win.image_cache.put(image.clone(), *fp_w, *fp_h, d);
-                    facts
-                }
-            };
+            // One lookup; a miss decodes straight from the live `Arc` we
+            // already hold (no grid re-scan) with the same
+            // `aterm_render::decode_placement_within` the CPU blit draws from.
+            // A failed decode is cached empty, so it is not re-decoded every
+            // frame.
+            let d = win.image_cache.get_or_decode(image, *fp_w, *fp_h);
+            // A raster side is at most `MAX_PLACEMENT_RASTER_SIDE`, so it fits.
+            let side = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+            let (empty, iw, ih) = (d.rgba.is_empty(), side(d.w), side(d.h));
             if empty || iw == 0 || ih == 0 {
                 continue;
             }
@@ -7826,9 +7735,9 @@ impl GpuRenderer {
                 continue;
             };
             pinned_images.push(std::sync::Arc::clone(image));
-            // The decode cache is bounded but `placements` is not, so a placed key
-            // may have been evicted. Skip it: its rows stay transparent and the
-            // cell's bg shows through.
+            // The cache keeps every image this present used, so a placed key is
+            // resident; were one not, its rows would stay transparent and the
+            // cell's bg show through.
             let Some(decoded) = win.image_cache.peek(image, *fp_w, *fp_h) else {
                 continue;
             };
@@ -17138,16 +17047,17 @@ impl GpuRenderer {
                         continue;
                     };
                     // Source tile origin in the footprint (CPU `cell_col*cw` /
-                    // `cell_row*ch`) plus the image's row in the stacked texture,
-                    // clamped so an edge cell never samples a neighbour's region.
+                    // `cell_row*ch`), clamped to the footprint so an edge cell
+                    // never samples a neighbour's region.
+                    let (fw, fh) = (fp_w as u32, fp_h as u32);
                     let lip = if image.cell_row == 0 { lift } else { 0 };
                     let sx0 = (image.cell_col as usize * cw) as u32;
                     let sy0 = (image.cell_row as usize * ch + lift - lip) as u32;
-                    if sx0 >= dw || sy0 >= dh {
+                    if sx0 >= fw || sy0 >= fh {
                         continue;
                     }
-                    let mut tile_w = (cw as u32).min(dw - sx0);
-                    let tile_h = ((ch + lip) as u32).min(dh - sy0);
+                    let mut tile_w = (cw as u32).min(fw - sx0);
+                    let tile_h = ((ch + lip) as u32).min(fh - sy0);
                     // Mixed row: clip the tile to its run's box. The tile is 1:1,
                     // so trimming the dest width drops the same source texels the
                     // CPU drops (`uv` follows `tile_w`). Only the right edge can
@@ -17163,12 +17073,27 @@ impl GpuRenderer {
                     // The lip rows land above the cell band; `y0 >= lift` by
                     // construction.
                     let rect = [x0, y0 - lip as f32, tile_w as f32, tile_h as f32];
-                    let uv = [
-                        sx0 as f32 / pw,
-                        (img_y0 + sy0) as f32 / ph,
-                        tile_w as f32 / pw,
-                        tile_h as f32 / ph,
-                    ];
+                    // The tile in texels: 1:1 when the raster is the footprint;
+                    // a footprint past `MAX_PLACEMENT_RASTER_PX` was decoded
+                    // smaller, and the tile spans the same fraction of it, so the
+                    // nearest sampler picks the raster pixel under each device
+                    // pixel's centre, as the CPU blit does.
+                    let uv = if (dw, dh) == (fw, fh) {
+                        [
+                            sx0 as f32 / pw,
+                            (img_y0 + sy0) as f32 / ph,
+                            tile_w as f32 / pw,
+                            tile_h as f32 / ph,
+                        ]
+                    } else {
+                        let (kx, ky) = (dw as f32 / fw as f32, dh as f32 / fh as f32);
+                        [
+                            sx0 as f32 * kx / pw,
+                            (img_y0 as f32 + sy0 as f32 * ky) / ph,
+                            tile_w as f32 * kx / pw,
+                            tile_h as f32 * ky / ph,
+                        ]
+                    };
                     let image_inst =
                         if aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index) {
                             &mut self.inst.image_below_bg
@@ -18750,25 +18675,6 @@ fn glow8(q: &aterm_render::GlowQuad) -> [u8; 8] {
 fn with_over_cap(mut inst: RainGlowInstance, color: u32) -> RainGlowInstance {
     inst.color[3] = (color >> 24) as u8;
     inst
-}
-
-/// Decode the inline image `key` (`(arc_ptr, fp_w, fp_h)`) to footprint RGBA
-/// with the same `aterm_render::decode_placement` the CPU path uses, so the
-/// sampled bytes match the CPU `blit_image_cell` copy. A missing or undecodable
-/// image yields an empty `rgba`, cached so it is not re-decoded every frame.
-fn decode_for_key(
-    image: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
-    fp_w: usize,
-    fp_h: usize,
-) -> GpuDecodedImage {
-    // Decode straight from the caller's live `Arc<ImageData>`; the footprint
-    // was computed from this image's cols/rows at the call site.
-    let rgba = aterm_render::decode_placement(image, fp_w, fp_h).unwrap_or_default();
-    GpuDecodedImage {
-        w: fp_w as u32,
-        h: fp_h as u32,
-        rgba,
-    }
 }
 
 /// One frame's pass-0 decision: the load op plus the optional scissor band.
@@ -21114,189 +21020,6 @@ mod tests {
         );
     }
 
-    /// The decoded LRU is bounded but the per-frame placement map is not, so
-    /// the pack loop can look up an evicted-but-placed key: `peek` returns
-    /// `None` for it and `build_image_plane` skips it.
-    #[test]
-    fn image_cache_evicts_past_cap_so_peek_can_miss() {
-        let mut cache = GpuImageCache::default();
-        let mk_decoded = |i: usize| GpuDecodedImage {
-            w: 1,
-            h: 1,
-            rgba: vec![i as u8, 0, 0, 255],
-        };
-        // Insert one more DISTINCT image than the entry cap can hold. Each
-        // `Arc` is retained so we can look it up by `Arc::ptr_eq` afterwards.
-        let n = GpuImageCache::MAX_ENTRIES + 1;
-        let imgs: Vec<_> = (0..n).map(|_| test_image_data()).collect();
-        for (i, img) in imgs.iter().enumerate() {
-            cache.put(img.clone(), 1, 1, mk_decoded(i));
-        }
-        // The cache never exceeds its cap.
-        assert!(cache.entries.len() <= GpuImageCache::MAX_ENTRIES);
-        // The first-inserted image was evicted; a still-placed lookup gets
-        // `None`.
-        assert!(cache.peek(&imgs[0], 1, 1).is_none());
-        // The most-recently inserted image is still resident.
-        assert!(cache.peek(&imgs[n - 1], 1, 1).is_some());
-    }
-
-    /// A steady frame with more distinct visible images than a small count cap
-    /// decodes each image once, not once per present: the layout loop probes
-    /// in row-major order, so an undersized LRU would evict exactly the next
-    /// probe (100% miss). Three "presents" over 9 images must cost 9 decodes.
-    #[test]
-    fn image_cache_nine_distinct_images_decode_once_not_per_present() {
-        let mut cache = GpuImageCache::default();
-        let imgs: Vec<_> = (0..9).map(|_| test_image_data()).collect();
-        let mut decodes = 0usize;
-        for _present in 0..3 {
-            // The layout loop's shape: sequential probe, decode+insert on miss.
-            for img in &imgs {
-                if cache.get(img, 2, 2).is_none() {
-                    decodes += 1;
-                    cache.put(
-                        img.clone(),
-                        2,
-                        2,
-                        GpuDecodedImage {
-                            w: 2,
-                            h: 2,
-                            rgba: vec![0x55; 2 * 2 * 4],
-                        },
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            decodes, 9,
-            "a 9-image working set must decode once per image, then run \
-             decode-free on every later present (count-only LRU re-decoded \
-             all 9 per present)"
-        );
-    }
-
-    /// The decoded-byte budget (as in the CPU `ImageCache`): entries evict
-    /// LRU-first once the `rgba` total would exceed `MAX_BYTES`, and a single
-    /// over-budget image still inserts alone, so it decodes once rather than
-    /// every frame.
-    #[test]
-    fn image_cache_byte_budget_evicts_lru_and_admits_an_oversize_image_alone() {
-        let mut cache = GpuImageCache::default();
-        // Three entries of MAX_BYTES/4 each fit together...
-        let quarter = GpuImageCache::MAX_BYTES / 4;
-        let imgs: Vec<_> = (0..4).map(|_| test_image_data()).collect();
-        let big = |len: usize| GpuDecodedImage {
-            w: 1,
-            h: 1,
-            rgba: vec![0; len],
-        };
-        for img in imgs.iter().take(3) {
-            cache.put(img.clone(), 1, 1, big(quarter));
-        }
-        assert!(cache.peek(&imgs[0], 1, 1).is_some());
-        // ...and a fourth of MAX_BYTES/2 forces the OLDEST out (bytes bound,
-        // not the 64-entry count bound — only 4 entries are present).
-        cache.put(imgs[3].clone(), 1, 1, big(GpuImageCache::MAX_BYTES / 2));
-        assert!(
-            cache.peek(&imgs[0], 1, 1).is_none(),
-            "the LRU entry must be evicted to fit the byte budget"
-        );
-        assert!(cache.peek(&imgs[1], 1, 1).is_some());
-        assert!(cache.peek(&imgs[2], 1, 1).is_some());
-        assert!(cache.peek(&imgs[3], 1, 1).is_some());
-        // A single image LARGER than the whole budget evicts everything else
-        // yet still inserts (decoded once, reused across presents).
-        let huge = test_image_data();
-        cache.put(huge.clone(), 1, 1, big(GpuImageCache::MAX_BYTES + 1));
-        assert!(
-            cache.peek(&huge, 1, 1).is_some(),
-            "a single over-budget image must still insert alone"
-        );
-        assert!(cache.peek(&imgs[3], 1, 1).is_none());
-        assert_eq!(cache.entries.len(), 1);
-    }
-
-    /// Two distinct images with the same footprint do not alias in the decode
-    /// cache: entries compare the weak source identity's pinned address.
-    /// Simulated with two live, distinct Arcs.
-    #[test]
-    fn image_cache_distinguishes_distinct_arcs_of_equal_footprint() {
-        let mut cache = GpuImageCache::default();
-        let a = test_image_data();
-        let b = test_image_data();
-        // Cache A's decode under footprint (4, 4).
-        cache.put(
-            a.clone(),
-            4,
-            4,
-            GpuDecodedImage {
-                w: 4,
-                h: 4,
-                rgba: vec![0xAA; 4 * 4 * 4],
-            },
-        );
-        // B is a DIFFERENT image with the SAME footprint: its lookup must MISS, never
-        // alias onto A's pixels (the ABA bug returned A's decode here).
-        assert!(
-            cache.get(&b, 4, 4).is_none(),
-            "a distinct Arc must not hit A's cached entry"
-        );
-        // A still hits, with its own pixels (copy out so the borrow ends before the
-        // next `&mut self` call below).
-        let a_first = cache.get(&a, 4, 4).expect("A is cached").rgba[0];
-        assert_eq!(a_first, 0xAA, "A returns its OWN decode");
-        // The SAME Arc at a DIFFERENT footprint also misses (footprint disambiguation
-        // is preserved alongside the Arc-identity match).
-        assert!(
-            cache.get(&a, 8, 8).is_none(),
-            "same Arc, different footprint must miss"
-        );
-    }
-
-    #[test]
-    fn image_cache_releases_source_payload_but_pins_its_identity() {
-        use std::sync::Arc;
-        for rgba in [Vec::new(), vec![0xcc; 4]] {
-            let mut source = test_image_data();
-            Arc::get_mut(&mut source).unwrap().bytes = vec![0x55; 16 * 1024 * 1024];
-            let observed = Arc::downgrade(&source);
-            let identity = Arc::as_ptr(&source);
-            let decoded_bytes = rgba.len();
-            let mut cache = GpuImageCache::default();
-            cache.put(source.clone(), 1, 1, GpuDecodedImage { w: 1, h: 1, rgba });
-            assert_eq!(
-                Arc::strong_count(&source),
-                1,
-                "cache owns no source payload"
-            );
-            assert_eq!(cache.get(&source, 1, 1).unwrap().rgba.len(), decoded_bytes);
-            assert_eq!(cache.peek(&source, 1, 1).unwrap().rgba.len(), decoded_bytes);
-            assert!(cache.peek(&source, 2, 1).is_none());
-
-            // The old strong cache owner outlived the grid/history owner.
-            let historical_owner = source.clone();
-            drop(source);
-            assert!(observed.upgrade().is_some(), "historical retention control");
-            drop(historical_owner);
-            assert!(observed.upgrade().is_none(), "source Vec must be released");
-            drop(observed);
-            assert_eq!(cache.entries[0].0.as_ptr(), identity);
-            let replacement = test_image_data();
-            assert_ne!(
-                Arc::as_ptr(&replacement),
-                identity,
-                "weak cache key pins address"
-            );
-            assert!(cache.get(&replacement, 1, 1).is_none());
-            assert!(cache.peek(&replacement, 1, 1).is_none());
-            assert_eq!((cache.entries.len(), cache.bytes), (1, decoded_bytes));
-            eprintln!(
-                "GPU image cache: 16777216 source bytes released; {decoded_bytes} decoded bytes retained"
-            );
-        }
-    }
-
     use super::*;
     use aterm_core::terminal::Terminal;
     use aterm_render::Theme;
@@ -21414,22 +21137,6 @@ mod tests {
                 "a fully clipped crown must not issue a zero/underflowed scissor"
             );
         }
-    }
-
-    /// A fresh, distinct `Arc<ImageData>` for the decode-cache tests (each call
-    /// allocates a NEW `ImageData`, so two calls never share a pointer).
-    fn test_image_data() -> std::sync::Arc<aterm_core::grid::extra::ImageData> {
-        std::sync::Arc::new(aterm_core::grid::extra::ImageData {
-            bytes: Vec::new(),
-            format: aterm_core::grid::extra::ImageFormat::Unknown,
-            cols: 1,
-            rows: 1,
-            z_index: 0,
-            band_lift_px: 0,
-            cell_offset_px: (0, 0),
-            scaling: aterm_core::grid::extra::ImageScaling::Fit,
-            source_rect: None,
-        })
     }
 
     /// `pack_image_plane`'s `dw == tw` single-memcpy path matches a naive

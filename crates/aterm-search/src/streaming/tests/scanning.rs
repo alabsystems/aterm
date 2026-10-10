@@ -505,12 +505,8 @@ fn content_modified_clamps_current_index() {
 // Wrapped-line coordinate remapping tests (#7572)
 // =============================================================================
 
-/// Search match on a wrapped line has coordinates within the physical row width.
-///
-/// Before the fix, matches found in joined wrapped-line text could have
-/// start_col/end_col values that exceeded the terminal's physical column count,
-/// because coordinates were reported relative to the joined string rather than
-/// remapped to the physical row.
+/// A match found in joined wrapped-line text is remapped to physical-row
+/// coordinates, never left relative to the joined string.
 #[test]
 fn wrapped_line_match_coordinates_within_physical_width() {
     use super::super::test_content::WrappedTestContent;
@@ -537,13 +533,6 @@ fn wrapped_line_match_coordinates_within_physical_width() {
     assert_eq!(m.row, 1, "match should be on physical row 1");
     assert_eq!(m.start_col, 0, "match should start at column 0 of row 1");
     assert_eq!(m.end_col, 5, "match should end at column 5 of row 1");
-
-    // The end column must not exceed the physical row width (5 columns).
-    assert!(
-        m.end_col <= 5,
-        "end_col {} exceeds physical row width 5",
-        m.end_col
-    );
     assert!(search.verify_all_invariants());
 }
 
@@ -579,7 +568,7 @@ fn wrapped_line_match_spanning_boundary_is_clamped() {
     assert!(search.verify_all_invariants());
 }
 
-/// Non-wrapped rows pass through scan_row normally (regression check).
+/// Non-wrapped rows pass through scan_row normally.
 #[test]
 fn non_wrapped_rows_unaffected_by_wrapping_logic() {
     use super::super::test_content::WrappedTestContent;

@@ -52,6 +52,11 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_AGENTS_DIR",
     "ATERM_REROUTE_DIR",
     "__ATERM_REROUTE_PASSTHROUGH",
+    // The reroute → every upstream copy it runs, and a `rustc`/`rustdoc` stub → a
+    // stock cargo's compile: "already announced", so what that command spawns by name
+    // is not announced again and is still judged (`ANNOUNCED_ENV`,
+    // crates/atpkg/src/reroute.rs).
+    "__ATERM_REROUTE_ANNOUNCED",
     // atpkg's shell hook → the shell integration, and a pass → its own children.
     "ATPKG_AGENTS",
     "ATPKG_SPAWNER_PID",
@@ -213,6 +218,9 @@ const DEV_SEAMS: &[&str] = &[
     // (handoff_rendezvous.rs `debug_die_before_dial`), for live checks of how
     // soon the outgoing process stops waiting for it.
     "ATERM_DEBUG_DIE_BEFORE_DIAL",
+    // A headless instance that keeps its desk as a window does (aterm-gui
+    // `desk::Desk`): the real-Claude lab's cold restore (quit and crash).
+    "ATERM_DEBUG_HEADLESS_RESTORE",
     // The fabric push lane's step hold (subscribe.rs `push_held`): the bridge race
     // test in aterm-link parks the lane between adoption and drain to force the
     // interleaving deterministically.

@@ -27,8 +27,11 @@
 //! therefore gets COARSER / fewer deltas and CANNOT block, backpressure, or even
 //! slow the producing session's reader thread — the producer's `try_send` is O(1)
 //! and infallible by design (it discards rather than waits). If the subscriber's
-//! own socket write blocks or fails, its thread drops the connection (and
-//! deregisters) — the producer is never involved in that path.
+//! own socket write fails, its thread drops the connection (and deregisters) —
+//! the producer is never involved in that path. A write the subscriber is slow
+//! to read (a consumer that paused) waits for it: its push worker stays its own
+//! for the whole subscription, reading or not, and the stream goes on when it
+//! reads again: an end of stream still means its sessions ended or it hung up.
 //!
 //! ## Discipline
 //!

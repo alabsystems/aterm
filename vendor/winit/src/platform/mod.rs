@@ -56,5 +56,5 @@ pub mod modifier_supplement;
 #[cfg(any(windows_platform, macos_platform, x11_platform, wayland_platform, docsrs))]
 pub mod scancode;
 
-#[cfg(free_unix)]
+#[cfg(any(free_unix, macos_platform))]
 pub mod headless;

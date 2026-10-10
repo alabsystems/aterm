@@ -717,22 +717,27 @@ impl PetBrain {
     /// (`under_text_clearance_past_caret`). An incoherent map, or none,
     /// admits nothing.
     pub(super) fn console_still_body_clear(&self) -> bool {
-        self.console_still_rect_clear(self.col, self.row)
+        self.console_still_rect_verdict(self.col, self.row) == Some(true)
     }
 
     /// [`Self::console_still_body_clear`]'s verdict for a still body standing
-    /// at `(col, row)` of the same map: a crossfade ghost still fading there
-    /// at the boundary (`Carried::own_clear`).
-    pub(super) fn console_still_rect_clear(&self, col: f32, row: f32) -> bool {
+    /// at `(col, row)` of the same map — a ghost still on glass there at the
+    /// boundary (`Departure::own_clear`) — three-valued over what the map
+    /// sees of it (`PetWorld::seen_under_text_clearance_past_caret`): `None`
+    /// where the part of it this map covers is clear and the rest is outside
+    /// the coverage window (unseen, which is not evidence of anything), and
+    /// `Some(false)` over a protected cell the map sees, or with no certified
+    /// map at all, which admits nothing.
+    pub(super) fn console_still_rect_verdict(&self, col: f32, row: f32) -> Option<bool> {
         let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
-            return false;
+            return Some(false);
         };
         let rect = still_body_rect(
             (col, row),
             (self.last_cell_w, self.last_cell_h),
             self.last_grid,
         );
-        world.under_text_clearance_past_caret(rect, 0.0) == Some(true)
+        world.seen_under_text_clearance_past_caret(rect)
     }
 
     /// An examined obstruction under the pet's natural body. `clear` would
@@ -2099,10 +2104,27 @@ impl PetBrain {
         // ghost whose rectangle the body never stood on in THIS world: it is
         // the old surface's body fading on glass a new screen now owns
         // (`Departure::resight`). It is kept only where this map certifies
-        // nothing protected — no selection, image, overlay or unseen cell —
-        // and it goes under whatever ink the new screen has there, so the
-        // text in front of it stays legible. Over anything else it is
-        // dropped, and the arriver fades in alone, as a fresh sighting does.
+        // nothing protected — no selection, image or overlay — and it goes
+        // under whatever ink the new screen has there, so the text in front
+        // of it stays legible. Where this map cannot see it (outside its
+        // caret-centred coverage window: a tall screen whose caret is far
+        // from where the old body stood), it keeps the verdict its own
+        // surface gave it at the boundary (`Departure::own_clear`), beneath
+        // whatever ink is there — unknown is not evidence, the visibility
+        // hold's rule for a body already on glass — while any protected cell
+        // the map does see under it still refuses it
+        // (`PetWorld::seen_under_text_clearance_past_caret`). Culling it
+        // there left the arriver alone at its ramp's floor (measured: 15/255
+        // on the first frame of a 90-row alternate screen). So its guarantee
+        // is NEVER OVER A PROTECTED CELL THIS MAP SEES: a protected cell of
+        // the new screen outside the window is unknown, and the ghost may
+        // fade over it for its quarter second, beneath the ink (an inline
+        // image is drawn above the under-text layer in both renderers, and
+        // a double-width row's glyphs over the ghost). Over anything
+        // protected it sees it is dropped, and its presence is not lost: it
+        // goes to its arriver from this frame on (below), so the cat stands
+        // at its new station at the presence the user saw instead of
+        // vanishing to the floor.
         //
         // A GHOST ON ITS OWN GLASS (`Departure::own_glass`) is not on this
         // map at all: it stands in the pane the focus left, in that pane's
@@ -2111,11 +2133,15 @@ impl PetBrain {
         // beneath that pane's ink, which nobody observes after it.
         let base = *frame;
         let selection = world.selection_rect();
-        for (departure, live) in frame.departures.iter_mut().zip(&self.departures) {
+        // The presence of the crossfade ghosts refused this frame, as drawn,
+        // and their envelopes, which the arriver's ramp takes over below.
+        let mut refused = 0u16;
+        let mut handed = 0.0f32;
+        for (departure, live) in frame.departures.iter_mut().zip(self.departures.iter_mut()) {
             let Some(d) = departure.as_mut() else {
                 continue;
             };
-            if live.is_some_and(|l| l.own_glass) {
+            if live.is_some_and(|l| l.own_glass.is_some()) {
                 d.under_ink = true;
                 continue;
             }
@@ -2133,15 +2159,48 @@ impl PetBrain {
                 None => false,
                 Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
                 Some(rect) if live.is_some_and(|l| l.resight) => {
-                    let admitted = world.under_text_clearance_past_caret(rect, 0.0) == Some(true);
                     d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
-                    admitted
+                    world
+                        .seen_under_text_clearance_past_caret(rect)
+                        .unwrap_or_else(|| live.is_some_and(|l| l.own_clear))
                 }
                 Some(_) => true,
             };
             if !keep {
+                if let Some(l) = live.take_if(|l| l.resight) {
+                    refused += u16::from(d.alpha) * u16::from(base.lane_alpha) / 255;
+                    handed += l.envelope((self.lane_clock - l.born) as f32);
+                }
                 *departure = None;
             }
+        }
+        // A REFUSED CROSSFADE GHOST HANDS ITS PRESENCE TO ITS ARRIVER. The
+        // ghost and the arriver are one cat changing places on one ramp; a
+        // ghost that may not be drawn — something protected under it in this
+        // world, or no rectangle on this grid — puts what it would have shown
+        // on the arriver instead, never more than the lane's presence. The
+        // cat moves to its new station at once rather than vanishing to the
+        // ramp's floor and fading back in.
+        if refused > 0 {
+            frame.alpha = (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
+        }
+        // THE HAND-OVER IS FOR GOOD. The refused ghost left the lane above,
+        // and the arriver's ramp starts from its share: lifting `arrive_from`
+        // by `envelope / remaining` adds exactly the ghost's envelope to every
+        // later frame's arrival, `envelope × remaining_then / remaining_now`
+        // (equal to the ghost's own fade on the ramp they share, its peak
+        // times what is left). A refusal judged afresh on every frame,
+        // with the ghost kept in the lane, counted it twice: carried to the
+        // next boundary beside the boosted body as presence the user saw
+        // (measured: a protected alternate screen quit two frames after it
+        // was entered summed 492/255 on the first frame back, a cat popping
+        // in beside the ghost), and re-admitted when the protection lifted
+        // mid-fade (the arriver fell 206/255 in one frame while the ghost
+        // reappeared at the old seat). No ramp left, nothing is owed: the
+        // arriver is already at the lane's presence.
+        let remaining = self.arrive_t / self.arrive_in;
+        if handed > 0.0 && remaining > 0.0 {
+            self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
         }
     }
 
@@ -2896,6 +2955,7 @@ mod tests {
             .process(b"\x1b[5;21Hxxxxxxxx\x1b[6;21Hxxxxxxxx\x1b[6;17H");
         let ghost = |s: &Scene| Departure {
             born: s.pet.lane_clock,
+            id: 0,
             coat: 1,
             iris: 1,
             from_col: s.pet.col,
@@ -2907,7 +2967,8 @@ mod tests {
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
             resight: false,
-            own_glass: false,
+            own_glass: None,
+            own_clear: false,
             peak: 1.0,
         };
         s.pet.departures[0] = Some(ghost(&s));
@@ -2967,7 +3028,8 @@ mod tests {
     /// nothing protected under it. Spent, it stands at the old body's cell
     /// beneath that pane's text while the arriver comes up at its own
     /// station. CONTROL: a selection under the body in that observation
-    /// refuses it, and the arriver fades in alone.
+    /// refuses it (what the arriver does with its presence then is
+    /// `pet_coordinate_seams`' `a_ghost_its_own_glass_refuses_…`).
     #[test]
     fn a_ghost_on_its_own_glass_needs_its_own_worlds_admission() {
         let switch = |select: bool| {
@@ -2990,7 +3052,7 @@ mod tests {
                 s.pet.observe_console(&input, &facts, PetPane::full(&input));
             }
             s.pet.resight_coordinate_space();
-            s.pet.displace_resight();
+            s.pet.displace_resight(1);
             let kept = s.pet.has_own_glass_ghost();
             // The new pane's caret, elsewhere: the arriver's station.
             s.term.process(b"\x1b[15;40H");
@@ -3007,9 +3069,52 @@ mod tests {
         );
         assert!(f.alpha > 0, "beside the arriver");
 
-        let (kept, _, f) = switch(true);
-        assert!(!kept, "control: a selection under the body refuses it");
-        assert!(f.departures.iter().all(Option::is_none));
+        let (_, _, f) = switch(true);
+        assert!(
+            f.departures.iter().all(Option::is_none),
+            "control: a selection under the body refuses it"
+        );
+    }
+
+    /// A GHOST IS CARRIED ACROSS A BOUNDARY AT WHAT ITS OWN SLOT DREW
+    /// (`PetBrain::last_drawn`), slot for slot: one in the lane's second slot
+    /// behind an empty first is carried at that slot's presence — a cover
+    /// that dimmed it to 0.4, not its envelope's full peak. CONTROL: a slot
+    /// that drew nothing is not carried.
+    #[test]
+    fn a_carried_ghost_keeps_what_its_own_slot_drew() {
+        let carry = |drawn: f32| {
+            let mut s = Scene::new();
+            s.pet.departures[1] = Some(Departure {
+                born: s.pet.lane_clock,
+                id: 0,
+                coat: 1,
+                iris: 1,
+                from_col: s.pet.col,
+                row: s.pet.row,
+                edge: s.pet.col,
+                speed: DEPART_SPEED,
+                still: true,
+                facing_left: false,
+                stride0: 0.0,
+                pose0: PetGlyphId::PetSit,
+                resight: false,
+                own_glass: None,
+                own_clear: false,
+                peak: 1.0,
+            });
+            s.pet.last_drawn = [0.0; PET_DEPARTURES_MAX];
+            s.pet.last_drawn[1] = drawn;
+            s.pet.resight_coordinate_space();
+            s.pet
+                .carried
+                .iter()
+                .flatten()
+                .map(|c| c.presence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(carry(0.4), [0.4], "carried at what its slot drew");
+        assert!(carry(0.0).is_empty(), "control: a ghost that drew nothing");
     }
 
     /// MEASURED ON GLASS (0.83.0 with the crossfade fix, the Claude-Code-
@@ -3116,6 +3221,7 @@ mod tests {
         s.frame(0.016);
         let ghost = Departure {
             born: s.pet.lane_clock,
+            id: 0,
             coat: 1,
             iris: 1,
             from_col: s.pet.col,
@@ -3127,7 +3233,8 @@ mod tests {
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
             resight: false,
-            own_glass: false,
+            own_glass: None,
+            own_clear: false,
             peak: 1.0,
         };
         s.pet.departures[0] = Some(ghost);

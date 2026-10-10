@@ -18,7 +18,7 @@ fn new_search_is_idle() {
 fn config_getters_reflect_defaults_and_custom_values() {
     let search = StreamingSearch::new();
     assert!(search.wrap_enabled());
-    assert_eq!(search.case_sensitive(), cfg!(kani));
+    assert!(!search.case_sensitive());
     assert!(search.highlight_all());
 
     let configured = StreamingSearch::with_config(StreamingSearchConfig {

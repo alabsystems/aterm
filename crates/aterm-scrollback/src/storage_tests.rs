@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for `ScrollbackStorage` — extracted from `tests.rs` (#2100).
+//! Tests for `ScrollbackStorage`.
 
 use super::*;
 
@@ -153,7 +153,7 @@ fn scrollback_storage_memory_budget() {
 fn scrollback_storage_memory_line_limit() {
     let mut storage = ScrollbackStorage::default();
 
-    // #7929: default is now a bounded cap, not `None`.
+    // #7929: the default is a bounded cap, not `None`.
     assert_eq!(storage.line_limit(), Some(DEFAULT_LINE_LIMIT));
 
     storage.set_line_limit(Some(1000));
@@ -745,8 +745,7 @@ fn streaming_iter_matches_get_line_walk_memory() {
 }
 
 /// Corrupt-segment parity: a corrupt warm block is skipped WHOLE, and
-/// `skipped_lines()` reports exactly the block's line count — the same total
-/// the old per-line walk accumulated one error at a time (#5947).
+/// `skipped_lines()` reports exactly the block's line count (#5947).
 #[test]
 fn streaming_iter_skips_corrupt_block_with_same_totals() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);

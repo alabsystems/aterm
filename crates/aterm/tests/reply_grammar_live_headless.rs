@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REPLY GRAMMAR OVER THE REAL SOCKET for the verbs no lane drove end to
-//! end: `controls`, `open … close`, `await`, `temporal` and `history` (the
-//! INTROSPECTION audit's F13/F15 remainder). Each had handler-level tests; none
-//! was read back as a client reads it — the status line, then exactly the
+//! THE REPLY GRAMMAR OVER THE REAL SOCKET for `controls`, `open … close`,
+//! `await`, `temporal` and `history`, read back as a client reads it — the
+//! status line, then exactly the
 //! frame its `Framing` promises (`OK <n>` + n rows for Lines, `OK <nbytes>` +
 //! exactly those bytes for Bytes, one line for Status) — through a real
 //! `aterm --headless`.

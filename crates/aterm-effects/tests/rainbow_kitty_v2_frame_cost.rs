@@ -5,8 +5,7 @@
 //! §21).
 //!
 //! §18's budget: p50 ≤ 0.4 ms / p90 ≤ 0.6 ms producer CPU per tick at 120 Hz
-//! including the ribbon, zero allocation per steady frame, idle → zero
-//! (owner, 2026-09-05).
+//! including the ribbon, zero allocation per steady frame, idle → zero.
 //!
 //! This drives the v2 [`Engine`] through the §21 gestures (12 cps prose, a burst
 //! with a same-row 40-cell nav meteor every 500 ms, an 80-cell Ctrl-E
@@ -149,7 +148,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// The budget twin's p50/p90 are wall-clock numbers, so neither test runs while
 /// the other does: the laws' pool must not take the cores the budget measures
-/// on. (The tally no longer needs it; it is per thread.)
+/// on.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Count the allocations `f` makes on this thread. Returns the count and the
@@ -1442,13 +1441,8 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
 /// the same script.
 ///
 /// The two numbers are the reference machine's (§18 of
-/// docs/design/RAINBOW-KITTY-V2.md, which does not name it; the 0.253–0.258 ms
-/// median / 0.48 ms p90 that §18 records beside them are v1's kept ribbon at
-/// design time, at `geometry()`). Every v2 run of this gate the doc records
-/// (§17.3's phase-7 row, §18's Stardust row, §23, §24–§26 and the mend among
-/// them; none names its machine) is at most p50 137 / p90 151 µs, §26's
-/// ping-pong: about a third of the p50 budget and a quarter of the p90.
-/// `RK_FRAME_COST_BUDGET_SCALE` (`common::budget_scale`) scales the two
+/// docs/design/RAINBOW-KITTY-V2.md); every v2 run the doc records is at most
+/// p50 137 / p90 151 µs. `RK_FRAME_COST_BUDGET_SCALE` (`common::budget_scale`) scales the two
 /// reference numbers, for the engine alone and through the seam, on a host
 /// with no measurement on record, and nothing else: the zero-alloc,
 /// idle → zero and cap laws the non-ignored twin holds are allocation counts

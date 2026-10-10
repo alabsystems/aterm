@@ -117,9 +117,6 @@ impl TerminalHandler<'_> {
         self.transient.app_sync_open = false;
         self.transient.app_sync_dirty = false;
 
-        // Reset grapheme cluster mode (mode 2027)
-        self.modes.grapheme_cluster_mode = false;
-
         // Reset sixel display mode (DECSDM, mode 80) — xterm resets on DECSTR
         self.modes.sixel_display_mode = false;
 

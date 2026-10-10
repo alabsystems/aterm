@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The response-framing primitives every verb shares: glyph sanitization,
-//! percent-encoding for single-token fields, and the one JSON escape.
+//! percent-encoding for single-token fields, and the one JSON escape; and the
+//! one reading of a wait verb's `<ms>` ([`wait_ms`]).
 //! `aterm-gui`'s `control` module re-exports them, so the poll face, the push
 //! face and the asciicast emitter produce identical bytes; keep one copy.
 
@@ -45,6 +46,22 @@ pub fn visible_row(t: &aterm_core::terminal::Terminal, r: usize) -> String {
 pub use aterm_codec::pct::{
     decode as pct_decode, encode as pct_encode, encode_into as pct_encode_into,
 };
+
+/// The wait family's default timeout (`wait`, `ready`, `await`): 30 s.
+pub const WAIT_DEFAULT_MS: u64 = 30_000;
+
+/// The longest any wait verb waits: 600 s, whatever `<ms>` asked.
+pub const WAIT_MAX_MS: u64 = 600_000;
+
+/// A wait verb's `<ms>`: a whole number of milliseconds, held at
+/// [`WAIT_MAX_MS`]. `None` for anything else (`2s`, `1.5`, `-1`, empty), which
+/// the verb answers with its usage line: read leniently, `wait 2s` waited the
+/// whole 30 s default where `turn timeout=2s` and `await consent timeout=2s`
+/// refused it. One reading, so the family cannot disagree again.
+#[must_use]
+pub fn wait_ms(token: &str) -> Option<u64> {
+    token.parse::<u64>().ok().map(|ms| ms.min(WAIT_MAX_MS))
+}
 
 /// Escape a string as a JSON string body (no quotes): two-char escapes for
 /// `"`, `\` and the C0 whitespace controls, `\u00XX` for other control bytes;

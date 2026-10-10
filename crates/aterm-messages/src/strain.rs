@@ -1599,6 +1599,23 @@ impl StrainTracker {
         }
     }
 
+    /// End the episode NOW where sampling stopped, as [`Self::lapsed`] ends
+    /// it (at its last reading), without waiting out [`STALE_STRAIN`] from
+    /// that reading. For the host whose band is about to retire the row for
+    /// silence (ruling 441 (u)): the row's own staleness cap runs from its
+    /// last restatement, up to [`STRAIN_KEEPALIVE`] before the last reading,
+    /// so it falls before the lapse, and the band settles before the
+    /// engine's turn. The row would go Stale (a `⚠ … stopped` entry) and the
+    /// lapse then post the record beside it. Ended here, the row becomes the
+    /// record (rulings 209 and 211: one entry per episode). Nothing while
+    /// calm.
+    pub fn end_where_sampling_stopped(&mut self) -> StrainOut {
+        match self.last_reading_at.or(self.episode_start) {
+            Some(t) if self.state != State::Calm => self.lapse(t),
+            _ => StrainOut::None,
+        }
+    }
+
     /// End the episode at `at` (its last reading).
     fn lapse(&mut self, at: Instant) -> StrainOut {
         match self.state {

@@ -694,10 +694,21 @@ fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, 
 /// key and renumber epoch at every step, so a ConPTY arm leaking into the
 /// Native path moves it. A deliberate change to the native resize moves it
 /// too: re-capture it then, saying what moved.
+///
+/// Re-captured 2026-10-09 (bug hunt 9, `TIERED` only; was
+/// `0xc4cc_9a06_602e_98ee`): a blank the rewrap copies inside a line's
+/// content now counts in the row's length (`copy_cells_to_row`,
+/// `fill_row_cells`), so tiered history, staged at that length, keeps it.
+/// Dumped step by step against the previous code, the `RING` arm is identical
+/// and the `TIERED` arm differs on one logical line only, from step 110 on: a
+/// line whose rows are runs of blanks (left by the script's ED 3 and reader
+/// scrolls) keeps its 46 blanks, where the old code staged two of its rows at
+/// length 0 and 4 and joined them to `  ij`; the counters move by the rows
+/// those blanks take.
 #[test]
 fn native_policy_matches_the_0_94_0_resize() {
     const RING: u64 = 0xb706_f513_99e0_6395;
-    const TIERED: u64 = 0xc4cc_9a06_602e_98ee;
+    const TIERED: u64 = 0xaa63_71b5_0ce0_182b;
     let plain = |t: &mut Terminal, r: u16, c: u16| t.resize(r, c);
     let native = |t: &mut Terminal, r: u16, c: u16| {
         t.resize_with_policy(r, c, ResizePolicy::Native);

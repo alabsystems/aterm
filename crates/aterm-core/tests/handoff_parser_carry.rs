@@ -149,24 +149,16 @@ fn a_refused_carry_resumes_at_ground() {
     );
 }
 
-/// ENGINE STATE OUTPUT STILL TO COME RELIES ON (round eight of the update
-/// audit, finding 502). The parser carry continues a sequence split at the
-/// park, but these states a program sets live in the engine, not the parser:
-/// the character REP (`CSI b`) repeats, an open OSC 8 link, an SGR 58
+/// Engine state that output still to come relies on (update audit round
+/// eight, finding 502). The parser carry
+/// continues a sequence split at the park, but these states live in the
+/// engine: the character REP (`CSI b`) repeats, an open OSC 8 link, an SGR 58
 /// underline colour, a VT52 `ESC Y` waiting for its address bytes, a ZWJ
-/// waiting for the emoji it joins, the XTPUSHSGR stack and the XTSAVE'd
-/// modes. A successor that resumed without them painted nothing for the REP,
-/// wrote the rest of the link's text unlinked, drew the default underline
-/// colour, printed the VT52 address as text, wrote the joined emoji as a
-/// glyph of its own (the rest of the line two columns off), left the
-/// pushed-over pen in force at the XTPOPSGR and the mode as the program set it
-/// at the XTRESTORE. A park right after a complete flag kept no state but lost
-/// a fact of the screen: the restored flag read as a lone regional indicator
-/// and took the next one into its cell, the rest of the line two columns off.
-/// Each split, handed over the seamless way through either restore door, now
-/// lands on the screen one engine fed the whole stream draws: the same cells
-/// (underline colour included), the same text, the same link on every cell,
-/// the same cursor.
+/// waiting for the emoji it joins, the XTPUSHSGR stack, the XTSAVE'd modes,
+/// and a complete flag (else the next regional indicator joins its cell).
+/// Each split, handed over through either restore door, must land on the
+/// screen one engine fed the whole stream draws: same cells (underline colour
+/// included), text, link on every cell and cursor.
 #[test]
 fn split_at_park_matches_unsplit() {
     let mut lost = Vec::new();

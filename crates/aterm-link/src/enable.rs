@@ -11,10 +11,10 @@
 //! aterm fabric doctor
 //! ```
 //!
-//! `on` is `tools/fabric-enable.sh --enable` in Rust, plus three things the
-//! script could not do: record where the fabric is so every client finds it
-//! without arguments (the rendezvous file), arm the instances already running,
-//! and PROVE the result with a message that round-trips through the broker.
+//! Beyond installing the broker and the bridge, `on` records where the fabric
+//! is so every client finds it without arguments (the rendezvous file), arms
+//! the instances already running, and PROVES the result with a message that
+//! round-trips through the broker.
 //! Every step is idempotent and says whether it changed anything; `--dry-run`
 //! prints every step and touches nothing.
 //!
@@ -66,8 +66,7 @@
 //!    same socket and log): `on` names its pid and stops. The plist runs the
 //!    broker DIRECTLY — ProgramArguments are the words, no `/bin/sh -c`, every
 //!    value XML-escaped — and the broker verb unlinks a stale socket itself. An
-//!    install carrying the script's `/bin/sh -c "rm -f …; exec …"` argv is read
-//!    as CURRENT, not restarted for its spelling.
+//!    installed job whose argv says anything else is rewritten and restarted.
 //! 7. `[fabric] command` in aterm.toml: replacing only the `command` key of an
 //!    existing `[fabric]` table, in any spelling TOML allows (`[ "fabric" ]`, a
 //!    quoted `"command"`), and leaving everything else alone. The edit is read
@@ -178,8 +177,7 @@ use crate::render::safe;
 /// The rendezvous file's name, beside the instance control sockets.
 pub const RENDEZVOUS_FILE: &str = "fabric.toml";
 
-/// The fleet `on` joins unless `--fleet` says otherwise — the name
-/// `tools/fabric-enable.sh` used.
+/// The fleet `on` joins unless `--fleet` says otherwise.
 pub const DEFAULT_FLEET: &str = "local";
 
 /// The launchd label (and systemd unit name) of the broker under the DEFAULT
@@ -620,22 +618,10 @@ impl Paths {
         argv
     }
 
-    /// The argv `tools/fabric-enable.sh` wrote: a shell that unlinks the
-    /// socket and execs the broker. An install carrying it is CURRENT (the
-    /// broker verb unlinks a stale socket itself) and is not restarted for its
-    /// spelling.
-    fn legacy_broker_argv(&self) -> Vec<String> {
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("rm -f '{}'; exec {}", self.sock(), self.broker_words()),
-        ]
-    }
-
     /// Whether `text`, an installed plist, already runs THIS broker under THIS
     /// label with `KeepAlive` — by what it says, not by its bytes: the direct
-    /// argv [`Paths::plist_text`] writes, or the script's shell form, in any
-    /// layout (plistlib's tabs and line breaks included).
+    /// argv [`Paths::plist_text`] writes, in any layout (plistlib's tabs and
+    /// line breaks included).
     #[must_use]
     pub fn plist_is_current(&self, text: &str) -> bool {
         let flat = collapse_between_tags(text);
@@ -646,12 +632,11 @@ impl Paths {
         if !flat.contains(&label) || !flat.contains("<key>KeepAlive</key><true/>") {
             return false;
         }
-        plist_program_arguments(&flat)
-            .is_some_and(|argv| argv == self.broker_argv() || argv == self.legacy_broker_argv())
+        plist_program_arguments(&flat).is_some_and(|argv| argv == self.broker_argv())
     }
 
     /// The broker command a shell-quoted supervisor line runs (the systemd
-    /// unit, and the script's legacy plist argv).
+    /// unit).
     fn broker_words(&self) -> String {
         if matches!(self.wire, Wire::Sealed { .. }) {
             // Every word single-quoted; `argv_safe` already refused a word
@@ -903,9 +888,9 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// POSIX `cksum`'s CRC — the number `tools/fabric-enable.sh` derived a
-/// non-default label from (`printf '%s' "$ROOT" | cksum`), reproduced so a job
-/// the script installed under a custom root is the job this command finds.
+/// POSIX `cksum`'s CRC: the suffix of a non-default root's label
+/// ([`Paths::label`]), the number `printf '%s' "$ROOT" | cksum` prints, so a
+/// shell can name the job a custom root runs.
 #[must_use]
 pub fn cksum(data: &[u8]) -> u32 {
     fn feed(crc: &mut u32, byte: u8) {
@@ -4340,8 +4325,8 @@ mod tests {
     }
 
     /// THE LABEL RULE: the default root keeps the plain label; any other root
-    /// derives one from POSIX `cksum` of its path — the number
-    /// `tools/fabric-enable.sh` computed, measured on this machine:
+    /// derives one from POSIX `cksum` of its path — the number `cksum`
+    /// prints, measured on this machine:
     /// `printf '%s' /Users//example/.local/share/aterm-fabric | cksum` →
     /// `2100958200 39`.
     #[test]
@@ -4405,11 +4390,11 @@ mod tests {
     }
 
     /// THE PLIST RUNS THE BROKER DIRECTLY — the words, one `<string>` each,
-    /// no `/bin/sh -c` — and is valid XML for any path; the shell form the
-    /// script wrote is CURRENT all the same, so `on` does not restart a
-    /// healthy broker for its spelling; a foreign argv is not.
+    /// no `/bin/sh -c` — and is valid XML for any path; it reads as CURRENT in
+    /// any layout, so `on` does not restart a healthy broker for its spelling;
+    /// a foreign argv is not current.
     #[test]
-    fn the_plist_runs_the_broker_directly_and_the_scripts_form_reads_as_current() {
+    fn the_plist_runs_the_broker_directly_and_reads_as_current_in_any_layout() {
         let p = Paths {
             home: PathBuf::from("/Users//example"),
             login_home: Some(PathBuf::from("/Users//example")),
@@ -4444,29 +4429,6 @@ mod tests {
         assert_eq!(
             plist_program_arguments(&text).as_deref(),
             Some(p.broker_argv().as_slice())
-        );
-        // The script's form, byte for byte.
-        let legacy = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\">\n\
-             <dict>\n\
-             \x20 <key>Label</key><string>systems.alab.astream-broker</string>\n\
-             \x20 <key>ProgramArguments</key>\n\
-             \x20 <array>\n\
-             \x20   <string>/bin/sh</string><string>-c</string>\n\
-             \x20   <string>rm -f '/Users//example/.local/share/aterm-fabric/bus.sock'; exec '/Users//example/.local/bin/aterm' link broker '/Users//example/.local/share/aterm-fabric/bus.sock' '/Users//example/.local/share/aterm-fabric/bus.log'</string>\n\
-             \x20 </array>\n\
-             \x20 <key>RunAtLoad</key><true/>\n\
-             \x20 <key>KeepAlive</key><true/>\n\
-             \x20 <key>ProcessType</key><string>Background</string>\n\
-             \x20 <key>WorkingDirectory</key><string>/Users//example/.local/share/aterm-fabric</string>\n\
-             \x20 <key>StandardOutPath</key><string>/Users//example/.local/share/aterm-fabric/broker.out</string>\n\
-             \x20 <key>StandardErrorPath</key><string>/Users//example/.local/share/aterm-fabric/broker.err</string>\n\
-             </dict>\n\
-             </plist>\n";
-        assert!(
-            p.plist_is_current(legacy),
-            "the script's install is current, not restarted"
         );
         // plistlib's layout (tabs, a line break between key and value, the
         // keys sorted) with the direct argv: current too.
@@ -4881,7 +4843,7 @@ mod tests {
         assert!(Rendezvous::parse("[x\n").is_err());
     }
 
-    /// THE GRANTS are the script's eight, in its order, with the node in six.
+    /// THE GRANTS are the node ring's eight, in order, with the node in six.
     #[test]
     fn the_eight_grants_are_the_node_ring() {
         let g = node_grants("local", "n-a");

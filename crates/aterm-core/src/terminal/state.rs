@@ -343,6 +343,13 @@ pub struct Terminal {
     /// Text selection state. Managed by the UI layer but stored here so it can
     /// be adjusted as the terminal scrolls or text changes.
     pub(super) text_selection: crate::selection::TextSelection,
+    /// What the last mouse report the host encoded for this terminal carried
+    /// (`Terminal::note_mouse_report`): xterm's `mouse_row`/`mouse_col`, the
+    /// memo behind "motion is reported only if the pointer has moved to a
+    /// different character cell". Written by the UI layer's input seam under
+    /// this terminal's lock, like `text_selection`; never VT state, never
+    /// checkpointed.
+    pub(super) mouse_report_memo: Option<super::mouse::MouseReportMemo>,
     /// The other screen's selection, parked across an alternate-screen switch.
     ///
     /// A selection belongs to the screen it was made on. While

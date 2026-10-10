@@ -200,8 +200,7 @@ const MAX_ENTRIES: u64 = 4_000_000;
 /// complete; or NO build, unmarked and therefore re-installable.
 ///
 /// Returns the `tree_root` folded while staging (the verified one when the row signs
-/// one). A tracked installer's tree carries `com.apple.provenance` like every file it
-/// writes; the store heal its door ends with clears it ([`crate::provenance::heal_store`]).
+/// one).
 pub fn verify_and_stage(
     artifact: &Artifact,
     archive: &Path,
@@ -571,9 +570,10 @@ fn check_developer_id(
 ///
 /// Then, for every lane, the row's `links` are created as RELATIVE symlinks
 /// `bin/<name> -> ../<target>` ([`apply_links`]) so the shims resolve `bin/<tool>`. The
-/// root is folded from what was written for the archive and raw lanes; the `dmg`
-/// lane walks the finished tree once (its bytes were laid by `ditto`, not by this
-/// process's write loop).
+/// root is folded from what was written for the archive and raw lanes, and handed out
+/// only once a listing of the tree spells back every name it records
+/// (`TreeAccumulator::require_spelled_back`); the `dmg` lane walks the finished tree
+/// once (its bytes were laid by `ditto`, not by this process's write loop).
 ///
 /// `dest` must be an empty (or absent) directory the caller owns — the fold's
 /// precondition, enforced by every lane. On error the caller removes `dest`.
@@ -637,6 +637,11 @@ pub(crate) fn stage_payload_modes(
     apply_links(dest, &artifact.links, folded.as_mut())?;
     match folded {
         Some(tree) => {
+            // Every name is laid: the disk must spell the fold back before its root is
+            // anyone's record (`TreeAccumulator`'s docs: a filesystem that rewrites one
+            // name collides with nothing the exclusive creates could refuse).
+            tree.require_spelled_back(dest)
+                .map_err(StageError::Extract)?;
             let modes = tree.declared_modes();
             Ok((tree.root(), modes))
         }
@@ -676,13 +681,16 @@ fn stage_raw_binary(
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
     let bin = dest.join("bin");
     refuse_symlinked_bin(&bin)?;
-    std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
+    // Made through the fold, as every folding lane makes its directories, so the
+    // `links` laid after it find `bin` among the names this stage made.
+    let mut tree = TreeAccumulator::new();
+    crate::extract::make_dir_exact(dest, &bin, Path::new("bin"), &mut tree)
+        .map_err(StageError::Extract)?;
     crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
     let target = bin.join(tool.exe_file());
     let file = std::fs::File::open(archive).map_err(StageError::Io)?;
     let written =
         crate::extract::stage_file(file, &target, 0o755, cap).map_err(StageError::Extract)?;
-    let mut tree = TreeAccumulator::new();
     let rel = crate::extract::rel_bytes_under(dest, &target).map_err(StageError::Extract)?;
     tree.record_file(rel, written.mode, written.content_sha_hex);
     Ok(tree)
@@ -779,9 +787,19 @@ fn apply_links(
         if std::fs::symlink_metadata(dest.join(target)).is_err() {
             return Err(payload2("links target is not in the staged tree: ", target));
         }
-        std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
-        crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
         let link = bin.join(name);
+        // The fold records the link as `bin/<name>`, so `bin` must be the name the stage
+        // made, not one the filesystem folds onto it (an archive's `Bin/` on
+        // case-insensitive APFS): the same exact-name rule as the archive's own members.
+        match tree.as_deref_mut() {
+            Some(tree) => {
+                let raw = Path::new("bin").join(name);
+                crate::extract::make_dir_exact(dest, &bin, &raw, tree)
+                    .map_err(StageError::Extract)?;
+            }
+            None => std::fs::create_dir_all(&bin).map_err(StageError::Io)?,
+        }
+        crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
         if std::fs::symlink_metadata(&link).is_ok() {
             return Err(payload2(
                 "links name collides with a staged entry: bin/",
@@ -1441,6 +1459,7 @@ mod tests {
             links: std::collections::BTreeMap::new(),
             vendor: String::new(),
             protocol: "github-release".into(),
+            provenance: None,
         }
     }
 
@@ -2718,8 +2737,9 @@ mod tests {
     }
 
     /// The `raw-binary` lane: the download becomes `bin/<entry>` at `0755`, and the
-    /// root it folds is the one a hand-laid `bin/<entry>` walks to. An `entry` that is
-    /// not a bare tool name is refused before anything is written.
+    /// root it folds is the one a hand-laid `bin/<entry>` walks to, with or without a
+    /// `links` alias beside it. An `entry` that is not a bare tool name is refused before
+    /// anything is written.
     #[cfg(unix)]
     #[test]
     fn raw_binary_payload_becomes_bin_entry_at_0755() {
@@ -2749,6 +2769,24 @@ mod tests {
         assert_eq!(tree_root(&build).unwrap(), expected);
         // The download itself is untouched (flow reclaims it).
         assert_eq!(std::fs::metadata(&dl).unwrap().len(), payload.len() as u64);
+
+        // A raw-binary row may carry `links` (`vendor::check_links` admits them on every
+        // payload). The link lands in the `bin` this lane made, which `apply_links` takes
+        // only because the lane recorded it in the fold: a `bin` made behind the fold's
+        // back is a name the stage did not lay, and the link is refused as Occupied.
+        lay_link(&replica, "bin/claude-alias", "../bin/claude");
+        let expected = tree_root(&replica).unwrap();
+        let mut art = vendor_artifact(&dl, "raw-binary", &expected);
+        art.entry = "claude".into();
+        art.links.insert("claude-alias".into(), "bin/claude".into());
+        let build = d.join("store/claude-links/2026082601");
+        let root = verify_and_stage(&art, &dl, &build, &StageHooks::NONE).unwrap();
+        assert_eq!(root, expected);
+        assert_eq!(tree_root(&build).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_link(build.join("bin/claude-alias")).unwrap(),
+            Path::new("../bin/claude")
+        );
 
         for bad in ["", "bin/claude", "../claude", "sudo"] {
             let mut art = vendor_artifact(&dl, "raw-binary", &expected);
@@ -2931,6 +2969,86 @@ mod tests {
             assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
             assert!(!build.exists(), "{label}: nothing staged");
             assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The root a stage hands back is the walk of the tree it leaves, whatever the
+    /// filesystem folds. A vendor-direct build records exactly this root (no index signed
+    /// one) and `aterm pkg verify` walks the build against it, so a stage that recorded
+    /// `dir/g` over a disk holding `Dir/g` — one directory under two spellings on
+    /// case-insensitive APFS — left an install that read as drifted from the moment it
+    /// landed (and a row signed through the same stage installed, then drifted). The
+    /// archive's own members and the `links` a stage adds under `bin/` (over an archive
+    /// that laid `Bin/`) are both held to it: where the filesystem keeps the spellings
+    /// apart both stage and agree, where it folds them the stage is refused with nothing
+    /// left behind, and spelled one way they always stage.
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_root_is_the_walk_of_the_tree_it_leaves_when_names_fold() {
+        /// `(label, tar entries, links, spelled one way)`.
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, u8, &'a str, &'a [u8], u32)],
+            &'a [(&'a str, &'a str)],
+            bool,
+        );
+        let d = tmp("folded-names");
+        let cases: &[Case<'_>] = &[
+            (
+                "members",
+                &[
+                    ("Dir/f", b'0', "", b"one", 0o644),
+                    ("dir/g", b'0', "", b"two", 0o755),
+                ],
+                &[],
+                false,
+            ),
+            (
+                "members-exact",
+                &[
+                    ("Dir/f", b'0', "", b"one", 0o644),
+                    ("Dir/g", b'0', "", b"two", 0o755),
+                ],
+                &[],
+                true,
+            ),
+            (
+                "links",
+                &[("Bin/tool", b'0', "", b"#!/bin/sh\n", 0o755)],
+                &[("t", "Bin/tool")],
+                false,
+            ),
+            (
+                "links-exact",
+                &[("bin/tool", b'0', "", b"#!/bin/sh\n", 0o755)],
+                &[("t", "bin/tool")],
+                true,
+            ),
+        ];
+        for (label, entries, links, exact) in cases {
+            let gz = d.join(format!("{label}.tar.gz"));
+            std::fs::write(&gz, gzip_bytes(&tar_bytes(entries))).unwrap();
+            let mut art = vendor_artifact(&gz, "tar-gz", "");
+            for (name, target) in *links {
+                art.links.insert((*name).into(), (*target).into());
+            }
+            let build = d.join(format!("store/{label}/1"));
+            match verify_and_stage(&art, &gz, &build, &StageHooks::NONE) {
+                Ok(root) => assert_eq!(
+                    tree_root(&build).unwrap(),
+                    root,
+                    "{label}: the recorded root is the installed tree's"
+                ),
+                Err(StageError::Extract(ExtractError::Rejected(
+                    crate::extract::ExtractReject::Occupied,
+                    _,
+                ))) if !exact => {
+                    assert!(!build.exists(), "{label}: nothing staged");
+                    assert!(scratch_beside(&build).is_empty(), "{label}: no scratch");
+                }
+                Err(e) => panic!("{label}: {e:?}"),
+            }
         }
         let _ = std::fs::remove_dir_all(&d);
     }

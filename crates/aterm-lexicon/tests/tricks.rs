@@ -403,9 +403,9 @@ fn no_plain_english_word_opens_ordinary_command_lines_or_chat_messages() {
 }
 
 /// THE `sleep 5` RULING. `sleep` is a shell command people type by hand, and
-/// it is PLAIN anyway: a direct request is answered every time (the owner's
-/// law), and the listener's tentative tier makes the collision cheap — `sleep
-/// 5` blinks the word and is revoked at `5`; the pet never moves. The same
+/// it is PLAIN anyway: a direct request is answered every time, and the
+/// listener's tentative tier makes the collision cheap — `sleep 5` blinks the
+/// word and is revoked at `5`; the pet never moves. The same
 /// holds for every iconic bare verb. Pinned by name because "make `sleep` an
 /// address word" is the first thing a future editor will want to do, and it
 /// turns the feature's most obvious command into one that silently fails.
@@ -1174,10 +1174,8 @@ fn reaches(rows: &[TrickRow], lex: &TrickLexicon, lang: &str, trick: Trick) -> b
 /// vocabulary with one gap in it: the word a French or Korean speaker types
 /// for that trick is almost always still sitting in some OTHER trick's row,
 /// so their request classifies, fires, and is answered with the wrong
-/// performance while every test stays green. `sing` shipped exactly that way
-/// — it was a `speak` surface in 44 languages, and `speak` deals ONE note —
-/// and a four-trick pin could not see it. Widening this is the durable half
-/// of that fix: the data half alone would decay at the next new trick.
+/// performance while every test stays green (`sing` once sat in `speak`'s
+/// rows in 44 languages).
 #[test]
 fn every_language_in_the_file_reaches_every_trick() {
     let rows = TrickLexicon::all_rows();

@@ -20,21 +20,17 @@ fn grid_new() {
 fn grid_assert_invariants_after_operations() {
     let mut grid = Grid::new(24, 80);
 
-    // Write some text
     for c in "Hello, World!".chars() {
         grid.write_char(c);
     }
     grid.assert_invariants();
 
-    // Move cursor
     grid.move_cursor_to(10, 40);
     grid.assert_invariants();
 
-    // Scroll
     grid.scroll_up(5);
     grid.assert_invariants();
 
-    // Resize
     grid.resize(30, 100);
     grid.assert_invariants();
 }
@@ -203,7 +199,6 @@ fn grid_delete_chars() {
 #[test]
 fn grid_insert_lines() {
     let mut grid = Grid::new(5, 10);
-    // Write content to each row
     for row in 0..5 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
@@ -225,7 +220,6 @@ fn grid_insert_lines() {
 #[test]
 fn grid_delete_lines() {
     let mut grid = Grid::new(5, 10);
-    // Write content to each row
     for row in 0..5 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
@@ -247,17 +241,14 @@ fn grid_delete_lines() {
 #[test]
 fn grid_screen_alignment_pattern() {
     let mut grid = Grid::new(3, 5);
-    // Set some content first
     grid.write_char('X');
     grid.line_feed();
     grid.write_char('Y');
 
-    // Set a scroll region
     grid.set_scroll_region(1, 2);
 
     grid.screen_alignment_pattern();
 
-    // All cells should be 'E'
     for row in 0..3 {
         for col in 0..5 {
             assert_eq!(
@@ -268,11 +259,9 @@ fn grid_screen_alignment_pattern() {
         }
     }
 
-    // Cursor should be at home
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(grid.cursor_col(), 0);
 
-    // Scroll region should be reset to full screen
     assert!(grid.scroll_region().is_full(3));
 }
 

@@ -7,10 +7,10 @@
 //! A wait on the busy row (`await gone esc.to.interrupt rows <start> …`, the
 //! supervisor's) and the live upgrade's busy footer look only at the rows
 //! from the live zone's first row down: a dead process's `esc to interrupt`
-//! footer above them stops counting (live, 2026-09-27: `/exit`, then a
-//! fresh `claude` with no `clear`, held every whole-screen wait for its
-//! 20 s step). The one misreading that cut may never make is the other way
-//! round — a LIVE busy row left out, a running turn waited on as over. So
+//! footer above them stops counting (`/exit`, then a fresh `claude` with
+//! no `clear`, held every whole-screen wait for its 20 s step). The one
+//! misreading that cut may never make is the other way round — a LIVE busy
+//! row left out, a running turn waited on as over. So
 //! for every fixture FILE under `aterm-phase/src/fixtures/` and (in the
 //! aterm workspace) `aterm-agent/src/supervise/policy/fixtures/`, whole and
 //! at every tail cut:

@@ -561,7 +561,7 @@ fn staged_assets(layout: &Layout, program: &str) -> Vec<String> {
 
 // THE COMPRESSED ASSET OF A FAILED STAGE IS RETAINED — ONE COPY, REUSED — WHEN THE
 // BYTES WERE RIGHT, and reclaimed with its `.part` when they were not: a stage that
-// failed for a reason that was not the bytes' (a provenance refusal, a full disk) must
+// failed for a reason that was not the bytes' (a permission refusal, a full disk) must
 // not re-download the same archive (743 MB for `trust`) on every pass. The strandage
 // bound still holds: `sweep_foreign_partials` keeps one archive per program, this pass's.
 #[test]
@@ -2818,107 +2818,6 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
     assert_eq!(
         crate::ops::which(&layout, "trust").unwrap(),
         tool_bin(&layout.build_dir("trust", 4821), "trust")
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The heals [`observe_heals`] saw, as `(root, live)`.
-#[cfg(unix)]
-type SeenHeals = std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, bool)>>>;
-
-/// Every heal the stand-in runs from here on, as `(root, live)`: `live` when the
-/// program's `current` link (the one activation link) already named the root AT THAT
-/// MOMENT.
-#[cfg(unix)]
-fn observe_heals(layout: &Layout) -> (SeenHeals, crate::provenance::test_bind::ObserveGuard) {
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let (l, s) = (layout.clone(), std::rc::Rc::clone(&seen));
-    let guard = crate::provenance::test_bind::observe(move |roots| {
-        for root in roots {
-            let names = |link: PathBuf| std::fs::read_link(link).is_ok_and(|t| &t == root);
-            let program = root.parent().and_then(Path::file_name);
-            let live = program
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|p| names(l.program_current(p)));
-            s.borrow_mut().push((root.clone(), live));
-        }
-    });
-    (seen, guard)
-}
-
-/// PROVENANCE BEFORE THE FLIP: every member a group stages has
-/// its tree healed while no `current` link names it yet — cleared after the flip, the
-/// tag's removal moved the ctimes a starting tippy pins, and the tippy refused the
-/// toolchain mid-run ([`crate::provenance::heal_staged`] has the measurement). Each heal
-/// is observed as it runs; after the pass, both members are live.
-#[cfg(unix)]
-#[test]
-fn a_group_heals_every_staged_tree_before_its_flip() {
-    let dir = scratch("group-heal-before-flip");
-    let fake = group_fixture(&dir);
-    let layout = layout(&dir);
-    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
-    let (seen, _observing) = observe_heals(&layout);
-    let report = apply_channel(
-        &fake,
-        &layout,
-        &anchor(),
-        "stable",
-        TRIPLE,
-        &installed,
-        &[],
-        fl(0),
-        0,
-    )
-    .unwrap();
-    assert_eq!(
-        report.groups[0].1,
-        TxnOutcome::Applied(vec!["ay".into(), "trust".into()])
-    );
-    let seen = seen.borrow();
-    for (program, build) in [("ay", 18u64), ("trust", 4821)] {
-        let staged = layout.build_dir(program, build);
-        assert_eq!(
-            seen.iter()
-                .filter(|(root, _)| *root == staged)
-                .collect::<Vec<_>>(),
-            vec![&(staged.clone(), false)],
-            "{program}'s staged tree is healed once, before its flip: {seen:?}"
-        );
-        assert_eq!(
-            std::fs::read_link(layout.program_current(program)).unwrap(),
-            staged,
-            "and it is live now"
-        );
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The same for one program's install: its staged tree is healed before activation.
-#[cfg(unix)]
-#[test]
-fn an_install_heals_its_staged_tree_before_activation() {
-    let dir = scratch("install-heal-before-flip");
-    let fake = fixture(&dir);
-    let layout = layout(&dir);
-    let (seen, _observing) = observe_heals(&layout);
-    let req = InstallRequest {
-        channel: "stable",
-        program: "ay",
-        triple: TRIPLE,
-        installed: None,
-    };
-    let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
-    assert_eq!(report.build, 18);
-    let staged = layout.build_dir("ay", 18);
-    assert_eq!(
-        *seen.borrow(),
-        vec![(staged.clone(), false)],
-        "healed once, before it was live"
-    );
-    assert_eq!(
-        std::fs::read_link(layout.program_current("ay")).unwrap(),
-        staged
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5809,7 +5708,7 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
         .lines()
         .map(|l| {
             if l.starts_with("client=") {
-                String::from("client=0.0.0")
+                format!("client={}+another", aterm_types::version::app_version())
             } else {
                 l.to_string()
             }

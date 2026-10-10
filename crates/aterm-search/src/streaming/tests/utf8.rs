@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Production-path UTF-8 tests — #2688.
+//! Production-path UTF-8 tests (#2688).
 //!
-//! The Kani proofs (INV-SEARCH-2, INV-SEARCH-4) verify a `#[cfg(kani)]`
-//! byte-level scanner, not the production `str::find()` path. These unit
-//! tests exercise the production path with multi-byte UTF-8 content and
-//! assert the same invariants.
+//! These unit tests exercise the production `str::find()` path with
+//! multi-byte UTF-8 content and assert INV-SEARCH-2 and INV-SEARCH-4.
 
 use super::super::test_content::TestContent;
 use super::super::*;
@@ -76,7 +74,7 @@ fn utf8_emoji_no_duplicate_results() {
 /// INV-SEARCH-2 + INV-SEARCH-4 (production path): overlapping ASCII matches.
 ///
 /// The production path advances by one character (not match length) so
-/// overlapping matches are found, same as the Kani byte-level scanner.
+/// overlapping matches are found.
 #[test]
 fn overlapping_ascii_matches_production_path() {
     let mut search = StreamingSearch::with_config(StreamingSearchConfig {
@@ -166,9 +164,9 @@ fn utf8_literal_combining_mark_zero_display_width_filtered() {
     assert!(search.verify_result_positions_valid());
 }
 
-/// Regression test: multi-byte case folding produces correct column positions.
+/// Regression (#2775): multi-byte case folding produces correct column positions.
 ///
-/// Bug #2775: `map_lower_byte_to_original` must handle characters where
+/// `map_lower_byte_to_original` must handle characters where
 /// `to_lowercase()` changes the byte length. U+212A (Kelvin Sign) is 3
 /// bytes but lowercases to 'k' (1 byte). Searching case-insensitively for "k"
 /// in text containing the Kelvin sign must produce correct start/end columns.

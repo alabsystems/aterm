@@ -4,28 +4,17 @@
 //! REGRESSION PIN: the f-bomb reaches the major languages ON THE SHIPPED
 //! DEFAULT, and does not fire on ordinary Chinese.
 //!
-//! Owner, 2026-07-24: "make sure that chinese and other major languages also
-//! have f-bombs". The lexicon *contained* 51 profanity entries across 49
-//! languages, which made the feature look done — but 18 of those entries were
-//! flagged `ambiguous = true`, and `Lexicon` drops every ambiguous entry whose
-//! language is not explicitly un-gated. With the shipped default
-//! (`languages = ["en"]`) that left **97 of 323 profanity surfaces, 30%, never
-//! loaded**: Polish `kurwa`, Arabic, Hebrew, Persian, Bengali, Swedish and
-//! Tagalog silently had no f-bomb at all.
+//! `Lexicon` drops every `ambiguous = true` entry whose language is not
+//! un-gated, so an ambiguous flag on a language's only profanity silences it
+//! under the shipped default (`languages = ["en"]`). The gate belongs only on
+//! surfaces that collide with a BENIGN word — Swedish `fan` vs English "fan",
+//! Hebrew `כוס` (also "cup"), Chinese 操/草/干 (everyday words), Romanian
+//! `fut` (prefixes "future"); a surface whose only collision is ANOTHER
+//! language's profanity fires profanity either way, and stays un-gated.
 //!
-//! The `ambiguous` gate is doing real work and is NOT disabled here. It stays
-//! on surfaces that genuinely collide with a BENIGN word — Swedish `fan` vs
-//! English "fan", Hebrew `כוס` (also "cup"), Chinese 操/草/干 (everyday words),
-//! Romanian `fut` (prefixes "future"). What the gate does not belong on is a
-//! surface whose only collision is with ANOTHER language's profanity, which
-//! fires profanity either way. Those were split into un-gated siblings.
-//!
-//! The second half pins a FALSE POSITIVE that shipped: the CJK scanner is
-//! maximal-munch from the run start, so the real expletive 我操 ("I fuck")
-//! matched inside the extremely common 我操作… ("I operate…") — "I operate the
-//! computer" detonated an f-bomb. Suppressed via `exceptions.toml`, whose
-//! mechanism is class-agnostic even though it began as a feline-only list.
-//! This matters more now that detonations are ~3x more frequent.
+//! The second half pins a false positive: the CJK scanner is maximal-munch
+//! from the run start, so the expletive 我操 ("I fuck") matched inside the
+//! common 我操作… ("I operate…"). `exceptions.toml` suppresses it.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -78,9 +67,8 @@ fn major_languages_have_a_working_f_bomb_by_default() {
     );
 }
 
-/// The gate still exists. A surface kept `ambiguous` because it collides with an
-/// ordinary word must STAY dark by default — otherwise this fix would have
-/// traded silent under-coverage for noisy false positives.
+/// The gate still exists: a surface kept `ambiguous` because it collides with
+/// an ordinary word stays dark by default.
 #[test]
 fn genuinely_ambiguous_surfaces_stay_gated() {
     let lx = shipped();

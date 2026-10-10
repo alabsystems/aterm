@@ -10,7 +10,7 @@
 //! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
 //!   `StrikeSelection` derived model (`aterm_spec::derive::strike_selection_model`)
 //!   carries `ChosenFromAvailable` + `ChosenAdequateMinimal` +
-//!   `ChosenMaxWhenNoneAdequate`. `cargo test -p aterm-spec`
+//!   `ChosenMaxWhenNoneAdequate`. `targo --unverified test -p aterm-spec`
 //!   (`derived_strike_selection_proves_and_catches_largest_strike_bias`) runs the
 //!   REAL `ty` binary over the bounded state space: it PROVES the law at `Buggy=0`
 //!   and CATCHES the pre-W10 always-largest (`u16::MAX`) request at `Buggy=1`.
@@ -25,9 +25,7 @@
 //! Products (`d*src`) are outside `ty`'s Expr language (no `*`), so the area
 //! filter's laws have no derived model (documented WAIVER on
 //! [`aterm_render::area_overlap`]): the always-on proof weight is the exhaustive
-//! integer lattice here, redundantly deepened by the config-free `#[kani::proof]`
-//! harnesses in aterm-render (`resample_kani`, a trust-mc `verify.sh --full`
-//! lane) over the bit-precise bounded domain.
+//! integer lattice here (src, dst 1..=48, both sums).
 
 use aterm_render::{area_overlap, resample_rgba, select_strike_ppem};
 

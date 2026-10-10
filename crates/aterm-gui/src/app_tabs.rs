@@ -2139,7 +2139,7 @@ impl App {
             layouts,
             crate::tab_model::TabSet::new(stable_tab),
         );
-        self.windows.insert(wid_b, ws_b);
+        self.windows.insert(wid_b, Box::new(ws_b));
         self.frontmost_window = Some(wid_b);
         // Re-mirror BOTH: A's active tab changed (it lost its old active), and B is
         // the new frontmost (also re-points the global control/notify handle to B).
@@ -2392,7 +2392,7 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        self.windows.insert(wid_b, ws_b);
+        self.windows.insert(wid_b, Box::new(ws_b));
         self.install_window_config_assets(wid_b);
         self.frontmost_window = Some(wid_b);
         // Re-mirror BOTH viewers: B is the new frontmost (also re-points the global
@@ -2824,17 +2824,19 @@ impl App {
     /// `Terminal` lock: the verdict is the status sweep's publication, not a
     /// re-read.
     ///
+    /// The stall row names the publication's explicit restart where the act
+    /// would be carried (`InputStallFact::act`, the one predicate
+    /// [`crate::restart_act::offered`]), as the server's attention entry
+    /// does, and otherwise the tab's own resume line, never `claude
+    /// --continue` ([`crate::input_stall::after_restart`], 2026-09-26).
+    ///
     /// `relaunching` is the host's own word of which sessions' agents it
-    /// would relaunch once a stall's remedy ends them
+    /// would relaunch under `[harness] relaunch`
     /// ([`crate::harness_host::HostHandle::relaunching`], read before the
-    /// store's lock); the stall row says so only where the host also holds
-    /// the session's claim and nobody else's hand is on it
-    /// ([`crate::input_stall::host_relaunches`], resume-hint review
-    /// 2026-09-26: a `drive watch` session was promised the relaunch), and
-    /// otherwise names the tab's own resume line, never `claude --continue`
-    /// ([`crate::input_stall::after_restart`], 2026-09-26). The memory wall's
-    /// row names the same line ([`crate::status_item::SessionRow::resume`]),
-    /// and says the host restarts the agent only on that same predicate
+    /// store's lock). The memory wall's row names the tab's resume line
+    /// ([`crate::status_item::SessionRow::resume`]) and says the host
+    /// restarts the agent itself only where it would and also holds the
+    /// session's claim with nobody else's hand on it
     /// ([`crate::status_item::SessionRow::restarts`]): a supervised row under
     /// `relaunch = false` or a `drive watch` claim was promised a restart
     /// that never came (resume-hint review, 2026-09-26).
@@ -2852,9 +2854,12 @@ impl App {
                 m.live_supervisor(crate::metrics::now_us()).is_some(),
             )
         };
-        // Before the timeline's leaf lock, never under it.
-        let relaunches =
-            crate::input_stall::host_relaunches(&h.ctx, relaunching, crate::metrics::now_us());
+        // THE MEMORY ROW'S WORD ([`crate::status_item::SessionRow::restarts`]):
+        // the host's own restart at an idle point, under `[harness] relaunch`
+        // (`relaunching`) on a session whose hand is its own. Before the
+        // timeline's leaf lock, never under it.
+        let restarts = relaunching.contains(h.ctx.self_id.as_str())
+            && crate::input_stall::host_hand_refusal(&h.ctx, crate::metrics::now_us()).is_none();
         let (agent, host_supervises, stall, resume) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
@@ -2864,12 +2869,11 @@ impl App {
                 rev: a.rev,
                 subject: a.subject.clone(),
             });
+            // The stall's words name the publication's explicit restart
+            // (`InputStallFact::act`), as its attention entry does.
             let stall = a.input.clone().map(|f| {
-                (
-                    f,
-                    a.program.clone(),
-                    crate::input_stall::after_restart(&tl, relaunches),
-                )
+                let after = crate::input_stall::after_restart(&tl, f.act.as_ref());
+                (f, a.program.clone(), after)
             });
             let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             (
@@ -2900,10 +2904,8 @@ impl App {
             supervised: supervised || host_supervises,
             input_stall,
             resume,
-            // The one predicate the stall row's "aterm relaunches it" rides:
-            // the memory row says "restarting it" on the same word, never on
-            // supervision alone (resume-hint review, 2026-09-26).
-            restarts: relaunches,
+            // Never on supervision alone (resume-hint review, 2026-09-26).
+            restarts,
         }
     }
 

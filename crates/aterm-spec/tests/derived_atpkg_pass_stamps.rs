@@ -4,7 +4,7 @@
 use aterm_spec::{derive::atpkg_pass_stamps_model, interp, verify};
 
 /// The pass record proves over its bounded space (interpreter, and `ty` where installed)
-/// and `Buggy = 1` — the record as it was until 2026-09-23 — is caught. Each historical
+/// and `Buggy = 1` — the record before PK-3/PK-4 — is caught. Each historical
 /// defect is then replayed on its own, so every invariant is shown to catch the bug it was
 /// written for: PK-3's cache-served success healing a sibling's ladder and standing a
 /// waiter down, and PK-4's vendor-door write read as a failed pass and as a pass

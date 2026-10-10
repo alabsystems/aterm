@@ -350,7 +350,15 @@ pub(crate) fn run_conformance() {
         ProjectionWitness::initial(),
     );
 
-    app.note_forwarded_press_key(window_a, physical, false, key.clone(), mods, base_layout);
+    app.note_forwarded_press_key(
+        window_a,
+        physical,
+        false,
+        key.clone(),
+        mods,
+        base_layout,
+        None,
+    );
     match app.physical_press_owners.get(&physical) {
         Some(PhysicalPressOwner::Forwarded {
             window,
@@ -358,6 +366,7 @@ pub(crate) fn run_conformance() {
             key: stored_key,
             mods: stored_mods,
             base_layout: stored_layout,
+            layout_text: None,
         }) => {
             assert_eq!(*window, window_a);
             assert_eq!(*session, session_a);

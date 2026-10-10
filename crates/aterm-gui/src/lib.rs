@@ -225,10 +225,6 @@ mod chrome_regrow_conformance;
 // handoff's.
 mod build_badge;
 mod build_info;
-// The binary's per-commit provenance: `crates/aterm` stamps it and installs it
-// first thing in `main` (`build_info::BuildStamp` says why it is not an `env!`
-// of this crate).
-pub use build_info::{BuildStamp, install_build_stamp};
 #[cfg(test)]
 mod host_exceptions_tests;
 #[cfg(all(test, unix))]
@@ -246,13 +242,6 @@ mod work_counts;
 #[must_use]
 pub fn running_build_number() -> u64 {
     build_info::build_number().parse::<u64>().unwrap_or(0)
-}
-
-/// The running app version, for the headless update lane's one plain line
-/// (`aterm 0.91.0 is up to date · checked 12 min ago`).
-#[must_use]
-pub fn running_version() -> &'static str {
-    build_info::VERSION
 }
 
 pub use update_words::DevSharedWrites;
@@ -294,7 +283,7 @@ pub fn dev_build_shared_writes() -> Option<DevSharedWrites> {
 pub fn running_binary_identity() -> aterm_update_core::linux::BinaryIdentity {
     aterm_update_core::linux::BinaryIdentity {
         schema: 1,
-        version: build_info::VERSION.into(),
+        version: build_info::version().into(),
         build_number: running_build_number(),
         commit: build_info::git_commit_full().into(),
         target: build_info::BINARY_TARGET.into(),
@@ -332,12 +321,6 @@ mod clipboard_win;
 mod clipboard_x11;
 mod close_confirm;
 mod command_registry;
-/// Compiler-provenance probe (`rustc -vV` parser + r/t flavor classifier). The
-/// production copy is `include!`d by `build.rs` (which stamps the env vars
-/// `build_info` reads); this test-only mount runs the same code against real
-/// `-vV` fixtures.
-#[cfg(test)]
-mod compiler_probe;
 /// Config-directory marker files (`privacy-access-card-answered`, the
 /// debugger-access markers): the exclusive, bounded, never-written-through
 /// read/write rules.
@@ -423,6 +406,9 @@ mod dataless_files;
 /// can answer; the receiving half lives in `aterm_pty::adopt_handoff`.
 #[cfg(windows)]
 mod defterm_win;
+/// What an instance keeps of its desk across launches (quit layout, crash
+/// journal, restore pass, restored agents), and the lab's headless seam.
+mod desk;
 /// The durability flushes every atomic publish and the crash journal take.
 mod durable;
 /// The PTY keeper's window side (P3, opt-in `[keeper] enabled`): register,
@@ -517,7 +503,6 @@ mod platform_win;
 /// CoreGraphics on macOS, `softbuffer` everywhere else.
 mod present;
 mod press_custody_conformance;
-mod provenance_repair;
 mod relaunch_notice;
 mod session_waits;
 mod strain_host;
@@ -690,6 +675,9 @@ mod resize_epoch;
 /// Every grid resize a session took, grouped into runs, and whether the app has
 /// drawn over content a resize displaced (`resizes`, `status render=`).
 mod resize_ledger;
+/// The explicit restart (`aterm ctl restart`): its stamp before its signal,
+/// its escalation, and the carrier that finishes an act a Commit cut.
+mod restart_act;
 mod restore;
 mod robi_bubble;
 mod scroll_motion;
@@ -2317,17 +2305,25 @@ mod launch_fatal_exit_tests {
     /// Second sentinel: run the child against plain `exit(3)`.
     const OLD_TERMINATOR: &str = "aterm-launch-fatal-old-terminator";
 
+    /// The status [`the_driver_destructors_ran`] leaves with. Nothing else in
+    /// the child exits with it: libtest exits 0 or 101, the fatal 1.
+    const HANDLER_RAN: i32 = 86;
+
     unsafe extern "C" {
         /// `stdlib.h`: register a handler for `exit(3)`. Declared here, not in
         /// `aterm-libc`, because only this fixture registers one.
         fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
     }
 
-    /// The GPU driver's static destructors, reduced to the abort they cause.
-    /// Registered with `atexit`, so it runs on `exit(3)` and nothing else.
-    extern "C" fn abort_the_way_the_driver_did() {
-        // SAFETY: async-signal-safe; raises SIGABRT on the calling process.
-        unsafe { libc::abort() }
+    /// The GPU driver's static destructors, reduced to the fact that they ran.
+    /// Registered with `atexit`, so it runs on `exit(3)` and nothing else. The
+    /// driver's own destructors aborted; this one leaves with [`HANDLER_RAN`]
+    /// instead, so the control that runs it on every test run writes no crash
+    /// report (an abort did: one `aterm_gui-*.ips` per run until 2026-10-09).
+    extern "C" fn the_driver_destructors_ran() {
+        // `_exit`, through the crate's one spelling of it: no further handler
+        // or destructor runs, and nothing returns.
+        crate::crash_signal::clean_exit_now(HANDLER_RAN)
     }
 
     /// The child half of both cases below, inert unless re-executed with [`ARM`].
@@ -2339,7 +2335,7 @@ mod launch_fatal_exit_tests {
         }
         // SAFETY: registering a C exit handler. The re-exec passes
         // `--test-threads=1`, so this child is single threaded at this point.
-        let armed = unsafe { atexit(abort_the_way_the_driver_did) };
+        let armed = unsafe { atexit(the_driver_destructors_ran) };
         assert_eq!(armed, 0, "atexit accepted the handler");
         if argv.iter().any(|a| a == OLD_TERMINATOR) {
             // The control: the same armed process, leaving through `exit(3)`,
@@ -2375,7 +2371,12 @@ mod launch_fatal_exit_tests {
             None,
             "a handled configuration error must not die on a signal — stderr: {stderr}"
         );
-        assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "status {HANDLER_RAN} is the armed `atexit` handler run, as exit(3) runs it \
+             — stderr: {stderr}"
+        );
         assert!(
             stderr.contains("aterm-gui: spawn failed: child could not exec"),
             "the one true sentence still reaches stderr — stderr: {stderr}"
@@ -2386,22 +2387,17 @@ mod launch_fatal_exit_tests {
         );
     }
 
-    /// The control: `std::process::exit` on the identical armed process still dies
-    /// on signal 6.
+    /// The control: `std::process::exit` on the identical armed process still runs
+    /// the handler, and leaves with its status.
     #[test]
-    fn the_terminator_this_replaced_still_dies_on_signal_6() {
+    fn the_terminator_this_replaced_still_runs_the_handler() {
         let out = run_child(true);
         let stderr = &out.stderr;
         let status = out.status.expect("the stand-in exited");
         assert_eq!(
-            status.signal(),
-            Some(libc::SIGABRT),
-            "exit(3) must still run the armed handler — stderr: {stderr}"
-        );
-        assert_eq!(
             status.code(),
-            None,
-            "a signalled death reports no exit status — stderr: {stderr}"
+            Some(HANDLER_RAN),
+            "exit(3) must still run the armed handler — stderr: {stderr}"
         );
     }
 }
@@ -3277,6 +3273,9 @@ enum PhysicalPressOwner {
         key: aterm_types::keyboard::Key,
         mods: aterm_types::keyboard::Modifiers,
         base_layout: Option<char>,
+        /// The press's layout character (`InputEvent::Key::layout_text`), so a
+        /// held German Shift+2 repeats `"`, not the US table's `@`.
+        layout_text: Option<char>,
     },
     /// A literal text/raw-sequence press wrote a payload instead of a protocol
     /// key report. Repeats stay pinned to this exact session and payload;
@@ -4439,6 +4438,11 @@ enum Wake {
     /// listed only when something changed. A log line, one ledger row per item, and
     /// the Security page's "Last change"; never a row on glass.
     PkgMachineSettings(String),
+    /// `foreign: <scope> <items>` — what one of a pass's looks found that aterm leaves
+    /// alone, with atpkg's fix ([`atpkg::cli::FOREIGN_MARKER`]): that look's one
+    /// exceptions entry, ended by its first report that names nothing
+    /// (`App::note_foreign_tools`).
+    PkgForeign(String),
     /// `machine-state:` — the posture record a pass prints after its apply
     /// ([`atpkg::cli::MACHINE_STATE_MARKER`]); the Security page's "This Mac" card
     /// takes it instead of spawning `atpkg machine` again.
@@ -4464,7 +4468,7 @@ enum Wake {
         text: String,
         reply: std::sync::mpsc::Sender<Result<AppNoticeTaken, &'static str>>,
     },
-    /// `aterm ctl notice <post|progress|done|dismiss|act> …` (Owner-only): the message
+    /// `aterm ctl notice <post|progress|done|ask|dismiss|act> …` (Owner-only): the message
     /// band's write face, parsed by `aterm_messages::wire::NoticeRequest::parse` and
     /// applied by `App::take_notice`.
     Notice {
@@ -5654,20 +5658,6 @@ pub enum AppActivation {
     Prohibited,
 }
 
-impl AppActivation {
-    /// The SDK's raw value (`NSApplication.h`), which
-    /// `crates/aterm/tests/headless_activation.rs` reads back through
-    /// `NSRunningApplication.activationPolicy`.
-    #[must_use]
-    pub const fn ns_raw(self) -> isize {
-        match self {
-            Self::Regular => 0,
-            Self::Accessory => 1,
-            Self::Prohibited => 2,
-        }
-    }
-}
-
 /// What a launch asks AppKit for at `applicationDidFinishLaunching:` — the two
 /// `EventLoopBuilderExtMacOS` knobs that decide whether a process can take the
 /// keyboard, as one value.
@@ -5706,12 +5696,22 @@ impl LaunchPosture {
 /// `defer_gpu_build` and `defer_font_seal`, and decided for the same reason:
 /// NO GLASS.
 ///
+/// SUPERSEDED ON macOS FOR HEADLESS (2026-09-26), kept because it is what the
+/// AppKit loop must be told. A macOS `--headless` run now builds winit's
+/// display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`), which
+/// never creates the `NSApplication` this posture is applied to — building that
+/// object opened the process's WindowServer connection, and with it a TCC
+/// preflight on WindowServer's main thread (AGENTS.md rule 5; see the
+/// `with_headless` selection in `main_entry`). The rest of this note is the
+/// 2026-09-21 decision as it stood while headless still built the AppKit loop.
+///
 /// The incident (2026-09-21, an Intel Mac on macOS 13.7): "something keeps
-/// stealing focus while I type". On macOS a `--headless` run builds the real
-/// AppKit event loop — winit's display-free backend exists only for a free-unix
-/// host with no display server — and winit's `applicationDidFinishLaunching:`
-/// then does two things for it that only make sense for a process with a
-/// window: an UNBUNDLED binary is given `NSApplicationActivationPolicyRegular`
+/// stealing focus while I type". On macOS a `--headless` run built the real
+/// AppKit event loop — winit's display-free backend then existed only for a
+/// free-unix host with no display server — and winit's
+/// `applicationDidFinishLaunching:` then did two things for it that only make
+/// sense for a process with a window: an UNBUNDLED binary is given
+/// `NSApplicationActivationPolicyRegular`
 /// (a Dock tile, a Cmd-Tab entry, a LaunchServices record as a second "aterm"),
 /// and every launch is sent `activateIgnoringOtherApps:YES`. So every headless
 /// instance took the keyboard from whatever the human was typing into and had
@@ -8494,7 +8494,7 @@ struct SyncObservation {
 
 /// Per-window view state: the OS handle + present target, the optional
 /// focused-terminal capability, grid size, and per-window input, selection, IME,
-/// find, blink and bell state. `App` holds a `BTreeMap<WindowId, WindowState>`.
+/// find, blink and bell state. `App` holds each one boxed (its `windows` field).
 /// The typed constructors establish a terminal or native front-content contract;
 /// the OS window and present target attach later in `resumed` (never headless).
 struct WindowState {
@@ -8660,14 +8660,20 @@ struct WindowState {
     /// Origin word/line of an in-flight double/triple-click drag, so motion
     /// extends the selection by whole units. `None` for simple/block drags.
     gesture: Option<GestureOrigin>,
-    /// The mouse button held down (set on press, cleared on release), so a motion
-    /// report under mouse tracking (DECSET 1002/1003) carries the real button instead
-    /// of the no-button hover code.
+    /// The button a motion report under mouse tracking (DECSET 1002/1003) names
+    /// instead of the no-button hover code: the LOWEST of the held buttons in
+    /// `reported_buttons`, xterm's `FirstBitN` (`app_mouse::held_button`), never
+    /// set on its own, so releasing one button of a chord leaves the other named.
     held_mouse_button: Option<aterm_types::mouse::MouseButton>,
     /// Bitmask (`1 << button.slot()`) of buttons whose press was reported to a
     /// mouse-tracking app, so each release pairs with its press. Keyed on `slot()`,
     /// since thumb-button wire codes alias under `& 7`.
     reported_buttons: u8,
+    /// Per `slot()`: the session each held button's press went to and the cell
+    /// last sent to it, so its drag motion and release reach that program even
+    /// after a tab or pane switch moved the front (`App::settle_hidden_button_owners`).
+    /// `None` for a bit set without a recorded owner, which follows the front.
+    button_owners: [Option<app_mouse::ButtonOwner>; 5],
     /// Physical keys whose press a GUI gate consumed; the matching release is
     /// swallowed so Kitty `REPORT_EVENT_TYPES` apps never see an orphan release. A
     /// per-window mirror; `physical_press_owners` is authoritative.
@@ -10622,6 +10628,7 @@ impl WindowState {
             gesture: None,
             held_mouse_button: None,
             reported_buttons: 0,
+            button_owners: [None; 5],
             consumed_press_keys: std::collections::HashSet::new(),
             overlay_consumed_keys: std::collections::HashSet::new(),
             focused: true,
@@ -12907,7 +12914,14 @@ struct App {
     /// All logical windows. Each owns its canonical focused-content identity,
     /// optional focused-terminal capability, grid size, input/selection/IME/find/
     /// blink/bell state, OS window, and present target.
-    windows: BTreeMap<WindowId, WindowState>,
+    ///
+    /// Boxed: a `WindowState` is tens of KB, and a map that holds it by value
+    /// moves all of it through every frame of `BTreeMap::insert` (several copies
+    /// each in an unoptimized build) and reserves room for 11 of them in each
+    /// node. A test that built a few headless Apps ran out of libtest's 2 MiB
+    /// thread stack inside that insert as `WindowState` grew; boxed, the map
+    /// moves and stores a pointer.
+    windows: BTreeMap<WindowId, Box<WindowState>>,
     /// The logical window that currently has focus (the one most call sites act on
     /// via `front`/`front_mut`). `None` only if every window has been closed.
     frontmost_window: Option<WindowId>,
@@ -13032,6 +13046,12 @@ struct App {
     /// Shell pids reattached from the PTY keeper after the last window's crash, which
     /// the recovery row's `End sessions` hangs up. Empty otherwise.
     keeper_recovered: Vec<i32>,
+    /// The ids of the messages the last park's carry handed over
+    /// (`App::park_window_carry`). At that attempt's Commit every other live
+    /// row ends with this process (`App::close_uncarried_messages`, ruling
+    /// 441 (d)), so the successor never reads one as cut off by a crash.
+    #[cfg(unix)]
+    handoff_carried_messages: Vec<u64>,
     /// The layout captured at the moment a window close decided to exit
     /// the app (`close_window_logical` drains `windows` before `el.exit()`, so the
     /// post-loop writer would otherwise see an empty map on that path). The Cmd-Q
@@ -13060,6 +13080,9 @@ struct App {
     /// engine, control socket, and offscreen rendering (`image`/snapshot via
     /// [`Wake::Control`]) all run, but nothing is presented on screen.
     headless: bool,
+    /// What this instance keeps of its desk across launches ([`desk::Desk`]):
+    /// a window's, none headless, or a window's under the lab's headless seam.
+    desk: desk::Desk,
     /// This instance's control-socket plan and whether it bound, kept for the overlap
     /// handoff: a committed parent `_exit`s without `owned_endpoint::release`, a
     /// rollback republishes `latest`, and the successor sweeps the predecessor's socket
@@ -13104,6 +13127,14 @@ struct App {
     /// `platform::recent_user_input_event` windowed, the inert arm headless and in
     /// tests (same reason as `lock_modifiers`).
     user_input_recent: fn(std::time::Duration) -> bool,
+    /// Menu-bar reader behind `chrome`'s `menu …` lines (macOS):
+    /// `app_introspect::read_app_menu_bar` windowed, `app_introspect::no_app_menu_bar`
+    /// (`menu (none)`) headless and in unit tests. The AppKit read starts with
+    /// `+[NSApplication sharedApplication]`, which in a headless process creates the
+    /// application object and opens its WindowServer connection (AGENTS.md rule 5;
+    /// `grep_guard` B9h holds the selection).
+    #[cfg(target_os = "macos")]
+    app_menu_bar: fn(crate::appkit::MainThread) -> Vec<String>,
     /// macOS consent state: injected probes plus the Full Disk Access cache
     /// (`control_privacy::ConsentState`); inert arms headless and in tests.
     /// Instance-owned, so a successor starts with an empty cache.
@@ -13474,9 +13505,12 @@ struct App {
     /// `config.` families a reload found fixed; the same words returning later are
     /// raised as a new break, not recorded as a repeat.
     config_cleared: std::collections::BTreeSet<String>,
-    /// The managed-current words last recorded (title, detail), so a marker printed
-    /// every pass records once per change (`App::post_managed_current`).
-    managed_current_recorded: Option<(String, Vec<String>)>,
+    /// The managed-current record this process wrote last: the programs it named,
+    /// each with its version and standing, and its id, so a marker printed every pass
+    /// is recorded once per set of versions and re-words that record as the tab counts
+    /// move (`App::post_managed_current`).
+    managed_current_recorded:
+        Option<(Vec<toolchain_words::ManagedItem>, aterm_messages::MessageId)>,
     /// The harness note this process last recorded (`App::record_harness_note`): a
     /// note repeated word for word is not written again.
     harness_note_recorded: Option<String>,
@@ -13602,6 +13636,11 @@ struct App {
     /// `upgrade:<sid>`, `disk`): each begins a record once and ends once
     /// (`App::note_harness_host`).
     host_noted: std::collections::BTreeSet<String>,
+    /// The exception keys whose words the door last refused, with the fault
+    /// `aterm.log` said (`exceptions_host::checked_entry`): each refusal is
+    /// one error line, not one per look, and a key a pass names but whose words
+    /// were refused keeps its open entry (`App::except_replace`).
+    entries_refused: std::collections::BTreeMap<String, aterm_messages::exceptions::EntryFault>,
     /// The tabs whose supervisor has failed past its restart budget and not yet
     /// been seen steady (`App::note_harness_host`, `settle_supervisors`).
     supervisor_failing: std::collections::BTreeMap<String, exceptions_host::SupervisorFail>,
@@ -14351,7 +14390,10 @@ impl App {
     /// for "is the user looking at aterm": successor activation, the output-gap hold,
     /// and [`Self::update_apply_hands_off_keys`].
     pub(crate) fn any_os_window_focused(&self) -> bool {
-        self.windows.values().any(os_window_focused)
+        self.windows
+            .values()
+            .map(Box::as_ref)
+            .any(os_window_focused)
     }
 
     /// Whether an overlap handoff is in flight in either of its shapes: parked
@@ -16768,6 +16810,9 @@ impl App {
         // Settle any in-flight pointer drag against the still-front content, so the
         // switch cannot leave a zombie `InProgress` selection.
         self.settle_selection_gesture(wid);
+        // A held button whose program the switch took off the glass gets its
+        // release now, so neither it nor the new front sees half a pair.
+        self.settle_hidden_button_owners(wid);
         // Close find through its own seam: it restores the Smart Title and parks the find
         // origin for a later reopen. `false`: not a user exit, and the close is lock-free
         // (so the switch parks rather than restores the viewport).
@@ -16932,6 +16977,13 @@ impl App {
         // Presence follows the window's front session: a tab switch, a split, a
         // migration all land here, so the rim and band re-project here.
         self.refresh_presence_window(wid);
+        // The pointer's pane-local cell was in the old front's grid: re-derive it
+        // in the new front's, so a press, release or wheel before the next motion
+        // (a keyboard focus move with the pointer still) addresses the cell the
+        // pointer is on rather than one clamped into the pane it left.
+        if front_changed {
+            self.rederive_pointer_cell(wid);
+        }
     }
 
     /// Mount native leaves in visible tab trees and suspend every hidden view.
@@ -17467,7 +17519,7 @@ impl App {
             key_sequences: keybinding::KeySequences::default(),
             windows: {
                 let mut m = BTreeMap::new();
-                m.insert(WindowId(0), ws0);
+                m.insert(WindowId(0), Box::new(ws0));
                 m
             },
             frontmost_window: Some(WindowId(0)),
@@ -17501,12 +17553,15 @@ impl App {
             handoff_device_proof_term: false,
             handoff_successor: false,
             keeper_recovered: Vec::new(),
+            #[cfg(unix)]
+            handoff_carried_messages: Vec::new(),
             quit_capture: None,
             crash_journal: crash_journal::Lane::inert(),
             restored_agents: Vec::new(),
             handoff_restored_agents: Vec::new(),
             winit_to_window: HashMap::new(),
             headless: true,
+            desk: desk::Desk::Headless,
             sock_plan: None,
             sock_bound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(unix)]
@@ -17519,6 +17574,8 @@ impl App {
             typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
             lock_modifiers: keymap::no_lock_modifiers,
             user_input_recent: platform::no_recent_user_input_event,
+            #[cfg(target_os = "macos")]
+            app_menu_bar: app_introspect::no_app_menu_bar,
             consent: control_privacy::ConsentState::inert(),
             consent_warmup: consent_warmup::WarmupState::inert(),
             claimant_retire: consent_retire::RetireState::new(true),
@@ -17596,6 +17653,7 @@ impl App {
             demotions_logged: 0,
             ripening: Vec::new(),
             host_noted: std::collections::BTreeSet::new(),
+            entries_refused: std::collections::BTreeMap::new(),
             supervisor_failing: std::collections::BTreeMap::new(),
             resume_standing: std::collections::BTreeMap::new(),
             resume_swept: false,
@@ -19621,7 +19679,10 @@ impl App {
         let painted = handoff_paint_proven(
             self.headless,
             self.first_present_done,
-            self.windows.values().filter(|ws| ws.os_window.is_some()),
+            self.windows
+                .values()
+                .map(Box::as_ref)
+                .filter(|ws| ws.os_window.is_some()),
         );
         if !(drained && painted) {
             return;
@@ -20514,11 +20575,13 @@ impl ApplicationHandler<Wake> for App {
         self.retry_title_observations();
         // Deferred session restore, once window 0 has painted: rebuild extra
         // tabs/panes/windows and place any leftover adopted shells, then repaint.
-        // One-shot. Never headless; the handoff lane already ran it in `resumed`.
+        // One-shot. Never headless (nothing is queued without a desk; the lab's
+        // headless seam has no glass to wait for); the handoff lane already ran it
+        // in `resumed`.
         if restore_pass_due(
             RestorePassSite::Park,
             self.restore_pass_handoff_lane(),
-            self.first_present_done,
+            self.desk.on_glass(self.first_present_done),
             self.restore_pass_queued(),
         ) {
             self.run_restore_pass(el);
@@ -20668,10 +20731,6 @@ impl ApplicationHandler<Wake> for App {
         // The update checker's watchdog: a stale heartbeat is logged, warned once and
         // replaced. Its wake is folded below (`UpdateChecker`).
         self.watch_update_checker();
-        // Provenance: one off-thread measurement per process, logged once and never acted
-        // on — a tracked aterm is not relaunched (`crate::provenance_repair`).
-        #[cfg(target_os = "macos")]
-        crate::provenance_repair::log_once_in_background();
         // Handoff reveal fallback: a window still hidden past its deadline is revealed,
         // with `last_present` cleared so its next present is not skipped. Runs before
         // the readiness re-check, which needs every window revealed.
@@ -21542,7 +21601,11 @@ impl ApplicationHandler<Wake> for App {
         // fixed ~125fps: resolve the primary monitor's refresh period now that the
         // display is up. `refresh_rate_millihertz()` is Hz×1000, so the period is
         // 1e12 / mHz ns (60Hz -> 16.7ms, 120Hz -> 8.3ms). Keep the MIN_FRAME_INTERVAL
-        // default if it's unavailable (no monitor / driver doesn't report it).
+        // default if it's unavailable (no monitor / driver doesn't report it). On
+        // macOS a headless loop is always display-free and answers no monitor —
+        // asking AppKit's loop here was a CoreGraphics display query, a WindowServer
+        // connection — so macOS headless paces at the default, as a display-free
+        // free-unix run always did.
         if let Some(mhz) = el
             .primary_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
@@ -21943,7 +22006,10 @@ impl ApplicationHandler<Wake> for App {
                     let began: Result<VideoMode, String> = match mode {
                         Err(m) => Err(m.into()),
                         Ok(VideoMode::SwapchainTap) => {
-                            match (self.backend.gpu_mut(), self.windows.get_mut(&wid)) {
+                            match (
+                                self.backend.gpu_mut(),
+                                self.windows.get_mut(&wid).map(Box::as_mut),
+                            ) {
                                 (
                                     Some(gpu),
                                     Some(WindowState {
@@ -22606,6 +22672,10 @@ impl ApplicationHandler<Wake> for App {
                 // Re-take every adopted session's input watch before the replay: wakes
                 // were dropped while pending, and bytes queued after prepare have none.
                 let _ = self.rewatch_adopted_input(Instant::now());
+                // An explicit restart the predecessor's Commit cut inside its
+                // grace is finished here: its stamp is on disk, its
+                // escalation thread ended with that instance.
+                self.carry_cut_restarts();
                 let device_term = self.handoff_device_proof_term;
                 let mut current: Vec<(u64, i32, i32)> = self
                     .pool
@@ -22966,6 +23036,10 @@ impl ApplicationHandler<Wake> for App {
                 } else {
                     aterm_log::debug!("atpkg managed-current (unchanged): {detail}");
                 }
+            }
+            Wake::PkgForeign(body) => {
+                aterm_log::debug!("atpkg foreign: {body}");
+                self.note_foreign_tools(&body);
             }
             Wake::PkgMachineRefused(detail) => {
                 aterm_log::info!("atpkg machine: {detail}");
@@ -23394,8 +23468,8 @@ impl ApplicationHandler<Wake> for App {
                         "aterm-gui: document was not opened: {}",
                         rejected.detail()
                     );
-                    // Headless has no glass for the sheet — and a `Prohibited` process
-                    // could not present it — so the stderr line is the whole report.
+                    // Headless has no glass for the sheet, nor an application object
+                    // to present it from, so the stderr line is the whole report.
                     if !self.headless {
                         menu::notify("Couldn’t Open File", rejected.detail());
                     }
@@ -26628,11 +26702,11 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
 /// alone with the package manager switched off, [`spawn_pkg_update_check`]), when it claims
 /// the day's slot: the passes no longer apply the `[machine]` settings (Phase 3), so this
 /// and a terminal session's launch are what keep them applied, and they claim ONE daily
-/// slot between them ([`atpkg::machine::launch_apply_due`]) — its `$HOME` walk used to run
+/// slot between them ([`atpkg::machine::launch_apply_due`]) — the apply used to run
 /// at every window launch. The claim is taken on this thread, never the event loop's.
 /// The child gets the same PATH and spawner pid the passes get, no `--wait-lock` (the
-/// verb takes no store lock — it writes a per-host preference and renames build output
-/// the user owns), and its stdout runs through
+/// verb takes no store lock — it writes two per-host preferences and nothing else), and
+/// its stdout runs through
 /// [`read_seed_markers`] so the `machine-settings:` line lands where a pass's would.
 /// Never joined (`consent_warmup.rs` rule): a wedged `defaults` must not hold a launch.
 ///
@@ -27648,6 +27722,10 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     if let Some(body) = r6_marker_body(line, MACHINE_SETTINGS_MARKER) {
         return Some(Wake::PkgMachineSettings(body.to_string()));
     }
+    // What a look left alone, and the fix that is the owner's: the exceptions digest's.
+    if let Some(body) = r6_marker_body(line, atpkg::cli::FOREIGN_MARKER) {
+        return Some(Wake::PkgForeign(body.to_string()));
+    }
     // The pass's own state record, after its change line.
     if let Some(body) = r6_marker_body(line, atpkg::cli::MACHINE_STATE_MARKER) {
         return Some(Wake::PkgMachineState(body.to_string()));
@@ -28050,6 +28128,8 @@ impl App {
                     self.post_managed_current(body);
                 } else if let Some(body) = r6_marker_body(text, MACHINE_SETTINGS_MARKER) {
                     self.post_machine_settings(body);
+                } else if let Some(body) = r6_marker_body(text, atpkg::cli::FOREIGN_MARKER) {
+                    self.note_foreign_tools(body);
                 } else {
                     self.record_message(toolchain_words::appnotice(
                         aterm_messages::tags::TOOLCHAIN,
@@ -29761,8 +29841,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             // The `checked-in` spellings first make LaunchServices answer the
             // launch with this pid, as a successor that checks in before its
             // dial would, so the parent's watch on a NAMED pid is what
-            // has to see the death.
+            // has to see the death. Never headless: checking in creates the
+            // application object, and with it a WindowServer connection
+            // (AGENTS.md rule 5; B9h).
             let checked_in = death.checks_in_first()
+                && !headless
                 && handoff_rendezvous::debug_check_in_with_launch_services();
             aterm_log::warn!(
                 "overlap handoff: $ATERM_DEBUG_DIE_BEFORE_DIAL is set — this successor dies \
@@ -30284,13 +30367,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // thread spawn, so the sigwait() snapshot thread is the sole SIGUSR1 recipient.)
 
     // A windowed run whose display cannot open (no $DISPLAY/$WAYLAND_DISPLAY, dead X server)
-    // gets a clean one-line error and non-zero exit, not a crash report. `--headless` with
-    // no display uses winit's display-free backend; with a display it keeps the real one,
-    // so there is one code path wherever a display exists.
+    // gets a clean one-line error and non-zero exit, not a crash report. `--headless` uses
+    // winit's display-free backend: on free unix when no display is reachable (with one it
+    // keeps the real backend, so there is one code path wherever a display exists), and on
+    // macOS always. The AppKit backend is `+[NSApplication sharedApplication]`, whose init
+    // opens the process's WindowServer connection, and a new connection makes WindowServer
+    // run a synchronous TCC preflight of the binary on its own main thread (AGENTS.md rule
+    // 5; `grep_guard` B9g holds the selection). Asking macOS whether a display exists would
+    // itself ask WindowServer, so the macOS choice takes no probe.
     let mut builder = EventLoop::<Wake>::with_user_event();
-    // macOS has no display-free backend, so `--headless` must request the no-glass posture
-    // (`launch_posture`) or winit makes it a Dock-visible app that steals focus. Windowed
-    // keeps winit's default, except an update successor (activated at Commit).
+    // The no-glass posture (`launch_posture`) is applied to the AppKit loop's application
+    // object; the macOS display-free loop builds none, so for headless it is inert there.
+    // Windowed keeps winit's default, except an update successor (activated at Commit).
     apply_launch_posture(
         &mut builder,
         launch_posture(headless, handoff_commit.is_some()),
@@ -30313,6 +30401,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         not(any(target_os = "macos", target_os = "android", target_os = "ios"))
     ))]
     if headless && !a_display_server_is_reachable() {
+        use winit::platform::headless::EventLoopBuilderExtHeadless as _;
+        builder.with_headless();
+    }
+    #[cfg(target_os = "macos")]
+    if headless {
         use winit::platform::headless::EventLoopBuilderExtHeadless as _;
         builder.with_headless();
     }
@@ -30439,7 +30532,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // Spawns nothing elsewhere.
         let dev_proxy = event_loop.create_proxy();
         aterm_update::dev_channel::spawn_watch(
-            build_info::VERSION,
+            build_info::version(),
             Box::new(move |lag| {
                 let _ = dev_proxy.send_event(Wake::DevBuildStanding { lag });
             }),
@@ -30482,7 +30575,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             // A seeded change with no pass behind it: the record-missing fallback follows at
             // once.
             let _ = proxy.send_event(Wake::PkgMachineSettings(
-                "spotlight-noindex 73 dir(s) migrated; universal-control disabled".to_string(),
+                "universal-control disabled".to_string(),
             ));
             Wake::PkgMachineRecordMissing
         } else {
@@ -30671,11 +30764,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         seamless_adopt.extend(keeper_recovery.adopted);
     }
     let adopting = !seamless_adopt.is_empty();
+    // What this instance keeps of its desk: a window's, none headless — unless the lab's
+    // headless seam gives a headless instance a window's (`desk::Desk`).
+    let desk = desk::Desk::of(headless);
+    if desk == desk::Desk::LabHeadless {
+        crate::logging::stderr_line!(
+            "aterm-gui: $ATERM_DEBUG_HEADLESS_RESTORE is set: this headless instance keeps its \
+             desk as a window does (quit layout with its agents, crash journal, restore, relaunch)"
+        );
+    }
     // Consume the layout manifest (single-use, so a crash mid-restore cannot loop), for both
-    // seamless adopt and cold restore; never headless. Its first leaf seeds session 0's cwd
-    // or names its shell. The crash-journal claim runs on the same launches: journals whose
-    // writer is gone are taken, and without a quit layout those whose writer ended uncleanly
-    // (per crash evidence read before it is consumed below) are reopened.
+    // seamless adopt and cold restore; never headless (the cold restore: never without a
+    // desk). Its first leaf seeds session 0's cwd or names its shell. The crash-journal claim
+    // runs on the same launches: journals whose writer is gone are taken, and without a quit
+    // layout those whose writer ended uncleanly (per crash evidence read before it is
+    // consumed below) are reopened.
     let mut journal_claim = crash_journal::BootClaim::default();
     // The writer of each window of the layout below, when it is known: a
     // reopened crash journal's (`Reopened::writers`); a quit's `session.toml`
@@ -30686,7 +30789,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let mut quit_windows = 0usize;
     let mut restore_manifest = if !headless && seamless_adopting {
         seamless_layout.filter(|manifest| !manifest.is_empty())
-    } else if !headless && config.restore_session_or_default() {
+    } else if desk.kept() && config.restore_session_or_default() {
         // The quit's `session.toml`, its run, the runs of the other instances' desks it kept,
         // and its time: a journal left by a quit cut short is set aside so the desk opens
         // once (for an older build's quit, only journals no newer than the layout).
@@ -30754,14 +30857,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     } else {
         None
     };
-    // The journal writer runs on every windowed launch. A launch that reopened a crash
-    // journal writes on probation (`crash_journal::PROBATION`) so a layout that stops aterm
-    // cannot loop.
+    // The journal writer runs on every launch that keeps a desk (every windowed one). A
+    // launch that reopened a crash journal writes on probation (`crash_journal::PROBATION`)
+    // so a layout that stops aterm cannot loop.
     let mut crash_journal = crash_journal::Lane::new(
-        if headless {
-            None
-        } else {
+        if desk.kept() {
             crash_journal::journal_dir()
+        } else {
+            None
         },
         std::process::id(),
     );
@@ -31630,7 +31733,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         key_sequences,
         windows: {
             let mut m = BTreeMap::new();
-            m.insert(WindowId(0), ws0);
+            m.insert(WindowId(0), Box::new(ws0));
             m
         },
         frontmost_window: Some(WindowId(0)),
@@ -31677,12 +31780,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_device_proof_term: device_proof_term,
         handoff_successor: seamless_adopting,
         keeper_recovered: keeper_recovered_shells.clone(),
+        #[cfg(unix)]
+        handoff_carried_messages: Vec::new(),
         quit_capture: None,
         crash_journal,
         restored_agents: Vec::new(),
         handoff_restored_agents: Vec::new(),
         winit_to_window: HashMap::new(),
         headless,
+        desk,
         sock_plan: sock_plan.clone(),
         sock_bound: sock_bound.clone(),
         #[cfg(unix)]
@@ -31703,6 +31809,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             platform::no_recent_user_input_event
         } else {
             platform::recent_user_input_event
+        },
+        #[cfg(target_os = "macos")]
+        app_menu_bar: if headless {
+            app_introspect::no_app_menu_bar
+        } else {
+            app_introspect::read_app_menu_bar
         },
         consent: control_privacy::ConsentState::new(headless),
         consent_warmup: consent_warmup::WarmupState::new(headless),
@@ -31814,6 +31926,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         demotions_logged: 0,
         ripening: Vec::new(),
         host_noted: std::collections::BTreeSet::new(),
+        entries_refused: std::collections::BTreeMap::new(),
         supervisor_failing: std::collections::BTreeMap::new(),
         resume_standing: std::collections::BTreeMap::new(),
         resume_swept: false,
@@ -32063,12 +32176,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // `forget` seam below would drop what its thread still held.
     let _ = app.close_messages_at_exit();
     // Write the restore manifest for the next launch: from `quit_capture` when a last-window
-    // close drained `app.windows`, else from live state (Cmd-Q). Never headless.
-    // Best-effort.
+    // close drained `app.windows`, else from live state (Cmd-Q). Never without a desk
+    // (headless; `desk::Desk`). Best-effort.
     // Whether the quit wrote (or tried to write) its own desk, stamped with this
     // run: what replaces a take-back the cold update lane still owes.
     let mut quit_wrote_its_desk = false;
-    if !app.headless && app.config.restore_session_or_default() {
+    if app.desk.kept() && app.config.restore_session_or_default() {
         let mut manifest = app
             .quit_capture
             .take()
@@ -32080,8 +32193,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // successor, the ones its parent handed it running: the crash
         // journal's own question (`App::fill_desk_agents`), since the
         // journal that named them is retired below. The host's shutdown
-        // above keeps what its queue owes. A person's own quit keeps none.
-        if system_quit::asked() {
+        // above keeps what its queue owes. A person's own quit keeps none
+        // (under the lab's headless seam every quit is taken as the system's).
+        if app.desk.quit_keeps_agents(system_quit::asked()) {
             app.fill_desk_agents(&mut manifest);
         }
         // Stamped with this run, so a quit cut short before the journal below
@@ -32208,6 +32322,24 @@ pub(crate) fn held_pane_session(
         .child_reaped
         .store(true, std::sync::atomic::Ordering::Release);
     session
+}
+
+/// A HELD PANE'S SCROLLBACK, made ready for the import after Commit (round
+/// eight, finding 39): with a sidecar to import, the import's keys reserved in
+/// `term` — the engine [`held_pane_session`] just restored the pane's screen
+/// into — under its first lock, before anything else reads it, and the bottom
+/// the screen sits at noted for the viewport restore. `None` when nothing
+/// crosses and nothing is counted, so the pane owes the import worker nothing.
+pub(crate) fn held_pane_history(
+    term: &Mutex<Terminal>,
+    mut history: crate::handoff_history::AdoptedHistory,
+) -> Option<crate::handoff_history::AdoptedHistory> {
+    if history.carry.is_some() {
+        let mut engine = term_lock(term);
+        history.reserve_in(&mut engine);
+        history.anchor_in(&engine);
+    }
+    (history.carry.is_some() || history.dropped > 0).then_some(history)
 }
 
 /// A session with no PTY and no process, answering to `self_id`: `term` as

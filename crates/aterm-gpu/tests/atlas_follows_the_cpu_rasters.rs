@@ -1,31 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ATLAS MUST FOLLOW THE CPU'S RASTERS.
+//! The GPU atlas must follow the CPU's rasters.
 //!
-//! `GpuRenderer` wraps a CPU `Renderer` and keeps its own copy of that
-//! renderer's glyph pixels, uploaded into a texture atlas. So the two hold the
-//! same pixels twice, and every setter that changes them has to drop BOTH. When
-//! the CPU setter drops its rasterized glyphs and the GPU wrapper does not
-//! invalidate its atlas, the CPU re-rasterizes and the GPU keeps serving the old
-//! upload: the config edit reaches the face and never reaches the glass.
+//! `GpuRenderer` wraps a CPU `Renderer` and uploads that renderer's glyph
+//! pixels into its own atlas, so every setter that changes them must drop both.
+//! A forwarding setter whose CPU side drops its glyphs but whose GPU side keeps
+//! the atlas re-rasterizes on the CPU while the GPU serves the old upload: the
+//! edit reaches the face and never reaches the glass.
 //!
-//! That is not hypothetical. `set_adjust_baseline` forwarded to the CPU face —
-//! which drops its glyphs, because the baseline moves the pixels — and never
-//! invalidated, so a live `adjust_baseline` edit did nothing visible.
-//! `set_runtime_font_discovery` had the same gap on its chain-widening path.
+//! This is a source scan, like `ty_drivers_are_armed.rs`: the failure is a
+//! setter that never calls the shared helper, which no runtime hook on the
+//! helper can observe. It needs no GPU, so it gates on every host.
 //!
-//! **This is a SOURCE scan, deliberately, and for the same reason
-//! `ty_drivers_are_armed.rs` is one**: the failure mode is a setter that never
-//! calls the shared helper at all, which no runtime hook on the helper can
-//! observe. It also needs no GPU, so it gates on every host rather than only the
-//! ones with a device.
-//!
-//! THE PREDICATE IS `clear_glyph_images`, not "clears something". An earlier
-//! version of this scan matched `glyphs.clear()` as a substring and so flagged
-//! `set_font_subpixel`, whose CPU side clears `subpx_glyphs` — the LCD overlay,
-//! a CPU-only path whose bytes never reach this atlas. That was a false alarm,
-//! and a rule that cries wolf is one people turn off.
+//! The predicate is `clear_glyph_images`, not any `.clear()`: the CPU's
+//! `subpx_glyphs` (the LCD overlay) is CPU-only and never reaches this atlas.
 
 use std::collections::BTreeMap;
 
@@ -91,13 +80,9 @@ fn every_gpu_setter_whose_cpu_twin_drops_rasters_invalidates_the_atlas() {
         mismatched.push(name.clone());
     }
 
-    // ANTI-VACUITY. If the scan stops matching (a rustfmt change, a refactor that
-    // moves these out of the file), every list above goes empty and the
-    // assertion below passes while checking NOTHING — which is precisely the
-    // class of defect this file exists to catch, turned on itself. The floor is
-    // well under the 13 pairs present when this was written, so ordinary
-    // additions and removals do not trip it, but a scan that has stopped working
-    // cannot masquerade as a clean one.
+    // Anti-vacuity: a scan that stopped matching (a rustfmt change, setters
+    // moved out of the file) would examine nothing and pass. The floor sits
+    // well under the current count so ordinary additions do not trip it.
     assert!(
         examined.len() >= 8,
         "the scan examined only {} setter pair(s) — it has stopped finding them, \

@@ -4106,7 +4106,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
             stderr_line(&format!(
                 "the aterm that answered predates `{name}` ({status}); the entry above is this \
                  client's (aterm {}), and that aterm will refuse the verb",
-                aterm_types::version::APP_VERSION
+                aterm_types::version::app_version()
             ))?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -4224,7 +4224,10 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             drop(out);
             return Ok(ExitCode::SUCCESS);
         } else if arg == "-V" || arg == "--version" {
-            print_stdout_line(&format!("aterm-ctl {}", aterm_types::version::APP_VERSION))?;
+            print_stdout_line(&format!(
+                "aterm-ctl {}",
+                aterm_types::version::app_version()
+            ))?;
             return Ok(ExitCode::SUCCESS);
         } else if arg == "--completions" {
             // Hidden pre-verb flag (not in `--help`): print the shell completion

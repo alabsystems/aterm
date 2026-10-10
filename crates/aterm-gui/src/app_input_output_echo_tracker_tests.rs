@@ -77,6 +77,7 @@ fn enter(mods: TMods, event_type: KeyEventType) -> InputEvent {
         key: TKey::Named(TNamed::Enter),
         mods,
         base_layout: None,
+        layout_text: None,
         event_type,
     }
 }

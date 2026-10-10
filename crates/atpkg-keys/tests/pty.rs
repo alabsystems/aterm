@@ -51,9 +51,15 @@ impl Pty {
     /// That split is the whole point: `/dev/tty` resolves through the controlling terminal,
     /// so the child has one even though its stdout is a pipe — which is precisely the shape
     /// of `atpkg-keys setup | tee log`.
+    ///
+    /// The strip goes first (`inherit_nothing`, before the hook below): the child holds its
+    /// stdio, its terminal and nothing else of this process. A std child under the pinned
+    /// seal keeps any descriptor another test thread had open unflagged at the spawn, and a
+    /// session waiting at its prompt would hold that pipe for as long as it waits.
     pub fn spawn(&self, mut cmd: Command) -> Child {
+        use aterm_uds::spawnfd::InheritNothing as _;
         let slave = self.slave.as_raw_fd();
-        cmd.stdin(Stdio::null());
+        cmd.inherit_nothing().stdin(Stdio::null());
         // SAFETY: everything in the hook is async-signal-safe (`setsid`, `ioctl`, `dup`) and
         // touches no state shared with the parent. `slave` is open in the child from the
         // fork until its exec closes it.

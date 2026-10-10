@@ -130,7 +130,7 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of th
       - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY
         (OB-22's per-site walk adds `crates/aterm-control/src`) —
         test/bench FILES dropped by path, and in-file items whose `cfg` gate
-        ENTAILS `test`/`kani` (`all(test, ..)` yes; `any(test, unix)` and
+        ENTAILS `test` (`all(test, ..)` yes; `any(test, unix)` and
         `not(test)` no) blanked before segmentation, so a gate that does not
         entail it stays visible and fails rather than skipping silently —
         plus ONE modeled `term_lock` hop into Terminal methods. It does NOT
@@ -332,7 +332,7 @@ fn gui_source_files(root: &Path) -> Vec<PathBuf> {
 /// `App::tab_titles`).
 ///
 /// Masking is subtractive, so it removes only code that cannot ship: the
-/// predicate [`cfg_attr_never_ships`] requires the gate to entail `test`/`kani`
+/// predicate [`cfg_attr_never_ships`] requires the gate to entail `test`
 /// (`all(test, ..)` yes, `any(test, unix)` and `not(test)` no). The shared
 /// item walker ([`lock_order::mask_items_where`]) preserves line count and
 /// restores any span it cannot terminate.
@@ -341,8 +341,8 @@ fn mask_unshipped_items(text: &str) -> String {
 }
 
 /// Does this trimmed attribute line prove its item absent from a shipped
-/// build? True only for `#[cfg(<pred>)]` whose `<pred>` entails `test` or
-/// `kani` (see [`cfg_pred_entails_unshipped`]); anything else keeps the item.
+/// build? True only for `#[cfg(<pred>)]` whose `<pred>` entails `test` (see
+/// [`cfg_pred_entails_unshipped`]); anything else keeps the item.
 fn cfg_attr_never_ships(attr: &str) -> bool {
     let Some(rest) = attr.strip_prefix("#[cfg(") else {
         return false;
@@ -354,16 +354,16 @@ fn cfg_attr_never_ships(attr: &str) -> bool {
 }
 
 /// Does `pred` (a `cfg` predicate without the `cfg(..)` wrapper) hold only when
-/// `test` or `kani` is set? `false` means "not proven unshipped":
+/// `test` is set? `false` means "not proven unshipped":
 ///
-///   * the bare idents `test` / `kani`;
+///   * the bare ident `test`;
 ///   * `all(..)`: one entailing child suffices, so
 ///     `all(test, any(windows, target_os = "linux"))` is test-only;
 ///   * `any(..)`: every child must entail (`any(test, unix)` ships on unix);
 ///   * everything else, `not(..)` included, is false.
 fn cfg_pred_entails_unshipped(pred: &str) -> bool {
     let pred = pred.trim();
-    if pred == "test" || pred == "kani" {
+    if pred == "test" {
         return true;
     }
     for (head, all_children_required) in [("all(", false), ("any(", true)] {
@@ -943,7 +943,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             .unwrap_or(&file)
             .to_string_lossy()
             .into_owned();
-        // Blank in-file test/kani items before segmentation, so a gated helper
+        // Blank in-file test items before segmentation, so a gated helper
         // cannot lend its body to a same-named shipped fn (see
         // `mask_unshipped_items`).
         parse_source_fns(&mask_unshipped_items(&text), &rel, &mut fns);
@@ -1475,11 +1475,9 @@ mod tests {
         // (`#[cfg(all(test, any(windows, target_os = "linux")))]`).
         for yes in [
             "#[cfg(test)]",
-            "#[cfg(kani)]",
             "#[cfg(all(test, unix))]",
             "#[cfg(all(test, any(windows, target_os = \"linux\")))]",
-            "#[cfg(all(unix, all(kani, debug_assertions)))]",
-            "#[cfg(any(test, kani))]",
+            "#[cfg(all(unix, all(test, debug_assertions)))]",
         ] {
             assert!(cfg_attr_never_ships(yes), "`{yes}` must be masked");
         }

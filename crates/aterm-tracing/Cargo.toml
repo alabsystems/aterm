@@ -2,20 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-# THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE.
-#
-# `[patch.crates-io]` matches on PACKAGE name, so to redirect the four
-# third-party consumers' `tracing = "0.1.4x"` lines at this code the package
-# must be called `tracing` — nothing else works. The DIRECTORY keeps the
-# `aterm-` prefix so a `ls crates/` or a stack trace still reads as ours and
-# nobody mistakes this for a vendored upstream (those live under `vendor/`,
-# which is where genuinely-upstream source belongs).
+# The package must be `tracing`: `[patch.crates-io]` matches on package name.
+# The directory keeps the `aterm-` prefix so it reads as ours, not vendored.
 name = "tracing"
-# NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
-# consumers, not an aterm release number: softbuffer 0.4.8 asks for ^0.1.41,
-# the winit fork for ^0.1.40, tiny-xlib 0.2.5 for ^0.1.37 and zbus 5.16.0 for
-# ^0.1.40. 0.1.44 is what the graph resolved to before the swap, and it
-# satisfies all four, so the lockfile's version line does not move.
+# Not `version.workspace = true`: a semver contract with the consumers
+# (softbuffer ^0.1.41, winit ^0.1.40, tiny-xlib ^0.1.37, zbus ^0.1.40).
 version = "0.1.44"
 edition.workspace = true
 license.workspace = true
@@ -23,33 +14,19 @@ repository.workspace = true
 description = "First-party no-op `tracing` facade for aterm (replaces tracing + tracing-core + tracing-attributes; also pin-project-lite on mac/windows)"
 
 [dependencies]
-# The ONLY dependency, optional, and off on three of the four cells.
-#
-# Renamed from `aterm-tracing-attributes` to `tracing-attributes` for two
-# reasons: the shim re-exports it as `tracing::instrument`, and the rename makes
-# the implicit optional-dependency feature spell `tracing-attributes` — the same
-# feature name upstream's `attributes = ["tracing-attributes"]` refers to.
-# Measured on Linux the resolver enables exactly `attributes, default, std,
-# tracing-attributes` on this package (zbus takes `tracing` with default
-# features on), so that spelling has to exist or the resolve breaks.
+# Optional; off on mac, windows and wasm. Renamed so the implicit feature is
+# spelled `tracing-attributes`, as upstream's: on Linux zbus takes default
+# features and the resolver enables `attributes, default, std,
+# tracing-attributes`.
 tracing-attributes = { package = "aterm-tracing-attributes", path = "../aterm-tracing-attributes", optional = true }
 
 [features]
-# Upstream's feature table, reproduced. Only `default`, `std`, `attributes` and
-# `tracing-attributes` are reachable from aterm's graph today (Linux, via zbus);
-# mac / windows / wasm resolve this package with NO features at all, which is
-# why the crate is `#![no_std]` unconditionally and why every macro has to work
-# with the table completely empty.
-#
-# The unreachable entries are declared anyway because they cost one line each
-# and they remove a whole class of "some transitive crate asked for
-# `tracing/log`" resolution failures that would otherwise surface as a broken
-# build on a cell we cannot compile here. They are all no-ops: there is no
-# `log` bridge and no level filtering, because there is nothing to filter.
+# Upstream's feature table. Only `default`, `std`, `attributes` and
+# `tracing-attributes` are reachable today (Linux, via zbus); the rest are
+# no-ops declared so a transitive `tracing/log` request still resolves.
 default = ["std", "attributes"]
 attributes = ["tracing-attributes"]
-# Accepted and ignored: the shim is `no_std` whether or not this is on. Upstream
-# forwards it to `tracing-core/std`; we have no `tracing-core`.
+# Ignored: the shim is `no_std` regardless.
 std = []
 async-await = []
 log = []
@@ -72,7 +49,5 @@ release_max_level_trace = []
 workspace = true
 
 [lib]
-# No unit tests live in src/, so this lib's libtest harness ran 0 tests in every
-# gate while still being linked and executed. Off; doctests are governed
-# separately and still run.
+# No unit tests in src/; doctests still run.
 test = false

@@ -3,9 +3,9 @@
 
 //! WINDOWS CRISPNESS: grid fitting on the platform that shipped with none.
 //!
-//! Before this wave the Windows raster chain fell through to a raw outline
-//! fill — stems landed at fractional pixel phases and horizontal features
-//! straddled two rows — on the one platform whose reference renderers (Windows
+//! Without it the Windows raster chain falls through to a raw outline
+//! fill — stems land at fractional pixel phases and horizontal features
+//! straddle two rows — on the one platform whose reference renderers (Windows
 //! Terminal, VS Code, conhost) are all DirectWrite-hinted in the next window.
 //!
 //! The seam itself (`font_hinting` full ⇄ off actually changes coverage while
@@ -120,7 +120,7 @@ fn renderer(bytes: &[u8], px: f32, mode: &str) -> Renderer {
 /// The headline: on Windows 11's VARIABLE Cascadia Mono (what
 /// `font_family = "Cascadia Mono"` names), at the desktop 12px, grid fitting
 /// concentrates the stem — more whole-ink texels, fewer
-/// mid-grey ones — instead of the raw outline fill Windows used to ship.
+/// mid-grey ones — instead of the raw outline fill.
 #[test]
 fn variable_primary_is_grid_fitted_at_12px() {
     let (path, bytes) = variable_system_face();

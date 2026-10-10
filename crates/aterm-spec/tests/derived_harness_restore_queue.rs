@@ -161,7 +161,8 @@ fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
 /// worker was stopped healthy, or handed over to a successor a changed
 /// policy starts at the next pass — is handed by the host once it
 /// supervises again; and the next park carries the relaunch the rollback
-/// queued, an overtaken one of the same tab notwithstanding. NEGATIVE
+/// queued, an overtaken one of the same tab notwithstanding; and one a quit
+/// keeps the queue from taking stays owed for the quit layout. NEGATIVE
 /// CONTROLS: the mutants that shipped, each caught by its invariant.
 #[test]
 fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
@@ -315,6 +316,19 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         ],
     );
     assert!(!model.action_enabled("Commit", &split), "{split:?}");
+    // Round sixteen: a quit closes the queue before the worker told to take
+    // its relaunch up decides; refused, it stays owed — stranded, for the
+    // quit layout — and nothing more is queued, stepped or handed.
+    let quit = run(
+        &model,
+        &[
+            "Crash", "Hand", "Read", "Suspend", "Resume", "Rollback", "Quit", "Decide",
+        ],
+    );
+    assert_eq!((quit["queued"], quit["commit"]), (0, 2));
+    for action in ["QueueSteps", "Park", "Start", "HandUnwatched"] {
+        assert!(!model.action_enabled(action, &quit), "{action}: {quit:?}");
+    }
 
     // Each mutant, alone, breaks its claim.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
@@ -399,6 +413,18 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Suspend",
         "Resume",
         "Rollback",
+    ]);
+    // Until round sixteen: a worker told `TakenUp` that decided after a quit
+    // closed the queue had its relaunch refused, and owed it no more.
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "Suspend",
+        "Resume",
+        "Rollback",
+        "Quit",
+        "DecideClosedDrops",
     ]);
     // Round twelve: both captures read the overtaken relaunch first.
     let dropped = run(

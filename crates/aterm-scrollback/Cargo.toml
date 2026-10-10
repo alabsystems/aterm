@@ -30,11 +30,6 @@ zstd = ["dep:zstd"]
 # and the memory-mapped `.dtrm` cold store. Implies `zstd` because the on-disk
 # page format is zstd-compressed. Off by default per §2.7.
 disk-tier = ["dep:libc", "zstd"]
-# Register this crate's kani harnesses as `proof_anchor!`s for the
-# `spec_xref_closure` gate (TRUST_NATIVE_TLA §4). OFF by default so production
-# builds (and the §2.7 no-platform invariant) stay free of aterm-spec. The
-# anchors do not need `cfg(kani)`, so they register under a normal build.
-spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
 aterm-rle = { workspace = true }
@@ -44,13 +39,10 @@ aterm-lz4 = { workspace = true }
 zstd = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 aterm-log = { workspace = true }
-# Verifier-ledger anchors only (see the `spec-anchors` feature).
-aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
-# Lets the `#[cfg(test)]` `spec_proof_anchors` module compile without the
-# `spec-anchors` feature.
+# The seeded `XorShift` the generated and disk-backed tests draw from.
 aterm-spec = { workspace = true }
 
 [lints]

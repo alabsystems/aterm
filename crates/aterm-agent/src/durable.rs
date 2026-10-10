@@ -31,19 +31,11 @@ pub(crate) fn sync_data(file: &File) -> std::io::Result<()> {
 /// the same point and in the same order, so a test sees the same files, renames and
 /// errors. What it drops is the drive-cache barrier. No test can observe that barrier,
 /// because it only orders the disk against a power loss. It also stalls the whole VOLUME
-/// while it runs, so every test binary the gate runs beside this one waits behind it for
-/// its own temp-dir metadata. Measured 2026-10-06: one `aterm-agent --lib` run made 2,561
-/// `F_FULLFSYNC`s, 17.7 s of flushing across its threads: about 1,790 WAL appends
-/// (`commit_record`), 450 of the operator's directory, private-file, fault-marker and
-/// checkpoint flushes, 290 `write_atomic_mode`s and 3 ledger cuts. With these arms it
-/// makes 2, both in two tests' own code. The run took 45.8-46.3 s instead of 49.8-50.9 s
-/// alone, and 52.9-54.1 s instead of 57.7-57.9 s beside the aterm-primer,
-/// aterm-update-core and aterm-release unit-test runs; beside it, those first two run
-/// back to back took at most 1.0-1.1 s instead of 2.5 s. Off Apple targets `sync_all`
-/// already is `fsync(2)`, so the arm above stays. Integration tests, every shipped build
-/// and every crate that depends on this one (an `aterm-gui --lib` run made about 835 of
-/// these through the operator and `write_atomic_mode`, counted 2026-10-06) compile it
-/// too.
+/// while it runs, so every test binary the gate runs beside this one waits behind it.
+/// Measured: one `aterm-agent --lib` run made 2,561 `F_FULLFSYNC`s (17.7 s of
+/// flushing); with these arms it makes 2, and the run takes about 4 s less alone and
+/// slows its neighbours less. Off Apple targets `sync_all` already is `fsync(2)`.
+/// Integration tests, shipped builds and dependent crates keep the full barrier.
 #[cfg(all(test, target_vendor = "apple"))]
 pub(crate) fn sync_all(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;

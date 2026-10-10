@@ -226,9 +226,13 @@ pub(crate) const KEY_FILE_ACCESS: &str = "privacy.fda";
 /// FDA card's `privacy.` prefix retraction has nothing of it to resolve.
 pub(crate) const KEY_DEBUGGER_ACCESS: &str = "privacy.debugger";
 
-/// The `Intent::OpenSystemPane` pane name of the Full Disk Access list — the
-/// only pane the codec carries (`messages_host::privacy_pane`).
+/// The `Intent::OpenSystemPane` pane name of the Full Disk Access list
+/// (`messages_host::privacy_pane`).
 pub(crate) const PANE_FULL_DISK_ACCESS: &str = "full-disk-access";
+
+/// The `Intent::OpenSystemPane` pane name of Spotlight's Search Privacy list
+/// (`messages_host::privacy_pane`), where the owner adds `~/Developer`.
+pub(crate) const PANE_SPOTLIGHT_SEARCH_PRIVACY: &str = "spotlight-search-privacy";
 
 /// The key of the install-posture row (R21): one per launch.
 #[cfg(any(target_os = "macos", test))]
@@ -4534,6 +4538,35 @@ pub(crate) fn disk_settings_entry(notes: &[String]) -> Entry {
     entry.log_line(format!("disk-settings-off notes={}", notes.len()))
 }
 
+/// The key of the line saying Spotlight indexes the developer root
+/// ([`devroot_indexed_entry`]).
+pub(crate) const DEVROOT_INDEXED_KEY: &str = "devroot.indexed";
+
+/// Spotlight indexes `~/Developer`, MEASURED (`atpkg::devroot::spotlight`: the probe
+/// was found): the one fix is the owner's — the Search Privacy list is root-owned
+/// and has no API — and one press opens the pane it is made in.
+pub(crate) fn devroot_indexed_entry() -> Entry {
+    Entry::new(
+        Family::DevRoot,
+        "",
+        "indexed",
+        "Spotlight indexes ~/Developer",
+        Why::OnlyYou(Reason::new(
+            "only you can add a folder to Spotlight's Search Privacy list",
+        )),
+        Then::press(
+            Mover::open_system_pane(PANE_SPOTLIGHT_SEARCH_PRIVACY),
+            "Add ~/Developer to Spotlight's Search Privacy",
+        ),
+    )
+    .resurface(Resurface::CHOICE)
+    .more(format!(
+        "{}, then + and ~/Developer",
+        atpkg::devroot::SEARCH_PRIVACY
+    ))
+    .log_line("devroot-indexed measured=indexed")
+}
+
 /// The live upgrade cannot run (its state folder cannot hold the lock): the
 /// host's fact, an EVENT of [`Family::UpgradeHost`]
 /// (`harness.upgrade-host.cannot-run`), in the classifier's own words; the
@@ -5713,11 +5746,41 @@ pub(crate) fn agent_upgrade_went_through(
     format!("{} upgraded {place}", agent_word(row.agent))
 }
 
+/// How long after its relaunch a move may finish and its record still read as
+/// the move's own news ([`moved_line`]): ten minutes, well past a move's
+/// adoption, first idle point and model wait.
+const MOVED_SAID_AFTER_S: u64 = 10 * 60;
+
+/// When a move happened (`moved_at`, its relaunch line typed), as its record's
+/// line — `moved at 2:04 PM`, `moved yesterday 2:04 PM`, `moved Thursday 2:04
+/// PM` — on the reader's clock `offset` from UTC, against the day it finished
+/// (`done_at`), which is the record's. `None` when the move finished within
+/// [`MOVED_SAID_AFTER_S`] of it (the record's own instant says it), when
+/// either instant is unknown, and where the clock's offset is: no time is said
+/// on a clock that may be hours off.
+pub(crate) fn moved_line(moved_at: u64, done_at: u64, offset: Option<i64>) -> Option<String> {
+    if moved_at == 0 || done_at < moved_at.saturating_add(MOVED_SAID_AFTER_S) {
+        return None;
+    }
+    let when = clock_on_day(moved_at, done_at, offset?);
+    Some(if when.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("moved at {when}")
+    } else {
+        format!("moved {when}")
+    })
+}
+
 /// THE LIVE AGENT UPGRADE, DONE: the owner's outcome line — the build the
 /// session resumed on and the model its first answer named, or that the model
 /// could not be confirmed ([`aterm_agent::harness::upgrade::restart_outcome`])
 /// — as a RECORD. Until 2026-09-24 it went only to the ledger's JSONL, so a
 /// model that changed across the move was news nobody was told.
+///
+/// A move that FINISHED WELL AFTER IT HAPPENED says when it happened
+/// ([`moved_line`]): a Claude Code move is done at its session's first idle
+/// point after the relaunch, and the record is written then — `Claude Code
+/// moved onto 2.1.287` was recorded seven days after the move (audit
+/// 2026-10-09), dated as if it had just happened.
 pub(crate) fn agent_upgrade_done(
     row: &aterm_agent::harness::upgrade_drive::Row,
     place: &str,
@@ -5730,12 +5793,14 @@ pub(crate) fn agent_upgrade_done(
         .outcome
         .split_once(" · ")
         .map_or(row.outcome.as_str(), |(_, rest)| rest);
+    let moved = moved_line(row.moved_at, row.done_at, crate::presence::local_offset_s());
     let mut msg = Message::new(
         tags::HARNESS,
         Severity::Success,
         format!("{} moved onto {}", row.agent.product(), clean(&row.to)),
     )
-    .line(place);
+    .line(place)
+    .lines(moved);
     if !model.is_empty() {
         msg = msg.line(clean(model));
     }

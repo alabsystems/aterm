@@ -443,8 +443,9 @@ impl LaneService for ParkingService {
         &self,
         line: String,
         _scope: Scope,
-        stream: &CtlStream,
+        _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
+        out: &mut Vec<u8>,
     ) -> Option<ServeDisposition> {
         let reply = if line == "park" {
             // Past the test's hang detector: only a seen hangup releases it.
@@ -467,11 +468,8 @@ impl LaneService for ParkingService {
         } else {
             format!("OK {line}\n")
         };
-        let mut writer = stream;
-        writer
-            .write_all(reply.as_bytes())
-            .is_err()
-            .then_some(ServeDisposition::Close)
+        out.extend_from_slice(reply.as_bytes());
+        None
     }
 
     fn is_wait(&self, line: &str, _scope: Scope) -> bool {

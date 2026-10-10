@@ -258,8 +258,8 @@ pub fn left_out_block(mode: Mode, scope: &Scope) -> String {
         return String::new();
     }
     let mut text = String::from(
-        "          MEASURE tier: not part of the merge contract, not run here; a release cut\n\
-         \x20         needs it green (`tools/verify.sh --measure`):\n",
+        "          MEASURE tier: not part of the merge contract, not run here; a release\n\
+         \x20         measures the bundle it signs (`tools/verify.sh --measure <APP>`):\n",
     );
     for title in plan::tier_titles(scope, Tier::Measure) {
         text.push_str(&format!("      - {title}\n"));
@@ -483,7 +483,7 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
 /// neither the source nor the toolchain moved under the run (`moved`).
 ///
 /// It asks the tier's OWN stages, never the run's verdict: a `--full` run
-/// whose Kani floor skipped (a `--full`-only stage) still measured; one whose
+/// whose cross-cell check skipped (a `--full`-only stage) still measured; one whose
 /// paint row went red did not, whatever main's receipt would excuse.
 /// `specs` and `reports` are the plan and its stage reports, index for index.
 ///
@@ -563,11 +563,11 @@ fn could_not_run_tail(text: &mut String, t: &Tally) {
 /// `--no-windows` skip lifts only on an idle desktop; a library this host's
 /// verifier ceiling refused cannot be lifted on this machine at all (its skip
 /// row names the RAM that verifies it), nor is a test run's skip for a wedged
-/// `trustd` (its row names the reboot), so the verdict ends at that row.
+/// macOS service (`trustd`, the disk-image service: its row names the
+/// reboot), so the verdict ends at that row.
 fn land_remedy(scope: &Scope, t: &Tally) -> &'static str {
     let names_its_remedy = |s: &String| {
-        s.starts_with(crate::stages::TRUST_NARROWED_BY_MEMORY)
-            || s.starts_with(crate::libtest::TRUSTD_SKIPPED)
+        s.starts_with(crate::stages::TRUST_NARROWED_BY_MEMORY) || crate::libtest::is_host_skip(s)
     };
     let windows = |s: &String| s.contains(crate::plan::NO_WINDOWS_REASON);
     let rerunnable =
@@ -578,7 +578,7 @@ fn land_remedy(scope: &Scope, t: &Tally) -> &'static str {
         "          The windowed stages run on an idle desktop: `tools/verify.sh` there.\n"
     } else {
         // The skip row already names what lifts it (the RAM that verifies the
-        // library, the reboot that clears trustd); no re-run here does.
+        // library, the reboot that clears a wedged service); no re-run here does.
         ""
     }
 }
@@ -1225,9 +1225,8 @@ mod tests {
         assert_eq!(
             v.text,
             "\n=== verdict ===\n  VERIFY: PASS (mode=fast scope=workspace, 0 skipped) — merge contract satisfied\n\
-             \x20         MEASURE tier: not part of the merge contract, not run here; a release cut\n\
-             \x20         needs it green (`tools/verify.sh --measure`):\n\
-             \x20     - conformance release artifact (paint/spin build it otherwise)\n\
+             \x20         MEASURE tier: not part of the merge contract, not run here; a release\n\
+             \x20         measures the bundle it signs (`tools/verify.sh --measure <APP>`):\n\
              \x20     - measuring tests (--workspace; run alone)\n\
              \x20     - gui typing-pacing smoke\n"
         );
@@ -1239,8 +1238,8 @@ mod tests {
     /// green measured; one MEASURE row skipped, red or could-not-run, a MEASURE
     /// stage that recorded nothing, a narrowed scope, a moved tree and the
     /// default plan (which has no MEASURE stage) did not — each
-    /// saying why. A `--full`-only stage that skipped (the Kani floor with
-    /// trust-mc absent) costs nothing: the question is the tier's.
+    /// saying why. A `--full`-only stage that skipped (the cross-cell check
+    /// with a cross std absent) costs nothing: the question is the tier's.
     #[test]
     fn a_run_measured_the_tree_only_when_every_measure_stage_ran_whole_and_green() {
         use crate::Report;
@@ -1263,7 +1262,9 @@ mod tests {
                     let mut r = Report::new(s.title.clone());
                     match bad {
                         Some((id, f)) if id == s.id => f(&mut r),
-                        _ if s.id == plan::StageId::KaniFloor => r.skip("trust-mc (absent)"),
+                        _ if s.id == plan::StageId::CrossCells => {
+                            r.skip("gate cells (no installed std)");
+                        }
                         _ => r.pass("did the thing"),
                     }
                     r
@@ -1362,8 +1363,8 @@ mod tests {
         );
         assert!(narrowed.text.contains(LINE), "{}", narrowed.text);
         assert!(
-            !narrowed.text.contains("conformance release artifact"),
-            "a scope that builds no release prime names none: {}",
+            !narrowed.text.contains("measuring tests"),
+            "a scope that runs no measuring tests names none: {}",
             narrowed.text
         );
 

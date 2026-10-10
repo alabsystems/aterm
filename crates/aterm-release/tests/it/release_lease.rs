@@ -468,7 +468,8 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         build_number: 55,
         commit: owner,
         min_build: None,
-        arm64_only: false,
+        artifact: Some("aa".repeat(32)),
+        macho_sha256: Some("bb".repeat(32)),
         linux: None,
         manifest_signed: false,
         signature_required: false,
@@ -494,8 +495,8 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
     );
     std::fs::remove_file(repo.join("claim")).unwrap();
 
-    // So does a modification to a tracked path — there is no longer any
-    // journal-derived write that recovery will explain away.
+    // So does a modification to a tracked path: recovery explains away no
+    // journal-derived write.
     std::fs::write(repo.join(".gitignore"), "dist/\nextra/\n").unwrap();
     assert!(
         publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).is_err()

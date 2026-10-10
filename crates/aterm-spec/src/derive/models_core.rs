@@ -1533,13 +1533,12 @@ pub fn recovery_redraw_model() -> Model {
 /// makes the fast-link blink, app-owned ghost, and RTT leak reachable.
 ///
 /// HYSTERESIS (`fast_streak` / `retracted`). The gate is a LATCH, not a
-/// comparator, and this model must say so: `ConfirmFast` used to set `slow = 0`
-/// outright, which is the SINGLE-SAMPLE close the implementation deliberately
-/// replaced (`FAST_SAMPLES_TO_HIDE` consecutive decisive fast turns, a smoothed
-/// estimate that agrees, and an EMPTY pending set). The old abstraction only
-/// looked sound because the conformance test fired `ConfirmFast` at an already
-/// closed latch — so the one property the model exists to pin, "speculation
-/// never blinks off on one lucky turn", was unpinned. `fast_streak` counts the
+/// comparator: at `Buggy=0`, `ConfirmFast` closes it only after `Hide` decisive
+/// fast turns, never on a SINGLE sample (the implementation requires
+/// `FAST_SAMPLES_TO_HIDE` consecutive decisive fast turns, a smoothed estimate
+/// that agrees, and an EMPTY pending set). A conformance test that fires
+/// `ConfirmFast` only at an already closed latch leaves that unpinned.
+/// `fast_streak` counts the
 /// decisive fast turns (capped at `Hide`) and `retracted` marks the STEP on
 /// which the gate went 1 -> 0, because the defect is a retraction taken on thin
 /// evidence, not a steady state: `RetractOnlyOnSustainedFastEvidence` then makes

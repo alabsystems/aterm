@@ -367,7 +367,9 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
 /// a ZWJ emoji on the saved primary under 1049, (iii) a title left
 /// unterminated (`printf '\e]0;x'`), (iv) a full-screen 5K and a maximized 6K
 /// window, (v) a DECSC on the last row, then 1049, then the message band's
-/// one-row shrink — and (vi) a link-dense line past the record cap, which
+/// one-row shrink (the slot now follows its prompt up the demoted row, and
+/// (v') is the slot that shrink still leaves past the grid: DECSC on a blank
+/// row it trims) — and (vi) a link-dense line past the record cap, which
 /// until plan P2-4 was still carried blank. Each is now carried at a named
 /// rung, committed by `screen_digest`, adopted exactly by the consumer, and the
 /// whole pool settles; (vi) keeps its screen and loses only that line's links
@@ -439,6 +441,15 @@ fn producer_is_total_over_hostile_and_large_desks() {
         Full,
     ));
 
+    let mut trimmed = Terminal::new(56, 149);
+    trimmed.process(b"prompt % \x1b[56;1H\x1b7\x1b[1;10H");
+    trimmed.resize(55, 149);
+    desks.push((
+        "(v') DECSC on a blank row the band's shrink trims",
+        trimmed,
+        Full,
+    ));
+
     let mut links = Terminal::new(24, 80);
     links.process(&link_dense(8, 8192));
     desks.push((
@@ -495,12 +506,23 @@ fn producer_is_total_over_hostile_and_large_desks() {
             rung,
         });
     }
-    // (v): the DECSC slot rides raw — the row the grid no longer has.
+    // (v): the DECSC slot followed the prompt up the row the shrink demoted.
     let band = &pool[7].checkpoint;
     assert_eq!(
-        band.saved_cursor_main.map(|saved| saved.cursor_row),
-        Some(55)
+        band.saved_cursor_main
+            .map(|saved| (saved.cursor_row, saved.cursor_col)),
+        Some((54, 9))
     );
+    // (v'): a slot whose row the shrink trimmed rides as the engine holds it,
+    // on the row the grid no longer has.
+    let trimmed = &pool[8].checkpoint;
+    assert_eq!(
+        trimmed
+            .saved_cursor_main
+            .map(|saved| (saved.cursor_row, saved.cursor_col)),
+        Some((55, 0))
+    );
+    assert_eq!(trimmed.rows, 55);
     let before: Vec<CarryRung> = pool.iter().map(|carry| carry.rung).collect();
     let digest = settle_wire_carries(&mut pool, WireCaps::current()).expect("the pool commits");
     assert_eq!(

@@ -320,7 +320,8 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     );
     // With an amount the fill is measured finer than the count, and kept
     // inside the count's span: 36 % beside `3 of 10 programs` stands, 45 %
-    // is held at the fourth program's 40 %, 20 % is raised to 30 %.
+    // is held one permille short of the fourth program's 40 % (`39%`, never
+    // the next count's percent), 20 % is raised to 30 %.
     let measured = |fill: u16, stats: &str| {
         Meter {
             fill_permille: Some(fill),
@@ -337,7 +338,7 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         .fill_permille
     };
     assert_eq!(measured(356, "3 of 10 programs"), Some(356));
-    assert_eq!(measured(450, "3 of 10 programs"), Some(400));
+    assert_eq!(measured(450, "3 of 10 programs"), Some(399));
     assert_eq!(measured(200, "3 of 10 programs"), Some(300));
     assert_eq!(measured(900, "10 of 10 programs"), Some(1000));
     // Not a whole-number count: the reporter's fill stands.

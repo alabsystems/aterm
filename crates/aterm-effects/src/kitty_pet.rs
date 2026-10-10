@@ -1093,6 +1093,12 @@ const ARRIVE_FLOOR: f32 = 0.06;
 /// walks it the rest of the way. A ghost farther off is another place, and
 /// keeps fading there beside the arriver.
 const ADOPT_REACH: f32 = 1.0;
+/// How far (cells, and lift) an adopted body may be from the seat it was
+/// adopted at and still wear the look the user saw there (`AdoptedLook`):
+/// a sliver of a cell, under a device pixel at text sizes, so the held look
+/// never travels. The brain's first step past it — a walk, a hop, a leap —
+/// hands the body over to the brain's own look, the look of that motion.
+const ADOPT_HOLD_REACH: f32 = 0.05;
 
 /// Cap on concurrent departing bodies; past it the oldest is dropped.
 pub const PET_DEPARTURES_MAX: usize = 3;
@@ -1375,10 +1381,11 @@ pub struct PetDepartureSprite {
     /// The outgoing look's ramp indices.
     pub coat: u8,
     pub iris: u8,
-    /// Birth stamp of the [`Departure`] this resolves: identity only (never in
-    /// [`PetFrame::fp`]). The emitter keys held tiles on it, since a slot can
-    /// be reborn while a stale tile survives.
-    pub born: f64,
+    /// Which ghost this is ([`Departure::id`]): identity only (never in
+    /// [`PetFrame::fp`]). The emitter keys its held tile on it, so a slot
+    /// reborn under another ghost never wears the old one's tile, and a ghost
+    /// carried across a boundary keeps its own.
+    pub id: u32,
     /// Drawn beneath the glyphs. Set only for a re-sighting ghost the new
     /// surface has ink under (see `Departure::resight`), and always for one
     /// on its own glass (`Self::own_glass`); every other ghost is drawn over
@@ -1390,6 +1397,11 @@ pub struct PetDepartureSprite {
     /// live lane never draws it: the companion owner places it in the window
     /// at its own pane (`CompanionFrame::glass`).
     pub own_glass: bool,
+    /// Which own glass, by the key its host gave it
+    /// ([`PetBrain::displace_resight`]): each ghost on its own glass stands in
+    /// the pane IT was drawn in, so a quick cycle across three panes keeps
+    /// every ghost fading where it is. `0` for every other ghost.
+    pub glass: u32,
 }
 
 /// One live departing body's birth record; its sprite is a pure function of
@@ -1400,6 +1412,18 @@ struct Departure {
     /// dt-clamped lane clock and one long frame cannot sprint it across the
     /// screen.
     born: f64,
+    /// WHICH GHOST THIS IS, from its birth to its end: unique for the pet's
+    /// life ([`PetBrain::departure_serial`], which no retire resets) and kept
+    /// by a ghost carried across a boundary ([`PetBrain::spend_crossfade`]),
+    /// whatever slot it lands in. The emitter's held tile belongs to it
+    /// (`PetDepartureSprite::id`): a bake the frame's budget defers re-emits
+    /// the ghost's own last tile, never another ghost's and never nothing.
+    /// `born` could not be that key: every boundary restarts the lane clock,
+    /// so every crossfade ghost was born at 0.0, and a carried ghost is
+    /// re-based onto its arriver's ramp — measured, a carried leaver whose
+    /// first frame on a lighter background was deferred drew nothing for that
+    /// frame (4 of 4 toggles), its hold dropped as another ghost's.
+    id: u32,
     /// The look the pet was wearing when the handoff fired.
     coat: u8,
     iris: u8,
@@ -1434,6 +1458,8 @@ struct Departure {
     /// stands on glass the NEW surface owns, so the console layer judges its
     /// own rectangle in the new world (`finish_console_frame`): never over a
     /// protected cell, and under the glyphs wherever the new screen has ink.
+    /// Where the new world cannot see it at all, it keeps the verdict it
+    /// came with ([`Self::own_clear`]).
     resight: bool,
     /// THE GHOST ON ITS OWN GLASS ([`PetBrain::displace_resight`]): a
     /// re-sighting ghost whose surface was not replaced on glass but LEFT
@@ -1442,7 +1468,28 @@ struct Departure {
     /// and the new surface's world has nothing to say about it: it was
     /// admitted by its own surface's last observation at the boundary, and
     /// it is drawn beneath that pane's ink, which nobody observes after it.
-    own_glass: bool,
+    /// `Some(key)`: the host's key for THAT glass
+    /// ([`PetBrain::displace_resight`]) — every ghost on its own glass knows
+    /// which pane it fades in, so ghosts in different panes are judged, kept
+    /// and dropped each by its own pane.
+    own_glass: Option<u32>,
+    /// THE VERDICT IT CAME WITH: its rectangle was admitted, nothing
+    /// protected under it, by the observation of the surface it was drawn on
+    /// at the boundary that made it a ghost — the world the body was judged
+    /// in on the frame the user saw ([`PetBrain::resight_coordinate_space`],
+    /// judged before the retire drops that map). The warrant to spend it on
+    /// that glass when the focus leaves it ([`PetBrain::displace_resight`]:
+    /// every ghost on its own glass had it). A re-sighting ghost the NEW
+    /// world cannot see — its rectangle outside that map's caret-centred
+    /// coverage window, as on a tall screen whose caret is far from the old
+    /// body — keeps this verdict, beneath whatever ink is there: unknown is
+    /// not evidence, the visibility hold's own rule for a body already on
+    /// glass (`finish_console_frame`); a protected cell that world does see
+    /// under it still refuses it. Measured before: a 90-row alternate
+    /// screen entered with its caret 79 rows from the body culled the ghost,
+    /// and the cat was 15/255 on the first frame. `false` for the handoff's
+    /// departures, which no boundary judged.
+    own_clear: bool,
     /// The opacity the fade starts from, `0..=1`: the presence the body had
     /// ON GLASS when it left. A re-sighting ghost is the body the user just
     /// saw, so it starts where that body was — the last emitted
@@ -1457,26 +1504,66 @@ struct Departure {
     peak: f32,
 }
 
-/// A crossfade ghost still fading at a boundary, carried across it by value
-/// ([`PetBrain::resight_coordinate_space`]): the body it stands for is still
-/// on glass, and the surface the focus goes to may be the one it fades on —
-/// a quick toggle between two panes, two tabs or two screens.
+/// A ghost of this cat still on glass at a boundary, carried across it by
+/// value ([`PetBrain::resight_coordinate_space`]): a crossfade ghost still
+/// fading — the body it stands for is still on glass, and the surface the
+/// focus goes to may be the one it fades on (a quick toggle between two
+/// panes, two tabs or two screens) — or the breed handoff's leaver, the old
+/// coat running off or fading in place, which stops where it was drawn.
 #[derive(Clone, Copy, Debug)]
 struct Carried {
+    /// A still ghost where it was drawn, in the look it was drawn in, with
+    /// the verdict of the surface it stood on at this boundary
+    /// (`Departure::own_clear`): the warrant to keep fading on that glass if
+    /// the focus leaves it. A ghost on its own glass keeps the one its own
+    /// boundary gave it.
     ghost: Departure,
-    /// What the user saw of it at the boundary, `0..=1`: its envelope at its
-    /// age times the lane's presence. A carried ghost continues from HERE —
-    /// re-based onto the next crossfade's ramp, or adopted by its arriver.
+    /// What the user saw of it at the boundary, `0..=1`: what its slot drew
+    /// on the last emitted frame (`PetBrain::last_drawn`) — its envelope at
+    /// its age times the lane's presence, after the console's culls and the
+    /// visibility hold; a ghost that drew nothing is not carried. A carried
+    /// ghost continues from HERE — re-based onto the next crossfade's ramp,
+    /// or adopted by its arriver.
     presence: f32,
-    /// Its rectangle was admitted by its surface's last observation at the
-    /// boundary (`PendingResight::own_clear`'s law): the warrant to keep
-    /// fading on that glass if the focus leaves it (`displace_resight`).
-    /// Read only for a ghost that stood on the focused surface's glass.
-    own_clear: bool,
     /// The host found the focus back on this ghost's OWN glass, exactly as
     /// it was drawn ([`PetBrain::come_home`]). Read only for a ghost that
-    /// stood on its own glass.
+    /// stood on its own glass; one that is not home keeps fading there.
     home: bool,
+}
+
+/// THE ADOPTED LOOK ([`PetBrain::spend_crossfade`]): an arriver that adopted
+/// a carried ghost of itself at its seat IS the body the user was looking
+/// at, so it goes on in that body's look — the ghost's pose and facing, the
+/// frame the user saw (`Departure::pose0`; a still ghost is drawn at unit
+/// scale, with no lift) — instead of the fresh brain's, which the retire
+/// reset to a sit or a sleep. Measured before: a ghost caught mid-stretch
+/// became a walk frame at the same cell on the adoption frame.
+///
+/// The look is worn while the body RESTS AT THE SEAT it was adopted at
+/// (within [`ADOPT_HOLD_REACH`], no lift, not gathering for a leap or in
+/// one): through the whole homecoming ramp, and after it, for a still pose,
+/// until the brain's OWN look steps — its pose or facing changes on a frame,
+/// by the brain's ordinary transitions. A pose caught mid-stride
+/// ([`PetBrain::mid_stride`]) hands over when the ramp ends instead: a gait
+/// beat held on a motionless cat is a stuck leg, and a walk folding into the
+/// stand at the seat is how every walk ends. The first frame the brain sets
+/// the body in motion hands over too, so the held look never travels: it
+/// never slides across cells, rides a flight or flies backwards (measured
+/// before: a standing look glided 3.47 cells through a leap, then became
+/// the landing frame in mid-air). Every handover rides a step the brain
+/// takes anyway; the body never changes pose in place because it was
+/// adopted. Reduced motion wears the brain's still pose at once.
+#[derive(Clone, Copy, Debug)]
+struct AdoptedLook {
+    /// The ghost's pose (pre-skin) and facing.
+    pose: PetGlyphId,
+    facing_left: bool,
+    /// The seat the body was adopted at, `(col, row)`: the look is worn only
+    /// while the body rests there.
+    seat: (f32, f32),
+    /// The brain's own pose and facing on the last frame that wore the
+    /// adopted look; `None` until the first.
+    beneath: Option<(PetGlyphId, bool)>,
 }
 
 /// THE RE-SIGHTING CROSSFADE's pending ghost ([`PetBrain::resight_coordinate_space`]).
@@ -1486,12 +1573,6 @@ struct PendingResight {
     ghost: Departure,
     /// The instant of the tick that drew it.
     at: Instant,
-    /// The ghost's rectangle was admitted by its OWN surface's last
-    /// observation — the world the body was judged in on the frame the user
-    /// saw: nothing protected under it there. The warrant to spend it on that
-    /// glass ([`PetBrain::displace_resight`]); the replaced-surface crossfade
-    /// judges it in the new world instead.
-    own_clear: bool,
 }
 
 impl Departure {
@@ -1514,6 +1595,48 @@ impl Departure {
             (1.0 - (t - fade_start) / EDGE_FADE).clamp(0.0, 1.0)
         };
         fade * self.peak.clamp(0.0, 1.0)
+    }
+
+    /// Where age `t` draws it: its left column, its pose (pre-skin) and its
+    /// facing. A still departure holds its carried cell and look; a running
+    /// one runs toward its edge at [`Self::speed`] on the run cycle
+    /// (distance-driven feet, seeded from the live stride), holding at the
+    /// edge if early.
+    fn look_at(&self, t: f32) -> (f32, PetGlyphId, bool) {
+        let span = (self.edge - self.from_col).abs();
+        let dir = if self.edge < self.from_col { -1.0 } else { 1.0 };
+        let run = (self.speed * t).min(span);
+        let col = self.from_col + dir * run;
+        if self.still {
+            // The in-place fade: the ghost is the body the user was just
+            // looking at, so it holds that body's exact look.
+            return (col, self.pose0, self.facing_left);
+        }
+        let stride = self.stride0 + run / RUN_STRIDE_CELLS;
+        let cycle = PetBrain::CYCLE_RUN;
+        let frame = ((stride.rem_euclid(1.0) * cycle.len() as f32) as usize).min(cycle.len() - 1);
+        (col, cycle[frame], dir < 0.0)
+    }
+
+    /// This departure STOPPED where age `t` draws it: a still ghost at that
+    /// cell in that look, its envelope from [`Self::peak`] — what a boundary
+    /// carries ([`Carried`]). The handoff's leaver running off is stopped
+    /// mid-stride where the user saw it: across a boundary its exit door is
+    /// on a surface the new one replaced, and a still ghost is the one whose
+    /// rectangle a boundary can admit. A still ghost is already itself.
+    fn stopped_at(self, t: f32) -> Self {
+        if self.still {
+            return self;
+        }
+        let (col, pose0, facing_left) = self.look_at(t);
+        Self {
+            from_col: col,
+            edge: col,
+            still: true,
+            pose0,
+            facing_left,
+            ..self
+        }
     }
 }
 
@@ -2437,6 +2560,9 @@ pub struct PetBrain {
     /// The mote lane (dust / z's / notes) and its deterministic serial.
     motes: [Option<Mote>; PET_MOTES_MAX],
     mote_serial: u8,
+    /// The last [`Departure::id`] given out; carried across every retire and
+    /// drain ([`Self::reborn`]), so no two ghosts of this pet ever share one.
+    departure_serial: u32,
     /// One deal per arrival: `settle_serial` counts settles (bumped in
     /// [`Self::enter_settled`]) and `settle_seed` is
     /// `settle_serial + mote_serial`, so the same typing deals the same hand.
@@ -2512,6 +2638,16 @@ pub struct PetBrain {
     /// user saw. A re-sighting ghost starts its fade here
     /// (`Departure::peak`).
     last_presence: f32,
+    /// What each slot of [`Self::departures`] put on glass in the last
+    /// emitted frame, `0..=1`, slot for slot (`resolve_departures` and
+    /// `finish_console_frame` both index the lane that way): the ghost's
+    /// envelope times the lane's presence, visibility hold included, after
+    /// the console's culls — a selection over it, a refused re-sighting
+    /// ghost, a frame with no cat — which draw it at zero. What the user saw
+    /// of each ghost, as [`Self::last_presence`] is of the body: a ghost is
+    /// carried across a boundary at this presence, and not at all where it
+    /// drew nothing ([`Self::resight_coordinate_space`]).
+    last_drawn: [f32; PET_DEPARTURES_MAX],
     /// The grid `(cols, rows)` of the last tick's sense: the clamp the drawn
     /// body was placed under, which a re-sighting ghost's admission at the
     /// boundary needs ([`Self::resight_coordinate_space`]).
@@ -2522,6 +2658,14 @@ pub struct PetBrain {
     /// so the retired zero-alpha fast path may skip the write harmlessly:
     /// nothing can read it while the pet is hidden.
     last_pose: PetGlyphId,
+    /// The facing the last emitted frame drew, beside [`Self::last_pose`]:
+    /// a re-sighting ghost holds the look the user saw, the adopted look
+    /// included ([`Self::adopted_look`]).
+    last_facing: bool,
+    /// The look an arriver adopted with a ghost of itself, worn while the
+    /// body rests at that seat until the brain's own look steps or it moves
+    /// ([`AdoptedLook`]). Reset by every retire.
+    adopted_look: Option<AdoptedLook>,
     /// Coarse-offer inputs kept from the last tick, since
     /// [`Self::next_change_deadline`] is asked between ticks: the cell height
     /// (a visible step is a whole device pixel) and whether the frame was
@@ -2698,6 +2842,7 @@ impl Default for PetBrain {
             skid_dir: 0.0,
             motes: [None; PET_MOTES_MAX],
             mote_serial: 0,
+            departure_serial: 0,
             settle_serial: 0,
             settle_seed: 0,
             mote_mark: 0,
@@ -2720,11 +2865,14 @@ impl Default for PetBrain {
             resight: None,
             carried: [None; PET_DEPARTURES_MAX],
             last_presence: 0.0,
+            last_drawn: [0.0; PET_DEPARTURES_MAX],
             last_grid: (0, 0),
             // A fresh pet is asleep (see `quiet` above), so its last look
             // is the sleep frame — consistent with what the first emit
             // would write.
             last_pose: PetGlyphId::PetSleep0,
+            last_facing: false,
+            adopted_look: None,
             last_cell_h: 0,
             last_cell_w: 0,
             last_reduced: false,
@@ -2923,6 +3071,7 @@ impl PetBrain {
         // land it as the fade-to-zero path does.
         let worn = self.pending_worn.or(self.worn);
         let mote_serial = self.mote_serial;
+        let departure_serial = self.departure_serial;
         let mote_mark = self.mote_mark;
         let last_frolic = self.last_frolic;
         let bored_cool = self.bored_cool;
@@ -2954,6 +3103,7 @@ impl PetBrain {
             },
             worn,
             mote_serial,
+            departure_serial,
             mote_mark,
             last_frolic,
             bored_cool,
@@ -3031,26 +3181,60 @@ impl PetBrain {
     /// cat at all — the arriver adopts it, its place and its presence, and
     /// continues from there. Idempotent: a second boundary before the next
     /// tick keeps the first one's ghosts.
+    ///
+    /// THE BREED HANDOFF'S LEAVER is on glass too — the old coat running off
+    /// toward its edge, or fading in place at a homecoming — and it is the
+    /// same pet's body: it is carried with every crossfade ghost, stopped
+    /// where it was drawn in the frame the user saw ([`Departure::stopped_at`]),
+    /// and fades there on the arriver's ramp like the rest. Measured before:
+    /// a ceremony's leaver at 255 vanished in one frame at an alternate-screen
+    /// enter or a split-pane switch, and a homecoming's old coat did too.
+    ///
+    /// Every ghost is carried at WHAT THE LAST FRAME DREW of it
+    /// (`last_drawn`), never at its record's envelope, and one that drew
+    /// nothing is not carried. Measured before: a leaver a selection culled
+    /// on every frame — nothing of it on glass — was carried at its full
+    /// envelope and popped in at 255 after an alternate-screen enter (the cat
+    /// 126 → 396/255 in one frame); after a split-pane switch its presence
+    /// was handed to the arriver instead, which came up at 255 beside the old
+    /// body's ghost (149 → 404/255).
     pub fn resight_coordinate_space(&mut self) {
-        // THE CROSSFADE GHOSTS STILL ON GLASS are this cat, and the surface
-        // the focus goes to next may be the one they fade on: the retire
-        // below would cut each mid-fade — the pane, tab or screen the focus
-        // returns to dropped from the ghost's presence to the arriver's
-        // floor in one frame. They are carried by value with what the user
-        // saw of them, and judged where they stand before the old map goes.
+        // EVERY GHOST STILL ON GLASS is this cat, and the surface the focus
+        // goes to next may be the one it fades on: the retire below would
+        // cut each mid-fade — the pane, tab or screen the focus returns to
+        // dropped from the ghost's presence to the arriver's floor in one
+        // frame, and a leaver running off vanished. They are carried by value
+        // with what the user saw of them, where the user saw them, and judged
+        // where they stand before the old map goes. What the user saw is what
+        // the last frame DREW of each (`last_drawn`), never the lane's record:
+        // a ghost the console culled there (a selection over it) or a cover
+        // dimmed was not on glass at that presence, and carrying its envelope
+        // put a cat the user never saw on glass at 255 after the boundary.
         let carried = if self.carried.iter().any(Option::is_some) {
             self.carried
         } else {
-            let lane = self.alpha.clamp(0.0, 1.0);
             let mut carried = [None; PET_DEPARTURES_MAX];
-            for (slot, d) in carried.iter_mut().zip(self.departures.iter().flatten()) {
+            let live = self
+                .departures
+                .iter()
+                .zip(self.last_drawn)
+                .filter_map(|(d, drawn)| d.map(|d| (d, drawn)));
+            for (slot, (d, presence)) in carried.iter_mut().zip(live) {
                 let age = (self.lane_clock - d.born) as f32;
-                let presence = d.envelope(age) * lane;
-                if d.resight && age < d.life() && presence > 0.0 {
+                if age < d.life() && presence > 0.0 {
+                    let ghost = d.stopped_at(age);
+                    // Its verdict on the glass it stood on; one on its own
+                    // glass keeps the one its own boundary gave it. Where
+                    // this map cannot see it, it keeps the one it came with.
+                    let own_clear = match ghost.own_glass {
+                        Some(_) => ghost.own_clear,
+                        None => self
+                            .console_still_rect_verdict(ghost.from_col, ghost.row)
+                            .unwrap_or(ghost.own_clear),
+                    };
                     *slot = Some(Carried {
-                        ghost: *d,
+                        ghost: Departure { own_clear, ..ghost },
                         presence,
-                        own_clear: !d.own_glass && self.console_still_rect_clear(d.from_col, d.row),
                         home: false,
                     });
                 }
@@ -3063,6 +3247,7 @@ impl PetBrain {
             (self.alpha > 0.0 && self.last_presence > 0.0).then(|| PendingResight {
                 ghost: Departure {
                     born: 0.0,
+                    id: self.next_departure_id(),
                     coat,
                     iris,
                     from_col: self.col,
@@ -3070,18 +3255,18 @@ impl PetBrain {
                     edge: self.col,
                     speed: DEPART_SPEED,
                     still: true,
-                    facing_left: self.facing_left,
+                    facing_left: self.last_facing,
                     stride0: self.stride,
                     pose0: self.last_pose,
                     resight: true,
-                    own_glass: false,
+                    own_glass: None,
+                    // Judged NOW, before the retire below drops the old
+                    // surface's map: it is still the observation the body
+                    // was drawn against.
+                    own_clear: self.console_still_body_clear(),
                     peak: self.last_presence,
                 },
                 at,
-                // Judged NOW, before the retire below drops the old
-                // surface's map: it is still the observation the body was
-                // drawn against.
-                own_clear: self.console_still_body_clear(),
             })
         });
         self.retire_coordinate_space();
@@ -3094,18 +3279,19 @@ impl PetBrain {
         self.resight = None;
     }
 
-    /// THE GHOST COMES HOME: the host found the new surface to be the glass
-    /// a carried own-glass ghost stands on ([`Self::carried`]), exactly as it
-    /// was drawn — the focus went back to the pane it was fading in. The next
-    /// tick spends it there in the same breath as the pending re-sighting
-    /// ghost: on the focused surface's own glass now, so it is an ordinary
-    /// re-sighting ghost (`Departure::resight`, judged in the new world,
-    /// beneath its ink) — or, standing at the arriver's seat, the arriver
-    /// itself. Without a pending ghost to cross-fade with, it is dropped
-    /// with it.
-    pub fn come_home(&mut self) {
+    /// THE GHOST COMES HOME: the host found the new surface to be `glass`
+    /// — the own glass ([`Self::displace_resight`]'s key) that carried ghosts
+    /// stand on ([`Self::carried`]) — exactly as it was drawn: the focus went
+    /// back to the pane they were fading in. The next tick spends them there
+    /// in the same breath as the pending re-sighting ghost: on the focused
+    /// surface's own glass now, so each is an ordinary re-sighting ghost
+    /// (`Departure::resight`, judged in the new world, beneath its ink) — or,
+    /// standing at the arriver's seat, the arriver itself. Carried ghosts on
+    /// any other own glass keep fading there. Without a pending ghost to
+    /// cross-fade with, they are dropped with it.
+    pub fn come_home(&mut self, glass: u32) {
         for carried in self.carried.iter_mut().flatten() {
-            if carried.ghost.own_glass {
+            if carried.ghost.own_glass == Some(glass) {
                 carried.home = true;
             }
         }
@@ -3119,41 +3305,51 @@ impl PetBrain {
     /// cells ([`PetDepartureSprite::own_glass`]): the old body fades where
     /// the user saw it while the arriver comes up at the new pane's station.
     ///
-    /// It is kept only if its own surface's last observation admitted its
-    /// rectangle (`PendingResight::own_clear`, judged at the boundary) —
-    /// nothing protected under it there — and it is drawn beneath that
-    /// pane's ink for its whole quarter second, because nobody observes that
-    /// pane again before it has faded: an unobserved rectangle draws under
-    /// the text, the safe direction for a layering decision. Otherwise the
-    /// ghost is dropped and the arriver fades in alone.
-    pub fn displace_resight(&mut self) {
-        self.resight = self
-            .resight
-            .take()
-            .filter(|pending| pending.own_clear)
-            .map(|pending| PendingResight {
-                ghost: Departure {
-                    own_glass: true,
-                    ..pending.ghost
-                },
-                ..pending
-            });
+    /// It is drawn only if its own surface's last observation admitted its
+    /// rectangle (`Departure::own_clear`, judged at the boundary) — nothing
+    /// protected under it there — and it is drawn beneath that pane's ink
+    /// for its whole quarter second, because nobody observes that pane again
+    /// before it has faded: an unobserved rectangle draws under the text, the
+    /// safe direction for a layering decision. Otherwise the tick that spends
+    /// it draws no ghost and hands its presence to the arriver
+    /// ([`Self::spend_crossfade`]), which comes up from there instead of from
+    /// its ramp's floor.
+    ///
+    /// `glass` is the host's key for that pane's glass
+    /// ([`PetDepartureSprite::glass`], never `0`): a ghost on its own glass is
+    /// judged by its own pane — kept while that pane is on glass as drawn,
+    /// dropped with it ([`Self::forget_own_glass`]), or home when the focus
+    /// comes back to it ([`Self::come_home`]) — whatever happens to the
+    /// ghosts in other panes.
+    pub fn displace_resight(&mut self, glass: u32) {
+        self.resight = self.resight.take().map(|pending| PendingResight {
+            ghost: Departure {
+                own_glass: Some(glass),
+                ..pending.ghost
+            },
+            ..pending
+        });
     }
 
-    /// Drop every ghost standing on its own glass, pending or fading: the
-    /// host says that glass is gone (its pane closed or zoomed away) or no
-    /// longer the pixels it was drawn at (the cell metrics changed).
-    pub fn forget_own_glass(&mut self) {
-        if self.resight.is_some_and(|pending| pending.ghost.own_glass) {
+    /// Drop every ghost standing on own glass `glass`, pending, carried or
+    /// fading: the host says that glass is gone (its pane closed or zoomed
+    /// away) or no longer the pixels it was drawn at (the cell metrics
+    /// changed). Ghosts on any other glass are untouched.
+    pub fn forget_own_glass(&mut self, glass: u32) {
+        let on = |own: Option<u32>| own == Some(glass);
+        if self
+            .resight
+            .is_some_and(|pending| on(pending.ghost.own_glass))
+        {
             self.resight = None;
         }
         for slot in &mut self.carried {
-            if slot.is_some_and(|c| c.ghost.own_glass) {
+            if slot.is_some_and(|c| on(c.ghost.own_glass)) {
                 *slot = None;
             }
         }
         for slot in &mut self.departures {
-            if slot.is_some_and(|d| d.own_glass) {
+            if slot.is_some_and(|d| on(d.own_glass)) {
                 *slot = None;
             }
         }
@@ -3163,16 +3359,40 @@ impl PetBrain {
     /// ([`Self::displace_resight`]).
     #[must_use]
     pub fn has_own_glass_ghost(&self) -> bool {
-        self.resight.is_some_and(|pending| pending.ghost.own_glass)
-            || self.departures.iter().flatten().any(|d| d.own_glass)
+        self.resight
+            .is_some_and(|pending| pending.ghost.own_glass.is_some())
+            || self
+                .carried
+                .iter()
+                .flatten()
+                .any(|c| c.ghost.own_glass.is_some())
+            || self
+                .departures
+                .iter()
+                .flatten()
+                .any(|d| d.own_glass.is_some())
+    }
+
+    /// A ghost stands, is carried to stand, or is about to stand on own
+    /// glass `glass` ([`Self::displace_resight`]'s key): the host keeps that
+    /// glass's pixel frame exactly as long as this holds.
+    #[must_use]
+    pub fn has_ghost_on_glass(&self, glass: u32) -> bool {
+        let on = |own: Option<u32>| own == Some(glass);
+        self.resight
+            .is_some_and(|pending| on(pending.ghost.own_glass))
+            || self.carried.iter().flatten().any(|c| on(c.ghost.own_glass))
+            || self.departures.iter().flatten().any(|d| on(d.own_glass))
     }
 
     /// THE CROSSFADE, SPENT ON THE TICK THAT SIGHTED THE NEW CARET: the
     /// arriver is seated at its lawful station (`self.col`, `self.row`) at
     /// full presence; the pending ghost is the body the user just saw; the
-    /// carried ghosts are this cat's ghosts that were still fading at the
-    /// boundary ([`Self::resight_coordinate_space`]). ONE ramp,
-    /// [`HOMECOMING_IN`], hands every one of them over to the arriver:
+    /// carried ghosts are this cat's ghosts that were still on glass at the
+    /// boundary ([`Self::resight_coordinate_space`]): crossfade ghosts still
+    /// fading, and the breed handoff's leaver stopped where it was drawn.
+    /// ONE ramp, [`HOMECOMING_IN`], hands every one of them over to the
+    /// arriver:
     ///
     /// * a ghost's envelope is a function of its own life, which is the
     ///   arriver's ramp — it starts at the presence it had on glass
@@ -3186,38 +3406,60 @@ impl PetBrain {
     ///   linearly to one cat.
     /// * a carried ghost on the focused surface's glass, at the arriver's
     ///   seat (within [`ADOPT_REACH`]) and in the arriver's look, is not a
-    ///   second cat: the arriver ADOPTS it — its cell, its facing and its
-    ///   presence — and continues from there on the same ramp
-    ///   ([`Self::arrive_from`]). Starting at the floor beside it put two
-    ///   cats in the pane the focus came back to, the old one still fading
-    ///   and the new one at 6 %: the cat there dipped and doubled.
+    ///   second cat: the arriver ADOPTS it — its cell, its facing, its
+    ///   presence and the look the user saw it in — and continues from there
+    ///   on the same ramp ([`Self::arrive_from`], [`AdoptedLook`]). Starting
+    ///   at the floor beside it put two cats in the pane the focus came back
+    ///   to, the old one still fading and the new one at 6 %: the cat there
+    ///   dipped and doubled. Seating it in the fresh brain's pose changed the
+    ///   pose in place on the adoption frame (measured: a stretch became a
+    ///   walk frame at the same cell).
     /// * any other carried ghost keeps fading where its glass still is: on
     ///   the focused surface (the same glass, or its own pane the focus came
     ///   back to — [`Self::come_home`]) as a re-sighting ghost judged in this
     ///   world; in the pane the focus left beside the pending ghost
     ///   ([`Self::displace_resight`]) if its own surface admitted it at the
-    ///   boundary (`Carried::own_clear`); anywhere else it is dropped, as its
-    ///   glass is.
+    ///   boundary (`Departure::own_clear`); on ITS OWN glass, in whichever
+    ///   pane it was drawn in, while the host keeps that pane on glass as
+    ///   drawn (it drops the ones it does not, [`Self::forget_own_glass`],
+    ///   before this tick). A quick cycle across three panes (A → B → C)
+    ///   dropped A's ghost mid-fade when the focus did not come back to A:
+    ///   that pane went from 238/255 to nothing in one frame, the cat summing
+    ///   to 30/255.
+    /// * A GHOST THIS TICK DOES NOT PUT ON GLASS HANDS ITS PRESENCE TO THE
+    ///   ARRIVER: the pending ghost or a carried one that its own surface did
+    ///   not admit where the focus left it (`Departure::own_clear`: something
+    ///   protected or unseen under it there), or one past the lane's cap
+    ///   ([`PET_DEPARTURES_MAX`]). The arriver's ramp starts from what the
+    ///   user saw of it (`arrive_from`, summed with an adopted body's and
+    ///   capped at full) instead of the floor, so the cat moves to its new
+    ///   station rather than vanishing — the rule a ghost the new world
+    ///   refuses keeps on every frame (`finish_console_frame`). A ghost whose
+    ///   glass is gone was dropped before this tick (`forget_resight`,
+    ///   [`Self::forget_own_glass`]), as its pixels are.
     fn spend_crossfade(
         &mut self,
         pending: PendingResight,
         carried: [Option<Carried>; PET_DEPARTURES_MAX],
     ) {
         // Where each carried ghost's glass is this tick: on the focused
-        // surface (`Some(false)`), on the pane the focus left (`Some(true)`),
-        // or gone (`None`).
+        // surface (`Some(None)`), on an own glass by its key (`Some(Some(_))`:
+        // its own pane, still on glass as drawn, or the pane the focus just
+        // left), or nowhere (`None`: the surface the focus left did not admit
+        // it there).
         let displaced = pending.ghost.own_glass;
         let glass = |c: &Carried| match (c.ghost.own_glass, displaced) {
-            (true, _) => c.home.then_some(false),
-            (false, false) => Some(false),
-            (false, true) => c.own_clear.then_some(true),
+            (Some(_), _) if c.home => Some(None),
+            (Some(own), _) => Some(Some(own)),
+            (None, None) => Some(None),
+            (None, Some(left)) => c.ghost.own_clear.then_some(Some(left)),
         };
         let seat = (self.col, self.row);
         let adopted = carried
             .iter()
             .enumerate()
             .filter_map(|(i, c)| c.map(|c| (i, c)))
-            .filter(|(_, c)| glass(c) == Some(false))
+            .filter(|(_, c)| glass(c) == Some(None))
             .filter(|(_, c)| self.worn == Some((c.ghost.coat, c.ghost.iris)))
             .filter(|(_, c)| {
                 (c.ghost.from_col - seat.0).abs() <= ADOPT_REACH
@@ -3229,30 +3471,51 @@ impl PetBrain {
             self.row = body.ghost.row;
             self.facing_left = body.ghost.facing_left;
         }
+        // The adopted body goes on in the look the user saw it in while it
+        // rests at this seat, until the brain's own look next steps
+        // (`AdoptedLook`).
+        self.adopted_look = adopted.map(|(_, body)| AdoptedLook {
+            pose: body.ghost.pose0,
+            facing_left: body.ghost.facing_left,
+            seat: (self.col, self.row),
+            beneath: None,
+        });
         self.alpha = 1.0;
         self.arrive_t = HOMECOMING_IN;
         self.arrive_in = HOMECOMING_IN;
-        self.arrive_from = adopted.map_or(0.0, |(_, body)| body.presence);
-        self.spawn_departure(Departure {
-            born: self.lane_clock,
-            ..pending.ghost
-        });
+        // What the arriver starts from: an adopted body's presence, plus every
+        // ghost this tick keeps off glass.
+        let mut handed = adopted.map_or(0.0, |(_, body)| body.presence);
+        if pending.ghost.own_glass.is_none() || pending.ghost.own_clear {
+            self.spawn_departure(Departure {
+                born: self.lane_clock,
+                ..pending.ghost
+            });
+        } else {
+            handed += pending.ghost.peak;
+        }
         let mut rest = [None; PET_DEPARTURES_MAX];
         for (i, (slot, c)) in rest.iter_mut().zip(carried).enumerate() {
-            if adopted.is_none_or(|(adopted, _)| adopted != i) {
-                *slot = c.and_then(|c| glass(&c).map(|own| (c, own)));
+            let Some(c) = c.filter(|_| adopted.is_none_or(|(adopted, _)| adopted != i)) else {
+                continue;
+            };
+            match glass(&c) {
+                Some(own) => *slot = Some((c, own)),
+                None => handed += c.presence,
             }
         }
         // The brightest first: the lane is capped, and a carried ghost never
         // evicts the one this switch just made.
-        rest.sort_by(|a: &Option<(Carried, bool)>, b| {
-            let presence = |s: &Option<(Carried, bool)>| s.map_or(-1.0, |(c, _)| c.presence);
+        rest.sort_by(|a: &Option<(Carried, Option<u32>)>, b| {
+            let presence = |s: &Option<(Carried, Option<u32>)>| s.map_or(-1.0, |(c, _)| c.presence);
             presence(b).total_cmp(&presence(a))
         });
         for (c, own_glass) in rest.into_iter().flatten() {
             if self.departures.iter().all(Option::is_some) {
-                break;
+                handed += c.presence;
+                continue;
             }
+            // The same ghost, re-based onto this ramp (`Departure::id`).
             self.spawn_departure(Departure {
                 born: self.lane_clock,
                 resight: true,
@@ -3261,6 +3524,7 @@ impl PetBrain {
                 ..c.ghost
             });
         }
+        self.arrive_from = handed.min(1.0);
     }
 
     /// THE GRIEF WINDOW (gauntlet F4a): true from a failed command's note
@@ -4082,6 +4346,7 @@ impl PetBrain {
                 self.col = self.col.clamp(0.0, max_col);
                 self.row = self.row.clamp(0.0, max_row);
                 self.last_presence = 0.0;
+                self.last_drawn = [0.0; PET_DEPARTURES_MAX];
                 return PetFrame {
                     alpha: 0,
                     lane_alpha: 0,
@@ -5880,8 +6145,10 @@ impl PetBrain {
                     self.arrive_t = arrive_in;
                     self.arrive_in = arrive_in;
                     self.arrive_from = 0.0;
+                    let id = self.next_departure_id();
                     self.spawn_departure(Departure {
                         born: self.lane_clock,
+                        id,
                         coat: old.0,
                         iris: old.1,
                         from_col: self.col,
@@ -5895,7 +6162,8 @@ impl PetBrain {
                         stride0: self.stride,
                         pose0: self.last_pose,
                         resight: false,
-                        own_glass: false,
+                        own_glass: None,
+                        own_clear: false,
                         peak: 1.0,
                     });
                     // Homecoming only: one ear-twitch bob of recognition, at a
@@ -8304,6 +8572,12 @@ impl PetBrain {
         out
     }
 
+    /// A fresh [`Departure::id`].
+    fn next_departure_id(&mut self) -> u32 {
+        self.departure_serial = self.departure_serial.wrapping_add(1);
+        self.departure_serial
+    }
+
     /// Admit one departing body, dropping the oldest when the lane is full
     /// ([`PET_DEPARTURES_MAX`]).
     fn spawn_departure(&mut self, d: Departure) {
@@ -8345,37 +8619,24 @@ impl PetBrain {
                 self.departures[i] = None;
                 continue;
             }
-            let span = (d.edge - d.from_col).abs();
-            let dir = if d.edge < d.from_col { -1.0 } else { 1.0 };
-            let run = (d.speed * t).min(span);
             let alpha = d.envelope(t);
-            let (pose, facing_left) = if d.still {
-                // The in-place fade: the ghost is the body the user was
-                // just looking at, so it holds that body's exact look.
-                (d.pose0, d.facing_left)
-            } else {
-                // Distance-driven feet on the run stride, continuing the live
-                // body's phase.
-                let stride = d.stride0 + run / RUN_STRIDE_CELLS;
-                let frame = ((stride.rem_euclid(1.0) * Self::CYCLE_RUN.len() as f32) as usize)
-                    .min(Self::CYCLE_RUN.len() - 1);
-                (Self::CYCLE_RUN[frame], dir < 0.0)
-            };
+            let (col, pose, facing_left) = d.look_at(t);
             *slot = Some(PetDepartureSprite {
                 // The species skin applies here for the same reason the live
                 // body applies it at emit: the record stays species-blind.
                 pose: self.species.skin(pose),
-                col: d.from_col + dir * run,
+                col,
                 row: d.row,
                 facing_left,
                 alpha: (alpha * 255.0) as u8,
                 coat: d.coat,
                 iris: d.iris,
-                born: d.born,
+                id: d.id,
                 // A ghost on its own glass is beneath that pane's ink from
                 // its first frame (`Departure::own_glass`).
-                under_ink: d.own_glass,
-                own_glass: d.own_glass,
+                under_ink: d.own_glass.is_some(),
+                own_glass: d.own_glass.is_some(),
+                glass: d.own_glass.unwrap_or(0),
             });
         }
         out
@@ -8880,8 +9141,41 @@ impl PetBrain {
         lift += self
             .retired_flight_lift
             .map_or(0.0, |(held_lift, _)| held_lift);
-        // The last pose, pre-skin, for a departure spawned now.
+        // THE ADOPTED LOOK: an arriver that adopted its own ghost wears the
+        // look the user saw while the body rests at the seat it was adopted
+        // at — through the ramp, then, for a still pose, until the brain's
+        // own look steps. The handover rides that step, or the brain setting
+        // the body in motion (it leaves the seat, lifts, or gathers to
+        // leap): the held look never travels (`AdoptedLook`).
+        let own = (pose, self.facing_left);
+        let ramp = self.arrive_t > 0.0;
+        let (col, row, action) = (self.col, self.row, self.action);
+        let (pose, facing_left) = match self.adopted_look.as_mut() {
+            Some(look)
+                if !sense.reduced_motion
+                    && (col - look.seat.0).abs() <= ADOPT_HOLD_REACH
+                    && (row - look.seat.1).abs() <= ADOPT_HOLD_REACH
+                    && lift.abs() <= ADOPT_HOLD_REACH
+                    && !matches!(
+                        action,
+                        PetAction::Crouch | PetAction::Leap | PetAction::Land
+                    )
+                    && (ramp
+                        || (!Self::mid_stride(look.pose)
+                            && look.beneath.is_none_or(|b| b == own))) =>
+            {
+                look.beneath = Some(own);
+                (scale_x, scale_y, lift) = (1.0, 1.0, 0.0);
+                (look.pose, look.facing_left)
+            }
+            _ => {
+                self.adopted_look = None;
+                own
+            }
+        };
+        // The last look, pre-skin, for a departure spawned now.
         self.last_pose = pose;
+        self.last_facing = facing_left;
         let mut frame = PetFrame {
             alpha: (self.alpha.clamp(0.0, 1.0) * arrival * 255.0) as u8,
             // Presence alone, for the departure lane; the arrival ramp belongs
@@ -8894,7 +9188,7 @@ impl PetBrain {
             col: self.col,
             row: self.row,
             lift,
-            facing_left: self.facing_left,
+            facing_left,
             scale_x,
             scale_y,
             purr,
@@ -8905,6 +9199,12 @@ impl PetBrain {
         };
         self.finish_console_frame(&mut frame, sense);
         self.last_presence = f32::from(frame.alpha) / 255.0;
+        // Each ghost as the emitter draws it: `d.alpha × lane_alpha`, zero
+        // where the console culled it.
+        let lane = f32::from(frame.lane_alpha) / 255.0;
+        self.last_drawn = core::array::from_fn(|i| {
+            frame.departures[i].map_or(0.0, |d| f32::from(d.alpha) / 255.0 * lane)
+        });
         frame
     }
 
@@ -8928,6 +9228,30 @@ impl PetBrain {
         PetGlyphId::PetRun2,
         PetGlyphId::PetRun3,
     ];
+
+    /// A frame (pre-skin) caught between two steps: a beat of a gait, the
+    /// skid, or a frame of a flight from its gather to its landing. Held on
+    /// a motionless body it reads as a stuck animation — a leg lifted for a
+    /// second — so an adopted look in one hands over when the ramp ends
+    /// ([`AdoptedLook`]).
+    fn mid_stride(pose: PetGlyphId) -> bool {
+        Self::CYCLE_WALK.contains(&pose)
+            || Self::CYCLE_LWALK.contains(&pose)
+            || Self::CYCLE_RUN.contains(&pose)
+            || matches!(
+                pose,
+                PetGlyphId::PetSkid
+                    | PetGlyphId::PetCrouch
+                    | PetGlyphId::PetCrouchWiggle
+                    | PetGlyphId::PetLaunch
+                    | PetGlyphId::PetLeapRise
+                    | PetGlyphId::PetLeap
+                    | PetGlyphId::PetHop
+                    | PetGlyphId::PetApex
+                    | PetGlyphId::PetLeapDescend
+                    | PetGlyphId::PetLand
+            )
+    }
 
     /// The distance-driven gait frame — see the module note on why this is not a
     /// function of elapsed time.
@@ -8977,7 +9301,19 @@ impl PetBrain {
             return;
         }
         // Species and worn look are re-asserted by the host every frame.
-        *self = Self::default();
+        *self = self.reborn();
+    }
+
+    /// A fresh brain — [`Self::default`] — but for the one counter no reset
+    /// rewinds: [`Departure::id`] stays unique for the pet's life, so the
+    /// emitter never pairs a ghost born after a retire or a drain with a
+    /// tile it still holds for one before it (`PetDepartureSprite::id`).
+    #[must_use]
+    pub(crate) fn reborn(&self) -> Self {
+        Self {
+            departure_serial: self.departure_serial,
+            ..Self::default()
+        }
     }
 
     /// Host sync for the pet's identity: one appearance wears one cat. The
@@ -15623,6 +15959,7 @@ mod tests {
             pet.lane_clock = f64::from(k) * 0.1;
             pet.spawn_departure(Departure {
                 born: pet.lane_clock,
+                id: 0,
                 coat: k,
                 iris: 0,
                 from_col: 10.0,
@@ -15634,7 +15971,8 @@ mod tests {
                 stride0: 0.0,
                 pose0: PetGlyphId::PetSit,
                 resight: false,
-                own_glass: false,
+                own_glass: None,
+                own_clear: false,
                 peak: 1.0,
             });
         }
@@ -15670,6 +16008,7 @@ mod tests {
     fn a_departing_body_is_a_pure_function_of_its_record() {
         let record = Departure {
             born: 5.0,
+            id: 0,
             coat: 7,
             iris: 2,
             from_col: 20.0,
@@ -15681,7 +16020,8 @@ mod tests {
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
             resight: false,
-            own_glass: false,
+            own_glass: None,
+            own_clear: false,
             peak: 1.0,
         };
         let mut a = PetBrain::default();

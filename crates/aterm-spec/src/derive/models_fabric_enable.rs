@@ -12,9 +12,7 @@ use super::Model;
 /// (`a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model`) —
 /// that is the crate whose integration tests can run the binary. Existing
 /// capability bytes and temporary-file cleanup are checked there too, at every
-/// mint and on each failure exit. Until round 13 both were a shell fixture
-/// around `tools/fabric-enable.sh`; that script is a wrapper over the command
-/// now and the transaction it modelled is Rust.
+/// mint and on each failure exit.
 /// `Buggy=1` restores continuing after rejection and premature publication.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

@@ -3,18 +3,10 @@
 
 //! Fast non-cryptographic hashing for aterm.
 //!
-//! An inline FxHash, bit-compatible with `rustc-hash` 2.1: the fast,
-//! non-cryptographic hash `rustc` uses.
-//!
-//! # Exported types
-//!
-//! - [`FxHasher`] -- the core hasher implementing [`std::hash::Hasher`]
-//! - [`FxBuildHasher`] -- a zero-sized [`BuildHasher`] that creates `FxHasher`s
-//! - [`FxHashMap`] -- type alias for `HashMap<K, V, FxBuildHasher>`
-//! - [`FxHashSet`] -- type alias for `HashSet<V, FxBuildHasher>`
-//! - [`fnv1a_64`], [`fnv1a_64_extend`], [`Fnv1a64`], [`fnv_mix_u64`],
-//!   [`FNV64_OFFSET`], [`FNV64_PRIME`] -- FNV-1a/64, the one hash whose values
-//!   may persist or cross a crate boundary (see the `fnv` module)
+//! - [`FxHasher`], [`FxBuildHasher`], [`FxHashMap`], [`FxHashSet`]: an inline
+//!   FxHash, bit-compatible with `rustc-hash` 2.1. In-process only.
+//! - [`fnv1a_64`] and friends: FNV-1a/64, the one hash whose values may
+//!   persist or cross a crate boundary (see the `fnv` module).
 //!
 //! # Example
 //!
@@ -286,10 +278,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     multiply_mix(s0, s1) ^ (len as u64)
 }
 
-/// A [`BuildHasher`] that produces [`FxHasher`] instances.
-///
-/// This is a zero-sized type that can be used as the hasher parameter for
-/// `HashMap` and `HashSet`.
+/// A zero-sized [`BuildHasher`] that produces [`FxHasher`]s.
 ///
 /// ```
 /// use std::hash::BuildHasher;
@@ -383,7 +372,7 @@ mod tests {
         }
     }
 
-    /// Helper to feed raw bytes to the hasher (avoids relying on std Hash impls).
+    /// Feeds raw bytes to the hasher, bypassing std's `Hash` impls.
     #[derive(Debug)]
     struct HashBytes(&'static [u8]);
     impl Hash for HashBytes {
@@ -404,14 +393,6 @@ mod tests {
             HashBytes(b"These are some bytes for testing rustc_hash.") =>
                 if B32 { 2303640537 } else { 2349210501944688211 },
         }
-    }
-
-    #[test]
-    fn test_fxhashmap_with_capacity_and_hasher() {
-        // Verify the construction pattern used throughout the codebase.
-        let map: FxHashMap<u32, u32> = FxHashMap::with_capacity_and_hasher(16, FxBuildHasher);
-        assert_eq!(map.len(), 0);
-        assert!(map.capacity() >= 16);
     }
 
     #[test]

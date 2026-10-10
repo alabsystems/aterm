@@ -28,7 +28,7 @@ pub struct ViSearchState {
 impl ViSearchState {
     /// Create an empty search state.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -38,14 +38,14 @@ impl ViSearchState {
     /// binary-search the list, so unsorted input yields wrong navigation
     /// (no memory unsafety). No debug_assert here: a caller-contract
     /// assert is a reachable panic the L0 gate cannot prove away.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn set_matches(&mut self, matches: Vec<ViPoint>) {
         self.focused = None;
         self.matches = matches;
     }
 
     /// Clear all matches and reset focus.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.matches.clear();
         self.focused = None;
@@ -53,28 +53,28 @@ impl ViSearchState {
 
     /// Number of matches.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn match_count(&self) -> usize {
         self.matches.len()
     }
 
     /// Whether there are any matches.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
     }
 
     /// Currently focused match index.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn focused_index(&self) -> Option<usize> {
         self.focused
     }
 
     /// Currently focused match position.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn focused_point(&self) -> Option<ViPoint> {
         // Written as a match (not `and_then`) so the verifier does not have
         // to model a `&self`-capturing closure aggregate (unsupported MIR).
@@ -134,10 +134,6 @@ impl ViSearchState {
         self.focused_point() == Some(point)
     }
 }
-
-#[cfg(kani)]
-#[path = "search_kani_proofs.rs"]
-mod kani_proofs;
 
 #[cfg(test)]
 mod tests {

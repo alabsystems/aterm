@@ -20,10 +20,11 @@ pub(crate) struct Cli {
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
     /// `--headless`: no window is ever created — engine + PTY + control socket
-    /// only — and on macOS the process cannot be activated either (no Dock tile,
-    /// never the front app; `launch_posture` in `lib.rs`), so a harness may boot
-    /// one beside a human who is typing. The flag is the one spelling; an update
-    /// successor inherits it with the rest of argv.
+    /// only — and on macOS no application object either (winit's display-free
+    /// loop: no Dock tile, never the front app, no WindowServer connection;
+    /// `main_entry` in `lib.rs`), so a harness may boot one beside a human who is
+    /// typing. The flag is the one spelling; an update successor inherits it with
+    /// the rest of argv.
     pub(crate) headless: bool,
     /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file
     /// means the process that started this instance is gone, so it shuts down
@@ -680,8 +681,6 @@ const STARTER_CONFIG: &str = "\
 # Settings ▸ Security shows the measured state and has Apply now. macOS only.
 # [machine]
 # universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
-# spotlight_noindex = true         # rename cargo target dirs under $HOME to .noindex
-#                                  #   (a `target` symlink keeps cargo working)
 
 # --- input policy: map a chord to RAW BYTES sent to the program, overriding the
 # default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,

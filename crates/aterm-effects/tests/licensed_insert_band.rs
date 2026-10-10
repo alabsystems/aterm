@@ -507,9 +507,8 @@ fn torn_timings() -> Vec<(Shape, u64, u64)> {
 
 // Every law below replays independent takes, each its own host on its own
 // clock, so each runs them on the binary's threads (`crate::common::par_map`)
-// and the first failing take in the law's order raises its own panic. One
-// after another they were this file's wall (2026-10-05: 0.8 to 4.0 s a law
-// alone on one thread, up to 40.8 s in the merge gate's run).
+// and the first failing take in the law's order raises its own panic (0.8 to
+// 4.0 s a law alone on one thread).
 
 #[test]
 fn a_tab_completion_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert() {

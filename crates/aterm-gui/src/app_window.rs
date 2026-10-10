@@ -405,7 +405,9 @@ impl App {
     /// The frontmost logical window's state (immutable). Transitional — every
     /// caller is single-window today; later steps route by an explicit WindowId.
     pub(crate) fn front(&self) -> Option<&WindowState> {
-        self.frontmost_window.and_then(|id| self.windows.get(&id))
+        self.frontmost_window
+            .and_then(|id| self.windows.get(&id))
+            .map(Box::as_ref)
     }
 
     /// The window-chrome theme from config `window_theme`. `Auto` stays `Auto` so
@@ -525,6 +527,7 @@ impl App {
     pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
         self.frontmost_window
             .and_then(move |id| self.windows.get_mut(&id))
+            .map(Box::as_mut)
     }
 
     /// Logical window creation (no winit): mint a fresh [`WindowId`], spawn a
@@ -657,7 +660,7 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        self.windows.insert(wid, ws);
+        self.windows.insert(wid, Box::new(ws));
         self.install_window_config_assets(wid);
         // The new window becomes frontmost, and the global control/notify handle
         // follows it here, in the same seam that moves the front, so the control

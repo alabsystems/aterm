@@ -2688,21 +2688,34 @@ pub(crate) enum Imported {
 /// Blocking; the import worker's. A pane whose scrollback was cleared since
 /// the adopt is not imported into at all, before the sidecar is read and
 /// again at the attach ([`Imported::Cleared`]).
+///
+/// A HELD PANE'S LINES CROSS WITHOUT A LINK (`held_pane`): its screen is shown
+/// with every hyperlink dropped (`seamless::take_held_panes`), because nothing
+/// runs behind it and its carry is outside the adoption proof, so a link there
+/// could only be a click that opens a URL; its scrollback, imported in front of
+/// that screen, keeps every glyph and drops every link the same way. A handed
+/// session's lines keep theirs.
 pub(crate) fn import(
     term: &Mutex<Terminal>,
     carry: HistoryCarry,
     claim: OlderHistoryClaim,
+    held_pane: bool,
 ) -> Result<Imported, String> {
     if !locked(term, |t| t.older_history_claim_holds(claim)) {
         return Ok(Imported::Cleared);
     }
     let SidecarLines {
         cols: from_cols,
-        lines,
+        mut lines,
         links_dropped,
     } = carry
         .read_verified()
         .map_err(|why| format!("the sidecar arrived with {why}"))?;
+    if held_pane {
+        for line in &mut lines {
+            line.clear_hyperlinks();
+        }
+    }
     let deadline = std::time::Instant::now() + IMPORT_PATIENCE;
     loop {
         let cols = locked(term, |t| t.history_cols());
@@ -2922,7 +2935,7 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                 ),
                 (Some(carry), Some(claim)) => {
                     let take = carry.take();
-                    match import(&term, carry, claim) {
+                    match import(&term, carry, claim, held_pane) {
                         Ok(Imported::Retained {
                             kept,
                             links_dropped,

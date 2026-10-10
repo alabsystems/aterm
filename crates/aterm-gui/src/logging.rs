@@ -302,7 +302,7 @@ fn write_harness_fault(
     writeln!(
         f,
         "aterm-gui {} supervisor fault on {thread} at unix {}.{:03}\n{info}\n\nbacktrace:\n{backtrace}\n",
-        aterm_types::version::APP_VERSION,
+        crate::build_info::version(),
         ts.as_secs(),
         ts.subsec_millis(),
     )?;
@@ -328,7 +328,7 @@ pub(crate) fn write_crash_report(
     writeln!(
         f,
         "aterm-gui {} crashed at unix {}.{:03}{}{}\n{info}\n\nbacktrace:\n{backtrace}",
-        aterm_types::version::APP_VERSION,
+        crate::build_info::version(),
         ts.as_secs(),
         ts.subsec_millis(),
         run.map(|nanos| format!("{REPORT_RUN}{nanos}"))
@@ -1392,7 +1392,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let report = std::fs::read_to_string(&path).unwrap();
-        assert!(report.contains(aterm_types::version::APP_VERSION));
+        assert!(report.contains(crate::build_info::version()));
         assert!(report.contains("panicked at 'boom', main.rs:7"));
         assert!(report.contains("backtrace:\n0: frame_a"));
         assert_eq!(

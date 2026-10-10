@@ -3,12 +3,9 @@
 //
 // Operations xterm reaches under a second final byte.
 //
-// Each sequence here names an operation the engine already implements under its
-// primary spelling; the alternate spelling is not a different feature but the
-// same one an emitter may legitimately choose, so the two must be
-// indistinguishable from the screen. A terminal that recognizes only the
-// primary spelling looks, to the program that picked the other one, exactly like
-// a terminal that dropped the sequence — silently, with no error to notice.
+// Each alternate spelling names an operation the engine implements under its
+// primary spelling, so the two must be indistinguishable on screen. Missing the
+// alternate drops the sequence silently for the program that chose it.
 //
 // Every expectation is quoted from xterm's ctlseqs ("XTerm Control Sequences").
 

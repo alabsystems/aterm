@@ -346,7 +346,11 @@ fn readiness_proof_fires_only_when_drained() {
 fn a_failed_capture_barrier_does_not_withdraw_handoff_readiness() {
     use super::handoff_paint_proven as proven;
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let ws = app
+        .windows
+        .get_mut(&WindowId(0))
+        .map(Box::as_mut)
+        .expect("test window");
     assert!(
         !proven(false, true, std::iter::once(&*ws)),
         "control: a window that never presented has proven nothing"

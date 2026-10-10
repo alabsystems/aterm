@@ -104,6 +104,53 @@ fn grid_columns_agree_with_what_the_grid_paints() {
     );
 }
 
+/// East Asian Ambiguous characters, which `ambiguous_width = "wide"` draws in
+/// two cells: an arrow, box drawing, Latin-1 and Greek letters, a circled digit,
+/// the replacement character, an emoji-capable arrow with VS16 (already wide,
+/// so VS16 widens nothing) and with VS15, and one beside a CJK ideograph.
+const AMBIGUOUS_SAMPLES: &[(&str, &str)] = &[
+    ("arrow", "\u{2192}"),
+    ("box drawing", "\u{2500}\u{2500}"),
+    ("degree + middle dot", "\u{b0}\u{b7}"),
+    ("greek alpha + combining", "\u{3b1}\u{301}"),
+    ("circled digit", "\u{2460}"),
+    ("replacement character", "\u{fffd}"),
+    ("left-right arrow + VS16", "\u{2194}\u{fe0f}"),
+    ("play button + VS15", "\u{25b6}\u{fe0e}"),
+    ("ambiguous beside CJK", "\u{4e2d}\u{2192}\u{6587}"),
+];
+
+/// The column the grid paints `marker` at under `ambiguous_width = "wide"`.
+fn painted_column_wide(prefix: &str, marker: &str) -> Option<u16> {
+    let mut term = Terminal::new(3, 60);
+    term.apply_config(&aterm_core::config::TerminalConfig {
+        ambiguous_width_double: true,
+        ..Default::default()
+    });
+    term.process(format!("{prefix}{marker}").as_bytes());
+    (0..60u16).find(|&c| term.get_line_text(0, Some((c, c))).as_deref() == Some(marker))
+}
+
+/// Under `ambiguous_width = "wide"` the model is told the policy and agrees
+/// with the grid, ambiguous characters and every other sample alike.
+#[test]
+fn grid_columns_agree_with_what_the_grid_paints_under_wide_ambiguous_width() {
+    use aterm_types::text_shaping::AmbiguousWidth;
+    let mut wrong = Vec::new();
+    for (label, sample) in AMBIGUOUS_SAMPLES.iter().chain(SAMPLES) {
+        let painted = painted_column_wide(sample, "|").expect("the marker is painted somewhere");
+        let modelled = aterm_grapheme::str_grid_columns_with(sample, AmbiguousWidth::Double);
+        if usize::from(painted) != modelled {
+            wrong.push(format!("{label}: grid {painted} vs model {modelled}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "`str_grid_columns_with(.., Double)` disagrees with the grid it models:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
 #[test]
 fn the_find_bar_reports_the_column_the_grid_paints() {
     let mut wrong = Vec::new();

@@ -292,6 +292,64 @@ fn advance_batch_partial_then_complete() {
 // tests pin that equivalence at and around the capacity boundary so nobody
 // "optimizes" the fast path into a divergence.
 
+/// THE BULK COPY KEEPS EXACTLY WHAT `OscPut` KEEPS, AT EVERY BUFFER LENGTH.
+/// In `OscString` the fast path appends `osc_bulk_copy_len(len, n)` of the `n`
+/// data bytes before the first control byte; the per-byte path's `OscPut`
+/// pushes data byte `i` onto a buffer of `L(i) = min(len + i, MAX)` bytes only
+/// while `osc_put_keeps(L(i))`. At every breakpoint of the two piecewise-linear
+/// functions — `n` and `i` at 0, 1 and next to `n - 1` and `room = MAX - len`
+/// — byte `i` is pushed exactly when the bulk copy keeps it, `OscPut` takes
+/// `L(i)` to `L(i + 1)`, both paths end the run at the same length, and that
+/// length is within the cap. Placed relative to `room`, those points are every
+/// branch either function has at a given `len`, so `len` runs over both ends
+/// of the buffer in full and a prime stride between (every `len` would take
+/// seconds and reach no other branch).
+#[test]
+fn osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint() {
+    use crate::dispatch::{osc_bulk_copy_len, osc_put_keeps};
+    let ends = 4096;
+    let lens = (0..=ends)
+        .chain((ends..MAX_OSC_DATA - ends).step_by(4093))
+        .chain(MAX_OSC_DATA - ends..=MAX_OSC_DATA);
+    for len in lens {
+        let room = MAX_OSC_DATA - len;
+        for n in [
+            0,
+            1,
+            2,
+            room.saturating_sub(1),
+            room,
+            room + 1,
+            room + 2,
+            MAX_OSC_DATA + 1,
+        ] {
+            let copy_len = osc_bulk_copy_len(len, n);
+            assert_eq!(len + copy_len, (len + n).min(MAX_OSC_DATA), "{len} {n}");
+            for i in [
+                0,
+                1,
+                n.saturating_sub(2),
+                n.saturating_sub(1),
+                room.saturating_sub(1),
+                room,
+                room + 1,
+            ] {
+                if i >= n {
+                    continue;
+                }
+                let before = (len + i).min(MAX_OSC_DATA);
+                let pushed = osc_put_keeps(before);
+                assert_eq!(
+                    (len + i + 1).min(MAX_OSC_DATA),
+                    before + usize::from(pushed),
+                    "{len} {n} {i}"
+                );
+                assert_eq!(pushed, i < copy_len, "{len} {n} {i}");
+            }
+        }
+    }
+}
+
 #[test]
 fn osc_sub_cap_payload_delivered_intact() {
     // A payload comfortably under the cap must be delivered without truncation,

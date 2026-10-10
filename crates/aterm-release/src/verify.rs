@@ -630,7 +630,7 @@ pub enum CutMode {
 ///
 /// Under the single-version scheme the default version is not a bump of
 /// anything: it is [`RemoteState::current_version`] itself — the version the
-/// PUBLISHED commit declares, which is what a real cut builds. So "cut again
+/// PUBLISHED commit declares, which is what a real cut releases. So "cut again
 /// before publishing the next version" lands squarely on the already-published
 /// guard, whose message names the exact fix.
 pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
@@ -683,7 +683,7 @@ pub fn post_publish(
     let best = scanned.first().ok_or_else(|| {
         Error::new(format!(
             "no published release in {slug} carries {} — the fleet sees NOTHING; if a cut is \
-             open, `{} --resume` finishes it",
+             open, `{}` finishes it",
             manifest_out::MANIFEST_ASSET,
             publish::CUT_COMMAND
         ))
@@ -827,8 +827,7 @@ pub fn post_publish(
             return Err(Error::new(format!(
                 "https://github.com/{slug}/releases/latest/download/{} names {pointed}, \
                  not {tag} — every credential-less install discovers the channel head from \
-                 that pointer and would never see {tag}. The cut owns `latest`: `{cut} \
-                 --resume` while {tag}'s cut is open, which makes it the head behind the head \
+                 that pointer and would never see {tag}. The cut owns `latest`: `{cut}` while {tag}'s cut is open, which makes it the head behind the head \
                  ratchet; never re-point it by hand (docs/RELEASING.md, \"The cut owns \
                  `latest`\")",
                 manifest_out::MANIFEST_ASSET,
@@ -930,7 +929,7 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
 
 /// `targo --unverified ship status` — version, ledger tail, dangling claims (ledger vs the
 /// channel) and latest published build (spec §5).
-/// `ship status`'s statement of what the next cut builds: the commit `pub publish`
+/// `ship status`'s statement of what the next cut releases: the commit `pub publish`
 /// recorded, and the version IT declares — not this checkout's, which a cut does
 /// not build. Informational: an unreadable ledger or commit is
 /// said, never an error.
@@ -943,7 +942,7 @@ fn next_cut_line(
         Ok(source) => source,
         Err(e) => {
             return format!(
-                "next cut builds the commit `pub publish` records ({e}); this checkout \
+                "next cut releases the commit `pub publish` records ({e}); this checkout \
                  declares v{checkout_version}"
             );
         }
@@ -957,11 +956,11 @@ fn next_cut_line(
     .and_then(|full| publish::release_version_from_workspace(&full));
     match declared {
         Ok(version) => format!(
-            "next cut builds the published commit {short} (v{version}, verified {}), \
+            "next cut releases the published commit {short} (v{version}, verified {}), \
              whatever this checkout holds",
             source.verified_at
         ),
-        Err(e) => format!("next cut builds the published commit {short} ({e})"),
+        Err(e) => format!("next cut releases the published commit {short} ({e})"),
     }
 }
 
@@ -1051,7 +1050,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
             step(
                 "cut",
                 &format!(
-                    "IN PROGRESS: v{} (build {}) {} — `{} --resume`",
+                    "IN PROGRESS: v{} (build {}) {} — `{}`",
                     j.version,
                     j.build_number,
                     j.position(),
@@ -1488,7 +1487,7 @@ fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::Cu
 }
 
 /// Yank's local gates, before anything remote: a clean checkout whose own cutter
-/// this is (`identity` — [`gates::current_cutter_identity_gate`] in production),
+/// this is (`identity` — [`gates::current_own_cutter_gate`] in production),
 /// bound to the origin its Cargo.toml names. Cleanup-only yank resumes can mutate
 /// tags and releases without calling the fresh-cut ladder, so they need these too.
 ///
@@ -1519,7 +1518,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     yank_local_gates(
         &git,
         &origin_slug_of(repo)?,
-        &gates::current_cutter_identity_gate,
+        &gates::current_own_cutter_gate,
     )?;
     let _cred = publish::ChannelCred::enter();
     // Keep the release object + manifest discoverable after tag-first cleanup;
@@ -1564,7 +1563,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
         && !j.finished()
     {
         return Err(Error::new(format!(
-            "an unfinished cut is journaled: v{} (build {}) — finish it (`{cut} --resume`) or \
+            "an unfinished cut is journaled: v{} (build {}) — finish it (`{cut}`) or \
              discard it (`{cut} --abandon v{}`) before yanking; nothing was deleted",
             j.version,
             j.build_number,
@@ -1678,7 +1677,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     Ok(())
 }
 
-/// `tools/cut-launch.sh --abandon vX.Y.Z` (spec §5): withdraw what this unfinished cut
+/// `targo --unverified ship release --abandon vX.Y.Z` (spec §5): withdraw what this unfinished cut
 /// put on the channel ([`publish::withdraw_unpublished_release`]: its own draft
 /// deleted, or exactly its uploads taken back off the engine's source release, which
 /// stays), delete the tag the cut minted on origin, release the lease and the fence,
@@ -1714,15 +1713,10 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     }
     let git = ledger::GitCli::new(repo);
     publish::assert_origin_repo_binding(&git, &origin_slug_of(repo)?)?;
-    // The cutter that withdraws a cut is its claim commit's own, as for `--resume` and
+    // The cutter that withdraws a cut is its claim's own, as for `--resume` and
     // `recover`: the rules a withdrawal follows are the rules its journal was written
-    // under, whatever format that is.
-    let tree = publish::place_claim_tree(&git, repo, &header)?;
-    if publish::run_as_the_trees_cutter(&tree, &header.commit, publish::abandon_args(version))?
-        == publish::Cutter::HandedOff
-    {
-        return Ok(());
-    }
+    // under (`ship release` is that cutter, from the release's clone).
+    gates::own_cutter_gate(&git, &header.commit, false)?;
     let journal = publish::Journal::load(&journal_path)?.ok_or_else(|| {
         Error::new(format!(
             "{} vanished while abandoning",
@@ -1738,7 +1732,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     if release_state(&slug, &tag)? == ReleaseState::Published {
         return Err(Error::new(format!(
             "{tag} is the channel's PUBLISHED app release — this cut's head PATCH landed, so \
-             it is finished, not abandoned: `{} --resume` re-sends only that PATCH, proves \
+             it is finished, not abandoned: `{}` re-sends only that PATCH, proves \
              what a stranger sees and completes the journal (a bad build is then retired \
              with `{} yank <build> --release-credentials <profile.toml> --mac-only|--linux-artifacts \
              DIRECTORY`)",
@@ -1932,7 +1926,7 @@ mod tests {
             cut.release_credentials.as_deref(),
             Some(Path::new("/keys/m3.toml"))
         );
-        assert!(!cut.dry_run && !cut.resume && !cut.gate && !cut.arm64_only);
+        assert!(!cut.dry_run && !cut.resume);
         assert!(cut.rehearse.is_none());
 
         // A flagless yank asks for the plain real cut, so an unarmed tree (and every
@@ -1946,12 +1940,10 @@ mod tests {
         );
     }
 
-    /// When the successor is handed to the published commit's own cutter, that
-    /// cutter is asked for a CUT carrying the yank's floor, signing inputs and
-    /// Linux declaration — the handed-over argv parses back to exactly the
-    /// successor's options.
+    /// The successor a yank cuts carries the yank's floor, signing inputs and Linux
+    /// declaration — never the yank itself.
     #[test]
-    fn a_handed_off_successor_is_a_cut_with_the_yanks_options_never_a_yank() {
+    fn a_yanks_successor_is_a_cut_with_the_yanks_options() {
         let successor = successor_cut_options(
             1_783_918_102,
             &YankOptions {
@@ -1966,30 +1958,13 @@ mod tests {
             successor.linux_artifacts.as_deref(),
             Some(Path::new("/handoff"))
         );
+        assert_eq!(successor.min_build, Some(1_783_918_102));
         // A Mac-only yank forwards that too: its successor is Mac-only on purpose.
         let mac_only = YankOptions {
             mac_only: true,
             ..Default::default()
         };
         assert!(successor_cut_options(7, &mac_only).mac_only);
-        let argv: Vec<String> = publish::cut_args(&successor)
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
-        match crate::cli::parse_handed_off(&argv).unwrap() {
-            crate::cli::Cmd::Cut {
-                opts,
-                abandon: None,
-            } => assert_eq!(opts, successor),
-            other => panic!("{argv:?} parsed as {other:?}"),
-        }
-        // NEGATIVE CONTROL: the process's own argv — what the first handoff
-        // re-ran — is the YANK, which would start the whole yank over.
-        let process_argv = ["yank", "1783918101", "--mac-only"].map(String::from);
-        assert!(matches!(
-            crate::cli::parse(&process_argv).unwrap(),
-            crate::cli::Cmd::Yank { .. }
-        ));
     }
 }
 
@@ -2059,7 +2034,7 @@ mod yank_local_gate_tests {
 
 #[cfg(test)]
 mod next_cut_tests {
-    //! `ship status` names what the next cut builds — the published commit and the
+    //! `ship status` names what the next cut releases — the published commit and the
     //! version it declares — since a cut does not build the checkout.
 
     use super::*;
@@ -2098,7 +2073,7 @@ mod next_cut_tests {
         let line = next_cut_line(&root, Ok(source), "0.93.0");
         assert!(line.contains(&published[..12]), "{line}");
         assert!(line.contains("(v0.92.0, verified"), "{line}");
-        // NEGATIVE CONTROL: the checkout's own version is not what the cut builds.
+        // NEGATIVE CONTROL: the checkout's own version is not what the cut releases.
         assert!(!line.contains("0.93"), "{line}");
 
         let unread = next_cut_line(&root, Err(Error::new("no ledger here")), "0.93.0");

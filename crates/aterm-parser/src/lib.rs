@@ -17,21 +17,14 @@
 //! ## Verification
 //!
 //! - TLA+ spec: `tla/Parser.tla`
-//! - Kani proofs: see `proofs.rs` + `proofs_utf8.rs`, including:
-//!   - Core invariants: `parser_never_panics`, `params_bounded`, `intermediates_bounded`,
-//!     `state_always_valid`, `printable_slice_is_valid_utf8`.
-//!   - Parameter safety: `param_accumulation_saturates`, `param_finalize_bounded`,
-//!     `param_many_digits_safe`, `param_semicolon_safe`.
-//!   - Transition/termination safety: `state_transitions_all_valid`, `state_transitions_sequential_valid`,
-//!     `c1_controls_valid_transitions_when_enabled`, `c1_controls_no_state_change_when_disabled`,
-//!     `escape_sequence_terminates`, `csi_sequence_terminates`, `osc_sequence_terminates`,
-//!     `dcs_sequence_terminates`, `cancel_returns_to_ground`, `utf8_continuation_safe`,
-//!     `utf8_malformed_sequences_preserve_decoder_invariants`, `transition_table_lookup_safe`.
-//!   - SIMD safety: `simd_avx2_offset_no_overflow`, `simd_neon_offset_no_overflow`,
-//!     `simd_scalar_fallback_range_valid` (models of the chunk-loop shape),
-//!     `simd_scalar_predicate_equivalence`, `simd_avx2_bias_correct`.
-//!   - Seamless-update carry: `restore_carry_yields_valid_state` (every carry
-//!     `restore_carry` accepts keeps the TypeInvariant; a refusal installs nothing).
+//! - Exhaustive tests (`src/tests/`): representative states at every bound
+//!   (each state, each bound the invariant names, every UTF-8 lead and each
+//!   Table 3-7 row's pending prefixes) x every two-byte tail x both C1 modes
+//!   x both advance paths keep the TypeInvariant
+//!   (`tests::invariants::every_state_every_byte_keeps_the_type_invariant`); every
+//!   introducer terminates; parameter accumulation saturates and finalizing
+//!   clamps; every carry `restore_carry` accepts keeps the invariant through
+//!   one more byte, and a refusal installs nothing.
 //! - Fuzz target: `fuzz/fuzz_targets/parser.rs`
 //!
 //! ## Performance
@@ -62,16 +55,12 @@
 //!    and one action dispatch. No action re-processes previous input.
 //!
 //! 4. **Bounds enforcement**: All buffer operations check capacity before
-//!    insertion, preventing unbounded growth. See Kani proof `params_bounded`.
+//!    insertion, preventing unbounded growth.
 //!
 //! Throughput floors live in the `aterm-bench` harnesses (`xtask perf`).
 
 #![deny(missing_docs, clippy::all, clippy::pedantic)]
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
-#![allow(
-    unexpected_cfgs,
-    reason = "required for #[cfg(kani)] formal verification"
-)]
 #![allow(
     clippy::must_use_candidate,
     reason = "not all functions need #[must_use]"
@@ -325,39 +314,13 @@ impl Parser {
         }
     }
 
-    /// Create a parser optimized for Kani verification.
-    ///
-    /// Avoids pre-allocation in `osc_data` to reduce CBMC state space.
-    #[cfg(kani)]
-    #[must_use]
-    pub fn kani_stub() -> Self {
-        Self {
-            state: State::Ground,
-            params: ArrayVec::new_const(),
-            intermediates: ArrayVec::new_const(),
-            osc_data: Vec::new(),
-            osc_discard: false,
-            current_param: 0,
-            param_started: false,
-            dcs_active: false,
-            apc_active: false,
-            utf8_buffer: [0; 4],
-            utf8_len: 0,
-            utf8_expected: 0,
-            string_utf8: utf8::Utf8Prefix::NONE,
-            subparam_mask: 0,
-            last_was_colon: false,
-            c1_controls_enabled: false,
-        }
-    }
-
     /// Create a new parser with C1 control code interpretation enabled.
     ///
     /// This constructor enables 8-bit C1 control code interpretation (0x80-0x9F).
     /// Only use this for legacy applications that require C1 support. For modern
     /// UTF-8 terminals, use [`Parser::new()`] which disables C1 by default.
     #[must_use]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn with_c1_controls() -> Self {
         let mut parser = Self::new();
         parser.c1_controls_enabled = true;
@@ -389,9 +352,5 @@ impl Parser {
     }
 }
 
-// External test and proof modules
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod proofs;

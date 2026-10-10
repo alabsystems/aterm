@@ -45,7 +45,7 @@
 //! marker's directory itself, [`configured_marker`]), a [`ANCESTOR_RECHECK`]
 //! look at its path: a vnode watch on an outer
 //! ancestor need not report what a burst of nested `mkdir`s creates under
-//! it (m3, 2026-09-24: a lost ancestor wake held a first install until the
+//! it (a lost ancestor wake once held a first install until the
 //! fallback). Off macOS there is no directory watch, and the fallback IS the
 //! wake: a KNOWN POLL, every fallback period, cut short by the trigger. A
 //! side marker is looked at on that poll and told ONLY WHEN IT IS ANOTHER FILE
@@ -419,8 +419,9 @@ impl SidePoll {
 }
 
 /// Wait at most `limit` for `pid` to exit: `true` once it has (at once when
-/// it already has), `false` when it still runs at the end. A push on macOS
-/// (`EVFILT_PROC`/`NOTE_EXIT`); elsewhere `kill(pid, 0)` every 250 ms.
+/// it already has — a zombie its parent has not reaped yet included), `false`
+/// when it still runs at the end. A push on macOS (`EVFILT_PROC`/`NOTE_EXIT`);
+/// elsewhere `kill(pid, 0)` every 250 ms.
 #[must_use]
 pub fn wait_exit(pid: u32, limit: Duration) -> bool {
     let gone = || !super::upgrade_drive::alive(pid);
@@ -447,8 +448,16 @@ pub fn wait_exit(pid: u32, limit: Duration) -> bool {
             )
         };
         if rc < 0 {
-            // ESRCH: nothing by that pid to watch — it has exited.
-            return gone();
+            // ESRCH: nothing by that pid the kernel will watch — it has
+            // exited, reaped or NOT: a zombie (ended, its parent yet to reap
+            // it) is refused too, while `kill(pid, 0)` still finds it. Asked
+            // of `gone` alone, a zombie read as still running at once, with
+            // no wait: the restart's escalation took a program that heard
+            // its SIGTERM for one that outlived the deadline, and the
+            // upgrade's relaunch said `wait:exiting` for an agent that had
+            // ended.
+            let esrch = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            return esrch || gone();
         }
         // Registered, then read again: an exit in the gap is queued or seen.
         if gone() {
@@ -1067,7 +1076,7 @@ mod tests {
     /// waited for until the limit, and reads as not exited.
     #[test]
     fn an_exit_is_seen_as_it_happens() {
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("0.3")
             .spawn()
             .unwrap();
@@ -1078,7 +1087,7 @@ mod tests {
         assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
         reaper.join().unwrap().unwrap();
         assert!(wait_exit(pid, FALLBACK), "already gone");
-        let mut runs = std::process::Command::new("/bin/sleep")
+        let mut runs = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
@@ -1088,6 +1097,44 @@ mod tests {
         runs.kill().unwrap();
         runs.wait().unwrap();
     }
+
+    /// A ZOMBIE HAS EXITED: a process that ended and that its parent has not
+    /// reaped yet (an agent's shell slow to reap it) is refused by
+    /// `EVFILT_PROC` (`ESRCH`) while `kill(pid, 0)` still finds it, and
+    /// [`wait_exit`] says it exited, at once. FAILS WITHOUT IT: read by
+    /// `kill(pid, 0)` alone it still ran, and no wait was made at all — the
+    /// restart's escalation said "still running at the act's deadline" of a
+    /// program that had heard its SIGTERM (3 of 30 runs of aterm-gui's
+    /// `-- restart` six at a time on a loaded machine).
+    #[test]
+    fn a_zombie_has_exited() {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Until it has exited, left unreaped (`WNOWAIT`): a zombie.
+        loop {
+            // SAFETY: a zeroed out-parameter `waitid` fills, for our own child.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: as above; `WNOWAIT` leaves the child to `child.wait`.
+            let rc =
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            let err = std::io::Error::last_os_error();
+            if rc == 0 {
+                break;
+            }
+            assert_eq!(err.raw_os_error(), Some(libc::EINTR), "waitid: {err}");
+        }
+        assert!(
+            super::super::upgrade_drive::alive(pid),
+            "kill(pid, 0) still finds a zombie"
+        );
+        let started = Instant::now();
+        assert!(wait_exit(pid, FALLBACK), "a zombie has exited");
+        assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
+        child.wait().unwrap();
+    }
+
     /// Where the package prefix exists but no atpkg pass has made the notice
     /// directory, the host makes it, so the watch sits on it and no recheck
     /// runs. Negative control: with no prefix at all nothing is made, and the

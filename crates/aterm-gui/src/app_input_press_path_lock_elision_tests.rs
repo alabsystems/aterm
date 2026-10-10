@@ -14,6 +14,7 @@ fn press(ch: char) -> InputEvent {
         key: Key::Character(ch),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     }
 }
@@ -185,6 +186,7 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
                     key: Key::Named(NamedKey::Enter),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -233,6 +235,7 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
                     key: Key::Character(ch),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -248,6 +251,7 @@ fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
                 key: Key::Named(NamedKey::Enter),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             Source::Human
@@ -342,6 +346,7 @@ fn only_a_plain_tab_arms_the_delivered_insert_stamp() {
         key: Key::Named(NamedKey::Tab),
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     assert_eq!(
@@ -445,6 +450,7 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
                     key: Key::Character(ch),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -459,6 +465,7 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
                 key: Key::Named(NamedKey::Tab),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             Source::Human
@@ -513,6 +520,7 @@ fn tab_arms_a_user_gesture_and_keeps_banked_stamps() {
                 key: Key::Named(NamedKey::Tab),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             Source::Human
@@ -581,6 +589,7 @@ fn a_ctrl_v_press_arms_an_insert_and_keeps_banked_stamps() {
                     key,
                     mods,
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -735,6 +744,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         key,
         mods,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let seam = |key: NamedKey| Via::Seam(press(Key::Named(key), Modifiers::empty()));
@@ -967,6 +977,7 @@ fn a_tab_or_ctrl_v_arms_an_insert_under_rainbow_kitty_only() {
                     key,
                     mods,
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -1042,6 +1053,7 @@ fn an_ime_commit_keeps_in_flight_typed_stamps() {
                     key: Key::Character(ch),
                     mods: Modifiers::empty(),
                     base_layout: None,
+                    layout_text: None,
                     event_type: KeyEventType::Press,
                 },
                 Source::Human
@@ -1249,8 +1261,10 @@ fn unmapped_mac_keys_skip_hid_while_mapped_keys_keep_legacy_and_kitty_parity() {
     app.on_key(wid, unmapped());
     assert!(drain(pipe).is_empty());
     assert_eq!(READS.load(Ordering::Relaxed), 0);
+    // Caps Lock (the HID read) capitalizes the letter: xterm applies Lock,
+    // kitty and Terminal.app send the OS's 'A'. It used to type 'a'.
     app.on_key(wid, character_event('a', ElementState::Pressed));
-    assert_eq!(drain(pipe), b"a");
+    assert_eq!(drain(pipe), b"A");
     app.on_key(wid, arrow(ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[A");
     assert_eq!(READS.load(Ordering::Relaxed), 2);
@@ -1764,6 +1778,7 @@ fn legacy_release_is_byte_silent_and_skips_the_seam() {
         Key::Character('a'),
         Modifiers::empty(),
         None,
+        None,
     );
     app.release_physical_press(wid, physical);
     assert_eq!(
@@ -1805,6 +1820,7 @@ fn kitty_event_type_release_still_reports() {
             key: Key::Character('a'),
             mods: Modifiers::CTRL,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         Source::Human,
@@ -1822,6 +1838,7 @@ fn kitty_event_type_release_still_reports() {
         false,
         Key::Character('a'),
         Modifiers::CTRL,
+        None,
         None,
     );
     app.release_physical_press(wid, physical);
@@ -1946,6 +1963,7 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
             key: Key::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         Source::Human,
@@ -1964,6 +1982,7 @@ fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
             key: Key::Character('a'),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Repeat,
         },
         Source::Human,
@@ -2014,6 +2033,7 @@ fn an_inert_press_to_a_hidden_session_takes_the_terminal_lock_once() {
         key: EngineKey::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
         mods: Modifiers::SHIFT,
         base_layout: None,
+        layout_text: None,
         event_type: KeyEventType::Press,
     };
     let acq = crate::term_lock_acquisitions_on_this_thread;
@@ -2057,6 +2077,7 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         key: EngineKey::Character('j'),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type,
     };
 
@@ -2089,6 +2110,7 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
             key: EngineKey::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
             mods: Modifiers::SHIFT,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         },
         crate::app_input::PressPhase::Initial,

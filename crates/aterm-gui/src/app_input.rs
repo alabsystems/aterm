@@ -2750,18 +2750,22 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     let folded = ev.keypad_folded();
     let ev = folded.as_ref().unwrap_or(ev);
     let predict_candidate: Option<(Option<char>, bool)> = match ev {
-        InputEvent::Key { key, mods, .. }
-            if !mods.contains(TMods::CTRL)
-                && !mods.contains(TMods::ALT)
-                && !mods.contains(TMods::SUPER) =>
+        InputEvent::Key {
+            key,
+            mods,
+            layout_text,
+            ..
+        } if !mods.contains(TMods::CTRL)
+            && !mods.contains(TMods::ALT)
+            && !mods.contains(TMods::SUPER) =>
         {
             match key {
-                // Predict the shifted glyph the encoder sends and the shell echoes:
-                // `Key::Character` holds the unshifted base, so 'h'+Shift predicts 'H'.
-                TKey::Character(c) => Some((
-                    Some(aterm_types::keyboard::shifted_character(*c, *mods).unwrap_or(*c)),
-                    false,
-                )),
+                // Predict the glyph the encoder sends and the shell echoes:
+                // `Key::Character` holds the unshifted base, so 'h'+Shift predicts
+                // 'H', and German Shift+2 the layout's '"'.
+                TKey::Character(c) => {
+                    Some((Some(input::typed_glyph(*c, *mods, *layout_text)), false))
+                }
                 TKey::Named(TNamed::Space) => Some((Some(' '), false)),
                 TKey::Named(TNamed::Backspace) => Some((None, true)),
                 _ => None,
@@ -2895,15 +2899,20 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     let mut brk = false;
     let mut glyph_shifted = false;
     match ev {
-        InputEvent::Key { key, mods, .. } => {
+        InputEvent::Key {
+            key,
+            mods,
+            layout_text,
+            ..
+        } => {
             let chorded = mods.contains(TMods::CTRL)
                 || mods.contains(TMods::ALT)
                 || mods.contains(TMods::SUPER);
             match key {
                 TKey::Character(c) if !chorded => {
-                    // The shifted glyph the encoder sends (`Key::Character` holds the
+                    // The glyph the encoder sends (`Key::Character` holds the
                     // base); the detector folds case, so KITTY still counts.
-                    typed = Some(aterm_types::keyboard::shifted_character(*c, *mods).unwrap_or(*c));
+                    typed = Some(input::typed_glyph(*c, *mods, *layout_text));
                     // …and the SOUND'S witness, from the same
                     // snapshot that picked that glyph.
                     glyph_shifted = mods.contains(TMods::SHIFT);
@@ -3074,13 +3083,14 @@ pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
 /// committed text. `None` for a key that delivers nothing. Built once per press by
 /// `on_key`, classified by [`press_fence`] and sent by the dispatch.
 fn physical_press(ev: &KeyEvent, mods: ModifiersState) -> Option<InputEvent> {
-    if let Some((key, mods, base_layout)) =
+    if let Some((key, mods, base_layout, layout_text)) =
         keymap::build_key_input(ev, keymap::modifiers_from_winit(mods))
     {
         return Some(InputEvent::Key {
             key,
             mods,
             base_layout,
+            layout_text,
             event_type: aterm_types::keyboard::KeyEventType::Press,
         });
     }
@@ -3723,7 +3733,7 @@ impl App {
     ///
     /// Bytes come from the source-blind [`input::seam_egress_receipt`], the only
     /// byte-producing reader of `keyboard_mode()` / `mouse_tracking_enabled()` and the
-    /// only caller of `encode_key_with_layout`, the `encode_mouse_*` family,
+    /// only caller of `encode_key_with_text`, the `encode_mouse_*` family,
     /// `encode_committed_text`, `format_paste` and the focus-report egress. It reads
     /// the relevant mode once per event under one `term_lock` and ends at
     /// `self.sink.write_frame`. (The predictive-echo gate's
@@ -4397,9 +4407,12 @@ impl App {
     }
 
     /// Routes an input event through the full convergence seam, pinning its terminal
-    /// to `target_session`. Used only for a physical key hold whose press established
-    /// session ownership, so focus or tab changes cannot retarget later repeats. `None`
-    /// is the ordinary path, resolving the current front terminal.
+    /// to `target_session`. Used for a physical key hold whose press established
+    /// session ownership, so focus or tab changes cannot retarget later repeats, and
+    /// for a pointer event addressed to a visible pane other than the front: the pane
+    /// under the pointer, or the session a held button's press went to
+    /// (`App::pointer_route`, `App::owner_route`). `None` is the ordinary
+    /// path, resolving the current front terminal.
     ///
     /// A resize entry point for the ledger (`site=input`; the control `resize` verb
     /// arrives as `InputEvent::Resize`). Only this shim is `#[track_caller]`, so a
@@ -4606,11 +4619,26 @@ impl App {
         // the press-time window identity. If no view fronts the session, the
         // hidden-session seam routes the bytes without arming blink, cat, trail or
         // predictor state elsewhere.
+        let pointer = matches!(
+            ev,
+            InputEvent::MouseButton { .. }
+                | InputEvent::MouseMove { .. }
+                | InputEvent::Wheel { .. }
+        );
         let wid = if let Some(target) = target_session {
+            // A pointer event is presented by any visible pane of `wid` that shows
+            // the session, not only the focused one: the pointer addresses the pane
+            // under it (`App::pointer_route`), or the pane a held button's
+            // press went to. Keyboard payloads keep the front-only rule, because
+            // their presentation side effects (blink, cat, trail, predictor) belong
+            // to the window's front terminal.
             let presented = self
                 .front_terminal(wid)
                 .filter(|terminal| terminal.session == target)
                 .map(|_| wid)
+                .or_else(|| {
+                    (pointer && self.visible_session_rect(wid, target).is_some()).then_some(wid)
+                })
                 .or_else(|| {
                     self.windows.keys().copied().find(|candidate| {
                         self.front_terminal(*candidate)
@@ -5956,7 +5984,8 @@ impl App {
             }
             // --- Mouse button: tracking-ON report else local gesture (a/b/d/i) -
             ev @ InputEvent::MouseButton { .. } => {
-                self.input_mouse_button(wid, &ev, &term, &modes, &sink)
+                let fronted = self.session_is_front(wid, session);
+                self.input_mouse_button(wid, &ev, &term, &modes, &sink, fronted)
             }
             // --- Mouse motion: tracking-ON report else drag the selection (c) ---
             ev @ InputEvent::MouseMove { .. } => {
@@ -5973,6 +6002,8 @@ impl App {
                 }
                 // A held-button drag with tracking off grows the local selection, in
                 // any mode (a drag the app began tracking mid-gesture settles locally).
+                // Motion during the front's selection is always the front's
+                // (`App::pointer_route`), so this is never another pane's report.
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                     self.clear_move_license(wid);
                     self.drag_selection(wid, row, col);
@@ -5984,13 +6015,17 @@ impl App {
                 // motion (DEC1000, or buttonless DEC1002), so the hover cannot revoke a
                 // key waiting for its echo. Actual reports (accepted, spilled, or queued
                 // for the ordered writer) remain boundaries, as do failed attempts.
-                if receipt.accepted_order().is_some()
-                    || receipt.is_queued()
-                    || !matches!(
-                        receipt.egress,
-                        input::Egress::TrackingOff { .. }
-                            | input::Egress::Reported(input::Delivery::Full)
-                    )
+                // The licence is the FRONT terminal's typed move, so a report to
+                // another visible pane (the pointer over a sibling) leaves it be:
+                // that program's bytes cannot move the front's caret.
+                if self.session_is_front(wid, session)
+                    && (receipt.accepted_order().is_some()
+                        || receipt.is_queued()
+                        || !matches!(
+                            receipt.egress,
+                            input::Egress::TrackingOff { .. }
+                                | input::Egress::Reported(input::Delivery::Full)
+                        ))
                 {
                     self.clear_move_license(wid);
                 }
@@ -6083,7 +6118,8 @@ impl App {
     /// carried data: the human handler ran the MULTI_CLICK_MS streak FSM, while a
     /// controller passes an authoritative count without touching `last_press`.
     /// `block` carries the selection-type intent so the seam never reads `self.mods`.
-    /// Only the left button selects. `ev` must be `InputEvent::MouseButton { .. }`.
+    /// Only the left button selects, and only in the front pane (`fronted`). `ev`
+    /// must be `InputEvent::MouseButton { .. }`.
     fn input_mouse_button(
         &mut self,
         wid: WindowId,
@@ -6091,6 +6127,7 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
+        fronted: bool,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.fx
@@ -6130,8 +6167,11 @@ impl App {
         let receipt = paste_order::report_ordered_or_inline(term, modes, sink, ev);
         note_refused_report(receipt);
         let egress = receipt.egress;
+        // The local gesture belongs to the front pane: a button addressed to another
+        // visible pane whose program does not track the mouse selects nothing.
         if let input::Egress::TrackingOff { .. } = egress
             && button == aterm_types::mouse::MouseButton::Left
+            && fronted
         {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.last_mouse_cell = (row, col);
@@ -6525,6 +6565,20 @@ impl App {
                 }
             }
             return;
+        }
+        // A glide still easing ANOTHER pane's history lands on its own target
+        // before this gesture arms its own: one window holds one glide, and
+        // replacing it would leave that pane stopped wherever its ease had got
+        // to. The wheel follows the pointer from pane to pane
+        // (`App::pointer_route`), so this is a person scrolling one pane and then
+        // the next, not only a focus move.
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.scroll_glide.as_ref())
+            .is_some_and(|st| !Arc::ptr_eq(&st.term, term))
+        {
+            self.settle_scroll_motion_at_target(wid, now);
         }
         let app_interval = self.frame_interval;
         // Chain onto an in-flight glide of the same engine at the same geometry;
@@ -7002,12 +7056,10 @@ impl App {
         // An instant ScrollView jump overrides any in-flight glide tail and wakes the
         // scroll pill. The verb path stays instant: the controller `scroll` reply
         // reports the applied offset, and keybindings share it.
+        // Whole-row, so clear any sub-row frac and elastic bounce left by a prior
+        // gesture — the front pane's; another pane's glide keeps running.
+        self.drop_front_scroll_motion(wid);
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.scroll_glide = None;
-            // Whole-row, so clear any sub-row frac and elastic bounce left by a prior
-            // gesture.
-            ws.overscroll = None;
-            ws.scroll_frac_px = 0;
             ws.scroll_pill.touch(std::time::Instant::now());
         }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -7282,7 +7334,11 @@ impl App {
         else {
             return;
         };
-        let sel_row = i32::from(row) - term_lock(&term).grid().display_offset() as i32;
+        let (sel_row, col) = {
+            let term = term_lock(&term);
+            let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            (sel_row, crate::app_mouse::pointer_char(&term, row, col).0)
+        };
         match click_count {
             2 => self.select_word_click(wid, sel_row, col),
             3 => self.select_line_click(wid, sel_row, col),
@@ -7350,6 +7406,10 @@ impl App {
             project = "aterm_gui::app_input::input_release_pairing_conformance::project"
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the press record is the whole InputEvent::Key identity plus its route"
+    )]
     fn note_forwarded_press_key(
         &mut self,
         wid: WindowId,
@@ -7358,6 +7418,7 @@ impl App {
         key: aterm_types::keyboard::Key,
         mods: aterm_types::keyboard::Modifiers,
         base_layout: Option<char>,
+        layout_text: Option<char>,
     ) {
         if repeat {
             return;
@@ -7375,6 +7436,7 @@ impl App {
                 key,
                 mods,
                 base_layout,
+                layout_text,
             },
         );
     }
@@ -7806,12 +7868,19 @@ impl App {
             key,
             mods,
             base_layout,
+            layout_text,
         }) = self.physical_press_owners.get(&physical_key)
         else {
             return false;
         };
-        let (window, session, key, mods, base_layout) =
-            (*window, *session, key.clone(), *mods, *base_layout);
+        let (window, session, key, mods, base_layout, layout_text) = (
+            *window,
+            *session,
+            key.clone(),
+            *mods,
+            *base_layout,
+            *layout_text,
+        );
         if self.pool.get(session).is_none() {
             return true;
         }
@@ -7824,6 +7893,7 @@ impl App {
                 key,
                 mods,
                 base_layout,
+                layout_text,
                 event_type: aterm_types::keyboard::KeyEventType::Repeat,
             },
             Source::Human,
@@ -7998,6 +8068,7 @@ impl App {
                 key,
                 mut mods,
                 base_layout,
+                layout_text,
             } => {
                 // A modifier's release reports the state it leaves (kitty): its
                 // own bit stays set while the other side is still held (both
@@ -8019,7 +8090,7 @@ impl App {
                 #[cfg(not(test))]
                 let _ = window;
                 // Byte-silent release: without Kitty `REPORT_EVENT_TYPES`,
-                // `encode_key_with_layout` encodes nothing for a release, so the seam
+                // `encode_key_with_text` encodes nothing for a release, so the seam
                 // would take the terminal mutex for nothing. The press published that
                 // answer (`publish_release_relevance`), so a proven-silent release skips
                 // the seam and reports `Delivery::Full`. `None` asks the engine.
@@ -8031,6 +8102,7 @@ impl App {
                     key,
                     mods,
                     base_layout,
+                    layout_text,
                     event_type: aterm_types::keyboard::KeyEventType::Release,
                 };
                 // Keep the seam's per-session ordering: a release seen while a paste
@@ -8170,11 +8242,13 @@ impl App {
         // A native page never emits a Kitty modifier byte, and its reducers
         // ignore Caps/Num Lock, so no IOKit lock-state lookup is made here.
         let km_mods = keymap::modifiers_from_winit(mods);
-        if let Some((key, km_mods, base_layout)) = keymap::build_key_input(ev, km_mods) {
+        if let Some((key, km_mods, base_layout, layout_text)) = keymap::build_key_input(ev, km_mods)
+        {
             let input = InputEvent::Key {
                 key,
                 mods: km_mods,
                 base_layout,
+                layout_text,
                 event_type: aterm_types::keyboard::KeyEventType::Press,
             };
             self.note_local_repeat_press(
@@ -8825,12 +8899,23 @@ impl App {
         // winit resolved non-empty `text`; a bare Alt+arrow or a textless Alt
         // chord still falls through to the encoder. With the default
         // (`option_as_meta = true`) this block is skipped.
+        //
+        // Only PRINTABLE text composes. winit gives the named keys an
+        // approximate text too — "\r", "\x08", "\t", "\x1b" for Enter,
+        // Backspace, Tab and Escape — and through the IME-commit encoder
+        // Option+Backspace wrote a bare BS (^H) and the others lost Option,
+        // or under kitty report-all wrote nothing at all. Those are the
+        // textless Alt chords the paragraph above sends to the encoder. A
+        // control code is never typed text; Space's " " is, so Option+Space
+        // still types the space it always did (not Meta+Space, `ESC SP`, in
+        // the middle of `a | b` for a typist still holding Option from `|`).
         if !self.option_as_meta
             && mods.alt_key()
             && !mods.control_key()
             && !mods.super_key()
             && let Some(text) = &ev.text
             && !text.is_empty()
+            && !text.chars().any(char::is_control)
         {
             self.forward_literal_press(wid, ev.physical_key, InputEvent::Text(text.to_string()));
             return;
@@ -8882,6 +8967,7 @@ impl App {
             key,
             mods: mapped_mods,
             base_layout,
+            layout_text,
             ..
         }) = press
         {
@@ -8899,6 +8985,7 @@ impl App {
                 key.clone(),
                 km_mods,
                 base_layout,
+                layout_text,
             );
             self.input(
                 wid,
@@ -8906,6 +8993,7 @@ impl App {
                     key,
                     mods: km_mods,
                     base_layout,
+                    layout_text,
                     event_type: aterm_types::keyboard::KeyEventType::Press,
                 },
                 Source::Human,
@@ -9547,11 +9635,32 @@ impl App {
     /// every key that reaches it, and this half needs no lock. Arms that end a
     /// press before the seam still call the full `snap_to_bottom`.
     fn cancel_press_scroll_motion(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.scroll_glide = None;
-            ws.overscroll = None;
-            ws.scroll_frac_px = 0;
+        self.drop_front_scroll_motion(wid);
+    }
+
+    /// Drop the window's wheel glide, its sub-row residual and its bounce —
+    /// when they are the FRONT pane's. A glide the wheel started on another,
+    /// unfocused pane (the pointer reaches the pane under it, hunt 8) keeps
+    /// running: a key typed into the focused pane, its snap to live or a
+    /// `ScrollView` jump there must not lose the other pane's scroll.
+    pub(crate) fn drop_front_scroll_motion(&mut self, wid: WindowId) {
+        let front = self
+            .front_terminal(wid)
+            .map(|terminal| terminal.term.clone());
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let elsewhere = ws.scroll_glide.as_ref().is_some_and(|glide| {
+            front
+                .as_ref()
+                .is_none_or(|front| !Arc::ptr_eq(&glide.term, front))
+        });
+        if elsewhere {
+            return;
         }
+        ws.scroll_glide = None;
+        ws.overscroll = None;
+        ws.scroll_frac_px = 0;
     }
 
     /// Repaint after a vi keystroke (the vi-cursor override re-reads the position).
@@ -9715,6 +9824,7 @@ impl App {
             key: TKey::Named(key),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Repeat,
         };
         match &ev.logical_key {
@@ -9862,7 +9972,7 @@ impl App {
     /// Reads the two read-only projections on `Terminal`
     /// (`kitty_reports_functional_keys` / `kitty_report_all_keys`) under one
     /// lock. Never calls an encoder; the seam remains the sole caller of
-    /// `encode_key_with_layout`.
+    /// `encode_key_with_text`.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn front_defers_tab_menu_chord(
         &self,
@@ -10638,8 +10748,8 @@ impl App {
             crate::native_app::AppKind::Settings | crate::native_app::AppKind::Recovery => return,
         };
         // The palette row is already disabled headless (`palette_live`); this
-        // guards any other caller: a `Prohibited` process cannot present the
-        // panel, so the modal would never return.
+        // guards any other caller: a headless process has no application
+        // object to present the panel from, so the modal would never return.
         if self.headless {
             crate::logging::stderr_line!(
                 "aterm-gui: {title} needs a window; a headless instance has no file picker"
@@ -11523,6 +11633,7 @@ mod forwarded_release_handoff_activity_tests {
             TKey::Character('a'),
             Modifiers::empty(),
             None,
+            None,
         );
         let cancelled = arm_pending_overlap(&mut app);
         let epoch = app.update_handoff_activity_epoch;
@@ -11989,6 +12100,7 @@ mod keypad_press_class_tests {
             key: Key::Named(key),
             mods,
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         }
     }
@@ -12027,6 +12139,15 @@ mod keypad_press_class_tests {
         let decimal_ev = press(NamedKey::NumpadDecimal, Modifiers::empty());
         let decimal = classify_press(&decimal_ev);
         assert_eq!(decimal.typed, Some('.'));
+        // Shift picks a keypad level, never the main row's shifted glyph: the
+        // encoder writes '5' for Shift+KP_5 and '=' for Shift+KP_=, so that is
+        // the echo to predict, not the US table's '%' and '+'.
+        let shifted_ev = press(NamedKey::Numpad5, Modifiers::SHIFT);
+        let shifted = classify_press(&shifted_ev);
+        assert_eq!(shifted.typed, Some('5'));
+        assert_eq!(shifted.predict_candidate, Some((Some('5'), false)));
+        let equal_ev = press(NamedKey::NumpadEqual, Modifiers::SHIFT);
+        assert_eq!(classify_press(&equal_ev).typed, Some('='));
     }
 
     /// NumLock off, the keypad is a second navigation block: its arrows and
@@ -12059,6 +12180,7 @@ mod keypad_press_class_tests {
             key: Key::Character('5'),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         };
         assert_eq!(classify_press(&five).typed, Some('5'));
@@ -12138,6 +12260,13 @@ mod keystroke_press_side_effect_tests;
 #[path = "app_input_press_path_lock_elision_tests.rs"]
 mod press_path_lock_elision_tests;
 
+/// The layout's character on a text press (Caps Lock, Shift on a non-US
+/// layout) and Ctrl on a non-Latin one, through the shipping `on_key` — on the
+/// backends whose key is the layout's unshifted key (macOS, X11/Wayland).
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "app_input_layout_text_tests.rs"]
+mod layout_text_tests;
+
 #[cfg(all(test, unix))]
 #[path = "app_input_pet_console_input_tests.rs"]
 mod pet_console_input_tests;
@@ -12161,6 +12290,7 @@ mod predictive_echo_input_gate_tests {
             key: Key::Character(ch),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         }
     }
@@ -12373,6 +12503,7 @@ mod full_kitty_sing_seam_tests {
             key: Key::Character(character),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         }
     }
@@ -12452,12 +12583,14 @@ mod full_kitty_sing_seam_tests {
                 key: Key::Named(NamedKey::Backspace),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             InputEvent::Key {
                 key: Key::Named(NamedKey::Enter),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
         ] {
@@ -12543,6 +12676,7 @@ mod tone_status_tests {
             key: Key::Character(character),
             mods: Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: KeyEventType::Press,
         }
     }
@@ -12755,12 +12889,14 @@ mod person_presence_tests {
                 key: Key::Character('x'),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             InputEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Press,
             },
             InputEvent::Text("typed".into()),
@@ -12855,6 +12991,7 @@ mod person_presence_tests {
                 key: Key::Character('x'),
                 mods: Modifiers::empty(),
                 base_layout: None,
+                layout_text: None,
                 event_type: KeyEventType::Release,
             },
             pointer_move(3),

@@ -85,7 +85,7 @@ impl Me {
             pid,
             started: own_birth().unwrap_or_else(now_secs),
             build: crate::running_build_number(),
-            version: crate::running_version().to_string(),
+            version: crate::build_info::version().to_string(),
         }
     }
 }

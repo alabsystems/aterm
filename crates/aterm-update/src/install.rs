@@ -48,170 +48,6 @@ pub(crate) const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration
 /// bounds only a volume that went away mid-copy.
 const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-// ---------------------------------------------------------------------------
-// Unpacking from a provenance-tracked app.
-//
-// macOS stamps `com.apple.provenance` on every file a tracked process writes, and a
-// process is tracked when its executable carries the tag or its parent is tracked
-// (`crates/atpkg/src/provenance.rs`). This updater writes the successor bundle, so
-// a tracked aterm would hand the tag to every app that replaces it.
-//
-// A job launchd spawns from an untagged executable escapes: launchd is its parent,
-// and `/usr/bin/ditto` is a base-OS binary. So when this process measures itself
-// tracked, the unpacks run as one-shot launchd jobs.
-//
-// The tag on a bundle's root directory alone is enough to make its processes
-// tracked, and a tracked rename tags the directory it moves. So the moves that
-// place the unpacked bundle take their own lane, [`rename_untagged`], which
-// exchanges rather than renames and needs no helper process.
-//
-// The lane does not launder: `ditto` preserves extended attributes (so the
-// resource forks and the codesign seal survive), and the provenance tag is one, so
-// an untracked job copying a tagged tree writes a tagged one (measured). It only
-// does not ADD the tag, so everything upstream of it must already be clean.
-// ---------------------------------------------------------------------------
-
-/// Whether this process is provenance-tracked, measured by writing a probe file into
-/// `scratch` and reading the attribute back, never inferred from the binary's own
-/// attributes (a clean binary under a tracked parent is tracked). `false` when the
-/// probe cannot be written or inspected: a lane that cannot measure must not route
-/// an unpack through machinery it has no evidence it needs. The probe is removed.
-#[cfg(target_os = "macos")]
-fn process_is_tracked(scratch: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    let probe = scratch.join(format!(".provenance-probe-{}", std::process::id()));
-    if std::fs::write(&probe, b"probe\n").is_err() {
-        return false;
-    }
-    let verdict = (|| {
-        let c_path = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
-        // SAFETY: `c_path` is NUL-terminated and outlives both calls; a null buffer with
-        // size 0 is the documented size query; the second call passes `buf`'s own length.
-        let needed = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0, 0) };
-        if needed <= 0 {
-            return Some(false);
-        }
-        let mut buf = vec![0u8; needed as usize];
-        let got = unsafe {
-            libc::listxattr(
-                c_path.as_ptr(),
-                buf.as_mut_ptr().cast::<libc::c_char>(),
-                buf.len(),
-                0,
-            )
-        };
-        if got < 0 {
-            return None;
-        }
-        buf.truncate(got as usize);
-        Some(
-            buf.split(|b| *b == 0)
-                .any(|name| name == b"com.apple.provenance"),
-        )
-    })();
-    let _ = std::fs::remove_file(&probe);
-    verdict.unwrap_or(false)
-}
-
-/// Moves `from` onto `to` without handing the moved directory this process's
-/// `com.apple.provenance` tag.
-///
-/// A tracked process tags every directory it RENAMES, and the tag on a bundle's ROOT
-/// is what makes every process LaunchServices starts from that bundle tracked in turn —
-/// so a tracked updater that renames the successor into place hands the tag to the app
-/// that replaces it, and to every app after that, forever. Unpacking already escapes
-/// through launchd; the moves that place the unpacked bundle did not, and they are the
-/// carrier.
-///
-/// `renamex_np(RENAME_SWAP)` tags neither side, so creating the destination and
-/// exchanging it with the clean payload lands the clean inode at the destination
-/// and leaves the tagged empty directory at the source, where it is dropped. Three
-/// syscalls, no helper process.
-///
-/// It degrades to a plain rename whenever an exchange would change what the
-/// caller's error handling expects:
-///
-/// * `to` already exists: `rename` replaces an empty directory and fails
-///   `ENOTEMPTY` on a full one (`stage_from_zip` creates its extract directory
-///   before the `ditto`, so this is real).
-/// * `from` and `to` are on different volumes: `RENAME_SWAP` is in-volume only, and
-///   three restore paths read an instant `EXDEV` as "the bytes cannot reach the
-///   staging path".
-/// * this process is untracked: a plain rename already lands clean.
-///
-/// The exchange's cost is two crash windows: between create and exchange an empty
-/// directory sits at `to`, and between exchange and drop at `from`. Both occur on
-/// the staging path (`from` is `staged_app` on the main same-volume carrier, `to`
-/// is `staged_app` on all four restores). Most readers verify what they find
-/// ([`Ready::is_publishable`], [`verified_bundle_identity`]) and an empty directory
-/// fails; [`recover_orphaned_prepared_candidate`]'s opening guard asks only for
-/// presence, so it tests [`holds_a_stage`]. Read it before adding another
-/// presence-only check against these paths.
-///
-/// It can only stop a tag being added, never remove one, so every move from unpack
-/// to installed bundle takes this lane.
-fn rename_untagged(from: &Path, to: &Path, scratch: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if exchange_is_needed(from, to, scratch) && exchange_move(from, to).is_ok() {
-        return Ok(());
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = scratch;
-    std::fs::rename(from, to)
-}
-
-/// Whether to exchange: the three conditions from [`rename_untagged`], kept apart
-/// from the mechanism.
-///
-/// The volume test compares the two parent directories: `EXDEV` is a property of
-/// the entries being moved, and [`same_volume`] resolves symlinks, so asking about
-/// `from` would measure what a symlinked source points at. `same_volume` fails
-/// closed on a path it cannot stat, so a missing parent declines the exchange.
-#[cfg(target_os = "macos")]
-fn exchange_is_needed(from: &Path, to: &Path, scratch: &Path) -> bool {
-    let (Some(from_parent), Some(to_parent)) = (from.parent(), to.parent()) else {
-        return false;
-    };
-    std::fs::symlink_metadata(to).is_err()
-        && same_volume(from_parent, to_parent)
-        && process_is_tracked(scratch)
-}
-
-/// The exchange itself: create the destination, swap the two entries, drop the
-/// emptied source. The caller has already decided the exchange applies; kept apart
-/// from [`exchange_is_needed`] so it is testable on hosts where this process is
-/// untracked.
-///
-/// `Err` means nothing moved and nothing was left behind, so the caller can fall
-/// back to a plain rename.
-#[cfg(target_os = "macos")]
-fn exchange_move(from: &Path, to: &Path) -> std::io::Result<()> {
-    // Exclusive create: never adopt a directory that raced into existence, because the
-    // decision above concluded there was nothing at `to` to preserve.
-    std::fs::DirBuilder::new().create(to)?;
-    match rename_swap(from, to) {
-        Ok(()) => {
-            // `from` now holds the empty directory we made and the move has
-            // happened, so this cannot fail the call; log the leftover name.
-            if let Err(error) = std::fs::remove_dir(from) {
-                crate::warn(&format!(
-                    "moved {} to {} but could not drop the emptied \
-                     source name ({error}); it remains an empty directory",
-                    from.display(),
-                    to.display()
-                ));
-            }
-            Ok(())
-        }
-        // Leave the destination exactly as absent as we found it, so the caller's plain
-        // rename produces the error the CALLER's error handling was written against.
-        Err(error) => {
-            let _ = std::fs::remove_dir(to);
-            Err(error)
-        }
-    }
-}
-
 /// Each copy owns a fresh private directory on the destination volume, so a helper
 /// that outlives its deadline can write only here, never into a later attempt, the
 /// published stage, or the fixed rollback path. Unconfirmed attempts keep their
@@ -284,17 +120,16 @@ fn copy_attempt_lapsed(root: &Path) -> bool {
         .is_some_and(|age| age >= STALE_COPY_ATTEMPT_AFTER)
 }
 
-/// Reclaims copy attempts no writer and no caller can still use.
-///
-/// Settled: an explicitly abandoned attempt whose fenced writer published a
-/// terminal status. Completion alone is not enough: a live caller may have finished
-/// copying but not promoted yet.
+/// Reclaims copy attempts no writer and no caller can still use: those past
+/// [`STALE_COPY_ATTEMPT_AFTER`] that their caller gave up or outlived. Completion
+/// alone is never enough: a live caller may have finished copying but not promoted
+/// yet.
 ///
 /// Lapsed: an attempt past [`STALE_COPY_ATTEMPT_AFTER`] that its caller abandoned,
 /// or whose caller is gone ([`copy_owner_gone`]). This covers a caller killed
-/// mid-copy (never marks abandoned) and a launchd copy stopped by `launchctl
-/// remove` (never publishes status); the age stands in for the writer's end. A
-/// live caller's attempt it has not given up is never reclaimed, however old.
+/// mid-copy (never marks abandoned) and a writer not confirmed stopped at its
+/// deadline; the age stands in for the writer's end. A live caller's attempt it has
+/// not given up is never reclaimed, however old.
 ///
 /// The background checker owns this sweep; copy allocation creates only its own
 /// directory and marker.
@@ -340,33 +175,12 @@ pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
         let abandoned = crate::read_ledger_text(&root.join("abandoned")).as_deref() == Some("1\n");
         if copy_attempt_lapsed(&root) && (abandoned || copy_owner_gone(&root)) {
             let _ = std::fs::remove_dir_all(&root);
-            continue;
-        }
-        if !abandoned {
-            continue;
-        }
-        let Some(label) = crate::read_ledger_text(&root.join("launchd.job")) else {
-            continue;
-        };
-        let Some(nonce) = label.strip_prefix("systems.alab.aterm-update.unpack-") else {
-            continue;
-        };
-        if !aterm_codec::hex::is_hex(nonce, 32) {
-            continue;
-        }
-        let status = root.join(format!(".{label}.status"));
-        if !is_non_symlink_dir(&root.join(format!(".{label}.status.once"))) {
-            continue;
-        }
-        if crate::read_ledger_text(&status).is_some_and(|text| text.trim().parse::<u8>().is_ok()) {
-            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }
 
 /// The shipping promotion boundary, shared by DMG extraction, ZIP extraction,
-/// and cross-volume apply. `run` must report success only after the copy exits;
-/// the launchd wrapper additionally fences its own automatic restarts.
+/// and cross-volume apply. `run` must report success only after the copy exits.
 fn copy_into_isolated_destination(
     args: &[std::ffi::OsString],
     what: &str,
@@ -386,9 +200,9 @@ fn copy_into_isolated_destination(
     let result = match completed {
         Err(failure) if failure.writer_stopped => Err(failure.message),
         Err(failure) => {
-            // Even a successful launchctl remove is asynchronous. Keep the
-            // one-shot claim and completion evidence for a future conservative
-            // sweep. A late completion licenses cleanup only, never promotion.
+            // A writer not confirmed stopped may still be copying: keep its
+            // attempt, marked abandoned, for the reaper's lapsed rule. A late
+            // completion licenses cleanup only, never promotion.
             let marker_error = std::fs::write(attempt.root.join("abandoned"), "1\n")
                 .err()
                 .map(|error| format!("; could not mark abandoned copy: {error}"))
@@ -403,228 +217,32 @@ fn copy_into_isolated_destination(
             if !is_non_symlink_dir(&attempt.payload) {
                 Err(format!("{what}: copied payload is not a real directory"))
             } else {
-                rename_untagged(&attempt.payload, destination, &attempt.root)
+                std::fs::rename(&attempt.payload, destination)
                     .map(|()| (status, stderr))
                     .map_err(|error| format!("{what}: promote completed copy: {error}"))
             }
         }
         Ok(completed) => Ok(completed),
     };
-    // A terminal copy owns no live writer. A restarted wrapper cannot recreate
-    // its claim after this never-reused parent disappears (plain mkdir, no -p).
+    // A terminal copy owns no live writer.
     let _ = std::fs::remove_dir_all(&attempt.root);
     result
 }
 
 /// Run `/usr/bin/ditto` into an isolated attempt, bounded by `limit`, then promote
-/// only its completed output. A provenance-tracked process delegates the copy to
-/// launchd so the successor's files do not inherit its provenance tag.
-fn ditto_bounded_clean(
+/// only its completed output.
+fn ditto_bounded(
     args: &[std::ffi::OsString],
     what: &str,
     limit: std::time::Duration,
-    scratch: &Path,
 ) -> Result<(std::process::ExitStatus, String), String> {
-    copy_into_isolated_destination(args, what, |args, attempt_root| {
-        #[cfg(target_os = "macos")]
-        if process_is_tracked(scratch) {
-            return ditto_via_launchd(args, what, limit, attempt_root).map_err(|message| {
-                crate::verify::HelperFailure {
-                    message,
-                    writer_stopped: false,
-                }
-            });
-        }
+    copy_into_isolated_destination(args, what, |args, _| {
         crate::verify::status_bounded_with_stderr_observed(
             aterm_uds::spawnfd::command("/usr/bin/ditto").args(args),
             what,
             limit,
         )
     })
-}
-
-/// The tracked half of [`ditto_bounded_clean`]. Submit, job completion, and
-/// timeout cleanup share one deadline. A short reserve allows bounded removal
-/// after a stuck submit or copy; neither launchctl invocation can wait forever.
-#[cfg(target_os = "macos")]
-fn ditto_via_launchd(
-    args: &[std::ffi::OsString],
-    what: &str,
-    limit: std::time::Duration,
-    scratch: &Path,
-) -> Result<(std::process::ExitStatus, String), String> {
-    ditto_via_launchd_using(args, what, limit, scratch, Path::new("/bin/launchctl"))
-}
-
-#[cfg(target_os = "macos")]
-struct LaunchdCopyBudget {
-    work: std::time::Instant,
-    finish: std::time::Instant,
-}
-
-#[cfg(target_os = "macos")]
-impl LaunchdCopyBudget {
-    fn new(now: std::time::Instant, limit: std::time::Duration) -> Self {
-        let finish = now + limit;
-        let reserve = std::time::Duration::from_secs(2).min(limit / 4);
-        Self {
-            work: finish - reserve,
-            finish,
-        }
-    }
-
-    fn deadline(&self, cleanup: bool) -> std::time::Instant {
-        if cleanup { self.finish } else { self.work }
-    }
-}
-
-// launchctl submit can restart a failed wrapper, including after it published a
-// successful ditto status. The exclusive claim survives that gap: no incarnation
-// may copy twice, and a removed attempt parent cannot be recreated by this claim.
-#[cfg(target_os = "macos")]
-const LAUNCHD_COPY_WRAPPER: &str = r#"st="$1"; lab="$2"; ctl="$3"; shift 3; /bin/mkdir "$st.once" 2>/dev/null || exit 0; "$@"; s=$?; printf '%s
-' "$s" > "$st.tmp" && mv -f "$st.tmp" "$st"; "$ctl" remove "$lab"; exit 0"#;
-
-#[cfg(target_os = "macos")]
-fn ditto_via_launchd_using(
-    args: &[std::ffi::OsString],
-    what: &str,
-    limit: std::time::Duration,
-    scratch: &Path,
-    launchctl: &Path,
-) -> Result<(std::process::ExitStatus, String), String> {
-    use aterm_uds::spawnfd::Stdio;
-    use std::os::unix::process::ExitStatusExt as _;
-    use std::time::{Duration, Instant};
-    let budget = LaunchdCopyBudget::new(Instant::now(), limit);
-    let work_deadline = budget.deadline(false);
-    let nonce = random_nonce().ok_or_else(|| "launchd copy nonce unavailable".to_string())?;
-    let label = format!("systems.alab.aterm-update.unpack-{nonce}");
-    std::fs::write(scratch.join("launchd.job"), &label)
-        .map_err(|error| format!("record launchd copy identity: {error}"))?;
-    let status_file = scratch.join(format!(".{label}.status"));
-    let status_tmp = scratch.join(format!(".{label}.status.tmp"));
-    let err_log = scratch.join(format!(".{label}.err"));
-    aterm_log::info!(
-        "aterm-update: this process is provenance-tracked — running {what} as a launchd job \
-         so the bundle it lays carries no com.apple.provenance"
-    );
-    let run_until = |cmd: &mut aterm_uds::spawnfd::Command, operation: &str, until: Instant| {
-        let remaining = until.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(crate::verify::mark_passing(format!(
-                "{operation}: unpack deadline exhausted"
-            )));
-        }
-        crate::verify::status_bounded_with_stderr(cmd.stdout(Stdio::null()), operation, remaining)
-    };
-    let result = (|| {
-        let (status, stderr) = run_until(
-            aterm_uds::spawnfd::command(launchctl)
-                .arg("submit")
-                .args(["-l", &label])
-                .arg("-e")
-                .arg(&err_log)
-                .arg("--")
-                .arg("/bin/sh")
-                .arg("-c")
-                .arg(LAUNCHD_COPY_WRAPPER)
-                .arg("aterm-update-unpack")
-                .arg(&status_file)
-                .arg(&label)
-                .arg(launchctl)
-                .arg("/usr/bin/ditto")
-                .args(args),
-            &format!("launchctl submit for {what}"),
-            work_deadline,
-        )?;
-        if !status.success() {
-            return Err(ditto_failure(
-                &format!("launchctl submit for {what}"),
-                status,
-                &stderr,
-            ));
-        }
-        loop {
-            let remaining = work_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                // Out of the job budget, like the direct helper's own ceiling: a
-                // passing refusal.
-                return Err(crate::verify::mark_passing(format!(
-                    "{what} did not finish within its {}s launchd job budget; treating as a failure",
-                    limit.as_secs()
-                )));
-            }
-            // The same bounded regular-file reader used for updater ledgers:
-            // a FIFO, oversized file or incomplete publication is not a result.
-            if let Some(text) = crate::read_ledger_text(&status_file) {
-                let code = text
-                    .trim()
-                    .parse::<u8>()
-                    .map_err(|_| format!("{what}: launchd job returned a malformed exit status"))?;
-                let stderr = launchd_stderr_tail(&err_log);
-                // This is the wrapper's shell exit code (signals are 128+n),
-                // not the unavailable raw wait status of launchd's child.
-                return Ok((
-                    std::process::ExitStatus::from_raw(i32::from(code) << 8),
-                    stderr,
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50).min(remaining));
-        }
-    })();
-    let result = match result {
-        Ok(completed) => Ok(completed),
-        Err(error) => {
-            // A timed-out submit may already have created the job. Try removal
-            // even on that path, using only the original budget's remaining time.
-            match run_until(
-                aterm_uds::spawnfd::command(launchctl).args(["remove", &label]),
-                &format!("launchctl remove for {what}"),
-                budget.deadline(true),
-            ) {
-                Ok((status, _)) if status.success() => Err(error),
-                Ok((status, stderr)) => Err(format!(
-                    "{error}; cleanup not confirmed: {}",
-                    ditto_failure("launchctl remove", status, &stderr)
-                )),
-                Err(cleanup) => Err(format!("{error}; cleanup not confirmed: {cleanup}")),
-            }
-        }
-    };
-    if result.is_ok() {
-        for path in [&status_file, &status_tmp, &err_log] {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-    result
-}
-
-/// Match the direct helper's bounded diagnostic tail without loading a job's
-/// entire stderr log. Opening nonblocking and requiring a regular file avoids
-/// mistaking a FIFO for a log and waiting on a writer that may never arrive.
-#[cfg(target_os = "macos")]
-fn launchd_stderr_tail(path: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt;
-    const KEEP: u64 = 512;
-    let read = || -> Option<String> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)
-            .ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        file.seek(SeekFrom::Start(metadata.len().saturating_sub(KEEP)))
-            .ok()?;
-        let mut bytes = Vec::new();
-        file.take(KEEP).read_to_end(&mut bytes).ok()?;
-        Some(String::from_utf8_lossy(&bytes).trim().to_string())
-    };
-    read().unwrap_or_default()
 }
 
 /// Ceiling on one staging unpack (the DMG copy or the zip extract). A release is
@@ -1902,7 +1520,7 @@ fn recover_abandoned_preswap_trial_if_exact(
             let _ = remove_path_no_follow(&fixed);
         } else {
             let _ = remove_path_no_follow(&staging.staged_app);
-            if rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()).is_err() {
+            if std::fs::rename(&fixed, &staging.staged_app).is_err() {
                 // EXDEV (or any restore failure): the bytes cannot reach the
                 // staging path. Retire the publication and reclaim the fixed
                 // candidate so this launch settles at NoUpdate and the next check
@@ -2090,7 +1708,7 @@ fn recover_orphaned_prepared_candidate(
     current_build: u64,
     ready: &Ready,
 ) -> Result<(), String> {
-    if holds_a_stage(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
+    if is_non_symlink_dir(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
         return Ok(());
     }
     // Past this point `ready.toml` advertises bytes that are not at `staged_app`, and
@@ -2118,12 +1736,7 @@ fn recover_orphaned_prepared_candidate(
         staging.retire_published();
         return Ok(());
     }
-    // An empty placeholder can sit at the staging path (the crash cut the guard above
-    // falls through on). Clear it first: `rename_untagged` will not exchange onto an
-    // existing destination, and a plain tracked rename would put the provenance tag
-    // back onto the bundle.
-    let _ = remove_path_no_follow(&staging.staged_app);
-    if let Err(error) = rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()) {
+    if let Err(error) = std::fs::rename(&fixed, &staging.staged_app) {
         // EXDEV on an external-volume install (fixed sits on the install volume,
         // staging under HOME) or any other restore failure: as in the
         // nothing-to-adopt branch, retire the marker, report success and let the
@@ -2166,27 +1779,10 @@ fn is_non_symlink_dir(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
-/// A stage, not merely a directory wearing the stage's name.
-///
-/// [`rename_untagged`] leaves an empty directory at one end of its exchange for two
-/// syscalls, so shape alone cannot separate "a staged bundle is present" from "a
-/// crash cut the move in half". [`recover_orphaned_prepared_candidate`]'s opening
-/// guard is the one reader that asks only whether something is there.
-///
-/// Non-empty, not "has an `Info.plist`": it catches the new state and changes
-/// nothing else. What it lets through is still only a candidate; the code past the
-/// guard verifies it.
-fn holds_a_stage(path: &Path) -> bool {
-    is_non_symlink_dir(path)
-        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
-}
-
 fn recover_prepared_candidate(prepared: &PreparedSwapCandidate, staging: &Staging) {
     if prepared.moved_from_stage {
         let _ = remove_path_no_follow(&staging.staged_app);
-        if let Err(error) =
-            rename_untagged(&prepared.fixed, &staging.staged_app, &staging.staged_dir())
-        {
+        if let Err(error) = std::fs::rename(&prepared.fixed, &staging.staged_app) {
             // A marker without its exact bytes must never survive a failed
             // pre-swap transaction.
             let _ = remove_path_no_follow(&prepared.fixed);
@@ -2217,18 +1813,17 @@ fn prepare_fixed_swap_candidate(
     // copy on the launch path. External-volume installs keep the copy path.
     let moved_from_stage = same_volume(staged, installed);
     if moved_from_stage {
-        rename_untagged(staged, &fixed, &staging.staged_dir())
+        std::fs::rename(staged, &fixed)
             .map_err(|error| format!("move verified stage to fixed swap path: {error}"))?;
     } else {
         // The one slow step here: a large copy between volumes, while the apply lock is
         // held and before the window exists. Bounded so an unplugged or wedged external
         // volume cannot hang the launch and every launch queued on the lock.
         let copy_started = std::time::Instant::now();
-        let (status, stderr) = ditto_bounded_clean(
+        let (status, stderr) = ditto_bounded(
             &[staged.into(), fixed.as_os_str().to_os_string()],
             "ditto to fixed swap path",
             CROSS_VOLUME_COPY_TIMEOUT,
-            staged.parent().unwrap_or(staged),
         )
         .inspect_err(|_| {
             let _ = remove_path_no_follow(&fixed);
@@ -2254,11 +1849,8 @@ fn prepare_fixed_swap_candidate(
         return Err("fixed swap candidate is not on the installed volume".to_string());
     }
     // The candidate's sealed identity. On the same-volume path this is the
-    // identity the CALLER just read, because the move carried the very inode it read it
-    // from — true whether the move was taken as `rename(2)` or as [`rename_untagged`]'s
-    // `RENAME_SWAP` exchange, which exchanges the two directory entries and leaves both
-    // inodes untouched (measured). Same bytes, same
-    // signature, same plist. Re-running the five
+    // identity the CALLER just read, because `rename(2)` moved the very inode it read it
+    // from: same bytes, same signature, same plist. Re-running the five
     // codesign/spctl/PlistBuddy helpers over it would re-answer a question
     // nothing could have changed the answer to — the apply lock is held, the
     // parent is a private directory, and `checked_bundle_exchange` revalidates
@@ -3382,7 +2974,7 @@ fn publish_verified_stage_within(
     // observe "absent", but never an old marker paired with the new bundle.
     let _ = std::fs::remove_file(&staging.ready);
     let _ = std::fs::remove_dir_all(&staging.staged_app);
-    rename_untagged(incoming, &staging.staged_app, &staging.staged_dir())
+    std::fs::rename(incoming, &staging.staged_app)
         .map_err(|error| format!("publish staged bundle: {error}"))?;
 
     // The marker is the commit point and is written last, durably: it is the
@@ -3438,14 +3030,13 @@ pub fn stage_from_dmg(
     refuse_without_room(&staging.staged_dir(), tree_bytes(&src), "the update bundle")?;
     // `ditto` (not `cp -R`) preserves extended attributes + the _CodeSignature
     // layout, so the copied bundle's signature stays valid.
-    let (status, stderr) = ditto_bounded_clean(
+    let (status, stderr) = ditto_bounded(
         &[
             src.as_os_str().to_os_string(),
             incoming.as_os_str().to_os_string(),
         ],
         "ditto",
         STAGE_UNPACK_TIMEOUT,
-        &staging.staged_dir(),
     )
     .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&incoming);
@@ -3904,7 +3495,7 @@ pub fn stage_from_zip(
     std::fs::create_dir_all(&extract).map_err(|e| format!("create zip extract dir: {e}"))?;
     // `ditto -x -k` (not `unzip`) restores extended attributes and the sequestered
     // resource forks, so the extracted bundle's codesign seal stays intact.
-    let (status, stderr) = ditto_bounded_clean(
+    let (status, stderr) = ditto_bounded(
         &[
             "-x".into(),
             "-k".into(),
@@ -3913,7 +3504,6 @@ pub fn stage_from_zip(
         ],
         "ditto zip extract",
         STAGE_UNPACK_TIMEOUT,
-        &staging.staged_dir(),
     )
     .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&extract);
@@ -3953,7 +3543,7 @@ pub fn stage_from_zip(
     // A rename inside `staged/` (same directory, so necessarily the same volume)
     // moves the bundle without re-copying it — nothing is re-materialized, so no
     // extended attribute or signature byte can be lost in transit.
-    if let Err(error) = rename_untagged(&src, &incoming, &staging.staged_dir()) {
+    if let Err(error) = std::fs::rename(&src, &incoming) {
         let _ = std::fs::remove_dir_all(&extract);
         return Err(format!("move extracted bundle into place: {error}"));
     }
@@ -6631,5 +6221,5 @@ mod boot_tests;
 mod tests;
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "install_launchd_copy_tests.rs"]
-mod launchd_copy_tests;
+#[path = "install_copy_tests.rs"]
+mod copy_tests;

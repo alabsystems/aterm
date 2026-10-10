@@ -4,7 +4,7 @@
 // `unsafe_code` is denied across the crate EXCEPT inside `pty_wrap` (Phase 1,
 // #8005). The allowlist is narrowly scoped: `pty_wrap.rs` uses
 // `#![allow(unsafe_code)]` locally for a single `#[repr(transparent)]`
-// pointer reinterpret with a Kani layout-equivalence harness. Every other
+// pointer reinterpret, pinned by its layout-equivalence tests. Every other
 // module keeps `#![deny(unsafe_code)]`.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]

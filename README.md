@@ -485,13 +485,16 @@ harnesses do not, though explicit network commands still do their work.
 Descriptive tab titles use a local summarizer unless you opt into a remote
 provider.
 
-On macOS aterm also changes two settings by default: it turns Universal Control
-off for this Mac, and renames cargo `target` folders under your home to
-`target.noindex` so Spotlight skips them (a `target` symlink or a
-`.cargo/config.toml` line keeps builds working). In `aterm.toml`, `[machine]`
-`universal_control = "leave"` and `spotlight_noindex = false` stop both
-(Settings ▸ Security); `aterm pkg machine` prints the line that turns Universal
-Control back on.
+On macOS aterm also turns Universal Control off for this Mac by default. In
+`aterm.toml`, `[machine]` `universal_control = "leave"` stops it (Settings ▸
+Security); `aterm pkg machine` prints the line that turns it back on.
+
+Code goes in `~/Developer`: `aterm doctor` names the git checkouts under your home
+that are not there, `aterm pkg devroot move --all` moves them a repository at a time
+(refusing any with uncommitted work or a program running in it), and its `spotlight:`
+row measures whether Spotlight skips `~/Developer` — add the folder once in System
+Settings ▸ Spotlight ▸ Search Privacy, the one way Apple documents to keep a folder out
+of the index.
 
 ## Community and license
 

@@ -138,6 +138,10 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // The successor itself still receives it: LaunchServices merges the launching
     // process's environment, and no child shell stands between them.
     "ATERM_DEBUG_DIE_BEFORE_DIAL",
+    // A headless instance that keeps its desk as a window does (aterm-gui
+    // `desk::Desk`, the real-Claude lab's cold restore): a nested aterm's desk
+    // is its own.
+    "ATERM_DEBUG_HEADLESS_RESTORE",
     // RETIRED CREDENTIALS STAY DENIED. Nothing reads these, but the value is a SECRET
     // that an old install.sh told people to export (`launchctl setenv`); that export
     // outlives the knob, and without this entry would reach every program in every
@@ -339,6 +343,7 @@ mod tests {
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
             "ATERM_DEBUG_DIE_BEFORE_DIAL",
+            "ATERM_DEBUG_HEADLESS_RESTORE",
             "ATERM_NUDGE_CLASS",
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");

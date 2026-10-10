@@ -74,8 +74,23 @@ pub enum Script {
     /// The ordinary glyph.
     #[default]
     Normal,
-    /// Subscript: small, its foot on the cell's floor.
-    Sub,
+    /// Subscript: small, its foot on the cell's floor, and moved `nudge`
+    /// [`Script::NUDGES_PER_CELL`]ths of a cell sideways (negative: left).
+    /// A small glyph centred in a full cell stands far from its neighbours;
+    /// the nudge lets a row builder set a line of them at a tighter pitch
+    /// than the grid's, one character still per cell.
+    Sub {
+        /// Sideways offset of the glyph, in [`Script::NUDGES_PER_CELL`]ths
+        /// of a cell.
+        nudge: i8,
+    },
+}
+
+impl Script {
+    /// The steps a cell is divided into for [`Script::Sub`]'s `nudge`: fine
+    /// enough that a nudge rounds by well under a pixel at text sizes, and
+    /// one byte reaches about eight cells either way.
+    pub const NUDGES_PER_CELL: i8 = 16;
 }
 
 /// A single render-ready terminal cell.
@@ -1577,11 +1592,20 @@ impl Terminal {
             self.extract_identity
         };
 
+        // Every row starts in logical order: an identity map per row, kept as
+        // an empty inner Vec so a permuted row's buffer is reused. A row the
+        // scoped arm retains is the identity (it may retain rows only after a
+        // fill that permuted none), so clearing it is exact.
+        for map in &mut scratch.visual_to_logical {
+            map.clear();
+        }
+        scratch.visual_to_logical.resize_with(rows, Vec::new);
+
         // BiDi visual reordering (feature `bidi`): permute each row into visual
         // order for both renderers and the `image` capture (see
-        // `apply_bidi_reorder`). It is mask-aware and reports whether it
-        // permuted anything, so the next refill can require logical order.
-        // Feature-off builds stamp `false`.
+        // `apply_bidi_reorder`), recording each permuted row's map. It is
+        // mask-aware and reports whether it permuted anything, so the next
+        // refill can require logical order. Feature-off builds stamp `false`.
         #[cfg(feature = "bidi")]
         {
             scratch.engine_row_order = if self.apply_bidi_reorder(scratch, refill_mask) {

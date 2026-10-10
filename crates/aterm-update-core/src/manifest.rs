@@ -90,8 +90,9 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// The ZIP asset's file name within the same release, e.g.
-    /// `"aterm-0.10.0-mac.zip"` — a `ditto -c -k --sequesterRsrc --keepParent`
-    /// archive of the very same signed `aterm.app` the DMG carries. Absent ⇒ None
+    /// `"aterm-0.10.0-mac.zip"` — a `ditto -c -k --keepParent` archive, of the bytes
+    /// alone (no extended attributes or forks), of the very same signed `aterm.app`
+    /// the DMG carries. Absent ⇒ None
     /// (a manifest cut before zip staging existed); such a release still updates
     /// through the DMG.
     ///

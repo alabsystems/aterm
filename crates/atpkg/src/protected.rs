@@ -33,10 +33,9 @@
 //! # Which roots
 //!
 //! * the six per-folder services under `$HOME` ([`HOME_FOLDERS`]) — `Documents`,
-//!   `Desktop`, `Downloads`, `Pictures`, `Movies`, `Music` — the same names
-//!   [`crate::noindex`]'s walk prunes and `aterm_containment::sbpl::PRIVATE_SUBDIRS`
-//!   denies (atpkg does not depend on that crate; `noindex`'s test pins the two lists
-//!   to each other, and this module's pins `noindex`'s);
+//!   `Desktop`, `Downloads`, `Pictures`, `Movies`, `Music` — which the developer-root
+//!   survey ([`crate::devroot`]) never opens, and which
+//!   `aterm_containment::sbpl::PRIVATE_SUBDIRS` denies;
 //! * the two file-provider domains under `~/Library` ([`LIBRARY_DOMAINS`]) — iCloud
 //!   Drive (`Mobile Documents`) and every third-party sync provider (`CloudStorage`),
 //!   which prompt as `NSFileProviderDomainUsageDescription` and which the design records
@@ -261,17 +260,5 @@ mod tests {
             &home,
             Path::new("/Users//someone/Library")
         ));
-    }
-
-    /// The six names are the SAME six the home walk prunes. Two lists that could drift
-    /// apart would be two definitions of "protected"; this pins them.
-    #[test]
-    fn the_home_folders_match_the_noindex_walks_prune_list() {
-        for folder in HOME_FOLDERS {
-            assert!(
-                crate::noindex::SKIP_DIRS.contains(folder),
-                "noindex::SKIP_DIRS must prune {folder:?} — the two lists have drifted"
-            );
-        }
     }
 }

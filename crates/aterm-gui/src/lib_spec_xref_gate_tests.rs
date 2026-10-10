@@ -72,9 +72,8 @@ fn report_has_spec_link_failure(report: &str) -> bool {
     })
 }
 
-/// Parse only TrustIr's primary machine-count header. Other `spec-link:` lines
-/// (currently the successful harness-manifest summary) are not headers and must
-/// never make an otherwise honest report look like it has duplicate headers.
+/// Parse only TrustIr's primary machine-count header. Any other `spec-link:` line
+/// is protocol drift, which [`classify_spec_link`] fails closed on.
 fn parse_spec_link_header(line: &str) -> Option<(usize, &str)> {
     let header = line.strip_prefix("spec-link: ")?;
     let (count, path) = header.split_once(" machine(s) in ")?;
@@ -85,33 +84,6 @@ fn parse_spec_link_header(line: &str) -> Option<(usize, &str)> {
 fn parse_canonical_usize(raw: &str) -> Option<usize> {
     let value = raw.parse::<usize>().ok()?;
     (raw == value.to_string()).then_some(value)
-}
-
-fn parse_counted_noun(value: &str, singular: &str, plural: &str) -> Option<usize> {
-    let (count, noun) = value.split_once(' ')?;
-    let count = parse_canonical_usize(count)?;
-    let expected = if count == 1 { singular } else { plural };
-    (noun == expected).then_some(count)
-}
-
-/// Recognize the one auxiliary `spec-link:` success line TrustIr v27 emits when
-/// a required harness manifest was checked. Keep this structural so arbitrary or
-/// malformed `spec-link:` output still fails closed.
-fn is_harness_manifest_summary(line: &str) -> bool {
-    let Some(summary) = line.strip_prefix("spec-link: harness manifest ") else {
-        return false;
-    };
-    let Some((path, counts)) = summary.rsplit_once(" (") else {
-        return false;
-    };
-    if path.is_empty() {
-        return false;
-    }
-    let Some((harness_count, proof_count)) = counts.split_once("), checked ") else {
-        return false;
-    };
-    parse_counted_noun(harness_count, "harness", "harnesses").is_some()
-        && parse_counted_noun(proof_count, "proof binding", "proof bindings").is_some()
 }
 
 /// Parse one complete TrustIr v27 coverage row. This deliberately validates the
@@ -219,29 +191,18 @@ fn classify_spec_link(exit_code: Option<i32>, report: &str) -> Option<SpecLinkDi
     let [status] = statuses.as_slice() else {
         return None;
     };
-    let mut headers = Vec::new();
-    let mut harness_summaries = 0usize;
-    for line in report
+    // Every `spec-link:` line must be the one header: a new or malformed record
+    // must be understood before the gate can consume it; never silently ignore
+    // protocol drift.
+    let headers: Vec<_> = report
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("spec-link:"))
-    {
-        if let Some(header) = parse_spec_link_header(line) {
-            headers.push(header);
-        } else if is_harness_manifest_summary(line) {
-            harness_summaries += 1;
-        } else {
-            // A new or malformed `spec-link:` record must be understood before
-            // the gate can consume it; never silently ignore protocol drift.
-            return None;
-        }
-    }
+        .map(parse_spec_link_header)
+        .collect::<Option<_>>()?;
     let [(header_count, _header_path)] = headers.as_slice() else {
         return None;
     };
-    if harness_summaries > 1 {
-        return None;
-    }
     let coverage = parse_spec_link_coverage(report)?;
     let reasons: Vec<_> = report
         .lines()
@@ -321,22 +282,12 @@ fn report_has_exact_full_coverage(
 
 /// Run `trust-ir spec-link <module>` and return (exit code, stdout+stderr). A
 /// violation-free design-only report exits 1 in TrustIr v27, so callers go through
-/// [`classify_spec_link`]. With `manifest`, also pass `--harness-manifest <m>
-/// --require-manifest` so proof names resolve and missing bindings stay errors.
-fn run_spec_link(
-    trust_ir: &std::path::Path,
-    module: &std::path::Path,
-    manifest: Option<&std::path::Path>,
-) -> (Option<i32>, String) {
+/// [`classify_spec_link`].
+fn run_spec_link(trust_ir: &std::path::Path, module: &std::path::Path) -> (Option<i32>, String) {
     let mut cmd = command(trust_ir);
     // aterm emits the documented v27 TEXT shape (`lower_to_ir`); trust-ir 0.2.0
     // auto-detects the `.trust_ir` extension as BINARY, so pin the format.
     cmd.arg("spec-link").arg("--format").arg("text").arg(module);
-    if let Some(m) = manifest {
-        cmd.arg("--harness-manifest")
-            .arg(m)
-            .arg("--require-manifest");
-    }
     let out = spawn_with_settled_env(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -380,7 +331,6 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
     let design_only = concat!(
         "spec-link: 1 machine(s) in exploratory.trust_ir\n",
         "  machine \"Ring\" [embedded] coverage 1/1 = 100.0% (1 anchored, 0 waived) [design-only]\n",
-        "spec-link: harness manifest /tmp/harness-manifest.json (432 harnesses), checked 8 proof bindings\n",
         "spec-link-status: non-certifying\n",
         "spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n",
     );
@@ -394,38 +344,6 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
         1,
         SpecLinkDisposition::ExplicitDesignOnly
     ));
-    assert_eq!(
-        classify_spec_link(
-            Some(1),
-            &design_only.replace(
-                "/tmp/harness-manifest.json",
-                "/tmp/build (final)/harness-manifest.json"
-            )
-        ),
-        Some(SpecLinkDisposition::ExplicitDesignOnly),
-        "a valid harness-manifest path may itself contain ` (`"
-    );
-    assert_eq!(
-        classify_spec_link(
-            Some(1),
-            &design_only.replace(
-                "/tmp/harness-manifest.json",
-                "/tmp/spec-link failed:/[Ob./harness-manifest.json"
-            )
-        ),
-        Some(SpecLinkDisposition::ExplicitDesignOnly),
-        "failure-marker text inside a harness path is not a diagnostic"
-    );
-    let singular_manifest = design_only.replace(
-        "(432 harnesses), checked 8 proof bindings",
-        "(1 harness), checked 1 proof binding",
-    );
-    assert_eq!(
-        classify_spec_link(Some(1), &singular_manifest),
-        Some(SpecLinkDisposition::ExplicitDesignOnly),
-        "TrustIr uses singular nouns only for an exact count of one"
-    );
-
     let external = certifying.replace(
         "[embedded]",
         "[external(/tmp/spec-link failed:/[Ob./spec ] coverage models/Ring.tla)]",
@@ -489,10 +407,6 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
         format!(
             "{design_only}spec-link: harness manifest /tmp/other.json (1 harness), checked 1 proof binding\n"
         ),
-        design_only.replace("432 harnesses", "1 harnesses"),
-        design_only.replace("432 harnesses", "2 harness"),
-        design_only.replace("8 proof bindings", "1 proof bindings"),
-        design_only.replace("8 proof bindings", "2 proof binding"),
         design_only.replace("[embedded]", "[external()]"),
         design_only.replace("[embedded]", "[external( )]"),
         design_only.replace("[embedded]", "[garbage]"),
@@ -604,9 +518,8 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
         "duplicate machine coverage must fail closed"
     );
 
-    // The live assembled-module shape: every unique machine row plus TrustIr's auxiliary
-    // `spec-link: harness manifest ...` line, which is not a second header and must not
-    // invalidate an honest DesignOnly report.
+    // The live assembled-module shape: every unique machine row must classify as an
+    // honest DesignOnly report.
     let live_modules = registered_modules();
     // This test checks the report SHAPE against the live set, which is built
     // from the registry itself and so cannot stop being representative. What a
@@ -638,10 +551,6 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
              (0 anchored, 0 waived) [design-only]\n"
         ));
     }
-    live_report.push_str(
-        "spec-link: harness manifest /tmp/harness-manifest.json (432 harnesses), \
-         checked 8 proof bindings\n",
-    );
     live_report.push_str("spec-link-status: non-certifying\n");
     for module in &live_modules {
         let description = format!("machine {:?} is explicitly design-only", module.name());
@@ -656,38 +565,6 @@ fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
     );
 }
 
-/// The lane a cargo-like driver needs before `run`, learned by asking it: targo's
-/// `run` exists only in `--unverified`, and the outer test's lane does not propagate to
-/// nested `$CARGO` children. Any other driver (a Trust toolchain's compat `cargo`, which
-/// refuses `--unverified`) names the same lane with one cfg-scoped `--config` that
-/// appends the off-switch to the Trust-lane table: `.cargo/config.toml` carries none
-/// since 2026-10-07, so without it that cargo would verify the whole graph, and a stock
-/// compiler prints no `trust_verify` cfg, so the line is inert there. The manifest
-/// generator is test infrastructure, so the unverified lane is right.
-fn cargo_lane_args(driver: &std::ffi::OsStr) -> &'static [&'static str] {
-    // Asked under the settled environment too: a rustup proxy answering
-    // for a scratch HOME finds no toolchain, and the lane is then wrong.
-    let is_targo = spawn_with_settled_env(
-        command(driver)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .and_then(Child::wait_with_output)
-    .is_ok_and(|out| {
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("targo")
-    });
-    if is_targo {
-        &["--unverified"]
-    } else {
-        &[
-            "--config",
-            "target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]",
-        ]
-    }
-}
-
 /// Spawn `cmd` while no handoff test has the process environment pointed at
 /// its scratch. Those tests point HOME and XDG_RUNTIME_DIR at a scratch dir
 /// while their fixture lives (`seamless::tests::ScratchEnv`), under
@@ -696,8 +573,7 @@ fn cargo_lane_args(driver: &std::ffi::OsStr) -> &'static [&'static str] {
 /// 2026-09-30). A child copies the environment when it is spawned, so the
 /// lock is held for the spawn alone, never the build.
 ///
-/// Every child this gate starts itself goes through here: the driver's
-/// `--version` probe, its `run`s, and `trust-ir spec-link`. A `ty` goes
+/// Every child this gate starts itself goes through here: `trust-ir spec-link`. A `ty` goes
 /// through `aterm_spec::verify::ty_output`, which gives it a HOME of its
 /// own; which `ty` or `trust-ir` runs is the account's store's answer, never
 /// the moved HOME's (`aterm_spec::verify`'s discovery).
@@ -708,120 +584,6 @@ fn spawn_with_settled_env(cmd: &mut Command) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
-fn harness_manifest() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("aterm-gui manifest dir has a workspace-root grandparent")
-        .to_path_buf();
-    // Use the driver running this test (env `CARGO`, else `targo`), not a bare `cargo`
-    // from PATH: a Trust-only machine has none, and an aterm session's reroute stub
-    // refuses it. `cargo_lane_args` asks the driver for its lane.
-    let driver = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
-    // xtask builds in the gate's xtask lane, never the target dir this test
-    // inherited: building there rewrote `serde_derive` and `aterm_spec` under
-    // the doctests compiling beside it (E0460/E0463, measured 2026-10-01).
-    let xtask_target = root.join("target-xtask");
-    let in_tree = spawn_with_settled_env(
-        command(&driver)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", &xtask_target)
-            .args(cargo_lane_args(&driver))
-            .arg("run")
-            .arg("-q")
-            .arg("-p")
-            .arg("xtask")
-            .arg("--")
-            .arg("harness-manifest"),
-    )
-    .and_then(|mut child| child.wait());
-    // A spawn that cannot START is the same verdict as one that exits non-zero:
-    // the in-tree attempt failed, and the neutral-cwd retry decides — carrying
-    // the reason, so the notice never hides a missing binary behind a guess.
-    let in_tree_why = match &in_tree {
-        Ok(status) => format!("{status}"),
-        Err(error) => format!("could not start {}: {error}", driver.to_string_lossy()),
-    };
-    let in_tree_ok = in_tree.ok().filter(std::process::ExitStatus::success);
-    // A nested checkout may inherit an ancestor cargo config whose vendored source
-    // replacement lacks aterm's deps; retry with the same driver from a config-neutral
-    // cwd against the explicit manifest, noting the lane.
-    let status = if let Some(status) = in_tree_ok {
-        status
-    } else {
-        crate::logging::stderr_line!(
-            "spec_xref_closure: in-tree `{} run -p xtask` failed ({in_tree_why}; \
-             host-repo cargo config?) — retrying from a config-neutral cwd via env CARGO",
-            driver.to_string_lossy()
-        );
-        let cargo = driver.clone();
-        let lane = cargo_lane_args(&cargo);
-        // The neutral cwd loses the repo's .cargo/config.toml rustflags (cargo
-        // config discovery is cwd-based, not manifest-based). Under targo that
-        // costs nothing: `--unverified` selects the lane and targo injects the
-        // off-switch itself; a compat `cargo` carries it in `cargo_lane_args`'
-        // `--config`, which needs no config file to append to. RUSTFLAGS is
-        // deliberately NOT assigned here — the stock-cargo branch that appended
-        // `-Ztrust-verify=off` to it (and recognised the retired
-        // `-Zno-trust-verify`) was removed 2026-09-28 with the stock fallback it
-        // served (owner directive: Trust only).
-        // CAPTURED, not inherited: this rung's failure used to panic with a
-        // bare "xtask harness-manifest failed" while the child's one line
-        // saying WHY scrolled past unattributed (or nowhere, under -q) —
-        // the same throw-away-the-reason shape run_spec_link already fixed.
-        let out = spawn_with_settled_env(
-            command(&cargo)
-                .current_dir(std::env::temp_dir())
-                .env("CARGO_TARGET_DIR", &xtask_target)
-                .args(lane)
-                .arg("run")
-                .arg("-q")
-                .arg("--manifest-path")
-                .arg(root.join("Cargo.toml"))
-                .arg("-p")
-                .arg("xtask")
-                .arg("--")
-                .arg("harness-manifest")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .and_then(Child::wait_with_output)
-        .expect("run `targo --unverified run -p xtask -- harness-manifest` (neutral cwd)");
-        if !out.status.success() {
-            // The lane/toolchain env is what decides this spawn's fate (the
-            // silent-exit diagnosis above was made from exactly this dump),
-            // so quote it — minus the CARGO_PKG_* metadata spam, which never
-            // steers anything.
-            let markers: Vec<String> = std::env::vars()
-                .filter(|(k, _)| {
-                    (k.starts_with("TARGO") || k.starts_with("TRUST") || k.starts_with("CARGO"))
-                        && !k.contains("_PKG_")
-                        || k == "RUSTFLAGS"
-                })
-                .map(|(k, v)| format!("  {k}={v}"))
-                .collect();
-            panic!(
-                "xtask harness-manifest failed on BOTH rungs (in-tree driver, then env \
-                 CARGO {cargo:?} from a neutral cwd, exit {:?}). Retry-rung \
-                 stderr:\n{}\nstdout:\n{}\nenv markers:\n{}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr),
-                String::from_utf8_lossy(&out.stdout),
-                markers.join("\n")
-            );
-        }
-        out.status
-    };
-    assert!(status.success(), "xtask harness-manifest failed");
-    let path = root
-        .join("target")
-        .join("trust")
-        .join("harness-manifest.json");
-    assert!(path.exists(), "xtask did not write {path:?}");
-    path
-}
-
 /// The registered `SpecModule` set: every embedded `Model` plus every active external
 /// `.tla` in aterm-spec-models' `specs/`.
 fn registered_modules() -> Vec<SpecModule> {
@@ -829,7 +591,7 @@ fn registered_modules() -> Vec<SpecModule> {
         .into_iter()
         .map(SpecModule::Embedded)
         .collect();
-    let dir = aterm_spec_models::specs_dir();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../aterm-spec-models/specs");
     let mut external = 0usize;
     for entry in std::fs::read_dir(&dir).expect("read aterm-spec-models specs/") {
         let path = entry.expect("dir entry").path();
@@ -1114,8 +876,8 @@ fn spec_xref_closure() {
         aterm_keeper::core::classify_death
             as fn(aterm_keeper::core::DeathEvidence) -> aterm_keeper::core::Verdict,
     ));
-    // Tiered: proofs #1–#3 (anchors, closure, coverage, Tier-1 conformances, verifier
-    // ledger) need no toolchain; conformances escalate to `ty` where installed. Proof #4
+    // Tiered: proofs #1–#3 (anchors, closure, coverage, Tier-1 conformances) need
+    // no toolchain; conformances escalate to `ty` where installed. Proof #4
     // (`spec_xref_strict_vacuity`) and analysis #5 (TrustIr spec-link) need the toolchain
     // and print a notice otherwise.
 
@@ -1216,10 +978,8 @@ fn spec_xref_closure() {
             .join("\n")
     );
 
-    // StreamingSearch is the first embedded machine whose shipping methods
-    // are fully bound in ty while bounded-local Kani harnesses join a subset
-    // of the same actions. Keep the machine itself non-vacuous before
-    // checking the joined verifier rows below.
+    // StreamingSearch's shipping methods are fully bound in ty: keep the
+    // machine itself non-vacuous.
     let streaming = report
         .coverage
         .iter()
@@ -1777,114 +1537,14 @@ fn spec_xref_closure() {
         );
     }
 
-    // Proof #3b: the unified verifier ledger over `ty` and kani. Collect the
-    // `proof_anchor!` kani harnesses (scrollback ring/evict, grid ring, streaming search)
-    // and emit one per-(machine, action) ledger. `check_closure` already verified every
-    // proof anchor's (machine, action) resolves.
-    let proofs: Vec<_> = aterm_spec::xref::proof_anchors().collect();
-    assert!(
-        !proofs.is_empty(),
-        "ZERO proof anchors collected — the cross-crate `inventory` collection of \
-         `proof_anchor!`s (aterm-scrollback / aterm-grid / aterm-search with \
-         `spec-anchors` ON) did not link. The unified verifier ledger would be \
-         vacuously ty-only."
-    );
-    let ledger = aterm_spec::xref::verifier_ledger(&modules);
-    crate::logging::stderr_line!(
-        "spec_xref_closure: UNIFIED VERIFIER LEDGER (Phase 4) — {} proof anchor(s) over the \
-         kani half, {} (machine, action) rows total:",
-        proofs.len(),
-        ledger.len()
-    );
-    // Print ONLY the rows bound to at least one verifier (the rest are unbound
-    // model actions, already reported in the coverage ledger above) so the ledger
-    // reads as the cross-verifier picture, not a wall of `ty=–  kani-anchor=–`.
-    for e in ledger.iter().filter(|e| e.ty || e.kani) {
-        let detail = if e.proofs.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "    [{}]",
-                e.proofs.iter().cloned().collect::<Vec<_>>().join(", ")
-            )
-        };
-        crate::logging::stderr_line!("  {}{}", e.render(), detail);
-    }
-    // Non-vacuity: every collected proof anchor must land on a real ledger row with
-    // `kani` set — i.e. the (machine, action) resolved and the ledger registered it.
-    for p in &proofs {
-        let row = ledger.iter().find(|e| {
-            aterm_spec::xref::machine_matches(p.machine, &e.machine) && e.action == p.action
-        });
-        let row = row.unwrap_or_else(|| {
-            panic!(
-                "proof anchor `{}` -> {}::{} did not resolve to a ledger row (Ob.1/Ob.4 \
-                 should have already failed in Proof #2)",
-                p.proof_name, p.machine, p.action
-            )
-        });
-        assert!(
-            row.kani,
-            "ledger row {}::{} must be kani-anchored (proof `{}` anchors it)",
-            row.machine, row.action, p.proof_name
-        );
-    }
-    // The ledger must show GENUINE cross-verifier coverage in ONE report:
-    // ty-only temporal protocol actions, kani-anchored bounded-local ring actions,
-    // and the intentional StreamingSearch joins where both verifiers are bound to
-    // different obligations attached to the same shipping action.
-    assert!(
-        ledger.iter().any(|e| e.ty),
-        "no ty-discharged (machine, action) in the ledger — the temporal half is empty."
-    );
-    assert!(
-        ledger.iter().any(|e| e.kani && !e.ty),
-        "no kani-only (machine, action) — the bounded-local half (ring/eviction harnesses) \
-         did not register, so the ledger would be ty-only. Ledger:\n{}",
-        ledger
-            .iter()
-            .filter(|e| e.ty || e.kani)
-            .map(|e| e.render())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    for action in [
-        "ScanHit",
-        "ScanMiss",
-        "NextMatch",
-        "Add",
-        "Invalidate",
-        "Cancel",
-    ] {
-        let row = ledger
-            .iter()
-            .find(|e| {
-                aterm_spec::xref::machine_matches("streaming_search", &e.machine)
-                    && e.action == action
-            })
-            .unwrap_or_else(|| panic!("StreamingSearch::{action} missing from ledger"));
-        assert!(
-            row.ty && row.kani,
-            "StreamingSearch::{action} must remain joined across ty and Kani"
-        );
-    }
-    crate::logging::stderr_line!(
-        "spec_xref_closure: ledger non-vacuous — {} row(s) ty+kani-anchor, {} kani-anchor only, \
-         {} ty-only.",
-        ledger.iter().filter(|e| e.ty && e.kani).count(),
-        ledger.iter().filter(|e| e.kani && !e.ty).count(),
-        ledger.iter().filter(|e| e.ty && !e.kani).count(),
-    );
-
     // ---- Proof #4 (non-vacuity / Tier-0 under the armed ty) is its own test,
     // `spec_xref_strict_vacuity` below: it reads nothing the proofs here build,
     // and apart from them it runs beside them rather than after them. ----
 
     // Analysis #5: TrustIr independently analyzes the obligations in design-only mode.
-    // Lower the modules, deduplicated anchors/waivers and proof anchors to v27
-    // `.trust_ir`, generate the harness manifest, run `trust-ir spec-link
-    // --harness-manifest … --require-manifest`, and require no structural, Ob.1/Ob.4,
-    // L1, L2 or S0-S2 violation, every proof name resolved, every active machine at
+    // Lower the modules and deduplicated anchors/waivers to v27 `.trust_ir`, run
+    // `trust-ir spec-link`, and require no structural, Ob.1/Ob.4, L2 or S0-S2
+    // violation, every active machine at
     // 100% (Ob.3 still enforced by the in-Rust closure), and either certifying exit 0 or
     // v27's violation-free design-only result. Design-only is an integrity check, not
     // certification, and the notice says so.
@@ -1893,18 +1553,16 @@ fn spec_xref_closure() {
     ) {
         let fallback_deduplicated =
             aterm_spec::ir::fallback_anchor_deduplication_count(&modules, &refs);
-        let module_txt =
-            aterm_spec::ir::lower_to_ir("aterm_spec_xref", &modules, &refs, &waivers, &proofs);
+        let module_txt = aterm_spec::ir::lower_to_ir("aterm_spec_xref", &modules, &refs, &waivers);
         let lowered = aterm_spec::ir::lowered_machine_names(&modules, &refs);
         crate::logging::stderr_line!(
             "spec_xref_closure: assembled .trust_ir — {} bytes, {} SpecModule block(s), {} \
-             actively-lowered machine(s): {:?}; {} proof line(s) lowered; {} colliding source \
+             actively-lowered machine(s): {:?}; {} colliding source \
              anchor record(s) omitted from TrustIr's unresolved S0 fallback view",
             module_txt.len(),
             modules.len(),
             lowered.len(),
             lowered,
-            proofs.len(),
             fallback_deduplicated,
         );
 
@@ -1913,12 +1571,9 @@ fn spec_xref_closure() {
         let ir_path = ir_dir.join("aterm_spec_xref.trust_ir");
         std::fs::write(&ir_path, &module_txt).expect("write .trust_ir");
 
-        // The harness manifest the L1 resolution needs (generated by the always-run
-        // xtask node — the same generator the build-graph spec-link uses).
-        let manifest = harness_manifest();
-        let (exit_code, report) = run_spec_link(&trust_ir, &ir_path, Some(&manifest));
+        let (exit_code, report) = run_spec_link(&trust_ir, &ir_path);
         crate::logging::stderr_line!(
-            "--- trust-ir spec-link report (REAL assembled module, L1+L2 armed) ---\n{report}"
+            "--- trust-ir spec-link report (REAL assembled module, L2 armed) ---\n{report}"
         );
         let disposition = classify_spec_link(exit_code, &report).unwrap_or_else(|| {
             panic!(
@@ -1936,18 +1591,6 @@ fn spec_xref_closure() {
                 unresolved fallback-identity deduplication"
             );
         }
-        // L1 evidence: the report must show the manifest was consulted and every proof
-        // binding resolved (not silently skipped).
-        let proof_binding = format!(
-            "checked {} proof binding{}",
-            proofs.len(),
-            if proofs.len() == 1 { "" } else { "s" }
-        );
-        assert!(
-            report.contains("harness manifest") && report.contains(&proof_binding),
-            "trust-ir report must show the exact harness manifest/proof binding count for L1 \
-             ({proof_binding:?}); report:\n{report}"
-        );
         // Every actively-lowered machine must appear under its canonical name with
         // its exact declared action count fully covered. This is stricter than merely
         // finding a machine-name substring in a design-only report.
@@ -1974,8 +1617,8 @@ fn spec_xref_closure() {
                 "NOTICE — trust-ir spec-link is VIOLATION-FREE BUT NON-CERTIFYING: every \
                  aterm SpecModule is explicitly design-only (`target none`) because aterm \
                  does not yet own Trust FuncIds/typed projection targets. This external run \
-                 analyzed the emitted fallback-deduplicated structure, coverage reporting, \
-                 and proof names; it did not inspect {fallback_deduplicated} colliding source \
+                 analyzed the emitted fallback-deduplicated structure and coverage \
+                 reporting; it did not inspect {fallback_deduplicated} colliding source \
                  anchor record(s) omitted from that view. The in-Rust full-inventory closure \
                  and Tier-1 conformance remain the authority."
             ),
@@ -2272,7 +1915,6 @@ fn trust_ir_has_teeth() {
         &modules,
         &[&good_anchor, &bogus_anchor],
         &[],
-        &[],
     );
     let bad_path = dir.join("bad.trust_ir");
     std::fs::write(&bad_path, &bad_txt).expect("write bad module");
@@ -2282,7 +1924,7 @@ fn trust_ir_has_teeth() {
         "bogus anchor must be present in the lowered module:\n{bad_txt}"
     );
 
-    let (bad_exit_code, bad_report) = run_spec_link(&trust_ir, &bad_path, None);
+    let (bad_exit_code, bad_report) = run_spec_link(&trust_ir, &bad_path);
     crate::logging::stderr_line!("--- trust-ir spec-link report (BOGUS module) ---\n{bad_report}");
     assert_eq!(
         bad_exit_code,
@@ -2307,11 +1949,10 @@ fn trust_ir_has_teeth() {
     // ---- Positive: drop the bogus anchor -> the same module is violation-free ----
     // Cover the remaining action (Ring has only Push) — already covered by the
     // good anchor, so no waiver needed; the good module is fully bound.
-    let good_txt =
-        aterm_spec::ir::lower_to_ir("aterm_teeth_good", &modules, &[&good_anchor], &[], &[]);
+    let good_txt = aterm_spec::ir::lower_to_ir("aterm_teeth_good", &modules, &[&good_anchor], &[]);
     let good_path = dir.join("good.trust_ir");
     std::fs::write(&good_path, &good_txt).expect("write good module");
-    let (good_exit_code, good_report) = run_spec_link(&trust_ir, &good_path, None);
+    let (good_exit_code, good_report) = run_spec_link(&trust_ir, &good_path);
     crate::logging::stderr_line!(
         "--- trust-ir spec-link report (CONTROL good module) ---\n{good_report}"
     );

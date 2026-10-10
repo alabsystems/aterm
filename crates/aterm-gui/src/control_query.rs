@@ -21,6 +21,7 @@ use aterm_core::search::{
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
 use aterm_search::MAX_SEARCH_MATCHES;
+use aterm_types::text_shaping::AmbiguousWidth;
 use winit::event_loop::EventLoopProxy;
 
 use super::{
@@ -2460,7 +2461,9 @@ pub(crate) enum AbsRow {
 /// a history index relative to the oldest retained line; indices at/above the
 /// scrollback count land on the visible screen. Scrollback lines come from
 /// `get_history_line` (Line text); visible rows from the combining-aware
-/// `get_line_text` so accents / ZWJ clusters survive (FIDELITY I-1).
+/// `written_line_text` so accents / ZWJ clusters survive (FIDELITY I-1). Both
+/// are the row as written, trailing blanks kept, so find answers the same for
+/// a row on the screen and after it scrolls into history.
 pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
     let grid = t.grid();
     let oldest = grid.oldest_absolute_row();
@@ -2481,7 +2484,7 @@ pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
         if visible >= visible_rows {
             return AbsRow::OutOfRange;
         }
-        AbsRow::Text(t.get_line_text(visible as i32, None).unwrap_or_default())
+        AbsRow::Text(t.written_line_text(visible as i32).unwrap_or_default())
     }
 }
 
@@ -2867,20 +2870,27 @@ impl WrapFrame {
 ///
 /// Every row a continuation follows is padded back out to the full `cols`
 /// display columns it occupies on the glass, however few of them hold text. Grid
-/// rows are read TRIMMED (the visible-row reader drops trailing blanks), so
-/// without the padding a run whose head ends in spaces — anything printed
-/// through a left-justified `%-Ns` — would splice its neighbour's first column
-/// onto its last non-blank one, both inventing matches that are not on the glass
-/// and shifting every column after it. With it, the joined line has a UNIFORM
-/// stride: column `c` of the run is row `c / cols`, column `c % cols`, which is
-/// the arithmetic [`WrapFrame::to_physical`] inverts. That uniformity is the
-/// whole contract, so the padding is derived from the ROW COUNT and never from
-/// the accumulated column total.
+/// rows are read as WRITTEN, and the cells past a row's written extent (a tail
+/// the program never wrote or erased, the cell a wide glyph left when it
+/// wrapped early) are not read, so without the padding such a row would splice
+/// its neighbour's first column onto its last written one, both inventing
+/// matches that are not on the glass and shifting every column after it. With
+/// it, the joined line has a UNIFORM stride: column `c` of the run is row
+/// `c / cols`, column `c % cols`, which is the arithmetic
+/// [`WrapFrame::to_physical`] inverts. That uniformity is the whole contract,
+/// so the padding is derived from the ROW COUNT and never from the accumulated
+/// column total. Columns are counted under the terminal's `ambiguous_width`
+/// policy, as the grid drew them.
 ///
 /// Joining also makes the logical line the unit a regex sees, so `^`/`$` bind to
 /// the reader's line rather than to a grid row — the semantics
 /// [`search_full_history_direction`] documents.
-fn join_wrapped_rows(lines: &mut [String], wrapped: &[bool], cols: usize) {
+fn join_wrapped_rows(
+    lines: &mut [String],
+    wrapped: &[bool],
+    cols: usize,
+    ambiguous: AmbiguousWidth,
+) {
     // A zero-column grid lays nothing out; leaving the rows alone keeps every
     // coordinate the caller already has, and there is no boundary to straddle.
     if cols == 0 {
@@ -2901,7 +2911,7 @@ fn join_wrapped_rows(lines: &mut [String], wrapped: &[bool], cols: usize) {
             // per continuation would make joining a long run quadratic in its
             // length, and a `cat` of a file with no newlines is exactly a long
             // run.
-            let mut columns = aterm_search::display_columns(&joined);
+            let mut columns = aterm_search::display_columns_with(&joined, ambiguous);
             // How many columns the run occupies once the rows joined so far are
             // laid out: one grid width per ROW, counted here rather than derived
             // from `columns % cols`. A row whose cells are all blank trims to the
@@ -2918,7 +2928,8 @@ fn join_wrapped_rows(lines: &mut [String], wrapped: &[bool], cols: usize) {
                 joined.extend(std::iter::repeat_n(' ', pad));
                 columns = columns.saturating_add(pad);
                 let continuation = std::mem::take(row);
-                columns = columns.saturating_add(aterm_search::display_columns(&continuation));
+                columns = columns
+                    .saturating_add(aterm_search::display_columns_with(&continuation, ambiguous));
                 joined.push_str(&continuation);
                 occupied = occupied.saturating_add(cols);
             }
@@ -3462,10 +3473,10 @@ fn search_full_history_direction_capped(
     // grid the rows do, so the stride that un-joins a logical line's columns can
     // never belong to a different geometry than the rows that were joined; the
     // anchor is carried into that frame here, where the runs are readable.
-    let wrap = {
+    let (wrap, ambiguous) = {
         let t = term_lock(term);
         let cols = usize::from(t.grid().cols());
-        WrapFrame {
+        let wrap = WrapFrame {
             cols,
             logical_anchor: anchor.and_then(|(row, col)| {
                 let origin =
@@ -3473,7 +3484,10 @@ fn search_full_history_direction_capped(
                 let origin = usize::try_from(origin).unwrap_or(row);
                 Some(WrapFrame::to_logical(cols, origin, row, col))
             }),
-        }
+        };
+        // The `ambiguous_width` policy every column (and every joined run's
+        // padding) is measured under, read with the width it pads to.
+        (wrap, t.ambiguous_width())
     };
 
     // Cache hit: clone the immutable index handle while holding the process-global
@@ -3487,6 +3501,7 @@ fn search_full_history_direction_capped(
         key_epoch,
         absolute_row_revision,
         max_lines,
+        ambiguous,
     );
     if let Some(index) = cached_index {
         // SA-1: the per-keystroke query layer. Literal queries narrow from the
@@ -3554,6 +3569,7 @@ fn search_full_history_direction_capped(
         max_lines,
         retained_base,
         indexed_end,
+        ambiguous,
     );
     let (mut index, snapshot_start) = if let Some((mut index, previous_visible_base)) = reusable {
         // The rows below the new retained floor are gone from the TERMINAL
@@ -3585,7 +3601,8 @@ fn search_full_history_direction_capped(
         )
     } else {
         (
-            TerminalSearch::with_capacity_and_max(retained_total, max_lines),
+            TerminalSearch::with_capacity_and_max(retained_total, max_lines)
+                .with_ambiguous_width(ambiguous),
             retained_base,
         )
     };
@@ -3653,7 +3670,7 @@ fn search_full_history_direction_capped(
     if let Some(first) = wrapped.first_mut() {
         *first = false;
     }
-    join_wrapped_rows(&mut lines, &wrapped, wrap.cols);
+    join_wrapped_rows(&mut lines, &wrapped, wrap.cols, ambiguous);
 
     // Build the index OUTSIDE any lock: line `j` keys at absolute row `oldest + j`, so
     // SearchMatch.line is already an absolute row and the eviction/incomplete semantics
@@ -3774,10 +3791,10 @@ pub(crate) fn search_full_history_point(
     // Same frame as the batch path: the index holds soft-wrapped runs joined, so
     // this walk hands the anchor over in the joined line's columns and hands the
     // hit back in the grid's.
-    let wrap = {
+    let (wrap, ambiguous) = {
         let terminal = term_lock(term);
         let cols = usize::from(terminal.grid().cols());
-        WrapFrame {
+        let wrap = WrapFrame {
             cols,
             logical_anchor: logical_origin(
                 &terminal,
@@ -3788,7 +3805,8 @@ pub(crate) fn search_full_history_point(
                 let origin = usize::try_from(origin).unwrap_or(anchor.0);
                 WrapFrame::to_logical(cols, origin, anchor.0, anchor.1)
             }),
-        }
+        };
+        (wrap, terminal.ambiguous_width())
     };
     let cached_index = cached_search_index(
         term,
@@ -3797,6 +3815,7 @@ pub(crate) fn search_full_history_point(
         key_epoch,
         absolute_row_revision,
         max_lines,
+        ambiguous,
     );
     let Some(index) = cached_index else {
         let full = search_full_history_direction(
@@ -3998,6 +4017,10 @@ fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cache key, field by field, as the snapshot stores it"
+)]
 fn cached_search_index(
     term: &Arc<Mutex<Terminal>>,
     alt_screen: bool,
@@ -4005,6 +4028,7 @@ fn cached_search_index(
     history_renumber_epoch: u64,
     absolute_row_revision: u64,
     max_lines: usize,
+    ambiguous_width: AmbiguousWidth,
 ) -> Option<Arc<TerminalSearch>> {
     let mut cache = search_cache_lock();
     cache.retain(|snapshot| snapshot.term.strong_count() != 0);
@@ -4018,6 +4042,9 @@ fn cached_search_index(
             && snapshot.history_renumber_epoch == history_renumber_epoch
             && snapshot.absolute_row_revision == absolute_row_revision
             && snapshot.max_lines == max_lines
+            // A live `ambiguous_width` switch moves no content generation, and
+            // every column (and every joined run's padding) is measured under it.
+            && snapshot.index.ambiguous_width() == ambiguous_width
     })?;
     let snapshot = cache.remove(position)?;
     let index = Arc::clone(&snapshot.index);
@@ -4040,6 +4067,10 @@ fn cached_search_index(
 /// report that it slid the absolute space) and a `retained_base` that only ever
 /// ADVANCES (retention drops the oldest rows and leaves every survivor's key
 /// alone, so a retreat can only be a slide nothing reported).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reuse guards, field by field, as the snapshot stores them"
+)]
 fn take_reusable_search_index(
     term: &Arc<Mutex<Terminal>>,
     alt_screen: bool,
@@ -4048,6 +4079,7 @@ fn take_reusable_search_index(
     max_lines: usize,
     retained_base: usize,
     indexed_end: usize,
+    ambiguous_width: AmbiguousWidth,
 ) -> Option<(TerminalSearch, usize)> {
     let mut cache = search_cache_lock();
     let position = cache.iter().position(|snapshot| {
@@ -4058,6 +4090,7 @@ fn take_reusable_search_index(
             && snapshot.max_lines == max_lines
             && snapshot.retained_base <= retained_base
             && snapshot.indexed_end <= indexed_end
+            && snapshot.index.ambiguous_width() == ambiguous_width
             && Arc::strong_count(&snapshot.index) == 1
     })?;
     let snapshot = cache.remove(position)?;
@@ -4332,7 +4365,7 @@ pub(crate) fn cmd_messages(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `notice <post|progress|done|dismiss|act> …` -> one status line: the message
+/// `notice <post|progress|done|ask|dismiss|act> …` -> one status line: the message
 /// band's WRITE face (design §5.2, rulings 163-179). The outside world's voice under
 /// the attention rule — an info/success `post` is a record (ruling 163), a warn/error
 /// `post` a row, `progress` a script's animated work in flight on one row per key
@@ -5410,7 +5443,8 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         selections: _, // OMITTED: compose-time per-pane selection list, the twin of `selection_clip` above. A styled frame is extracted from ONE Terminal via `cell_frame_into`, which clears it, so the scalar `selection` above is always this frame's whole selection authority.
         clusters: _,   // folded into per-cell "glyph" (cell_grapheme)
         combining: _,  // folded into per-cell "glyph" (cell_grapheme)
-        line_sizes: _, // frame "line_sizes" (F2)
+        visual_to_logical: _, // OMITTED: the renderer's BiDi visual→logical map. The styled rows are logical (`render_row_at_screen_into`), as is the selection geometry; `text order=display` serves the same map
+        line_sizes: _,        // frame "line_sizes" (F2)
         line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
         chrome_rasters: _, // OMITTED: host-owned message-band meter raster (pixel ground, rail, ink split), not engine cell content
@@ -6588,6 +6622,90 @@ mod tests {
             "L9",
             "reported on the row it is printed on"
         );
+    }
+
+    /// With `ambiguous_width = "wide"` the grid draws an East Asian Ambiguous
+    /// character (`→`) in two cells, and find measures the same way: `foo` after
+    /// two arrows is reported in cells 4-6, and a soft-wrapped run whose head is
+    /// four arrows and `ab` fills its row, so the join adds no padding and
+    /// `abfoo` straddles the wrap at the cell `a` is drawn in.
+    #[test]
+    fn find_measures_ambiguous_characters_as_the_grid_draws_them() {
+        let _serial = super::search_cap_test_guard();
+        let wide = aterm_core::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        };
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        term.lock().unwrap().apply_config(&wide);
+        term.lock().unwrap().process("→→foo bar".as_bytes());
+        assert_eq!(
+            cmd_search(&term, "foo", &RewrapGauge::default()),
+            "OK 1\n0 4 3\n"
+        );
+
+        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
+        term.lock().unwrap().apply_config(&wide);
+        term.lock().unwrap().process("→→→→abfoo".as_bytes());
+        assert!(
+            term.lock().unwrap().row_continues_previous(1),
+            "precondition: `foo` wrapped"
+        );
+        assert_eq!(
+            cmd_search(&term, "abfoo", &RewrapGauge::default()),
+            "OK 1\n0 8 5\n"
+        );
+    }
+
+    /// A live `ambiguous_width` switch moves no content generation, and the find
+    /// cache neither serves nor extends an index measured under the old policy:
+    /// the first search after the switch answers as a fresh index over the same
+    /// terminal does (one with no cache entry).
+    #[test]
+    fn a_live_ambiguous_width_switch_is_not_served_from_the_find_cache() {
+        let _serial = super::search_cap_test_guard();
+        let wide = aterm_core::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        };
+        let cached = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        cached.lock().unwrap().process("→→foo bar".as_bytes());
+        let narrow = cmd_search(&cached, "foo", &RewrapGauge::default());
+        cached.lock().unwrap().apply_config(&wide);
+        let after_switch = cmd_search(&cached, "foo", &RewrapGauge::default());
+
+        let fresh = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        fresh.lock().unwrap().process("→→foo bar".as_bytes());
+        fresh.lock().unwrap().apply_config(&wide);
+        let fresh = cmd_search(&fresh, "foo", &RewrapGauge::default());
+        assert_ne!(narrow, fresh, "precondition: the policy moves the match");
+        assert_eq!(after_switch, fresh);
+    }
+
+    /// Find answers the same for a line on the screen and after it scrolls into
+    /// history: both are read as written, trailing blanks kept, so `foo$` and a
+    /// query ending in the spaces the program printed do not change their hits
+    /// as output scrolls (absolute rows do not move on a scroll).
+    #[test]
+    fn a_lines_hits_do_not_change_when_it_scrolls_into_history() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        term.lock()
+            .unwrap()
+            .process(b"foo   \r\nbar \x1b[41m  \x1b[0m\r\nbaz\r\nfoo");
+        // `search` trims its pattern, so the trailing spaces are spelled as a
+        // regex repeat.
+        let queries = ["foo$ regex", "bar$ regex", "foo {2} regex", "bar {3} regex"];
+        let ask = |q: &str| cmd_search(&term, q, &RewrapGauge::default());
+        let on_screen: Vec<String> = queries.iter().map(|q| ask(q)).collect();
+        assert_eq!(
+            on_screen[0], "OK 1\n3 0 3\n",
+            "only the line ending at `foo`"
+        );
+        assert_eq!(on_screen[2], "OK 1\n0 0 5\n", "the printed spaces are text");
+        term.lock().unwrap().process(b"\r\n1\r\n2\r\n3\r\n4");
+        let in_history: Vec<String> = queries.iter().map(|q| ask(q)).collect();
+        assert_eq!(in_history, on_screen);
     }
 
     /// A soft-wrap run is indexed as ONE line keyed at the row it starts on, so
@@ -7875,9 +7993,16 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index =
-                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
-                    .expect("the previous search must have cached a consistent snapshot");
+            let index = super::cached_search_index(
+                &term,
+                key_alt,
+                key_seq,
+                key_epoch,
+                revision,
+                max_lines,
+                aterm_types::text_shaping::AmbiguousWidth::Single,
+            )
+            .expect("the previous search must have cached a consistent snapshot");
             let (results, _) = super::query_search_index(
                 &index,
                 q,
@@ -7976,9 +8101,16 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index =
-                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
-                    .expect("the previous search must have cached a consistent snapshot");
+            let index = super::cached_search_index(
+                &term,
+                key_alt,
+                key_seq,
+                key_epoch,
+                revision,
+                max_lines,
+                aterm_types::text_shaping::AmbiguousWidth::Single,
+            )
+            .expect("the previous search must have cached a consistent snapshot");
             let (results, point) = super::query_search_index(
                 &index,
                 q,
@@ -8058,9 +8190,16 @@ mod tests {
             };
             let max_lines =
                 super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-            let index =
-                super::cached_search_index(&term, key_alt, key_seq, key_epoch, revision, max_lines)
-                    .expect("the previous search must have cached a consistent snapshot");
+            let index = super::cached_search_index(
+                &term,
+                key_alt,
+                key_seq,
+                key_epoch,
+                revision,
+                max_lines,
+                aterm_types::text_shaping::AmbiguousWidth::Single,
+            )
+            .expect("the previous search must have cached a consistent snapshot");
             let (results, _) = super::query_search_index(
                 &index,
                 q,

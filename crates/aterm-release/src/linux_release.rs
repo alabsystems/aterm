@@ -101,11 +101,15 @@ const SSH_OPTIONS: [&str; 14] = [
 ///
 /// The body is one function called with stdin from `/dev/null`: bash parses
 /// all of it before running any of it, so nothing the build runs can read the
-/// rest of the script off the pipe. Each run gets its own `mktemp -d`, so an
-/// orphaned earlier run of the same build cannot delete or overwrite this one.
-/// `umask 077` because the worker refuses a group- or other-writable target
-/// root, and a login's `umask 002` (Ubuntu's default) made exactly that —
-/// measured on the first live run.
+/// rest of the script off the pipe. Each run gets its own `mktemp -d` for its
+/// worktree and its output, so no other run writes where this one reads its
+/// result. The build itself runs in the clone's one release cache
+/// (`<repo>-release.noindex`, `crate::snapshot::CacheRoot`), which every take holds
+/// alone from its snapshot through the copy into `$out` (`CacheHold`): an orphaned
+/// earlier run of the same build is waited for, never built beside, so it cannot
+/// change or delete what this run compiles. `umask 077` because the worker refuses a
+/// group- or other-writable target root, and a login's `umask 002` (Ubuntu's
+/// default) made exactly that — measured on the first live run.
 const WORKER_SCRIPT: &str = r#"main() {
 set -eu
 umask 077
@@ -734,13 +738,9 @@ fn clean_head(repo: &Path, commit: &str) -> Result<(), String> {
             .current_dir(repo),
         "Linux worker source HEAD",
     )?;
-    let status = output_text(
-        Command::new("git")
-            .args(["status", "--porcelain=v1", "--untracked-files=normal"])
-            .current_dir(repo),
-        "Linux worker source status",
-    )?;
-    if head.trim() != commit || !status.trim().is_empty() {
+    // The one clean-tree judge (`gates::dirty_paths`, the Trust lane's rule).
+    let dirty = crate::gates::dirty_paths(repo).map_err(|e| e.to_string())?;
+    if head.trim() != commit || !dirty.is_empty() {
         return Err(
             "Linux worker requires a clean checkout at exactly the requested claim commit".into(),
         );
@@ -754,8 +754,9 @@ fn output_text(command: &mut Command, what: &str) -> Result<String, String> {
 }
 
 /// A local-only worker. No credentials, signing, release API, or upload code is
-/// reachable from this function. Source and dependencies use the SAME sealed
-/// take as the Mac cutter, and `build_one(None)` is always the Trust native lane.
+/// reachable from this function. Source and dependencies come from the SAME
+/// snapshot of git objects as the Mac cutter's (`crate::snapshot`), and
+/// `build_one(None)` is always the Trust native lane.
 pub fn run_worker(
     repo: &Path,
     out: &Path,
@@ -768,7 +769,7 @@ pub fn run_worker(
     check_identity(version, build, commit)?;
     clean_head(repo, commit)?;
     let git = crate::ledger::GitCli::new(repo);
-    crate::gates::cutter_identity_gate(&git, commit, false).map_err(|e| e.to_string())?;
+    crate::gates::own_cutter_gate(&git, commit, false).map_err(|e| e.to_string())?;
     private_directory(out)?;
     let name = native.asset_name(version);
     let receipt = out.join(format!("{name}.handoff.toml"));
@@ -832,93 +833,85 @@ pub fn run_worker(
     if library_hash != seal_field("artifact_driver_sha256")? {
         return Err("Trust compiler library differs from its build-stamped seal".into());
     }
-    let mut take = super::SealedCargoTake::acquire(repo)?;
-    let result = (|| {
-        let plan = super::BuildPlan {
-            repo_root: repo.into(),
-            out_dir: out.into(),
-            build_number: build,
-            short_version: version.into(),
-            arm64_only: true,
-            expected_update_pin_sha256: None,
-        };
-        super::build_one(&plan, &take, "aterm", None)?;
-        take.verify()?;
-        clean_head(repo, commit)?;
-        if sha256_file(&compiler)? != compiler_hash
-            || sha256_file(&driver)? != driver_hash
-            || sha256_file(&provenance)? != provenance_hash
-            || sha256_file(&compiler_library)? != library_hash
-        {
-            return Err("Trust seal changed during the native Linux build".into());
-        }
-        let binary = take.target_dir.join("release/aterm");
-        let version_output = Command::new(&binary)
-            .arg("--version")
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !version_output.status.success() {
-            return Err("native Linux binary cannot start".into());
-        }
-        super::validate_cli_app_version(version, &version_output.stdout)?;
-        let identity = output_text(
-            Command::new(&binary).args(["update", "identity"]),
-            "native Linux compiled identity",
-        )?;
-        let identity: aterm_update_core::linux::BinaryIdentity =
-            aterm_json::from_str(&identity).map_err(|e| format!("Linux identity JSON: {e}"))?;
-        if identity.schema != 1
-            || identity.version != version
-            || identity.build_number != build
-            || identity.commit != commit
-            || identity.target != native.triple()
-            || identity.dirty
-        {
-            return Err(
-                "Linux executable does not report the exact clean source/build/target identity"
-                    .into(),
-            );
-        }
-        let artifact = Artifact {
-            schema: 1,
-            version: version.into(),
-            build_number: build,
-            commit: commit.into(),
-            target: native.triple().into(),
-            asset: name.clone(),
-            sha256: sha256_file(&binary)?,
-            size: fs::metadata(&binary).map_err(|e| e.to_string())?.len(),
-            source_fingerprint: take.source_fingerprint.clone(),
-            compiler_sha256: compiler_hash,
-            driver_sha256: driver_hash,
-            compiler_library_sha256: library_hash,
-            compiler_version,
-            compiler_provenance_sha256: provenance_hash,
-        };
-        artifact.validate(version, build, commit)?;
-        artifact.verify_file(&binary)?;
-        atomic_copy(&binary, &out.join(&name))?;
-        let text = aterm_toml::to_string(&artifact).map_err(|e| e.to_string())?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&receipt)
-            .map_err(|e| e.to_string())?;
-        file.write_all(text.as_bytes())
-            .and_then(|()| crate::durable::sync_all(&file))
-            .map_err(|e| e.to_string())?;
-        println!(
-            "Linux local handoff ready: {} (unsigned; only ship cut may publish it)",
-            out.join(&name).display()
-        );
-        Ok(())
-    })();
-    let released = take.release();
-    match (result, released) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        (Err(a), Err(b)) => Err(format!("{a}; additionally {b}")),
+    let take = super::Take::prepare(repo, commit)?;
+    let plan = super::BuildPlan {
+        repo_root: repo.into(),
+        commit: commit.into(),
+        out_dir: out.into(),
+        build_number: build,
+        short_version: version.into(),
+        expected_update_pin_sha256: None,
+        one_slice_at_a_time: true,
+    };
+    super::build_one(&plan, &take, "aterm", None, None)?;
+    take.verify()?;
+    clean_head(repo, commit)?;
+    if sha256_file(&compiler)? != compiler_hash
+        || sha256_file(&driver)? != driver_hash
+        || sha256_file(&provenance)? != provenance_hash
+        || sha256_file(&compiler_library)? != library_hash
+    {
+        return Err("Trust seal changed during the native Linux build".into());
     }
+    let binary = take.slice_target(None).join("release/aterm");
+    let version_output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !version_output.status.success() {
+        return Err("native Linux binary cannot start".into());
+    }
+    super::validate_cli_app_version(version, &version_output.stdout)?;
+    let identity = output_text(
+        Command::new(&binary).args(["update", "identity"]),
+        "native Linux compiled identity",
+    )?;
+    let identity: aterm_update_core::linux::BinaryIdentity =
+        aterm_json::from_str(&identity).map_err(|e| format!("Linux identity JSON: {e}"))?;
+    if identity.schema != 1
+        || identity.version != version
+        || identity.build_number != build
+        || identity.commit != commit
+        || identity.target != native.triple()
+        || identity.dirty
+    {
+        return Err(
+            "Linux executable does not report the exact clean source/build/target identity".into(),
+        );
+    }
+    let artifact = Artifact {
+        schema: 1,
+        version: version.into(),
+        build_number: build,
+        commit: commit.into(),
+        target: native.triple().into(),
+        asset: name.clone(),
+        sha256: sha256_file(&binary)?,
+        size: fs::metadata(&binary).map_err(|e| e.to_string())?.len(),
+        source_fingerprint: take.snapshot.digest.clone(),
+        compiler_sha256: compiler_hash,
+        driver_sha256: driver_hash,
+        compiler_library_sha256: library_hash,
+        compiler_version,
+        compiler_provenance_sha256: provenance_hash,
+    };
+    artifact.validate(version, build, commit)?;
+    artifact.verify_file(&binary)?;
+    atomic_copy(&binary, &out.join(&name))?;
+    let text = aterm_toml::to_string(&artifact).map_err(|e| e.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt)
+        .map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| crate::durable::sync_all(&file))
+        .map_err(|e| e.to_string())?;
+    println!(
+        "Linux local handoff ready: {} (unsigned; only ship cut may publish it)",
+        out.join(&name).display()
+    );
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -1209,11 +1202,6 @@ mod tests {
         );
         assert!(parse(&["cut", "--resume", "--mac-only"]).is_err());
         assert!(parse(&["cut", "--abandon", "v0.26.0", "--mac-only"]).is_err());
-        // A cutter handed its cut by another is exempt: its parent held the rule.
-        assert!(
-            crate::cli::parse_handed_off(&["cut".to_string()]).is_ok(),
-            "the handed-off cutter reads its parent's argv"
-        );
         // --linux-worker needs somewhere to land and a well-formed spec.
         assert!(parse(&["cut", "--mac-only", "--linux-worker", "aarch64=h:/r"]).is_err());
         assert!(

@@ -849,8 +849,8 @@ pub(crate) fn refresh_view_with(
         let _ = std::fs::remove_dir_all(&staged);
         mirror_tree(layout, &src, &staged)?;
         // A directory SYMLINK from the form that shipped before mirroring is a link,
-        // not a tree: it is exchanged or renamed as a link, and `remove_link` drops it.
-        swap_in(layout, &view, &staged, &at, &old)?;
+        // not a tree: it is renamed as a link, and `remove_link` drops it.
+        swap_in(&staged, &at, &old)?;
     }
     let live = view.join("bin");
     let stock_differed = stock_bytes_mismatch(&build, &view).is_some();
@@ -867,43 +867,19 @@ pub(crate) fn refresh_view_with(
     let changed = stock_differed || !same_bin(&live, &staged);
     let old = view.join(format!(".bin.old-{pid}"));
     let _ = std::fs::remove_dir_all(&old);
-    swap_in(layout, &view, &staged, &live, &old)?;
+    swap_in(&staged, &live, &old)?;
     Ok(plan.refreshed(build, changed, None))
 }
 
 /// Put the staged part `staged` in the view at `at`, and remove what stood there — through
-/// `old` when it is renamed aside.
-///
-/// PROVENANCE BEFORE THE SWAP ([`crate::provenance::heal_staged`]). What a tracked process lays
-/// here carries the tag: a clone of an untagged store file is tagged anew, and so is a directory it
-/// makes (measured with `cp -c` and `mkdir` from a tracked shell). Cleared after the swap by the
-/// door-end heal, the tag's removal moved the ctimes a tippy started from the view in between pins
-/// — the refusal measured on a store build — and `cargo +trust`, with every checkout pinning
-/// `channel = "trust"`, runs from here. So the view is healed ([`heal_before_swap`]) while the part
-/// is still its dot-temp.
-///
-/// BY EXCHANGE, NOT RENAME. A tracked process's `rename(2)` tags the entry it moves anew
-/// (measured on a healed directory and a healed file), while `renamex_np(RENAME_SWAP)` tags
-/// neither side. A part renamed
-/// into place would go live tagged whatever the heal before it did. So on macOS the staged
-/// part is EXCHANGED with what stands at `at`, an empty placeholder made there first when
-/// nothing does (a first lay, or a directory a newer build adds; nothing runs from a
-/// missing part, and nothing from an empty one), and the heal clears both before the
-/// exchange. Where the exchange is refused, and elsewhere, it is the two renames it always
-/// was, and the door-end heal the backstop.
-fn swap_in(layout: &Layout, view: &Path, staged: &Path, at: &Path, old: &Path) -> io::Result<()> {
-    let exchanging = cfg!(target_os = "macos");
-    if exchanging && std::fs::symlink_metadata(at).is_err() {
-        // Without the placeholder, the renames below.
-        let _ = std::fs::create_dir(at);
-    }
-    heal_before_swap(layout, view);
-    if exchanging && std::fs::symlink_metadata(at).is_ok() && exchange(staged, at).is_ok() {
-        // `staged` names what stood at `at` now: a tree, a placeholder or a link.
-        let _ = std::fs::remove_dir_all(staged);
-        crate::platform::remove_link(staged);
-        return Ok(());
-    }
+/// `old`, which it is renamed aside to. Two renames, on every platform, so the part is
+/// missing from the view between them: a process that starts from the view in that instant
+/// (a `cargo +trust` through rustup's proxy) finds no `bin/` or `lib/`. [`relay_blocked`]
+/// does not cover it — it defers a re-lay only while a lease is held or a process already
+/// runs from the view when the pass decides. A pass killed between the renames leaves the
+/// view without the part until the next pass, which finds it mismatched ([`view_matches`])
+/// and lays the part again; [`sweep_view_debris`] removes the `old` it left.
+fn swap_in(staged: &Path, at: &Path, old: &Path) -> io::Result<()> {
     if std::fs::symlink_metadata(at).is_ok() {
         std::fs::rename(at, old)?;
     }
@@ -911,36 +887,6 @@ fn swap_in(layout: &Layout, view: &Path, staged: &Path, at: &Path, old: &Path) -
     let _ = std::fs::remove_dir_all(old);
     crate::platform::remove_link(old);
     Ok(())
-}
-
-/// Heal `view` whole before a part is swapped in ([`swap_in`]): nothing runs from the view
-/// during a re-lay ([`relay_blocked`]), what is live in it is clean already, and a clearing
-/// job leaves an untagged file's ctime as it was (the provenance test
-/// `clearing_moves_ctime_alone_and_a_clean_root_is_left_as_it_was`).
-fn heal_before_swap(layout: &Layout, view: &Path) {
-    let _ = crate::provenance::heal_staged(layout, view);
-}
-
-/// Exchange the names `a` and `b` in one step, `renamex_np(RENAME_SWAP)`.
-#[cfg(target_os = "macos")]
-fn exchange(a: &Path, b: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let nul = |_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a view path");
-    let a = std::ffi::CString::new(a.as_os_str().as_bytes()).map_err(nul)?;
-    let b = std::ffi::CString::new(b.as_os_str().as_bytes()).map_err(nul)?;
-    // SAFETY: both C strings are NUL-terminated and outlive the call, which only reads
-    // them; RENAME_SWAP is the documented flag; -1 and errno on failure.
-    if unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// See the macOS body: no tag here, so no exchange is needed.
-#[cfg(not(target_os = "macos"))]
-fn exchange(_a: &Path, _b: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Whether the out-of-date view at `view` must be left as it stands this pass: a run holds
@@ -2627,7 +2573,25 @@ fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
 /// put back ([`unattended_heal`]), recorded so it can be undone ([`replaced_from`]).
 #[must_use]
 pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
-    reassert_with(
+    reassert_reporting(layout, rustup_home).lines
+}
+
+/// What a re-assertion said ([`reassert`]'s lines) and the entries it left alone because
+/// they are not atpkg's ([`Refusal::Foreign`]), each as its seam's name and the entry's
+/// path — what the pass's `foreign:` marker names for the window, whose one fix is
+/// [`DETACH_FIX`].
+#[derive(Debug, Default)]
+pub struct Reasserted {
+    /// The lines [`reassert`] returns.
+    pub lines: Vec<String>,
+    /// Every seam whose entry is foreign, with that entry.
+    pub foreign: Vec<(String, PathBuf)>,
+}
+
+/// [`reassert`], answering the foreign entries it left alone too ([`Reasserted`]).
+#[must_use]
+pub fn reassert_reporting(layout: &Layout, rustup_home: &Path) -> Reasserted {
+    reassert_said(
         layout,
         rustup_home,
         &refresh_view,
@@ -2641,18 +2605,20 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
 /// re-pointed at the view too, and the line names what it was, so it can be linked back.
 #[must_use]
 pub fn repair(layout: &Layout, rustup_home: &Path) -> Vec<String> {
-    reassert_with(
+    reassert_said(
         layout,
         rustup_home,
         &refresh_view,
         &crate::gc::process_table,
         true,
     )
+    .lines
 }
 
 /// [`reassert`] with the view's refresh injected ([`Refresh`]), and the process table the
 /// entry's in-use guard reads ([`Attached::LeftEntry`]), so what a pass records around a
 /// view or an entry it left behind — or a view it failed to lay — is provable from a test.
+#[cfg(test)]
 fn reassert_with(
     layout: &Layout,
     rustup_home: &Path,
@@ -2660,14 +2626,26 @@ fn reassert_with(
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
     repair: bool,
 ) -> Vec<String> {
+    reassert_said(layout, rustup_home, refresh, running, repair).lines
+}
+
+/// [`reassert_with`], answering the foreign entries left alone too ([`Reasserted`]).
+fn reassert_said(
+    layout: &Layout,
+    rustup_home: &Path,
+    refresh: Refresh<'_>,
+    running: &dyn Fn() -> Option<Vec<PathBuf>>,
+    repair: bool,
+) -> Reasserted {
     let mut lines = Vec::new();
+    let mut foreign = Vec::new();
     if !toolchains_dir(rustup_home).is_dir() {
         // NO RUSTUP, NO VIEW TO WAIT FOR: a view recorded left behind
         // ([`crate::quiet::ViewLeft`]) ends only when a re-assertion reaches its seam, which
         // none does without `~/.rustup/toolchains`; left, the park's re-check
         // (`quiet::Due::View`) would wake for it forever.
         crate::quiet::clear_views_left(layout);
-        return lines;
+        return Reasserted { lines, foreign };
     }
     let mut names: std::collections::BTreeSet<String> =
         recorded_names(layout).into_iter().collect();
@@ -2767,11 +2745,14 @@ fn reassert_with(
                     // refusal's own record is what doctor shows.
                     crate::quiet::clear_view_left(layout, &name);
                 }
+                if let Refusal::Foreign { path, .. } = &e {
+                    foreign.push((name.clone(), path.clone()));
+                }
                 lines.push(refusal_line(&name, &e, why));
             }
         }
     }
-    lines
+    Reasserted { lines, foreign }
 }
 
 /// A refusal as a person reads it: a filesystem failure names the entry it hit; every
@@ -3161,6 +3142,31 @@ mod tests {
             s.to_string().contains("in-prefix=no targets-view=no"),
             "{s}"
         );
+    }
+
+    /// THE UNATTENDED PASS NAMES THE FOREIGN ENTRY IT LEFT ALONE (audit 2026-10-09:
+    /// `~/.rustup/toolchains/trust … not aterm's link; left untouched` was prose 32 passes
+    /// printed and no one read): [`reassert_reporting`] answers it beside its line, for
+    /// the pass's `foreign:` marker, and still touches nothing. NEGATIVE CONTROL: once the
+    /// entry is atpkg's own, nothing is named.
+    #[cfg(unix)]
+    #[test]
+    fn the_unattended_pass_names_the_foreign_entry_it_left_alone() {
+        let fx = Fixture::new("foreignnamed");
+        fx.install_trust(6808);
+        let elsewhere = fx.root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        link(&elsewhere, &fx.seam("trust"));
+        let said = reassert_reporting(&fx.layout, &fx.rustup);
+        assert_eq!(said.foreign, vec![("trust".to_string(), fx.seam("trust"))]);
+        assert!(
+            said.lines.iter().any(|l| l.contains("left untouched")),
+            "{said:?}"
+        );
+        assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), elsewhere);
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        let said = reassert_reporting(&fx.layout, &fx.rustup);
+        assert!(said.foreign.is_empty(), "{said:?}");
     }
 
     /// A compiler at `<sysroot>/bin/<name>` that answers `-vV` with `commit-date: <date>` —
@@ -4697,157 +4703,6 @@ mod tests {
         assert_eq!(crate::quiet::due_with(&fx.layout, t0, &quiet), None);
     }
 
-    /// PROVENANCE BEFORE THE SWAP, THE VIEW'S HALF: each part a re-lay swaps in is healed while it
-    /// is still its dot-temp ([`heal_before_swap`]) — healed after the swap, by the door-end heal,
-    /// it moved the ctimes a tippy started from the view in between pins. Each heal is observed as
-    /// it runs: it is handed the view, the part it follows is still staged beside the live one, and
-    /// the view still presents the old build's tools. The NEGATIVE CONTROL is the same re-assertion
-    /// over a view that already matches: nothing laid, nothing healed.
-    #[cfg(unix)]
-    #[test]
-    fn a_view_part_is_healed_before_it_is_swapped_in() {
-        let fx = Fixture::new("view-heal-before-swap");
-        fx.install_trust(100);
-        let _ = reassert(&fx.layout, &fx.rustup);
-        let view = view_dir(&fx.layout, "trust");
-        let trustc = view.join("bin").join("trustc");
-        assert_eq!(
-            std::fs::read_to_string(&trustc).unwrap(),
-            "trustc of build 100"
-        );
-        type Seen = (Vec<PathBuf>, Vec<String>, String);
-        let seen: std::rc::Rc<std::cell::RefCell<Vec<Seen>>> = std::rc::Rc::default();
-        let observing = {
-            let (seen, view, trustc) = (std::rc::Rc::clone(&seen), view.clone(), trustc.clone());
-            crate::provenance::test_bind::observe(move |roots| {
-                let mut staged: Vec<String> = std::fs::read_dir(&view)
-                    .unwrap()
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with('.') && n.contains(".tmp-"))
-                    .collect();
-                staged.sort();
-                let presents = std::fs::read_to_string(&trustc).unwrap_or_default();
-                seen.borrow_mut().push((roots.to_vec(), staged, presents));
-            })
-        };
-        fx.install_trust(200);
-        let _ = reassert(&fx.layout, &fx.rustup);
-        let pid = std::process::id();
-        assert_eq!(
-            *seen.borrow(),
-            vec![
-                (
-                    vec![view.clone()],
-                    vec![format!(".lib.tmp-{pid}")],
-                    "trustc of build 100".to_string()
-                ),
-                (
-                    vec![view.clone()],
-                    vec![format!(".bin.tmp-{pid}")],
-                    "trustc of build 100".to_string()
-                ),
-            ],
-            "lib/ then bin/, each healed as its dot-temp, before the view moved"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&trustc).unwrap(),
-            "trustc of build 200",
-            "and the view presents the new build after"
-        );
-        seen.borrow_mut().clear();
-        let _ = reassert(&fx.layout, &fx.rustup);
-        assert!(
-            seen.borrow().is_empty(),
-            "the negative control: a view that matches is laid and healed not at all"
-        );
-        drop(observing);
-    }
-
-    /// THE SAME, ON THE REAL TAG AND THE REAL HEAL: a view a tracked process lays — first, then
-    /// over a new build — goes live with nothing in it tagged, directories included, and the
-    /// door-end heal after it moves no ctime a tippy started from the view pins. A part RENAMED
-    /// into place came out tagged, since a tracked `rename(2)` tags what it moves ([`swap_in`]),
-    /// and that heal moved its ctime. A tracked test process tags everything it writes (the probe
-    /// below says whether this one is); an untracked one tags nothing, so there the test proves
-    /// nothing and says so.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_view_laid_by_a_tracked_process_goes_live_untagged() {
-        use std::os::unix::fs::MetadataExt as _;
-        fn tagged_under(root: &Path, out: &mut Vec<PathBuf>) {
-            if crate::provenance::xattr_names_nofollow(root)
-                .unwrap()
-                .iter()
-                .any(|n| n == crate::provenance::PROVENANCE_XATTR)
-            {
-                out.push(root.to_path_buf());
-            }
-            if std::fs::symlink_metadata(root).unwrap().is_dir() {
-                for entry in std::fs::read_dir(root).unwrap().flatten() {
-                    tagged_under(&entry.path(), out);
-                }
-            }
-        }
-        let tagged = |root: &Path| {
-            let mut out = Vec::new();
-            tagged_under(root, &mut out);
-            out
-        };
-        let _real = crate::provenance::test_bind::real();
-        let fx = Fixture::new("view-untagged");
-        let probe = fx.root.path().join("probe");
-        std::fs::write(&probe, b"").unwrap();
-        let tracked = crate::provenance::carries(&probe, crate::provenance::PROVENANCE_XATTR);
-        if !tracked {
-            eprintln!("this test process is untracked: it tags nothing, and proves nothing here");
-        }
-        let view = view_dir(&fx.layout, "trust");
-        fx.install_trust(100);
-        let _ = reassert(&fx.layout, &fx.rustup);
-        assert_eq!(
-            tagged(&view),
-            Vec::<PathBuf>::new(),
-            "a first lay goes live untagged"
-        );
-        fx.install_trust(200);
-        let _ = reassert(&fx.layout, &fx.rustup);
-        assert_eq!(
-            std::fs::read_to_string(view.join("bin").join("trustc")).unwrap(),
-            "trustc of build 200"
-        );
-        assert_eq!(tagged(&view), Vec::<PathBuf>::new(), "and so does a re-lay");
-        let pinned = [
-            view.clone(),
-            view.join("bin"),
-            view.join("bin").join("trustc"),
-            view.join("lib"),
-            view.join("lib").join("libtrust.dylib"),
-        ];
-        let ctime = |p: &PathBuf| {
-            let m = std::fs::symlink_metadata(p).unwrap();
-            (m.ctime(), m.ctime_nsec())
-        };
-        let before: Vec<_> = pinned.iter().map(ctime).collect();
-        // The door's end, after the flip laid its shims: a shim written here is tagged when
-        // this process is, so the job runs over every store root, the view among them.
-        std::fs::create_dir_all(fx.layout.bin_dir()).unwrap();
-        std::fs::write(fx.layout.bin_dir().join("targo"), b"#!/bin/sh\n").unwrap();
-        let door_end = crate::provenance::heal_store(&fx.layout);
-        assert!(door_end.is_clean(), "{door_end:?}");
-        if tracked {
-            assert!(
-                matches!(door_end, crate::provenance::HealOutcome::Healed { .. }),
-                "the door-end job ran: {door_end:?}"
-            );
-        }
-        let after: Vec<_> = pinned.iter().map(ctime).collect();
-        assert_eq!(
-            after, before,
-            "the door-end heal moved nothing the view pins"
-        );
-    }
-
     /// A VIEW LEFT BEHIND ENDS WITH RUSTUP (2026-09-26): with `~/.rustup/toolchains` gone
     /// no re-assertion reaches a seam, so the record of a view left behind stood for good
     /// and stayed due to the park's re-check, waking passes that could lay nothing. The
@@ -5074,20 +4929,22 @@ mod tests {
         let view = view_dir(&fx.layout, "trust");
 
         /// Kills the probe however the test ends, so no stray outlives a failed assertion.
-        struct Probe(std::process::Child);
+        struct Probe(aterm_uds::spawnfd::Child);
         impl Drop for Probe {
             fn drop(&mut self) {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
             }
         }
+        // `spawnfd`'s: the probe holds its stdio and nothing else of this
+        // process, not another test thread's pipe while it lives.
         let mut probe = Probe(
-            std::process::Command::new(view.join("bin").join("targo"))
+            aterm_uds::spawnfd::command(view.join("bin").join("targo"))
                 .args(["--exact", "--nocapture", "--quiet", VIEW_PROBE])
                 .env(VIEW_PROBE_ENV, "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
                 .spawn()
                 .expect("spawn the view's targo"),
         );

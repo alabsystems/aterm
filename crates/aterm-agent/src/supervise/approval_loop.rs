@@ -55,10 +55,9 @@
 //! ([`box_identity`]: its auto-deny countdown ticked or wiped, a blank row
 //! gone, the transcript above it reflowed) is no move, and the wait goes on
 //! — so a `1` the box never took is "the box did not change after the
-//! press", not an approval pressed again each second (harness round-1
-//! review, 2026-09-24), and a box the vendor redraws before it takes it
-//! down is not pressed twice (measured live 2026-09-25, 2.1.283: every
-//! approved rm box of the proof run was). What a box's rows ARE — its span,
+//! press", not an approval pressed again each second, and a box the vendor
+//! redraws before it takes it down is not pressed twice (measured live,
+//! 2.1.283: every approved rm box was). What a box's rows ARE — its span,
 //! less the countdown, the focus marker and the blank rows — is read in one
 //! place, [`box_rows`], which the loop's review key of a box reads too
 //! (`run.rs`'s `box_key`): the press and the escalation agree on what "the
@@ -97,7 +96,7 @@
 //! `short-term`, that word's policy text written into its free-text row and
 //! Enter on it — `answer-long-term@v1`, `answer-short-term@v1`: THE POLICY
 //! TEXT, below) is keyed only when the things the pure decision cannot know
-//! hold, each read fresh (the critique of 2026-09-25) — else the loop waits
+//! hold, each read fresh — else the loop waits
 //! and decides again on a fresh read, and never escalates for the wait
 //! ([`Session::question_hold`]):
 //!
@@ -132,7 +131,7 @@
 //!    information, the tries going on — once it has missed for
 //!    [`PRESS_BADGE_AFTER`]); a screen that never holds still is waited on
 //!    the same back-off, and never keyed until it does. Nobody is there to
-//!    hand it to (the philosophy review of 2026-09-25, P3). `supervise`'s
+//!    hand it to. `supervise`'s
 //!    one look hands the box to the manager it returns to instead: after the
 //!    one retry, or after [`MAX_UNSETTLED_WAITS`] waits that ran out.
 //! 3. **Every check on a multi-select is the loop's own** (R2 (d)): it
@@ -642,21 +641,18 @@ pub(super) fn box_identity(rows: &[String]) -> Option<String> {
 /// redraws while the box waits, which is not the box:
 ///
 /// * THE AUTO-DENY COUNTDOWN, which ticks every second: its `⚠` row and every
-///   row it wrapped onto in a narrow grid (the harness round-2 review of
-///   2026-09-24: aterm-phase joins those into
-///   [`aterm_phase::PromptV2::auto_deny`], and the ticking first row no
-///   longer equalled it, so each tick read as a new box). A row is the
+///   row it wrapped onto in a narrow grid (aterm-phase joins those into
+///   [`aterm_phase::PromptV2::auto_deny`], which the ticking first row does
+///   not equal, so each tick would read as a new box). A row is the
 ///   countdown's while the rows so far spell the start of it, led by its `⚠`
 ///   row.
 /// * THE FOCUS MARKER `❯`: a focus move changes it, and an identity that
-///   counted it read the moved box as a new one (the harness round-3 review
-///   of 2026-09-24).
+///   counted it would read the moved box as a new one.
 /// * BLANK ROWS: within 5 ms of a taken `1` the vendor (2.1.283) wipes the
 ///   countdown and ONE of the two blank rows under it, and keeps the box
 ///   drawn some 550 ms more — an identity that counted blank rows read that
 ///   as the box leaving, and the box still on the screen was decided and
-///   pressed a second time (measured live 2026-09-25, every approved rm box
-///   of the proof run).
+///   pressed a second time (measured live: every approved rm box).
 ///
 /// The one reading of "the box's rows" the press's identity
 /// ([`box_identity`]) and the loop's review key (`run.rs`'s `box_key`) share.
@@ -1395,7 +1391,13 @@ impl<C: Ctl> Session<'_, C> {
                     + until.saturating_duration_since(Instant::now()).as_secs()
             )
         ));
-        self.turn_end_due = Some((until, "a person is typing".to_string()));
+        // Tests may look again sooner (`Session::set_person_hold_wait`): what
+        // that look finds is the next `status`'s.
+        #[cfg(test)]
+        let until = self
+            .person_hold_wait
+            .map_or(until, |wait| until.min(Instant::now() + wait));
+        self.set_due(until, "a person is typing");
         self.held = true;
         Ok(true)
     }

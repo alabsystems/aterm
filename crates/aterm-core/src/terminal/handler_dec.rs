@@ -217,9 +217,6 @@ impl TerminalHandler<'_> {
                         self.disable_synchronized_output();
                     }
                 }
-                2027 => {
-                    self.set_grapheme_cluster_mode(set);
-                }
                 // DEC mode 2031: color-scheme change reporting. When set, the
                 // terminal emits CSI ? 997 ; Ps n on every OS appearance change
                 // (driven by Terminal::set_color_scheme). Apps query the current
@@ -304,7 +301,11 @@ impl TerminalHandler<'_> {
                 // encoding as `KeyboardMode::WIN32_INPUT`; the encoder picks which
                 // keys need a win32 record (Enter chords) and which stay legacy VT,
                 // and conhost accepts the mixed stream.
-                9001 => {
+                //
+                // Only a session behind a console host has one to negotiate with
+                // (`win32_input_enabled`, the host's to set); anywhere else the
+                // request is program output and falls to the unknown-mode arm.
+                9001 if self.modes.win32_input_enabled => {
                     self.modes.win32_input_mode = set;
                 }
                 _ => {} // Unknown DEC mode
@@ -715,7 +716,7 @@ impl TerminalHandler<'_> {
     /// exit after `?47h`/`?1047h` (a 1049 exit there could restore an earlier
     /// app's save), then `release_dead_app_modes`.
     ///
-    /// Under conhost (`win32_input_mode`) conhost never leaves its own alternate
+    /// Under conhost (`win32_input_active`) conhost never leaves its own alternate
     /// buffer (`TransientState::conhost_alt_screen_left_up`) and keeps painting
     /// with absolute moves, so the cursor stays put and every used primary row
     /// moves into the scrollback first, out of reach of conhost's later full
@@ -726,7 +727,7 @@ impl TerminalHandler<'_> {
         }
         self.alt_archive
             .leave_orphaned(self.grid, self.transient.sync_end_seq);
-        let conhost = self.modes.win32_input_mode;
+        let conhost = self.modes.win32_input_active();
         let conhost_cursor = (self.grid.cursor(), self.grid.pending_wrap());
         if self.transient.alt_entered_without_cursor_save {
             self.exit_alternate_screen_1047();
@@ -1045,19 +1046,26 @@ impl TerminalHandler<'_> {
             1243 => state(self.modes.bidi_arrow_swap),
             2004 => state(self.modes.bracketed_paste),
             2026 => state(self.modes.synchronized_output),
-            2027 => state(self.modes.grapheme_cluster_mode),
             2031 => state(self.modes.report_color_scheme),
             // 2048 (in-band size reports) emits on enable and every resize.
             2048 => state(self.modes.in_band_size_reports),
             2500 => state(self.modes.bidi_box_mirroring),
             2501 => state(self.modes.bidi_autodetection),
             // ConPTY win32-input-mode — answered to the console host that set it.
-            9001 => state(self.modes.win32_input_mode),
+            // Without one (`win32_input_enabled`) the mode does not exist here.
+            9001 if self.modes.win32_input_enabled => state(self.modes.win32_input_mode),
             // Recognized but permanently reset: modes with no effect in a modern
             // terminal emulator.  Pm=4 is more spec-correct than Pm=0 (unknown).
             4 | 8 => 4,   // DECSCLM (smooth scroll), DECARM (auto repeat) — OS-managed
             18 | 19 => 4, // DECPFF (print form feed), DECPEX (print extent) — no printer
-            _ => 0,       // Unknown mode
+            // Grapheme cluster mode (contour's terminal-unicode-core): while
+            // set, every UAX #29 cluster must land in one cell. The print path
+            // does not segment that way (a Devanagari conjunct takes two cells,
+            // `☝🏽` three), so the mode is never on and `CSI ? 2027 h` falls
+            // to the unknown-mode arm; foot answers 4 likewise when its width
+            // method is not the mode's. A 2 here made Neovim 0.11+ set it.
+            2027 => 4,
+            _ => 0, // Unknown mode
         };
 
         // `ESC[?` + mode (<= 5 digits) + `;` + state + `$y` <= 12 bytes.
@@ -1679,6 +1687,40 @@ mod decbkm_tests {
     }
 }
 
+/// Mode 2027 is permanently reset: aterm's print path does not put each UAX #29
+/// cluster in one cell, so it never claims the mode a program could turn on.
+/// Neovim 0.11+ sends `CSI ? 2027 h` only on a reply of 2 and does nothing on
+/// 0, 3 or 4.
+#[cfg(test)]
+mod grapheme_cluster_mode_tests {
+    use crate::terminal::Terminal;
+
+    #[test]
+    fn mode_2027_is_permanently_reset() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2027$p");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[?2027;4$y",
+            "power-on"
+        );
+        // A program that sets it anyway changes nothing.
+        term.process(b"\x1b[?2027h\x1b[?2027$p");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[?2027;4$y",
+            "after CSI ? 2027 h"
+        );
+        assert!(!term.modes().grapheme_cluster_mode);
+        // DECRQSS, the other spelling of the query, agrees.
+        term.process(b"\x1bP$q?2027\x1b\\");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1bP1$r?2027l\x1b\\"
+        );
+    }
+}
+
 #[cfg(test)]
 mod xterm_keyboard_mode_tests {
     use crate::terminal::Terminal;
@@ -1810,9 +1852,17 @@ mod win32_input_mode_tests {
     use crate::terminal::Terminal;
     use aterm_types::keyboard::KeyboardMode;
 
+    /// A session behind a console host: the posture aterm-gui applies to a
+    /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
+    fn conpty_term() -> Terminal {
+        let mut term = Terminal::new(24, 80);
+        term.set_win32_input_enabled(true);
+        term
+    }
+
     #[test]
     fn mode_9001_is_off_by_default_and_toggles_the_win32_input_bit() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         assert!(!term.modes().win32_input_mode);
         assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
         term.process(b"\x1b[?9001h");
@@ -1827,7 +1877,7 @@ mod win32_input_mode_tests {
     fn mode_9001_is_consumed_not_echoed_to_the_grid() {
         // conhost sends it at session start, before the prompt: the sequence is
         // consumed whole and leaves nothing on the grid.
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         let cursor = term.cursor();
         assert_eq!((cursor.row, cursor.col), (0, 0));
@@ -1835,7 +1885,7 @@ mod win32_input_mode_tests {
 
     #[test]
     fn decrqm_reports_mode_9001_state() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
         term.process(b"\x1b[?9001h");
@@ -1847,7 +1897,7 @@ mod win32_input_mode_tests {
     fn xtsave_and_xtrestore_carry_mode_9001() {
         // The DECRQM table and the XTSAVE table are one fact (see
         // `query_dec_mode`); a mode reported by one must round-trip the other.
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         term.process(b"\x1b[?9001s"); // XTSAVE
         term.process(b"\x1b[?9001l");
@@ -1858,7 +1908,7 @@ mod win32_input_mode_tests {
 
     #[test]
     fn ris_clears_mode_9001() {
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         term.process(b"\x1bc");
         assert!(!term.modes().win32_input_mode);
@@ -1869,7 +1919,7 @@ mod win32_input_mode_tests {
     fn mode_9001_survives_decstr() {
         // DECSTR is the application's soft reset; the console host's input
         // negotiation is not the application's to undo, so only RIS clears it.
-        let mut term = Terminal::new(24, 80);
+        let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         term.process(b"\x1b[!p");
         assert!(term.modes().win32_input_mode);
@@ -2132,6 +2182,7 @@ mod conhost_left_alt_screen_tests {
     fn recovered_with_two_commands(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
+            term.set_win32_input_enabled(true);
             term.process(b"\x1b[?9001h\x1b[?1004h");
         }
         term.process(b"history 1\r\nhistory 2\r\n");
@@ -2230,6 +2281,7 @@ mod conhost_left_alt_screen_tests {
         // cmd's `\r\n` and prompt under the pager's last row, a command, then the
         // verb.
         let mut term = Terminal::new(ROWS, 40);
+        term.set_win32_input_enabled(true);
         term.process(b"\x1b[?9001h");
         term.process(b"C:\\>less file\r\n\x1b[?1049h\x1b[H\x1b[2J");
         for i in 1..ROWS {
@@ -2259,12 +2311,31 @@ mod conhost_left_alt_screen_tests {
         assert_eq!(count(&rows, "    echo after"), 1, "{rows:?}");
     }
 
+    /// The conhost layout is for a session a console host sits behind. On any
+    /// other terminal a program's `?9001h` is just output, and the recovery
+    /// must still leave the unix way: the 1049 exit restores the saved cursor
+    /// and the primary rows stay on the screen.
+    #[test]
+    fn a_programs_9001_does_not_fake_a_console_host_for_the_recovery() {
+        let mut term = Terminal::new(ROWS, 40);
+        term.process(b"\x1b[?9001h");
+        term.process(b"$ less file\r\n\x1b[?1049h\x1b[H\x1b[2J");
+        for i in 1..ROWS {
+            term.process(format!("pager {i}\r\n").as_bytes());
+        }
+        assert!(term.leave_alternate_screen());
+        assert_eq!((term.cursor().row, term.cursor().col), (1, 0));
+        assert_eq!(term.grid().scrollback_lines(), 0);
+        assert_eq!(term.row_text(0).unwrap().trim_end(), "$ less file");
+    }
+
     /// A pager that filled the screen after a short history, killed, then the
     /// shell's prompt: conhost scrolled its alternate buffer for the prompt, so
     /// its cursor is on the bottom row, far below the row `?1049h` saved.
     fn recovered_on_the_bottom_row(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
+            term.set_win32_input_enabled(true);
             term.process(b"\x1b[?9001h\x1b[?1004h");
         }
         term.process(b"history 1\r\nhistory 2\r\n");
@@ -2560,8 +2631,8 @@ mod mode_and_query_agreement_tests {
         // set/reset" and 0 "unknown" answers are not save/restorable state).
         const REPORTED: &[u16] = &[
             1, 3, 5, 6, 7, 9, 12, 25, 40, 45, 66, 67, 69, 80, 95, 1000, 1002, 1003, 1004, 1005,
-            1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1243, 2004, 2026, 2027, 2031, 2048,
-            2500, 2501, 9001,
+            1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1243, 2004, 2026, 2031, 2048, 2500,
+            2501, 9001,
         ];
         let mut lost = Vec::new();
         for &mode in REPORTED {
@@ -2569,6 +2640,10 @@ mod mode_and_query_agreement_tests {
             // Mode 3 (DECCOLM) is only honored while mode 40 is set.
             if mode == 3 {
                 term.process(b"\x1b[?40h");
+            }
+            // Mode 9001 exists only behind a console host (the host's posture).
+            if mode == 9001 {
+                term.set_win32_input_enabled(true);
             }
             term.process(format!("\x1b[?{mode}h").as_bytes());
             let _ = term.take_response();

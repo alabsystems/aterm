@@ -17,7 +17,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global counter for unique temp names within this process.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique temporary name component from the pid, a process-wide
@@ -229,11 +228,7 @@ where
     f(a, b)
 }
 
-// TempDir
-
-/// A temporary directory that is automatically deleted on drop.
-///
-/// The directory and all its contents are removed when this value is dropped.
+/// A temporary directory, removed with all its contents on drop.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
@@ -287,7 +282,7 @@ impl TempDir {
         ))
     }
 
-    /// Get the path to the temporary directory.
+    /// The directory's path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -310,9 +305,7 @@ impl AsRef<Path> for TempDir {
     }
 }
 
-// Builder
-
-/// Builder for creating temporary files and directories with custom options.
+/// Builder for temporary directories with a custom prefix.
 #[derive(Debug, Default)]
 pub struct Builder {
     prefix: Option<String>,
@@ -368,8 +361,6 @@ impl Builder {
     }
 }
 
-// Free functions
-
 /// Create a temporary directory in the system temp directory.
 ///
 /// # Errors
@@ -378,8 +369,6 @@ impl Builder {
 pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
 }
-
-// Stand-in executables
 
 /// Lay an executable stand-in at `path` holding `body`, mode 0555, replacing
 /// whatever is there by rename.
@@ -504,8 +493,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {

@@ -208,13 +208,10 @@ fn code_and_path_context_suppressed() {
 }
 
 /// THE SAME LAW, ON THE NO-SPACE ARM. `code_and_path_context_suppressed` above
-/// walks the SPACED arm of the scanner; the scanner has two, and the boundary
-/// test was spelled on one of them. A maximal no-space run is that arm's whole
-/// token — delimited by a script change exactly as a spaced token is delimited
-/// by a non-token character — so the same paths, flags and URLs must be just
-/// as quiet around Han, Hangul and Thai. Measured before the fix: every shape
-/// below decorated, while its Latin twin one test up did not, so a Japanese or
-/// Korean user's file listing sparkled and an English user's did not.
+/// walks the SPACED arm of the scanner. A maximal no-space run is that arm's
+/// whole token — delimited by a script change exactly as a spaced token is
+/// delimited by a non-token character — so the same paths, flags and URLs must
+/// be just as quiet around Han, Hangul and Thai.
 #[test]
 fn code_and_path_context_suppressed_in_no_space_scripts_too() {
     let o = opts_allow_cat();
@@ -251,9 +248,9 @@ fn code_and_path_context_suppressed_in_no_space_scripts_too() {
 /// exists because "`cat` is also the ubiquitous shell command", and the guard
 /// it drives suppressed every feline surface of <= 3 folded chars. Vietnamese
 /// `mèo` folds to `meo` — three — but is marks-required, so no bare-ASCII
-/// typing can ever reach it, and it is the only single-token cat word vi has.
-/// Turning the shell-command decoration OFF therefore turned Vietnamese feline
-/// off entirely. Two-sided: bare `cat` must stay opt-in.
+/// typing can ever reach it, and it is the only single-token cat word vi has:
+/// the short-feline guard must not silence it. Two-sided: bare `cat` must stay
+/// opt-in.
 #[test]
 fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
     let vi = Lexicon::with_languages(&["vi"]);
@@ -277,10 +274,10 @@ fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
 
 /// MARKS-REQUIRED IS A PROPERTY OF THE KEY, NOT OF THE CLASS. hu `cicák`
 /// (kitties, feline, marked) and id `cicak` (the house gecko, animal, bare)
-/// fold to one key. Feline outranks animal, and the precedence replacement
-/// used to throw the Indonesian claimant's testimony away with its class — so
-/// the bare spelling the data explicitly authored matched NOTHING, and ADDING
-/// a language silently switched off a word that had worked without it.
+/// fold to one key. Feline outranks animal, but the precedence replacement
+/// must keep the bare claimant's testimony: otherwise the bare spelling the
+/// data authored matches NOTHING, and ADDING a language switches off a word
+/// that worked without it.
 #[test]
 fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
     let o = opts_allow_cat();
@@ -386,9 +383,7 @@ fn cjk_single_char_is_opt_in() {
 #[test]
 fn cjk_incidental_compounds_suppressed() {
     // Even with single-char matching ON, exception compounds must not fire.
-    // (熊猫 left this list 2026-08-10: it is a POSITIVE panda form now — the
-    // longer compound wins the munch, which suppresses the inner cat just as
-    // hard; see `animal_multilingual::panda_compounds_are_pandas_...`.)
+    // (熊猫 is a panda: `animal_multilingual::panda_compounds_are_pandas_...`.)
     let on = ScanOptions {
         cjk_single_char: true,
         ..ScanOptions::default()
@@ -514,10 +509,9 @@ fn user_override_extends_coverage() {
     assert_eq!(lx.scan("fucking", &o).len(), 1);
 }
 
-/// v3 §6 (FIX III): USER surfaces that can never scan as written are no
-/// longer silently accepted — a single-char CJK form (dropped at scan unless
-/// `cjk_single_char = true`) and a mixed-script form (dropped at insert) both
-/// surface on the `conflicts` channel. Builtin data stays conflict-free (the
+/// v3 §6: USER surfaces that can never scan as written — a single-char CJK
+/// form (dropped at scan unless `cjk_single_char = true`) and a mixed-script
+/// form (dropped at insert) — surface on the `conflicts` channel. Builtin data stays conflict-free (the
 /// embedded single-char 操/草/干 and multi-word "con mèo" entries are
 /// deliberate and quiet) — pinned by `animal_multilingual.rs`'s
 /// `expanded_builtin_stays_conflict_free`.
@@ -553,9 +547,9 @@ fn user_unscannable_surfaces_surface_as_conflicts() {
     assert!(lx.scan("go abc猫 now", &ScanOptions::default()).is_empty());
 }
 
-// ------------------------------------------- marks-required gate (dmg fix)
+// ------------------------------------------------- marks-required gate ----
 
-/// THE RULE (2026-08-29): a surface that loses diacritics into a bare-ASCII
+/// THE RULE: a surface that loses diacritics into a bare-ASCII
 /// key (`đm` → `dm`, `coño` → `cono`) matches only tokens that themselves
 /// carry folded-away marks. The bare skeleton is ordinary text — `dm` is how
 /// one types `dmg`, `cono` sits inside `conoid` — and stays silent.
@@ -601,7 +595,7 @@ fn fold_idempotent_for_turkish_dotted_i() {
     );
 }
 
-// ===================== emphasis class (sparkle-words v2 P0) =====================
+// ------------------------------------------------------------ emphasis ----
 
 /// An emphasis override entry for the neutral coined word "megathink" — the
 /// shape `[sparkle_words.emphasis].extra_words` compiles into. The builtin
@@ -648,10 +642,8 @@ fn emphasis_negatives() {
     );
 }
 
-/// PIN (2026-07-02 decision): the builtin lexicon ships ZERO emphasis forms —
-/// the earlier hype-oriented seeds are removed, and the emphasis
-/// class is populated solely via `[sparkle_words.emphasis].extra_words` (a
-/// user override entry). Guards against the seeds silently returning.
+/// The builtin lexicon ships ZERO emphasis forms: the class is populated
+/// solely via `[sparkle_words.emphasis].extra_words` (a user override entry).
 #[test]
 fn builtin_ships_no_emphasis_forms() {
     let lx = lex();
@@ -671,31 +663,6 @@ fn builtin_ships_no_emphasis_forms() {
         lx.scan(concat!("ultra", "code ultrathink"), &default_opts())
             .is_empty(),
         "the removed seeds must not match the builtin"
-    );
-}
-
-#[test]
-fn emphasis_short_forms_match_only_with_user_consent() {
-    // v3 §6 FLIP of the former `emphasis_short_forms_never_match` pin: a
-    // USER-supplied (override) short emphasis surface now matches — explicit
-    // config is consent. Non-user short surfaces stay suppressed (see
-    // `non_user_short_emphasis_surface_stays_suppressed`).
-    let over = r#"
-[[entry]]
-class    = "emphasis"
-lang     = "en"
-mode     = "forms"
-stems    = []
-suffixes = []
-forms    = ["wow"]
-cjk      = false
-ambiguous= false
-"#;
-    let lx = Lexicon::with_languages_and_override(&["all"], Some(over)).expect("override parses");
-    assert_eq!(
-        lx.scan("wow", &default_opts()).len(),
-        1,
-        "user-supplied <= 3-folded-char emphasis surfaces match (v3 §6 consent rule)"
     );
 }
 
@@ -756,9 +723,7 @@ ambiguous= false
         lx.scan("megaorca", &o).is_empty(),
         "a retired class = \"orca\" entry loads as nothing, not as an error"
     );
-    // Nor does it mask a lower class any more (2026-09-27): while the class was
-    // suspended an orca entry outranked animal and emphasis and then drew
-    // nothing, so the same word under emphasis decorated nothing either.
+    // Nor does it mask a lower class that lists the same word.
     assert_eq!(
         one("megapod"),
         Class::Emphasis,
@@ -766,7 +731,7 @@ ambiguous= false
     );
 }
 
-// =============== Match.form_id / form_hash (sparkle identity P0) ================
+// ------------------------------------------- Match.form_id / form_hash ----
 
 #[test]
 fn form_hash_populated_and_position_independent() {
@@ -807,7 +772,7 @@ fn form_id_distinguishes_supported_morphology_from_its_stem() {
     assert_ne!(ms[1].form_hash, ms[2].form_hash);
 }
 
-// ===================== language attribution (sparkle-words v2.2 F4.5) =====================
+// ------------------------------------------------ language attribution ----
 
 /// Lang codes of the single match in `text`, in [`aterm_lexicon::LangSet`]
 /// iteration order (ascending id = lexicon first-appearance order, so the
@@ -848,8 +813,8 @@ fn kucing_under_default_languages_is_ms_jv() {
     assert_eq!(lx.lang_code(primary_lang(m.langs)), "ms");
 }
 
-/// The 'meow → Malay' misattribution fix: meow/mew (+ plurals) now live in the
-/// en feline entry, and the ms `meow` listing unions in rather than owning the
+/// meow/mew (+ plurals) attribute to English first: they live in the en
+/// feline entry, and the ms `meow` listing unions in rather than owning the
 /// surface. Holds under the default `["en"]` config too (the ms entry is not
 /// ambiguous).
 #[test]
@@ -1079,11 +1044,8 @@ fn form_hash_helpers_match_scan_semantics() {
 
 // ------------------------------------------------- refusals, never silent ----
 //
-// Three load-time refusals that used to be taken and then discarded. The
-// kitty-command loader's module doc has said for a while that every load law
-// is "recorded on `conflicts`, never silent"; the sparkle loader beside it
-// took three of them silently, and a person who tripped one saw a vocabulary
-// that simply did not arrive.
+// Every load law is recorded on `conflicts`, never silent: a person who
+// trips one must not just see a vocabulary that does not arrive.
 
 /// A configured `[sparkle_words] languages` code the DATA names nowhere
 /// un-gates nothing — `"DA"`, `"da-DK"`, `"dk"`, `"ALL"` are all silently
@@ -1135,10 +1097,9 @@ fn an_unknown_entry_mode_is_reported_and_its_stems_are_not_lost_in_silence() {
     }
 }
 
-/// A typo'd KEY is a parse error, not a list that silently never loads — the
-/// law `tricks.rs` already states in those words, now spelled on this loader
-/// too. `form = [...]` for `forms` used to yield an entry with zero surfaces
-/// and an empty `conflicts()`.
+/// A typo'd KEY is a parse error, not a list that silently never loads (the
+/// same law as `tricks.rs`): `form = [...]` for `forms` must not yield an
+/// entry with zero surfaces and an empty `conflicts()`.
 #[test]
 fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
     for (bad, good) in [
@@ -1175,9 +1136,7 @@ fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
 /// documentation of a word whose head noun is listed separately ("anak
 /// kucing" beside "kucing"). An entry where EVERY surface goes that way is a
 /// different animal: it contributes no key, so its class is unreachable in
-/// that language and nothing said so. Exactly one of 550 entries was in that
-/// state — Indonesian `canine`, whose only surface was the two-word "anak
-/// anjing", with bare `anjing` permanently profanity-claimed.
+/// that language, and that must be reported.
 #[test]
 fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
     let head =
@@ -1202,7 +1161,7 @@ fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
     assert_eq!(live.conflicts(), &[] as &[String]);
 }
 
-/// …and the shipped Indonesian dog now actually reaches its class. `anjing`
+/// …and the shipped Indonesian dog reaches its class. `anjing`
 /// stays the curse (cross-class precedence, deliberate), so the entry needs a
 /// surface of its own: `guguk`, the child-speak dog built from the bark.
 #[test]

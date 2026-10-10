@@ -9,6 +9,11 @@ use super::{
     handoff_masters_have_activity, handoff_ready_deadline, kill_and_reap_handoff_child,
     make_cloexec_pipe, wait_handoff_ready, worker_claim_handoff_reaper,
 };
+// The strip goes on every std candidate below that outlives a moment (each
+// `sleep 30` and its group), before any hook of its own: it holds its stdio
+// and nothing else of this process, not a pipe another test thread had open
+// unflagged at the fork.
+use aterm_uds::spawnfd::InheritNothing as _;
 use std::io::{BufRead as _, Read as _};
 use std::os::unix::process::CommandExt as _;
 
@@ -598,6 +603,7 @@ fn cancellation_kills_descendant_process_group_before_returning() {
     // `std::process::Child`.
     let mut command = std::process::Command::new("/bin/sh");
     command
+        .inherit_nothing()
         .arg("-c")
         .arg("sleep 30 & printf '%s\\n' \"$!\"; wait")
         .stdout(std::process::Stdio::piped());
@@ -646,6 +652,7 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
     // `std::process::Child`.
     let mut command = std::process::Command::new("/bin/sh");
     command
+        .inherit_nothing()
         .arg("-c")
         .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0")
         .stdout(std::process::Stdio::piped());
@@ -777,7 +784,7 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
     // `std::process::Child`.
     let mut command = std::process::Command::new("/bin/sh");
-    command.arg("-c").arg("sleep 30");
+    command.inherit_nothing().arg("-c").arg("sleep 30");
     // SAFETY: async-signal-safe setpgid only, matching production.
     unsafe {
         command.pre_exec(|| {
@@ -980,6 +987,7 @@ fn sleeping_candidate() -> (
     // std on purpose: `HandoffCandidateHandle::Forked` holds the shipped fork lane's
     // `std::process::Child`.
     let child = std::process::Command::new("/bin/sh")
+        .inherit_nothing()
         .arg("-c")
         .arg("exec sleep 30")
         .stdin(std::process::Stdio::null())
@@ -1078,6 +1086,7 @@ fn emergency_reaper_kills_group_even_after_leader_exits() {
     // spawnfd's `Child` would `waitpid` the (possibly recycled) number again on drop.
     let mut command = std::process::Command::new("/bin/sh");
     command
+        .inherit_nothing()
         .arg("-c")
         // The descendant does not retain stdout, so EOF proves the leader
         // completed its immediate exit without our test reaping it.

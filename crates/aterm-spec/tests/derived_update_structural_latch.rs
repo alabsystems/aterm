@@ -3,19 +3,18 @@
 
 use aterm_spec::{derive::native_update_structural_latch_model, interp, verify};
 
-/// A STRUCTURAL convergence no longer strands every later release (gap 14,
-/// 2026-09-26; round three). The latch on build N gets ONE re-sample after a
-/// day — never the launch its boot trial reverts on, which is held and said
-/// instead, and never PROMISED past the first count that rules it out (gap 14
-/// review) — and a verified newer release takes N's place at the install path,
-/// whatever the trial, without N being launched for it — and a retire that is
-/// REFUSED leaves that release unspent, offered again at its retry deadline
-/// (round three review). Build N stays covered whatever the digest. The
-/// negative controls replay gap 14's own `Decide`, the refusal that spent the
-/// release, the strand before gap 14 and its trial-blind fix, each in its own
-/// runs. Tier-0 here; the Tier-1 bind to the real
-/// `structural_latch`, `spend_physical_failure_budget` and
-/// `AutoApplyManualOnly::covers` is aterm-gui's `native_updater_conformance.rs`.
+/// A STRUCTURAL convergence does not strand every later release (gap 14). The
+/// latch on build N gets ONE re-sample after a day — never the launch its boot
+/// trial reverts on, which is held and said instead, and never PROMISED past the
+/// first count that rules it out — and a verified newer release takes N's place
+/// at the install path, whatever the trial, without N being launched for it —
+/// and a retire that is REFUSED leaves that release unspent, offered again at
+/// its retry deadline. Build N stays covered whatever the digest. The negative
+/// controls replay gap 14's own `Decide`, the refusal that spent the release,
+/// the strand before gap 14 and its trial-blind fix, each in its own runs.
+/// Tier-0 here; the Tier-1 bind to the real `structural_latch`,
+/// `spend_physical_failure_budget` and `AutoApplyManualOnly::covers` is
+/// aterm-gui's `native_updater_conformance.rs`.
 #[test]
 fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
     let model = native_update_structural_latch_model();
@@ -57,11 +56,11 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
         assert!(!model.action_enabled("DayPasses", &newer));
     }
 
-    // A refused retire leaves the latch, said, and does NOT spend the release
-    // (round three review): a refusal can be a moment — a verification that ran
-    // out of its budget, the apply lock held too long — so the release is
-    // offered again once its retry deadline passes. Until then it still
-    // outranks the day: N is not launched while a newer build is on its way.
+    // A refused retire leaves the latch, said, and does NOT spend the release.
+    // A refusal can be a moment — a verification that ran out of its budget,
+    // the apply lock held too long — so the release is offered again once its
+    // retry deadline passes. Until then it still outranks the day: N is not
+    // launched while a newer build is on its way.
     for trial in ["TrialHasRoom", "TrialIsSpent"] {
         let mut refused = model.init_state();
         assert!(model.fire(trial, &mut refused));
@@ -323,7 +322,7 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
         "gap 14 without room: held and said, the release spent"
     );
     assert!(!buggy.check_invariant("ANewerReleaseClearsTheLatch", &held));
-    // THE REFUSAL THAT SPENT THE RELEASE (round three as first shipped), looking
+    // THE REFUSAL THAT SPENT THE RELEASE (as first shipped), looking
     // at the newer release after the day: the look starts the retire as the
     // healthy lane does, and the refusal keeps the release spent, with no retry.
     let mut spent = buggy.init_state();

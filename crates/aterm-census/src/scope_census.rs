@@ -396,8 +396,8 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
       - IT PROVES THE ENFORCER DOES NOT MULTIPLY, NOT THAT NOT-MULTIPLYING IS
         SUFFICIENT. Whether the aggregator's scan is CORRECT over every shard
         is a model obligation (the `machine` field), checked elsewhere.
-      - SCOPE OF THE SWEEPS: non-test `crates/**/*.rs`, with #[cfg(test)] /
-        #[cfg(kani)] items blanked and crates/aterm-census/src excluded (the
+      - SCOPE OF THE SWEEPS: non-test `crates/**/*.rs`, with #[cfg(test)]
+        items blanked and crates/aterm-census/src excluded (the
         registry itself names every token and phrase).
 ";
 
@@ -572,8 +572,8 @@ fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Item gates whose code never ships: masked before every sweep, so test-only
-/// engines and kani harnesses can construct as many enforcers as they like.
-const UNSHIPPED_GATES: &[&str] = &["#[cfg(test)]", "#[cfg(kani)]"];
+/// engines can construct as many enforcers as they like.
+const UNSHIPPED_GATES: &[&str] = &["#[cfg(test)]"];
 
 /// Repo-relative, forward-slashed path for diagnostics and registry matching.
 fn rel(root: &Path, path: &Path) -> String {

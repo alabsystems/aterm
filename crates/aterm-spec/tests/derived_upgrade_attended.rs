@@ -7,7 +7,7 @@ use aterm_spec::{derive::upgrade_attended_turn_end_model, interp, verify};
 /// 2026-09-27 20:27 point, s-d3346: `held-back:attended` owning nothing, and
 /// `keep going` typed at the grace's lapse over the READY). Proved at `Buggy =
 /// 0`, caught at `Buggy = 1` on the live path; the backstop's count caught on
-/// its own dials — `Every = 1` (every wait in a row, the review of 2026-09-28)
+/// its own dials — `Every = 1` (every wait in a row)
 /// and `Stretch = 1` (not started over at the READY's turn) — each by the
 /// bounded check and on its own path; and the backstop for a stamp that fails
 /// closed is real: past `Bound` looks at the point the loop may continue, and
@@ -55,7 +55,7 @@ fn a_person_s_grace_over_a_ready_ends_in_the_restart() {
     let times =
         |n: i64, action: &'static str| std::iter::repeat_n(action, usize::try_from(n).unwrap());
 
-    // The review of 2026-09-28: the notice's answers without READY before it,
+    // The notice's answers without READY before it,
     // more of them than the backstop's looks. Fixed, the READY's first look
     // owns the point all the same.
     let before: Vec<&str> = times(bound + 1, "HostWaitsBefore")

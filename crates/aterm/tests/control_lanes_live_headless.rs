@@ -4,66 +4,49 @@
 //! The window's control socket keeps answering new clients however many
 //! PERSISTENT drivers hold connections to it, across a real headless instance.
 //!
-//! THE DEFECT (the live end-to-end run of 2026-09-26): the socket served a
-//! connection on one of eight fixed lanes for as long as the connection stayed
-//! open, so an open connection cost a lane whether it had a request or not —
-//! and every supervised agent tab holds one (its loop's persistent
-//! `RelayCtl`), parked most of the time in a 20 s `await`. Six supervised tabs
-//! plus two held connections made every new `aterm ctl` fail for a minute; with
-//! eight supervised tabs every other client — the owner's `aterm ctl`, agents,
-//! the fabric — would have been refused outright
-//! (`ERR control server busy; retry`).
+//! THE DEFECT: a connection held one of eight fixed lanes for as long as it
+//! stayed open, request or not, and every supervised agent tab holds one (its
+//! loop's `RelayCtl`, parked in a 20 s `await`). Eight supervised tabs refused
+//! every other client (`ERR control server busy; retry`).
 //!
 //! What this drives, over the real socket of the one `aterm` binary:
 //!
-//! * `idle_and_waiting_drivers_do_not_starve_a_new_client` — twelve
-//!   authenticated connections left IDLE between requests and twelve more
-//!   parked in a long `await` — twenty-four persistent drivers, three times
-//!   the eight lanes — and then fresh clients, raw and through `aterm ctl`,
-//!   must be answered every time. The held connections still answer in order
-//!   afterwards (the persistent-driver contract is kept, not traded away).
+//! * `idle_and_waiting_drivers_do_not_starve_a_new_client` — twelve idle and
+//!   twelve `await`-parked drivers (three times the lanes), then fresh clients,
+//!   raw and through `aterm ctl`, are answered every time, and the held
+//!   connections still answer in order afterwards.
 //! * `waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back`,
-//!   the NEGATIVE CONTROL: the busy reply is not gone. Waits are opened until
-//!   every wait lane and the request lanes' wait budget (half of them) hold
-//!   one, each admitted while fresh clients are still answered (idle drivers
-//!   held alongside do not count); the wait past that is answered the busy
-//!   line on a connection that stays open, and fresh clients — `aterm ctl`
-//!   among them — are still answered beside every wait. Before the budget (the
-//!   review of 2026-09-27), those waits took the request lanes without limit:
-//!   72 filled the socket, every fresh client was refused, and a parked
-//!   driver's next request waited behind them. `aterm ctl` reports the wait's
-//!   refusal as busy — an ordinary failure naming the server's words, never
-//!   "Broken pipe". Then every waiting client hangs up, and its place comes
-//!   back at the hangup, not at its own timeout (2026-09-25: SIGKILLed `aterm
-//!   ctl await … timeout=20000` clients kept every lane busy for the full
-//!   20 s): a fresh wait is held long before the waits' own end. The
-//!   listener's health fields are on `metrics`.
+//!   the NEGATIVE CONTROL: waits fill every wait lane and the request lanes'
+//!   wait budget (half of them), fresh clients answered beside each; the next
+//!   wait gets the busy line on a connection that stays open, and `aterm ctl`
+//!   reports it as busy, never "Broken pipe". Without the budget, waits took
+//!   every request lane and refused every fresh client. When the waits hang
+//!   up their places come back at once, not at their own timeout (SIGKILLed
+//!   `aterm ctl await … timeout=20000` clients once held every lane for 20 s).
+//!   The listener's health fields are on `metrics`.
 //! * `pipelined_waits_are_held_while_wait_lanes_are_free`: a wait with a
-//!   request written right behind it — `RelayClient::dial_via_local`'s
-//!   `dial <name>` then `version`, one `aterm drive --dial` relay each — moves
-//!   to a wait lane carrying that request, so twice the request lanes' worth of
-//!   them are all held, none told busy, and each `version` is answered after
-//!   its wait (the held waits end by the text typed into the session, one more
-//!   by its own short timeout). Until the carry, such a wait stayed on its
-//!   request lane: it held that lane for the relay's whole life, and with the
-//!   wait budget the fifth was told busy with most of the wait lanes free.
+//!   request written right behind it (`RelayClient::dial_via_local`'s `dial
+//!   <name>` then `version`) moves to a wait lane carrying that request, so
+//!   twice the request lanes' worth are all held, none told busy, and each
+//!   `version` is answered after its wait.
 //! * `the_connection_past_the_cap_is_told_busy_and_tabs_still_open`: the
-//!   open-connection bound answers to the descriptor limit. Under launchd's
-//!   default (a soft `RLIMIT_NOFILE` of 256, what the window started from the
-//!   Dock runs with) idle drivers are opened until a refusal STAYS (a
-//!   momentary one, while the lanes are still placing earlier connections, is
-//!   dialled again, and one is made on purpose so the retry is exercised): the
-//!   refusal must be the busy line, at exactly a quarter of the limit, and the
-//!   window must still open tabs. A fixed 1024 let about
-//!   240 idle connections use the process up (2026-09-26): every fresh client
-//!   then got a dropped connection instead of the busy line, and a new tab had
-//!   no descriptor left. And `aterm ctl` at the cap prints the busy line — for
-//!   a verb it sends (`status`) and for the discovery it answers itself (`ls`,
-//!   which until 2026-09-27 said "the addressed instance did not answer").
+//!   open-connection cap is a quarter of the descriptor limit. Under launchd's
+//!   default soft `RLIMIT_NOFILE` of 256 (a window started from the Dock), idle
+//!   drivers are opened until a refusal STAYS: it must be the busy line, at
+//!   exactly the cap, and the window must still open tabs. A fixed 1024 let
+//!   about 240 idle connections exhaust the descriptors, so clients got a
+//!   dropped connection and new tabs failed. `aterm ctl` at the cap prints the
+//!   busy line both for a sent verb (`status`) and for its own discovery (`ls`).
+//! * `peers_that_stop_mid_exchange_take_no_lane`: twice the request lanes'
+//!   worth each of peers that dialled and said nothing, stopped half way
+//!   through a request line, stopped half way through a frame's body, or did
+//!   not read a large answer (`help --full`). Each once held a request lane
+//!   while the server waited on it (a deadline on the wait only made it
+//!   reconnect); now the parker holds them, fresh clients are answered beside
+//!   them, and each is served once it goes on, its answer whole.
 //!
-//! Every instance runs under a descriptor limit its test names (the cap is a
-//! quarter of it), so no verdict depends on the shell the suite was started
-//! from.
+//! Every instance runs under a descriptor limit its test names, so no verdict
+//! depends on the shell the suite was started from.
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private explicit control socket, a
 //! config with every automatic lane off (the harness included), `--no-reroute`,
@@ -101,17 +84,12 @@ const BUSY: &str = "ERR control server busy; retry";
 /// a moment: a lane places a connection in milliseconds on an idle machine
 /// and can take a scheduler's seconds on a loaded one, while a cap or a
 /// saturation lasts until a connection closes or a wait ends. Paid only once a
-/// refusal is seen (a probe every 50 ms until it clears): it was 500 ms, and
-/// a lane that took longer than that ended the filling below the cap.
+/// refusal is seen (a probe every 50 ms until it clears).
 const REFUSAL_STAYS: Duration = Duration::from_secs(5);
 
 /// How long a wait for something that MUST happen may take before it is read
 /// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
 const HANG: Duration = Duration::from_secs(60);
-
-/// Where the cap test makes a refusal momentary on purpose: well below the cap
-/// (a quarter of launchd's 256 is 64).
-const MOMENT_AT: usize = 16;
 
 /// The soft descriptor limit launchd gives an app it starts (the Dock, Finder,
 /// `open`): the window's own budget, which aterm does not raise.
@@ -276,7 +254,7 @@ impl Driver {
     }
 
     /// Dial and say nothing: a peer the server gives its handshake time to
-    /// (30 s to present a token), on a request lane, while it stays silent.
+    /// (30 s from admission to present a token), in the parker, not on a lane.
     fn silent(sock: &Path) -> Self {
         let stream =
             UnixStream::connect(sock).unwrap_or_else(|e| panic!("dial the control socket: {e}"));
@@ -331,7 +309,12 @@ impl Driver {
     /// the listener refused may be closed before the line lands (`EPIPE`), and
     /// its busy line is still there for the next read, which decides.
     fn send(&mut self, line: &str) {
-        let _ = self.stream().write_all(format!("{line}\n").as_bytes());
+        self.send_raw(format!("{line}\n").as_bytes());
+    }
+
+    /// Write `bytes` as they are: part of a request, its newline still to come.
+    fn send_raw(&mut self, bytes: &[u8]) {
+        let _ = self.stream().write_all(bytes);
     }
 
     /// A reply ALREADY waiting on the connection, read without blocking: the
@@ -413,42 +396,14 @@ fn idle_driver(sock: &Path, token: &str) -> Result<Driver, String> {
     }
 }
 
-/// A momentary refusal, made on purpose: silent peers — dialled, never
-/// authenticated — until every request lane is at work on one's handshake, as
-/// a burst of new connections leaves them. A peer the listener refused on
-/// arrival (a lane was still placing the last driver) holds the busy line once
-/// a later client is answered (the listener writes it before it accepts the
-/// next peer), and is dialled again. Returns the peers; hanging them up ends
-/// the moment.
-fn occupy_request_lanes(sock: &Path, token: &str) -> Vec<Driver> {
-    let mut silent: Vec<Driver> = Vec::new();
-    for _ in 0..40 {
-        while silent.len() < RPC_LANES {
-            silent.push(Driver::silent(sock));
-        }
-        let reply = probe(sock, token);
-        silent.retain_mut(|peer| peer.waiting_reply().is_none());
-        if silent.len() == RPC_LANES {
-            assert_eq!(
-                reply, BUSY,
-                "a fresh client was served with {RPC_LANES} handshakes in progress"
-            );
-            return silent;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("the request lanes never all took a silent peer");
-}
-
 /// Text no row of this idle instance holds, until a test types it into the
 /// session.
 const WAIT_TEXT: &str = "zq-no-row-holds-this-qz";
 
 /// A wait the server can only end at its timeout (or when a test types
 /// [`WAIT_TEXT`]): `await match` for text no row of this idle instance holds.
-/// (Not `await seq <huge>`: an anchor above the current count is now read as
-/// one from another grid or process and latched at once — round seven of the
-/// update audit, finding 29.)
+/// (Not `await seq <huge>`: an anchor above the current count is read as one
+/// from another grid or process and latched at once.)
 fn long_wait(timeout_ms: u64) -> String {
     format!("await match {WAIT_TEXT} timeout {timeout_ms}")
 }
@@ -646,28 +601,19 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
 
     // Idle drivers, each served once and kept open, until a refusal STAYS. The
     // busy line is for work too: on a loaded machine every request lane can
-    // still be placing an earlier connection when the next one arrives
-    // (measured 2026-09-26: one early refusal at 25 open, its retry served
-    // 0.4 ms later). A refused connection never counted, so such a moment is
-    // dialled again and the filling goes on; the cap is a refusal that holds
-    // for [`REFUSAL_STAYS`] — the cap ends only when a connection closes, a
-    // lane's moment in milliseconds (seconds on a loaded gate). So that the
-    // retry is never dead code, one such
-    // moment is made on purpose at `MOMENT_AT` open (`occupy_request_lanes`)
-    // and ends as its silent peers hang up; taking its refusal for the cap
-    // would stop the filling there.
+    // still be placing an earlier connection when the next one arrives (one
+    // early refusal at 25 open was measured, its retry served 0.4 ms later).
+    // Such a moment is dialled again and the filling goes on; the cap is a
+    // refusal that holds for [`REFUSAL_STAYS`]. No client can make a moment on
+    // purpose any more: silent peers made one here until a peer's silence
+    // stopped holding a lane (`peers_that_stop_mid_exchange_take_no_lane`).
     let mut held: Vec<Driver> = Vec::new();
-    let mut moment: Option<Vec<Driver>> = None;
-    let mut made_moment_retried = false;
     let mut cleared = 0;
     let refusal = 'fill: loop {
         assert!(
             held.len() < TRIES,
             "{TRIES} connections open at soft limit {soft_limit} and none refused"
         );
-        if held.len() == MOMENT_AT && !made_moment_retried && moment.is_none() {
-            moment = Some(occupy_request_lanes(&sock, &token));
-        }
         let reply = match idle_driver(&sock, &token) {
             Ok(driver) => {
                 held.push(driver);
@@ -678,24 +624,18 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         if reply != BUSY {
             break reply;
         }
-        // The moment made on purpose ends here: its silent peers hang up.
-        let made = moment.take().is_some();
         let stays = Instant::now() + REFUSAL_STAYS;
         while Instant::now() < stays {
             std::thread::sleep(Duration::from_millis(50));
             match idle_driver(&sock, &token) {
                 Ok(driver) => {
                     held.push(driver);
-                    if made {
-                        made_moment_retried = true;
-                    } else {
-                        cleared += 1;
-                        assert!(
-                            cleared <= 40,
-                            "{cleared} refusals cleared on retry below the cap: \
-                             the lanes are not free of idle connections"
-                        );
-                    }
+                    cleared += 1;
+                    assert!(
+                        cleared <= 40,
+                        "{cleared} refusals cleared on retry below the cap: \
+                         the lanes are not free of idle connections"
+                    );
                     continue 'fill;
                 }
                 Err(again) if again == BUSY => {}
@@ -705,8 +645,7 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         break reply;
     };
     eprintln!(
-        "cap: {} open at soft limit {soft_limit}; the moment made at {MOMENT_AT} retried: \
-         {made_moment_retried}; {cleared} more momentary refusals retried",
+        "cap: {} open at soft limit {soft_limit}; {cleared} momentary refusals retried",
         held.len()
     );
     assert_eq!(
@@ -721,10 +660,6 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         cap,
         "the socket refuses, and keeps refusing, at a quarter of the soft descriptor \
          limit {soft_limit} ({cleared} momentary refusals retried)"
-    );
-    assert!(
-        made_moment_retried,
-        "the refusal made momentary on purpose at {MOMENT_AT} open was never retried"
     );
     for driver in &held {
         bound_reads(driver.stream(), HANG);
@@ -1177,4 +1112,126 @@ fn pipelined_waits_are_held_while_wait_lanes_are_free() {
             "pipelined wait {index}: then its `version`, got {next:?}"
         );
     }
+}
+
+/// Read until a line that starts with `upto` has arrived: the count of bytes
+/// before that line, and the line itself.
+fn read_through(reader: &mut BufReader<UnixStream>, upto: &str) -> (usize, String) {
+    let mut before = 0;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("the connection ended {before} bytes in, before {upto:?}"),
+            Ok(_) if line.starts_with(upto) => return (before, line.trim_end().to_string()),
+            Ok(read) => before += read,
+            Err(e) => panic!("read {before} bytes, then: {e}"),
+        }
+    }
+}
+
+#[test]
+fn peers_that_stop_mid_exchange_take_no_lane() {
+    /// Of each kind: twice the request lanes, each of which it once held.
+    const EACH: usize = 2 * RPC_LANES;
+
+    roomy_test_process();
+    let Some(world) = world("m") else {
+        eprintln!("SKIP: no scratch base with a short enough socket path");
+        return;
+    };
+    let sock = world.0.join("run/aterm/lanes.sock");
+    let Some(_instance) = boot(&world.0, &sock, ROOMY_SOFT_LIMIT) else {
+        return;
+    };
+    let token = token(&sock);
+    // What a `help --full` answer is, read whole by a client that reads.
+    let whole = {
+        let mut reader = Driver::open(&sock, &token);
+        reader.send("help --full");
+        reader.send("version");
+        read_through(&mut reader.reader, "OK version=").0
+    };
+
+    // Each peer is placed one at a time, never in a burst (a burst of fresh
+    // connections is work that may fill the request lanes for a moment, which
+    // the busy line is FOR). Dialled, and not a byte said: one the listener
+    // refused on arrival holds the busy line once a later client is answered,
+    // and is dialled again.
+    let mut silent: Vec<Driver> = Vec::new();
+    while silent.len() < EACH {
+        let mut peer = Driver::silent(&sock);
+        answered(&sock, &token);
+        if peer.waiting_reply().is_none() {
+            silent.push(peer);
+        }
+    }
+    let established = |what: &str| {
+        Driver::established(&sock, &token)
+            .unwrap_or_else(|reply| panic!("a {what} peer was not served: {reply:?}"))
+    };
+    // Half a request line.
+    let mut halfway: Vec<Driver> = (0..EACH)
+        .map(|_| {
+            let mut driver = established("half-sent");
+            driver.send_raw(b"vers");
+            driver
+        })
+        .collect();
+    // A frame's header and half its body (into the idle shell's input line).
+    let mut framing: Vec<Driver> = (0..EACH)
+        .map(|_| {
+            let mut driver = established("half-framed");
+            driver.send_raw(b"feed-bin 6\nabc");
+            driver
+        })
+        .collect();
+    // A large answer asked for, and not read: then the request behind it.
+    let mut unread: Vec<Driver> = (0..EACH)
+        .map(|_| {
+            let mut driver = established("unread");
+            driver.send("help --full");
+            driver.send("version");
+            driver
+        })
+        .collect();
+
+    // Sixty-four peers the server is waiting on, against eight request lanes:
+    // every fresh client is answered (a moment of work is waited out), raw and
+    // through `aterm ctl`.
+    for attempt in 0..20 {
+        let reply = answered(&sock, &token);
+        assert!(
+            reply.starts_with("OK"),
+            "fresh client {attempt} was refused beside {EACH} silent, {EACH} half-sent, \
+             {EACH} half-framed and {EACH} unread peers: {reply:?}"
+        );
+    }
+    let out = aterm_ctl(&world.0, &sock, &["version"]);
+    assert!(
+        out.status.success(),
+        "aterm ctl version beside them: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Each goes on, and is served: nothing it began was lost.
+    for (index, driver) in halfway.iter_mut().enumerate() {
+        driver.send_raw(b"ion\n");
+        let reply = driver.line();
+        assert!(
+            reply.starts_with("OK version="),
+            "half-sent peer {index}: {reply:?}"
+        );
+    }
+    for (index, driver) in framing.iter_mut().enumerate() {
+        driver.send_raw(b"def");
+        assert_eq!(driver.line(), "OK 6 bytes", "half-framed peer {index}");
+    }
+    for (index, driver) in unread.iter_mut().enumerate() {
+        let (got, _) = read_through(&mut driver.reader, "OK version=");
+        assert_eq!(
+            got, whole,
+            "unread peer {index}: its answer, whole, then the next"
+        );
+    }
+    drop(silent);
 }

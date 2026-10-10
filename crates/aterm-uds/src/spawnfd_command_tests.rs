@@ -307,8 +307,8 @@ fn staged_closed_stdio() {
 /// process that has closed its stdin and stdout, `io::pipe()` hands out 0
 /// and 1 — so this process's end of a child's pipe lands there and, left
 /// there, reads to the spawn as this process's own stdio, which an inherited
-/// slot hands the child (review of 2026-10-01: a child given the write end of
-/// its own stdin as its stdout waited for its stdin's end forever). Moved off
+/// slot hands the child (a child given the write end of its own stdin as its
+/// stdout waits for its stdin's end forever). Moved off
 /// 0..=2, the closed slots read closed and the child gets `/dev/null` there:
 /// `cat` sees its stdin end, and a child's stdin is not the read end of its
 /// own stdout.
@@ -642,8 +642,8 @@ fn programs_arguments_environments_and_directories_match_std() {
     );
     assert_eq!(kind_of("a script with no #! line"), Some(Ok(Some(0))));
     // `posix_spawnp` (this process's PATH) ends at the entry too long to join
-    // to the name; `execvp` (an edited one) passes it over (review of
-    // 2026-10-01). glibc refuses any name over `NAME_MAX` the same way both.
+    // to the name; `execvp` (an edited one) passes it over. glibc refuses any
+    // name over `NAME_MAX` the same way both.
     if cfg!(target_vendor = "apple") {
         assert_eq!(
             kind_of("a name too long for the PATH, which is this process's"),
@@ -732,8 +732,8 @@ fn held_out_err(fd: RawFd) -> [String; 2] {
 /// **A CHILD HOLDS ITS STDIO AND NOTHING ELSE, AND ITS PIPES STILL WORK.** An
 /// unflagged descriptor reaches a deliberately leaky raw spawn (the control,
 /// [`test_support::leaky_output`]: not `std`'s `Command`, whose child Trust's
-/// std hands nothing above stdio since SP-1) and none of
-/// the three paths through [`command`] — `spawn` with a piped stdout, `output`
+/// std hands nothing above stdio) and none of the three paths through
+/// [`command`] — `spawn` with a piped stdout, `output`
 /// (both pipes captured, the status kept) and `status` — nor a `std` command
 /// given [`InheritNothing::inherit_nothing`].
 #[test]
@@ -834,8 +834,8 @@ fn staged_pair_race() {
         .count();
     // NON-VACUITY: the same race through a deliberately leaky raw spawn
     // (`test_support`: Darwin's `posix_spawn` with no `CLOEXEC_DEFAULT`, as
-    // upstream std spawned; Trust's std no longer leaks, SP-1) must show a
-    // pair end at the spawn, or a clean count above would say nothing.
+    // upstream std spawns) must show a pair end at the spawn, or a clean count
+    // above would say nothing.
     let control = (0..PAIR_RACE_CONTROL_SPAWNS)
         .filter(|_| {
             let status = test_support::leaky_status("/bin/sh", &["-c", &probe]).expect("spawn");
@@ -1176,8 +1176,7 @@ fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
 /// the child leads a group of its own, or a session (and its group) of its
 /// own, read back with `getpgid` and `getsid`. Both at once, the session
 /// wins: the child leads its own group whatever group was asked — group `0`
-/// too, which asked of the kernel as well made the spawn answer `EPERM`
-/// (review of 2026-10-01).
+/// too, which asked of the kernel as well makes the spawn answer `EPERM`.
 #[test]
 fn a_child_leads_the_group_or_the_session_it_was_given() {
     unsafe extern "C" {
@@ -1333,10 +1332,10 @@ fn an_exec_hands_over_a_close_on_exec_source() {
 // The benchmark: what a spawn costs a process shaped like the window
 // ---------------------------------------------------------------------------
 
-/// The window's shape, as the landing review measured it: 6 585 VM regions and
-/// about 400 MB resident. The stage maps `BENCH_CHUNKS` chunks of
-/// `BENCH_CHUNK` bytes and makes every other one inaccessible, so each is a
-/// region of its own; the writable half is touched resident.
+/// The window's shape, measured: 6 585 VM regions and about 400 MB resident.
+/// The stage maps `BENCH_CHUNKS` chunks of `BENCH_CHUNK` bytes and makes every
+/// other one inaccessible, so each is a region of its own; the writable half is
+/// touched resident.
 #[cfg(target_vendor = "apple")]
 const BENCH_CHUNK: usize = 128 * 1024;
 #[cfg(target_vendor = "apple")]
@@ -1463,7 +1462,7 @@ fn staged_bench() {
             }),
         ),
         (
-            "std Command + InheritNothing (fork: command() before)",
+            "std Command + InheritNothing (fork + strip)",
             Box::new(|| {
                 let mut child = std::process::Command::new("/usr/bin/true")
                     .inherit_nothing()
@@ -1517,8 +1516,8 @@ fn staged_bench() {
 /// window — about 6 400 VM regions, 400 MB resident — the `spawn()` call and
 /// the parent's bill after it (rewriting its resident memory once, the
 /// copy-on-write faults a fork leaves) for a plain `std` spawn (the
-/// `posix_spawn` baseline), the forked `std` + strip that [`command`] was, and
-/// [`command`] now. Run it by hand:
+/// `posix_spawn` baseline), a forked `std` + strip, and [`command`]. Run it by
+/// hand:
 ///
 /// ```text
 /// targo --unverified test -p aterm-uds --lib -- --ignored --nocapture \

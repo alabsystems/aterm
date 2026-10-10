@@ -115,32 +115,9 @@ impl Drop for ApplyBudget {
     }
 }
 
-/// How much of a child's stderr [`status_bounded_with_stderr`] keeps: the LAST
+/// How much of a child's stderr [`status_bounded_with_stderr_observed`] keeps: the LAST
 /// bytes, because a diagnostic is the last thing a failing copy prints.
 const STDERR_KEEP: usize = 512;
-
-/// Bounded run of a child whose stdout is worth nothing but whose STDERR is —
-/// today `ditto`, whose copy can legitimately run for minutes and therefore gets
-/// its own explicit `limit` rather than [`HELPER_TIMEOUT`] or the apply budget.
-///
-/// A timeout is an `Err`. Termination and reaping use only a short reserve from
-/// the original budget; the typed internal result distinguishes an observed exit
-/// from unconfirmed cleanup so callers do not reclaim a live writer's paths.
-///
-/// The tail of stderr rides back with the status so a failure can say WHY: a bare
-/// exit status reads the same for a full disk, a corrupt archive and a read-only
-/// volume.
-///
-/// The stream is drained on its own thread, so a child that writes more than the
-/// pipe holds cannot wedge against this poll loop; only the tail is kept. The
-/// returned string is empty when the child said nothing.
-pub(crate) fn status_bounded_with_stderr(
-    cmd: &mut Command,
-    what: &str,
-    limit: Duration,
-) -> Result<(std::process::ExitStatus, String), String> {
-    status_bounded_with_stderr_observed(cmd, what, limit).map_err(|failure| failure.message)
-}
 
 /// Failure of an owned helper, including whether its absence was actually
 /// observed. A kill request alone is not an exit/reap witness.
@@ -181,6 +158,21 @@ fn stop_helper_before(child: &mut impl HelperChild, deadline: Instant) -> bool {
     }
 }
 
+/// Bounded run of a child whose stdout is worth nothing but whose STDERR is —
+/// today `ditto`, whose copy can legitimately run for minutes and therefore gets
+/// its own explicit `limit` rather than [`HELPER_TIMEOUT`] or the apply budget.
+///
+/// A timeout is an `Err`. Termination and reaping use only a short reserve from
+/// the original budget; the typed internal result distinguishes an observed exit
+/// from unconfirmed cleanup so callers do not reclaim a live writer's paths.
+///
+/// The tail of stderr rides back with the status so a failure can say WHY: a bare
+/// exit status reads the same for a full disk, a corrupt archive and a read-only
+/// volume.
+///
+/// The stream is drained on its own thread, so a child that writes more than the
+/// pipe holds cannot wedge against this poll loop; only the tail is kept. The
+/// returned string is empty when the child said nothing.
 pub(crate) fn status_bounded_with_stderr_observed(
     cmd: &mut Command,
     what: &str,
@@ -878,12 +870,13 @@ mod tests {
             crate::is_passing_refusal(&timed_out("codesign", false)),
             "the helper's own ceiling is the same moment"
         );
-        let copy = status_bounded_with_stderr(
+        let copy = status_bounded_with_stderr_observed(
             Command::new("/bin/sleep").arg("30"),
             "ditto",
             Duration::from_millis(100),
         )
-        .expect_err("a copy past its limit is a failure");
+        .expect_err("a copy past its limit is a failure")
+        .message;
         assert!(crate::is_passing_refusal(&copy), "{copy}");
 
         // CONTROL: `false` ran and refused — the verdict shape, with no key.
@@ -1145,7 +1138,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_bounded_keeps_the_tail_of_stderr_without_wedging_on_a_flood() {
-        let (status, stderr) = status_bounded_with_stderr(
+        let (status, stderr) = status_bounded_with_stderr_observed(
             Command::new("/bin/sh")
                 .arg("-c")
                 .arg("echo 'first line' >&2; echo 'ditto: No space left on device' >&2; exit 1"),
@@ -1161,7 +1154,7 @@ mod tests {
         );
 
         // A flood: 128 KiB of stderr, past the 64 KiB pipe, then a clean exit.
-        let (status, stderr) = status_bounded_with_stderr(
+        let (status, stderr) = status_bounded_with_stderr_observed(
             Command::new("/bin/sh")
                 .arg("-c")
                 .arg("i=0; while [ $i -lt 2048 ]; do echo 'a line of stderr noise, sixty-four bytes long, give or take..' >&2; i=$((i+1)); done; echo 'the last line' >&2"),
@@ -1178,7 +1171,7 @@ mod tests {
         assert_eq!(last_stderr_line(&stderr), Some("the last line"));
 
         // Silence is an empty tail, not a failure.
-        let (status, stderr) = status_bounded_with_stderr(
+        let (status, stderr) = status_bounded_with_stderr_observed(
             &mut Command::new("/usr/bin/true"),
             "a quiet copy",
             Duration::from_secs(60),

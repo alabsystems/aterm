@@ -644,8 +644,7 @@ fn rainbow_coalesced_typing_sweeps_every_skipped_cell() {
 /// A hand at human speed into an app that repaints late: seven presses at 10
 /// keys/s, one repaint ~700 ms later, one observed move of seven columns (and
 /// one of ten). A credit is spent by the cells it lays and survives until then,
-/// so the presses that earned the cells pay for them however old they are
-/// (owner, 2026-09-10).
+/// so the presses that earned the cells pay for them however old they are.
 #[test]
 fn a_late_repaint_lays_every_cell_the_hand_typed() {
     let g = geom();
@@ -843,7 +842,7 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     );
 
     // ONE press, caret jumps five columns: vim's `w`. Refused by the credit
-    // budget — and the ring must now say which budget.
+    // budget, and the ring must say which budget.
     let at = t0 + Duration::from_millis(260);
     glow.note_typed_cells(at, 1);
     glow.tick(
@@ -926,8 +925,7 @@ fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
 /// Width-credit pricing: one press of a wide glyph advances two columns, so its
 /// echo coalesces on that press's 2-cell credit and sweeps the continuation
 /// cell. The same hop on a 1-cell credit is a skim and is refused, and an
-/// admitted coalesce spends its credits so they cannot fund a second echo
-/// (owner, 2026-08-15).
+/// admitted coalesce spends its credits so they cannot fund a second echo.
 #[test]
 fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
     let g = geom();

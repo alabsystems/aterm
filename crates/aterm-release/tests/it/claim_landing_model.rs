@@ -9,7 +9,8 @@
 //! peer commit and every ledger line, build numbers strictly increase, and a
 //! claimed-unpublished version is read as a recut — never fresh, never "cut
 //! elsewhere", never claimed again once published. This file drives the REAL
-//! writers (`ledger::claim` with `changelog::claim_changelogs`) and the REAL reader
+//! writers (`ledger::reserve` and `ledger::claim` with `changelog::claim_changelogs`)
+//! and the REAL reader
 //! (`publish::real_cut_version`, over `verify::derive_cut_mode`) against real git —
 //! a bare origin, a rival clone for the peers' pushes and other claims, a work clone
 //! as the cut tree — projects every observed state onto the model's variables, and
@@ -269,6 +270,10 @@ impl GitRunner for Hooked<'_> {
         }
         self.inner.git(args)
     }
+
+    fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+        self.inner.git_input(args, input)
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -452,8 +457,9 @@ impl Harness {
         self.refuses(action, &next);
     }
 
-    /// The REAL claim from the cut tree at the published commit, with `during` landed
-    /// on main at its first push, every observed step checked. `bad_landing` also
+    /// The REAL reservation and claim from the cut tree at the published commit, with
+    /// `during` landed on main at the claim's first push, every observed step checked
+    /// (the reservation is the model's `ClaimRead`: it fixes `n`). `bad_landing` also
     /// commits the landing built from the release commit's tree and requires the model
     /// to refuse it.
     fn claim(&mut self, during: Option<Env>, bad_landing: bool) -> ledger::Result<ledger::Claim> {
@@ -482,9 +488,10 @@ impl Harness {
             max_attempts: ledger::MAX_CLAIM_ATTEMPTS,
             source: &self.source,
         };
-        let result = ledger::claim(&hooked, &self.fix.work, &plan, &|source, main| {
-            changelog::claim_changelogs(source, main, VERSION, DATE)
-        });
+        let rolls =
+            |source: &str, main: &str| changelog::claim_changelogs(source, main, VERSION, DATE);
+        let result = ledger::reserve(&hooked, &plan, &rolls)
+            .and_then(|reserved| ledger::claim(&hooked, &self.fix.work, &plan, &reserved, &rolls));
         if during.is_some() {
             self.pushes += 1;
         }
@@ -589,6 +596,12 @@ impl Harness {
                 self.tips.push(main.commit.clone());
                 self.step("ClaimLand", next);
             }
+            Err(error) if error.to_string().contains("at or past the reserved build") => {
+                // Build once: the tail reached the reserved number, nothing was
+                // claimed, and the release reserves again.
+                let next = self.with(&[("phase", 1)]);
+                self.step("ClaimStale", next);
+            }
             Err(error) => {
                 assert!(error.to_string().contains("cut elsewhere"), "{error}");
                 let next = self.with(&[("phase", 5), ("elsewhere", 1)]);
@@ -609,19 +622,26 @@ impl Harness {
     }
 }
 
-/// Peers push; the fresh claim loses a race to another version's claim, re-reads
-/// and lands by a merge; the cut dies; the reader calls the next cut a recut (and
-/// the historical reader, replayed, is refused); the recut loses a race to a peer,
-/// lands again (and a landing from the release commit's tree, committed for real,
-/// is refused); it publishes; the next cut is refused.
+/// Peers push; another version's claim reaches the fresh claim's reserved number,
+/// so the claim refuses with nothing claimed (build once: the bytes carry it) and
+/// the release reserves again and lands by a merge; the cut dies; the reader calls
+/// the next cut a recut (and the historical reader, replayed, is refused); the
+/// recut loses a race to a peer, keeps its number and lands (and a landing from the
+/// release commit's tree, committed for real, is refused); it publishes; the next
+/// cut is refused.
 #[test]
 fn the_real_claim_and_reader_refine_the_model_through_a_wedge_and_a_recut() {
     let mut h = Harness::new("wedge");
     h.env(Env::Peer);
     assert_eq!(h.classify(), "ClassifyFresh");
-    let first = h
+    let stale = h
         .claim(Some(Env::Rival), false)
-        .expect("a lost race to another version's claim is retried");
+        .expect_err("a reservation another claim reached is never landed");
+    assert!(stale.to_string().contains("nothing was burned"), "{stale}");
+    assert_eq!(h.state["phase"], 1, "the release reserves again");
+    let first = h
+        .claim(None, false)
+        .expect("a fresh reservation lands above the rival's line");
     assert_ne!(first.landed, first.commit, "main moved, so it took a merge");
     h.die();
 

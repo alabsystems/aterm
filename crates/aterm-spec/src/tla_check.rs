@@ -5,7 +5,7 @@
 //! TLA+ file parsing for action cross-referencing.
 //!
 //! Parses `.tla` files to extract module names and definition names,
-//! enabling cross-referencing between Kani proofs and TLA+ properties.
+//! enabling cross-referencing between Rust refinements and TLA+ properties.
 
 use std::collections::BTreeSet;
 use std::path::Path;

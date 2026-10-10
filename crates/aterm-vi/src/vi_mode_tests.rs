@@ -23,7 +23,7 @@ fn toggle_activates_at_cursor() {
 #[test]
 fn motion_ignored_when_inactive() {
     let mut vi = ViMode::new();
-    vi.motion(24, 80, 0, 23, ViMotion::Down, ViBoundary::Grid);
+    vi.motion(80, 0, 23, ViMotion::Down, ViBoundary::Grid);
     assert_eq!(vi.cursor_point(), ViPoint::default());
 }
 
@@ -31,7 +31,7 @@ fn motion_ignored_when_inactive() {
 fn basic_motion_down() {
     let mut vi = ViMode::new();
     vi.toggle(ViPoint::new(5, 10));
-    vi.motion(24, 80, 0, 23, ViMotion::Down, ViBoundary::Grid);
+    vi.motion(80, 0, 23, ViMotion::Down, ViBoundary::Grid);
     assert_eq!(vi.cursor_point(), ViPoint::new(6, 10));
 }
 
@@ -42,8 +42,8 @@ fn mark_set_and_goto() {
     vi.toggle(ViPoint::new(5, 10));
 
     assert!(vi.set_mark('a'));
-    vi.motion(24, 80, 0, 23, ViMotion::Down, ViBoundary::Grid);
-    vi.motion(24, 80, 0, 23, ViMotion::Down, ViBoundary::Grid);
+    vi.motion(80, 0, 23, ViMotion::Down, ViBoundary::Grid);
+    vi.motion(80, 0, 23, ViMotion::Down, ViBoundary::Grid);
     assert_eq!(vi.cursor_point(), ViPoint::new(7, 10));
 
     vi.motion_with_grid(&grid, ViMotion::GotoMark('a'), ViBoundary::Grid);
@@ -133,8 +133,16 @@ fn first_occupied_no_double_tap_on_unwrapped_line() {
 fn scroll_moves_cursor() {
     let mut vi = ViMode::new();
     vi.toggle(ViPoint::new(10, 5));
-    vi.scroll(0, 23, 5);
-    assert_eq!(vi.cursor_point().line, 15);
+    vi.scroll(0, 23, 79, 5);
+    assert_eq!(vi.cursor_point(), ViPoint::new(15, 5));
+}
+
+#[test]
+fn scroll_clamps_the_column_to_the_last_one() {
+    let mut vi = ViMode::new();
+    vi.toggle(ViPoint::new(10, 50));
+    vi.scroll(0, 23, 39, 0);
+    assert_eq!(vi.cursor_point(), ViPoint::new(10, 39));
 }
 
 #[test]
@@ -403,4 +411,34 @@ fn search_clamps_respects_scrollback_bounds() {
         "valid scrollback line should be preserved"
     );
     assert_eq!(vi.cursor_point().col, 8, "valid col should be preserved");
+}
+
+/// `H`, `M` and `L` name the rows the viewport shows. A vi line is
+/// live-relative and the viewport's top row is line `-display_offset`, so
+/// scrolled back they land on the rows the window draws, not the live
+/// screen's (which may be out of view altogether once the offset reaches the
+/// screen height). The column is kept, clamped to the grid.
+#[test]
+fn high_middle_low_name_the_viewport_rows_at_every_display_offset() {
+    const ROWS: u16 = 4;
+    const HISTORY: i32 = 12;
+    for offset in 0..=HISTORY {
+        let grid = MockGrid::new(ROWS, 20)
+            .with_scrollback(HISTORY)
+            .with_display_offset(offset);
+        let mut vi = ViMode::new();
+        vi.toggle(ViPoint::new(1, 7));
+        for (motion, row) in [
+            (ViMotion::High, 0),
+            (ViMotion::Middle, 2),
+            (ViMotion::Low, 3),
+        ] {
+            vi.motion_with_grid(&grid, motion, ViBoundary::Grid);
+            assert_eq!(
+                vi.cursor_point(),
+                ViPoint::new(row - offset, 7),
+                "{motion:?} at display offset {offset}"
+            );
+        }
+    }
 }

@@ -134,7 +134,7 @@ impl Grid {
     /// glyph's background) instead of leaving the old content stranded. Call with
     /// the cursor still on the old row, before `advance_autowrap_line()`.
     #[inline]
-    fn blank_wide_wrap_tail(&mut self, ecols: u16, fill: Cell) {
+    pub(super) fn blank_wide_wrap_tail(&mut self, ecols: u16, fill: Cell) {
         let row = self.storage.cursor.row;
         let col = self.storage.cursor.col;
         // `None` only if the row does not exist; then nothing was blanked and
@@ -150,6 +150,12 @@ impl Grid {
             // (`fill` here). EL/ED share this rule; only the rectangle ops use
             // `Clear1Cell` instead. See `Row::clear_range_with_orphan`.
             bce = Some(r.clear_range_with_orphan(col, ecols, fill, fill));
+            // Record the hole the wrap leaves, so a rewrap drops this cell and
+            // only it (`RowFlags::EARLY_WRAP_HOLE`). Only a hole that is the
+            // row's physical last cell: under DECLRMM or on a DECDWL row the
+            // wrap edge is not the row end, and no rewrap merges such a row.
+            let cols = r.cols();
+            r.set_early_wrap_hole(ecols == cols && col.saturating_add(1) == cols);
         }
         // A truecolor BCE cell carries only an RGB marker; the bytes live in
         // `RgbColorRing`, so the blanked tail and the orphan column need ring

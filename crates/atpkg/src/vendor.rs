@@ -719,6 +719,7 @@ pub(crate) mod testkit {
             strip_components: 0,
             links: BTreeMap::new(),
             vendor: "Anthropic PBC".into(),
+            provenance: None,
         }
     }
 }

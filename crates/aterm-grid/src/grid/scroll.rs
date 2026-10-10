@@ -309,6 +309,9 @@ impl Grid {
         if rows_to_reuse > 0 {
             self.reuse_scrolled_rows(rows_to_reuse, cols);
         }
+        // The rows just scrolled off took their links into history: hold the
+        // uncompressed history's link payload to its byte budget (O(1) under it).
+        self.enforce_history_link_budget();
 
         debug_assert!(
             self.storage.rows.len()
@@ -897,13 +900,21 @@ impl Grid {
         // So a fresh session padding a blank screen with LFs mints blank
         // scrollback here, as xterm does; the top-anchored region path gets
         // the gate.
+        //
+        // The count is clamped to the screen, as xterm's `xtermScroll` and
+        // Alacritty's `scroll_up_relative` clamp it to the region: a scroll of
+        // a screenful or more leaves the screen blank and archives exactly that
+        // screenful. Unclamped, `CSI 65535 S` (8 bytes, the parser's ceiling)
+        // archived 65,535 rows, ~4 ms under the terminal lock each, so 16 KiB of
+        // program output held the lock — and the window's redraw — for seconds
+        // (hunt 7, 2026-10-09).
         if self
             .storage
             .scroll_region
             .is_full(self.storage.visible_rows)
         {
             self.reset_display_offset_with_damage();
-            self.scroll_up(n);
+            self.scroll_up(n.min(usize::from(self.storage.visible_rows)));
             return;
         }
         // Degenerate single-row region: nowhere to scroll to — no-op.

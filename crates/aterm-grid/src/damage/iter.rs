@@ -165,16 +165,16 @@ impl Iterator for DamageBoundsIterator<'_> {
 
 /// Iterator merging consecutive damaged rows with overlapping column ranges
 /// into rectangles (fewer draw calls).
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 pub struct MergedDamageIterator<'a> {
     inner: DamageBoundsIterator<'a>,
     pending: Option<super::rect::DamageRect>,
 }
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl<'a> MergedDamageIterator<'a> {
     /// Create a new merged damage iterator.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn new(damage: &'a Damage, rows: u16, cols: u16) -> Self {
         Self {
             inner: damage.iter_bounds(rows, cols),
@@ -183,7 +183,7 @@ impl<'a> MergedDamageIterator<'a> {
     }
 }
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl Iterator for MergedDamageIterator<'_> {
     type Item = super::rect::DamageRect;
 

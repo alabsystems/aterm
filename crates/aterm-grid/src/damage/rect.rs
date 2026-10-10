@@ -17,17 +17,17 @@ pub struct LineDamageBounds {
 impl LineDamageBounds {
     /// Create new line damage bounds.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn new(line: u16, left: u16, right: u16) -> Self {
         Self { line, left, right }
     }
 }
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl LineDamageBounds {
     /// Check if this bounds is empty (no damage).
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn is_empty(&self) -> bool {
         self.left >= self.right
     }
@@ -35,7 +35,7 @@ impl LineDamageBounds {
     /// Whether two rows are consecutive with overlapping or adjacent column
     /// ranges, so they merge into one rectangle.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn can_merge_with(&self, other: &Self) -> bool {
         // Must be adjacent lines
         if self.line.abs_diff(other.line) != 1 {
@@ -61,7 +61,7 @@ impl LineDamageBounds {
 
 /// A rectangular damage region spanning several rows, batching adjacent
 /// damaged rows into fewer GPU draw calls.
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamageRect {
     /// Top row (inclusive).
@@ -74,11 +74,11 @@ pub struct DamageRect {
     pub right: u16,
 }
 
-#[cfg(any(test, kani, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 impl DamageRect {
     /// Create a new damage rectangle.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn new(top: u16, bottom: u16, left: u16, right: u16) -> Self {
         Self {
             top,
@@ -101,7 +101,7 @@ impl DamageRect {
 
     /// Number of rows in this rectangle.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn height(self) -> u16 {
         self.bottom.saturating_sub(self.top)
     }

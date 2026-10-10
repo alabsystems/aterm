@@ -757,7 +757,7 @@ fn a_session_naming_no_mode_gets_the_verdict_wait_back_at_its_first_busy_read() 
 const WORKER_PARK: &str = "SUPERVISE_ENGINE_TEST_PARK";
 
 /// The stand-in worker's body: idle unless asked to park — past the minute
-/// [`StandIn::spawn`] may wait for it to start (it was 30 s, under that).
+/// [`StandIn::spawn`] may wait for it to start.
 /// Every [`StandIn`] is killed on drop.
 #[test]
 fn park_as_worker() {
@@ -769,18 +769,18 @@ fn park_as_worker() {
 /// A stand-in worker: this test binary, parked, with exactly `env` (and the
 /// word that parks it); not `/bin/sleep`, whose environment macOS hides as a
 /// platform binary's. Killed on drop.
-struct StandIn(std::process::Child);
+struct StandIn(aterm_uds::spawnfd::Child);
 
 impl StandIn {
     fn spawn(env: &[(String, String)]) -> Self {
-        let mut c = std::process::Command::new(std::env::current_exe().expect("exe"));
+        let mut c = aterm_uds::spawnfd::command(std::env::current_exe().expect("exe"));
         c.args(["supervise::run::tests::engine::park_as_worker", "--exact"])
             .env_clear()
             .env(WORKER_PARK, "1")
             .envs(env.iter().map(|(k, v)| (k, v)))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
         // Owned at once, so every path out of here reaps it.
         let worker = Self(c.spawn().expect("the stand-in worker"));
         // Until the exec, the kernel shows this process's environment.
@@ -817,7 +817,7 @@ fn loop_scratch(tag: &str) -> PathBuf {
 
 /// `git <args>` in `dir`, hermetic, asserted ok.
 fn loop_git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = aterm_uds::spawnfd::command("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1956,13 +1956,11 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     }
 }
 
-/// THE INCIDENT OF 2026-09-27 in the loop: the usage-limit dialog in the
-/// fullscreen panel (aterm-phase's `LIMIT_OPTIONS_PANEL`, which the window
-/// supervisor escalated five times as `nothing that waits`) gets the dated
-/// wait row under the window's defaults — a fenced `down` guarded on the
-/// panel's title, then Enter guarded on the focused wait row — ledgered
-/// under `limit-wait@v1`, never a digit, never the credits row, and nothing
-/// asked of the owner.
+/// The usage-limit dialog in the fullscreen panel (aterm-phase's
+/// `LIMIT_OPTIONS_PANEL`) gets the dated wait row under the window's
+/// defaults — a fenced `down` guarded on the panel's title, then Enter
+/// guarded on the focused wait row — ledgered under `limit-wait@v1`, never a
+/// digit, never the credits row, and nothing asked of the owner.
 #[test]
 fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     const WAIT: &str = "Wait here, then continue automatically at Oct 2 at 5am";
@@ -2887,8 +2885,7 @@ fn a_press_that_did_not_land_is_tried_again_at_full_power() {
     m.stall_sleep = Some(Duration::from_millis(50));
     // The session ends once the box was pressed three times AND badged, so
     // the run is decided by what happened, not by how many back-off turns a
-    // 3 s `max` fits: at load 40 on 14 cores it fit two (gate of 2026-10-05).
-    // `max` is now only a hang detector.
+    // 3 s `max` fits under load. `max` is only a hang detector.
     m.exit_when = Some(|m| {
         m.presses().len() >= 3
             && m.requests
@@ -3658,6 +3655,11 @@ struct TestHost {
     /// real `codex_wall_reset`, in that process's own zone); `None`: a host
     /// that places nothing, and the loop reads the words itself.
     codex: std::sync::Mutex<Option<(u32, PathBuf)>>,
+    /// Its agent's transcript tail ([`IdleHost::transcript_tail`]) before
+    /// its first restart and after it; `None`: none to read.
+    tails: std::sync::Mutex<Option<(String, String)>>,
+    /// How many times the loop asked for it.
+    tail_asks: std::sync::atomic::AtomicUsize,
 }
 
 /// A healthy Claude Code's footprint.
@@ -3798,6 +3800,15 @@ impl IdleHost for TestHost {
         self.limit_asks.fetch_add(1, Ordering::SeqCst);
         *self.limit_until.lock().unwrap()
     }
+    fn transcript_tail(&self) -> Option<String> {
+        self.tail_asks.fetch_add(1, Ordering::SeqCst);
+        let (before, after) = self.tails.lock().unwrap().clone()?;
+        Some(if self.restarted.lock().unwrap().is_empty() {
+            before
+        } else {
+            after
+        })
+    }
     fn place_reset(&self, text: &str, now: i64) -> Option<Option<i64>> {
         let (pid, home) = self.codex.lock().unwrap().clone()?;
         let now = u64::try_from(now).expect("unix");
@@ -3852,8 +3863,7 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
 }
 
 /// A POINT ONLY A PERSON CAN ANSWER IS JOURNALED ONCE, AND ENDS WHEN THE
-/// WORKER WORKS (owner, 2026-09-28: a reason the person must be engaged, and
-/// what to do). A spend limit that names no reset is read at two points (the
+/// WORKER WORKS. A spend limit that names no reset is read at two points (the
 /// notice, then the same notice on a retry's rows): the journal carries ONE
 /// `EXCEPTION … => <action>` and the host is told once; the worker's next busy
 /// read closes it with `CLEARED … exception=spend after=…` and tells the host
@@ -4012,12 +4022,9 @@ fn an_exception_stands_while_its_wall_is_out_of_view_and_ends_when_the_agent_wor
     );
 }
 
-/// THE HOST TAKES NO STEP AT THE LOGIN WALL (the incident of 2026-09-27):
-/// the screen the session showed for nine hours — the supervisor's
-/// `continue` answered by `⏺ Login expired · Please run /login` — is no
-/// idle point for the host, so the live upgrade's notice is never typed
-/// into it (main read it idle with no wall, the host took its step there,
-/// and four notices went into the wall, each met by the same row). Once the
+/// THE HOST TAKES NO STEP AT THE LOGIN WALL: the supervisor's `continue`
+/// answered by `⏺ Login expired · Please run /login` is no idle point for
+/// the host, so the live upgrade's notice is never typed into it. Once the
 /// person's `/login` is done (`⎿  Login successful`) the point is the
 /// host's — the NEGATIVE CONTROL: the host does step there.
 #[test]
@@ -4222,9 +4229,9 @@ fn the_loop_says_which_guard_withheld_the_point_the_host_asked_for() {
 }
 
 /// T1-b, A USAGE LIMIT'S NOTICE LEFT ON THE SCREEN A GRACE PAST ITS RESET IS
-/// THE IDLE POINT IT IS (the owner's ruling of 2026-09-29, "treat it as idle
-/// after reset + 1 h"; design record 2026-09-28, "No upgrade stuck forever",
-/// C9). Claude Code leaves its weekly notice standing after the reset until
+/// THE IDLE POINT IT IS (the owner's ruling, "treat it as idle after reset +
+/// 1 h"; design record 2026-09-28, "No upgrade stuck forever", C9). Claude
+/// Code leaves its weekly notice standing after the reset until
 /// something is typed, and the loop read it as a wall for good — `NotIdle` at
 /// the point (the phase reads `limited`), `Wall` and `LimitEpisode` behind it
 /// — so the quiet upgrade never moved such a tab. The real loop over scripted
@@ -4504,23 +4511,22 @@ fn a_live_limit_naming_no_reset_is_never_spent_by_an_earlier_notices_reset() {
     assert_eq!(steps, 2, "the same spent notice, offered: {lines:#?}");
 }
 
-/// T1-b, A BARE CLOCK TIME IS PLACED ON THE DAY THE TRANSCRIPT NAMES (the
-/// review of 2026-09-30, of C9). Claude Code printed `You've hit your session
-/// limit · resets 3pm (America/Los_Angeles)` the day before, at 13:02 PDT, and
-/// its transcript's limit row names that day's 15:00 (`quotaLimits.resetsAt`,
+/// T1-b, A BARE CLOCK TIME IS PLACED ON THE DAY THE TRANSCRIPT NAMES (C9).
+/// Claude Code printed `You've hit your session limit · resets 3pm
+/// (America/Los_Angeles)` the day before, at 13:02 PDT, and its transcript's
+/// limit row names that day's 15:00 (`quotaLimits.resetsAt`,
 /// [`IdleHost::limit_until`]). The notice stood overnight, and the loop
 /// starts again the next morning at 08:55 — an aterm update, a hot swap, a
 /// reaped worker — on a redrawn conversation that carries no done row. The
-/// words name no day: read that morning they were its own 3 pm, ahead, and
-/// the loop withheld every point (`NotIdle`) and stretched its budget to that
-/// 3 pm, while the upgrade and the owner's view read the reset long passed.
-/// The real loop over scripted screens now reads the transcript's day: the
-/// point is OFFERED (`HOST seq=…`), and no `EXTEND` is said. NEGATIVE
-/// CONTROLS, each the loop's own reading — withheld, the budget stretched to
-/// today's 3 pm: a transcript naming none (a reset is never guessed), one
-/// naming another clock time the day before (another limit's), and one naming
-/// the same clock time a day after (a transcript moves a bare time only to an
-/// earlier day). A dated notice names its own day: the next-week control of
+/// words name no day; read as that morning's 3 pm they would withhold every
+/// point (`NotIdle`) and stretch the budget to it. The real loop over
+/// scripted screens reads the transcript's day: the point is OFFERED
+/// (`HOST seq=…`), and no `EXTEND` is said. NEGATIVE CONTROLS, each the loop's
+/// own reading — withheld, the budget stretched to today's 3 pm: a transcript
+/// naming none (a reset is never guessed), one naming another clock time the
+/// day before (another limit's), and one naming the same clock time a day after
+/// (a transcript moves a bare time only to an earlier day). A dated notice
+/// names its own day: the next-week control of
 /// `a_limit_notice_left_past_its_reset_and_its_grace_is_an_idle_point`.
 ///
 /// THE SCREEN'S OWN PRINT IS EVIDENCE TOO (the done row, `done 1:02 PM`,
@@ -4655,13 +4661,13 @@ fn a_codex_wall_is_read_by_the_loop_in_the_zone_the_codex_printed_it_in() {
     // environment is hidden from `KERN_PROCARGS2`, a real Codex's is not),
     // started with `TZ=UTC` and read back with it.
     let stand_in = || {
-        let mut c = std::process::Command::new(std::env::current_exe().expect("exe"))
+        let mut c = aterm_uds::spawnfd::command(std::env::current_exe().expect("exe"))
             .args(["harness::upgrade_drive::tests::park_when_asked", "--exact"])
             .env("UPGRADE_DRIVE_TEST_PARK", "1")
             .env("TZ", "UTC")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("the stand-in Codex");
         let pid = c.id();
@@ -6149,20 +6155,19 @@ fn a_refused_memory_restart_says_the_persons_restart_on_a_host_that_restarts() {
 const PERSONS_ROW: &str = "it holds the most memory; restart it yourself";
 const ATERMS_ROW: &str = "it holds the most memory, so aterm restarts it";
 
-/// A REFUSED MEMORY RESTART STANDS UNTIL THE HOST IS ASKED AGAIN (the review
-/// of 657f6333f, 2026-09-30). The refusals are the agent's own launch
-/// (`refused:one-shot`, `refused:self`) and stand for its life, so the
-/// person's restart the row names after one is not taken back at the next
-/// busy read: the clear there promised aterm's restart for the whole next
-/// turn, and the next idle point's refusal took it back — the row flipping
-/// every turn. The point is escalated, the agent works again, and its next
-/// idle point asks the host again: REFUSED, the row is the person's from the
-/// first refusal on, said once; ADOPTED, the restart is made, and only after
-/// it does the row name aterm's restart again (a latch never cleared would
-/// leave the person's) — said by the restart itself, on the measure it was
-/// made on: the relaunched agent is a small one, whose measures say nothing,
-/// and the person's `claude --resume` line left standing would resume the
-/// conversation aterm just relaunched a second time.
+/// A REFUSED MEMORY RESTART STANDS UNTIL THE HOST IS ASKED AGAIN. The
+/// refusals are the agent's own launch (`refused:one-shot`, `refused:self`) and
+/// stand for its life, so the person's restart the row names after one is not
+/// taken back at the next busy read: the clear there promised aterm's restart
+/// for the whole next turn, and the next idle point's refusal took it back —
+/// the row flipping every turn. The point is escalated, the agent works again,
+/// and its next idle point asks the host again: REFUSED, the row is the
+/// person's from the first refusal on, said once; ADOPTED, the restart is made,
+/// and only after it does the row name aterm's restart again (a latch never
+/// cleared would leave the person's) — said by the restart itself, on the
+/// measure it was made on: the relaunched agent is a small one, whose measures
+/// say nothing, and the person's `claude --resume` line left standing would
+/// resume the conversation aterm just relaunched a second time.
 #[test]
 fn a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again() {
     let run = |tag: &str, second: &'static str| {
@@ -6253,17 +6258,16 @@ fn a_refused_memory_restart_keeps_the_persons_row_until_the_host_is_asked_again(
     );
 }
 
-/// A REFUSED RESTART AT CLAUDE CODE'S OWN MEMORY BANNER (the review of
-/// 657f6333f, 2026-09-30). The banner is the point's wall, not the host's
-/// measure: its escalation is not the measure's to hand back, and nothing
-/// asks the host again while it stands (the measure the point was read with
-/// stays the point's). The measure stops being acted on for a while — the
-/// Mac's trouble passes, or the footprint falls an eighth under the ceiling
-/// and the warning's episode ends — and comes back: the row is said again
-/// with the person's restart, as the badge says, never aterm's, and no
-/// restart is asked for. Clearing the refusal on that dip (or at the
-/// episode's end) promised aterm's restart beside `the restart could not be
-/// made` until a person acted.
+/// A REFUSED RESTART AT CLAUDE CODE'S OWN MEMORY BANNER. The banner is the
+/// point's wall, not the host's measure: its escalation is not the measure's to
+/// hand back, and nothing asks the host again while it stands (the measure the
+/// point was read with stays the point's). The measure stops being acted on for
+/// a while — the Mac's trouble passes, or the footprint falls an eighth under
+/// the ceiling and the warning's episode ends — and comes back: the row is said
+/// again with the person's restart, as the badge says, never aterm's, and no
+/// restart is asked for. Clearing the refusal on that dip (or at the episode's
+/// end) promised aterm's restart beside `the restart could not be made` until a
+/// person acted.
 #[test]
 fn a_refused_restart_at_the_memory_banner_keeps_the_persons_row_when_the_measure_comes_back() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -6372,7 +6376,7 @@ fn a_refused_restart_at_the_memory_banner_keeps_the_persons_row_when_the_measure
     }
 }
 
-/// A RESTART THAT TYPED ITS CARRY-ON (the review of the N1 fix, 2026-09-26):
+/// A RESTART THAT TYPED ITS CARRY-ON:
 /// a host whose restart types the relaunched agent's carry-on itself says
 /// `continued` ([`IdleHost::restart`]) — a turn it typed, whose answer is
 /// the harness's: answered short, it is no short turn of the worker's. Here
@@ -6447,6 +6451,160 @@ fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
     let lines = run("adopted");
     assert!(waiting(&lines, 1), "the worker's own turn: {lines:#?}");
     assert!(!continued(&lines), "{lines:#?}");
+}
+
+/// THE DECISION'S VERDICT KEPT FOR THE LOOP'S BOOKS (H6-HARNESS-1, the
+/// review of pass 3): a Fable limit that names its reset (`resets Oct 30 at
+/// 9pm`), its notice the transcript's newest entry — CONFIRMED — is
+/// relaunched on opus, and the host types the relaunched agent's carry-on
+/// (`continued`), so the transcript ends on that turn by the time the loop
+/// reads the point again to record the restart. Read again with the
+/// transcript asked, that read refused the wall the restart was made for,
+/// and the switch's way back lost its reset: `(from the launch's model, no
+/// return scheduled …)`, the session left on the fallback for good. Kept, the
+/// switch is the same as with no transcript at all: from fable, back at the
+/// reset (`2026-10-31T04:00:00Z`), and its ledger row says so; the
+/// transcript was asked at the decision only.
+#[test]
+fn a_model_buckets_relaunch_keeps_its_way_back_when_the_transcript_moves_on() {
+    let fable = || {
+        let mut r = rows(&[
+            "⏺ Running the suite.",
+            "  ⎿  You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)",
+            "",
+            "✻ Worked for 3m 2s · done 4:51 PM",
+            "",
+        ]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    let notice = r#"{"parentUuid":"a","isSidechain":false,"type":"user","message":{"role":"user","content":"run the suite"},"timestamp":"2026-10-08T16:35:31.654Z"}
+{"parentUuid":"b","isSidechain":false,"type":"assistant","timestamp":"2026-10-08T16:35:31.676Z","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)"}]},"error":"rate_limit","isApiErrorMessage":true}
+{"parentUuid":"c","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T16:35:31.677Z"}"#;
+    let carried = format!(
+        "{notice}\n{}",
+        r#"{"parentUuid":"d","isSidechain":false,"type":"user","message":{"role":"user","content":"aterm relaunched you on opus; carry on"},"timestamp":"2026-10-08T16:36:00.000Z"}"#
+    );
+    let run = |tails: Option<(String, String)>| {
+        let (dir, ledger) = ledger_file("bucket-books");
+        let host = Arc::new(TestHost::default());
+        *host.restarts.lock().unwrap() = vec![Some("continued")].into();
+        *host.tails.lock().unwrap() = tails;
+        let mut m = Mock::new(true, vec![busy_screen(), fable()]);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            ..SuperviseOpts::hosted()
+        };
+        // 2026-10-08 12:00 PDT: the reset is ahead.
+        let (r, lines) = hosted_with_host_at(
+            &mut m,
+            &opts,
+            &host,
+            Stop::reached(
+                |h| !h.restarted.lock().unwrap().is_empty(),
+                Duration::from_millis(500),
+            ),
+            None,
+            &ledger,
+            Some(1_791_486_000),
+        );
+        assert_eq!(r, Ok(()));
+        let open = crate::supervise::approvals::open_model_switch(&ledger, Some("@s-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let asks = host.tail_asks.load(Ordering::SeqCst);
+        (lines, open.map(|o| (o.from, o.back_at_unix)), asks)
+    };
+    let want = Some((Some("fable".to_string()), Some(1_793_419_200)));
+    let (lines, open, _) = run(None);
+    assert_eq!(open, want, "with no transcript: {lines:#?}");
+    let (lines, open, asks) = run(Some((notice.to_string(), carried)));
+    assert_eq!(open, want, "with the transcript moved on: {lines:#?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("RESTARTED seq=")
+            && l.contains("relaunch --model opus (from fable, back at ")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("rule=wall-confirm@v1")),
+        "nothing refused: {lines:#?}"
+    );
+    assert!(asks >= 1, "the decision asked: {asks}");
+}
+
+/// …AND EVERY OTHER BOOKS' READ OF A RELAUNCH (the review of pass 4: each
+/// reverted to a decision's read, no test failed). The same confirmed Fable
+/// limit, its relaunch on opus asked of the host, which answers
+/// `wait:changed` (the agent's own work runs: the relaunch is tried again on
+/// the restart back-off) or `refused:off` (not made: the point's own act
+/// instead). The point is read again for the loop's books after the ask —
+/// the wait's due time, the switch left unmade — by when the transcript has
+/// moved on (here, to a turn after the notice). Each keeps the decision's
+/// verdict: the transcript asked at the decision only (neither read takes
+/// anything else from the wall today — the restart's due time is cut at
+/// the reset only within the first back-off step — so the ask is what a
+/// read for the books must not make), and nothing said unconfirmed.
+#[test]
+fn a_model_buckets_relaunch_not_made_keeps_the_decisions_verdict() {
+    let fable = || {
+        let mut r = rows(&[
+            "⏺ Running the suite.",
+            "  ⎿  You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)",
+            "",
+            "✻ Worked for 3m 2s · done 4:51 PM",
+            "",
+        ]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    let notice = r#"{"parentUuid":"a","isSidechain":false,"type":"user","message":{"role":"user","content":"run the suite"},"timestamp":"2026-10-08T16:35:31.654Z"}
+{"parentUuid":"b","isSidechain":false,"type":"assistant","timestamp":"2026-10-08T16:35:31.676Z","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your Fable limit · resets Oct 30 at 9pm (America/Los_Angeles)"}]},"error":"rate_limit","isApiErrorMessage":true}
+{"parentUuid":"c","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T16:35:31.677Z"}"#;
+    let moved = format!(
+        "{notice}\n{}\n{}",
+        r#"{"parentUuid":"d","isSidechain":false,"type":"user","message":{"role":"user","content":"carry on"},"timestamp":"2026-10-08T16:36:00.000Z"}"#,
+        r#"{"parentUuid":"e","isSidechain":false,"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T16:36:01.000Z"}"#
+    );
+    for answer in ["wait:changed", "refused:off"] {
+        let (dir, ledger) = ledger_file("bucket-unmade-books");
+        let host = Arc::new(TestHost::default());
+        *host.restarts.lock().unwrap() = vec![Some(answer)].into();
+        *host.tails.lock().unwrap() = Some((notice.to_string(), moved.clone()));
+        let mut m = Mock::new(true, vec![busy_screen(), fable()]);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            ..SuperviseOpts::hosted()
+        };
+        let (r, lines) = hosted_with_host_at(
+            &mut m,
+            &opts,
+            &host,
+            Stop::reached(
+                |h| !h.restarted.lock().unwrap().is_empty(),
+                Duration::from_millis(500),
+            ),
+            None,
+            &ledger,
+            Some(1_791_486_000),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()), "{answer}");
+        assert_eq!(
+            *host.restarted.lock().unwrap(),
+            ["model"],
+            "{answer}: the relaunch asked once: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("rule=wall-confirm@v1")),
+            "{answer}: nothing refused: {lines:#?}"
+        );
+        assert_eq!(
+            host.tail_asks.load(Ordering::SeqCst),
+            1,
+            "{answer}: the transcript asked at the decision only: {lines:#?}"
+        );
+    }
 }
 
 /// A model bucket's fallback and its way back are relaunches the host makes
@@ -6926,11 +7084,10 @@ fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
     assert_eq!(steps, 1, "the relaunched REPL: {requests:#?}");
 }
 
-/// THE TAIL THAT CUTS THE PROMPT BOX'S TOP RULE (the merge of the branch's
-/// live-zone read with main's `tail_misses_the_live_rows`, 2026-09-27): the
-/// measured inline REPL one row lower in its 50-row pane, so its caret row —
-/// the cursor on it — is the tail's FIRST row and its top rule the row above
-/// the tail. Main's rules do not see it: the cursor is not above the tail,
+/// THE TAIL THAT CUTS THE PROMPT BOX'S TOP RULE: the measured inline REPL one
+/// row lower in its 50-row pane, so its caret row — the cursor on it — is the
+/// tail's FIRST row and its top rule the row above the tail.
+/// `tail_misses_the_live_rows` does not see it: the cursor is not above the tail,
 /// the tail is not blank, and it holds no box. The tail, read with the
 /// cursor, decides nothing (the prompt box that holds the cursor has no top
 /// rule on it), and it ends on a blank row: it is read again whole and cut to
@@ -6996,10 +7153,10 @@ fn a_tail_that_cuts_the_prompt_boxs_top_rule_is_read_in_the_live_zone() {
 /// 2026-10-01, a 144x53 pane): the card on rows 11-12 and the composer's top
 /// rule on row 14, so the loop's 40-row tail starts on row 13 and holds the
 /// whole composer, the cursor on its caret, and neither card row. Its reader
-/// decides that tail — an idle composer — and it was read once: `EVENT idle`,
-/// no `0`, the card up for good (18 of 18 probes on a live instance, the
-/// worker's last words lost with it). An idle composer under a blank tail is
-/// now read whole and cut to the live zone, and the card is dismissed.
+/// decides that tail — an idle composer — and, read once (`EVENT idle`, no `0`),
+/// the card stays up for good (18 of 18 probes on a live instance, the worker's
+/// last words lost with it). An idle composer under a blank
+/// tail is read whole and cut to the live zone, and the card is dismissed.
 /// `SURVEY_CARD_ABOVE_THE_TAIL_MEASURED` is the measured frame with the
 /// pane's blank rows put back; the screen after is the same with the card's
 /// three rows (head, options, the blank under them) gone, as the measured
@@ -9118,7 +9275,7 @@ fn a_dialog_held_by_the_policy_is_answered_when_handed_back() {
     for back in [None, Some("recommended")] {
         let (presses, badge, key) = run(Some(back));
         // The mock's dialog never leaves, so the Enter is retried once on the
-        // screen that held still (main's R3a): one Enter, maybe twice.
+        // screen that held still (R3a): one Enter, maybe twice.
         assert!(
             (1..=2).contains(&presses.len()),
             "handed back ({back:?}): {presses:?}"
@@ -9175,23 +9332,29 @@ fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
 
     // The person as the real server reports them: the `status` made for the
     // second tab's decision sees them too (one stamp), so the answer is held
-    // for them before the question's own wait; after their grace the loop
-    // answers the tab, but the end is still theirs. The person is aged to
-    // 10 ms short of the grace; the second tab sits until the loop keys it,
-    // and the loop is stopped at the worker's first busy read, where a choice
-    // is told.
+    // for them (`HELD`) before the question's own wait; once the hold is over
+    // the loop answers the tab, but the end is still theirs. The person typed
+    // just now and the look after the hold finds their grace over
+    // ([`TYPED_NOW`]); the second tab sits until the loop keys it, and the
+    // loop is stopped at the worker's first busy read, where a choice is told.
     let mut m = questioned(vec![
         q(f::QUESTION_TABS_INCIDENT),
         q(f::QUESTION_TABS_SECOND),
         busy_screen(),
         idle_screen(),
     ]);
-    m.human = vec!["null", "9990", "15000"];
-    m.status_human_from = [(2, 9_990), (3, 15_000)].into_iter().collect();
+    m.human = vec!["null", TYPED_NOW, QUIET_PAST_GRACE];
+    m.status_human_from = [(2, stamp_ms(TYPED_NOW)), (3, stamp_ms(QUIET_PAST_GRACE))]
+        .into_iter()
+        .collect();
     m.key_gates = vec![(1, 1)];
     m.stall_sleep = Some(Duration::from_millis(5));
-    let mut opts = hosted_answering(true);
-    opts.policy.human_grace_s = 10;
+    let (jdir, journal) = journal_file("tabs-person-held");
+    let mut opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted_answering(true)
+    };
+    opts.policy.human_grace_s = PERSON_GRACE_S;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut out: Vec<u8> = Vec::new();
     {
@@ -9203,8 +9366,15 @@ fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
         s.set_approval_env(owner_env());
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
+        s.set_person_hold_wait(Duration::ZERO);
         let _ = s.run_hosted(&opts, stop, &mut out);
     }
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&jdir);
+    assert!(
+        records.iter().any(|r| r.line.starts_with("HELD ")),
+        "held for the person: {records:#?}"
+    );
     let lines = String::from_utf8(out).expect("utf-8");
     assert!(
         m.requests
@@ -9221,6 +9391,29 @@ fn a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice() {
         "{:#?}",
         m.requests
     );
+}
+
+/// The grace of a test that holds the loop for a person
+/// ([`Session::held_for_person`]; `[harness] human_grace_s`, the default's two
+/// minutes), and the person's stamps (`"human_ms"` on a read, `status
+/// human_ms=`) on either side of it: [`TYPED_NOW`], inside it by the whole
+/// grace, so the hold is decided with two minutes to spare and only a hang,
+/// never a loaded machine, ages them out of it first; and
+/// [`QUIET_PAST_GRACE`], whose grace is over. The hold is looked at again at
+/// once ([`Session::set_person_hold_wait`]), so no grace is waited out in real
+/// time: that look reads the age the next `status` reports. (A person staged
+/// a few milliseconds short of a grace is aged out of it by any preemption
+/// between the `status` that stamped them and the decision, since the hold
+/// is decided on the clock: [`Session::hands_off_until`].)
+const PERSON_GRACE_S: u32 = 120;
+/// A person who typed just now ([`PERSON_GRACE_S`]).
+const TYPED_NOW: &str = "0";
+/// A person quiet past their grace ([`PERSON_GRACE_S`]).
+const QUIET_PAST_GRACE: &str = "180000";
+
+/// A person's stamp as `status` reports it (`human_ms=`).
+fn stamp_ms(stamp: &str) -> u64 {
+    stamp.parse().expect("an age in milliseconds")
 }
 
 /// [`Mock`] with the hosted loop's stop set the moment a read serves the
@@ -11838,13 +12031,11 @@ fn survey_reactive(debounce_ms: u64, land: Duration, tweak: &dyn Fn(&mut Mock)) 
 }
 
 // The worlds of the survey card's Tier-1 ([`survey_press_violations`]) run as tests of
-// their own (2026-10-05): each waits in real time, and the twelve runs in turn were 27 s
-// of one test.
+// their own: each waits in real time.
 
 /// WORLD 1, a card that has shown its settle and nobody about: one Press, at a state the
 /// model allows. WORLD 2, a YOUNG card (the vendor drops a digit inside 300 ms): skip the
-/// settle (the first prototype's 500 ms was this close) and the model forbids the press the
-/// vendor would have dropped.
+/// settle and the model forbids the press the vendor would have dropped.
 #[test]
 fn tier1_the_cards_0_goes_only_where_the_model_allows() {
     let m = survey_sitting(with_survey(idle_screen()), &|_, _| {});
@@ -11952,9 +12143,8 @@ fn tier1_the_cards_dropped_0_is_backspaced_where_the_model_allows() {
 }
 
 /// WORLD 7, a card that TAKES the digit 300 ms after it was written: with a landing time
-/// that outlasts the debounce the loop never backspaces; with one that does not (the flaw
-/// of the first prototype) the backspace comes at a state where the `0` is still pending,
-/// and the model forbids it.
+/// that outlasts the debounce the loop never backspaces; with one that does not the
+/// backspace comes at a state where the `0` is still pending, and the model forbids it.
 #[test]
 fn tier1_the_cards_taken_0_is_never_backspaced_under_its_debounce() {
     let outlasting = survey_reactive(300, Duration::from_millis(400), &|_| {});
@@ -11981,6 +12171,46 @@ fn tier1_the_cards_0_backspaced_under_its_debounce_is_forbidden() {
         !survey_press_violations(&short, false).is_empty(),
         "the model forbids a backspace under a pending 0: {:#?}",
         short.key_probes
+    );
+}
+
+/// THE PROBE'S GATE READS THE POINT AS IT WAS DECIDED (H6-HARNESS-1; the
+/// review of pass 4 reverted that read to a decision's, and no test
+/// failed): a lost login's words in an MCP result's second block, which the
+/// transcript refuses (it ends on the model's reply), is an ordinary idle
+/// point, the roster says the account's read is due there, and the probe
+/// runs — `/usage`, its panel, the Escape — its gate's reading of the point
+/// asking the transcript nothing: asked once, at the decision, by the time
+/// the probe is claimed (the point decided again after the panel asks
+/// again, as a decision does).
+#[test]
+fn the_probes_gate_reads_a_refused_wall_as_it_was_decided() {
+    use aterm_phase::prompt::fixtures as f;
+    let host = ProbeHost::probing(true);
+    *host.tail.lock().unwrap() =
+        Some(include_str!("fixtures/claude-2.1.294-transcript-mcp-wall-phrase.jsonl").to_string());
+    let mut spoof = rows(&[
+        "❯ toolstart",
+        "",
+        "⏺ github - get_issue (MCP)(n: 7)",
+        "  ⎿  Issue 7: the parser drops a row",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+        "✻ Cogitated for 4s · done 2:41 PM",
+        "",
+    ]);
+    spoof.extend(composer("  ? for shortcuts"));
+    let mut m = probe_mock(
+        vec![busy_screen(), spoof],
+        &[f::USAGE_REFRESHING, f::USAGE_SETTLED],
+        &host,
+    );
+    let lines = probe_walk("probe-refused-wall", &mut m, &host, 120, &|_| {});
+    assert_eq!(probe_writes(&m), ["/usage", "esc"], "{lines:#?}");
+    assert_eq!(
+        *host.asks_at_claims.lock().unwrap(),
+        [1],
+        "the decision asked, the gate did not: {lines:#?}"
     );
 }
 
@@ -12573,14 +12803,13 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     named(&bad, "TypesTheCommand", "NeverTheTypedCommand");
 }
 
-/// A model bucket's fallback
-/// relaunch the host keeps answering `wait:…` — its last look finds the agent's
-/// own background work running, and the relaunch would end it — is ASKED AGAIN
-/// (the last pause of [`TurnEndTiming::restart_backoff`] for ever) and NOTHING
-/// IS TYPED BLIND meanwhile, at a wall (`requires usage credits`) that names no
-/// reset and that a `keep going` cannot lift: the fallback is the answer, as
-/// soon as the jobs end. NEGATIVE CONTROL: the memory banner's restart, whose
-/// only remedy the relaunch is, is asked as often.
+/// A model bucket's fallback relaunch the host keeps answering `wait:…` — its last look
+/// finds the agent's own background work running, and the relaunch would end it — is
+/// ASKED AGAIN (the last pause of [`TurnEndTiming::restart_backoff`] for ever) and
+/// NOTHING IS TYPED BLIND meanwhile, at a wall (`requires usage credits`) that names no
+/// reset and that a `keep going` cannot lift: the fallback is the answer, as soon as
+/// the jobs end. NEGATIVE CONTROL: the memory banner's restart, whose only remedy the
+/// relaunch is, is asked as often.
 #[test]
 fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed_blind() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -12650,14 +12879,13 @@ fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed
     );
 }
 
-/// The same deferred fallback at a
-/// bucket that NAMES its reset: asked again until the reset, then the
-/// continuation goes first — the wall may have lifted, and sitting past a
-/// reset for a relaunch the host will not make was the stall — while the host
-/// is still answering `wait:changed`. If the wall answers, the fallback is
-/// asked for again. The reset is 4 s off and the run stops at the journaled
-/// continuation (a minute's backstop): the assertions are about ORDER (asked
-/// more than once, then the continuation).
+/// The same deferred fallback at a bucket that NAMES its reset: asked again until the
+/// reset, then the continuation goes first — the wall may have lifted, and sitting past
+/// a reset for a relaunch the host will not make was the stall — while the host is
+/// still answering `wait:changed`. If the wall answers, the fallback is asked for
+/// again. The reset is 4 s off and the run stops at the journaled continuation (a
+/// minute's backstop): the assertions are about ORDER (asked more than once, then the
+/// continuation).
 #[test]
 fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_reset() {
     const FABLE: &str = include_str!(
@@ -12793,7 +13021,7 @@ fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share(
         s.turn_end_execute(&point, action, &opts, &[], &mut Alone)
             .expect("the restart is deferred, not failed");
         let took = began.elapsed();
-        let (at, why) = s.turn_end_due.clone().expect("a retry is due");
+        let Due { at, why, .. } = s.turn_end_due.clone().expect("a retry is due");
         assert!(why.contains("restart:model waits"), "{why}");
         (at.duration_since(began), took)
     };
@@ -12818,15 +13046,14 @@ fn a_deferred_fallback_is_retried_at_the_reset_the_grace_and_the_sessions_share(
     );
 }
 
-/// The RETURN to the bucket's model
-/// the host keeps deferring (`wait:changed`: the agent's own background work
-/// runs, and the relaunch would end it) never holds the point back: the
-/// continuation is typed, the switch stays open, and the return is asked again
-/// at the next idle point. A replay: an expired switch seeded from
-/// the ledger, a host that always answers `wait:changed` — 69 asks in 1.5 s and
-/// no continuation, at any point, of a tab that always has a job running.
-/// NEGATIVE CONTROL: a return the host makes (`adopted`) types nothing of the
-/// loop's own — the host's carry-on is the turn.
+/// The RETURN to the bucket's model the host keeps deferring (`wait:changed`: the
+/// agent's own background work runs, and the relaunch would end it) never holds the
+/// point back: the continuation is typed, the switch stays open, and the return is
+/// asked again at the next idle point. A replay: an expired switch seeded from the
+/// ledger, a host that always answers `wait:changed` — 69 asks in 1.5 s and no
+/// continuation, at any point, of a tab that always has a job running. NEGATIVE
+/// CONTROL: a return the host makes (`adopted`) types nothing of the loop's own — the
+/// host's carry-on is the turn.
 #[test]
 fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
     let run = |answers: Vec<Option<&'static str>>| {
@@ -12890,14 +13117,12 @@ fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
     );
 }
 
-/// A loop that starts at a
-/// wall its predecessor already continued past — a new window, a seamless
-/// update, a fault: a new loop every one to ten hours on tab 1 — is on the
-/// back-off from THAT act, and types nothing the moment it attaches. The
-/// approval ledger says the act went three minutes ago: the next try is ten
-/// minutes after it, so 3 s (past the `1s` reset) type nothing. NEGATIVE
-/// CONTROL: no such row, the loop continues at once (stopped at its journaled
-/// continuation).
+/// A loop that starts at a wall its predecessor already continued past — a new window,
+/// a seamless update, a fault: a new loop every one to ten hours on tab 1 — is on the
+/// back-off from THAT act, and types nothing the moment it attaches. The approval
+/// ledger says the act went three minutes ago: the next try is ten minutes after it, so
+/// 3 s (past the `1s` reset) type nothing. NEGATIVE CONTROL: no such row, the loop
+/// continues at once (stopped at its journaled continuation).
 #[test]
 fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_off() {
     let run = |seed: bool| {
@@ -12959,7 +13184,7 @@ fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_
     );
 }
 
-// ---- the person fence at the write (main's `key|send if-human=<n>`) ------
+// ---- the person fence at the write (`key|send if-human=<n>`) ------------
 
 /// Under `recommended` (the default priority) the loop's decisions, keys and
 /// request strings are the recommended path's, byte for byte. The four-tab

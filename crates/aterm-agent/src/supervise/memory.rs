@@ -561,7 +561,7 @@ mod tests {
     /// agent at warn swapping 89 MB/s with 121 GB in use; an agent at critical
     /// pressure). Negative controls: a 45.8 GB agent beside the 109 GB one is
     /// warned about, not acted on; a healthy agent is never over; `off` judges
-    /// nothing; one MiB under the ceiling is under it (owner, 2026-09-29).
+    /// nothing; one MiB under the ceiling is under it.
     #[test]
     fn a_measure_past_the_ceiling_warns_and_acts_only_in_trouble_on_the_dominant_agent() {
         use Pressure::{Critical, Normal, Warn};

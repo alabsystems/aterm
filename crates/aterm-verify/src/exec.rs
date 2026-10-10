@@ -166,9 +166,10 @@ impl Cmd {
     /// guards), the smokes, the drives and every other child that RUNS code keep
     /// the inherited tier. That is why this is opt-in per child, not a default.
     ///
-    /// A RELEASE's MEASURE run keeps even these at the inherited tier
-    /// ([`CompileQos::Inherited`]): there the compile is the release's critical
-    /// path, and UTILITY let a peer's build starve it.
+    /// No gate compile is a release's critical path: the release builds the bytes
+    /// MEASURE judges itself, once (`aterm-release`'s build step), and hands the
+    /// MEASURE run that artifact, so every compile a gate run makes yields to the
+    /// desktop.
     #[must_use]
     pub fn demoted(mut self) -> Self {
         self.demoted = true;
@@ -226,44 +227,6 @@ pub struct ExecEnv<'a> {
     /// ([`crate::CHILD_ENV`], [`crate::Ctx::with_pinned_child_facts`]): the git
     /// stamp, `RUST_TEST_THREADS`, `TRUST_STAGE2_BIN`, `CARGO_INCREMENTAL=0`.
     pub add_env: &'a [(OsString, OsString)],
-    /// The tier a [`Cmd::demoted`] child runs at this run: UTILITY unless the
-    /// run is a release's MEASURE (`--compile-qos inherited`, [`CompileQos`]).
-    pub compile_qos: CompileQos,
-}
-
-/// The tier every [`Cmd::demoted`] (compile-only) child of ONE run gets.
-///
-/// `Utility` is every run's default, for the reason [`Cmd::demoted`] measured:
-/// a gate's compiles yield to the programs a person is typing into.
-///
-/// `Inherited` is a RELEASE's MEASURE run, and nothing else's (`--compile-qos
-/// inherited`, which `tools/release.sh` step 7 passes and the parser admits
-/// only with `--measure`). There the compile IS the release's critical path,
-/// and UTILITY hands it to whatever else the machine runs: 0.100.0's MEASURE
-/// (2026-09-29) built its fat-LTO artifact in 3943.6 s (`load 75.84 -> 53.53 on
-/// 18 cores`, its ladder's own line) while a peer's default-QoS build held the
-/// cores — the release's operator saw its compile at 2-4% of one core — and
-/// the step took 4858 s (the release's steps.tsv). The release already owns the
-/// machine's gate lock, so the peers it now competes with as an equal are
-/// builds, not a person's typing; the measured stages keep the inherited tier
-/// in every run, as before.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CompileQos {
-    #[default]
-    Utility,
-    Inherited,
-}
-
-impl CompileQos {
-    /// The tier a `--compile-qos` value names, `None` for anything else.
-    #[must_use]
-    pub fn parse(v: &str) -> Option<Self> {
-        match v {
-            "utility" => Some(CompileQos::Utility),
-            "inherited" => Some(CompileQos::Inherited),
-            _ => None,
-        }
-    }
 }
 
 /// The one-minute load average, in-process: `getloadavg(3)` (libSystem, glibc
@@ -435,9 +398,10 @@ pub fn parse_load_average(text: &str) -> Option<f64> {
         .and_then(|t| t.parse().ok())
 }
 
-/// The host's physical memory in bytes, read once per run for
-/// [`crate::plan::measure_overlap`], and whether it is Linux's `MemTotal`
-/// (a few percent under the installed RAM); `None` when the host will not say.
+/// The host's physical memory in bytes, read once per run for the plan's memory
+/// decisions ([`crate::plan::land_builds`], [`crate::testrun::memory_jobs`]), and
+/// whether it is Linux's `MemTotal` (a few percent under the installed RAM);
+/// `None` when the host will not say.
 ///
 /// The same two sources `tools/trust-gate-all.sh` reads for the trust lane's
 /// `HOST:` figure: Linux's `MemTotal` from `/proc/meminfo`, else `sysctl -n
@@ -756,8 +720,7 @@ pub fn run_measured(cmd: &Cmd, env: ExecEnv<'_>) -> (Run, Option<Duration>) {
 }
 
 /// The `Command` for `cmd` before its cwd and environment are applied: the
-/// program itself or, for a [`Cmd::demoted`] child of a run whose
-/// [`ExecEnv::compile_qos`] is [`CompileQos::Utility`], the program behind
+/// program itself or, for a [`Cmd::demoted`] child, the program behind
 /// `taskpolicy -c utility`.
 ///
 /// Wrapped only when `taskpolicy` exists and the program resolves to an
@@ -770,11 +733,7 @@ pub fn run_measured(cmd: &Cmd, env: ExecEnv<'_>) -> (Run, Option<Duration>) {
 /// background-group process that reads the terminal is stopped by `SIGTTIN`,
 /// which would be a hang.
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
-    let mut c = if cmd.demoted
-        && env.compile_qos == CompileQos::Utility
-        && crate::is_executable_file(taskpolicy)
-        && resolves(cmd, env)
-    {
+    let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
         let mut c = Command::new(taskpolicy);
         c.args(["-c", "utility"]).arg(&cmd.program);
         c
@@ -1396,7 +1355,6 @@ mod tests {
             child_ceiling,
             remove_env: &[],
             add_env: &[],
-            compile_qos: CompileQos::Utility,
         }
     }
 
@@ -1614,39 +1572,6 @@ mod tests {
             spawned_argv(&spawn_command(&hidden, env, &fake))[0],
             "sh",
             "the child's own PATH override is the one searched"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// A RELEASE's MEASURE run (`--compile-qos inherited`) spawns even a demoted
-    /// compile bare, at the gate's own tier, with a real `taskpolicy` and a
-    /// resolvable tool both present — the case that WOULD be wrapped in any
-    /// other run (0.100.0's fat-LTO build, starved at UTILITY by a peer's
-    /// default-QoS build). The negative control is the same child, same env,
-    /// with the run's default tier: wrapped.
-    #[cfg(unix)]
-    #[test]
-    fn a_releases_measure_run_keeps_its_compiles_at_the_inherited_tier() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = crate::mktemp_dir("atv-qos-release").expect("mktemp");
-        let fake = tmp.join("taskpolicy");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let fake_s = fake.to_string_lossy().into_owned();
-        let compile = Cmd::new("/bin/sh").args(["-c", "exit 0"]).demoted();
-        let release = ExecEnv {
-            compile_qos: CompileQos::Inherited,
-            ..env_in(&tmp)
-        };
-        assert_eq!(
-            spawned_argv(&spawn_command(&compile, release, &fake)),
-            ["/bin/sh", "-c", "exit 0"],
-            "a release's MEASURE run: the compile keeps the inherited tier"
-        );
-        assert_eq!(
-            spawned_argv(&spawn_command(&compile, env_in(&tmp), &fake))[..3],
-            [fake_s.as_str(), "-c", "utility"],
-            "negative control: any other run still demotes the same compile"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1941,14 +1866,19 @@ mod tests {
     fn read_pid(file: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Ok(t) = std::fs::read_to_string(file)
-                && t.ends_with('\n')
-            {
-                return t.trim().to_string();
+            if let Some(pid) = written_pid(file) {
+                return pid;
             }
             assert!(Instant::now() < deadline, "no pid in {}", file.display());
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The pid in `file` once its writer has finished the line, else `None`.
+    #[cfg(unix)]
+    fn written_pid(file: &Path) -> Option<String> {
+        let t = std::fs::read_to_string(file).ok()?;
+        t.ends_with('\n').then(|| t.trim().to_string())
     }
 
     /// A shell that backgrounds a long `sleep` — the grandchild — writes its
@@ -1969,13 +1899,27 @@ mod tests {
     #[test]
     fn a_ceiling_kill_takes_the_childs_whole_process_group() {
         let tmp = crate::mktemp_dir("atv-ceil-group").expect("mktemp");
-        let pidfile = tmp.join("grandchild.pid");
-        let r = run(
-            &with_grandchild(&pidfile),
-            ceiled(&tmp, Some(Duration::from_millis(500))),
-        );
-        assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
-        let grandchild = read_pid(&pidfile);
+        // The ceiling clock starts at the spawn, so a ceiling that fires before
+        // the shell has backgrounded its `sleep` kills a group with no
+        // grandchild in it, and no pid ever comes (2026-10-01: a merge gate at
+        // load 110 on 18 cores waited its minute for one behind a 0.5 s
+        // ceiling). The group is dead and reaped once `run` returns, so a
+        // pidfile with no finished line by then never gets one: that run
+        // tested nothing, and the next doubles the ceiling.
+        let mut ceiling = Duration::from_millis(500);
+        let grandchild = loop {
+            let pidfile = tmp.join(format!("grandchild-{}ms.pid", ceiling.as_millis()));
+            let r = run(&with_grandchild(&pidfile), ceiled(&tmp, Some(ceiling)));
+            assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
+            if let Some(pid) = written_pid(&pidfile) {
+                break pid;
+            }
+            assert!(
+                ceiling < GONE,
+                "no shell backgrounded its grandchild within a {ceiling:?} ceiling"
+            );
+            ceiling *= 2;
+        };
         assert!(
             gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the ceiling kill"

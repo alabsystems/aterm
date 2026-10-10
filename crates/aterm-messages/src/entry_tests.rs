@@ -46,10 +46,9 @@ fn full_disk_access() -> Entry {
         "fda",
         "needed",
         "macOS keeps asking for access",
-        // The privacy stream's words (plan-tcc revision 3, `consent_card.rs`:
-        // FDA_WHY, FDA_THEN), quoted here as stand-ins until those constants
-        // exist on main; the host imports them, it never retypes them. Nothing
-        // here promises what the switch will do (S1 is not measured).
+        // Stand-ins for aterm-gui's `consent_card::FDA_WHY` / `FDA_THEN` (that
+        // crate depends on this one); the host imports them, it never retypes
+        // them. Nothing here promises what the switch will do.
         Why::OnlyYou(Reason::new("macOS forgets an Allow when aterm updates")),
         Then::press(
             Mover::open_system_pane("full-disk-access"),
@@ -236,11 +235,10 @@ fn an_entry_goes_through_the_family_pass_and_a_dismissal_holds() {
 fn every_upgrade_kind_passes_the_rule() {
     use crate::text::title_words;
     let kinds: [(Family, &str, &str, &str, &str, &str); 16] = [
-        // own-work: the WHY names what actually holds the move (review
-        // 2026-09-29, minor W: nine of tab 1's ten children were Bash-tool
-        // wrappers under four minutes old, so "16 programs ... stop that work"
-        // gave the owner nothing to stop). A job that outlives a turn is named
-        // and ended; an agent that never pauses is quit and resumed.
+        // own-work: the WHY names what actually holds the move (a count of
+        // short-lived tool children gives the owner nothing to stop). A job
+        // that outlives a turn is named and ended; an agent that never pauses
+        // is quit and resumed.
         (
             Family::Upgrade,
             "",
@@ -337,8 +335,8 @@ fn every_upgrade_kind_passes_the_rule() {
             "your seat does not include usage credits",
             "Ask your Claude admin for a seat with usage credits",
         ),
-        // a stall no reader names (the resume stream's canary fired, `bfc77d36b`,
-        // and nothing changed for three hours)
+        // a stall no reader names (the resume stream's canary fired and nothing
+        // changed for three hours)
         (
             Family::Resume,
             "s-1",
@@ -365,8 +363,7 @@ fn every_upgrade_kind_passes_the_rule() {
             "this dev build overwrote the PATH links, the shell hooks and the agent primer",
             "Run `aterm pkg repair` from the release",
         ),
-        // the privacy stream's words (plan-tcc revision 3), stood in until the
-        // constants are on main
+        // the privacy stream's words (stand-ins for `consent_card`'s)
         (
             Family::Privacy,
             "fda",

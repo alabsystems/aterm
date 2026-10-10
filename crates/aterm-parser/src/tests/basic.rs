@@ -81,7 +81,7 @@ fn parse_osc_c1_st_is_data_not_terminator() {
 
     // 0x9C is treated as data in OscString state (not ST terminator).
     // This is required for UTF-8 correctness: 0x9C is a valid continuation
-    // byte in CJK characters (e.g., 本 = E6 9C AC). Part of #3745 fix.
+    // byte in CJK characters (e.g., 本 = E6 9C AC).
     // Terminate with BEL to flush the OSC.
     parser.advance(b"\x1b]0;Title\x9cMore\x07", &mut sink);
 
@@ -187,7 +187,7 @@ fn reset_clears_state() {
     assert_eq!(sink.csi_dispatches[0].0, vec![32]);
 }
 
-// ============== Latin-1 byte handling tests (#7160) ==============
+// ============== Latin-1 byte handling tests ==============
 
 /// Bytes 0xA0-0xFF in Ground state should be printed as Latin-1 characters
 /// via the basic advance() path, not silently dropped.
@@ -260,4 +260,43 @@ fn advance_fast_treats_high_bytes_as_utf8() {
         char::REPLACEMENT_CHARACTER,
         "advance_fast should treat 0xE9 as UTF-8 lead byte, not Latin-1"
     );
+}
+
+/// Every introducer ends where its terminator says, in both C1 modes and
+/// through both the byte path and the fast path: `ESC [` with every digit
+/// and every final byte (0x40..=0x7E), `ESC ]` with every printable data
+/// byte and BEL, and `ESC P q` with ST all leave the parser at `Ground`.
+#[test]
+fn every_introducer_terminates() {
+    let mut streams: Vec<Vec<u8>> = Vec::new();
+    for digit in b'0'..=b'9' {
+        for final_byte in 0x40..=0x7E {
+            streams.push(vec![0x1B, b'[', digit, final_byte]);
+        }
+    }
+    for data in 0x20..=0x7E {
+        streams.push(vec![0x1B, b']', data, 0x07]);
+    }
+    streams.push(b"\x1bPq\x1b\\".to_vec());
+    for c1 in [false, true] {
+        for fast in [false, true] {
+            for stream in &streams {
+                let mut parser = if c1 {
+                    Parser::with_c1_controls()
+                } else {
+                    Parser::new()
+                };
+                if fast {
+                    parser.advance_fast(stream, &mut NullSink);
+                } else {
+                    parser.advance(stream, &mut NullSink);
+                }
+                assert_eq!(
+                    parser.state(),
+                    State::Ground,
+                    "c1={c1} fast={fast} {stream:02x?}"
+                );
+            }
+        }
+    }
 }

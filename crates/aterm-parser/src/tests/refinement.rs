@@ -2,37 +2,24 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parser TLA+ refinement mapping.
-//!
-//! Projects the concrete `Parser` state to the abstract `ParserModel` that
-//! corresponds to the TLA+ `Parser.tla` specification variables:
-//!   - `state`      ↦ one of 14 named parser states
-//!   - `params`     ↦ bounded parameter vector (max 16)
-//!   - `intermediates` ↦ bounded intermediate vector (max 4)
-//!   - `currentParam`  ↦ current parameter accumulator
-//!
-//! UTF-8 decoding state is intentionally excluded — the TLA+ spec models
-//! the VT parser state machine, not the encoding layer above it.
-//! See `Parser.tla` DESIGN NOTE on FV-11.
+//! Refinement mapping: the concrete `Parser` projected onto `ParserModel`,
+//! the VT state machine's variables (state, parameter and intermediate
+//! counts, the parameter accumulator). UTF-8 decoding is the layer above the
+//! state machine and is not modelled.
 
 use aterm_spec::Refines;
 
 use crate::{Parser, State};
 
-/// Abstract parser model corresponding to `Parser.tla` variables.
-///
-/// This captures only the state variables that appear in the TLA+ spec.
-/// Implementation details (UTF-8 buffer, osc_data, APC tracking) are
-/// excluded because the TLA+ spec does not model them.
+/// The abstract parser state. The UTF-8 buffer, OSC data and APC tracking
+/// are not part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParserModel {
-    /// Current parser state (one of 14 states in the TLA+ `States` set).
     pub state: State,
-    /// Number of accumulated CSI/DCS parameters (TLA+ `params` sequence length).
+    /// Accumulated CSI/DCS parameters.
     pub param_count: usize,
-    /// Number of intermediate bytes (TLA+ `intermediates` sequence length).
     pub intermediate_count: usize,
-    /// Current parameter accumulator value (TLA+ `currentParam`).
+    /// The parameter being accumulated.
     pub current_param: u32,
 }
 
@@ -90,11 +77,10 @@ fn test_ground_after_complete_sequence() {
 
     let model = parser.project();
     assert_eq!(model.state, State::Ground);
-    // After CSI dispatch the finalized param remains until the next
-    // sequence clears the buffer (TLA+ Clear action fires on entry).
+    // After dispatch the finalized param remains until the next sequence
+    // clears the buffer on entry.
     assert_eq!(model.param_count, 1);
 
-    // Start a new sequence to observe the Clear action
     parser.advance(b"\x1b[", &mut sink);
     let model = parser.project();
     assert!(model.state.is_csi());

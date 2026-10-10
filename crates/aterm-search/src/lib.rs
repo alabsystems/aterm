@@ -34,8 +34,8 @@
 //!
 //! ## Verification
 //!
-//! - Kani proofs: `no_false_negatives_symbolic`
-//! - Tests: `search_with_positions`, `search_reverse_iterator_multiple_matches_per_line`
+//! - Tests: `verified_search_matches_bruteforce` (`tests/search_vs_bruteforce.rs`:
+//!   no false negatives or positives against brute force), `search_with_positions`, `search_reverse_iterator_multiple_matches_per_line`
 //! - Fuzz tests: `fuzz/fuzz_targets/search.rs` (in aterm-core)
 //! - TLA+ spec: derived `StreamingSearch` machine
 //!   (`aterm_spec::derive::streaming_search_model()`) — proven at build time by
@@ -47,6 +47,8 @@
 #![deny(clippy::all)]
 
 use std::borrow::Cow;
+
+use aterm_types::text_shaping::AmbiguousWidth;
 
 mod bitmap;
 mod bloom;
@@ -61,7 +63,7 @@ mod types;
 
 pub use bloom::BloomFilter;
 pub use budgeted::BudgetedSearch;
-pub use grapheme::display_columns;
+pub use grapheme::{display_columns, display_columns_with};
 pub use index::{
     DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch, SearchIndex, SearchOptionsError,
     max_cached_for_retained,
@@ -70,9 +72,6 @@ pub use types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod proofs;
 
 /// Terminal search that integrates with Grid and Scrollback.
 ///
@@ -148,6 +147,20 @@ impl TerminalSearch {
             indexed_scrollback_lines: 0,
             generation: 0,
         }
+    }
+
+    /// Measure match columns under the terminal's `ambiguous_width` policy
+    /// (see [`SearchIndex::set_ambiguous_width`]); a builder for a fresh index.
+    #[must_use]
+    pub fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
+        self.index.set_ambiguous_width(ambiguous);
+        self
+    }
+
+    /// The `ambiguous_width` policy match columns are measured under.
+    #[must_use]
+    pub fn ambiguous_width(&self) -> AmbiguousWidth {
+        self.index.ambiguous_width()
     }
 
     /// The oldest line still retained in the index.
@@ -355,7 +368,7 @@ impl TerminalSearch {
     ///
     /// This uses O(log n) range queries to skip lines before `after_line`,
     /// then iterates with early termination to find the first match.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn find_next(
         &self,
         query: &str,
@@ -399,7 +412,7 @@ impl TerminalSearch {
     ///
     /// This uses O(log n) range queries to only search lines before `before_line`,
     /// then iterates with early termination to find the first match.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub fn find_prev(
         &self,
         query: &str,

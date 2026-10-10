@@ -11,7 +11,7 @@
 //! printed with the command that replays it; a failing case prints its index
 //! and input length. `PROPTEST_CASES` raises the case count.
 //!
-//! two binaries mount this file, one per engine build, because every soup run
+//! Two binaries mount this file, one per engine build, because every soup run
 //! carries dozens of `ESC P [0-9;]* q` sixel hooks and the two builds route
 //! them differently:
 //! - aterm-core's `fuzz_process_never_panics` (as `mod fresh`) runs against
@@ -21,11 +21,9 @@
 //!   `DcsType::Unknown` path), with it under `--features sixel` or the
 //!   `--workspace` gate, where feature unification turns it on.
 //! - aterm-conformance's `vt` suite (as `mod fresh_terminal`, by `#[path]`)
-//!   always runs against aterm-core[sixel], that crate's dependency, as
-//!   robustness.rs did: there the hooks reach the decoder and image placement
-//!   on every run, `-p aterm-conformance` alone included, and no feature
-//!   unification is relied on. `known_adversarial_corpus_is_survived` pins
-//!   each binary's build.
+//!   always runs against aterm-core[sixel], that crate's dependency: there
+//!   the hooks reach the decoder and image placement on every run,
+//!   `-p aterm-conformance` alone included.
 //!
 //! `known_adversarial_corpus_is_survived` pins each binary's build. A `sixel`
 //! self dev-dependency cannot be used instead: cargo cannot turn a

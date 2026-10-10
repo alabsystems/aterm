@@ -89,7 +89,7 @@ fn disk_cold_cache_byte_limit_is_enforced() {
         cold.cache.borrow().len() < num_pages,
         "the byte budget must force eviction below the page-count cap"
     );
-    // cache_bytes stays exactly the sum of per-entry byte sizes (Kani post-cond 3).
+    // cache_bytes stays exactly the sum of per-entry byte sizes.
     let sum: usize = cold.cache.borrow().values().map(|e| e.bytes).sum();
     assert_eq!(
         cold.cache_bytes.get(),
@@ -1622,4 +1622,70 @@ fn disk_cold_append_barrier_fires_on_byte_policy() {
         caught_up,
         "byte-policy barrier must fire during a sustained burst"
     );
+}
+
+/// An in-memory tier over pages of `line_counts` lines, built the way
+/// `push_compressed` leaves the index (no file, so nothing is read).
+fn tier_of_pages(line_counts: &[u32]) -> DiskColdTier {
+    let mut cold = DiskColdTier::new();
+    let mut total = 0usize;
+    for &line_count in line_counts {
+        cold.index.push(PageIndexEntry {
+            offset: HEADER_SIZE as u64,
+            compressed_size: 50,
+            line_count,
+        });
+        total += len_u32_to_usize(line_count);
+        cold.cumulative_lines.push(total);
+    }
+    cold.line_count = total;
+    cold
+}
+
+/// THE PAGE LOOKUP AND THE FRONT TRUNCATION, OVER EVERY SMALL LAYOUT: every
+/// tier of 1..=4 pages of 1..=6 lines each (1554 layouts, so every
+/// non-uniform cumulative boundary the `+1` encoding meets). `find_page`
+/// brackets every line in its page; and after `truncate_front_lines(n)` for
+/// every `n` up to the whole tier, the line count drops by `n` and, while a
+/// page survives, `front_offset` is inside the first live page — what
+/// `compact_page_trimmed`'s `&lines[trim..]` relies on.
+#[test]
+fn find_page_and_front_truncation_over_every_small_layout() {
+    let mut layouts: Vec<Vec<u32>> = Vec::new();
+    let mut frontier: Vec<Vec<u32>> = vec![Vec::new()];
+    for _ in 0..4 {
+        frontier = frontier
+            .iter()
+            .flat_map(|l| (1..=6).map(move |c| [l.as_slice(), &[c]].concat()))
+            .collect();
+        layouts.extend(frontier.iter().cloned());
+    }
+    assert_eq!(layouts.len(), 6 + 36 + 216 + 1296);
+    for layout in &layouts {
+        let cold = tier_of_pages(layout);
+        let total = cold.line_count;
+        for line in 0..total {
+            let page = cold
+                .find_page(line)
+                .unwrap_or_else(|| panic!("{layout:?}: no page for line {line}"));
+            let start = page.checked_sub(1).map_or(0, |p| cold.cumulative_lines[p]);
+            assert!(
+                start <= line && line < cold.cumulative_lines[page],
+                "{layout:?}: line {line} in page {page}"
+            );
+        }
+        assert_eq!(cold.find_page(total), None, "{layout:?}: past the end");
+        for n in 1..=total {
+            let mut cold = tier_of_pages(layout);
+            cold.truncate_front_lines(n);
+            assert_eq!(cold.line_count, total - n, "{layout:?} minus {n}");
+            if let Some(first) = cold.live_index().first() {
+                assert!(
+                    cold.front_offset < len_u32_to_usize(first.line_count),
+                    "{layout:?} minus {n}: front_offset {} past the first live page",
+                    cold.front_offset
+                );
+            }
+        }
+    }
 }

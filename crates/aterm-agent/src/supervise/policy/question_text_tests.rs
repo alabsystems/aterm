@@ -1410,9 +1410,8 @@ struct ModelReads {
 /// function, its environment built once a state), breadth first.
 ///
 /// The states met are kept in a hash set, membership being all the walk asks
-/// of it: a `BTreeSet` of value vectors compared them element by element down
-/// its tree on every successor, 40% of the test's samples (measured
-/// 2026-10-06). The walk's order is the queue's, as before.
+/// of it: a `BTreeSet` of value vectors cost 40% of the test's samples
+/// (measured). The walk's order is the queue's.
 fn model_reads(multi: bool) -> ModelReads {
     let committed = aterm_spec::derive::supervisor_question_text_model();
     let model = aterm_spec::interp::with_consts(&committed, &[("Multi", i64::from(multi))]);

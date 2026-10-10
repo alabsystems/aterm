@@ -670,8 +670,7 @@ pub(crate) fn pending_stub_executable_at(
     // (`reroute::lay`). Every seed runs the adoption lay and every install pass reconciles
     // twice, so a name that stays wanted-and-absent re-laid identical bytes each time. A body
     // that differs — the atpkg it names changed, or an older client's retired extra/requires
-    // line — is rewritten. A macOS tag is not a difference: the store heal clears it in place
-    // ([`crate::provenance::heal_store`]).
+    // line — is rewritten.
     if standing.is_some() && stub_is_current(&shim, &body) {
         return Ok(None);
     }

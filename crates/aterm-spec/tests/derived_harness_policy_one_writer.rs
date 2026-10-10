@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `HarnessPolicyOneWriter` (2026-09-29): the supervisor's
+//! Tier-0 for `HarnessPolicyOneWriter`: the supervisor's
 //! `[harness]` policy has one writer, the config watcher. Twin of the Clean
 //! island in aterm-gui's `config_watcher_island.rs`; Tier-1 is
 //! `config_watcher::tests::the_watcher_is_the_policys_one_writer`.

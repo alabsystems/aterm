@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W2 second pass, part two: the claims nobody armed.
+//! Adversarial tests: ivar alignment, empty classes, wide selectors, release-build checks.
 
 #![cfg(target_os = "macos")]
-// This file USED to carry `#![allow(clippy::too_many_arguments)]`, because
-// `declare_class!` emits each body as an inherent `fn` carrying every declared
-// argument and the ten-colon selector below therefore tripped the lint with its
-// span inside the expansion — where no `#[allow]` a caller writes can reach.
-// The macro now emits the allow itself, alongside the `non_snake_case` and
-// `dead_code` it already emitted. The absence of the attribute here IS F9's
-// arming: put the ten-colon method back under a bare `targo tippy` and the
-// lint fires again if the macro stops emitting it.
+// No `#![allow(clippy::too_many_arguments)]` here, on purpose: `declare_class!`
+// must emit that allow itself (the lint's span is inside the expansion, where a
+// caller's `#[allow]` cannot reach). The ten-colon selector below makes the
+// lint fire if the macro stops emitting it.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
@@ -248,7 +244,7 @@ const SIGABRT: i32 = 6;
 
 #[test]
 fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
-    // W2's claim: the initialised flag is checked in RELEASE builds too,
+    // The initialised flag is checked in RELEASE builds too,
     // because the class is registered under a public name and ObjC code can
     // `+alloc`/`-init` it without ever reaching `alloc_init`. That instance's
     // ivar slot is all zeros; reading it as an `Arc` would be undefined

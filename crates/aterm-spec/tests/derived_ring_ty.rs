@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Tier-0 for DERIVED specs: the TLA+ generated from a Rust `Model` (one source)
-//! is exhaustively model-checked by the real `ty` binary.
+//! Tier-0 for `ty_model!` models (`aterm_spec::derive`'s module docs): each
+//! model's generated TLA+ (`Model::to_tla()` / `.to_cfg()`) is exhaustively
+//! checked over its bounded state space, so a model change re-checks the spec.
 //!
-//! This is Tier 0 of the `ty_model!` workflow (`aterm_spec::derive`'s module
-//! docs): no hand-written `.tla` — `Model::to_tla()` produces the module and
-//! `.to_cfg()` the config, and `ty check` proves the invariants hold over the
-//! whole bounded state space. Change the model, the spec changes, and this
-//! re-checks the new spec.
-//! Drift is impossible by construction. Both the single-action ring AND the
-//! two-action cursor (which exercises `UNCHANGED` + a disjunctive `Next`) are
-//! checked, so the derivation is shown to generalize.
-//!
-//! VERIFICATION GATE (two-tier, see [`aterm_spec::verify`]): every obligation is
-//! discharged by the IN-PROCESS interpreter (exhaustive BFS of the same bounded
-//! model — a real check, toolchain-free), and ADDITIONALLY by the external `ty`
-//! binary wherever it is installed. The tiers must agree; disagreement panics.
+//! Two tiers ([`aterm_spec::verify`]): the in-process interpreter always
+//! discharges every obligation, and the external `ty` re-checks it wherever it
+//! is installed. The tiers must agree; disagreement panics.
 
 // The property models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
@@ -105,23 +96,16 @@ use aterm_spec::derive::{
 use aterm_spec::verify;
 use std::process::Command;
 
-/// The POLICY this file states for the THREE function-valued models it drives
-/// (EvictFull, TierResidency, Recording): skip the miss and keep going. For
-/// every other model here — all scalar — the interpreter tier discharges the
-/// obligation unconditionally and this is a no-op, since [`verify::NotRun`] is
-/// only reachable when a function-valued model meets a machine with no Trust
-/// `ty`.
+/// Skip a `NotRun` for the three function-valued models (EvictFull,
+/// TierResidency, Recording); for scalar models the interpreter always
+/// discharges and this is a no-op.
 ///
-/// Skipping rather than failing is deliberate. A hard require would make
-/// `targo --unverified test -p aterm-spec --test spec_suite -- derived_ring_ty::` — the file you iterate on
-/// while editing a model — unrunnable without the Trust toolchain, and it would
-/// buy no coverage: each of the three has a toolchain-free Tier-1 conformance
-/// twin binding it to shipping code (`aterm-buffer`'s `conformance_evict_full`
-/// and `conformance_temporal`, `aterm-core`'s `conformance_recording`). What
-/// must never happen is the miss passing SILENTLY: the `_tiered` call has
-/// already written its `NOT RUN (not a pass)` line straight to stderr, where a
-/// passing test's output still reaches the log, so the skip needs no second
-/// line here.
+/// Skipping, not failing: a hard require would make this file unrunnable
+/// without the Trust toolchain and buy no coverage, since each of the three
+/// has a toolchain-free Tier-1 twin (`aterm-buffer`'s `conformance_evict_full`
+/// and `conformance_temporal`, `aterm-core`'s `conformance_recording`). The
+/// miss is never silent: the `_tiered` call already wrote `NOT RUN (not a
+/// pass)` to stderr.
 fn tier0_or_skip(discharge: Result<verify::Covered, verify::NotRun>) {
     let _skipped_with_its_notice: Option<verify::NotRun> = discharge.err();
 }
@@ -157,19 +141,14 @@ fn derived_ring_spec_proves_and_catches_late_eviction() {
     assert!(!buggy.check_invariant("LenBounded", &state));
 }
 
-/// NEW-1 of the live e2e (2026-09-26): the server's `idle` for a Claude
-/// Code is the handshake an orchestrator types its first prompt on. Idle is
-/// published only for the NEW REPL drawn whole, the terminal's cursor in its
-/// prompt box, so a prompt typed on it is never lost, on every path — a new
-/// folder's trust dialog, pressed, or a folder trusted before; in a new tab,
-/// or the inline renderer relaunched in the same tab with the previous run's
-/// prompt box still on the screen. The old reader (`Buggy=1`: idle for any
-/// screen with no box and no spinner) publishes idle on the shell's rows the
-/// dialog's press leaves; the reader of 2026-09-26 (`Buggy=2`: idle at the
-/// last caret's whole box, the cursor not asked) publishes idle on the
-/// previous run's box while nothing of the new launch is drawn under it (the
-/// review of 2026-09-26: a draft lost 3 of 3). The prompt typed there is
-/// lost — each catches both invariants.
+/// The server's `idle` for a Claude Code is the handshake an orchestrator
+/// types its first prompt on, so it is published only for the new REPL drawn
+/// whole with the cursor in its prompt box: after a trust dialog is pressed,
+/// in a folder trusted before, in a new tab or a relaunch in the same tab.
+/// `Buggy=1` (idle for any screen with no box and no spinner) reads idle on
+/// the rows the dialog's press leaves; `Buggy=2` (idle at any whole box, the
+/// cursor not asked) reads idle on the previous run's box. Each loses the
+/// prompt and breaks both invariants.
 #[test]
 fn derived_claude_is_idle_only_at_its_composer() {
     let model = claude_idle_at_composer_model();
@@ -215,7 +194,7 @@ fn derived_claude_is_idle_only_at_its_composer() {
         let lost = step(&buggy, &old, "Type");
         assert!(!buggy.check_invariant("NoFirstPromptLost", &lost));
 
-        // The reader of 2026-09-26: any whole box on the screen.
+        // Buggy=2: any whole box on the screen.
         let framed = aterm_spec::interp::with_buggy(&model, 2);
         let seen = step(&framed, &pressed, "Look");
         assert_eq!(
@@ -1000,7 +979,7 @@ fn derived_watcher_latch_proves_and_catches_silent_loss() {
     assert_proves_and_catches(&watcher_latch_model());
 }
 
-/// Damage→present bounded response (the 2026-07-05 five-fps incident): pending
+/// Damage→present bounded response: pending
 /// PTY damage waits at most `Expiry + 1` idle ticks for its present — a lost
 /// `Wake::Output` may cost one bounded heal window, never process-lifetime
 /// present starvation — and a wake stranded with its loop wake-up is re-posted
@@ -1060,7 +1039,7 @@ fn derived_damage_to_present_proves_and_catches_starvation() {
     assert_proves_and_catches(&model);
 }
 
-/// No false heal (2026-09-29): the watchdog never heals a wake still QUEUED
+/// No false heal: the watchdog never heals a wake still QUEUED
 /// behind a long frame. PROVES `NoFalseHeal` with the evidence rule (Buggy=0)
 /// and CATCHES the age-only heal (Buggy=1). The replayed live trace is pinned
 /// step by step: in a running turn, damage arms and posts a wake, the frame runs
@@ -1547,31 +1526,6 @@ fn derived_predictive_echo_proves_no_flash_and_catches_immediate_display() {
     assert_proves_and_catches(&model);
 }
 
-/// The incident models must participate in the repository-wide spec-link and
-/// strict-vacuity closure, not only their direct Tier-0/Tier-1 tests. This is a
-/// regression lock for the registry seam consumed by aterm-gui's closure gate.
-#[test]
-fn zoom_and_typing_incident_models_are_registered_for_global_verification() {
-    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
-        .into_iter()
-        .map(|model| model.name)
-        .collect();
-    for expected in [
-        "SurfaceCoverage",
-        "StartupPhasePublication",
-        "PresentRetry",
-        "GpuLossRoute",
-        "GpuLossRecovery",
-        "RecoveryRedraw",
-        "PredictiveEchoVisibility",
-    ] {
-        assert!(
-            registered.contains(expected),
-            "{expected} must resolve through the global spec↔source registry"
-        );
-    }
-}
-
 /// Self-reflection feedback governor (RFC R4 / L2): once the breaker trips, no
 /// self-write survives — the storm backstop. PROVES FailClosed at Buggy=0,
 /// CATCHES the breaker-bypass at Buggy=1. Bound to `aterm-agent::SelfGovernor`
@@ -1835,7 +1789,7 @@ fn derived_emacs_search_navigation_proves_and_catches_each_regression() {
 /// deadline; output that re-pins the viewport mid-glide shifts the target with
 /// it. `ty` proves `BoundedWakes`, `DisarmedAtTarget`, `ReducedSettled` and
 /// `TargetIsAnchored` (Buggy=0), and catches the audited mutant that keeps the
-/// intermediate row + armed deadline across `SetReduced` and the pre-2026-09-22
+/// intermediate row + armed deadline across `SetReduced` and the
 /// tick that left the target behind the machine's re-pin (Buggy=1).
 /// Bound to the shipping `scroll_motion::Glide` and App settle reducer by
 /// aterm-gui's convergence lattice tests plus
@@ -2959,8 +2913,8 @@ fn derived_control_connection_admission_proves_and_catches_overflow() {
 /// it parks; waiting, it moves to a wait lane, or — past the wait lanes — waits
 /// on at most `Inline` request lanes and is answered busy beyond them; so
 /// persistent drivers never use the request lanes up and a fresh client is
-/// refused only for work or the open-connection bound. The mutant is the
-/// 2026-09-26 design (and six more defects), each caught alone; three of its
+/// refused only for work or the open-connection bound. The mutant carries
+/// seven defects, each caught alone; three of its
 /// traces are replayed here: two drivers go idle ON their lanes and the third
 /// client is refused for it, waits past the wait lanes take every request
 /// lane, and a wait is kept on a request lane — then a second one answered
@@ -3008,7 +2962,7 @@ fn derived_control_lane_tenure_proves_and_catches_the_held_lane() {
         "a refusal for the open-connection bound is not one an idle driver caused"
     );
 
-    // WAITS PAST THE WAIT LANES (the review of 2026-09-27). The one wait lane is
+    // WAITS PAST THE WAIT LANES. The one wait lane is
     // taken, and a second wait is served on its request lane (the budget,
     // Inline=1). A third wait cannot move either. The fallback as first shipped
     // served it on its request lane too: both lanes then hold a wait, and a
@@ -3048,11 +3002,10 @@ fn derived_control_lane_tenure_proves_and_catches_the_held_lane() {
         "a parked driver's next request still finds a request lane"
     );
 
-    // A WAIT WITH A REQUEST PIPELINED BEHIND IT (the review of the budget,
-    // 2026-09-27). Until its bytes moved with it, such a wait never left its
-    // request lane: it took the budget's place, and the next one was answered
-    // busy, the wait lane free all along (the fifth `aterm drive --dial`
-    // relay). The mutant replays that; the shipping design's only step for a
+    // A WAIT WITH A REQUEST PIPELINED BEHIND IT. Unless its bytes move with
+    // it, such a wait never leaves its request lane: it takes the budget's
+    // place, and the next one is answered busy, the wait lane free all along.
+    // The mutant replays that; the shipping design's only step for a
     // wait beside a free wait lane is the move.
     let step = |state, action| buggy.successors(action, &state)[0].clone();
     let kept = step(step(buggy.init_state(), "Admit"), "InlineWait");
@@ -4526,33 +4479,6 @@ fn derived_video_tap_slot_proves_and_catches_lifecycle_and_ordering_mutants() {
     assert_every_invariant_carries_a_mutant(&model, &["DropCountBounded", "ValuesBounded"]);
 }
 
-/// Every capture lifecycle model must participate in the global spec-link,
-/// strict-vacuity, and source-anchor closure.
-#[test]
-fn capture_tap_models_are_registered_for_global_verification() {
-    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
-        .into_iter()
-        .map(|model| model.name)
-        .collect();
-    for expected in [
-        "SnapshotGenerationCommit",
-        "VideoRecordingLifecycle",
-        "ExactInstanceRetention",
-        "AnchoredArtifactTransaction",
-        "ArtifactReplyPublication",
-        "ArtifactHandoffCapacity",
-        "VideoBatchPublicationDurability",
-        "ArtifactReaderLease",
-        "PresentedFrameTap",
-        "VideoTapSlot",
-    ] {
-        assert!(
-            registered.contains(expected),
-            "{expected} must resolve through the global spec↔source registry"
-        );
-    }
-}
-
 /// A focused leaf can change cell coordinates without changing the coarse
 /// single/composed class (divider drag, zoom transition, or focus move). The
 /// retained cursor-effect state must be reset before that frame is eligible to
@@ -4661,8 +4587,7 @@ fn derived_native_preview_font_convergence_proves_and_catches_lost_ready_frame()
     assert_proves_and_catches(&model);
 }
 
-/// The mode light's return (owner, 2026-09-27: "when I toggle auto-approve,
-/// it turns off auto mode (what?!)"): proved at `Buggy=0`, and each defect it
+/// The mode light's return: proved at `Buggy=0`, and each defect it
 /// was written for is its own law's counterexample at `Buggy=1` — a press
 /// from an expected mode, a press into a box or mid-turn, a stop that does
 /// not say where. The paths, pinned: from manual, three presses reach the
@@ -4904,26 +4829,6 @@ fn derived_semantic_prewarm_request_swap_proves_and_catches_mixed_active_paint()
     assert!(!buggy.check_invariant("MismatchedReadyMovesToCache", &mixed));
 
     assert_every_invariant_breaks_first(&model, &["FlagsBounded"]);
-}
-
-/// Every semantic-prewarm race model participates in the global spec-link and
-/// strict-vacuity closure, not only its direct Tier-0/Tier-1 test.
-#[test]
-fn semantic_prewarm_models_are_registered_for_global_verification() {
-    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
-        .into_iter()
-        .map(|model| model.name)
-        .collect();
-    for expected in [
-        "SemanticPrewarmGeneration",
-        "SemanticPrewarmHandshake",
-        "SemanticPrewarmRequestSwap",
-    ] {
-        assert!(
-            registered.contains(expected),
-            "{expected} must resolve through the global spec↔source registry"
-        );
-    }
 }
 
 /// Versioned preference writes accept an unchanged touched key across unrelated
@@ -6344,11 +6249,13 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert_every_invariant_carries_a_mutant(&model, &["FloorStateBounds"]);
 }
 
-/// The release claim's writer/reader contract (owner ruling R2, 2026-09-23): the
+/// The release claim's writer/reader contract (owner ruling R2): the
 /// release commit carries only the published code, main keeps every peer commit
-/// and every ledger line, build numbers strictly increase, and a claimed-unpublished
-/// version is read as a recut — never fresh, never "cut elsewhere", never claimed
-/// again once published. Each mutant is replayed and caught by its own law.
+/// and every ledger line, build numbers strictly increase — a reservation the
+/// tail reached is reserved again, never landed under its old number (build
+/// once) — and a claimed-unpublished version is read as a recut — never fresh,
+/// never "cut elsewhere", never claimed again once published. Each mutant is
+/// replayed and caught by its own law.
 #[test]
 fn derived_release_claim_landing_proves_the_writer_reader_contract() {
     let model = release_claim_landing_model();
@@ -6356,16 +6263,21 @@ fn derived_release_claim_landing_proves_the_writer_reader_contract() {
     assert_proves_and_catches(&model);
     assert_every_invariant_carries_a_mutant(&model, &["ClaimStateBounds"]);
 
-    // Peers push, the claim loses a race to another version's claim, re-reads,
-    // and lands as a merge; the cut dies; the recut claims again and publishes; a
-    // third cut is refused.
+    // Peers push; another version's claim reaches the reserved number, so the
+    // claim is stale (nothing claimed) and the release reserves again and lands as
+    // a merge; the cut dies; the recut loses a race to a peer, keeps its number
+    // and lands; it publishes; a third cut is refused.
     let mut state = model.init_state();
+    for action in ["PeerPush", "ClassifyFresh", "ClaimRead", "RivalClaim"] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+    }
+    assert!(
+        !model.action_enabled("ClaimRetry", &state),
+        "a reservation the tail reached is never landed: {state:?}"
+    );
     for action in [
-        "PeerPush",
-        "ClassifyFresh",
+        "ClaimStale",
         "ClaimRead",
-        "RivalClaim",
-        "ClaimRetry",
         "ClaimLand",
         "Die",
         "ClassifyRecut",
@@ -7002,13 +6914,35 @@ fn derived_release_yank_is_successor_first_and_crash_convergent() {
     assert_every_invariant_carries_a_mutant(&model, &["YankStateBounds"]);
 }
 
+/// These models are named by `refines` anchors and the global spec-link and
+/// strict-vacuity closure, which see only registered models.
 #[test]
-fn release_channel_models_are_registered_for_xref_resolution() {
+fn incident_models_are_registered_for_global_verification() {
     let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
         .into_iter()
         .map(|model| model.name)
         .collect();
     for expected in [
+        "SurfaceCoverage",
+        "StartupPhasePublication",
+        "PresentRetry",
+        "GpuLossRoute",
+        "GpuLossRecovery",
+        "RecoveryRedraw",
+        "PredictiveEchoVisibility",
+        "SnapshotGenerationCommit",
+        "VideoRecordingLifecycle",
+        "ExactInstanceRetention",
+        "AnchoredArtifactTransaction",
+        "ArtifactReplyPublication",
+        "ArtifactHandoffCapacity",
+        "VideoBatchPublicationDurability",
+        "ArtifactReaderLease",
+        "PresentedFrameTap",
+        "VideoTapSlot",
+        "SemanticPrewarmGeneration",
+        "SemanticPrewarmHandshake",
+        "SemanticPrewarmRequestSwap",
         "ReleaseDurablePostIntent",
         "ReleaseChannelFloor",
         "ReleaseJournalPrefix",
@@ -7020,7 +6954,7 @@ fn release_channel_models_are_registered_for_xref_resolution() {
     ] {
         assert!(
             registered.contains(expected),
-            "{expected} must resolve through the spec↔source registry"
+            "{expected} is not registered"
         );
     }
 }
@@ -7140,9 +7074,8 @@ fn derived_native_update_auto_intent_proves_and_catches_lost_stage_wake() {
 }
 
 /// THE APPLY LADDER: a never-quiet terminal lands at the bound and activity
-/// never latches the automatic lane manual-only. The mutant is the 2026-09-20
-/// incident — a busy terminal stood down past the typing hold — and it WEDGES
-/// before landing, which is exactly what the owner's aterm did eleven times.
+/// never latches the automatic lane manual-only. The mutant stands a busy
+/// terminal down past the typing hold, and it WEDGES before landing.
 #[test]
 fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stand_down() {
     let model = native_update_apply_ladder_model();
@@ -7187,7 +7120,7 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     let ruleless = buggy.successors("ParkWithoutTheRule", &mid_word)[0].clone();
     assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &ruleless));
 
-    // THE 2026-09-21 AUDIT. A genuine physical failure at KeysOnly latches the
+    // A genuine physical failure at KeysOnly latches the
     // lane; the clock keeps running underneath the latch; the lapse resumes
     // the ladder at the phase the clock reached — never a fresh one.
     let mut keys_only = model.init_state();
@@ -7248,7 +7181,7 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     let miss_latched = buggy.successors("ParkMissLatches", &keys_only)[0].clone();
     assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &miss_latched));
 
-    // THE CONSENT WARM-UP (2026-09-23): the one hold no phase relaxes. At the
+    // THE CONSENT WARM-UP: the one hold no phase relaxes. At the
     // bound, a warm-up the user started blocks every admitted park; its end —
     // always enabled while it holds — lets the landing through. The mutant's
     // ruleless park lands on top of the dialog and is caught.
@@ -7278,7 +7211,7 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     ladder_lets_a_newer_release_clear_a_converged_activation_latch(&model, &latched);
 }
 
-/// LAW 1 OF THE LADDER, MACHINE-CHECKED (round three, plan P1-7): "the staged
+/// LAW 1 OF THE LADDER, MACHINE-CHECKED (plan P1-7): "the staged
 /// build lands" holds on every fair behaviour, on the interpreter always and on
 /// `ty` wherever it is installed (`PROPERTY TheLadderLands` under the stated
 /// `WF_vars` / `SF_vars`); every stated fairness assumption is needed; and each
@@ -7298,7 +7231,7 @@ fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livel
     verify::liveness_proves_and_catches_tiered(&model, &live, "NativeUpdateApplyLadder Law 1");
     let is_landed = |state: &aterm_spec::interp::State| state["landed"] == 1;
 
-    // THE v0.91 LOOP: the capture refusal re-filed as the machine being busy,
+    // THE REFILING LOOP: the capture refusal re-filed as the machine being busy,
     // every time the park's gate opens on the same refusing desk.
     let refiling = verify::buggy_baseline_with(&model, "CaptureRefusedAsActivity");
     assert_eq!(
@@ -7353,10 +7286,10 @@ fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livel
         "the look that kept the latch is how the run got there:\n{waits}"
     );
 
-    // THE REFUSAL THAT SPENT THE RELEASE for good (round three as first
-    // shipped): a retire refused for a moment — a verification past its budget
-    // on a captive-portal network — left the release spent, and the machine
-    // waited for a still newer build or a person. The same livelock, reached
+    // THE REFUSAL THAT SPENDS THE RELEASE for good: a retire refused for a
+    // moment — a verification past its budget on a captive-portal network —
+    // leaves the release spent, and the machine waits for a still newer build
+    // or a person. The same livelock, reached
     // through a refusal the healthy lane now answers with a retry.
     let spending = verify::buggy_baseline_with(&model, "RefusedRetireSpendsTheRelease");
     assert_eq!(
@@ -7402,9 +7335,9 @@ fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livel
         "the loop is refuse, wait, refuse:\n{refused_forever}"
     );
 
-    // THE WEDGES (the 2026-09-20 stand-down, and a park miss filed as a
-    // failure): non-progress too, as a stall — the one shape the deadlock check
-    // already saw, and the two checks agree on it.
+    // THE WEDGES (the stand-down, and a park miss filed as a failure):
+    // non-progress too, as a stall — the one shape the deadlock check already
+    // saw, and the two checks agree on it.
     for wedge in ["StandDown", "ParkMissLatches"] {
         let wedged = verify::buggy_baseline_with(&model, wedge);
         let stall = aterm_spec::interp::nonprogress_under(&wedged, &live)
@@ -7431,14 +7364,14 @@ fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livel
     assert!(!live.goal_holds(&model, &converged_rest));
 }
 
-/// ROUND THREE (2026-09 update robustness): a latch that converged STRUCTURALLY
+/// A latch that converged STRUCTURALLY
 /// on the activation the failed candidate installed — no deadline left — is not
 /// a dead end. A verified newer release behind it takes the activation's place:
 /// the latch clears at the look, the newer build is armed on a ladder of its own,
 /// and what lands is the newer build. With no newer release the latch holds
 /// (the convergence notice and the Version menu are the person's).
 ///
-/// A retire the environment REFUSES (round three review) moves nothing and
+/// A retire the environment REFUSES moves nothing and
 /// spends nothing: the release waits out its retry deadline and is offered
 /// again.
 ///
@@ -7446,7 +7379,7 @@ fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livel
 /// look that keeps the latch; gap 14's answer — one more attempt at the
 /// activation, whose successor refuses to boot-apply past itself, so the build
 /// that lands is the one that failed; and a refused retire that spends the
-/// release for good (round three as first shipped).
+/// release for good.
 fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
     model: &Model,
     latched: &aterm_spec::interp::State,
@@ -7492,7 +7425,7 @@ fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
     assert_eq!((landed["landed"], landed["parked_newer"]), (1, 1));
     assert!(model.check_invariant("NeverLandsTheSupersededActivation", &landed));
 
-    // A REFUSED RETIRE (round three review) moves nothing and spends nothing:
+    // A REFUSED RETIRE moves nothing and spends nothing:
     // the release waits out its retry deadline — no look in the meantime — and
     // is then offered again, and a retry that lands lands the newer build.
     let refused = model.successors("SupersedeRefused", &waiting)[0].clone();
@@ -7530,7 +7463,7 @@ fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
             "the healthy ladder has no {mutant}"
         );
     }
-    // The refusal that spent the release (round three as first shipped): the
+    // The refusal that spends the release: the
     // latch stands, the release is never offered again.
     let spent = buggy.successors("RefusedRetireSpendsTheRelease", &waiting)[0].clone();
     assert_eq!(
@@ -7559,25 +7492,25 @@ fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
     assert!(!buggy.check_invariant("NeverLandsTheSupersededActivation", &landed_stale));
 }
 
-/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-6): a physical latch survives the
-/// failed candidate's own bundle swap. On the launched lane the candidate
-/// boot-applies the bundle before it dials, so the reconcile after its failure
-/// retires the download for the installed-bundle activation of the same update.
-/// The healthy lane re-keys the latch and keeps its deadline; the mutant — what
-/// v0.87–v0.91 shipped — clears it, the activation arms half a second later,
-/// and a structural failure's ten-minute confirming retry runs at once.
+/// Plan P0-6: a physical latch survives the failed candidate's own bundle
+/// swap. On the
+/// launched lane the candidate boot-applies the bundle before it dials, so the
+/// reconcile after its failure retires the download for the installed-bundle
+/// activation of the same update. The healthy lane re-keys the latch and keeps
+/// its deadline; the mutant clears it, the activation arms half a second
+/// later, and a structural failure's ten-minute confirming retry runs at once.
 /// `NoEarlyRelease` catches it.
-/// ROUND FOUR OF THE 2026-09 UPDATE ROBUSTNESS WORK (plan item 2): a failure
-/// on a passing MOMENT — the pre-park `codesign` past the apply budget, the
-/// apply lock held past its wait, a successor that exited 75 because its swap
+///
+/// Plan item 2: a failure on a passing MOMENT — the pre-park `codesign` past the apply
+/// budget, the apply lock held past its wait, a successor that exited 75 because its swap
 /// was deferred for one of those — latches the lane with a deadline, and the
 /// deadline releases it: the ladder resumes where the clock is. No structural
 /// verdict is ever minted from it, even after the bundle swap that makes one
 /// reachable for a genuine failure.
 ///
-/// The mutant is what shipped: the cached verdict of that moment booked
-/// STRUCTURAL, so the latch converged — a healthy build held for the day's
-/// re-sample, or for good as "the installed copy's". The healthy lane has no
+/// The mutant books the cached verdict of that moment STRUCTURAL, so the
+/// latch converges — a healthy build held for the day's re-sample, or for good
+/// as "the installed copy's". The healthy lane has no
 /// such step; `APassingFailureNeverConverges` catches the mutant's. The ladder's
 /// liveness cannot (a converged latch with nothing newer is Law 2's rest), which
 /// is the reason the invariant exists.
@@ -7670,11 +7603,11 @@ fn ladder_keeps_a_latch_across_its_own_bundle_swap(
     );
 }
 
-/// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3): a park the capture REFUSES is a
+/// Plan P0-3: a park the capture REFUSES is a
 /// fact about the desk, never about the moment. The healthy ladder answers for
 /// it — the refusing session is carried at a degraded rung and the park lands —
-/// and a refusal is never filed as the machine being busy. The mutant is the
-/// v0.91 shape: the refusal re-filed as a park miss, stood down as activity and
+/// and a refusal is never filed as the machine being busy. The mutant
+/// re-files the refusal as a park miss, stood down as activity and
 /// retried every fifteen minutes into the same refusal, with nothing on any
 /// surface. `RefusalNeverRetriesAsActivity` catches it.
 fn ladder_never_retries_a_capture_refusal_as_activity(model: &Model) {
@@ -8374,15 +8307,11 @@ fn derived_top_anchored_scroll_proves_history_retention() {
         assert_eq!(state.get("selection_footer_row"), Some(&4), "{choice}");
     }
 
-    // SELECTION CUSTODY Phase 4: the DISJOINT flavours are the new half. A selection
-    // outside the damaged rows survives every regime — including the interior and
-    // margined scrolls that used to kill it unconditionally. This is the reported
-    // bug, stated as a model property: a status bar repainting in a scroll region
-    // must not destroy a highlight anchored up in scrollback.
+    // The DISJOINT flavours: a selection outside the damaged rows survives every
+    // regime, interior and margined scrolls included — a status bar repainting in
+    // a scroll region must not destroy a highlight anchored up in scrollback.
     //
-    // `ChooseArchivalDisjoint` belongs in this loop and used to be missing from it,
-    // because the invariant's archival arm ignored `selection_disjoint` and demanded
-    // the remap for every archival state. Archiving a row and MOVING the selection
+    // Archiving a row and MOVING the selection
     // are two different questions: the splice shifts rows above its boundary, and a
     // selection below the region is not one of them. So the archival regime still
     // retains its displaced row (`expected_history == 1`) while leaving a disjoint
@@ -8433,7 +8362,7 @@ fn derived_top_anchored_scroll_proves_history_retention() {
     assert!(!buggy.check_invariant("FixedFooterAnchorTracksLogicalInsertion", &dropped));
     assert!(!buggy.check_invariant("EligibleSelectionUsesPiecewiseRemap", &dropped));
 
-    // …and the Phase 4 mutant: an interior scroll that clears a DISJOINT selection —
+    // …and the mutant: an interior scroll that clears a DISJOINT selection —
     // the literal shipping defect the damage lattice removes.
     let mut over_cleared = buggy.init_state();
     assert!(buggy.fire("ChooseInteriorDisjoint", &mut over_cleared));
@@ -8774,7 +8703,7 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
 
     // An IN-PLACE take — a rewrite over the selected rows that scrolls nothing, or
     // a fail-closed `post_process` arm — clears the highlight and leaves the
-    // reader exactly where they were (closed 2026-09-25; a KNOWN GAP before).
+    // reader exactly where they were.
     for take in [
         "OutputDamagesTheSelectedRowsInPlace",
         "OutputTookTheSelectionUnattributedInPlace",
@@ -9438,7 +9367,7 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
     assert_eq!(modern.get("child_readers"), Some(&1));
     assert_eq!(modern.get("diagnostic_wake"), Some(&0));
 
-    // ROUND EIGHT OF THE UPDATE AUDIT, #18: input queued to the parent while its
+    // Input queued to the parent while its
     // claim is held (what the claim answers takes real time) parks the write
     // until it drains into the masters; a fence that ends with it undelivered
     // gives the claim to the rejection, which grants nothing and rolls back.
@@ -9678,7 +9607,7 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
         &kill_after_commit_win,
     ));
 
-    // THE LATE PARK (2026-09-19): the launched lane. The successor exists before
+    // THE LATE PARK: the launched lane. The successor exists before
     // the park, holding nothing; the grant follows the park; from there the
     // decision is the fork lane's.
     let mut launched = model.init_state();
@@ -11338,10 +11267,7 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert_eq!(typed["births"], 1);
     assert_eq!(typed["licensed_tally"], 1);
     assert_eq!(typed["resident"], 1);
-    assert_eq!(
-        typed["spent"], 1,
-        "the echo SPENDS the press's credit (2026-09-10: a credit is spent by the cells it lays)"
-    );
+    assert_eq!(typed["spent"], 1, "the echo SPENDS the press's credit");
     assert!(
         !model.fire("LicensedTypedMoveMintsLight", &mut typed),
         "a spent licence cannot fund a second echo"
@@ -11370,7 +11296,7 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
         "a stale stamp licenses nothing"
     );
     // …but the PRESS behind it is still in flight, and THAT licenses its own
-    // one-cell echo (2026-09-12, the stalled last key): spent on admission,
+    // one-cell echo (the stalled last key): spent on admission,
     // so it funds one cell, once. The model carries no hop width, so at ONE
     // press the refusal is enabled beside it — the engine's real transition
     // for a hop wider than one cell: refused, and the press KEPT.
@@ -11399,7 +11325,7 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert!(model.fire("UnexplainedHopForgetsCredits", &mut expiry));
     assert_eq!(expiry["forfeited"], 1);
 
-    // THE DELIVERED INSERT (2026-09-10): enqueue arms nothing; the writer
+    // THE DELIVERED INSERT: enqueue arms nothing; the writer
     // thread's completed write arms the insert's own slot; its echo spends
     // it exactly once and the ring scores the sweep.
     let mut insert = model.init_state();
@@ -11500,7 +11426,7 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
         "a `no-credits` refusal is an unexplained hop: the pool is forgotten with it"
     );
 
-    // THE STALL (2026-09-12, the owner's "I t" screenshot): two presses, the
+    // THE STALL: two presses, the
     // stamp window elapses while the row stays silent, and the row echoes
     // both as one batch — no stamp is fresh, and the LEDGER licenses it:
     // the presses are in flight, and the batch spends them.
@@ -12623,7 +12549,7 @@ fn derived_session_id_claim_proves_catches_and_multiplies() {
     assert!(m.fire("Launch", &mut st), "and the relaunch adopts again");
     assert_eq!(st.get("holders"), Some(&1));
 
-    // THE HANDOFF WINDOW (closed 2026-09-25): the predecessor has exited, its
+    // THE HANDOFF WINDOW: the predecessor has exited, its
     // lock is gone, and the successor has not published yet. The successor
     // MARKER is the only gate standing; with it the launch is refused.
     let handoff = aterm_spec::interp::with_consts(&m, &[("Handoff", 1)]);
@@ -13012,8 +12938,8 @@ fn derived_log_rotation_proves_and_catches_lost_lines_and_unbounded_growth() {
 }
 
 /// THE MODEL LADDER: every due model move lands. The healthy ladder never
-/// waits past the bound and never wedges before moving; the mutant is the
-/// 2026-09-25 incident's rule (move only on a cold cache), and it walks the
+/// waits past the bound and never wedges before moving; the mutant moves
+/// only on a cold cache, and it walks the
 /// wait past the bound on a session that simply keeps answering.
 #[test]
 fn derived_harness_model_ladder_lands_every_due_move_and_catches_the_cold_only_rule() {
@@ -13283,12 +13209,9 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
         })
         .collect();
     // Each configuration's interpreter walks run on a thread of their own,
-    // while this thread runs every `ty`-tier obligation in turn. As one loop
-    // the walks (~9 s on one thread) sat between the `ty` runs, and this test
-    // was its binary's last to finish (2026-09-30, while every `ty` spawn
-    // still queued behind one lock, gone 2026-10-01; the binary at the gate's
-    // seven test threads, four runs each: 35.4 s -> 32.8 s median; this test
-    // alone 17 s -> 9.4 s).
+    // while this thread runs every `ty`-tier obligation in turn: as one loop
+    // the walks (~9 s) sat between the `ty` runs and made this the binary's
+    // last test to finish (this test alone: 17 s -> 9.4 s).
     std::thread::scope(|scope| {
         for (config, m) in &configs {
             scope.spawn(move || model_switch_config_walks(*config, m));
@@ -13372,8 +13295,8 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     );
     fire_all(&model, &mut other, &["SettleElapses", "Visit"]);
     assert_eq!((other["set"], other["fl"], other["due"]), (0, 1, 0));
-    // THE LINE (2026-10-01): a restart asking no model drops the failed
-    // `--model` its process was relaunched with; the line before kept it.
+    // THE LINE: a restart asking no model drops the failed `--model` its
+    // process was relaunched with.
     let mut line = other.clone();
     let mut kept_flag = other.clone();
     fire_all(&model, &mut line, &["Restart"]);
@@ -13395,7 +13318,7 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
 
     // AN ASK THAT RAN STANDS: applied, then a person moves off it, and the
     // settle window passes — never recorded failed, the ask still the
-    // harness's own. The settle step before 2026-09-27 failed it.
+    // harness's own.
     let mut ran = model.init_state();
     fire_all(
         &model,
@@ -13417,9 +13340,9 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     fire_all(&buggy, &mut failed_it, &["SettleFailsAnAskThatRan"]);
     assert!(!buggy.check_invariant("AppliedAskStands", &failed_it));
 
-    // A SIGNAL NEVER SENT ASKED NOTHING (2026-10-01): the READY'd restart's
-    // signal refused, its ask is taken back — nothing settles as FAILED, and
-    // the round, its model with it, stands. The refusal before kept the ask.
+    // A SIGNAL NEVER SENT ASKED NOTHING: the READY'd restart's signal
+    // refused, its ask is taken back — nothing settles as FAILED, and the
+    // round, its model with it, stands.
     let mut refused = model.init_state();
     fire_all(
         &model,
@@ -13465,15 +13388,11 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
     assert!(!buggy.check_invariant("AnnouncedModelRides", &retaken));
 }
 
-/// THE RIDE KEEPS THE MOVE LAWS (2026-10-01; the gap the skeptic review of
-/// `HarnessModelSwitch` found on 2026-09-27). `UpTheListOnly`,
-/// `PersonsChoiceStaysInFamily` and `NeverOntoAppliedOrFailed` once held for
-/// the rule's verdict and every visit's decision EXCEPT while an announced
-/// model rode: `upgrade_drive::visit_models` carried the upgrade's
-/// `model_list` whatever the visit decided, and a gave-up upgrade's late READY
-/// restarted with it too (`restart` asks `st.model_list`), so the healthy
-/// model reached, in every configuration, a restart about to ask for
-/// `claude-opus-5-5`:
+/// THE RIDE KEEPS THE MOVE LAWS. `UpTheListOnly`, `PersonsChoiceStaysInFamily`
+/// and `NeverOntoAppliedOrFailed` hold while an announced model rides too.
+/// Without the ride's guard, a visit carries the upgrade's `model_list`
+/// whatever it decided, and a gave-up upgrade's late READY restarts with it,
+/// so a restart asks for `claude-opus-5-5`:
 ///
 /// * (a) after it was recorded FAILED — both from a standing notice and from
 ///   a gave-up one;
@@ -13483,10 +13402,9 @@ fn derived_harness_model_switch_proves_and_catches_every_law() {
 ///   claude-sonnet-5`).
 ///
 /// The ride's guard (`upgrade_models::ride_bar`) re-takes the three laws
-/// inside the ride, so NO healthy state reaches any of them now, in any
-/// configuration — and each is still reached the old way, through its
-/// `Ride*` mutant alone (the NEGATIVE CONTROLS: the reachability this test
-/// pinned before the fix, the code before 2026-10-01). A state "rides" here
+/// inside the ride, so no healthy state reaches any of them in any
+/// configuration; each is reached through its `Ride*` mutant alone (the
+/// negative controls). A state "rides" here
 /// when a visit has just left the round carrying the model, which its restart
 /// then asks for (`Relaunch` asks whenever `ann == 1`).
 ///

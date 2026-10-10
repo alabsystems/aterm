@@ -67,6 +67,9 @@ pub use crate::trick_flash::TrickFlashPhase;
 const MAX_OCCURRENCES: usize = 128;
 /// Hard cap on emitted decorations per frame.
 const MAX_DECORATIONS: usize = 256;
+/// Held departing-body tiles ([`WordDecorations::pet_depart_tiles`]): twice
+/// the pet's departure lane.
+const PET_DEPART_HOLDS: usize = 2 * crate::kitty_pet::PET_DEPARTURES_MAX;
 /// Cap on emitted ink cells per frame (§4.4): row-major truncation at rescan,
 /// whole words only — an occurrence past the cap gets no ink (partial-word ink
 /// would sweep a torn gradient).
@@ -1920,12 +1923,14 @@ pub struct WordDecorations {
     /// never re-emits the old coat beside its departing ghost. Cleared with the
     /// atlas.
     pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId, u8, u8)>,
-    /// Each departing body's last-resolved tile `(born, ax, ay)`, one per brain
-    /// slot (sharing [`Self::pet_last_tile`] would strobe both bodies). Keyed by
-    /// the departure's `born` stamp, because a ghost can outlive the handoff
-    /// debounce and a slot may be reborn under a stale hold; a mismatched hold
-    /// is refused and dropped.
-    pet_depart_tiles: [Option<(f64, u16, u16)>; crate::kitty_pet::PET_DEPARTURES_MAX],
+    /// Each departing body's last-resolved tile `(id, ax, ay)` (sharing
+    /// [`Self::pet_last_tile`] would strobe both bodies), keyed by the ghost
+    /// itself (`PetDepartureSprite::id`) and found by it in whichever slot of
+    /// the lane the ghost stands this frame: a ghost carried across a boundary
+    /// may land in another slot, and keeps its hold; a slot reborn under
+    /// another ghost never wears this one's. Twice the lane, so the holds of
+    /// one frame's ghosts never evict each other ([`Self::hold_departure_tile`]).
+    pet_depart_tiles: [Option<(u32, u16, u16)>; PET_DEPART_HOLDS],
     /// The dog roster's exact-size tile cache ([`crate::dog_baker`]) for the
     /// typed-word dog cameo, through the shared atlas's `host_tile`.
     dog_baker: crate::dog_baker::DogBaker,
@@ -2626,7 +2631,7 @@ impl WordDecorations {
         self.pet_baker.clear();
         self.animal_baker.clear();
         self.pet_last_tile = None;
-        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        self.pet_depart_tiles = [None; PET_DEPART_HOLDS];
         self.dog_baker.clear();
         self.dog_last_tile = None;
         self.robi_baker.clear();
@@ -2646,7 +2651,7 @@ impl WordDecorations {
         }
         self.held_tile_metric = (cell_w, cell_h);
         self.pet_last_tile = None;
-        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        self.pet_depart_tiles = [None; PET_DEPART_HOLDS];
         self.dog_last_tile = None;
         self.robi_last_body = None;
     }
@@ -3635,22 +3640,19 @@ impl WordDecorations {
         // Each ghost draws like the live body (its own
         // [`crate::pet_baker::PetBakeKey`] and `host_id`, the same feet-anchored
         // `body_px` via a synthetic [`PetFrame`]) in its old `(coat, iris)`.
-        // Per-slot held tiles (`pet_depart_tiles`) absorb bake misses without
-        // strobing. Ghosts push first, so they run off behind the live pet.
+        // Held tiles (`pet_depart_tiles`, one per ghost) absorb bake misses
+        // without strobing. Ghosts push first, so they run off behind the
+        // live pet.
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [None; crate::kitty_pet::PET_DEPARTURES_MAX];
-        for (i, slot) in depart_sprites.iter_mut().enumerate() {
-            let Some(d) = pet.departures[i] else {
-                self.pet_depart_tiles[i] = None;
+        for (slot, d) in depart_sprites.iter_mut().zip(pet.departures) {
+            // A GHOST ON ITS OWN GLASS stands in another pane's cells: never
+            // this lane's ([`Self::pet_own_glass`] places it). Its held tile
+            // is its own and stays.
+            let Some(d) = d.filter(|d| !d.own_glass) else {
                 continue;
             };
-            // A GHOST ON ITS OWN GLASS stands in another pane's cells: never
-            // this lane's ([`Self::pet_own_glass`] places it). Its slot's
-            // held tile is its own and stays.
-            if d.own_glass {
-                continue;
-            }
-            *slot = self.pet_departure_sprite(i, d, &pet, geom, colors, (nat_w, nat_h));
+            *slot = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h));
         }
         for g in depart_sprites.iter().flatten() {
             free.push(*g);
@@ -3683,13 +3685,36 @@ impl WordDecorations {
         Some(fp)
     }
 
+    /// Hold `at` as ghost `id`'s tile (`pet_depart_tiles`): in its own entry,
+    /// else in one that no ghost of this frame (`live`) owns — there is always
+    /// one, since the table is twice the lane and ids are unique.
+    fn hold_departure_tile(
+        &mut self,
+        id: u32,
+        (ax, ay): (u16, u16),
+        live: &[Option<crate::kitty_pet::PetDepartureSprite>],
+    ) {
+        let owned = |held: u32| live.iter().flatten().any(|d| d.id == held);
+        let entry = self
+            .pet_depart_tiles
+            .iter()
+            .position(|e| e.is_some_and(|(held, ..)| held == id))
+            .or_else(|| {
+                self.pet_depart_tiles
+                    .iter()
+                    .position(|e| e.is_none_or(|(held, ..)| !owned(held)))
+            });
+        if let Some(entry) = entry {
+            self.pet_depart_tiles[entry] = Some((id, ax, ay));
+        }
+    }
+
     /// ONE DEPARTING BODY'S SPRITE at `geom`, in that grid's own pixels: the
     /// live lane's ghost law, shared by [`Self::pet_cursor`] and
-    /// [`Self::pet_own_glass`]. Slot `i` keys the per-slot held tile
+    /// [`Self::pet_own_glass`]. The ghost's id keys its held tile
     /// (`pet_depart_tiles`).
     fn pet_departure_sprite(
         &mut self,
-        i: usize,
         d: crate::kitty_pet::PetDepartureSprite,
         pet: &crate::kitty_pet::PetFrame,
         geom: EffectGeom,
@@ -3705,14 +3730,14 @@ impl WordDecorations {
         if alpha == 0 {
             return None;
         }
-        // BORN-KEYED HOLD (the field's own docstring): a held tile from a
-        // PREVIOUS occupant of this slot is dropped, never worn — with
-        // `DEPART_MAX` past the handoff debounce a ghost can outlive the
-        // spacing between births, so slot identity alone no longer proves
-        // the hold belongs to this departure.
-        if self.pet_depart_tiles[i].is_some_and(|(held_born, ..)| held_born != d.born) {
-            self.pet_depart_tiles[i] = None;
-        }
+        // THE GHOST'S OWN HOLD (the field's docstring): found by its id,
+        // never by its slot, so no other ghost's tile is ever worn.
+        let held = self
+            .pet_depart_tiles
+            .iter()
+            .flatten()
+            .find(|&&(id, ..)| id == d.id)
+            .map(|&(_, ax, ay)| (ax, ay));
         let key = crate::pet_baker::PetBakeKey {
             pose: d.pose,
             coat: d.coat,
@@ -3726,11 +3751,11 @@ impl WordDecorations {
             .tile(&key)
             .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), nat_w, nat_h, rgba))
             .map(|t| (t.ax, t.ay));
-        if let Some((ax, ay)) = resolved {
-            self.pet_depart_tiles[i] = Some((d.born, ax, ay));
+        if let Some(at) = resolved {
+            self.hold_departure_tile(d.id, at, &pet.departures);
         }
         // Budget spent, nothing held yet: lands next frame.
-        let (ax, ay) = resolved.or(self.pet_depart_tiles[i].map(|(_, ax, ay)| (ax, ay)))?;
+        let (ax, ay) = resolved.or(held)?;
         let ghost = crate::kitty_pet::PetFrame {
             alpha,
             // The ghost's frame IS its composed byte — `body_px` and the
@@ -3782,13 +3807,15 @@ impl WordDecorations {
 
     /// THE GHOST ON ITS OWN GLASS (`PetDepartureSprite::own_glass`): a
     /// split-pane focus switch's fading half — the old body in the pane the
-    /// focus left, still on glass beside the new one. Drawn at THAT pane's
-    /// grid (`own`: its cols and rows, at this frame's cell metrics), moved
-    /// to its pane `origin` in window-grid pixels and cropped to that pane,
-    /// so it stands exactly where the body was drawn and never crosses a
-    /// divider; beneath the text (its `under_ink`). Pushed into `free`, the
-    /// WINDOW's channel — a pane's placement would put it in the focused
-    /// pane, or crop it away.
+    /// focus left, still on glass beside the new one. The departure in
+    /// `slot` is drawn at THAT pane's grid (`own`: its cols and rows, at this
+    /// frame's cell metrics), moved to its pane `origin` in window-grid
+    /// pixels and cropped to that pane, so it stands exactly where the body
+    /// was drawn and never crosses a divider; beneath the text (its
+    /// `under_ink`). Pushed into `free`, the WINDOW's channel — a pane's
+    /// placement would put it in the focused pane, or crop it away. Ghosts
+    /// in different panes are drawn one call each, each at its own pane
+    /// (`CompanionFrame::glass`).
     ///
     /// Call it right after a [`Self::pet_cursor`] that drew this frame's pet
     /// (`Some`): it rides that call's baker frame, one-body claim and
@@ -3798,6 +3825,7 @@ impl WordDecorations {
         frame: PetCursorFrame,
         own: EffectGeom,
         origin: (i32, i32),
+        slot: usize,
         free: &mut Vec<FreeSprite>,
     ) -> Option<u64> {
         let PetCursorFrame {
@@ -3828,10 +3856,10 @@ impl WordDecorations {
         let mut fp = FNV64_OFFSET;
         let mut drew = false;
         for (i, d) in pet.departures.iter().enumerate() {
-            let Some(d) = d.filter(|d| d.own_glass) else {
+            let Some(d) = d.filter(|d| d.own_glass && i == slot) else {
                 continue;
             };
-            let Some(mut sprite) = self.pet_departure_sprite(i, d, &pet, own, colors, nat) else {
+            let Some(mut sprite) = self.pet_departure_sprite(d, &pet, own, colors, nat) else {
                 continue;
             };
             sprite.x = sprite.x.saturating_add(origin.0);
@@ -22850,7 +22878,7 @@ mod pet_stays_inside_the_grid_tests {
 
         // Stand in for a frame that resolved every hold.
         wd.pet_last_tile = Some((0, 0, crate::pet_glyphs_gen::PetGlyphId::PetLoaf, 0, 0));
-        wd.pet_depart_tiles[0] = Some((1.0, 0, 40));
+        wd.pet_depart_tiles[0] = Some((1, 0, 40));
         wd.dog_last_tile = Some((
             0,
             80,

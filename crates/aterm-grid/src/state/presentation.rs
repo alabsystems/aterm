@@ -501,27 +501,6 @@ const fn next_row_rev_clock(clock: u64) -> u64 {
 }
 
 impl GridPresentationState {
-    #[cfg(kani)]
-    pub(crate) fn kani_stub() -> Self {
-        Self {
-            damage: Damage::Full,
-            extras: CellExtras::new(),
-            styles: StyleTable::kani_stub(),
-            content_scroll_delta: 0,
-            selection_damage: SelectionDamage::None,
-            last_output_damage_abs: None,
-            last_resize_row_shift: 0,
-            last_resize_shape: ResizeShape::default(),
-            coordinates_invalidated: false,
-            row_band_moves: RowBandMoves::default(),
-            pending_absolute_row_update: None,
-            pending_selection_row_update: None,
-            row_rev: Vec::new(),
-            row_rev_clock: 0,
-            row_rev_folded_seq: 0,
-        }
-    }
-
     /// Fold the current damage session into the per-row revisions.
     ///
     /// Idempotent while nothing new has been marked, so the two folds a frame

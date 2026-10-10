@@ -20,17 +20,16 @@ const COLS: u16 = 116;
 
 /// A tick's snapshot of the terminal, keyed by everything it is read from.
 ///
-/// WHY (2026-10-05): the particles test ticks 5,746 frames and the program
-/// writes on one in 32, yet every tick took a full `cell_frame`, 30% of the
-/// file's CPU (`sample`). The snapshot is a pure function of the terminal:
-/// output (`screen_mutations`, the product's "nothing reached the screen"
-/// witness), the selection and the facts. A tick whose key is unchanged
-/// hands the brain and the scanner the last one; both still run every frame.
-/// Checked at every tick of the file's three scene tests before the checks
-/// were removed: equal to a fresh `cell_frame` (content and every metadata
-/// field but `row_rev`, the per-read revision lane neither reads), and the
-/// facts, read first now because the key needs them, equal to the facts read
-/// after a `cell_frame`. The file, alone on one thread: 2.34 -> 1.75 CPU-s.
+/// The particles test ticks 5,746 frames and the program writes on one in
+/// 32, so a full `cell_frame` per tick was 30% of the file's CPU. The
+/// snapshot is a pure function of the terminal: output (`screen_mutations`,
+/// the product's "nothing reached the screen" witness), the selection and the
+/// facts. A tick whose key is unchanged hands the brain and the scanner the
+/// last one; both still run every frame. Checked at every tick of the file's
+/// three scene tests: equal to a fresh `cell_frame` (content and every
+/// metadata field but `row_rev`, the per-read revision lane neither reads),
+/// and the facts, read first because the key needs them, equal to the facts
+/// read after a `cell_frame`.
 struct Seen {
     mutations: u64,
     selection: TextSelection,
@@ -164,10 +163,10 @@ type Ladder = (String, usize, usize, usize);
 #[test]
 fn nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder() {
     // Each mode builds its own scene on its own clock, so the two run on the
-    // binary's threads (`par_map`), 2026-10-05. Each is caught in its pool
+    // binary's threads (`par_map`). Each is caught in its pool
     // thread and judged here in the original order: the far-output line
     // prints and its law is asserted before the near-particles take's own
-    // panic, if any, is raised, as the loop did.
+    // panic, if any, is raised.
     let modes = ["far-output", "near-particles"];
     let ladders = crate::common::par_map(&modes, |&mode| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ladder(mode)))

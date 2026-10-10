@@ -114,8 +114,8 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
 /// refused looks own the point, the next owns nothing, and a turn of the
 /// agent's never renews it — the `Renew` dial (a count per point) owns the
 /// next point again, where the fixed machine leaves it to the loop. The count
-/// is the refused looks' own, and the owner's word starts it over (the review
-/// of 2026-09-28): `Shared` and `Stale` caught on their paths.
+/// is the refused looks' own, and the owner's word starts it over: `Shared`
+/// and `Stale` caught on their paths.
 #[test]
 fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
     use aterm_spec::derive::upgrade_refused_turn_end_model;
@@ -183,7 +183,7 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
     );
 
     // THE REFUSED LOOKS ARE A COUNT OF THEIR OWN, AND THE OWNER'S WORD STARTS
-    // IT OVER (the review of 2026-09-28). Settles of the notice's gate before
+    // IT OVER. Settles of the notice's gate before
     // the refusals leave it alone; the owner's word after the bound owns the
     // next refused look again. NEGATIVE CONTROLS, each on its path and by the
     // bounded check: one shared count (`Shared`), a word that leaves it
@@ -228,7 +228,7 @@ fn a_refused_notice_owns_its_point_for_its_looks_and_no_turn_renews_them() {
 /// round). Proved at `Buggy = 0`, caught at `Buggy = 1`; `Nag = 1` (an ask with
 /// no work seen since the notice) and `Hold = 1` (the restart gate's wait at
 /// the end of the work, a status lagging the idle screen, held past the
-/// re-ask's window: the review of 2026-09-28) each caught alone by the bounded
+/// re-ask's window) each caught alone by the bounded
 /// check and on its own path.
 #[test]
 fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
@@ -271,7 +271,7 @@ fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
     assert!(!nag.check_invariant("AnAskFollowsWorkItSaw", &n), "{n:?}");
     assert!(interp::bmc(&nag).is_err(), "caught by the bounded check");
 
-    // A STATUS THAT LAGS THE IDLE SCREEN (the review of 2026-09-28): the
+    // A STATUS THAT LAGS THE IDLE SCREEN: the
     // restart's gate waits there, and holds the point inside the re-ask's
     // window; past it the re-ask's line goes through the lag, and with the
     // asks spent the round gives up — never the wait again.

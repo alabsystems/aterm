@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Boundary condition and content mutation tests — algorithm audit (#1920).
+//! Boundary condition and content mutation tests.
 
 use super::super::test_content::TestContent;
 use super::super::*;
@@ -47,7 +47,7 @@ fn content_invalidated_removes_matches() {
 }
 
 // =========================================================================
-// BOUNDARY CONDITION TESTS — algorithm audit (#1920)
+// BOUNDARY CONDITION TESTS
 // =========================================================================
 
 #[test]
@@ -189,7 +189,7 @@ fn content_added_in_no_results_with_match_transitions() {
     // After scan_all with no matches, state is NoResults.
     assert_eq!(search.state(), SearchState::NoResults);
 
-    // New content arrives that matches — should transition to HasResults (#4518)
+    // Matching content arriving in NoResults transitions to HasResults.
     search.content_added(1, "hello world");
     assert_eq!(
         search.state(),
@@ -212,7 +212,6 @@ fn content_added_after_initial_match() {
     assert_eq!(search.state(), SearchState::HasResults);
     assert_eq!(search.results().len(), 1);
 
-    // Now content_added should add new matches
     search.content_added(1, "hello second");
     assert_eq!(
         search.results().len(),
@@ -241,7 +240,7 @@ fn scan_row_with_max_rows_zero_is_noop() {
 
 /// Case-insensitive match extent uses lowercased pattern byte length.
 ///
-/// Regression test for #2046 MEDIUM: When case-insensitive, `to_lowercase()`
+/// Regression (#2046): when case-insensitive, `to_lowercase()`
 /// can change byte length for certain Unicode characters (e.g., Turkish İ).
 /// Match end_col must use the lowercased pattern length, not the original.
 #[test]

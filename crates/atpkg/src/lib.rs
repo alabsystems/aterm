@@ -114,6 +114,9 @@ pub(crate) mod clone;
 pub mod compat;
 pub mod config;
 pub mod cost;
+/// The developer root, `~/Developer`: where checkouts and worktrees live on an owner's
+/// Mac, which ones do not yet, moving them there, and whether Spotlight skips it.
+pub mod devroot;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;
@@ -138,6 +141,10 @@ pub mod lay;
 /// Toolchain leases: a run holds the store build it resolved for as long as it runs, so gc
 /// never reclaims it and the unattended trust flip waits for it.
 pub mod lease;
+/// Which compiler built a toolchain or a payload, decided by content: compiler admission
+/// (`atpkg lineage check-compiler`), the payload scan (`atpkg lineage scan`), the
+/// SEED-MINT receipt check and the LINEAGE record a signed bundle carries.
+pub mod lineage;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
@@ -149,8 +156,8 @@ mod metadata_io;
 /// takes around it.
 mod meter;
 pub mod net;
-/// Spotlight exposure of Rust build output: discover target dirs, MEASURE whether one is
-/// really excluded (never assume), and migrate it to the `.noindex` form (§9).
+/// MEASURING whether Spotlight indexes a directory: a probe and a later control, never a
+/// claim read off a name (§9).
 pub mod noindex;
 /// Where atpkg's unasked notices go: stderr in its own CLI, the host's log in the terminal
 /// session and the window, which call it beside a live shell.
@@ -172,9 +179,6 @@ pub mod progress;
 /// The folders macOS guards with a consent dialog, named once, so no UNATTENDED lane
 /// (the update pass, the seed, the doctor's walk) ever opens one in aterm's name.
 pub mod protected;
-/// `com.apple.provenance`: the predicate (`listxattr`), the per-process tracking
-/// measurement, and the two sentences every refusal that names the tag shares.
-pub mod provenance;
 /// Flip when quiet: an unattended update stages a new Trust toolchain at once and flips it
 /// only when no run leases or runs from the one it replaces — four hours at the most.
 pub mod quiet;
@@ -201,6 +205,9 @@ pub mod sysroot;
 /// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
 /// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
 pub mod tarread;
+/// The fake programs `reroute`'s and `upstream_identity`'s unit tests exec.
+#[cfg(all(test, unix))]
+mod test_programs;
 /// Unit-test scratch directories, removed when the test ends however it ends.
 #[cfg(test)]
 pub(crate) mod testdir;
@@ -208,6 +215,7 @@ pub(crate) mod testdir;
 /// `aterm-verify` compiles this same file.
 pub mod toolchain;
 pub mod tree;
+pub mod upstream_identity;
 /// Per-protocol row admission (`https`: host allow-list + payload shape), the
 /// `system = "<bin>"` satisfaction probe and the PATH-shadow probe — both
 /// cross-platform (`PATHEXT` on Windows).

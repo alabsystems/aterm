@@ -789,6 +789,34 @@ fn test_char_width_plane14_is_zero() {
     }
 }
 
+/// Every conjoining vowel and final jamo (`Hangul_Syllable_Type` V and T) is
+/// zero-width in both modes, Hangul Jamo Extended-B's (U+D7B0..U+D7C6,
+/// U+D7CB..U+D7FB) as much as U+1160..U+11FF: each joins the syllable its
+/// leading consonant starts (UAX #29 GB6-GB8), so an Old-Hangul syllable is
+/// two cells, not four. glibc's utf8_gen.py and unicode-width rule the same.
+#[test]
+fn hangul_vowel_and_final_jamo_are_zero_width() {
+    let v_and_t = (0x1160_u32..=0x11FF)
+        .chain(0xD7B0..=0xD7C6)
+        .chain(0xD7CB..=0xD7FB);
+    for cp in v_and_t {
+        let c = char::from_u32(cp).expect("BMP scalar");
+        assert_eq!(crate::tables::width::char_width(c), 0, "U+{cp:04X}");
+        assert_eq!(crate::tables::width::char_width_cjk(c), 0, "U+{cp:04X} CJK");
+    }
+    // The unassigned code points around them stay narrow, and the leading
+    // consonants stay wide.
+    for c in ['\u{D7AF}', '\u{D7C7}', '\u{D7CA}', '\u{D7FC}', '\u{D7FF}'] {
+        assert_eq!(crate::tables::width::char_width(c), 1, "{c:?}");
+        assert_eq!(crate::tables::width::char_width_cjk(c), 1, "{c:?} CJK");
+    }
+    assert_eq!(crate::tables::width::char_width('\u{A960}'), 2);
+    assert_eq!(
+        crate::tables::width::str_width("\u{A960}\u{D7B0}\u{D7CB}"),
+        2
+    );
+}
+
 // CJK aggregate functions
 
 #[test]

@@ -491,18 +491,22 @@ WHAT IT IS
   with `desktop_alerts = true` in aterm.toml (default off).
   A worker that stopped reading its input (`status input=stalled|stopped`) is held:
   nothing is pressed or typed into it, its badge is withdrawn, and the server's own
-  "frozen" row is the notice (`aterm help introspection`, `signal`); once its remedy
-  (`signal term`, or `kill`) ends it, it is relaunched on its conversation and carried
-  on where aterm can, as a crash is (above).
+  "frozen" row is the notice (`aterm help introspection`, `restart`); once its remedy
+  (`aterm ctl @<sid> restart pid=<n> if-stalled`, the row names it) ends it, it is
+  relaunched on its conversation and carried on where aterm can, as a crash is (above).
+  `restart` writes its record before its signal, so its exit is relaunched whoever reads
+  it, and ends a program that lives through its SIGTERM itself (SIGKILL after 5 s for one
+  still frozen, after 30 s in any case); a bare `signal term` is just a signal, and the
+  exit it causes is read as the program's own (a graceful one is left at the shell).
   Nobody there, a stall ten minutes old (`stall_term_after_s`, 600 by default;
   `input=stalled` — a stopped job's `signal cont` stays a person's), with no
   person's hand within `human_grace_s` and no lease or named turn on the session,
   is warned about once — `STALL-WARNED … ended=no` in the session's journal and one
-  Messages record, the state and then the `signal term` that ends it — and left
-  running; with `stall_term = true` it gets `signal term` instead, once
-  (`SIGNALLED`), and a program that lives through it keeps the server's row, whose
-  `signal kill` is a person's (`stall_term_after_s = 0` or `relaunch = false`
-  limits it to the notice). Claude Code's
+  Messages record, the state and then the `restart` that ends it — and left
+  running; with `stall_term = true` it is restarted instead, once (`restart pid=<n>
+  if-stalled quiet=<human_grace_s>`, `RESTARTED`; the server's own fences decide, and
+  one it cannot carry says the warning instead) (`stall_term_after_s = 0` or
+  `relaunch = false` limits it to the notice). Claude Code's
   critical-memory banner is answered by its remedy: nothing is typed at it, and at
   its next idle point the agent is ended and relaunched on its own conversation,
   then told to carry on (`relaunch = false` limits it to the menu bar, with the
@@ -537,7 +541,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            secrets list — neither on a box that runs on another
                            machine — the trust dialog for the session's own folder
                            under a trust root) or "none"
-  trust_roots [["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]]
+  trust_roots [["~/Developer/aterm*", "~/Developer/ay*", "~/Developer/trust*",
+               "/private/tmp/claude-*"]]
                            the folders whose trust dialog "safe" answers
   rm_breaker_ask [false]   under "safe", an rm circuit breaker on a possibly-empty
                            variable the safe rules cannot prove is approved with
@@ -651,13 +656,13 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   relaunch [true]          relaunch an agent that crashed (Claude Code's session
                            record left behind as it exited, a Codex's exit status),
                            on its own conversation where it can (as above), a
-                           frozen one too once it is ended (by you, or by aterm
-                           under stall_term)
+                           frozen one too once `restart` ends it (yours, or
+                           aterm's under stall_term)
   stall_term_after_s [600] a worker frozen this long, nobody's hand on it, is
                            warned about once (a line, a Messages record) and left
                            running; 0 never
-  stall_term [false]       true: at that bound it gets `signal term` once for its
-                           relaunch instead of the warning
+  stall_term [false]       true: at that bound it is restarted once (`restart
+                           if-stalled`) instead of the warning
   memory_ceiling [auto]    an agent whose process group's memory (its physical
                            footprint, measured every few seconds) passes this is a
                            WARNING: one Messages row, with its resume line. It is
@@ -1323,83 +1328,59 @@ OCCASIONAL (recovery and preference)
                              release the hold (pins gate the coherence-group move)
   aterm pkg gc               reclaim superseded builds and interrupted downloads; it
                              says what it swept and why
-  aterm pkg noindex [<root>] [--depth <n>]
-                             storage hygiene, macOS only: list the cargo target dirs
-                             under <root> (default: the current directory) and say which
-                             ones Spotlight is free to walk. `mds` grinding build output
-                             can drive a WindowServer watchdog kill, so `aterm pkg doctor`
-                             warns when its own shallow scan of $HOME finds exposed ones.
-                             Elsewhere every subcommand is a clean no-op
-  aterm pkg noindex migrate <dir> [--dry-run]
-                             exclude ONE directory, by renaming it to end `.noindex` —
-                             the only mechanism measured to work here. A
-                             `.metadata_never_index` marker file is INERT (it is the
-                             usual advice and it silently does nothing), so nothing
-                             writes one. It renames and nothing else, so re-point cargo
-                             yourself (CARGO_TARGET_DIR, or [build] target-dir) and add
-                             the new name to .gitignore — an existing `target/` line does
-                             NOT match `target.noindex/`; the command prints both hints,
-                             and --dry-run prints them without renaming. Spotlight is
-                             never disabled globally
-  aterm pkg noindex apply (--all | <dir>...) [--dry-run]
-                             the doctor's remedy, done: migrate each exposed target dir
-                             AND keep cargo pointed at it. In a git checkout (a .git at
-                             the repo root, or `git rev-parse` saying so for a nested
-                             crate) that is a relative symlink `target -> target.noindex`
-                             left where the directory was and NO edit to
-                             .cargo/config.toml — the aterm repo's is tracked and the
-                             release cutter refuses a dirty tree — with the new name
-                             appended to the clone's .git/info/exclude (outside the
-                             working tree) so `git status` stays empty; the line reads
-                             `migrated A -> A.noindex (symlink A left in place; no config
-                             edit: git checkout)`. A repo not under git gets `[build]
-                             target-dir` written into its .cargo/config.toml (the bare
-                             `target.noindex` when it sits beside Cargo.toml) instead.
-                             Each rename is recorded first, by device and inode, in the
-                             package prefix's noindex.ledger, and only a recorded one is
-                             ever finished or cleaned up: a `.noindex` directory born
-                             under that name is left alone. `cargo clean` removes the
-                             link, not the directory: the link is not laid again, and
-                             once a build lays a fresh `target/` the stale
-                             `target.noindex` is deleted and the new one migrated (`first
-                             deleted …` under its line); a link left over nothing (`rm
-                             -rf target/`) gets its directory back, empty.
-                             --all is doctor's own scan of $HOME,
-                             repos only — a free-standing target dir (its pointer is an
-                             env var) is named and left; a directory you name is
-                             migrated regardless. A live build (cargo's flock) is
-                             skipped and retried; already-excluded is a success. `aterm
-                             pkg machine apply`, which aterm runs once a day at the
-                             first window or interactive session, runs the same
-                             scan-and-apply itself, with the doctor's smaller budget
-                             (`aterm pkg machine` says "at least" when it hit it),
-                             unless [machine] spotlight_noindex = false; `apply --all`
-                             by hand walks further
+  aterm pkg devroot          where code lives: ~/Developer, the one folder you add to
+                             System Settings ▸ Spotlight ▸ Search Privacy (Apple's one
+                             documented way to keep a folder out of the index; aterm
+                             cannot add it). Lists every git checkout and worktree
+                             under $HOME outside it, where each would go, and what
+                             holds each: uncommitted work, a process working in it or
+                             in another checkout of its repository, a Claude Code,
+                             Codex or Gemini session, a git lock, a destination in the
+                             way, a folder that cannot be renamed into ~/Developer.
+                             Dot-folders, Library and the folders macOS guards with a
+                             consent dialog are never read, and neither is a
+                             ~/Developer that is a link
+  aterm pkg devroot move (--all | <dir>...)
+                             move them into ~/Developer, under the same path they had
+                             under $HOME — never automatic. Refuses the whole run (exit
+                             3) while anything holds one, naming each — a repository
+                             with submodules moves whole or not at all, since their
+                             links are relative. Then, one repository at a time, renames
+                             its checkouts (nothing is copied) and repairs what names
+                             the old paths: `git worktree repair`, the git config values
+                             and alternates of every git directory, submodules' included
+                             (a cut clone's aterm-release.receiptsFrom), Claude Code's
+                             ~/.claude/projects/<path-key> folders (never what is in
+                             them), `aterm pkg link` dev links (exit 75 while another
+                             pass holds the store), and the publication engine's
+                             registry rows; then checks that every checkout of it still
+                             answers `git status` (exit 1 when one does not). A ^C waits
+                             for the run to end. A checkout with an x.py/LLVM build tree
+                             reconfigures after it, and an aterm.toml [packages.links]
+                             row naming a moved checkout is yours to edit (the plan says
+                             both first). One-time per Mac: the verb goes once every
+                             owner Mac reports a clean survey
+  aterm pkg devroot verify   MEASURE whether Spotlight skips ~/Developer (the same probe
+                             as noindex verify): 0 skipped, 1 indexed, 3 not measured
+                             (no ~/Developer, or one that is a link)
   aterm pkg machine          the [machine] settings as the doctor reads them: Universal
-                             Control (the cursor roaming to other Macs and iPads) and
-                             Spotlight's view of cargo build output
+                             Control (the cursor roaming to other Macs and iPads)
   aterm pkg machine apply    apply them NOW — what aterm runs once a day at the first
                              window or interactive session (a package pass runs it
-                             only after an edit to [machine], or after an apply that
-                             skipped a live build or failed a write).
-                             Universal Control is disabled for this host (both per-host
-                             keys; `aterm pkg machine` prints the revert line) and
-                             build output beside a Cargo.toml is renamed to its `.noindex`
-                             form with cargo kept pointed at it (a `target` symlink in a
-                             git checkout, a .cargo/config.toml edit elsewhere). Exit 0
-                             either way; it says what changed, why nothing changed
-                             (already applied, both switched off in [machine], a running
-                             build it retries next time, or a change that did not land),
-                             or that nothing was applied and why (a HOME that is not this
-                             account's)
+                             only after an edit to [machine], or after an apply whose
+                             write failed). Universal Control is disabled for this host
+                             (both per-host keys; `aterm pkg machine` prints the revert
+                             line). Exit 0 either way; it says what changed, why nothing
+                             changed (already applied, switched off in [machine], or a
+                             change that did not land), or that nothing was applied and
+                             why (a HOME that is not this account's)
   aterm pkg noindex verify <dir>
-                             MEASURE the exclusion rather than assume it: plant a probe
-                             file, ask the live index for it, remove it. `.noindex` is
-                             behaviour observed on this machine, not a documented Apple
-                             API, so a name ending in the right five characters is never
-                             taken as proof. `indexed` is proof; `excluded` is an
-                             inference bounded by a control probe; anything else answers
-                             `unknown` rather than guess
+                             MEASURE whether Spotlight indexes <dir> rather than assume
+                             it: plant a probe file, then a control beside it, ask the
+                             live index for both, remove both. A name is never taken as
+                             proof. `indexed` is proof; `excluded` is an inference
+                             bounded by the control; anything else answers `unknown`
+                             rather than guess
 
 PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg link <program> <checkout> [rel-bin…] | unlink | refresh
@@ -1411,11 +1392,21 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg verify-index | verify-pkg <args…>
                              run the client's full trust chain over index/roster or
                              pkg-manifest files on disk (operator / mirror self-check)
-  aterm pkg relocate <stage-root> [--sign <identity>] [--advisory]
-                             producer pack-time: vendor machine-local dylibs into the
-                             staged sysroot so the signed tarball is self-contained.
-                             --sign re-signs with the named identity; --advisory
-                             reports instead of failing.
+  aterm pkg relocate <stage-root> [--sign <identity>] [--advisory] [--donor-root <dir>]…
+                             producer pack-time: vendor the builder's dylibs into the
+                             staged sysroot so the signed tarball is self-contained —
+                             only from a Trust toolchain named by --donor-root,
+                             byte-identical, recorded in lib/atpkg-vendored/VENDORED;
+                             a rustup, ~/.cargo or Homebrew library is refused. --sign
+                             re-signs with the named identity; --advisory reports
+                             instead of failing.
+  aterm pkg lineage check-compiler <bin-dir> | scan <stage> --compiler <bin-dir>
+                             producer: admit a Trust compiler by CONTENT (native
+                             trustc/targo/driver, no rustup/cargo/Homebrew path, a
+                             Trust -vV, clean bytes) and LINEAGE (its LINEAGE or
+                             SEED-MINT checked against its bytes), and refuse a staged
+                             payload carrying any other compiler's evidence. Also
+                             `seed-mint <seal> <commit>` and `stamp <stage> --from <bin>`
   aterm pkg lease <toolchain-dir> [--who <words>] -- <command> [args…]
                              keep the toolchain <toolchain-dir> belongs to (a `bin/`, a
                              tool in it, the build, or the rustup view) while <command>
@@ -1721,39 +1712,27 @@ GOTCHAS (in the order they bite)
     `setup-unread` when it did not run — and how long it took. Settings ▸
     Packages shows its newest 50 events, less the warm lines, as Activity, in local
     relative time, with Open Log for the whole file.
-  * PROVENANCE (macOS): files written by some processes carry a system tag
-    (`com.apple.provenance`) that release builds refuse. The package manager clears it
-    automatically after every install; `aterm pkg doctor` reports any file it could not
-    clear, and `aterm pkg repair` retries.
   * MACHINE SETTINGS are applied by `aterm pkg machine apply`, per `aterm pkg doctor`'s
     own findings — aterm runs it once a day, at the first window or interactive session
-    (the walk of $HOME is not every tab's or every window's) — and by a package pass
-    (update, seed, install) only when the `[machine]` table changed since they were last
-    applied, or the last apply did not finish (a live build it skipped, a write that
-    failed), so a pass does not walk $HOME; when a pass does carry them it applies them before the manager
-    gate, the index, the network and the store lock. Two applies never walk $HOME at once:
-    each queues on `<prefix>/machine.lock`. The `[machine]` table of
-    aterm.toml, both defaults ACTIVE: `spotlight_noindex = true` (the apply scans $HOME
-    itself, with the doctor's smaller time budget, and renames the cargo target dirs it
-    reaches to their `.noindex` form; `aterm pkg noindex apply --all` by hand walks with
-    the verb's larger budget and finishes what an apply could not reach) and
-    `universal_control = "off"` (macOS: `defaults -currentHost write
-    com.apple.universalcontrol Disable` and `DisableMagicEdges` `-bool true` — written
-    again whenever the host is not fully disabled, not once, so the cursor stops roaming
-    to other Macs and iPads on the same Apple account. The apply writes BOTH keys, so the
-    revert deletes both — deleting one leaves the other set:
+    — and by a package pass (update, seed, install) only when the `[machine]` table
+    changed since it was last applied, or the last apply's write failed; when a pass
+    does carry it it applies it before the manager gate, the index, the network and the
+    store lock. Two applies never run at once: each queues on `<prefix>/machine.lock`.
+    The `[machine]` table of aterm.toml, its default ACTIVE: `universal_control = "off"`
+    (macOS: `defaults -currentHost write com.apple.universalcontrol Disable` and
+    `DisableMagicEdges` `-bool true` — written again whenever the host is not fully
+    disabled, not once, so the cursor stops roaming to other Macs and iPads on the same
+    Apple account. The apply writes BOTH keys, so the revert deletes both — deleting one
+    leaves the other set:
       defaults -currentHost delete com.apple.universalcontrol Disable
       defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges
     and set `universal_control = "leave"` with it, or the next apply disables it again.)
-    The scan does NOT walk Documents, Desktop, Downloads, Pictures, Movies, Music or
-    Library: macOS asks a human before a program reads those, and an unattended apply
-    may not raise that question — name such a directory to `aterm pkg noindex apply
-    <dir>` instead. What an apply CHANGED is printed as `machine-settings: …`, which the
-    window records in `aterm ctl appstatus` and its log and names on Settings ▸ Security
-    as the "Last change"; one that changed nothing prints no such line. One that
-    REFUSED (a home that is not the account's, an aterm.toml that does not parse) says
-    `machine settings not applied — …`, and one whose write did not land says
-    `machine settings failed — …`.
+    What an apply CHANGED is printed as `machine-settings: …`, which the window records
+    in `aterm ctl appstatus` and its log and names on Settings ▸ Security as the "Last
+    change"; one that changed nothing prints no such line. One that REFUSED (a home
+    that is not the account's, an aterm.toml that does not parse) says `machine
+    settings not applied — …`, and one whose write did not land says `machine settings
+    failed — …`.
   * The root anchor is COMPILED IN — the paper master's public key, a committed constant
     (aterm-update-core::pins::PAPER_MASTER_PUBKEYS), not a build env var — so a plain
     `targo --unverified build` is fully armed. There is no atpkg-specific root and no
@@ -1799,9 +1778,10 @@ WHAT IT IS
   table below. Nothing is substituted silently: a DIRECT row runs the branded tool and
   says so on stderr; a SIGNPOST row prints the branded command with YOUR arguments filled
   in and then runs UPSTREAM; the ORACLE row names `ay` and then runs upstream z3.
-  NOTHING IS REFUSED BY DEFAULT: a missing Trust tool or an unreachable package
-  manager runs the upstream tool after one line (EXIT CODES); `[reroute] strict =
-  true` refuses instead (ESCAPES).
+  NOTHING IS REFUSED BY DEFAULT BUT IN ONE PLACE: a missing Trust tool or an
+  unreachable package manager runs the upstream tool after one line (EXIT CODES);
+  `[reroute] strict = true` refuses instead (ESCAPES). Inside a Trust source checkout a
+  `cargo`/`rustc` that is not Trust exits 2 (EXCEPT INSIDE A TRUST SOURCE CHECKOUT).
 
 THE TABLE (one row per name)
   invoked    policy     behaviour
@@ -1812,9 +1792,10 @@ THE TABLE (one row per name)
                         gets clean's source verb, so `lean f.lean` runs `clean check
                         f.lean` (clean has no bare-file mode)
   tlc        SIGNPOST   announce, then run upstream; name `ty`; equivalence not claimed
-  rustc      SIGNPOST   announce, then run upstream; `trustc <args>` /
-                        `trustc -Ztrust-verify=off <args>`
-  cargo      SIGNPOST   announce, then run upstream; the verb picks the spelling targo
+  rustc      SIGNPOST   announce what it resolves to (by its `-vV`), then run it;
+                        `trustc <args>` / `trustc -Ztrust-verify=off <args>`
+  cargo      SIGNPOST   announce what it resolves to (by its `-vV`), then run it; the
+                        verb picks the spelling targo
                         ACCEPTS for it: build/check/test → `targo trust <args>` /
                         `targo --unverified <args>`; run, doc, install, … (no verified
                         lane) → `targo --unverified <args>`; metadata, tree, fmt, …
@@ -1849,31 +1830,70 @@ THE AGENT PROGRAMS (claude, codex)
   (0.157+).
 
 WHAT YOU SEE — `cargo build --release` in a session prints this on stderr, and then your
-build runs:
-  aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':
+build runs (here rustup's default is the Trust seal 7d5533b2):
+  aterm: running 'cargo' -> Trust 7d5533b2, via rustup trust (the rustup default); Trust's own spelling is 'targo':
            targo trust build --release          VERIFIED   — emits a proof claim
            targo --unverified build --release   UNVERIFIED — no proof claim
+         ('cargo' here is /Users//me/toolchains/trust-7d5533b2/bin/cargo.)
          `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
          ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
-  A SIGNPOST ANNOUNCES; IT DOES NOT PREVENT. A bare `cargo <verb>` is not substituted —
-  you asked for upstream cargo and you get upstream cargo — and the lines above are how
-  you learn the spelling that would have carried a proof claim. Name the lane in cargo's
-  own vocabulary, though, and the BRANDED tool runs: `cargo trust build` and
-  `cargo --unverified build` exec `targo` after one line, because you already said which
-  lane you meant. A DIRECT row is one line and then the tool runs — `rustfmt src/lib.rs`:
+  In a directory whose rust-toolchain.toml pins stock 1.97.1, the first line says so:
+  aterm: running 'cargo' -> STOCK cargo 1.97.1 (c980f4866), via rustup 1.97.1-aarch64-apple-darwin (pinned by /r/rust-toolchain.toml); not Trust (no proof claim); on Trust the tool is 'targo':
+  THE FIRST LINE NAMES WHAT RUNS BY WHAT IT IS: `cargo`/`rustc` is
+  resolved first — through rustup when the copy on PATH is rustup's proxy (`rustup which`,
+  in your directory, auto-install off), then by that file's `-vV`. A `trust:` line is
+  Trust (`-> Trust 7d5533b2, via rustup trust (the rustup default)`, and no "no proof
+  claim" is said of it); a `release:` line without one is STOCK, with its version, but
+  only when nothing in the answer marks Trust: one that prints a mark of Trust
+  (`trust-repo-commit-hash:`, `binary: trustc`, `(trustc …)`) and no `trust:` version —
+  the cargo of the Trust seal e9ca4908 — is named by that mark and is not known to be
+  Trust, never STOCK. Any other answer is "an unidentified cargo … not known to be
+  Trust". Neither of those two is Trust. A copy that is not
+  rustup's proxy (a wrapper, a shim) is asked exactly as it will run, `+toolchain` and
+  all. The line under the lanes names the file. rustup's answer is cached by everything
+  it reads, and a toolchain's own compiled cargo/rustc (beside the librustc_driver it
+  ships) by its file, so a warm run costs a few stats; a wrapper, shim or script in
+  front of them is asked on every call, since it can run a different compiler in each
+  directory.
+  A SIGNPOST ANNOUNCES; IT DOES NOT PREVENT, except inside a Trust source checkout
+  (below). A bare `cargo <verb>` is not substituted — you asked for upstream cargo and
+  you get upstream cargo — and the lines above are how you learn the spelling that would
+  have carried a proof claim. Name the lane in cargo's own vocabulary, though, and the
+  BRANDED tool runs: `cargo trust build` and `cargo --unverified build` exec `targo`
+  after one line, because you already said which lane you meant. A DIRECT row is one
+  line and then the tool runs — `rustfmt src/lib.rs`:
   aterm: running trustfmt, Trust's 'rustfmt'. (`aterm --no-reroute` restores upstream 'rustfmt'.)
 
-A STOCK PIN CHANGES NOTHING ABOVE. In a directory whose rust-toolchain.toml (or
+A STOCK PIN MOVES ONLY RUSTUP'S PROXIES. In a directory whose rust-toolchain.toml (or
 $RUSTUP_TOOLCHAIN) names a stock channel, a SIGNPOST adds one note under the lanes: the
 pin moves only rustup's proxies, never targo, so the Trust spellings still run the Trust
 toolchain there (targo, tippy, trustfmt and trustdoc are not rustup proxies; `aterm help
 rust` measures it per directory). A Trust pin, the default, adds nothing.
 
-NOTHING HERE REFUSES AN AGENT'S OWN COMMAND. A stub answers a NAME looked up on PATH, so
-it cannot tell a command an agent typed from one a tool spawned by name — a build script,
-a Makefile, a project's own stock-toolchain lane — and every child inherits the agent's
-environment, so it announces and runs. And aterm installs nothing into an agent, so no
-hook of aterm's refuses one either. What CAN see an agent's own command is its
+EXCEPT INSIDE A TRUST SOURCE CHECKOUT. There — the nearest x.py up the tree has a
+src/stage0 saying compiler_dist_channel=trust — a `cargo`/`rustc` that resolves to STOCK,
+or to anything not known to be Trust, does not run: exit 2, stdout untouched, and the
+line names what it resolved to, the checkout, the Trust spelling of your command, the
+file, and how to run that copy anyway: a session started with `aterm --no-reroute`. A
+stock compiler there would build part of Trust. What a tool spawns there BY NAME is
+judged the same — a cargo subcommand, `cargo run -p xtask`, a build script running
+`rustc +nightly` — beneath a Trust cargo the reroute let run too: an upstream copy the
+reroute runs hands its children an internal marker that keeps them from being announced
+a second time, never the escape, so they are still judged. A cargo started by path, or
+by `rustup run <tc> cargo`, runs `rustc` by name, and that rustc meets the same refusal:
+its `rustc -vV` (cargo stops there, exit status 2) and every compile it spawns, which
+carries CARGO_CRATE_NAME. With no package store (an `env -i` wrapper) the copy is still
+asked and judged; with aterm's package manager unreachable nothing can be asked, so a
+stub refuses a `cargo`/`rustc` there outright. NOT judged, because no name is looked up:
+a compiler run by its own path, or one handed to cargo as RUSTC, RUSTC_WRAPPER or
+build.rustc — a path is not a way round the rule, only past the check. Trust itself runs
+there as anywhere, and `[reroute] announce = false` does not silence the refusal.
+
+NOTHING ELSE HERE REFUSES AN AGENT'S OWN COMMAND. A stub answers a NAME looked up on
+PATH, so it cannot tell a command an agent typed from one a tool spawned by name — a build
+script, a Makefile, a project's own stock-toolchain lane — and every child inherits the
+agent's environment, so it announces and runs. And aterm installs nothing into an agent,
+so no hook of aterm's refuses one either. What CAN see an agent's own command is its
 text: `aterm pkg lane` reads one command line the way the shell runs it and exits 2 with
 the Trust spelling when it runs stock Rust at command position
 (`ATERM_STOCK_REASON='<why>'` in front lets it through) — the reader a guard you wire
@@ -1885,10 +1905,11 @@ EXIT CODES
   atpkg, or a branded tool's shim for a yanked build or a pending install, which says
   why). 127 when the tool it would run is not there: the upstream copy on PATH, or
   targo for `cargo trust|--unverified` (the line names the `aterm pkg install
-  <program>` or `aterm pkg repair` that fixes a missing Trust tool). 2 only
-  under `[reroute] strict = true`: z3, or a stub whose atpkg is unreachable (it names
-  the escape and never runs upstream); strict also turns a missing Trust tool
-  back into 127. Every announcement goes to stderr ONLY; stdout stays machine-parseable.
+  <program>` or `aterm pkg repair` that fixes a missing Trust tool). 2 inside a Trust
+  source checkout for a `cargo`/`rustc` that is not Trust, and otherwise only under
+  `[reroute] strict = true`: z3, or a stub whose atpkg is unreachable (it names the
+  escape and never runs upstream); strict also turns a missing Trust tool back into
+  127. Every announcement goes to stderr ONLY; stdout stays machine-parseable.
 
 ESCAPES AND CONTROLS (all of them; none is an environment variable)
   aterm --no-reroute           a whole session with every upstream tool restored. The
@@ -1923,12 +1944,20 @@ ESCAPES AND CONTROLS (all of them; none is an environment variable)
                                +trust x.rs` runs trustfmt without the directive.
                                `+trust…` keeps the lane question and is signposted like a
                                bare cargo; upstream receives the `+trust` it was given.
+                               Inside a Trust source checkout a `+<channel>` cargo/rustc
+                               that is not Trust does not run either (EXCEPT INSIDE A
+                               TRUST SOURCE CHECKOUT, above).
   An absolute path (`~/.cargo/bin/cargo`) and `rustup run <toolchain> cargo` never meet a
-  stub: the reroute answers a NAME looked up on PATH, nothing else. The rustc and rustdoc
-  such a cargo looks up by name to build a crate do meet one, and pass it unannounced to
-  the first upstream copy on PATH, as a stub-started cargo's do: the stub knows them by
-  the CARGO_CRATE_NAME cargo sets on them, which a name you type does not carry. Trust's
-  own cargo marks them TARGO_CRATE_NAME too, and its rustdoc stays trustdoc.
+  stub themselves: the reroute answers a NAME looked up on PATH, nothing else. What they
+  spawn by name does. The rustc and rustdoc such a cargo looks up by name to build a
+  crate pass unannounced to the first upstream copy on PATH, as a stub-started cargo's
+  do: the stub knows them by the CARGO_CRATE_NAME cargo sets on them, which a name you
+  type does not carry; inside a Trust source checkout such a rustc is still judged. Its
+  `rustc -vV` carries no such mark and is announced. Trust's own cargo marks its compiles
+  TARGO_CRATE_NAME too, and its rustdoc stays trustdoc. What a command the reroute ran
+  spawns by name is likewise not announced again, and still judged. Only `aterm
+  --no-reroute` carries a whole command past every stub; a path handed to cargo
+  (RUSTC=/path/to/rustc) is a path, and meets none.
 
 WHERE THE STUBS LIVE
   <prefix>/reroute — one stub per row, and one per agent program whose agents/ twin is
@@ -1958,6 +1987,11 @@ GOTCHAS
   * A script that spawns a bare `cargo` from inside a session meets the signpost: it
     gets the lines on stderr and then runs, unchanged. `[reroute] announce = false`
     silences the line if the noise is unwanted; naming the lane gets a proof claim.
+    INSIDE A TRUST SOURCE CHECKOUT it does not run when that cargo is not Trust (exit
+    2): a by-name spawn is exactly how a stock compiler would get into Trust's build —
+    and that holds beneath a cargo the reroute let run, too. Run the session with `aterm
+    --no-reroute` when you mean it — not the copy by its path: a cargo run that way
+    still spawns `rustc` by name, which is refused too.
   * Windows: no stubs are laid; a Windows session runs whatever PATH says."#,
         ),
     },
@@ -2518,17 +2552,18 @@ PROVISION — make this machine able to publish
       just failed.
 
 CUT — from a clean clone of the dev repo on main, never the shared checkout
-  tools/release.sh --dry-run --bump --mac-only   the plan and every refusal; no changes
-  tools/release.sh --bump --mac-only             the next MINOR, source then binary, live
-  tools/release.sh                               after a refusal: resumes where it stopped
+  targo --unverified ship release --dry-run --bump --mac-only   the plan and every refusal
+  targo --unverified ship release --bump --mac-only             the next MINOR, to live
+  targo --unverified ship release                               resumes where it stopped
       A cut must say --mac-only or --linux-artifacts <dir> (ships Linux).
-  The binary step alone, after `pub stage aterm` and `pub publish aterm`:
-  tools/cut-launch.sh --release-credentials <profile.toml> --mac-only [--dry-run]
-      Not a bare `ship cut`: from a shell inside aterm.app it is refused before the
-      claim. A real cut is refused when the channel lacks its source release, or
-      when the cutter was built from other sources than the tree.
+      A release is that command and nothing else: from your own shell (it
+      builds from git objects, so the shell changes no byte it ships), it
+      runs every step itself, asks the owner once for what only he can close,
+      and ends in one line. After any stop, run it again.
+  targo --unverified ship release --abandon vX.Y.Z
+      withdraws a claimed, unpublished cut (the claim commit stays).
 
-  aterm ship --help          every flag, including recovery (--resume, --abandon)
+  aterm ship --help          every flag, including recovery
   docs/RELEASING.md          the full runbook, including what to do when a cut
                              stops half-way
 "#;
@@ -3458,8 +3493,12 @@ fn rust_page() -> String {
          project whose rust-toolchain.toml pins a STOCK channel too: rustup reads that pin, so it\n\
          moves rustup's proxies (`cargo`, `rustc`, `rustfmt`, `cargo-clippy`) and never targo,\n\
          tippy, trustfmt or trustdoc — `targo here` below measures it for THIS directory.\n\
-         Stock `cargo`/`rustc` is not blocked — it is the exception, and inside a session a bare\n\
-         `cargo …` prints the `targo` spelling of your command before running (`aterm help reroute`).\n\
+         Stock `cargo`/`rustc` is the exception, and inside a session a bare `cargo …` names what it\n\
+         resolves to (by its `-vV`) and prints the `targo` spelling of your command before running.\n\
+         It is not blocked — EXCEPT INSIDE A TRUST SOURCE CHECKOUT (x.py beside a src/stage0 saying\n\
+         compiler_dist_channel=trust): there a `cargo`/`rustc` looked up by name that is not Trust\n\
+         exits 2 without running, whoever spawned it; `aterm --no-reroute` runs it anyway, and a\n\
+         compiler run by its own path is not judged (`aterm help reroute` has the boundary).\n\
          Name the lane; `targo` will not pick one for you:\n\
          \n\
          \x20 targo trust <cmd> …         VERIFIED   fail-closed; --allow-l0-gaps = advisory survey;\n\
@@ -4492,11 +4531,9 @@ fn resolve_from(found: PathBuf) -> OnPath {
 }
 
 /// aterm's own `rust-toolchain.toml` as built, the file the gates read at their
-/// repo root. Only its `channel` line is used.
-const ATERM_RUST_TOOLCHAIN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../rust-toolchain.toml"
-));
+/// repo root. Only its `channel` line is used. Named relative to this source
+/// file, so the compile records the file it read, not the checkout's path.
+const ATERM_RUST_TOOLCHAIN: &str = include_str!("../../../rust-toolchain.toml");
 
 /// The channel aterm's gates run discovery under: [`ATERM_RUST_TOOLCHAIN`]'s,
 /// never the current directory's.
@@ -4724,17 +4761,23 @@ HOW TO USE IT
   input. A leading `unread=ok`
   queues anyway: on `send` and `key` among the other options, on `hwkey`, `pointer` and
   `invoke` as the first token. The remedies are signals, which unread input never
-  refuses: `signal int` interrupts, `signal term` restarts a frozen program (then resume it
+  refuses: `signal int` interrupts, `signal term` ends a frozen program (then resume it
   on its own conversation — the `claude --resume <id>` aterm's line names for Claude Code,
   read from that process's own record, never the directory's newest conversation (a
-  sibling tab's where two share it); nothing to type where the window's supervisor
-  relaunches it), `signal cont` resumes a stopped job. On a peer they act on
+  sibling tab's where two share it)), `signal cont` resumes a stopped job. Where the
+  window's supervisor would carry the agent's restart (its own claim, nobody else's hand,
+  the agent in front, a launch its relaunch brings back — never a Codex daemon client
+  whose thread it could not name; `[harness] relaunch = false` does not refuse it),
+  every word of the stall — the line, the menu row, the band, the refusal, the
+  supervisor's mail — names `restart pid=<n> if-stalled` instead: it ends the program and
+  relaunches it on its conversation (a Codex on its thread where that has a rollout, else
+  fresh, so its words promise no conversation), and nothing is typed. On a peer they act on
   its owner's program, and so on its owner's work. A program
   can live through `signal term` — a Node program's SIGTERM listener never runs while its
   JS thread spins — so it stays `stalled` (`input_bytes=0`), every input verb still refused,
   until it ends or shows it is alive (it draws, reads a key sent since, or stops spinning);
   after 5 s aterm's line says it is still running and names `signal kill`, which nothing
-  can catch. THE
+  can catch (or the `restart` above, which ends it so itself). THE
   TYPEAHEAD HAZARD: keys the program never read stay queued in the tty after it exits, and
   the shell that takes the terminal back reads them as its own input — so `signal
   term|kill|hup|quit` discards a raw-mode job's unread input first (the tty's queue and
@@ -5193,8 +5236,7 @@ TURNING IT ON (the operator does this once)
                                 `--dry-run` prints every step and touches nothing;
                                 `aterm fabric off` undoes the parts that change behaviour
                                 and keeps the identity; `aterm fabric doctor` names the
-                                fix for each warning. tools/fabric-enable.sh --enable in
-                                the source checkout is now a wrapper over it.
+                                fix for each warning.
   Every piece is in the one aterm binary, under `aterm link` (the `aterm-link` argv0 alias
   is the same code). These are the steps `on` takes, so you can see what it touched — or
   do them by hand.

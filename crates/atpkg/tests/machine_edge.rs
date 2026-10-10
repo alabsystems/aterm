@@ -1,16 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `[machine]` settings at the REAL process edge (Phase 3, 2026-09-22): an update pass
+//! The `[machine]` settings at the REAL process edge: an update pass
 //! applies them only when the `[machine]` table changed since the last apply, and never
 //! under a private state root (ruling 409) nor when the window that spawned it says it runs
-//! under one (ruling 410's lead), and their own verb applies them every time.
+//! under one (ruling 410's lead), and their own verb applies them every time: a host
+//! preference written at the dispatch edge of every update/seed/install pass is not that
+//! edge's work (and the $HOME walk that once rode with it cost seconds).
 //!
-//! The settings' $HOME walk (up to 60,000 directories / 3 s) and `defaults` used to run at
-//! the dispatch edge of EVERY update/seed/install pass. The observable here is the
-//! synthetic-home refusal line: this child's `HOME` is a temp directory, so an apply that is
-//! ATTEMPTED prints `atpkg: machine settings not applied — …` (and touches nothing on the
-//! real machine), and one that is not attempted prints nothing about the machine at all.
+//! The observable is the synthetic-home refusal line: this child's `HOME` is a temp
+//! directory, so an apply that is ATTEMPTED prints `atpkg: machine settings not applied —
+//! …` (and touches nothing on the real machine), and one that is not attempted prints
+//! nothing about the machine at all.
 //! macOS only — elsewhere there is nothing to apply and nothing is ever printed.
 //!
 //! NEVER THE REAL STORE: `HOME` is a temp directory, `XDG_CONFIG_HOME` an absent one, and
@@ -90,11 +91,9 @@ impl Fixture {
 
     /// Whether `lines` say anything about the machine settings.
     fn says_machine(lines: &[String]) -> bool {
-        lines.iter().any(|l| {
-            l.starts_with("atpkg: machine")
-                || l.starts_with("atpkg machine:")
-                || l.starts_with("atpkg noindex:")
-        })
+        lines
+            .iter()
+            .any(|l| l.starts_with("atpkg: machine") || l.starts_with("atpkg machine:"))
     }
 
     fn attempted(lines: &[String]) -> bool {
@@ -120,9 +119,9 @@ fn an_update_pass_applies_the_machine_settings_only_when_the_table_changed() {
     .unwrap();
     let idle = fx.stdout(&["update"]);
     assert!(
-        !idle.iter().any(|l| l.starts_with("atpkg: machine")
-            || l.starts_with("atpkg machine:")
-            || l.starts_with("atpkg noindex:")),
+        !idle
+            .iter()
+            .any(|l| l.starts_with("atpkg: machine") || l.starts_with("atpkg machine:")),
         "an unchanged table rides no pass: {idle:?}"
     );
     assert!(

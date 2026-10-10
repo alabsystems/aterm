@@ -551,7 +551,10 @@ mod tests {
         let dir = fresh("cwd");
         let deep = dir.join("debug/deps");
         std::fs::create_dir_all(&deep).expect("deps");
-        let mut sleeper = std::process::Command::new("/bin/sleep")
+        // `spawnfd`'s, every child of these scans: each holds its stdio and
+        // nothing else of this process, not another test thread's pipe for as
+        // long as it lives.
+        let mut sleeper = crate::spawnfd::command("/bin/sleep")
             .arg("120")
             .current_dir(&deep)
             .spawn()
@@ -564,7 +567,7 @@ mod tests {
         let file = dir.join("held.rlib");
         std::fs::write(&file, b"x").expect("rlib");
         // `sh` holds the file open on descriptor 3 from another directory.
-        let mut holder = std::process::Command::new("/bin/sh")
+        let mut holder = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$1\"; exec /bin/sleep 120")
             .arg("sh")
@@ -610,10 +613,10 @@ mod tests {
         std::fs::create_dir_all(&work).expect("work");
         std::fs::copy("/bin/cat", &bin).expect("copy cat");
         crate::deadline::sign_ad_hoc(&bin);
-        let mut catter = std::process::Command::new(&bin)
+        let mut catter = crate::spawnfd::command(&bin)
             .current_dir(&work)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::piped())
             .spawn()
             .expect("the copied cat");
         let mut to = catter.stdin.take().expect("its stdin");
@@ -702,14 +705,14 @@ mod tests {
     /// working directory and the descriptors it kept across the exec are
     /// its own from then on.
     #[cfg(target_vendor = "apple")]
-    fn exec_done(child: &std::process::Child) -> u32 {
+    fn exec_done(child: &crate::spawnfd::Child) -> u32 {
         running(child, "/bin/sleep")
     }
 
     /// A child's pid once the kernel shows it running `exe` (see
     /// [`exec_done`]).
     #[cfg(target_vendor = "apple")]
-    fn running(child: &std::process::Child, exe: &str) -> u32 {
+    fn running(child: &crate::spawnfd::Child, exe: &str) -> u32 {
         let pid = child.id();
         let start = Instant::now();
         while super::executable(pid).as_deref() != Some(std::path::Path::new(exe)) {
@@ -808,16 +811,16 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_descriptor_on_a_revoked_terminal_holds_nothing() {
+        use crate::spawnfd::Stdio;
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::MetadataExt as _;
-        use std::process::Stdio;
         let me = std::process::id();
         let (master, slave) = a_pty();
         let rdev = std::fs::metadata(&slave).expect("stat the slave").rdev();
         let dirs = std::slice::from_ref(&slave);
         // The slave on descriptor 3, from a working directory and an
         // executable that are not it.
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<>\"$1\"; exec /bin/sleep 600")
             .arg("sh")
@@ -915,16 +918,22 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     impl Volume {
-        /// A 2 MB HFS+ image created at `image` and attached at `mnt`.
-        fn attach(image: &std::path::Path, mnt: &std::path::Path) -> Self {
+        /// A 2 MB HFS+ image created at `image` and attached at `mnt`;
+        /// `None`, after one line on stderr, when macOS's disk-image service
+        /// did not answer (`crate::deadline::disk_image_service_silent`). Not
+        /// `-quiet`: that would hide the `Operation timed out` the judgment reads.
+        fn attach(image: &std::path::Path, mnt: &std::path::Path) -> Option<Self> {
             use std::process::Stdio;
             let created = std::process::Command::new(HDIUTIL)
-                .args(["create", "-quiet", "-size", "2m", "-fs", "HFS+"])
+                .args(["create", "-size", "2m", "-fs", "HFS+"])
                 .args(["-layout", "NONE", "-volname", "aterm-uds-test"])
                 .arg(image)
                 .stdin(Stdio::null())
                 .output()
                 .expect("hdiutil create");
+            if crate::deadline::disk_image_service_silent(&created) {
+                return None;
+            }
             assert!(created.status.success(), "hdiutil create: {created:?}");
             let attached = std::process::Command::new(HDIUTIL)
                 .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
@@ -934,15 +943,18 @@ mod tests {
                 .stdin(Stdio::null())
                 .output()
                 .expect("hdiutil attach");
+            if crate::deadline::disk_image_service_silent(&attached) {
+                return None;
+            }
             assert!(attached.status.success(), "hdiutil attach: {attached:?}");
             let out = String::from_utf8_lossy(&attached.stdout);
             let dev = out
                 .split_whitespace()
                 .find(|w| w.starts_with("/dev/disk"))
                 .unwrap_or_else(|| panic!("no device in {out:?}"));
-            Self {
+            Some(Self {
                 dev: dev.to_owned(),
-            }
+            })
         }
 
         /// Detach it by force — what pulling out a disk does to its volume:
@@ -983,8 +995,8 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_dead_working_directory_is_no_working_directory() {
+        use crate::spawnfd::Stdio;
         use std::os::unix::fs::MetadataExt as _;
-        use std::process::Stdio;
         let me = std::process::id();
         let base = fresh("deadcwd");
         let (image, mnt, held) = (base.join("v.dmg"), base.join("mnt"), base.join("held"));
@@ -993,11 +1005,13 @@ mod tests {
         let file = held.join("open.rlib");
         std::fs::write(&file, b"x").expect("a file to hold");
         let device = |p: &std::path::Path| std::fs::metadata(p).expect("stat").dev();
-        let mut volume = Volume::attach(&image, &mnt);
+        let Some(mut volume) = Volume::attach(&image, &mnt) else {
+            return;
+        };
         let mounted = device(&mnt) != device(&base);
         // At the volume's root, the file on descriptor 3; `cat` ends when this
         // test's end of its stdin closes, a panic's unwinding among the ways.
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$1\"; exec /bin/cat")
             .arg("sh")
@@ -1126,7 +1140,7 @@ mod tests {
         let read = |pid: u32| super::scan_path_users_of(&[pid], dirs, &[me]).expect("scan");
         let gone = |scan: &super::PathScan| scan.users.is_empty() && scan.unreadable.is_empty();
 
-        let mut worker = std::process::Command::new("/bin/sleep")
+        let mut worker = crate::spawnfd::command("/bin/sleep")
             .arg("120")
             .current_dir(&dir)
             .spawn()
@@ -1150,7 +1164,7 @@ mod tests {
 
         let file = dir.join("held.rlib");
         std::fs::write(&file, b"x").expect("rlib");
-        let mut holder = std::process::Command::new("/bin/sh")
+        let mut holder = crate::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg("exec 3<\"$1\"; exec /bin/sleep 120")
             .arg("sh")

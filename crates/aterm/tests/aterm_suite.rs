@@ -57,5 +57,7 @@ mod supervise_turn_end_live_headless;
 #[cfg(unix)]
 mod tab_zero_master_live_headless;
 mod win_resources;
+#[cfg(target_os = "macos")]
+mod window_server_census_live_headless;
 #[cfg(windows)]
 mod windows_console_image;

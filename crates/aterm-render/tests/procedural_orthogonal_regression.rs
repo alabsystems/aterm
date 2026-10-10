@@ -16,9 +16,7 @@
 //! The AA families (arcs, diagonals, Powerline, wedges) carry interior grey
 //! levels by design, so they cannot be "unchanged since before AA"; what the
 //! second corpus pins is that they do not move by a byte without a reviewed
-//! re-bless. It replaced the two golden-PNG strips (`procedural_golden.rs`,
-//! 9x19 and 10x20), which pinned the same coverage bytes for seven AA glyphs
-//! at two sizes; the corpus pins every AA code point at every lattice size.
+//! re-bless, at every AA code point and every lattice size.
 //!
 //! The fixtures are INTENTIONALLY hard to regenerate by accident: bless with
 //! `ATERM_BLESS_GOLDEN=1 targo --unverified test -p aterm-render --test

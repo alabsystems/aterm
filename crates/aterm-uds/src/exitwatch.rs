@@ -420,7 +420,9 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
 #[cfg(all(test, unix))]
 mod moment_tests {
     use super::{ExitMoment, exit_moment_thread};
-    use std::process::Command;
+    // `spawnfd`'s: a `sleep 600` here holds its stdio and nothing else of this
+    // process, not another test thread's pipe for as long as it lives.
+    use crate::spawnfd::Command;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -519,7 +521,8 @@ mod moment_tests {
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests {
     use super::ExitWatch;
-    use std::process::{Command, Stdio};
+    // `spawnfd`'s, as in `moment_tests` above.
+    use crate::spawnfd::{Command, Stdio};
 
     /// A child that exits 7 reads `0x0700`, one SIGKILLed reads `0x9`, and the
     /// second read answers the same as the first (the knote is one-shot; the

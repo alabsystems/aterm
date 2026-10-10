@@ -13,7 +13,7 @@
 //!   `TextBlendGate` derived model (`aterm_spec::derive::text_blend_gate_model`)
 //!   carries the `CorrectionGated` invariant: the remap fires ONLY in
 //!   corrected mode, on an interior (non-endpoint) coverage texel, with a
-//!   non-degenerate luminance gap. `cargo test -p aterm-spec`
+//!   non-degenerate luminance gap. `targo --unverified test -p aterm-spec`
 //!   (`derived_text_blend_gate_proves_and_catches_degenerate_divide`) runs the
 //!   real `ty` binary over the bounded state space: it PROVES the invariant at
 //!   `Buggy=0` and CATCHES the ungated (div-by-near-zero) variant at `Buggy=1`.
@@ -28,7 +28,7 @@
 //! endpoint anchoring) cannot be stated in the ty expression language (no
 //! multiplication/`pow`), so — per the repo's box-drawing-rounding precedent —
 //! they are proven here by deliberate exhaustive lattice sweeps under plain
-//! `cargo test`.
+//! `targo --unverified test`.
 
 use aterm_render::{TEXT_BLEND_EPS, blend_text, correct_alpha, correction_applies};
 
@@ -101,7 +101,7 @@ fn endpoint_exactness_both_modes() {
     assert!(cases > 1000, "endpoint sweep too thin ({cases} cases)");
 }
 
-/// GOLDEN (the audit's sin-2 number): a 50%-coverage white texel on black must
+/// GOLDEN: a 50%-coverage white texel on black must
 /// land at ~sRGB 128 in the default linear-corrected mode — the apparent
 /// weight of a gamma-space (CoreText-like) blend — while pure linear puts it
 /// at ~sRGB 188 (the thin/washed dark-mode text this item fixes). The linear

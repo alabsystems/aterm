@@ -8,7 +8,7 @@
 //!
 //! The window (`aterm-gui.exe`) has no console, and a console child it starts
 //! with no flag gets a new VISIBLE console window — the flash the module exists
-//! to prevent (its docs carry the 2026-09-30 measurement). This file builds that
+//! to prevent (its docs carry the measurement). This file builds that
 //! parent without ever being it on screen: the test binary re-runs ITSELF as a
 //! PARENT started `Console::Detached` (no console at all, exactly the window's
 //! state), and that parent starts <this binary> as a CHILD that reports what it
@@ -49,14 +49,11 @@
 //! `set_flags` and the off-Unix `spawnfd::command`, a few lines each.
 //!
 //! WARNING: such a regression puts a console window on the screen of whoever
-//! runs this file, and then the test fails. That is the negative control,
-//! measured 2026-10-01 without anyone's screen: with the off-Unix
-//! `spawnfd::command` reverted to a bare `Command::new`, the
-//! `spawnfd::command` test below, run on a scratch desktop (`CreateDesktopW`,
-//! under a `cmd.exe` started `CREATE_NO_WINDOW` there), failed with its child
-//! at `window: true`, and a `ConsoleWindowClass` window titled with this binary
-//! appeared on that desktop; the same test of the real constructor passed
-//! there with no console window on either desktop.
+//! runs this file, and then the test fails. That negative control was measured
+//! on a scratch desktop (`CreateDesktopW`): with the off-Unix `spawnfd::command`
+//! reverted to a bare `Command::new`, the `spawnfd::command` test below failed
+//! with its child at `window: true` and a `ConsoleWindowClass` window appeared
+//! there; the real constructor passed with no console window.
 
 #![cfg(windows)]
 
@@ -291,8 +288,7 @@ fn play_role(test: &str) -> bool {
 }
 
 /// THE FIX: a parent with no console — the window's state — starts a quiet
-/// child, and the child has a console with no window. Before the module the
-/// same child had a console WITH a window: the flash.
+/// child, and the child has a console with no window (with one, the flash).
 #[test]
 fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
     const TEST: &str = "a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window";
@@ -324,8 +320,7 @@ fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
 /// its choice with `Console::Detached`), starts `spawnfd::command(<this
 /// binary>)` — how every shipped child is built — and the child has a console
 /// with no window. A `spawnfd::command` off Unix that dropped the console rule
-/// (a plain `Command::new`) gave this child a console window and failed here
-/// (measured on a scratch desktop: the module docs).
+/// fails here (the module docs' negative control).
 #[test]
 fn spawnfd_command_from_a_parent_with_no_console_gives_a_console_with_no_window() {
     const TEST: &str =
@@ -466,11 +461,11 @@ fn the_guard_refuses_every_word_that_would_show_a_console_window() {
 /// pseudoconsole — the console of every aterm tab — reports a console whose
 /// `GetConsoleWindow` is NOT NULL (a pseudoconsole hands it an invisible
 /// stand-in window: a `PseudoConsoleWindow` created hidden and never shown,
-/// measured with a WinEvent hook on Windows 11 build 26200, 2026-09-30).
-/// Without this, `window` was never seen to read anything but NULL on a machine
-/// whose own console is windowless (a review measured every process here at
-/// `window=0`), so the fix's `window=0` could have been a constant. A hidden `CREATE_NEW_CONSOLE` child would read 1 too, but it makes
-/// a real console window, which nothing in this file does.
+/// measured with a WinEvent hook on Windows 11 build 26200). On a machine whose
+/// own console is windowless every other process here reads `window=0`, so
+/// without this the fix's `window=0` could be a constant. A hidden
+/// `CREATE_NEW_CONSOLE` child would read 1 too, but it makes a real console
+/// window, which nothing in this file does.
 #[test]
 fn a_probe_on_a_pseudoconsole_sees_its_console_window() {
     const TEST: &str = "a_probe_on_a_pseudoconsole_sees_its_console_window";

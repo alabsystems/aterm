@@ -1140,7 +1140,7 @@ impl App {
             return;
         }
         if !crash_journal_writable(
-            self.first_present_done,
+            self.desk.on_glass(self.first_present_done),
             self.pending_restore.is_some() || !self.seamless_adopt.is_empty(),
             self.incoming_handoff_pending,
         ) || !self.crash_journal.capture_due(now)
@@ -1335,6 +1335,9 @@ impl App {
                 .map(|(sid, snap)| crate::harness_host::RestoredAgent {
                     place: self.upgrade_place(&sid),
                     // The layout's snapshot: no process was read for it.
+                    // The home and the login its leaf names ride it, and
+                    // only one naming neither takes the roster's account
+                    // (`harness_host::RestoredAgent::unread`).
                     cold: true,
                     sid,
                     snap,
@@ -1726,7 +1729,7 @@ impl App {
             metrics,
             crate::tab_model::TabSet::default(),
         );
-        self.windows.insert(wid, ws);
+        self.windows.insert(wid, Box::new(ws));
         self.frontmost_window = Some(wid);
         wid
     }
@@ -2620,15 +2623,7 @@ impl App {
         // under the engine's first lock, before anything else reads it.
         // What did not cross is said on the band with the handed tabs' and
         // counted on `status`.
-        let mut history = held.history;
-        if history.carry.is_some() {
-            let mut engine = crate::term_lock(&session.term);
-            history.reserve_in(&mut engine);
-            history.anchor_in(&engine);
-        }
-        if history.carry.is_some() || history.dropped > 0 {
-            session.handoff_history = Some(history);
-        }
+        session.handoff_history = crate::held_pane_history(&session.term, held.history);
         // The block the shell last reported, read while the engine is still
         // this function's alone (no reader runs in a held pane, and it is not
         // pooled yet): the carried exit names it, so the sweeps that read it
@@ -3903,7 +3898,8 @@ impl App {
         // CELL-PX-1: the host window's real cell box for every newborn engine.
         let cell_px = self.spawn_cell_px(wid);
         // A real run always has a proxy; the headless test harness (None) never gets
-        // here (restore is never taken for headless runs). Guard, don't panic.
+        // here (a headless run takes a restore only under the lab's seam, `desk::Desk`,
+        // and that run is a real one). Guard, don't panic.
         let proxy = self.proxy.clone()?;
         let leaves = layout.leaves();
         let mut ids: Vec<u64> = Vec::with_capacity(leaves.len());

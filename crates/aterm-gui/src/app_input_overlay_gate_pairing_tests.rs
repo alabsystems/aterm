@@ -17,6 +17,7 @@ fn named(key: NamedKey, event_type: KeyEventType) -> InputEvent {
         key: Key::Named(key),
         mods: Modifiers::empty(),
         base_layout: None,
+        layout_text: None,
         event_type,
     }
 }

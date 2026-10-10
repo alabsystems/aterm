@@ -83,8 +83,7 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     assert_eq!(Version::parse("codex-cli"), None);
 }
 
-/// THE CODEX LANE CARRIES THE MODEL, AND ONLY CARRIES IT (the decision of
-/// 2026-09-26, beside the Claude lane's same-family move): whatever model the
+/// THE CODEX LANE CARRIES THE MODEL, AND ONLY CARRIES IT: whatever model the
 /// launch named, in any spelling (`-m x`, `-mx`, `--model=x`), rides the
 /// relaunch verbatim with every other kept flag, and a launch that named none
 /// gets none — no model is guessed for Codex, and none is moved down.
@@ -308,8 +307,7 @@ fn the_exit_hint_is_the_tuis_own_last_words() {
         })
     );
     // 0.159+: the daemon's id under its own heading is still a daemon hint
-    // (before, it matched neither form and every daemon-mode upgrade ended
-    // `failed:no-resume-hint`).
+    // (missed, every daemon-mode upgrade ends `failed:no-resume-hint`).
     let two_line = daemon_exit_screen_two_line();
     let daemon = Some(ExitHint {
         thread: T1.into(),

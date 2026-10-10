@@ -5,10 +5,10 @@
 //! `aterm-gui` `tray_raster` draws: Settings, About, the command palette, the
 //! system-performance card).
 //!
-//! Two laws live here as PURE integer functions so they can be machine-checked
-//! (exhaustive lattice tests below + config-free `#[kani::proof]` harnesses for
-//! the trust-mc lane) and then CONSUMED verbatim by the shipping rasterizer —
-//! the proof is about the exact arithmetic that places pixels:
+//! Two laws live here as PURE integer functions so they can be checked
+//! exhaustively (the lattice tests below cover every residue the laws depend
+//! on) and then CONSUMED verbatim by the shipping rasterizer — the check is
+//! about the exact arithmetic that places pixels:
 //!
 //! 1. **Cap-height centering (leading-trim)** — a text run is vertically
 //!    centred in its row by placing the BASELINE at
@@ -17,7 +17,7 @@
 //!    `y + font_px` (fontdue's em box bottom), which sits ~0.135 em low.
 //!    [`baseline_in_row_q`] encodes the rule in 26.6 fixed point;
 //!    `|top_gap − bottom_gap| <= 1` subunit before device rounding, and
-//!    `<= 1px + 1` subunit after (`baseline_gap_*` proofs).
+//!    `<= 1px + 1` subunit after (`cap_centering_lattice`).
 //!
 //! 2. **Drift-free pen advance** — glyph advances accumulate in 26.6 fixed
 //!    point ([`px_to_q`] + plain `i64` addition, which is EXACT), and each
@@ -29,8 +29,8 @@
 //! WAIVER (Tier-0 `ty`): both laws divide (`/2` for the centring, `/64` for the
 //! device rounding); the derived-model `Expr` language is add/sub-only, so —
 //! exactly like the box-drawing rounding law (`procedural.rs`) — the
-//! machine-checked encodings are the exhaustive lattice tests + the trust-mc
-//! harnesses here, not a `ty` model. The FACE-SELECTION policy of the same
+//! machine-checked encodings are the exhaustive lattice tests here, not a `ty`
+//! model. The FACE-SELECTION policy of the same
 //! chrome overhaul (a pure boolean gate) IS `ty`-modelled: see
 //! `aterm_spec::derive::chrome_face_gate_model` and its Tier-1 binding in
 //! `aterm-gui`'s `tray_raster`.
@@ -57,11 +57,11 @@ pub fn q_to_px(q: i64) -> f32 {
 /// (ties round up, matching `f32::round` for the non-negative coordinates the
 /// raster uses; exact for negatives too via `div_euclid`).
 ///
-/// # Invariant (proven)
+/// # Invariant (checked)
 /// `|q_round_to_px(q) * Q − q| <= Q/2` for all `q` — each placement is within
 /// half a pixel of the exact fixed-point pen, with no dependence on how many
-/// advances were summed before it (`pen_round_error_half_px` kani harness +
-/// `pen_is_drift_free` lattice test).
+/// advances were summed before it (`rounding_error_bounded_by_half_px`, which
+/// covers every residue mod `Q`, + the `pen_is_drift_free` lattice test).
 #[must_use]
 pub fn q_round_to_px(q: i64) -> i64 {
     (q + Q / 2).div_euclid(Q)
@@ -73,12 +73,13 @@ pub fn q_round_to_px(q: i64) -> i64 {
 /// the leading-trim rule. `row_h = 0` degenerates to "centre the cap box on
 /// `row_top`" (used for anchor-centred labels like ring values).
 ///
-/// # Invariant (proven)
+/// # Invariant (checked)
 /// For `0 <= cap_h <= row_h`: with `top_gap = (baseline − cap_h) − row_top`
 /// (space above the cap box) and `bottom_gap = (row_top + row_h) − baseline`
 /// (space below the baseline), `|top_gap − bottom_gap| <= 1` subunit (1/64 px)
-/// — and `<= 1px` on the integer-px lattice — for ALL inputs
-/// (`baseline_gap_balance_exact` kani harness + `cap_centering_lattice` test).
+/// — and `<= 1px` on the integer-px lattice — for ALL inputs: the difference
+/// depends only on the parity of `row_h + cap_h`, and `cap_centering_lattice`
+/// sweeps both.
 #[must_use]
 pub fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
     row_top_q + (row_h_q + cap_h_q) / 2
@@ -117,8 +118,11 @@ mod tests {
     /// Integer-px lattice (`q = 64k` — the raster's observable grid): for every
     /// `(row_h, cap_h)` with `cap_h <= row_h`, `|top_gap − bottom_gap| <= 1px`.
     /// Sub-px lattice (every subunit): `|top_gap − bottom_gap| <= 1` subunit
-    /// before device rounding. Deliberately sweeps odd AND even sizes so the
-    /// `/2` truncation is exercised on both parities.
+    /// before device rounding, and `<= Q + 1` subunits (1px + 1/64) after the
+    /// baseline snaps to the device grid, which moves both gaps oppositely by
+    /// one rounding delta. Deliberately sweeps odd AND even sizes so the `/2`
+    /// truncation is exercised on both parities, and every residue of the
+    /// baseline mod `Q`, which is all the rounding depends on.
     #[test]
     fn cap_centering_lattice() {
         // Integer-pixel lattice, the law as stated: <= 1px.
@@ -145,6 +149,12 @@ mod tests {
                         (top_gap - bottom_gap).abs() <= 1,
                         "q lattice top={row_top} row_h={row_h} cap={cap}: \
                          gaps {top_gap} vs {bottom_gap}"
+                    );
+                    let snapped = q_round_to_px(b) * Q;
+                    let rounded = ((snapped - cap) - row_top) - ((row_top + row_h) - snapped);
+                    assert!(
+                        rounded.abs() <= Q + 1,
+                        "device-rounded top={row_top} row_h={row_h} cap={cap}: imbalance {rounded}"
                     );
                 }
             }
@@ -200,9 +210,9 @@ mod tests {
         );
     }
 
-    /// `q_round_to_px` half-pixel bound over a dense signed lattice (the kani
-    /// harness proves the full bounded domain; this keeps the law visible under
-    /// plain `cargo test`).
+    /// `q_round_to_px` half-pixel bound over a dense signed lattice: the error
+    /// depends only on `q mod Q`, and the lattice holds every residue many
+    /// times over, on both signs.
     #[test]
     fn rounding_error_bounded_by_half_px() {
         for q in -100_000..=100_000i64 {
@@ -230,92 +240,6 @@ mod tests {
         assert!(
             (table - measured).abs() < 0.05,
             "OS/2 ({table}) and measured-'H' ({measured}) cap heights agree"
-        );
-    }
-}
-
-/// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the chrome
-/// typography laws over their ENTIRE bounded integer domains — the guarantee
-/// the lattice tests above sample. CONFIG-FREE (no unwind/stub/solver), so the
-/// standard `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh` lane
-/// discharges them through trust-mc + ay.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::{Q, baseline_in_row_q, q_round_to_px};
-
-    /// Domain bound: generous for any real UI (rows/pens < 2^26 px) while
-    /// keeping every intermediate sum far from i64 overflow.
-    const BOUND: i64 = 1 << 32;
-
-    /// Cap-height centering law, EXACT form: before device rounding the two
-    /// gaps differ by at most one 26.6 subunit (1/64 px), for every
-    /// `row_top`, `0 <= cap_h <= row_h` in the bounded domain.
-    #[kani::proof]
-    fn baseline_gap_balance_exact() {
-        let row_top: i64 = kani::any();
-        let row_h: i64 = kani::any();
-        let cap_h: i64 = kani::any();
-        kani::assume(row_top > -BOUND && row_top < BOUND);
-        kani::assume(row_h >= 0 && row_h < BOUND);
-        kani::assume(cap_h >= 0 && cap_h <= row_h);
-        let b = baseline_in_row_q(row_top, row_h, cap_h);
-        let top_gap = (b - cap_h) - row_top;
-        let bottom_gap = (row_top + row_h) - b;
-        let diff = top_gap - bottom_gap;
-        kani::assert(diff >= -1 && diff <= 1, "gap imbalance exceeds one subunit");
-    }
-
-    /// Cap-height centering law THROUGH device rounding: snapping the baseline
-    /// to the integer-px grid moves both gaps oppositely by the same rounding
-    /// delta, so `|top_gap − bottom_gap| <= Q + 1` subunits (1px + 1/64) for
-    /// ALL fractional inputs — and on the integer-px lattice (row/cap multiples
-    /// of Q) the imbalance is at most exactly 1px.
-    #[kani::proof]
-    fn baseline_gap_balance_after_device_rounding() {
-        let row_top: i64 = kani::any();
-        let row_h: i64 = kani::any();
-        let cap_h: i64 = kani::any();
-        kani::assume(row_top > -BOUND && row_top < BOUND);
-        kani::assume(row_h >= 0 && row_h < BOUND);
-        kani::assume(cap_h >= 0 && cap_h <= row_h);
-        let b_px = q_round_to_px(baseline_in_row_q(row_top, row_h, cap_h));
-        let b = b_px * Q;
-        let diff = ((b - cap_h) - row_top) - ((row_top + row_h) - b);
-        kani::assert(
-            diff >= -(Q + 1) && diff <= Q + 1,
-            "device-rounded gap imbalance exceeds 1px + 1 subunit",
-        );
-    }
-
-    /// Pen placement error: for any fixed-point pen value, the device-px
-    /// placement is within half a pixel — independent of how many advances
-    /// were accumulated to reach it (i64 addition is exact, so this per-value
-    /// bound IS the per-glyph bound of every prefix of every run).
-    #[kani::proof]
-    fn pen_round_error_half_px() {
-        let q: i64 = kani::any();
-        kani::assume(q > -BOUND && q < BOUND);
-        let err = q_round_to_px(q) * Q - q;
-        kani::assert(
-            err >= -(Q / 2) && err <= Q / 2,
-            "placement error exceeds 0.5px",
-        );
-    }
-
-    /// Drift-freedom root: fixed-point accumulation is exact integer addition —
-    /// summing in any grouping yields the same pen, so no per-glyph error can
-    /// compound along a run.
-    #[kani::proof]
-    fn pen_accumulation_is_exact_addition() {
-        let a: i64 = kani::any();
-        let b: i64 = kani::any();
-        let c: i64 = kani::any();
-        kani::assume(a > -BOUND && a < BOUND);
-        kani::assume(b > -BOUND && b < BOUND);
-        kani::assume(c > -BOUND && c < BOUND);
-        kani::assert(
-            (a + b) + c == a + (b + c),
-            "fixed-point pen sums must associate",
         );
     }
 }

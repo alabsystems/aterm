@@ -1827,9 +1827,7 @@ mod tests {
                 pause_max: Duration::from_millis(5),
             };
             s.spawn(|| lane.run(Some("@s-1"), &say, tx, &stop));
-            // 500 ms here was ~7 ms of work plus however long a loaded gate
-            // left this thread unscheduled (the load-sensitive test audit of
-            // 2026-09-27).
+            // A hang detector: a loaded gate can leave this thread unscheduled.
             let got = rx.recv_timeout(HANG_DETECTOR);
             stop.store(true, Ordering::Relaxed);
             got

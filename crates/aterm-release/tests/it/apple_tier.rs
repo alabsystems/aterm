@@ -18,7 +18,7 @@
 //! The second kind proves the CALL SITES in `publish.rs` — the handful of lines
 //! that decide whether those rules ever run. They exist because a review found
 //! that two of them survived mutation: replacing `step_selfcheck`'s Tier APPLE
-//! gate with `if false`, and short-circuiting `step_build`'s notarize hook with
+//! gate with `if false`, and short-circuiting `step_sign`'s notarize hook with
 //! `if false &&`, each left the whole suite green. A rule nothing calls is a rule
 //! that does not exist, so `publish.rs` now hands its ordered decisions to
 //! [`publish::notarize_and_package`], [`publish::selfcheck_signing`] and
@@ -282,7 +282,7 @@ fn the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert() {
         !aterm_update_core::pins::anchor_active(""),
         "an empty anchor must never read as active"
     );
-    for done in [&[][..], &["build"][..]] {
+    for done in [&[][..], &["sign"][..]] {
         let tier = publish::resume_apple_tier("", &journal_with(done), None)
             .expect("an unpinned resume resolves without credentials");
         assert!(tier.identity().is_none(), "done = {done:?}");
@@ -838,7 +838,7 @@ fn the_apple_branch_refuses_to_run_for_a_cut_that_claims_nothing() {
 // suite green. Each test below states the mutation it kills, so a future reader
 // can re-run the experiment rather than trust the claim.
 
-// --- step_build's hook: `notarize_and_package` -------------------------------
+// --- step_sign's hook: `notarize_and_package` --------------------------------
 
 #[test]
 fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
@@ -1158,7 +1158,8 @@ fn journal_with(done: &[&str]) -> Journal {
         build_number: 1_783_918_101,
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c".into(),
         min_build: None,
-        arm64_only: false,
+        artifact: Some("aa".repeat(32)),
+        macho_sha256: Some("bb".repeat(32)),
         linux: None,
         manifest_signed: false,
         signature_required: false,
@@ -1180,10 +1181,10 @@ fn a_resume_past_the_build_never_asks_for_an_apple_credential() {
     // anything: the self-check re-proves the artifacts ON DISK against the
     // MANIFEST's claim.
     //
-    // MUTATION TARGET: delete the `is_done("build")` early return. With no
+    // MUTATION TARGET: delete the `is_done("sign")` early return. With no
     // credentials and an active anchor, resolution then fails and this test goes
     // red.
-    let tier = publish::resume_apple_tier(FAKE_TEAM, &journal_with(&["build"]), None)
+    let tier = publish::resume_apple_tier(FAKE_TEAM, &journal_with(&["sign"]), None)
         .expect("a resume past the build must not need Apple credentials");
     assert!(
         tier.identity().is_none(),

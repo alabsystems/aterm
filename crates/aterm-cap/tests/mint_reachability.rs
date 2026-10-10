@@ -134,9 +134,8 @@ fn no_production_code_outside_launchers_reaches_the_mint() {
             // Once a file enters a `#[cfg(test)]` region, the rest is test-only code
             // (matches the real layout: every mint lives under `#[cfg(test)] mod tests`).
             // A `<stem>_tests.rs` file IS such a module, declared `#[cfg(test)]
-            // #[path = …] mod tests;` in its parent (the shape aterm-pty's unix.rs
-            // tests moved to on 2026-10-06), so it is test-only from its first line,
-            // as grep_guard and aterm-census's is_test_file read it.
+            // #[path = …] mod tests;` in its parent, so it is test-only from its
+            // first line, as grep_guard and aterm-census's is_test_file read it.
             let mut in_test = file
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"));

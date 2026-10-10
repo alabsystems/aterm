@@ -31,7 +31,7 @@ struct Real {
     degraded: App,
     cold: App,
     /// A window that has not presented, and one that has.
-    windows: [WindowState; 2],
+    windows: [Box<WindowState>; 2],
 }
 
 impl Real {
@@ -90,7 +90,7 @@ impl Real {
     }
 }
 
-fn window(painted: bool) -> WindowState {
+fn window(painted: bool) -> Box<WindowState> {
     let mut ws = App::headless_for_test()
         .windows
         .remove(&WindowId(0))
@@ -144,6 +144,7 @@ fn real_steps(real: &mut Real, s: &State, alt: bool) -> BTreeSet<&'static str> {
     // windows, as `maybe_signal_handoff_ready` reads them.
     let drained = !queued;
     let [unpainted, painted_window] = &real.windows;
+    let (unpainted, painted_window): (&WindowState, &WindowState) = (unpainted, painted_window);
     let pick = |painted: i64| {
         if painted == 1 {
             painted_window

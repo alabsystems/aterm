@@ -246,15 +246,12 @@ impl Unfinished {
 
 /// [`run_prompt_turn`] over one persistent connection to `peer`.
 ///
-/// A CONNECTION THAT BROKE MID-TURN IS A CUT TURN (round eight of the update
-/// audit, finding 49): the server went away under it — an update's Commit
-/// `_exit`s it while the turn waits for the reply, after the prompt was typed
-/// and submitted — and nothing follows its successor on this connection. It
-/// exited 1 ("broke"), the code a caller retries, so the prompt was typed a
-/// second time: the failure `aterm ctl turn` exits 75 for (round seven,
-/// finding 17). Now [`Unfinished::Cut`], exit 75, saying whose connection
-/// broke (the socket's own `Broken pipe (os error 32)` names nothing) and not
-/// to send the prompt again blind.
+/// A CONNECTION THAT BROKE MID-TURN IS A CUT TURN: the server went away under
+/// it (an update's Commit `_exit`s it after the prompt was typed and
+/// submitted), and nothing follows its successor on this connection. Exit 1 is
+/// the code a caller retries, which would type the prompt twice, so this is
+/// [`Unfinished::Cut`], exit 75 (as `aterm ctl turn`), naming whose connection
+/// broke (the socket's own `Broken pipe` names nothing).
 fn run_relay_prompt_turn<S: std::io::Read + std::io::Write>(
     opts: &Opts,
     client: &mut RelayClient<S>,
@@ -2297,15 +2294,12 @@ mod tests {
         std::fs::remove_dir(dir).expect("remove endpoint directory");
     }
 
-    /// A PROMPT CUT BY ITS SERVER GOING AWAY IS EXIT 75, NEVER A RETRYABLE 1
-    /// (round eight of the update audit, finding 49). `aterm drive --socket <S>
-    /// prompt` runs its whole turn over one connection; an update that
-    /// Commits while it waits for the reply `_exit`s the server after the
-    /// prompt was typed and submitted. It exited 1 with "the connection …
-    /// broke", the code a caller retries — typing the prompt a second time,
-    /// the failure `aterm ctl turn` was fixed for (round seven, finding 17).
-    /// It now exits 75 (`aterm-ctl`'s code for an exchange its server went
-    /// away under) with nothing on stdout. FAILS WITHOUT THE FIX: `Err`, exit 1.
+    /// A PROMPT CUT BY ITS SERVER GOING AWAY IS EXIT 75, NEVER A RETRYABLE 1.
+    /// `aterm drive --socket <S> prompt` runs its whole turn over one
+    /// connection; an update that Commits while it waits for the reply
+    /// `_exit`s the server after the prompt was typed and submitted. Exit 75
+    /// (`aterm-ctl`'s code for an exchange its server went away under), nothing
+    /// on stdout.
     #[test]
     fn a_prompt_cut_by_its_servers_exit_is_75_never_a_retryable_1() {
         use std::io::{BufRead, BufReader, Write};

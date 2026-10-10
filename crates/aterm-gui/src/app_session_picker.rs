@@ -553,6 +553,7 @@ mod tests {
             key: aterm_types::keyboard::Key::Named(named),
             mods: aterm_types::keyboard::Modifiers::empty(),
             base_layout: None,
+            layout_text: None,
             event_type: aterm_types::keyboard::KeyEventType::Press,
         }
     }

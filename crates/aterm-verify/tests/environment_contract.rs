@@ -257,6 +257,13 @@ impl Fixture {
         self.ctx_at(&self.root)
     }
 
+    /// The release bundle the MEASURE tier is handed (`--measure <APP>`),
+    /// outside the checkout ([`common::fixture_bundle`]): the one
+    /// [`common::fixture_ctx`] attaches to a MEASURE run.
+    fn bundle(&self) -> PathBuf {
+        common::fixture_bundle(&self.base.join("release"))
+    }
+
     /// [`Self::ctx`] over another checkout of the fixture (a clone), with the
     /// fixture's own toolchain, scratch and HOME ([`common::checker_home`]).
     fn ctx_at(&self, root: &Path) -> Ctx {
@@ -531,10 +538,17 @@ fn an_edit_hidden_by_an_index_flag_is_verified_not_replaced_by_head() {
         "echo \"child: $* a=$(cat a.txt) b=$(cat b.txt) c=$(cat c.txt)\"; exit 0",
     );
     // The MEASURE tier's ladder (`--measure` follows the helper's `--fast`, and
-    // the last mode wins): its stages are three targo children and a skip, so
-    // the run is the sync, the tripwires and the bytes the children read, and
-    // none of the Fast ladder's other spawns, which this law reads no row of.
-    let (ladder, code) = gate(&repo.root, &repo.stage2, &["--measure"], &path_env());
+    // the last mode wins): its stages are one targo child (the measuring tests,
+    // handed the bundle) and a skip, so the run is the sync, the tripwires and
+    // the bytes the child reads, and none of the Fast ladder's other spawns,
+    // which this law reads no row of.
+    let bundle = repo.bundle();
+    let (ladder, code) = gate(
+        &repo.root,
+        &repo.stage2,
+        &["--measure", bundle.to_str().expect("utf-8")],
+        &path_env(),
+    );
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     assert!(
         ladder.contains(&format!("verify: source {head}+dirty ")),
@@ -971,6 +985,55 @@ fn snapshot_sync_keeps_ignored_lane_dirs() {
         assert!(stamp.starts_with("trustc-commit c1\n"), "{stamp}");
     }
     assert!(s.notes.is_empty(), "same compiler, same env: {:?}", s.notes);
+    s.finish();
+}
+
+/// ONLY THE TREE'S OWN RULES IGNORE A PATH, in the sync too. A file only the
+/// checkout's `.git/info/exclude` ignores, and an untracked `.gitignore` that
+/// ignores itself, are the caller's source (identity.rs `untracked_split`, the
+/// Trust lane's `tree_clean`), so the sync copies them in. Once the caller
+/// deletes them the resync removes the copies, which `git clean -fd` keeps —
+/// the snapshot is a worktree of the caller's repository and shares its
+/// exclude list — while the tree-ignored lane stays warm.
+#[test]
+fn what_only_the_checkouts_exclude_list_ignores_is_source_and_leaves_with_the_callers() {
+    let c = Caller::new("atv-env-exclude");
+    let exclude = c.root.join(".git/info/exclude");
+    let mut rules = fs::read_to_string(&exclude).unwrap_or_default();
+    rules.push_str("/local-notes.txt\n");
+    write(&exclude, &rules);
+    write(&c.root.join("local-notes.txt"), "notes\n");
+    write(&c.root.join("cache/.gitignore"), "*\n");
+    write(&c.root.join("cache/blob"), "residue\n");
+
+    let s = c.prepare(&[], Some("c1")).expect("snapshot");
+    let snap = s.root.clone();
+    assert_eq!(read(&snap.join("local-notes.txt")), "notes\n");
+    assert_eq!(read(&snap.join("cache/.gitignore")), "*\n");
+    for p in ["local-notes.txt", "cache/.gitignore"] {
+        assert!(s.tree.dirty.contains_key(p), "{p}: {:?}", s.tree.dirty);
+    }
+    s.finish();
+    write(&snap.join("target/debug/deps/libwarm.rlib"), "warm");
+
+    fs::remove_file(c.root.join("local-notes.txt")).expect("rm");
+    fs::remove_dir_all(c.root.join("cache")).expect("rm");
+    let s = c
+        .prepare(&[], Some("c1"))
+        .expect("resync after the caller deleted them");
+    assert!(
+        !snap.join("local-notes.txt").exists(),
+        "a stale copy stayed"
+    );
+    assert!(
+        !snap.join("cache/.gitignore").exists(),
+        "a stale rule file stayed"
+    );
+    assert!(snap.join("target/debug/deps/libwarm.rlib").exists());
+    assert_eq!(
+        s.tree,
+        TreeState::capture(&c.root, &path_env()).expect("caller")
+    );
     s.finish();
 }
 
@@ -1707,8 +1770,8 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
         }
     }
 
-    // THE BINARY, once per caller, on the MEASURE tier: its three children are
-    // the whole ladder, and what they are handed is what `main` wired, which
+    // THE BINARY, once per caller, on the MEASURE tier: its one child (the
+    // measuring tests, handed the bundle) is the whole ladder, and what they are handed is what `main` wired, which
     // is the one thing the half above cannot see. The caller's own export is
     // read from the process environment here, as a real run reads it.
     for (what, export) in callers {
@@ -1718,7 +1781,9 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-verify"));
         // Every knob is a flag (the gate reads none from the environment
         // since 2026-09-24): no windows, the fixture's own machine lock.
-        cmd.args(["--disk-floor", "0", "--measure", "--root"])
+        cmd.args(["--disk-floor", "0", "--measure"])
+            .arg(repo.bundle())
+            .arg("--root")
             .arg(&repo.root)
             .arg("--no-windows")
             .arg("--machine-lock-dir")
@@ -1759,8 +1824,7 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
 /// 9192 (commit-date 2026-09-17) and `~/.rustup/toolchains/trust`, a hand-made link
 /// to a from-source stage2 of 2026-08-20. `tools/verify.sh` and
 /// `tools/test-trust-contract-probe.sh` are held to it through the
-/// `--print-toolchain` flag each carries (`tools/release-preflight.sh`, the third
-/// shell mirror, through `tools/test-release-preflight.sh`).
+/// `--print-toolchain` flag each carries.
 struct DatedToolchains {
     base: PathBuf,
     home: PathBuf,
@@ -2097,7 +2161,9 @@ fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
 
     let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
         .args(["--disk-floor", "0"])
-        .args(["--measure", "--scope", "crate-x", "--root"])
+        .arg("--measure")
+        .arg(repo.bundle())
+        .args(["--scope", "crate-x", "--root"])
         .arg(&repo.root)
         .env("PATH", path_env())
         .arg("--no-windows")
@@ -2328,19 +2394,21 @@ fn a_verdict_that_could_not_be_written_files_no_receipt() {
     assert!(store.join(&head).exists(), "a read verdict is recorded");
 }
 
-/// A `--measure` RUN FILES ITS RECEIPT APART (2026-09-26), end to end over a
+/// A `--measure` RUN FILES ITS RECEIPT APART, UNDER THE BYTES IT JUDGED
+/// (2026-09-26; keyed by the artifact since 2026-10-09), end to end over a
 /// real git fixture. It is judged by the absolute rule and says why before
-/// any stage, runs the MEASURE tier alone, and — this fixture has no window,
-/// so the pacing smoke skips — says it did not measure the tree and why. Its
-/// receipt stands under `measure-<commit>` and `measure-tree-<tree>` saying
-/// `measured no`, and NOT under the commit or its tree, where a merge
-/// receipt (and main's list of reds) belongs. A merge-contract run after it
-/// files the commit's key and leaves the measurement standing.
+/// any stage, runs the MEASURE tier alone over the bundle it was handed, and —
+/// this fixture has no window, so the pacing smoke skips — says it did not
+/// measure and why. Its receipt stands under `measure-artifact-<sha256 of the
+/// bundle's aterm>` saying `measured no` and naming that digest, and NOT under
+/// the commit or its tree (where a merge receipt, and main's list of reds,
+/// belongs), nor under a commit- or tree-keyed measure name. A merge-contract
+/// run after it files the commit's key and leaves the measurement standing.
 #[test]
-fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
+fn a_measure_run_files_its_receipt_under_the_artifact_key_only() {
     let repo = Fixture::new("atv-env-measure");
-    // The two MEASURE children (the release build, the paint and spin run) are
-    // answered with exit 0 by any targo, and the Fast run below runs none.
+    // The one MEASURE child (the paint and spin run) is answered with exit 0 by
+    // any targo, and the Fast run below runs none.
     repo.git_init().with_bare_targo();
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
     let tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
@@ -2351,8 +2419,15 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
         Receipt::parse(&fs::read_to_string(key(k)).unwrap_or_else(|e| panic!("{k}: {e}")))
             .unwrap_or_else(|| panic!("{k} does not parse"))
     };
+    let artifact = aterm_verify::MeasureArtifact::at(&repo.bundle()).expect("the fixture's bundle");
+    let bytes = artifact.macho_sha256.clone();
+    assert_eq!(
+        bytes,
+        aterm_verify::sha256::hex(b"#!/bin/sh\nexit 0\n"),
+        "the key is the digest of the bundle's aterm, as written"
+    );
 
-    let mut ctx = repo.ctx();
+    let mut ctx = repo.ctx().with_measure_artifact(Some(artifact));
     ctx.mode = Mode::Measure;
     let (ladder, code) = repo.run(&ctx);
     assert_eq!(code, exit::PASS, "{ladder}");
@@ -2372,21 +2447,26 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
         "{ladder}"
     );
     assert!(!ladder.contains(FIRST_STAGE), "{ladder}");
-    let measured = read(&measure_key(&head));
+    let measured = read(&measure_key(&bytes));
     assert_eq!(
         (
             measured.mode.as_str(),
             measured.measured,
-            measured.merge_contract
+            measured.merge_contract,
+            measured.artifact.as_deref()
         ),
-        ("measure", Some(false), false),
+        ("measure", Some(false), false, Some(bytes.as_str())),
         "{measured:?}"
     );
-    assert_eq!(read(&measure_key(&tree_key(&tree))), measured);
-    for merge_key in [head.clone(), tree_key(&tree)] {
+    for elsewhere in [
+        head.clone(),
+        tree_key(&tree),
+        format!("measure-{head}"),
+        format!("measure-{}", tree_key(&tree)),
+    ] {
         assert!(
-            !key(&merge_key).exists(),
-            "a --measure run filed `{merge_key}`, where a merge receipt belongs"
+            !key(&elsewhere).exists(),
+            "a --measure run filed `{elsewhere}`: only the bytes it judged key it"
         );
     }
 
@@ -2397,7 +2477,7 @@ fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
     assert!(!ladder.contains("verify: MEASURE tier —"), "{ladder}");
     assert_eq!(read(&head).mode, "fast");
     assert_eq!(
-        read(&measure_key(&head)),
+        read(&measure_key(&bytes)),
         measured,
         "the merge-contract run left the measurement standing"
     );

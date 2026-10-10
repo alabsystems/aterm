@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE LEASE MIRROR'S PIN (2026-09-26).
+//! THE LEASE MIRROR'S PIN.
 //!
 //! The merge gate holds a lease on the toolchain it resolved for the whole run, and it
 //! takes it with std alone: `aterm_verify::lease` mirrors `atpkg::lease`, because

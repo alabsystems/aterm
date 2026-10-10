@@ -6,8 +6,10 @@
 
 use std::borrow::Cow;
 
+use aterm_types::text_shaping::AmbiguousWidth;
+
 use super::Terminal;
-use super::content::visible_row_bounds_to_string;
+use super::content::{TrailingBlanks, visible_row_bounds_to_string};
 
 /// Cap on the rows [`Terminal::selection_to_string`] materializes in one call.
 ///
@@ -69,13 +71,20 @@ pub(crate) fn line_text_bounded(bytes: &[u8], max_scan_bytes: usize) -> Cow<'_, 
 /// paints.
 ///
 /// [`visible_row_bounds_to_string`]: super::content::visible_row_bounds_to_string
-fn column_range_to_byte_offsets(s: &str, start_col: usize, end_col: usize) -> (usize, usize) {
+fn column_range_to_byte_offsets(
+    s: &str,
+    start_col: usize,
+    end_col: usize,
+    ambiguous: AmbiguousWidth,
+) -> (usize, usize) {
     // Grid columns, not each cluster's display width: outside emoji the grid
     // advances per character (a Devanagari conjunct spans 3 cells) and folds
     // across cluster boundaries (Sinhala `ක්‍ය` is two clusters in one cell),
-    // so a cluster is copied when any column it is drawn in is selected.
+    // so a cluster is copied when any column it is drawn in is selected. An
+    // East Asian Ambiguous character takes the cells the `ambiguous_width`
+    // policy draws it in.
     let mut range: Option<(usize, usize)> = None;
-    for g in aterm_grapheme::grid_graphemes(s) {
+    for g in aterm_grapheme::grid_graphemes_with(s, ambiguous) {
         if g.start_col > end_col {
             break;
         }
@@ -92,11 +101,16 @@ fn column_range_to_byte_offsets(s: &str, start_col: usize, end_col: usize) -> (u
 /// bounded by `max_scan_bytes` ([`MAX_SCROLLBACK_LINE_SCAN_BYTES`] in
 /// production); columns past the scanned content yield an empty string. Split
 /// from [`Terminal::get_line_text`] so the ceiling can be tested small.
+///
+/// A stored line holds exactly the cells its row had written, so
+/// [`TrailingBlanks::Written`] keeps the range as stored.
 fn scrollback_line_range_text(
     bytes: &[u8],
     start_col: u16,
     end_col: u16,
     max_scan_bytes: usize,
+    trailing: TrailingBlanks,
+    ambiguous: AmbiguousWidth,
 ) -> String {
     let scan = if bytes.len() <= max_scan_bytes {
         bytes
@@ -105,12 +119,19 @@ fn scrollback_line_range_text(
     };
     let line_lossy = String::from_utf8_lossy(scan);
     let line: &str = &line_lossy;
-    let (start_byte, end_byte) =
-        column_range_to_byte_offsets(line, usize::from(start_col), usize::from(end_col));
-    if start_byte < line.len() {
-        line[start_byte..end_byte].trim_end().to_string()
-    } else {
-        String::new()
+    let (start_byte, end_byte) = column_range_to_byte_offsets(
+        line,
+        usize::from(start_col),
+        usize::from(end_col),
+        ambiguous,
+    );
+    if start_byte >= line.len() {
+        return String::new();
+    }
+    let range = &line[start_byte..end_byte];
+    match trailing {
+        TrailingBlanks::Trim => range.trim_end().to_string(),
+        TrailingBlanks::Written => range.to_string(),
     }
 }
 
@@ -151,6 +172,16 @@ struct SelectionGeometry {
     adj_end_col: u16,
     /// `grid.cols()`; the caller has already rejected a zero-column grid.
     cols: u16,
+}
+
+/// One row of a linear selection walk, read once (see
+/// [`Terminal::push_linear_selection`]).
+struct SelectionRow<'a> {
+    /// The stored line of a history row; `None` for a live row, or a history
+    /// row that could not be read.
+    history: Option<Cow<'a, aterm_scrollback::Line>>,
+    /// Whether the row continues the one above (a soft wrap).
+    continues: bool,
 }
 
 impl Terminal {
@@ -299,6 +330,14 @@ impl Terminal {
 
     /// Walk a linear (Simple/Semantic/Lines) selection into `result`, returning
     /// `(rows_emitted, truncated)`, with one tier fetch per history row.
+    ///
+    /// Trailing blanks are trimmed where a logical line ends (a hard line break,
+    /// or the selection's last row), from the whole line: a row the next row
+    /// continues (a soft wrap) keeps every cell the program wrote, so a space it
+    /// printed in the last column joins the two words it separates, and those
+    /// kept blanks go when the line ends in blanks after all. The cell a wide
+    /// glyph leaves when it wraps early was never written, so it is not in the
+    /// row's written text either: no guess about holes is needed.
     fn push_linear_selection(
         &self,
         result: &mut String,
@@ -317,6 +356,15 @@ impl Terminal {
         } = geom;
         let mut rows_emitted = 0usize;
         let mut truncated = false;
+        // Whether a row's trailing blanks are content depends on the NEXT row's
+        // wrap bit, so the next row is read one iteration early and carried
+        // into its own: each history row is still fetched from the tier once (a
+        // fetch builds a full `Line` on the ring path, or clones one out of a
+        // decompressed block).
+        let mut lookahead: Option<SelectionRow<'_>> = None;
+        // Where the logical line now being emitted starts in `result`: its end
+        // trims back to here, never into the line before it.
+        let mut line_start = result.len();
 
         for row in first_row..=last_row {
             if rows_emitted >= max_rows || result.len() >= max_bytes {
@@ -324,27 +372,12 @@ impl Terminal {
                 break;
             }
             rows_emitted += 1;
-            // One tier fetch per history row: the line is fetched once here and
-            // both the soft-wrap bit and the text read it (a fetch builds a full
-            // `Line` on the ring path, or clones one out of a decompressed block).
-            // The text branch inlines `get_line_text`'s negative-row arm with the
-            // same column range and `MAX_SCROLLBACK_LINE_SCAN_BYTES` ceiling. Live
-            // rows (`row >= 0`) go through `get_line_text`.
-            let history_line = if row < 0 {
-                usize::try_from(-(i64::from(row)) - 1)
-                    .ok()
-                    .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
-            } else {
-                None
-            };
-            if row > first_row {
-                // Insert a newline only if this row is not a soft-wrap
-                // continuation. The bit is read through `continuation_bit`, shared
-                // with the logical-line click gestures; the fetched `history_line`
-                // is passed in to avoid a second fetch.
-                if !self.continuation_bit(row, history_line.as_deref()) {
-                    result.push('\n');
-                }
+            let current = lookahead.take().unwrap_or_else(|| self.selection_row(row));
+            // A newline only before a row that does not continue the one above
+            // (`continuation_bit`, shared with the logical-line click gestures).
+            if row > first_row && !current.continues {
+                result.push('\n');
+                line_start = result.len();
             }
 
             let start_col = if row == adj_start_row {
@@ -357,18 +390,37 @@ impl Terminal {
             } else {
                 cols - 1
             };
+            // `row < last_row` also means the range runs to the row's last
+            // column: only the end row stops short of it.
+            let trailing = if row < last_row {
+                let next = self.selection_row(row + 1);
+                let continued = next.continues;
+                lookahead = Some(next);
+                if continued {
+                    TrailingBlanks::Written
+                } else {
+                    TrailingBlanks::Trim
+                }
+            } else {
+                TrailingBlanks::Trim
+            };
 
+            // The history arm is `get_line_text`'s negative-row arm on the line
+            // already fetched, with the same `MAX_SCROLLBACK_LINE_SCAN_BYTES`
+            // ceiling.
             let line = if row < 0 {
-                history_line.as_ref().map(|stored| {
+                current.history.as_ref().map(|stored| {
                     scrollback_line_range_text(
                         stored.as_bytes(),
                         start_col,
                         end_col,
                         MAX_SCROLLBACK_LINE_SCAN_BYTES,
+                        trailing,
+                        self.ambiguous_width(),
                     )
                 })
             } else {
-                self.get_line_text(row, Some((start_col, end_col)))
+                self.line_text(row, Some((start_col, end_col)), trailing)
             };
             if let Some(line) = line {
                 if push_row_capped(result, &line, max_bytes) {
@@ -376,9 +428,31 @@ impl Terminal {
                     break;
                 }
             }
+            // The logical line ends here: trim it whole, so blanks a wrapped row
+            // kept are dropped when nothing but blanks follows them (a padded
+            // column wider than the window copies as its text, as before).
+            if trailing == TrailingBlanks::Trim {
+                let keep = line_start + result[line_start..].trim_end().len();
+                result.truncate(keep);
+            }
         }
 
         (rows_emitted, truncated)
+    }
+
+    /// Read selection-space `row` for [`Self::push_linear_selection`]: its
+    /// stored line when it is history (fetched once, here) and whether it
+    /// continues the row above.
+    fn selection_row(&self, row: i32) -> SelectionRow<'_> {
+        let history = if row < 0 {
+            usize::try_from(-(i64::from(row)) - 1)
+                .ok()
+                .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
+        } else {
+            None
+        };
+        let continues = self.continuation_bit(row, history.as_deref());
+        SelectionRow { history, continues }
     }
 
     /// Whether selection-space `row` continues the previous row's content (a
@@ -473,6 +547,7 @@ impl Terminal {
             return Some(own);
         }
         let cols = usize::from(self.grid.cols());
+        let ambiguous = self.ambiguous_width();
         // Measure each part, not the accumulating buffer: `byte_to_column` is
         // linear in its input, so measuring the join per row would be quadratic.
         let rows = usize::try_from(last.saturating_sub(first))
@@ -484,7 +559,7 @@ impl Terminal {
             if r > first {
                 part = self.get_line_text(r, None).unwrap_or_default();
             }
-            let width = crate::grapheme::byte_to_column(&part, part.len());
+            let width = aterm_grapheme::byte_to_column_with(&part, part.len(), ambiguous);
             text.push_str(&part);
             if r < last {
                 for _ in width..cols {
@@ -521,6 +596,7 @@ impl Terminal {
             return Some((own, first, last));
         }
         let cols = usize::from(self.grid.cols());
+        let ambiguous = self.ambiguous_width();
         let mut text = String::new();
         for r in first..=last {
             let part = if r == row {
@@ -528,7 +604,7 @@ impl Terminal {
             } else {
                 self.get_line_text(r, None).unwrap_or_default()
             };
-            let width = crate::grapheme::byte_to_column(&part, part.len());
+            let width = aterm_grapheme::byte_to_column_with(&part, part.len(), ambiguous);
             text.push_str(&part);
             if r < last {
                 for _ in width..cols {
@@ -539,13 +615,43 @@ impl Terminal {
         Some((text, first, last))
     }
 
-    /// Get text from a line (visible or scrollback).
+    /// Get text from a line (visible or scrollback), trailing blanks trimmed.
     ///
     /// `row` is terminal-relative and scroll-invariant: `0..rows` are the live
     /// screen rows (the renderer paints a selection at `viewport_row -
     /// display_offset`), negative rows are scrollback (`-1` = newest history
     /// line). `col_range` is inclusive; `None` extracts the whole line.
     pub fn get_line_text(&self, row: i32, col_range: Option<(u16, u16)>) -> Option<String> {
+        self.line_text(row, col_range, TrailingBlanks::Trim)
+    }
+
+    /// The text a row holds as written, trailing blanks included: every cell a
+    /// live row's program wrote (up to `Row::len`), and a history row's stored
+    /// line whole (bounded by [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]), which is what
+    /// that row held when it scrolled off. `None` when `row` addresses no line.
+    ///
+    /// One extractor for both, so a row reads the same on the screen and in
+    /// history: what search indexes, and what a `$`-anchored or space-ended
+    /// query sees, does not change when output scrolls the row off the screen.
+    #[must_use]
+    pub fn written_line_text(&self, row: i32) -> Option<String> {
+        if row < 0 {
+            let rev_idx = usize::try_from(-(i64::from(row)) - 1).ok()?;
+            let line = self.grid.history_line_rev(rev_idx)?;
+            return Some(
+                line_text_bounded(line.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned(),
+            );
+        }
+        self.line_text(row, None, TrailingBlanks::Written)
+    }
+
+    /// [`Self::get_line_text`] with the trailing-blank rule chosen.
+    fn line_text(
+        &self,
+        row: i32,
+        col_range: Option<(u16, u16)>,
+        trailing: TrailingBlanks,
+    ) -> Option<String> {
         let visible_rows = i32::from(self.grid.rows());
 
         if row >= 0 && row < visible_rows {
@@ -557,7 +663,7 @@ impl Terminal {
             }
             let (start_col, end_col) = col_range.unwrap_or((0, cols.saturating_sub(1)));
             Some(visible_row_bounds_to_string(
-                &self.grid, row_idx, start_col, end_col,
+                &self.grid, row_idx, start_col, end_col, trailing,
             ))
         } else if row < 0 {
             // Scrollback row: history_line_rev covers the ring buffer and tiered
@@ -577,6 +683,8 @@ impl Terminal {
                     start_col,
                     end_col,
                     MAX_SCROLLBACK_LINE_SCAN_BYTES,
+                    trailing,
+                    self.ambiguous_width(),
                 ));
             }
             None
@@ -588,7 +696,7 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::column_range_to_byte_offsets;
+    use super::{AmbiguousWidth, column_range_to_byte_offsets};
 
     /// The copy is correct and every selected history row is fetched from the
     /// tier exactly once: `take_row_to_line_ops` counts `Line` constructions
@@ -656,6 +764,188 @@ mod tests {
         );
     }
 
+    /// Select rows `first..=last` whole, as a drag over them does, and copy.
+    fn copy_rows(term: &mut crate::terminal::Terminal, first: i32, last: i32) -> Option<String> {
+        use crate::selection::{SelectionSide, SelectionType};
+        let cols = term.cols();
+        let sel = term.text_selection_mut();
+        sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(last, cols - 1, SelectionSide::Right);
+        sel.complete_selection();
+        term.selection_to_string()
+    }
+
+    /// A space the program printed in a wrapped row's last column separates two
+    /// words, so the copy keeps it at the join: on screen, from history, and for
+    /// a triple-click's line selection. A row that ends its line still loses
+    /// its trailing blanks.
+    #[test]
+    fn copy_keeps_a_space_printed_in_a_wrapped_rows_last_column() {
+        use crate::selection::{SelectionSide, SelectionType};
+        let mut term = crate::terminal::Terminal::new(4, 10);
+        // The space lands in column 9 and `jklmn` soft-wraps onto row 1.
+        term.process(b"abcdefghi jklmn\r\npad   ");
+        assert_eq!(term.get_line_text(0, None).as_deref(), Some("abcdefghi"));
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(
+            copy_rows(&mut term, 0, 2).as_deref(),
+            Some("abcdefghi jklmn\npad"),
+            "drag over the wrapped line and the next"
+        );
+
+        let (first, last) = term.logical_line_span(0);
+        let sel = term.text_selection_mut();
+        sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Lines);
+        sel.update_selection(last, 9, SelectionSide::Right);
+        sel.complete_selection();
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("abcdefghi jklmn"),
+            "triple-click's line selection"
+        );
+
+        term.process(b"\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(term.get_line_text(-3, None).as_deref(), Some("abcdefghi"));
+        assert_eq!(
+            copy_rows(&mut term, -3, -1).as_deref(),
+            Some("abcdefghi jklmn\npad"),
+            "the same rows copied from history"
+        );
+    }
+
+    /// The same at 80 columns, where dropping the space would fuse a command's
+    /// two arguments, and in prose wrapped mid-sentence.
+    #[test]
+    fn copy_keeps_wrap_boundary_spaces_in_prose_and_commands() {
+        let cmd = "cp ./build/output/release/artifacts/aterm-universal-apple-darwin.tar.zstxxxxxxx \
+                   /Volumes/backup/";
+        assert_eq!(
+            cmd.find(" /"),
+            Some(79),
+            "the space lands in the last column"
+        );
+        let mut term = crate::terminal::Terminal::new(4, 80);
+        term.process(cmd.as_bytes());
+        assert_eq!(copy_rows(&mut term, 0, 1).as_deref(), Some(cmd));
+
+        let mut term = crate::terminal::Terminal::new(4, 10);
+        term.process(b"aaaa bbbb cccc dddd");
+        assert_eq!(
+            copy_rows(&mut term, 0, 1).as_deref(),
+            Some("aaaa bbbb cccc dddd")
+        );
+    }
+
+    /// A line that ends in blanks across a wrap is trimmed whole, as it was
+    /// before wrapped rows kept their blanks: `printf 'foo%12s'` in 10 columns
+    /// (a padded column wider than the window) copies as `foo`, by drag, by
+    /// triple-click and from history, and a line of nothing but blanks copies
+    /// as an empty line.
+    #[test]
+    fn copy_trims_a_line_that_ends_in_blanks_across_a_wrap() {
+        use crate::selection::{SelectionSide, SelectionType};
+        let mut term = crate::terminal::Terminal::new(4, 10);
+        term.process(format!("foo{:12}\r\nnext", "").as_bytes());
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(
+            copy_rows(&mut term, 0, 2).as_deref(),
+            Some("foo\nnext"),
+            "drag"
+        );
+
+        let (first, last) = term.logical_line_span(0);
+        let sel = term.text_selection_mut();
+        sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Lines);
+        sel.update_selection(last, 9, SelectionSide::Right);
+        sel.complete_selection();
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("foo"),
+            "triple-click"
+        );
+
+        term.process(b"\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(
+            copy_rows(&mut term, -3, -1).as_deref(),
+            Some("foo\nnext"),
+            "from history"
+        );
+
+        let mut term = crate::terminal::Terminal::new(4, 10);
+        term.process(format!("a\r\n{:15}\r\nb", "").as_bytes());
+        assert_eq!(
+            copy_rows(&mut term, 0, 3).as_deref(),
+            Some("a\n\nb"),
+            "a blank line"
+        );
+    }
+
+    /// The cell a wide glyph leaves when it wraps early was never written, so
+    /// the copy keeps no blank for it: the program wrote `x中中中中中y`.
+    #[test]
+    fn copy_adds_no_blank_for_a_wide_glyphs_early_wrap() {
+        let mut term = crate::terminal::Terminal::new(4, 10);
+        term.process("x中中中中中y\r\n".as_bytes());
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(
+            copy_rows(&mut term, 0, 1).as_deref(),
+            Some("x中中中中中y"),
+            "on screen"
+        );
+        term.process(b"1\r\n2\r\n3\r\n");
+        assert_eq!(
+            copy_rows(&mut term, -2, -1).as_deref(),
+            Some("x中中中中中y"),
+            "from history"
+        );
+    }
+
+    /// With `ambiguous_width = "wide"` a scrollback copy of the cells a line's
+    /// `foo` is drawn in (4-6, after two two-cell arrows) copies `foo`, as the
+    /// same cells copy on the screen.
+    #[test]
+    fn a_scrollback_copy_measures_ambiguous_characters_as_the_grid_draws_them() {
+        use crate::selection::{SelectionSide, SelectionType};
+        let mut term = crate::terminal::Terminal::new(4, 20);
+        term.apply_config(&crate::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        term.process("→→foo bar\r\n".as_bytes());
+        let copy = |term: &mut crate::terminal::Terminal, row: i32| {
+            let sel = term.text_selection_mut();
+            sel.start_selection(row, 4, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(row, 6, SelectionSide::Right);
+            sel.complete_selection();
+            term.selection_to_string()
+        };
+        let smart = crate::selection::SmartSelection::with_builtin_rules();
+        assert_eq!(copy(&mut term, 0).as_deref(), Some("foo"), "on screen");
+        assert_eq!(
+            term.smart_word_at(0, 5, &smart),
+            Some((4, 7)),
+            "the word under cell 5 on screen"
+        );
+        term.process(b"1\r\n2\r\n3\r\n4");
+        assert_eq!(term.get_line_text(-1, None).as_deref(), Some("→→foo bar"));
+        assert_eq!(copy(&mut term, -1).as_deref(), Some("foo"), "from history");
+        let sel = term.text_selection_mut();
+        sel.start_selection(-1, 4, SelectionSide::Left, SelectionType::Block);
+        sel.update_selection(-1, 6, SelectionSide::Right);
+        sel.complete_selection();
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("foo"),
+            "a block copy from history"
+        );
+        term.scroll_display(1);
+        assert_eq!(
+            term.smart_word_at(0, 5, &smart),
+            Some((4, 7)),
+            "the word under cell 5 scrolled back"
+        );
+    }
+
     #[test]
     fn column_range_to_byte_offsets_rows() {
         // (text, start col, end col inclusive, expected substring). An empty
@@ -675,7 +965,8 @@ mod tests {
             ("", 0, 5, ""),
         ];
         for (text, start_col, end_col, want) in rows {
-            let (s, e) = column_range_to_byte_offsets(text, start_col, end_col);
+            let (s, e) =
+                column_range_to_byte_offsets(text, start_col, end_col, AmbiguousWidth::Single);
             assert_eq!(&text[s..e], want, "{text:?} cols {start_col}..={end_col}");
             if want.is_empty() {
                 assert_eq!((s, e), (text.len(), text.len()), "{text:?}");
@@ -815,32 +1106,49 @@ mod tests {
 
     #[test]
     fn scrollback_line_range_text_bounds_scan_to_ceiling() {
-        use super::scrollback_line_range_text;
+        use super::{AmbiguousWidth, TrailingBlanks, scrollback_line_range_text};
         // 2000 single-byte, single-width columns; ceiling of 100 bytes.
         let bytes = vec![b'A'; 2000];
 
         // In-range within the ceiling: cols 0..9 → 10 'A's.
-        assert_eq!(scrollback_line_range_text(&bytes, 0, 9, 100).len(), 10);
+        let read = |start, end, ceiling| {
+            scrollback_line_range_text(
+                &bytes,
+                start,
+                end,
+                ceiling,
+                TrailingBlanks::Trim,
+                AmbiguousWidth::Single,
+            )
+        };
+        assert_eq!(read(0, 9, 100).len(), 10);
 
         // Columns past the 100-byte ceiling are not materialized, so empty.
         assert!(
-            scrollback_line_range_text(&bytes, 500, 509, 100).is_empty(),
+            read(500, 509, 100).is_empty(),
             "columns past the scan ceiling must not be materialized"
         );
 
         // With a ceiling above the requested column, the same request is reachable
         // — proving the emptiness above is the ceiling, not a logic bug.
-        assert_eq!(scrollback_line_range_text(&bytes, 500, 509, 4096).len(), 10);
+        assert_eq!(read(500, 509, 4096).len(), 10);
     }
 
     #[test]
     fn scrollback_line_range_text_lossy_prefix_is_bounded() {
-        use super::scrollback_line_range_text;
+        use super::{AmbiguousWidth, TrailingBlanks, scrollback_line_range_text};
         // Invalid UTF-8 forces the lossy path; a >ceiling line must still only touch
         // a bounded prefix (no panic, bounded output).
         let mut bytes = vec![0xFFu8; 4096]; // invalid UTF-8, 4096 bytes
         bytes.extend_from_slice(b"tail");
-        let out = scrollback_line_range_text(&bytes, 0, 3, 64);
+        let out = scrollback_line_range_text(
+            &bytes,
+            0,
+            3,
+            64,
+            TrailingBlanks::Trim,
+            AmbiguousWidth::Single,
+        );
         // 64-byte prefix of 0xFF → up to 64 U+FFFD (3 bytes each); cols 0..3 → 4.
         assert!(out.chars().count() <= 4, "bounded to the requested columns");
         assert!(

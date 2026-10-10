@@ -4,16 +4,8 @@
 
 use std::sync::Arc;
 
+use super::lettered;
 use crate::{CellCoord, Grid};
-
-/// Letter column 0 of every row of `grid` (`A`, `B`, …).
-fn lettered(mut grid: Grid) -> Grid {
-    for row in 0..grid.rows() {
-        grid.set_cursor(row, 0);
-        grid.write_char((b'A' + row as u8) as char);
-    }
-    grid
-}
 
 /// Link column 0 of `row` to `url`; returns the url for later comparison.
 fn link(grid: &mut Grid, row: u16, url: &str) -> Arc<str> {

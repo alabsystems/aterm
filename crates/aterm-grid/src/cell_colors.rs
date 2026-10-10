@@ -54,7 +54,7 @@ impl PackedColors {
     /// Create with both indexed colors.
     #[must_use]
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn with_indexed(fg_index: u8, bg_index: u8) -> Self {
         Self(
             (Self::MODE_INDEXED << Self::FG_MODE_SHIFT)
@@ -186,7 +186,7 @@ impl PackedColors {
     /// Set background to default.
     #[must_use]
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub const fn set_bg_default(self) -> Self {
         Self(self.0 & !(Self::MODE_MASK << Self::BG_MODE_SHIFT))
     }

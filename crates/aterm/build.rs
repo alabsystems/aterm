@@ -22,11 +22,13 @@
 // consequence (`aterm_winres::Outcome` has no silent variant), and
 // `ATERM_REQUIRE_WIN_RESOURCES=1` makes it a hard error for release cutters.
 //
-// THE PER-COMMIT STAMP is this script's other job, on every target:
-// `mod build_stamp` below emits the commit, build number and build time `src/main.rs`
-// installs into the window library — stamped here, in the binary crate, so a
-// commit recompiles this crate rather than all of aterm-gui. It emits only
-// `rustc-env` values, never a link arg.
+// THE BUILD FACTS are this script's other job, on every target: `mod build_stamp`
+// below emits the commit, build number and build time, and `mod compiler` the
+// compiler provenance, profile and verification state, that `src/main.rs`'s
+// `BUILD_STAMP` compiles in and installs at startup (`aterm_types::version`).
+// Stamped here, in the binary crate, so a commit or a compiler change recompiles
+// this crate rather than the libraries. It emits only `rustc-env` values, never
+// a link arg.
 //
 // Off Windows the resource half returns at once: no .rc, no resource compiler,
 // and NO link arg — a macOS or Linux binary is byte-identical to one built
@@ -72,6 +74,7 @@ const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
     build_stamp::emit();
+    compiler::emit();
 
     // Build scripts run on the HOST, so `cfg!(windows)` here answers "what am I
     // running on", not "what am I building for" — wrong for either direction of
@@ -172,10 +175,8 @@ fn report(why: &str) {
 /// crate inherits — so the strings Explorer and Task Manager show cannot drift
 /// from the crate version, ever.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
-    // AUTHORIZED direct read of cargo's version env (allowlisted by
-    // aterm-types' `shipped_crates_cannot_bypass_the_shared_app_version`):
-    // a build script cannot link aterm_types, and these vars are the same
-    // workspace `version` that APP_VERSION itself is derived from — one
+    // This crate is the one reader of `CARGO_PKG_VERSION*`: these are the same
+    // workspace `version` `src/main.rs`'s `BUILD_STAMP` compiles in — one
     // ground truth, read at the only time a build script can read it.
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
@@ -286,11 +287,22 @@ fn env_num(key: &str) -> u16 {
         .unwrap_or(0)
 }
 
-// THE STAMP — the binary's PER-COMMIT provenance, stamped into THIS crate as
-// compile-time env vars. `src/main.rs` hands them to the window library first
-// thing (`aterm_gui::install_build_stamp(aterm_gui::build_stamp!())`), and every
-// surface reads them from there (`aterm-gui/src/build_info.rs`: the About panel,
-// `aterm ctl version`, the menu signature, the handoff identity):
+/// Run `cmd args…`, its trimmed stdout when it succeeded with some, else `None`.
+fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+// THE STAMP — the binary's build facts, stamped into THIS crate as compile-time
+// env vars. `src/main.rs` compiles them into ONE `BUILD_STAMP` and installs it
+// first thing (`aterm_types::version::install`), and every surface reads them
+// from there (`aterm-gui/src/build_info.rs`: the About panel, `aterm ctl
+// version`, the menu signature, the handoff identity; `app_version()` everywhere
+// else). `mod build_stamp` emits the per-commit half:
 //
 //   ATERM_GIT_COMMIT      short commit the binary was built from (+ "-dirty" when the
 //                         working tree had uncommitted changes); "unknown" w/o git.
@@ -303,7 +315,9 @@ fn env_num(key: &str) -> u16 {
 //                         else HEAD's committer Unix epoch (dev builds); "0" only w/o git.
 //   ATERM_BUILD_TIME      UTC build timestamp (RFC3339), or "unknown".
 //
-// WHY HERE AND NOT IN aterm-gui's build script: every value above moves with every
+// and `mod compiler` the rest (see there).
+//
+// WHY HERE AND NOT IN A LIBRARY'S build script: every value above moves with every
 // commit, and a build script's `rustc-env` reaches every unit of its package.
 // Stamped in aterm-gui, an empty commit recompiled all of aterm-gui (measured 185 s
 // incremental); here it recompiles only this crate's own units.
@@ -311,23 +325,14 @@ fn env_num(key: &str) -> u16 {
 // All probes are best-effort: a missing `git`/`date` degrades to "unknown" rather
 // than failing the build (so a source tarball without a .git still compiles).
 mod build_stamp {
+    use super::run;
     use std::path::PathBuf;
-    use std::process::Command;
 
     /// A build fact supplied by the caller instead of probed from git. Empty is
     /// treated as absent, so `FOO=` cannot half-pin a build.
     fn pinned(key: &str) -> Option<String> {
         println!("cargo:rerun-if-env-changed={key}");
         std::env::var(key).ok().filter(|v| !v.trim().is_empty())
-    }
-
-    fn run(cmd: &str, args: &[&str]) -> Option<String> {
-        let out = Command::new(cmd).args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
     }
 
     /// Emit the stamp and the `rerun-if` directives that keep it current.
@@ -515,5 +520,165 @@ mod build_stamp {
         paths.sort();
         paths.dedup();
         paths
+    }
+}
+
+// COMPILER provenance (which compiler produced this binary — matters because a
+// machine can carry both upstream Rust and the Trust toolchain's trustc, and
+// different machines carry DIFFERENT trust builds), parsed from `$RUSTC -vV` by
+// src/compiler_probe.rs (include!d below so the same parser is unit-tested under
+// the test suite; RUSTC is the env name cargo AND targo hand build scripts):
+//
+//   ATERM_COMPILER_VERSION_LINE  full first line of `$RUSTC -vV`
+//   ATERM_COMPILER_COMMIT        the compiler's full git commit hash
+//   ATERM_COMPILER_HOST          the compiler's host triple
+//   ATERM_COMPILER_TRUST_VERSION Trust's OWN version (the `trust:` -vV line), "" if none
+//   ATERM_COMPILER_FLAVOR        'r' (upstream Rust) | 't' (Trust: trustc)
+//   ATERM_BUILD_PROFILE          cargo PROFILE ("debug"/"release")
+//   ATERM_TRUST_VERIFY           "on" iff the Trust verification pipeline was in
+//                                this compile, else "off"
+//
+// All probes are best-effort: a missing compiler answer degrades to "unknown"
+// rather than failing the build.
+mod compiler {
+    use super::run;
+
+    // Shared with the test suite: `src/main.rs` mounts the same file as a
+    // #[cfg(test)] module, so the -vV parser and the flavor classifier are tested
+    // against real fixtures while this script uses the identical code.
+    include!("src/compiler_probe.rs");
+
+    /// Emit the compiler, profile and verification facts.
+    pub fn emit() {
+        // Interrogate the ACTUAL compiler the build driver is about to use (cargo
+        // and targo both set RUSTC for build scripts — targo's custom_build lane
+        // keeps the env name for drop-in compatibility; bare "rustc" is the
+        // no-driver fallback) rather than trusting whatever is first on PATH —
+        // per-binary provenance is the whole point when upstream Rust and the
+        // Trust toolchain (trustc) coexist on one machine.
+        let compiler_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+        let vv = run(&compiler_path, &["-vV"]).unwrap_or_default();
+        let compiler = parse_rustc_vv(&vv);
+        // Flavor ('r' = upstream Rust, 't' = Trust fork), in priority order:
+        //   1. the -vV self-identification ('binary: trustc' / '(trustc)' version
+        //      line — the 2026-07 toolchains stamp both; covers the lane where a
+        //      bare PATH-resolved `rustc` sets no env hint at all);
+        //   2. RUSTC path containing '/trust/' (the fork lives in $HOME/trust/build/...);
+        //   3. RUSTUP_TOOLCHAIN == 'trust' (a linked `rustup run trust` lane);
+        //   4. default 'r'.
+        // NOT inferred from '-dev' in the release — any local rustc build reports
+        // -dev. There is NO env override: an ATERM_COMPILER_FLAVOR that outranked
+        // the compiler's own self-report let a shell claim trustc provenance for a
+        // binary upstream rustc built, in the one field About and `ctl version`
+        // ship AS evidence. The three signals above cover every lane it was added
+        // for.
+        let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+        let flavor = detect_flavor(&vv, &compiler_path, toolchain.as_deref());
+        println!(
+            "cargo:rustc-env=ATERM_COMPILER_VERSION_LINE={}",
+            compiler.version_line
+        );
+        println!("cargo:rustc-env=ATERM_COMPILER_COMMIT={}", compiler.commit);
+        println!("cargo:rustc-env=ATERM_COMPILER_HOST={}", compiler.host);
+        // Trust's OWN version (the `trust:` -vV line, e.g. 0.1.0) — "" when the
+        // compiler reports none. Distinct from the rustc-shaped release token in
+        // the version line, which is the Rust release Trust is compatible with.
+        println!(
+            "cargo:rustc-env=ATERM_COMPILER_TRUST_VERSION={}",
+            compiler.trust_version
+        );
+        println!("cargo:rustc-env=ATERM_COMPILER_FLAVOR={flavor}");
+        println!(
+            "cargo:rustc-env=ATERM_BUILD_PROFILE={}",
+            std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
+        );
+        // Whether the Trust verification pipeline was really in this compile, for
+        // About and `aterm ctl version`. See `trust_verify_state` — the `--print
+        // cfg` probe alone answers this WRONG on a Trust toolchain.
+        println!(
+            "cargo:rustc-env=ATERM_TRUST_VERIFY={}",
+            trust_verify_state()
+        );
+        println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+        println!("cargo:rerun-if-env-changed=RUSTC");
+        println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
+    }
+
+    /// `"on"` iff this compile really runs the Trust verification pipeline.
+    ///
+    /// `CARGO_CFG_TRUST_VERIFY` alone is NOT the answer, and trusting it shipped a
+    /// false provenance line for months. Cargo derives every `CARGO_CFG_*` from a
+    /// `rustc --print cfg` probe, and targo deliberately strips the `-Ztrust-verify`
+    /// family from that probe — so on a Trust toolchain the cfg reports the
+    /// compiler's DEFAULT (verification on) while every real unit is compiled with
+    /// `-Ztrust-verify=off` by the `targo --unverified` lane (until 2026-10-07 by
+    /// `.cargo/config.toml`, which carries none now). Printing that as "on" claims
+    /// a hardening the binary does not carry, which is exactly what the honesty
+    /// ratchet forbids. The lane's switch reaches this script in
+    /// `CARGO_ENCODED_RUSTFLAGS` (measured 2026-10-07 on seal 321aaeda7, for
+    /// `targo --unverified` and for a compat `cargo` given the cfg-scoped
+    /// `--config` switch alike).
+    ///
+    /// So the rustflags cargo will actually pass to rustc win over the probe, and
+    /// the probe is only the fallback for the case it does answer correctly: no
+    /// explicit flag at all (a stock-Rust build, where the cfg is simply unset).
+    ///
+    /// Both spellings of the off-switch are recognised — `-Ztrust-verify=off` is
+    /// current, `-Zno-trust-verify=yes` is the retired one — and both the joined
+    /// (`-Ztrust-verify=off`) and split (`-Z` `trust-verify=off`) argument forms,
+    /// since a rustflags list may carry either.
+    fn trust_verify_state() -> &'static str {
+        fn from_value(flag: &str) -> Option<&'static str> {
+            if let Some(v) = flag.strip_prefix("trust-verify=") {
+                return Some(if v.eq_ignore_ascii_case("off") {
+                    "off"
+                } else {
+                    "on"
+                });
+            }
+            if let Some(v) = flag.strip_prefix("no-trust-verify=") {
+                return Some(if v.eq_ignore_ascii_case("yes") {
+                    "off"
+                } else {
+                    "on"
+                });
+            }
+            None
+        }
+
+        if let Some(encoded) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+            let encoded = encoded.to_string_lossy().into_owned();
+            // CARGO_ENCODED_RUSTFLAGS is 0x1f-separated (cargo's documented encoding).
+            let flags: Vec<&str> = encoded
+                .split('\u{1f}')
+                .filter(|flag| !flag.is_empty())
+                .collect();
+            let mut expect_z_value = false;
+            for flag in flags {
+                if expect_z_value {
+                    expect_z_value = false;
+                    if let Some(state) = from_value(flag) {
+                        return state;
+                    }
+                    continue;
+                }
+                if flag == "-Z" {
+                    expect_z_value = true;
+                    continue;
+                }
+                if let Some(rest) = flag.strip_prefix("-Z")
+                    && let Some(state) = from_value(rest)
+                {
+                    return state;
+                }
+            }
+        }
+
+        // No explicit flag: the cfg probe is authoritative (and on stock Rust, unset).
+        if std::env::var_os("CARGO_CFG_TRUST_VERIFY").is_some() {
+            "on"
+        } else {
+            "off"
+        }
     }
 }

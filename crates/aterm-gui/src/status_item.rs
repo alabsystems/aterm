@@ -191,8 +191,8 @@ pub(crate) struct SessionRow {
     /// relaunches at all (`[harness] relaunch`, read live), the session's
     /// kept snapshot is one the relaunch would plan
     /// ([`crate::harness_host::HostHandle::relaunching`]), the claim on it
-    /// is the host's OWN, and nobody else's hand is on it — the stall row's
-    /// predicate ([`crate::input_stall::host_relaunches`]), computed once in
+    /// is the host's OWN, and nobody else's hand is on it
+    /// ([`crate::input_stall::host_hand_refusal`]), computed once in
     /// `App::status_session_row`. Only then does a memory wall's row say
     /// [`SUPERVISED_MEMORY`]; otherwise it names the remedy with
     /// [`Self::resume`].
@@ -539,15 +539,16 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     let body_for = |what: &str| tab_body(&row.title, what);
     if let Some(stall) = &row.input_stall {
         // The whole remedy, never clipped to a row's `<kind> <command>`
-        // budget: `signal term` and what follows it — the tab's own resume
+        // budget: the restart and what follows it — the tab's own resume
         // line, or the host's word that it relaunches the agent itself (U1) —
         // sit at its end. That tail is the server attention's own
         // (`input_stall::attention_text`, from `input_stall::after_restart`):
-        // one composition, so the row and `meta attention=` say the same, and
-        // a session some OTHER supervisor holds (`drive watch`, which
-        // relaunches nothing), a held one, or one whose launch the relaunch
-        // would refuse, is never told the harness will relaunch it
-        // (`input_stall::host_relaunches`, resume-hint review 2026-09-26).
+        // one composition over one publication, so the row and `meta
+        // attention=` say the same, and a session some OTHER supervisor holds
+        // (`drive watch`, which relaunches nothing), a held one, or one whose
+        // launch the relaunch would refuse, is never told the harness will
+        // relaunch it (the publication's `act`, `restart_act::offered`;
+        // resume-hint review 2026-09-26).
         let body = body_for(&fold_clip(&stall.text, STALL_TEXT_MAX));
         return Some(Escalation {
             session: row.id,
@@ -2677,6 +2678,7 @@ mod tests {
             stopped: false,
             rss_mb: Some(39_731),
             restart: crate::input_stall::Restart::default(),
+            act: None,
         }
     }
 
@@ -2695,10 +2697,20 @@ mod tests {
             attention: Some("answer this box: 4. Chat about this".into()),
             ..agent_row(3, "\u{2733} worker", "wall:unresponsive", 9)
         };
-        // The window's host supervises it under `[harness] relaunch`: the
-        // server's own line says the host relaunches it (U1).
+        // The window's host would carry the explicit restart (the
+        // publication's `act`): the server's own line names it, and says the
+        // host relaunches it (U1).
         worker.input_stall = Some(stall_row(
-            &fact,
+            &crate::input_stall::InputStallFact {
+                act: Some(crate::input_stall::StallAct {
+                    cmd: aterm_agent::harness::resume::restart_command(
+                        Some("s-b7cf523445a1b0d8658e"),
+                        None,
+                    ),
+                    promised: true,
+                }),
+                ..fact.clone()
+            },
             Some("claude"),
             &AfterRestart::Relaunch,
             Some("14:02"),
@@ -2711,9 +2723,9 @@ mod tests {
         assert_eq!(
             esc.label,
             "\u{26a0} worker: claude is frozen: not reading input since 14:02 (1 B queued, rss \
-             38.8 GB) \u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term; aterm \
-             relaunches it on its conversation",
-            "hosted: the resume is the harness's (U1)"
+             38.8 GB) \u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e restart if-stalled; \
+             aterm relaunches it on its conversation",
+            "hosted: the explicit restart, and the relaunch is the harness's (U1)"
         );
         // Unhosted — or held by another supervisor, which relaunches
         // nothing: the resume is the person's, on THIS tab's conversation.

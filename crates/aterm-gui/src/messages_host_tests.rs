@@ -1750,6 +1750,10 @@ fn the_route_words_are_the_consent_cards_caption() {
         privacy_pane("full-disk-access"),
         Some(crate::menu::PrivacyPane::FullDiskAccess)
     );
+    assert_eq!(
+        privacy_pane(crate::message_reporters::PANE_SPOTLIGHT_SEARCH_PRIVACY),
+        Some(crate::menu::PrivacyPane::SpotlightSearchPrivacy)
+    );
     assert_eq!(privacy_pane("camera"), None);
 }
 
@@ -2031,7 +2035,7 @@ fn a_routine_pass_raises_no_row_and_records_every_outcome() {
         false,
     ));
     app.post_managed_current("claude 2.1.280 (Anthropic latest); codex 0.156.0 (OpenAI latest)");
-    app.post_machine_settings("spotlight-noindex 73 dir(s) migrated; universal-control disabled");
+    app.post_machine_settings("universal-control disabled");
     app.record_message(toolchain_words::deferred(
         "an earlier toolchain pass is still running",
     ));
@@ -2051,11 +2055,6 @@ fn a_routine_pass_raises_no_row_and_records_every_outcome() {
         (
             "Claude Code 2.1.280 and Codex 0.156.0 are current",
             "ready in every aterm tab",
-            "ok",
-        ),
-        (
-            "Spotlight now skips 73 build folders",
-            "renamed with a .noindex suffix; cargo still builds there",
             "ok",
         ),
         (
@@ -4681,10 +4680,16 @@ fn the_commit_wake_merges_the_parents_record_before_it_mints() {
 /// the process. The flush's own behaviour is the test above; this pins
 /// where it runs: last in what the claim answers, after the video answer
 /// (`App::answer_at_commit_claim`), and again, one fence grain at most,
-/// in a held claim's pass for what its fence recorded (round eight, #18).
+/// at the write, for what a held claim's fence recorded (round eight, #18)
+/// and for the rows the park's carry did not take, closed there (ruling 441
+/// (d)) after the admission's last reading, so a held pass it refuses keeps
+/// its rows, and their endings are in the file the successor reads. Where
+/// the close runs is `a_commit_whose_answers_took_time_holds_its_claim_through_the_fence`;
+/// what it closes is `uncarried_messages_tests`.
 #[test]
 fn the_seamless_parent_flushes_its_record_right_before_commit() {
     let src = include_str!("app_update_handoff.rs");
+    let close = "let closed = self.close_uncarried_messages();";
     let answers = src
         .find("    fn answer_at_commit_claim(")
         .expect("what the claim answers");
@@ -4697,15 +4702,33 @@ fn the_seamless_parent_flushes_its_record_right_before_commit() {
         .find("self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);")
         .expect("and flushes the message log");
     assert!(video < flush, "after the video answer");
+    assert!(
+        !body.contains("close_uncarried_messages("),
+        "the claim closes no row: a held claim's admission is read again"
+    );
     let records = |text: &str| text.contains("record_message(") || text.contains("post_message(");
     assert!(!records(&body[flush..]), "nothing records after it there");
     let answered = src
         .find("let answered_in = self.answer_at_commit_claim(child_pid);")
         .expect("the ProofReady arm runs it");
+    let held_pass = answered
+        + src[answered..]
+            .find("self.finish_proven_handoff(crate::UpdateHandoffCompletion {")
+            .expect("a held claim goes to its next pass");
+    let write = held_pass
+        + src[held_pass..]
+            .find("if claim\n            && admitted\n            && let (Some(commit_fd), Some(proof))")
+            .expect("the write, after the admission's last reading");
+    let held_close = answered
+        + src[answered..]
+            .find(close)
+            .expect("the write closes the uncarried rows");
     let held_flush = answered
         + src[answered..]
             .find("self.flush_messages_log_within(HANDOFF_INPUT_DRAIN_YIELD);")
-            .expect("a held claim flushes what its fence recorded");
+            .expect("and flushes what they and a held claim's fence recorded");
+    assert!(write < held_close, "only at the write");
+    assert!(held_close < held_flush, "before its flush");
     let commit = answered
         + src[answered..]
             .find("crate::seamless::commit_and_exit(commit_fd, proof)")
@@ -4790,6 +4813,53 @@ fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
             .live_rows()
             .any(|l| l.msg.title == "a config warning"),
         "a row about something else still crosses"
+    );
+}
+
+#[cfg(unix)]
+/// AN INTENT ONLY THE OLD PROCESS COULD PERFORM DOES NOT CROSS (ruling 265 /
+/// 417 (j), 441 (w)): the keeper's recovery row carried across a seamless
+/// update lands in a successor that reattached no shells itself
+/// (`keeper_recovered` is empty), where `End sessions` would end nothing and
+/// the page would say the running sessions "had already ended". The row
+/// keeps its words; a successor that did reattach keeps the press.
+#[test]
+fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
+    let mut parent = App::headless_for_test();
+    let id = parent.post_message(crate::message_reporters::keeper_recovered_message(
+        2, 0, None, None,
+    ));
+    let _ = parent
+        .settle_messages(Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10));
+    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    assert!(
+        carry.messages.iter().any(|m| m.id == id.raw()),
+        "premise: the recovery row crosses"
+    );
+    let offers_end = |app: &App| {
+        app.messages
+            .live(id)
+            .map(|l| l.msg.actions.contains(&Intent::EndRecovered))
+    };
+    let mut successor = App::headless_for_test();
+    successor.seed_carried_messages(&carry, Some("9.9.9"));
+    successor.messages.after_handoff_commit(Instant::now());
+    assert!(
+        successor.keeper_recovered.is_empty(),
+        "premise: the successor reattached nothing itself"
+    );
+    assert_eq!(
+        offers_end(&successor),
+        Some(false),
+        "the carried row stands without `End sessions`"
+    );
+    let mut reattached = App::headless_for_test();
+    reattached.keeper_recovered = vec![4242];
+    reattached.seed_carried_messages(&carry, Some("9.9.9"));
+    assert_eq!(
+        offers_end(&reattached),
+        Some(true),
+        "a process that reattached shells still offers to end them"
     );
 }
 
@@ -7115,7 +7185,8 @@ fn a_harness_note_is_recorded_and_never_takes_a_row() {
 
 /// AN UNCHANGED MANAGED-CURRENT MARKER IS RECORDED ONCE; NEWS IS RECORDED
 /// AGAIN (design ruling 58): atpkg prints it every pass, and the shared ring
-/// is for news — a moved version, or a frozen tab counted, is new words.
+/// is for news — a moved version is a new record, and a frozen tab counted
+/// re-words the record already written, in place (audit 2026-10-09).
 #[test]
 fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
     let mut app = App::headless_for_test();
@@ -7170,6 +7241,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         ),
         "a frozen tab counted is new words"
     );
+    assert_eq!(managed(&app), 2, "said in place: no new record");
     assert!(
         !app.post_managed_current(""),
         "an empty body records nothing"

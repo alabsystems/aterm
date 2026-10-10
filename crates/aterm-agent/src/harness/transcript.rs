@@ -83,6 +83,10 @@ const QUOTA_LIMITS: Shape = Shape::Object(&[
 ]);
 const CONVERSATION: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
+    // `null` on a conversation's first row: the supervisor's wall check
+    // reads a first prompt written after the rows that answer it
+    // (`supervise/wall_confirm.rs`).
+    ("parentUuid", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
@@ -167,7 +171,7 @@ pub(super) fn command(line: &str) -> aterm_json::Result<Value> {
 
 /// The upgrade/task readers additionally need text blocks and the vendor's
 /// own error/limit metadata, but never tool arguments, images, or results.
-pub(super) fn conversation(line: &str) -> aterm_json::Result<Value> {
+pub(crate) fn conversation(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Conversation>(line).map(|v| v.0)
 }
 

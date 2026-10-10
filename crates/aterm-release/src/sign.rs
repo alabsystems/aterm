@@ -1235,7 +1235,9 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
             );
             run_checked(
                 Command::new(DITTO)
-                    .args(["-c", "-k", "--keepParent"])
+                    .args(["-c", "-k"])
+                    .args(crate::dmg::ARCHIVE_NO_METADATA)
+                    .arg("--keepParent")
                     .arg(artifact)
                     .arg(&zip),
                 "ditto notarize zip",

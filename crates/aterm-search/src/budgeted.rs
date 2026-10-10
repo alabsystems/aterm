@@ -48,6 +48,8 @@
 
 use std::borrow::Cow;
 
+use aterm_types::text_shaping::AmbiguousWidth;
+
 use crate::grapheme::ColumnMap;
 use crate::index::{
     CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
@@ -105,6 +107,9 @@ pub struct BudgetedSearch {
     /// Final one-shot-compatible watermark, known from the deterministic
     /// eviction schedule before feeding begins. Zero means no eviction.
     final_lowest_retained_line: usize,
+    /// The terminal's `ambiguous_width` policy match columns are measured
+    /// under, as the batch index's.
+    ambiguous_width: AmbiguousWidth,
 }
 
 impl BudgetedSearch {
@@ -163,7 +168,17 @@ impl BudgetedSearch {
             rows_fed: 0,
             verify_from,
             final_lowest_retained_line,
+            ambiguous_width: AmbiguousWidth::Single,
         })
+    }
+
+    /// Measure match columns under the terminal's `ambiguous_width` policy, as
+    /// [`SearchIndex::set_ambiguous_width`] does for the batch path. Set it
+    /// before feeding rows.
+    #[must_use]
+    pub fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
+        self.ambiguous_width = ambiguous;
+        self
     }
 
     /// Consume and verify ONE row. Rows must be fed in ascending window order;
@@ -332,7 +347,7 @@ impl BudgetedSearch {
         if self.query.is_empty() && !matches!(&self.matcher, RowMatcher::Regex(_)) {
             return;
         }
-        let col_map = ColumnMap::new(text);
+        let col_map = ColumnMap::new(text, self.ambiguous_width);
         match &mut self.matcher {
             RowMatcher::Literal => {
                 // Use the batch forward iterator's own per-row verifier.

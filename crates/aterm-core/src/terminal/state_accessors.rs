@@ -8,6 +8,7 @@ use super::{
     CurrentStyle, Cursor, CursorStyle, KittyKeyboardFlags, MAX_TITLE_BYTES, Terminal,
     XtermKeyboardState,
 };
+use crate::grid::ResizePolicy;
 use aterm_types::PipelineTimestamps;
 use std::sync::Arc;
 
@@ -65,6 +66,91 @@ impl Terminal {
         self.vi.motion_with_grid(&self.grid, motion, boundary);
     }
 
+    /// Keep the vi cursor on its text after a batch moved rows, then clamp it
+    /// onto the grid.
+    ///
+    /// A vi line is counted from the live screen's top. `lines` is the rise of
+    /// the grid's absolute row counter (the count that re-pins a scrolled-back
+    /// viewport): output that scrolled the whole screen pushed every line that
+    /// many lines up. History grows only by such scrolls and by a region at the
+    /// top scrolling into it, both counted by the rise, so a line already in
+    /// history always moves up by the whole rise.
+    ///
+    /// `bands` is the batch's row-band record when it explains every row the
+    /// batch moved (`post_process`). A cursor on the screen then rides only the
+    /// moves its row was in, replayed in order:
+    ///
+    /// * a region at the top of a screen with history (`top == 0`, the counter
+    ///   rising): its rows and all of history go up and its top rows enter
+    ///   history, while the fixed rows below it stay (Codex's composer, apt's
+    ///   progress bar);
+    /// * any other band (an interior region, IL/DL, a reverse index, a top
+    ///   region with no history): its rows move, a cursor whose row left the
+    ///   band rests on the edge it left through, as Alacritty's does, and
+    ///   every line outside it stays.
+    ///
+    /// A row that entered history is among the batch's `lines` newest history
+    /// lines, so the replay stops there. Only a batch that also took rows off
+    /// the top of such a region without archiving them (DL at row 0) could
+    /// carry it further: the band record composes the two moves into one.
+    ///
+    /// The clamp runs on every batch, so a batch that cleared history (ED 3)
+    /// leaves no cursor below the oldest line. A cursor whose text left history
+    /// rests on the oldest line kept, which at display offset 0 can be above
+    /// the viewport: aterm's cursor follows its text out of a live viewport on
+    /// purpose. Alacritty's `scroll_up_relative` instead stops it at the
+    /// viewport's top, on text that is not its own.
+    pub(super) fn vi_follow_output(&mut self, lines: u64, bands: Option<aterm_grid::RowBandMoves>) {
+        if !self.vi_is_active() {
+            return;
+        }
+        let rise = i32::try_from(lines).unwrap_or(i32::MAX);
+        let before = self.vi.cursor_point().line;
+        let after = match bands {
+            Some(bands) if before >= 0 => bands
+                .as_slice()
+                .iter()
+                .fold(before, |line, band| {
+                    let (top, bottom) = (i32::from(band.top), i32::from(band.bottom));
+                    let moved = line.saturating_add(i32::from(band.delta));
+                    if top == 0 && band.delta < 0 && rise > 0 {
+                        // Archival: history and the region go up, the region's top
+                        // rows into history; the rows below it stay.
+                        if line <= bottom { moved } else { line }
+                    } else if (top..=bottom).contains(&line) {
+                        // A row moved out of the band is gone: rest on its edge.
+                        moved.clamp(top, bottom)
+                    } else {
+                        line
+                    }
+                })
+                .max(rise.saturating_neg()),
+            _ => before.saturating_sub(rise),
+        };
+        self.vi_shift(after.saturating_sub(before));
+    }
+
+    /// Move the vi cursor `delta` lines and clamp it onto the grid: its line
+    /// into `-history..=rows - 1`, its column into the width. While an
+    /// offloaded reflow holds the history (a window's width change), no
+    /// history is in memory to clamp against: the line keeps its floor until
+    /// [`Self::finish_resize_offload`] or [`Self::abort_resize_offload`]
+    /// clamps it — clamped then, a width change in copy mode put a cursor in
+    /// history on live line 0.
+    pub(super) fn vi_shift(&mut self, delta: i32) {
+        if !self.vi_is_active() {
+            return;
+        }
+        let topmost = if self.grid.reflow_offload_in_flight() {
+            i32::MIN
+        } else {
+            aterm_types::BufferAccess::total_lines(&self.grid).saturating_neg()
+        };
+        let bottommost = i32::from(self.grid.rows()).saturating_sub(1);
+        let last_col = self.grid.cols().saturating_sub(1);
+        self.vi.scroll(topmost, bottommost, last_col, delta);
+    }
+
     /// Execute a vi mode inline character search (f/F/t/T).
     ///
     /// Split-borrows `grid` (read) and `vi` (write).
@@ -103,6 +189,36 @@ impl Terminal {
     /// `reset()`/RIS like the `allow_*` bits.
     pub fn set_kitty_keyboard_enabled(&mut self, enabled: bool) {
         self.modes.kitty_keyboard_enabled = enabled;
+        self.refresh_mode_mirror();
+    }
+
+    /// Declare whether this session sits behind a Windows console host
+    /// (ConPTY), whose `CSI ? 9001 h` asks for win32-input-mode key records
+    /// (default off). Only then does DEC 9001 take effect; anywhere else it is
+    /// program output and is ignored, so a file that writes it cannot turn the
+    /// person's Escape and Enter chords into records no console host reads.
+    /// Host policy: preserved across `reset()`/RIS like the kitty capability.
+    pub fn set_win32_input_enabled(&mut self, enabled: bool) {
+        self.modes.win32_input_enabled = enabled;
+        self.refresh_mode_mirror();
+    }
+
+    /// Set the keyboard capabilities a console host decides, from the fact
+    /// that also picks the session's resize seam policy, so the two cannot
+    /// disagree. Behind a Windows console host ([`ResizePolicy::ConPty`]),
+    /// conhost's DEC 9001 is honored
+    /// ([`set_win32_input_enabled`](Self::set_win32_input_enabled)) and the
+    /// kitty protocol is off
+    /// ([`set_kitty_keyboard_enabled`](Self::set_kitty_keyboard_enabled)):
+    /// conhost cannot turn CSI-u reports into the key records a console
+    /// program reads. Any other session gets the reverse. It sets both bits
+    /// whichever way they stood, so a checkpoint that carried another host's
+    /// bits does not outlive it. A live session and every replay of one
+    /// (`cast drift`) call this with the policy they resize under.
+    pub fn set_console_host_posture(&mut self, policy: ResizePolicy) {
+        let console_host = policy == ResizePolicy::ConPty;
+        self.modes.win32_input_enabled = console_host;
+        self.modes.kitty_keyboard_enabled = !console_host;
         self.refresh_mode_mirror();
     }
 

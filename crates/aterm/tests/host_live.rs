@@ -1806,7 +1806,12 @@ fn one_supervisor_per_session() {
             "ttl=120000",
         ],
     );
-    run_fake(&inst, "k1", &["read.txt"]);
+    // The box, then a screen held for [`HOLD_S`]: the fake outlives the host's
+    // answer, so the claim the last look reads is still held. A fake that exits
+    // on the answer lets the host release its claim within a poll, and a look
+    // taken a second later on a loaded machine read `supervisor=-` (seen in the
+    // merge gate, 2026-10-09: the badge was gone 151 ms after the exit).
+    run_fake(&inst, "k1", &["read.txt", "worked.hold"]);
     program_is(&inst, "claude", HANG);
     // Start the lease being tested only after Claude is observably running.
     ctl_ok(

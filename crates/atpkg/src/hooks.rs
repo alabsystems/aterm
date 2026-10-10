@@ -3461,7 +3461,10 @@ mod tests {
             let _server = Server(tmux.clone(), socket.clone());
             let pane = "bash --noprofile --norc -c '. \"$ATPKG_TEST_HOOK\"; \
                         printf \"PATH=%s\\n\" \"$PATH\" > \"$ATPKG_TEST_OUT\"'";
-            let mut command = std::process::Command::new(&tmux);
+            // `spawnfd`'s: the tmux server this starts holds nothing of this
+            // process but what tmux keeps of its stdio — not another test
+            // thread's pipe for as long as the server lives.
+            let mut command = aterm_uds::spawnfd::command(&tmux);
             command
                 .args([
                     "-L",

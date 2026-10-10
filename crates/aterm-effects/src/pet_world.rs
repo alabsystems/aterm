@@ -874,6 +874,40 @@ impl PetWorld {
         self.clearance_in(&self.protected_prefix, Forgive::AnyCaret, rect, margin)
     }
 
+    /// [`Self::under_text_clearance_past_caret`] over what this map SEES of
+    /// `rect`, for a body that was already on glass before this map judged
+    /// it (a crossfade ghost on the surface that replaced its own):
+    ///
+    /// * `Some(false)`: a cell this map covers under it is protected, or the
+    ///   query is degenerate — however much of it lies outside the coverage
+    ///   window;
+    /// * `Some(true)`: it lies wholly inside the coverage window and nothing
+    ///   there is protected;
+    /// * `None`: the part this map covers, if any, is clear, and the rest is
+    ///   outside the window. Unknown is not evidence, and the caller keeps the
+    ///   verdict the body came with; but a protected cell the map can see
+    ///   always is.
+    #[must_use]
+    pub fn seen_under_text_clearance_past_caret(&self, rect: PetRect) -> Option<bool> {
+        self.stamp?;
+        let whole = self.under_text_clearance_past_caret(rect, 0.0);
+        if whole.is_some() {
+            return whole;
+        }
+        let cov = self.coverage;
+        let (r0, c0) = (rect.row.max(cov.row as f32), rect.col.max(cov.col as f32));
+        let r1 = (rect.row + rect.rows).min((cov.row + cov.rows) as f32);
+        let c1 = (rect.col + rect.cols).min((cov.col + cov.cols) as f32);
+        if !(r0 < r1 && c0 < c1) {
+            return None;
+        }
+        let seen = PetRect::new(r0, c0, r1 - r0, c1 - c0);
+        match self.under_text_clearance_past_caret(seen, 0.0) {
+            Some(false) => Some(false),
+            _ => None,
+        }
+    }
+
     /// Z-ORDER, three-valued: is the rectangle free of anything painted in
     /// the text layer, so a body there may be drawn IN FRONT of it? Every
     /// non-`Clear` cell counts except the live caret's keep-off ring. `None`
@@ -1487,6 +1521,54 @@ mod tests {
             Some(false)
         );
         assert_eq!(world.clearance(inside, f32::INFINITY), Some(false));
+    }
+
+    /// What the map sees of a body straddling its coverage window still
+    /// judges it: unknown cells are not evidence, a protected cell the map
+    /// covers is (`seen_under_text_clearance_past_caret`).
+    #[test]
+    fn a_protected_cell_the_map_sees_vetoes_a_body_half_outside_it() {
+        let mut term = Terminal::new(100, 300);
+        // A double-width row on pane row 36, the window's first.
+        term.process(b"\x1b[37;1H\x1b#6\x1b[100;300H");
+        let world = observe(&mut term);
+        assert_eq!(world.coverage().row, 36);
+        let half = PetRect::new(35.0, 60.0, 2.0, 5.0);
+        assert_eq!(world.under_text_clearance_past_caret(half, 0.0), None);
+        assert_eq!(
+            world.seen_under_text_clearance_past_caret(half),
+            Some(false),
+            "the seen half stands on a protected row"
+        );
+        let inside = PetRect::new(97.0, 60.0, 2.0, 5.0);
+        assert_eq!(
+            world.seen_under_text_clearance_past_caret(inside),
+            Some(true),
+            "fixture: inside the window and clear"
+        );
+        let mut plain = Terminal::new(100, 300);
+        plain.process(b"\x1b[100;300H");
+        let plain = observe(&mut plain);
+        assert_eq!(
+            plain.seen_under_text_clearance_past_caret(half),
+            None,
+            "the seen half is clear and the rest is unseen"
+        );
+        assert_eq!(
+            plain.seen_under_text_clearance_past_caret(PetRect::new(0.0, 0.0, 2.0, 5.0)),
+            None,
+            "wholly unseen"
+        );
+        assert_eq!(
+            plain.seen_under_text_clearance_past_caret(PetRect::new(f32::NAN, 0.0, 2.0, 5.0)),
+            Some(false),
+            "degenerate is a refusal"
+        );
+        assert_eq!(
+            PetWorld::default().seen_under_text_clearance_past_caret(inside),
+            None,
+            "a map that saw nothing"
+        );
     }
 
     /// The caret protects its own cells from placement but not visibility, and

@@ -2,10 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 //! Sparkle / ignition / cursor-cat / rainbow-kitty effect models, plus the
-//! generalized error-class trio — spec-model data constructors moved verbatim
-//! out of the one-file catalog in `derive.rs`
-//! (pure code motion; every constructor keeps its `crate::derive` path via the
-//! `pub use` re-exports there).
+//! generalized error-class trio. Each constructor keeps its `crate::derive`
+//! path via the `pub use` re-exports in `derive.rs`.
 
 use super::*;
 
@@ -431,9 +429,9 @@ pub fn sparkle_reflow_cardinality_model() -> Model {
 ///
 /// Each completed, continuity-tainted `kitty` token is a new intentional
 /// episode and must arm once. The healthy transition closes the replaced
-/// episode without installing/inheriting a redraw done mark. `Buggy = 1`
-/// reproduces the former ordering: the first retype arms but its outgoing old
-/// episode writes a mark, so the second retype is born-done and inert.
+/// episode without installing/inheriting a redraw done mark. `Buggy = 1`:
+/// the first retype arms but its outgoing old episode writes a mark, so the
+/// second retype is born-done and inert.
 ///
 /// Tier-1 binding:
 /// `word_decorations::tests::two_consecutive_recent_kitty_retypes_both_arm`
@@ -467,8 +465,8 @@ pub fn sparkle_retype_rearm_model() -> Model {
 /// from a full map, admits a freshly observed replacement, then offers the old
 /// episode back for grace. The healthy implementation treats the final offer
 /// as an LRU union and departs one episode, so cardinality remains at `Cap`.
-/// `Buggy = 1` reproduces the former raw grace `insert`: the old episode is
-/// reinserted after the fresh slot refills, reaching `Cap + 1`.
+/// `Buggy = 1` is a raw grace `insert`: the old episode is reinserted after
+/// the fresh slot refills, reaching `Cap + 1`.
 ///
 /// Tier-1 binding:
 /// `word_decorations::tests::persist_cap_drops_unmatched_grace_after_fresh_move`
@@ -1716,7 +1714,7 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///   ribbon, a starved one pays nothing and stays dark, and retiring a stale
 ///   stamp never refunds cells to fund a second stray sweep (`credit_refunded`).
 /// * A press is IN FLIGHT until its row echoes or an observed edge forgets it
-///   (2026-09-12, the stall): with no stamp fresh, two or more unpaid presses
+///   (the stall): with no stamp fresh, two or more unpaid presses
 ///   license the row's late echo as one batch (`InFlightBatchEchoMintsLight`),
 ///   and ONE unpaid press licenses exactly its own one-cell echo
 ///   (`InFlightPressEchoMintsLight`, the stalled last key) — spent on
@@ -1772,7 +1770,7 @@ pub fn cursor_hint_license_model() -> Model {
             // Moves that passed the licence seam (one per consumed arm).
             var admissions = 0;
             // The press CREDIT budget (`RainbowState::type_press_ring`).
-            // THE IN-FLIGHT LAW (2026-09-12, the stall): the unpaid pool is
+            // THE IN-FLIGHT LAW (the stall): the unpaid pool is
             // `credit_arms - spent - forfeited` — presses whose glyphs have
             // not been laid AND that no observed edge has forgotten. A
             // press is in flight until its row echoes (spent, by the cells
@@ -1801,7 +1799,7 @@ pub fn cursor_hint_license_model() -> Model {
             var swallow_admitted = 0;
             var wiped = 0;
             var credit_refunded = 0;
-            // THE DELIVERED INSERT (2026-09-10, "the image insert breaks the
+            // THE DELIVERED INSERT ("the image insert breaks the
             // rainbow"): a paste's write is QUEUED on the session FIFO and
             // lands later on the writer thread. `write_pending` is that
             // queued write; `insert_hint` is the insert's own licence slot
@@ -1983,7 +1981,7 @@ pub fn cursor_hint_license_model() -> Model {
             // stamp live after consuming it, so one press funds every echo that
             // follows — caught twice over, by the disposition conservation and
             // by `admissions <= arms`. The echo SPENDS the credit its cell
-            // lays (the 2026-09-10 law, `lays_typed_cells`: every same-row
+            // lays (`lays_typed_cells`: every same-row
             // forward typed echo spends), so the pool after an on-time echo
             // is what the real ring holds — empty.
             action LicensedTypedMoveMintsLight when (
@@ -2021,7 +2019,7 @@ pub fn cursor_hint_license_model() -> Model {
             // vim's `w` is one press echoing as a multi-cell hop. It stays dark
             // and pays nothing; the ring names `no-credits`. `Buggy=1` bills the
             // budget it could not afford AND tells `ctl trail` it painted.
-            // A `no-credits` refusal is an UNEXPLAINED HOP too (2026-09-12):
+            // A `no-credits` refusal is an UNEXPLAINED HOP too:
             // whatever the pool held did not describe this move, and it is
             // forgotten with the refusal.
             action StarvedCoalesceDeclines when (
@@ -2046,8 +2044,7 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // THE IN-FLIGHT BATCH (2026-09-12, the stall — the owner's "I t"
-            // screenshot): no stamp is fresh (absent, or stale in place — the
+            // THE IN-FLIGHT BATCH (the stall): no stamp is fresh (absent, or stale in place — the
             // row stayed silent past the window), and the LEDGER licenses the
             // echo: at least two unpaid presses whose glyphs have not been
             // laid. The batch spends them. The stale stamps are NOT consumed
@@ -2068,7 +2065,7 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
             }
-            // THE ONE-PRESS ECHO (2026-09-12, the stalled last key): no stamp
+            // THE ONE-PRESS ECHO (the stalled last key): no stamp
             // is fresh and exactly ONE press is unpaid — its own +1 echo is
             // licensed and the press is SPENT: one press, one cell, once.
             // `Buggy=1` does not spend, so the same press funds a second +1
@@ -2086,7 +2083,7 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
             }
-            // AN UNEXPLAINED HOP FORGETS THE CREDITS (2026-09-12): a keyless
+            // AN UNEXPLAINED HOP FORGETS THE CREDITS: a keyless
             // move the echo shape refuses — backward, cross-row, a row change
             // no key licensed, a forward hop the share rule refused. The
             // presses in flight did not describe it, so they are forgotten
@@ -2217,7 +2214,7 @@ pub fn cursor_hint_license_model() -> Model {
             invariant ASwallowedKeyNeverLicences: swallow_admitted == 0;
             invariant DeclinedMovesNeverDestroyEarnedLight: wiped == 0;
             invariant SpentCreditsNeverComeBack: credit_refunded == 0;
-            // THE IN-FLIGHT LAW'S TWO CLAIMS (2026-09-12): a press an
+            // THE IN-FLIGHT LAW'S TWO CLAIMS: a press an
             // unexplained hop forgot never licenses a later batch, and the
             // pool such a hop leaves behind is empty until the next press.
             // Each is falsified alone by the mutant that keeps the credits
@@ -2265,7 +2262,7 @@ pub fn cursor_hint_license_model() -> Model {
 }
 
 /// THE ECHO LEDGER'S LAW (`docs/design/RAINBOW-KITTY-V2.md`, "The late echo's
-/// one-press case", 2026-09-10): the rainbow-kitty v2 engine banks every
+/// one-press case"): the rainbow-kitty v2 engine banks every
 /// typed press and lets a LICENSED typed move pay a hole the seam refused —
 /// the cells between the engine's mirror and the move's `from` — out of the
 /// presses that could have produced it, one press one cell, and nothing else
@@ -2276,8 +2273,8 @@ pub fn cursor_hint_license_model() -> Model {
 /// `older` (presses banked before that key, whose glyphs lie in the hole),
 /// `younger` (the key and the presses still in flight behind it, whose glyphs
 /// lie at and past `from`), `stale` (presses past `ECHO_PATIENCE_S` — the
-/// host's in-flight patience `IN_FLIGHT_PATIENCE_S` by alias since 2026-09-12
-/// — which the next move drops as swallowed). `hole` is the caret's unlicensed advance
+/// host's in-flight patience `IN_FLIGHT_PATIENCE_S` by alias — which the next
+/// move drops as swallowed). `hole` is the caret's unlicensed advance
 /// since the mirror — a late echo the seam refused, or program output; the
 /// engine cannot tell which, and that is the whole point: only the ledger can.
 ///
@@ -2350,7 +2347,7 @@ pub fn echo_ledger_bridge_model() -> Model {
             // Presses one bounded run banks.
             const BankCap = 4;
             // Cells of the unswept echo the host licensed on its credits but
-            // did not sweep (the two-cell shape of the 2026-09-10 report).
+            // did not sweep (the reported two-cell shape).
             const Batch = 2;
 
             // The ledger, partitioned by the licensing key.
@@ -2899,9 +2896,9 @@ pub fn composed_sync_hold_model() -> Model {
 /// update (`DirtyReopenHoldsUntilClose`). The opposite, older error is an
 /// ALTERNATIVE hold rule, not a second half of the same one, so `Buggy = 1`
 /// picks it per trace (`PickLevelHold` sets `level_fault`, which `Buggy = 0`
-/// pins to zero): the LEVEL-sampled hold `bc73adcdd` retired, which reads a
-/// close+reopen as one endless episode and holds the clean reopen and the dirty
-/// episode alike, so the completed boundary never presents and a flooding TUI
+/// pins to zero): a LEVEL-sampled hold, which reads a close+reopen as one
+/// endless episode and holds the clean reopen and the dirty episode alike, so
+/// the completed boundary never presents and a flooding TUI
 /// pins presents to the sync timeout (`CleanReopenMayPresentCompletedBoundary`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -3044,11 +3041,10 @@ pub fn cursor_effect_scroll_model() -> Model {
 /// proof. `AltUniform` must make the same exact translation: changing active
 /// screen invalidates independently, but an in-screen full-grid shift is not
 /// ambiguous. Region, reset and in-place restore events must instead choose
-/// invalidation and drop all geometry/proof. `Buggy=1` is the former
-/// GUI policy: infer motion from the unchanged retained count and preserve the
-/// stranded effect state.
+/// invalidation and drop all geometry/proof. `Buggy=1` infers motion from the
+/// unchanged retained count and preserves the stranded effect state.
 ///
-/// `RegionBandMove` (event 6) is the THIRD answer, added 2026-09-10 for the
+/// `RegionBandMove` (event 6) is the THIRD answer, for the
 /// inline viewports Codex and friends stream through: the epoch still steps —
 /// `band_batches` counts it as a SUBSET, so every consumer that cannot
 /// translate bands still reads "discard" — but the whole row motion of that
@@ -3056,8 +3052,8 @@ pub fn cursor_effect_scroll_model() -> Model {
 /// DOWN by `Delta` (`survivor_y == StartY + Delta`: a region scroll down, the
 /// reverse index a streamed transcript line writes) and keeps its geometry
 /// alive. Row-bound PROOF still dies: the rows inside the band hold different
-/// content than the bytes that proof was measured against. `Buggy=1` is the
-/// pre-2026-09-10 policy for this event — `decision = 2` and every mark
+/// content than the bytes that proof was measured against. `Buggy=1` is
+/// `decision = 2` for this event and every mark
 /// destroyed, the per-line reset the owner reported as "the rainbow
 /// disappears".
 #[must_use]

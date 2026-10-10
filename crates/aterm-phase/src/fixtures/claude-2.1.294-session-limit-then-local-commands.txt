@@ -1,0 +1,29 @@
+# claude-code 2.1.294 · MEASURED 2026-10-08 (H6-HARNESS-1 pass 5), `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake OAuth token in place of the `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a REAL session limit (the stub's 429 rejecting the five-hour window) standing, the harness off, then a person's /usage, /login dismissed with Esc, and /model left with Esc: the limit's banner over the footer, the local commands' rows under its notice
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ a turn at the session limit
+  ⎿  You've hit your session limit · resets 5:11pm (America/Los_Angeles)
+
+⏺ Usage limit reached · continuing automatically at 5:11pm · esc to cancel
+
+✻ Cogitated for 0s · done 3:11 PM
+
+❯ /usage
+  ⎿  Settings dialog dismissed
+
+❯ /login
+  ⎿  Login interrupted
+
+❯ /model
+  ⎿  Kept model as Sonnet 5.5 (default)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 5:11pm
+    Continuing automatically at 5:11pm · esc to cancel
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                                 0 tokens
+                                                                                                                            ◐ medium · /effort

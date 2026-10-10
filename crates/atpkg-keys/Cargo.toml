@@ -62,6 +62,10 @@ aterm-tempfile = { workspace = true }
 # The real terminal the setup/join tests run the binary on (tests/pty.rs): both ends
 # close-on-exec from birth, and a `/dev/ptmx` open that lost the kernel's race redriven.
 aterm-pty = { workspace = true }
+# The strip that child installs first (`spawnfd::InheritNothing`, tests/pty.rs): it
+# holds its terminal and pipes and nothing else of the test process. Already in the dev
+# graph through aterm-pty and atpkg.
+aterm-uds = { workspace = true }
 
 [lints]
 workspace = true

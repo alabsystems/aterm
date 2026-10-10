@@ -96,10 +96,16 @@ pub struct TerminalModes {
     /// When enabled, terminal emulates VT52 with simpler escape sequences.
     /// Enter with CSI ? 2 l, exit with ESC <.
     pub vt52_mode: bool,
-    /// Grapheme cluster mode (mode 2027).
-    /// When enabled, cursor movement is by grapheme cluster, not codepoint.
-    /// Needed for correct handling of emoji and combining characters.
-    /// See: <https://gitlab.freedesktop.org/terminal-wg/specifications/-/issues/23>
+    /// Grapheme cluster mode (mode 2027,
+    /// <https://github.com/contour-terminal/terminal-unicode-core>). The mode
+    /// changes how text is segmented into cells, never cursor motion ("cursor
+    /// movement semantics of the terminal remain unchanged").
+    ///
+    /// aterm-core never sets it and reads it nowhere: its print path does not
+    /// put each UAX #29 cluster in one cell, so DECRQM answers `?2027` with 4
+    /// (permanently reset) and `CSI ? 2027 h` is ignored. The field keeps the
+    /// serialized modes the same shape across builds; a checkpoint an older
+    /// build wrote may still carry `true`, which changes nothing.
     pub grapheme_cluster_mode: bool,
     /// VT conformance level (DECSCL).
     /// Tracks which VT terminal level (VT100-VT520) the terminal emulates.
@@ -160,10 +166,22 @@ pub struct TerminalModes {
     /// Everything else stays legacy VT; conhost accepts the mixed stream.
     /// Reported by DECRQM, carried by XTSAVE/XTRESTORE, cleared by RIS like
     /// every other negotiated mode. Never reaches an application: it is a
-    /// negotiation with the console host, not a kitty flag. Default `false`;
-    /// a Unix PTY never sets it, so Unix encoding is byte-identical.
+    /// negotiation with the console host, not a kitty flag. Default `false`.
+    /// Honored only while [`Self::win32_input_enabled`] says a console host is
+    /// there ([`Self::win32_input_active`]), so a Unix PTY's encoding is
+    /// byte-identical whatever its programs write.
     #[cfg_attr(feature = "serde", serde(default))]
     pub win32_input_mode: bool,
+    /// Host capability: this session sits behind a Windows console host
+    /// (ConPTY), so DEC 9001 is a request from it. Set only by the embedder
+    /// (`Terminal::set_win32_input_enabled`) and preserved across
+    /// `Terminal::reset()`/RIS, like [`Self::kitty_keyboard_enabled`]. While it
+    /// is off, `CSI ? 9001 h` is program output and changes nothing: a file
+    /// that writes it would otherwise turn the person's Escape and Enter chords
+    /// into key records for whatever reads the tab next, and make an orphaned
+    /// alternate screen leave the conhost way. Default `false`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub win32_input_enabled: bool,
     /// DEC private mode 2048: in-band size reports. When set, the terminal emits
     /// `CSI 48 ; rows ; cols ; pixH ; pixW t` on enable and on every resize, so
     /// apps (neovim 0.10+) learn the geometry without an ioctl. Off by default.
@@ -369,6 +387,17 @@ impl TerminalModes {
     #[inline]
     pub const fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether a console host stands between this terminal and the program
+    /// and has asked for win32-input-mode: the host says one is there
+    /// ([`Self::win32_input_enabled`]) and it set DEC 9001
+    /// ([`Self::win32_input_mode`]). Both are needed, so a stale mode a
+    /// checkpoint carried is inert without the host's capability.
+    #[must_use]
+    #[inline]
+    pub const fn win32_input_active(&self) -> bool {
+        self.win32_input_enabled && self.win32_input_mode
     }
 
     /// Whether synchronized output mode is enabled.

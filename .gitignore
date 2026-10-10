@@ -60,11 +60,12 @@ target-trust
 # it leaving a `target-tippy` symlink untracked. Nothing tracked starts with
 # `target` at the root.
 /target-*
-# …and the Spotlight-excluded `target.noindex` a root `target` symlink points
-# at, until 2026-10-02 ignored only by a checkout's own `.git/info/exclude`,
-# which the Trust lane's clean test no longer reads (tools/trust-gate-all.sh
-# `tree_clean`: only the tree's rules ignore a path). No trailing slash, as above.
-/target.noindex
+# Folders a retired pass made (it renamed a cargo target dir, at any depth, to
+# `<dir>.noindex` behind a `<dir>` link, which the unanchored `target` rule above
+# already ignores) are left on disk. The rule is kept for them, tracked because the
+# Trust lane's clean test (tools/trust-gate-all.sh `tree_clean`) and the merge gate's
+# clean-tree judge read only tracked .gitignore files. No trailing slash, as above.
+target.noindex
 
 # The merge gate's snapshot lock and trash (crates/aterm-verify).
 /.aterm-verify/
@@ -100,9 +101,11 @@ release.conf
 *.ed25519.priv
 
 # Python bytecode from the art rigs (art/**/*.py are authoring tools, not
-# shipped code — their caches are pure build residue).
+# shipped code — their caches are pure build residue), and pytest's cache,
+# whose own `.gitignore` ignores itself, which the clean-tree judges refuse.
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # REGISTERED LINKED WORKTREES OF THIS REPO, parked inside the superproject's own
 # working directory. `.fabric-wt/a1a2` is a live `git worktree` checkout (its
@@ -120,8 +123,8 @@ __pycache__/
 # 871,344 — 81% — are that checkout's own `target/`.
 #
 # Nothing in the tree reads this path — `git grep fabric-wt` over all tracked
-# content matches only this rule, and no script under `tools/` or `scripts/`
-# names it — so ignoring it hides no tracked or trackable input.
+# content matches only this rule, and no script under `tools/` names it — so
+# ignoring it hides no tracked or trackable input.
 /.fabric-wt/
 
 # `ty`'s result cache (`.ty/cache.json`), written into the working directory of

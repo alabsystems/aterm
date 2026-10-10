@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The menagerie's zh/ja/ko (+ friends) contract (2026-08-10). Owner verbatim:
-//! "these need to work for Chinese and Korean and Japanese and other asian
-//! languages." Four laws under test:
+//! The menagerie's CJK/Thai contract. Four laws under test:
 //!
 //! 1. Multi-character CJK animal compounds load PLAIN — they match on the
 //!    DEFAULT builtin (`languages = ["en"]`), inside running CJK text, with
-//!    default scan options. No opt-in required: that silence was the bug.
+//!    default scan options. No opt-in required.
 //! 2. Single-character forms (象 / 馬 / 새 / 곰 …) ride the class-agnostic
 //!    `cjk_single_char` opt-in: silent without it, species-correct with it.
 //! 3. Finite prefix bombs are suppressed via exceptions.toml (カメラ never
@@ -38,8 +36,8 @@ fn gate_on() -> ScanOptions<'static> {
     }
 }
 
-/// The owner's own repro word, in all three languages, inside running text,
-/// on the DEFAULT builtin: the turkey peeks.
+/// The turkey, in all three languages, inside running text, on the DEFAULT
+/// builtin.
 #[test]
 fn turkey_speaks_chinese_japanese_and_korean() {
     let lex = Lexicon::builtin();
@@ -106,9 +104,8 @@ fn single_char_animal_forms_ride_the_cjk_single_char_gate() {
     }
 }
 
-/// The panda promotion: 熊猫/貓熊 were exceptions.toml suppressions (protecting
-/// the cat ideograph); they are now positive panda matches, and the longer
-/// compound STILL keeps the lone 猫 from sparkling even under the opt-in.
+/// 熊猫/貓熊 are panda matches, and the longer compound keeps the lone 猫 from
+/// sparkling even under the opt-in.
 #[test]
 fn panda_compounds_are_pandas_not_suppressions_and_never_cats() {
     let lex = Lexicon::builtin();
@@ -233,9 +230,8 @@ fn maximal_munch_and_particles_behave() {
     assert_eq!(single_species(lex, "ไก่", &o), "chicken");
 }
 
-/// The multilingual expansion keeps the builtin conflict-free (species
-/// uniqueness per surface, exceptions well-formed) — the data-validation
-/// battery's own gate, restated closest to the new data.
+/// The builtin stays conflict-free (species unique per surface, exceptions
+/// well-formed), on the default and on every language.
 #[test]
 fn expanded_builtin_stays_conflict_free() {
     assert_eq!(Lexicon::builtin().conflicts(), &[] as &[String]);

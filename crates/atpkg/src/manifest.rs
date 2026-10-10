@@ -462,6 +462,60 @@ pub struct Artifact {
     /// input.
     #[serde(default)]
     pub vendor: String,
+    /// `[artifact.provenance]` — which compiler built THIS row's payload, as the packer's
+    /// lineage scan recorded it ([`crate::lineage`]; tools/atpkg-publish.sh writes it from
+    /// `atpkg lineage scan`'s record and refuses to sign a `github-release` row without
+    /// one). Per ROW, not per manifest: `MERGE_FROM` appends the rows of other triples,
+    /// packed on other builders with other seals, to one manifest. Signed metadata for
+    /// people and audits; no install decision reads it. Absent on every row published
+    /// before the table existed, and ignored by every client older than it (no struct
+    /// here denies unknown fields).
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
+}
+
+/// `[artifact.provenance]`: the scan record of the packer that signed the row. Every
+/// field is a string exactly as `atpkg lineage scan` printed it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Provenance {
+    /// `release:` of the compiler that built the payload (`1.99.0-dev`).
+    #[serde(default)]
+    pub compiler_release: String,
+    /// Its `commit-hash:` — 40 hex.
+    #[serde(default)]
+    pub compiler_commit: String,
+    /// Its `trust:` product version.
+    #[serde(default)]
+    pub compiler_trust: String,
+    /// Its `host:` triple.
+    #[serde(default)]
+    pub compiler_host: String,
+    /// sha256 of its `bin/trustc`.
+    #[serde(default)]
+    pub trustc_sha256: String,
+    /// sha256 of its `bin/targo`.
+    #[serde(default)]
+    pub targo_sha256: String,
+    /// sha256 of its compiler driver.
+    #[serde(default)]
+    pub driver_sha256: String,
+    /// How its lineage was proven: `lineage`, `seed-mint`, or `unproven` (admitted while
+    /// the receipt requirement was dormant).
+    #[serde(default)]
+    pub lineage: String,
+    /// sha256 of the SEED-MINT receipt, or `none`.
+    #[serde(default)]
+    pub lineage_receipt_sha256: String,
+    /// The receipt's double-compile relation, or `none`.
+    #[serde(default)]
+    pub ddc_seed_relation: String,
+    /// Compiled objects the scan read.
+    #[serde(default)]
+    pub scan_objects: String,
+    /// Evidence of another compiler it found (always `0` in a signed row). `0` means
+    /// no evidence was found, not that none could exist (`lineage`'s module docs).
+    #[serde(default)]
+    pub scan_findings: String,
 }
 
 /// A `sysroot-bundle` with no explicit policy is treated as `self-contained` —
@@ -1415,6 +1469,65 @@ build_seconds = 0
             parse_pkg(&verified(missing)).unwrap_err(),
             Reject::Malformed
         );
+    }
+
+    /// `[artifact.provenance]` rides per row, exactly as tools/atpkg-publish.sh writes it
+    /// (after the row's `[artifact.cost]`, with a `MERGE_FROM` row appended after it), and
+    /// a client that predates the table parses the same bytes: no struct on the path
+    /// denies unknown fields, which is the whole backward-compatibility story.
+    #[test]
+    fn provenance_rides_per_row_and_old_clients_ignore_it() {
+        let commit = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
+        let body = format!(
+            "schema = 1\nprogram = \"ay\"\nversion = \"0.28.0\"\nbuild_number = 9001\nexposes = [\"ay\"]\n\n\
+             [[artifact]]\ntarget = \"aarch64-apple-darwin\"\nkind = \"binary\"\nprotocol = \"github-release\"\n\
+             asset = \"ay-9001.tar.zst\"\nsha256 = \"{h}\"\ntree_root = \"{h}\"\nsize = 10\n\
+             [artifact.cost]\ndownload_bytes = 10\ndisk_installed = 20\nbuild_seconds = 0\n\
+             [artifact.provenance]\ncompiler_release = \"1.99.0-dev\"\ncompiler_commit = \"{commit}\"\n\
+             lineage = \"unproven\"\nscan_objects = \"5\"\nscan_findings = \"0\"\n\n\
+             [[artifact]]\ntarget = \"x86_64-apple-darwin\"\nkind = \"binary\"\nprotocol = \"github-release\"\n\
+             asset = \"ay-9001-x86_64-apple-darwin.tar.zst\"\nsha256 = \"{h}\"\nsize = 10\n\
+             [artifact.cost]\ndownload_bytes = 10\ndisk_installed = 20\nbuild_seconds = 0\n",
+            h = "a".repeat(64)
+        );
+        let m = parse_pkg(&verified(&body)).expect("a manifest carrying provenance parses");
+        let p = m.artifacts[0]
+            .provenance
+            .as_ref()
+            .expect("row 0 carries provenance");
+        assert_eq!(p.compiler_commit, commit);
+        assert_eq!(p.lineage, "unproven");
+        assert_eq!(p.scan_findings, "0");
+        assert_eq!(
+            m.artifacts[1].provenance, None,
+            "a merged row without the table has none"
+        );
+        assert_eq!(
+            m.artifacts[1].cost.disk_installed, 20,
+            "the table does not swallow the next row"
+        );
+
+        // The pre-provenance client's shape: the same rows, no `provenance` field.
+        #[derive(Deserialize)]
+        struct OldCost {
+            disk_installed: u64,
+        }
+        #[derive(Deserialize)]
+        struct OldArtifact {
+            target: String,
+            cost: OldCost,
+        }
+        #[derive(Deserialize)]
+        struct OldPkg {
+            build_number: u64,
+            #[serde(rename = "artifact")]
+            artifacts: Vec<OldArtifact>,
+        }
+        let old: OldPkg = aterm_toml::from_str(&body).expect("an old client parses it");
+        assert_eq!(old.build_number, 9001);
+        assert_eq!(old.artifacts.len(), 2);
+        assert_eq!(old.artifacts[1].target, "x86_64-apple-darwin");
+        assert_eq!(old.artifacts[0].cost.disk_installed, 20);
     }
 
     // The signed `program` field binds the manifest to a program (§4.2 anti-replay): a

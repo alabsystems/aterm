@@ -616,9 +616,7 @@ fn append_row_writes_only_what_the_next_read_admits() {
 /// vendor's flow writes when it is run with the directory as its home. The
 /// directory `accounts add` makes, with nothing in it yet, is LISTED AND NOT
 /// ENROLLED: `not-enrolled` in the table, and no candidate for a session at
-/// a wall (the live check of 2026-10-02 read it `unseen` and named it
-/// `next:` before anybody had signed in). One entry makes it enrolled:
-/// `unseen`, and the candidate.
+/// a wall. One entry makes it enrolled: `unseen`, and the candidate.
 ///
 /// NEGATIVE CONTROLS: the row with no `dir` — this machine's own login —
 /// needs no directory at all; an absent path and a path that is a file are
@@ -2491,10 +2489,9 @@ fn every_non_candidate_has_its_reason_by_name() {
 }
 
 /// AN ACCOUNT AT ITS THRESHOLD IS NEVER A FRESH CANDIDATE, however near its
-/// reset. The 15-minute guard used to be part of `low` itself, so an account
-/// with NOTHING left, ten minutes from its reset, read as `usable` and was
-/// the best fresh candidate: a session left an account with 5 % left for one
-/// with none, walled on its first request, and spent a rotation for nothing.
+/// reset. The 15-minute guard is not part of `low`: otherwise an account with
+/// NOTHING left, ten minutes from its reset, reads as `usable` and the best
+/// fresh candidate, and a session spends a rotation to walk into a wall.
 #[test]
 fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
     let r = three();
@@ -2705,9 +2702,8 @@ fn rule_4_moves_ahead_of_the_wall_only_from_a_low_account_to_a_fresh_one() {
 /// WHO IS LEFT EARLY. The 15-minute guard is about leaving: a session is not
 /// moved off an account whose low window is about to reset. And an account a
 /// wall already stands on (another tab hit it, or a model's bucket) is left
-/// as a low one is — `limited` used to mask `low`, so the account in the
-/// WORSE condition was the one not left, and the tab's next turn ran into
-/// the wall.
+/// as a low one is: `limited` must not mask `low`, or the account in the
+/// WORSE condition is the one not left.
 #[test]
 fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_reset() {
     let r = three();
@@ -3297,8 +3293,7 @@ fn the_probe_interval_is_half_the_time_to_the_threshold_clamped() {
     assert_eq!(probe_interval(&pair(at(50, 0, NOW), at(60, 0, NOW))), 600);
 
     // Due at the interval, to the second. A sample stamped ahead of the
-    // clock (a clock set back) says nothing about now: it is due, where it
-    // used to read as taken a moment ago for as long as the clock was behind.
+    // clock (a clock set back) says nothing about now: it is due.
     let a = pair(at(50, 0, NOW - 600), at(60, 0, NOW));
     assert!(!probe_due(&a, NOW), "the instant it was read");
     assert!(!probe_due(&a, NOW + 899));
@@ -4527,8 +4522,7 @@ fn the_session_that_chose_an_unproven_account_is_not_moved_on_before_it_answers(
 
 /// THE CANARY'S HOLD LASTS TEN MINUTES, THEN THE NEXT SESSION TAKES ITS
 /// PLACE. A canary whose tab was closed, or that sits idle with nothing to
-/// send, used to hold every other session for good: the wall was waited out
-/// with fresh accounts idle, until the owner ran `accounts use`.
+/// send, must not hold every other session for good.
 ///
 /// `active` is never put back by the clock. The session on the unproven
 /// account stays; the next one to reach a point moves onto it and is the
@@ -4633,8 +4627,8 @@ fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
 
     // THE TAKE: a compare-and-set on the canary's record. Nothing else
     // moves — not `active`, not the proof, not the hour's rotations. (What
-    // the rotation wrote over goes with the record: the rotation was the
-    // silent canary's to take back, and no longer is.)
+    // the rotation wrote over goes with the record: it is no longer the
+    // silent canary's to take back.)
     let before = s.clone();
     let took = take_canary(&mut s, Some(&first), "s-two", lapsed).expect("takes the place");
     assert_eq!(
@@ -4795,14 +4789,11 @@ fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
 /// A RELAUNCH THE HOST REFUSES IS THE WORD OF THE SESSION THAT WAS TO MOVE,
 /// AND IT TAKES THE ROTATION BACK EXACTLY.
 ///
-/// `strike` used to decide whose relaunch was refused from the canary's
-/// record alone. So the rotation's maker, reporting `NotMoved` after another
-/// session had taken its place, dropped the TAKER's hold, and the next
-/// session was moved onto an account that had not answered inside the
-/// taker's ten minutes. And the undo of a rotation past an account that had
-/// itself not answered put `active` back without that account's `previous`,
-/// its proof and its canary's record: a later strike of it went back to
-/// nothing, and its hold read lapsed.
+/// `strike` does not decide from the canary's record alone: the rotation's
+/// maker, reporting `NotMoved` after another session took its place, must
+/// not drop the TAKER's hold. And undoing a rotation past an account that
+/// had itself not answered restores that account's `previous`, proof and
+/// canary record, so a later strike of it does not go back to nothing.
 #[test]
 fn a_refused_relaunch_is_its_own_sessions_word_and_takes_the_rotation_back_exactly() {
     let r = three();
@@ -5042,10 +5033,9 @@ fn a_refused_relaunch_is_its_own_sessions_word_and_takes_the_rotation_back_exact
 /// `previous` (main, proven) AND ITS OWN CANARY (`s-one`'s record), so a
 /// later strike of work-2 goes back to main, proven.
 ///
-/// The strike used to drop what the rotation wrote over (`undo` cleared,
-/// `previous` and the canary none): the second strike then went back to
-/// NOTHING — no active account, with a proven one standing — and the session
-/// still alone on work-2 held nobody.
+/// Were the strike to drop what the rotation wrote over, the second strike
+/// would go back to NOTHING — no active account, with a proven one
+/// standing — and the session still alone on work-2 would hold nobody.
 #[test]
 fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was() {
     let r = three();
@@ -5221,9 +5211,8 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
 /// host records the wall in the same transaction as the move, and `advise`
 /// gives the same answer asked before that or after.
 ///
-/// With the wall not recorded `advise` used to read its own account as
-/// usable NOW, so where every other account was limited there was "nothing
-/// to wait for" (`Stay(NoCandidate)`) instead of the wait.
+/// Read as usable before its wall is recorded, `me` would turn "every other
+/// account limited" into `Stay(NoCandidate)` instead of the wait.
 #[test]
 fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
     let r = three();
@@ -5780,11 +5769,11 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
     assert_eq!(cond(&three(), &only_ran, "pool-a", NOW), Condition::Unseen);
 }
 
-/// A STAMP IN THE FUTURE IS NOT "RECENT". Every age here used to be
-/// `now - t < WINDOW` with no lower bound, so a time stamped ahead of the
-/// clock (a clock set back) read as recent for as long as the clock was
-/// behind it: rotation times tripped the breaker, a probe claim blocked the
-/// probe, and a held sample or wall shadowed every real one.
+/// A STAMP IN THE FUTURE IS NOT "RECENT". An age read as `now - t < WINDOW`
+/// with no lower bound makes a time stamped ahead of the clock (a clock set
+/// back) recent for as long as the clock is behind it: rotation times trip
+/// the breaker, a probe claim blocks the probe, and a held sample or wall
+/// shadows every real one.
 #[test]
 fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     let r = three();
@@ -6138,11 +6127,10 @@ fn observations_merge_by_newest_and_machine_local_facts_never_do() {
     assert_eq!((tie("aa", "bb"), tie("bb", "aa")), (Some(2), Some(1)));
 }
 
-/// THE MERGE KEEPS THE MODULE'S OWN RULES. It used to evict this machine's
-/// records (its signed-out words with them) to make room for another
-/// machine's labels, drop a standing ninth wall while eight lapsed ones were
-/// kept, and bring back the walls the owner's pin had cleared — with the pin
-/// left standing on a walled account and no row in the ledger.
+/// THE MERGE KEEPS THE MODULE'S OWN RULES: it evicts none of this machine's
+/// records for another machine's labels, makes room for a ninth wall by
+/// the one that stops standing first, and brings back no wall the owner's
+/// pin cleared (a pin on a walled account ends, with a ledger row).
 #[test]
 fn a_merge_evicts_nothing_of_ours_restores_no_cleared_wall_and_ends_a_pin_on_a_wall() {
     let r = three();
