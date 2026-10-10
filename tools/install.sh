@@ -6,11 +6,7 @@
 # command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
 # fleet / drive), in one command. Every release is ONE lean app: aterm opens
 # immediately, and the ALab toolchain installs itself on first launch with live
-# progress. Flags only EXCLUDE. (--batteries — the batteries-included DMG pair,
-# seeded offline from a sealed payload — was RETIRED 2026-08-26: no release
-# cuts that pair any more, and the bare aterm-<v>.dmg is the same lean app as
-# the zip. The flag is still parsed so an old command line fails loudly, exit
-# 2, naming its next act.)
+# progress. Flags only EXCLUDE.
 #
 # The download source is the PUBLIC release repo (alabsystems/aterm; a run
 # from a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
@@ -28,8 +24,8 @@
 #              (…/releases/latest/download/aterm-appcast.toml, redirects
 #              refused) names the head's vMAJOR.MINOR.PATCH tag — the release
 #              cut owns that pointer, so it is the newest app release (see
-#              channel_head). An explicit --version names the tag instead, and
-#              may still name a retired two-component archive release
+#              channel_head). An explicit --version names the tag instead,
+#              spelled the same vMAJOR.MINOR.PATCH (canonical_authority_tag)
 #           2. fetch the manifest and ONE canonical container from that tag's
 #              own download URLs — the lean aterm-<v>-mac.zip; a pinned
 #              pre-lean release that ships no zip takes its bare aterm-<v>.dmg
@@ -211,10 +207,11 @@ decimal_in_closed_range() {
 # (crates/aterm-update/src/github.rs). Sets TAG_KIND_RESULT to:
 #   candidate — the current scheme: canonical vMAJOR.MINOR.PATCH, the
 #               workspace [workspace.package] version as written
-#               (VERSIONING.md). Only these are ever installed by default.
-#   legacy    — a retired pre-cut-over two-component vMAJOR.MINOR. Those
-#               releases stay published as archive history and are skipped, not
-#               errors, so the archive can coexist with the current channel.
+#               (VERSIONING.md). Only these are ever installed.
+#   legacy    — two components, vMAJOR.MINOR: a retired pre-cut-over archive
+#               tag, which is never installed (canonical_authority_tag refuses
+#               it by kind), or a macOS product version such as 14.0, which the
+#               min_os advisory compares.
 # Everything else fails closed (returns 1): no v prefix, fewer than two or more
 # than three components, an empty or non-numeric component, a leading-zero
 # spelling, or a component outside the updater's u64 domain. Garbage in the tag
@@ -246,10 +243,9 @@ parse_release_tag() {
 	esac
 }
 
-# A canonical numeric dotted tag of either arity. This is the shape gate for
-# operator input and for the manifest identity bind — an explicit --version may
-# still name a retired two-component archive release — and for the min_os
-# advisory, whose operands are macOS product versions, not aterm tags.
+# A canonical numeric dotted version of either arity: the shape gate for the
+# min_os advisory, whose operands are macOS product versions (14.0 has two
+# components), not aterm tags. A release tag is canonical_authority_tag's.
 canonical_numeric_tag() {
 	parse_release_tag "$1"
 }
@@ -296,13 +292,12 @@ compare_numeric_tags() {
 }
 
 # Bind tag, manifest version, local path shape, and digest before any DMG lookup,
-# join, or download. The elected authority is always vMAJOR.MINOR.PATCH; an
-# explicit --version may also name a retired two-component archive release, and
-# either way the tag, the manifest spelling, and aterm-<version>.dmg must agree
-# exactly — the same identity bind the updater enforces.
+# join, or download. The tag is vMAJOR.MINOR.PATCH, elected or pinned, and the
+# tag, the manifest spelling, and aterm-<version>.dmg must agree exactly — the
+# same identity bind the updater enforces.
 validate_manifest_identity() {
 	local tag="$1" version="$2" dmg_name="$3" sha256="$4"
-	if ! canonical_numeric_tag "$tag" || [[ "$tag" != "v$version" ]]; then
+	if ! canonical_authority_tag "$tag" || [[ "$tag" != "v$version" ]]; then
 		echo "install.sh: manifest version $version does not exactly match release tag $tag" >&2
 		return 2
 	fi
@@ -356,7 +351,7 @@ web_curl() {
 # arbitrary asset of the release.
 release_asset_url() { # <tag> <name>
 	local tag="$1" name="$2"
-	canonical_numeric_tag "$tag" || {
+	canonical_authority_tag "$tag" || {
 		echo "install.sh: refusing asset lookup for invalid release tag $tag" >&2
 		return 2
 	}
@@ -1045,10 +1040,9 @@ random_suffix() {
 # is the SAME seed-stripped app in a disk image — the manifest's required
 # `dmg` key still binds its name — and a current release never has it
 # elected here. The batteries-included DMG pair (the bare DMG sealing the
-# arm64 toolchain, `aterm-<v>-x86_64.dmg` the Intel one) and its --batteries
-# election were RETIRED 2026-08-26: no release cuts the pair, and the flag
-# refuses at the argument gate. A release that names no zip in its manifest
-# predates the lean container, so the default falls back to the bare DMG
+# arm64 toolchain, `aterm-<v>-x86_64.dmg` the Intel one) was RETIRED
+# 2026-08-26: no release cuts the pair. A release that names no zip in its
+# manifest predates the lean container, so the default falls back to the bare DMG
 # that release was cut for — every older --version pin keeps installing
 # exactly as before.
 #
@@ -3194,13 +3188,6 @@ TOOLSET_SIZE=""
 if [[ "$(uname -s)" == Darwin && "$(sysctl -n hw.optional.arm64 2>/dev/null)" == 1 ]]; then
 	TOOLSET_SIZE="~4.4 GiB"
 fi
-# The container election (2026-08-23 funnel flip — DESIGN-streaming-batteries
-# §7): the LEAN zip on every CPU (aterm opens immediately; the toolchain
-# installs itself on first launch with live progress). --batteries — the
-# sealed DMG pair for offline / air-gapped installs — was RETIRED 2026-08-26:
-# every release is the lean app, so there is no second container to elect.
-# The flag stays PARSED (below) so an old command line fails loudly with its
-# next act, exit 2, instead of "unknown argument".
 # PATH wiring for the user's OWN shell. `shell.d` is sourced by aterm's own
 # integration inside an aterm session, and by atpkg's marker block
 # (`# >>> atpkg shell integration >>>`), which atpkg's install/update pass
@@ -3245,14 +3232,6 @@ while [[ $# -gt 0 ]]; do
 		DO_TOOLCHAIN=0
 		shift
 		;;
-	--batteries)
-		# RETIRED 2026-08-26, parsed on purpose: every release is the lean
-		# app, so there is nothing for this flag to elect. Refuse naming the
-		# flag rather than fall through to "unknown argument", which would
-		# send an old runbook hunting for a typo.
-		echo "install.sh: --batteries no longer exists — rerun without it" >&2
-		exit 2
-		;;
 	--no-path)
 		DO_PATH=0
 		shift
@@ -3289,7 +3268,7 @@ if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 && "$DO_TOOLCHAIN" -eq 0 && "$DO_PATH" 
 	echo "install.sh: every half is excluded (--no-app --no-cli --no-toolchain --no-path) — nothing to do" >&2
 	exit 2
 fi
-if [[ "$TAG_EXPLICIT" -eq 1 ]] && ! canonical_numeric_tag "$TAG"; then
+if [[ "$TAG_EXPLICIT" -eq 1 ]] && ! canonical_authority_tag "$TAG"; then
 	echo "install.sh: --version pins a release and '$TAG_INPUT' is not one — expected X.Y.Z" >&2
 	exit 2
 fi
