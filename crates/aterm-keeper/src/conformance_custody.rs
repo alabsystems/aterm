@@ -51,7 +51,7 @@
 //! CLASSIFIER. Real children end with `exit(0)`, `exit(74)`, `exit(101)`,
 //! `SIGKILL` and `SIGTERM`; the keeper's own exit watch reads each status and
 //! the real core judges the window that ended so. (SIGABRT and SIGSEGV are
-//! judged from their encodings only: AGENTS.md rule 6.)
+//! judged from their encodings only: AGENTS.md.)
 //!
 //! JUDGEMENT. Every schedule of `KeeperDeathJudgement` — the window's build
 //! and end, the evidence degrading, its shell's own end — is driven on the
@@ -1241,7 +1241,7 @@ fn the_classifier_judges_real_ends() {
         ("exit 101", real_status("exit 101")),
         ("SIGKILL", real_status("kill -KILL $$")),
         ("SIGTERM", real_status("kill -TERM $$")),
-        // Encodings only, never a real core-dump signal (AGENTS.md rule 6).
+        // Encodings only, never a real core-dump signal (AGENTS.md).
         ("SIGABRT (encoding)", 6),
         ("SIGSEGV (encoding)", 11),
     ];

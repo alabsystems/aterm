@@ -362,7 +362,7 @@ fn a_shell_stuck_exiting_on_unread_output_is_reaped_not_left_a_zombie() {
 fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
     let sh = parked_session("printf 'UP\\n'; read go; exit 0");
     let identity = record_spawned_shell(sh.pid);
-    reap_shell_scheduled(identity, None, 2);
+    reap_shell_scheduled(identity, None, 2, InGrace::enter());
     let alive_at_return = process_birth(sh.pid).is_some();
     let go = b"go\n";
     // SAFETY: writing a few bytes from a valid buffer to the master this
@@ -433,4 +433,88 @@ fn a_child_handed_to_the_reaper_is_reaped_and_a_dropped_one_is_not() {
         "CONTROL: a dropped `Child` is a zombie until someone waits for it"
     );
     assert!(!handed_left, "the handed-over child was never reaped");
+}
+
+/// Set only on the child [`a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell`]
+/// starts: that child is the quitting process.
+#[cfg(target_os = "macos")]
+const QUITTING: &str = "ATERM_PTY_TEST_QUITTING";
+
+/// A QUIT CANNOT CUT A HOLDOUT'S ESCALATION SHORT. The quitting process runs
+/// a tab close's teardown — the hang-up, then [`reap_shell_in_background`] —
+/// waits in [`wait_for_reaps`], and exits at once, as aterm's final
+/// exit does. The shell ignores SIGHUP, so only the reap's SIGKILL ends it,
+/// and the wait holds the exit until that has gone out. Without the wait the
+/// reap thread dies with the process at its first poll, and the shell,
+/// re-parented to launchd, runs on for good. The exit is the point, so the
+/// quitting process is a child of this test binary, running this test.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
+    if std::env::var_os(QUITTING).is_some() {
+        let sh = parked_session("trap '' HUP; printf 'UP\\n'; exec sleep 600");
+        let identity = record_spawned_shell(sh.pid);
+        let birth = identity.birth.expect("a live child reads a birth");
+        // Named before anything can fail, so the parent can always clean up.
+        println!("HOLDOUT {} {birth}", sh.pid);
+        let _ = hangup_shell(&identity, sh.master);
+        reap_shell_in_background(identity);
+        let settled = wait_for_reaps(HANG_DETECTOR);
+        std::process::exit(if settled { 0 } else { 3 });
+    }
+    let test = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread after it")
+        .to_string();
+    let log = std::env::temp_dir().join(format!(
+        "aterm-pty-quitting-{}-{}.log",
+        std::process::id(),
+        test.replace("::", "-")
+    ));
+    let out = std::fs::File::create(&log).expect("the child's log");
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(QUITTING, "1")
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(out.try_clone().expect("the log, twice"))
+        .stderr(out)
+        .spawn()
+        .expect("start the quitting process");
+    let status = aterm_spec::wait::within(HANG_DETECTOR, Duration::from_millis(5), || {
+        child.try_wait().expect("the child's exit")
+    });
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_file(&log);
+    let holdout = text
+        .lines()
+        .find_map(|line| {
+            // libtest's own `test … ...` may lead the line.
+            let mut words = line[line.find("HOLDOUT ")? + "HOLDOUT ".len()..].split(' ');
+            let pid = words.next()?.parse().ok()?;
+            let birth = words.next()?.parse().ok()?;
+            Some(ShellIdentity::from_parts(pid, Some(birth), false))
+        })
+        .unwrap_or_else(|| panic!("the quitting process named no shell ({status:?}):\n{text}"));
+    // Its SIGKILL went out before the exit, so it is gone, or going: a hang
+    // detector, never a latency budget.
+    let gone = aterm_spec::wait::within(HANG_DETECTOR, Duration::from_millis(5), || {
+        (!holdout.verify()).then_some(())
+    });
+    if gone.is_none() && holdout.verify() {
+        // SAFETY: SIGKILL to the shell this test started, verified just above.
+        unsafe { libc::kill(holdout.pid, libc::SIGKILL) };
+    }
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the quitting process: {status:?}\n{text}"
+    );
+    assert!(
+        gone.is_some(),
+        "the HUP-ignoring shell outlived the process that quit after hanging it up \
+         ({holdout:?})"
+    );
 }

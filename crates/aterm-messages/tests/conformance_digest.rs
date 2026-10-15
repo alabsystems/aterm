@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1: the shipping `MessageCenter` follows the derived `ExceptionsDigest`
-//! model in lock step (AGENTS.md, derived models, step 3). Every real
+//! model in lock step (aterm-spec `derive`, step 3). Every real
 //! transition is one the model enables, and after each the projection
 //! `(open, glass)` of the real center equals the model's — so the digest can
 //! never want a band row (`LaterNeverWantsARow`), a dismissal holds inside its

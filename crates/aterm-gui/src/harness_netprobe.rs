@@ -39,10 +39,15 @@
 //!
 //! **Only the default route is measured** ([`route_of_agent`]): what decides
 //! it is read, read-only, from the agent's exec environment (atpkg's
-//! `process_args`, the one KERN_PROCARGS2 reader) and every settings source
-//! Claude Code reads for it — the user's, the project's, its local one, the
-//! managed file and its `managed-settings.d` drop-ins, a managed preference
-//! domain, and a `--settings` on its command line. A route the host cannot
+//! `process_args`, the one KERN_PROCARGS2 reader) and every settings document
+//! Claude Code reads for it — THE CHAIN, read where and as Claude Code reads
+//! it (aterm-agent's `claude_settings::sources_under`, the approval lane's
+//! own: the managed file and its drop-ins, a `--settings`, the project's
+//! files or a `--project-config-root`'s, the main worktree's local one, the
+//! user's `settings.json` or `cowork_settings.json` in its Claude Code
+//! directory) — and its managed
+//! preference domains, which this host cannot parse
+//! (`claude_settings::managed_preferences`). A route the host cannot
 //! reproduce, or cannot see, is never measured: its wall is tried on the time
 //! ladder. `[harness] probe_api = false` measures nothing at all.
 //!
@@ -50,22 +55,19 @@
 //! no test touches the network — the real connect and the real verified
 //! handshake are driven against loopback listeners.
 
-use std::io::{self, Read as _};
+use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use aterm_agent::harness::footer::claude_dir_of;
 use aterm_agent::harness::netwatch::{
-    self, API_HOST, API_PORT, NetState, Outcome, Route, RouteFacts, SettingsArg, Source,
+    self, API_HOST, API_PORT, NetState, Outcome, Route, RouteFacts, Source,
 };
+use aterm_agent::supervise::policy::WorkerEnv;
+use aterm_agent::supervise::policy::claude_settings;
 use aterm_agent::supervise::policy::turn_end::Reach;
-
-/// The most of a settings file this reader takes: larger is no file it
-/// reads (the route is then custom).
-const SETTINGS_CAP: u64 = 256 * 1024;
 
 /// A probe's three steps — the seam the tests replace.
 pub(crate) trait Probe: Send + Sync {
@@ -409,132 +411,47 @@ impl NetProbe {
     }
 }
 
-/// One settings source, read only if it is a regular file of at most
-/// [`SETTINGS_CAP`] bytes of text — opened non-blocking, so a FIFO planted
-/// there cannot park the reader.
-///
-/// A source inside a file-provider domain (iCloud Drive, a sync provider's folder)
-/// is [`Source::Unreadable`] WITHOUT being opened: the open raises a system dialog
-/// that has no timeout, and this is the one netprobe thread every session shares.
-/// `Unreadable` is already the safe direction (the route reads custom and is not
-/// measured). The predicate is atpkg's lexical one, fed a resolved path.
-fn read_source(path: &Path) -> Source {
-    read_source_in(aterm_types::dirs::home_dir().as_deref(), path)
-}
-
-/// [`read_source`] against an explicit `home`, so a test needs no `$HOME`.
-fn read_source_in(home: Option<&Path>, path: &Path) -> Source {
-    if let Some(home) = home {
-        let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if atpkg::protected::under_file_provider_domain(&home, &resolved) {
-            return Source::Unreadable;
-        }
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Source::Missing,
-        Err(_) => return Source::Unreadable,
-    };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return Source::Unreadable;
-    }
-    let mut bytes = Vec::new();
-    if file.take(SETTINGS_CAP + 1).read_to_end(&mut bytes).is_err()
-        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > SETTINGS_CAP
-    {
-        return Source::Unreadable;
-    }
-    String::from_utf8(bytes).map_or(Source::Unreadable, Source::Text)
-}
-
 /// What decides an agent's route, read now (module header): `env` its exec
-/// environment (`None`: unreadable), `argv` its command line, `cwd` its
-/// directory, `managed` Claude Code's managed-settings directory and `prefs`
-/// the managed-preferences one (parameters, so the tests read a scratch
-/// tree).
+/// environment (`None`: unreadable, and then nothing else is read), `argv`
+/// its command line, `cwd` its directory (one not absolute is not known:
+/// a snapshot taken before its cwd was read, whose project settings are
+/// then reported unread, never skipped — the review of 2026-09-27 found them
+/// skipped, and a proxy in `.claude/settings.local.json` read Default),
+/// `managed` Claude Code's managed-settings directory and `prefs` the
+/// managed-preferences one, `home` this process's home (parameters, so the
+/// tests read a scratch tree). The settings documents are the chain's
+/// ([`claude_settings::sources_under`]) and the managed preference domains
+/// ([`claude_settings::managed_preferences`]), each as the chain's one
+/// reader returned it — FENCED by `home`: one that is there inside a
+/// file-provider domain of it (iCloud Drive, a sync provider's folder) is
+/// read as unreadable, never opened, since this is the one thread every
+/// session shares and the open can raise a consent dialog that has no
+/// timeout (the chain's ruling, "The file-provider fence is the route's").
 fn gather(
     env: Option<Vec<String>>,
     argv: &[String],
     cwd: &Path,
-    managed: &Path,
+    managed: Option<&Path>,
     prefs: &Path,
+    home: Option<&Path>,
 ) -> RouteFacts {
-    let var = |key: &str| {
-        env.as_ref()?
-            .iter()
-            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+    let Some(env) = env else {
+        return RouteFacts::default();
     };
-    let cwd = cwd.is_absolute().then_some(cwd);
-    let claude_dir = claude_dir_of(var("CLAUDE_CONFIG_DIR"), var("HOME"));
-    let mut settings: Vec<(String, Source)> = Vec::new();
-    if claude_dir.is_none() {
-        settings.push(("the user's settings".to_string(), Source::Unreadable));
+    let worker = WorkerEnv::new(atpkg::caller_shell::ProcArgs {
+        argv: argv.to_vec(),
+        env: env.clone(),
+        ..Default::default()
+    });
+    let settings = claude_settings::sources_under(&worker, cwd, managed, home)
+        .into_iter()
+        .chain(claude_settings::managed_preferences(&worker, prefs))
+        .map(|source| (source.name, Source::from(source.text)))
+        .collect();
+    RouteFacts {
+        env: Some(env),
+        settings,
     }
-    if cwd.is_none() {
-        // The agent's directory is not known (a snapshot taken before its
-        // cwd was read): its project settings are a source this host cannot
-        // see, so the route is not the default (review, 2026-09-27: they were
-        // skipped, and a proxy in `.claude/settings.local.json` read Default
-        // and armed the Down hold).
-        settings.push(("the project's settings".to_string(), Source::Unreadable));
-    }
-    for (at, path) in netwatch::settings_files(claude_dir.as_deref(), cwd, managed) {
-        settings.push((at, read_source(&path)));
-    }
-    match std::fs::read_dir(managed.join("managed-settings.d")) {
-        Ok(entries) => {
-            let mut drop_ins: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                .collect();
-            drop_ins.sort();
-            for path in drop_ins {
-                settings.push((format!("{}", path.display()), read_source(&path)));
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => settings.push((
-            "the managed settings' drop-ins".to_string(),
-            Source::Unreadable,
-        )),
-    }
-    // A managed preference domain is a plist this reader does not parse: its
-    // presence alone is a route it cannot see.
-    let mut domains = vec![prefs.join(netwatch::MANAGED_PREFS_FILE)];
-    if let Some(user) = var("USER")
-        .or_else(|| var("LOGNAME"))
-        .filter(|u| !u.is_empty())
-    {
-        domains.push(prefs.join(user).join(netwatch::MANAGED_PREFS_FILE));
-    }
-    for domain in domains {
-        if std::fs::symlink_metadata(&domain).is_ok() {
-            settings.push((
-                "a managed preference domain".to_string(),
-                Source::Unreadable,
-            ));
-        }
-    }
-    for arg in netwatch::settings_args(argv) {
-        let source = match arg {
-            SettingsArg::Inline(json) => Source::Text(json),
-            SettingsArg::File(path) if path.is_absolute() => read_source(&path),
-            SettingsArg::File(path) => match cwd {
-                Some(cwd) => read_source(&cwd.join(path)),
-                None => Source::Unreadable,
-            },
-        };
-        settings.push(("--settings".to_string(), source));
-    }
-    RouteFacts { env, settings }
 }
 
 /// AGENT `pid`'S ROUTE, read now: its exec environment and every settings
@@ -545,8 +462,9 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
         env,
         argv,
         Path::new(cwd),
-        Path::new(netwatch::MANAGED_DIR),
-        Path::new(netwatch::MANAGED_PREFS_DIR),
+        claude_settings::MANAGED_DIR.map(Path::new),
+        Path::new(claude_settings::MANAGED_PREFERENCES_DIR),
+        aterm_types::dirs::home_dir().as_deref(),
     ))
 }
 
@@ -562,15 +480,17 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
 /// host only where the owner listed an account, once per agent process.
 pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> bool {
     let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
+    let home = aterm_types::dirs::home_dir();
     stored_login_of(
         &gather(
             env,
             argv,
             Path::new(cwd),
-            Path::new(netwatch::MANAGED_DIR),
-            Path::new(netwatch::MANAGED_PREFS_DIR),
+            claude_settings::MANAGED_DIR.map(Path::new),
+            Path::new(claude_settings::MANAGED_PREFERENCES_DIR),
+            home.as_deref(),
         ),
-        aterm_types::dirs::home_dir().as_deref(),
+        home.as_deref(),
     )
 }
 
@@ -581,7 +501,7 @@ pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> boo
 /// directory `accounts::profile_configs_dir` names for that environment —
 /// names only, no config opened). A store inside a file-provider domain of
 /// `home` is NOT LISTED (the listing could raise a consent dialog in aterm's
-/// name, as a settings file there could, [`read_source`]): it is read as
+/// name, as a settings file there could, `claude_settings`'s reader): it is read as
 /// holding a config, the direction that leaves the session alone. An
 /// environment that could not be read, or reads empty, is no stored login.
 fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
@@ -1079,8 +999,11 @@ mod tests {
         np.stop();
     }
 
+    /// Claude Code's managed preference domain's file name (2.1.300).
+    const MDM_DOMAIN: &str = "com.anthropic.claudecode.plist";
+
     /// A scratch tree for the route's sources.
-    fn scratch(tag: &str) -> PathBuf {
+    fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("aterm-netprobe-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in ["home/.claude", "proj/.claude", "managed", "prefs"] {
@@ -1091,35 +1014,6 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).expect("write");
-    }
-
-    /// A settings file inside a file-provider domain is never opened: it reads
-    /// `Unreadable` (the safe direction) though its text is perfectly good, while
-    /// the same file in an ordinary folder is read.
-    #[test]
-    fn a_settings_file_under_a_file_provider_domain_is_unreadable_never_opened() {
-        let dir = scratch("provider");
-        let home = dir.join("home");
-        let provider = home.join("Library/CloudStorage/x/.claude");
-        let ordinary = home.join("src/.claude");
-        for folder in [&provider, &ordinary] {
-            std::fs::create_dir_all(folder).expect("dir");
-            write(&folder.join("settings.json"), "{}");
-        }
-        assert!(matches!(
-            read_source_in(Some(&home), &provider.join("settings.json")),
-            Source::Unreadable
-        ));
-        assert!(matches!(
-            read_source_in(Some(&home), &ordinary.join("settings.json")),
-            Source::Text(text) if text == "{}"
-        ));
-        // no home known: nothing to fence against, the read is what it was
-        assert!(matches!(
-            read_source_in(None, &provider.join("settings.json")),
-            Source::Text(_)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE AGENT'S SETTINGS SIDE OF ITS LOGIN ([`stored_login_of`]): over the
@@ -1149,8 +1043,9 @@ mod tests {
                     env,
                     &argv,
                     &dir.join("proj"),
-                    &dir.join("managed"),
+                    Some(&dir.join("managed")),
                     &dir.join("prefs"),
+                    Some(&dir.join("home")),
                 ),
                 Some(&home),
             )
@@ -1210,9 +1105,15 @@ mod tests {
         assert!(!stored(env(&cloud), &["claude"]), "a store nobody lists");
         assert!(!home.join("Library/CloudStorage").exists(), "nor made");
 
-        // An environment that was not read is no stored login.
+        // An environment that was not read, or reads empty, is no stored
+        // login (an empty one is not gathered here: the chain would read the
+        // account's own Claude Code directory).
         assert!(!stored(None, &["claude"]));
-        assert!(!stored(Some(Vec::new()), &["claude"]));
+        let empty = RouteFacts {
+            env: Some(Vec::new()),
+            settings: Vec::new(),
+        };
+        assert!(!stored_login_of(&empty, Some(&home)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1220,9 +1121,11 @@ mod tests {
     /// each source that names a route makes it custom — the user's, the
     /// project's, the local one, the managed file, a managed drop-in, a
     /// managed preference domain's mere presence, and a `--settings` file or
-    /// inline JSON — and so does an unparseable file, an environment that
-    /// cannot locate the user's settings, and an agent directory not known
-    /// (its project settings unseen). Nothing is written but by the test.
+    /// inline JSON — and so does an unparseable file and an agent directory
+    /// not known (its project settings unseen). Nothing is written but by the
+    /// test. (An environment with no `HOME` reads the account's own Claude
+    /// Code directory, as Claude Code's `os.homedir()` does: the chain's
+    /// `claude_dir_at`, tested in aterm-agent.)
     #[test]
     fn the_route_reads_every_settings_source_claude_code_reads() {
         let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
@@ -1239,8 +1142,9 @@ mod tests {
                 env(),
                 &argv,
                 &dir.join("proj"),
-                &dir.join("managed"),
+                Some(&dir.join("managed")),
                 &dir.join("prefs"),
+                Some(&dir.join("home")),
             ))
         };
         write(
@@ -1276,16 +1180,12 @@ mod tests {
         assert!(matches!(facts(&["claude"]), Route::Custom(_)));
         std::fs::remove_file(dir.join("managed/managed-settings.d/20-gw.json")).expect("rm");
         std::fs::create_dir_all(dir.join("prefs/owner")).expect("prefs");
-        write(
-            &dir.join("prefs/owner").join(netwatch::MANAGED_PREFS_FILE),
-            "plist",
-        );
+        write(&dir.join("prefs/owner").join(MDM_DOMAIN), "plist");
         assert!(
             matches!(facts(&["claude"]), Route::Custom(_)),
             "an MDM domain"
         );
-        std::fs::remove_file(dir.join("prefs/owner").join(netwatch::MANAGED_PREFS_FILE))
-            .expect("rm");
+        std::fs::remove_file(dir.join("prefs/owner").join(MDM_DOMAIN)).expect("rm");
         write(&dir.join("proj/team.json"), proxy);
         assert!(matches!(
             facts(&["claude", "--settings", "team.json"]),
@@ -1296,15 +1196,6 @@ mod tests {
             Route::Custom(_)
         ));
         assert_eq!(facts(&["claude", "--settings", "{}"]), Route::Default);
-        // No HOME, no CLAUDE_CONFIG_DIR: the user's settings cannot be found.
-        let lost = netwatch::route_of(&gather(
-            Some(vec!["USER=owner".to_string()]),
-            &[],
-            &dir.join("proj"),
-            &dir.join("managed"),
-            &dir.join("prefs"),
-        ));
-        assert!(matches!(lost, Route::Custom(_)), "{lost:?}");
         // The agent's directory not known (an empty or relative cwd): its
         // project settings cannot be read, so the route is custom — even
         // with every source this host CAN see quiet (the control above).
@@ -1313,11 +1204,214 @@ mod tests {
                 env(),
                 &[],
                 Path::new(cwd),
-                &dir.join("managed"),
+                Some(&dir.join("managed")),
                 &dir.join("prefs"),
+                Some(&dir.join("home")),
             ));
             assert!(matches!(blind, Route::Custom(_)), "{cwd:?}: {blind:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE ROUTE'S FENCE (aterm-agent's `claude_settings`, "The
+    /// file-provider fence is the route's"): an agent launched in a
+    /// file-provider domain of the home (a sync provider's folder) is on the
+    /// DEFAULT route, and keeps its stored login, where no settings document
+    /// is there — a `stat` tells that, nothing is opened — and is custom, its
+    /// stored login not taken for granted, where one is there, however quiet
+    /// its text: it is never opened on this thread. NEGATIVE CONTROL: the same
+    /// quiet file in an ordinary folder is the default route. On f71bc6de9 the
+    /// first case read custom wherever the domain was this process's home's:
+    /// the fence fired before the existence check (aterm-agent's
+    /// `a_settings_file_not_there_in_a_file_provider_domain_sets_nothing`).
+    #[test]
+    fn a_project_in_a_file_provider_domain_is_measured_unless_a_document_is_there() {
+        let dir = scratch("provider");
+        let home = dir.join("home");
+        let cloud = home.join("Library/CloudStorage/SyncProvider-acct/proj");
+        std::fs::create_dir_all(&cloud).expect("the project");
+        let facts = |cwd: &Path| {
+            gather(
+                Some(vec![
+                    format!("HOME={}", home.display()),
+                    "USER=owner".to_string(),
+                ]),
+                &["claude".to_string()],
+                cwd,
+                Some(&dir.join("managed")),
+                &dir.join("prefs"),
+                Some(&home),
+            )
+        };
+        assert_eq!(netwatch::route_of(&facts(&cloud)), Route::Default);
+        assert!(stored_login_of(&facts(&cloud), Some(&home)));
+        let quiet = "{\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}";
+        std::fs::create_dir_all(cloud.join(".claude")).expect(".claude");
+        write(&cloud.join(".claude/settings.local.json"), quiet);
+        let r = netwatch::route_of(&facts(&cloud));
+        assert!(
+            matches!(&r, Route::Custom(why) if why.contains("settings.local.json could not be read")),
+            "{r:?}"
+        );
+        assert!(!stored_login_of(&facts(&cloud), Some(&home)));
+        write(&dir.join("proj/.claude/settings.local.json"), quiet);
+        assert_eq!(
+            netwatch::route_of(&facts(&dir.join("proj"))),
+            Route::Default
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE ROUTE AND THE STORED LOGIN ARE READ FROM THE CHAIN CLAUDE CODE
+    /// READS (2.1.299 and 2.1.300's settings-path switch, the approval lane's
+    /// `claude_settings::sources`), not from a list of this module's own: a
+    /// document that is empty, blank or led by a byte-order mark is `{}`; a
+    /// `--project-config-root` moves the project's two files to the root it
+    /// names (and the launch directory's are then not read); the local file
+    /// of the repository's main worktree counts for an agent launched in a
+    /// linked worktree; a true `CLAUDE_CODE_USE_COWORK_PLUGINS` reads
+    /// `cowork_settings.json` in place of `settings.json`; and a relative or
+    /// empty `CLAUDE_CONFIG_DIR` is taken against the agent's directory
+    /// (`path.resolve`). Each place below is one Claude Code takes an `env`
+    /// block from, so a proxy there is a route this host does not measure.
+    /// NEGATIVE CONTROL: a `--managed-settings` (the SDK parent's policy
+    /// JSON) is not one: an interactive 2.1.300 session launched with one
+    /// naming a base URL did not take it (the real-Claude lab, 2026-10-14).
+    /// Every case is checked and the wrong ones are listed together.
+    #[test]
+    fn the_route_and_the_stored_login_are_read_where_claude_code_reads_its_settings() {
+        let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
+        let quiet = "{\"model\":\"opus\"}";
+        let dir = scratch("chain");
+        let home = dir.join("home");
+        let proj = dir.join("proj");
+        let facts = |more: &[&str], argv: &[&str], cwd: &Path| {
+            let mut env = vec![format!("HOME={}", home.display()), "USER=owner".to_string()];
+            env.extend(more.iter().map(|s| (*s).to_string()));
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            gather(
+                Some(env),
+                &argv,
+                cwd,
+                Some(&dir.join("managed")),
+                &dir.join("prefs"),
+                Some(&dir.join("home")),
+            )
+        };
+        let route =
+            |more: &[&str], argv: &[&str], cwd: &Path| netwatch::route_of(&facts(more, argv, cwd));
+        let rm = |p: &Path| std::fs::remove_file(p).expect("rm");
+        let mkfile = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            write(p, text);
+        };
+        // Each case's verdict, the wrong ones listed together at the end.
+        let mut wrong: Vec<String> = Vec::new();
+        let mut expect = |case: &str, ok: bool, read: &dyn std::fmt::Debug| {
+            if !ok {
+                wrong.push(format!("{case}: read {read:?}"));
+            }
+        };
+        let custom = |r: &Route| matches!(r, Route::Custom(_));
+
+        // An empty, blank or marked document is `{}`: the default route, and
+        // the stored login left.
+        let local = proj.join(".claude/settings.local.json");
+        let user = home.join(".claude/settings.json");
+        for body in ["", " \n\t", "\u{feff}", "\u{feff}{\"model\":\"opus\"}"] {
+            for at in [&local, &user] {
+                write(at, body);
+                let case = format!("{body:?} in {}", at.display());
+                let r = route(&[], &["claude"], &proj);
+                expect(&case, !custom(&r), &r);
+                let stored = stored_login_of(&facts(&[], &["claude"], &proj), Some(&home));
+                expect(&format!("{case}, the stored login"), stored, &stored);
+                rm(at);
+            }
+        }
+        // NEGATIVE CONTROL: a marked document is still read.
+        write(&local, &format!("\u{feff}{proxy}"));
+        let r = route(&[], &["claude"], &proj);
+        expect("a marked proxy", custom(&r), &r);
+        rm(&local);
+
+        // `--project-config-root`: the root's files, not the launch
+        // directory's (an absolute root: 2.1.300 refuses to start on a
+        // relative one).
+        let root = dir.join("root");
+        let rooted = root.join(".claude/settings.local.json");
+        mkfile(&rooted, proxy);
+        let joined = format!("--project-config-root={}", root.display());
+        let spaced = [
+            "claude",
+            "--project-config-root",
+            root.to_str().expect("utf-8"),
+        ];
+        for argv in [&spaced[..], &["claude", joined.as_str()][..]] {
+            let r = route(&[], argv, &proj);
+            expect(&format!("{argv:?}"), custom(&r), &r);
+        }
+        let r = route(&[], &["claude"], &proj);
+        expect("no root", !custom(&r), &r);
+        rm(&rooted);
+        write(&proj.join(".claude/settings.json"), proxy);
+        let r = route(&[], &spaced, &proj);
+        expect(
+            "the launch directory's project file under a root",
+            !custom(&r),
+            &r,
+        );
+        rm(&proj.join(".claude/settings.json"));
+
+        // A linked worktree: the main worktree's local file counts.
+        let main = dir.join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        let wt = dir.join("wt");
+        mkfile(&gitdir.join("commondir"), "../..\n");
+        mkfile(&wt.join(".git"), &format!("gitdir: {}\n", gitdir.display()));
+        let sub = wt.join("crates/x");
+        std::fs::create_dir_all(&sub).expect("sub");
+        let r = route(&[], &["claude"], &sub);
+        expect("a quiet linked worktree", !custom(&r), &r);
+        mkfile(&main.join(".claude/settings.local.json"), proxy);
+        let r = route(&[], &["claude"], &sub);
+        expect("the main worktree's local file", custom(&r), &r);
+
+        // Cowork: `cowork_settings.json` in place of `settings.json`.
+        let cowork = ["CLAUDE_CODE_USE_COWORK_PLUGINS=1"];
+        write(&home.join(".claude/cowork_settings.json"), proxy);
+        let r = route(&cowork, &["claude"], &proj);
+        expect("cowork_settings.json", custom(&r), &r);
+        let r = route(&[], &["claude"], &proj);
+        expect("cowork off", !custom(&r), &r);
+        write(&home.join(".claude/cowork_settings.json"), quiet);
+        write(&user, proxy);
+        let r = route(&cowork, &["claude"], &proj);
+        expect("settings.json under cowork", !custom(&r), &r);
+        rm(&user);
+
+        // A relative `CLAUDE_CONFIG_DIR`, and an empty one, against the
+        // agent's directory.
+        mkfile(&proj.join("cc/settings.json"), quiet);
+        let relative = ["CLAUDE_CONFIG_DIR=cc"];
+        let r = route(&relative, &["claude"], &proj);
+        expect("a quiet relative CLAUDE_CONFIG_DIR", !custom(&r), &r);
+        write(&proj.join("cc/settings.json"), proxy);
+        let r = route(&relative, &["claude"], &proj);
+        expect("a relative CLAUDE_CONFIG_DIR", custom(&r), &r);
+        write(&proj.join("settings.json"), proxy);
+        let r = route(&["CLAUDE_CONFIG_DIR="], &["claude"], &proj);
+        expect("an empty CLAUDE_CONFIG_DIR", custom(&r), &r);
+
+        // NEGATIVE CONTROL: `--managed-settings` is not the session's.
+        let r = route(&[], &["claude", "--managed-settings", proxy], &proj);
+        expect("--managed-settings", !custom(&r), &r);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 }

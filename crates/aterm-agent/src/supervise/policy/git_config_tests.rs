@@ -839,8 +839,42 @@ fn the_first_entry_of_a_variable_wins() {
         "HOME=/h".to_string(),
     ]);
     assert_eq!(env.var("CLAUDE_CONFIG_DIR"), Some("/a"));
-    assert_eq!(env.claude_dir(), Some(PathBuf::from("/a")));
+    let cwd = Path::new("/w");
+    assert_eq!(env.claude_dir(cwd), Ok(PathBuf::from("/a")));
     let home_only = WorkerEnv::from_env(vec!["HOME=/h".to_string()]);
-    assert_eq!(home_only.claude_dir(), Some(PathBuf::from("/h/.claude")));
-    assert_eq!(WorkerEnv::default().claude_dir(), None);
+    assert_eq!(home_only.claude_dir(cwd), Ok(PathBuf::from("/h/.claude")));
+}
+
+/// The Claude Code directory as Claude Code 2.1.299 resolves it
+/// (`path.resolve(CLAUDE_CONFIG_DIR ?? join(os.homedir(), ".claude"))`, Bun's
+/// `os.homedir()` taking a non-empty `HOME`, else the passwd entry): a
+/// `CLAUDE_CONFIG_DIR` set at all wins, a relative one (or an empty one) taken
+/// against the process's directory; no `HOME`, or an empty one, is the
+/// account's home. Negative control: where the account names no home either,
+/// it is an error, never a directory skipped.
+#[test]
+fn the_claude_code_directory_is_resolved_as_claude_code_resolves_it() {
+    let cwd = Path::new("/w/proj");
+    let account = || Some(PathBuf::from("/Users//acct"));
+    for (config, home, want) in [
+        (Some("/a"), Some("/h"), "/a"),
+        (Some("cc"), Some("/h"), "/w/proj/cc"),
+        (Some("../cc/./x"), None, "/w/cc/x"),
+        (Some(""), Some("/h"), "/w/proj"),
+        (None, Some("/h"), "/h/.claude"),
+        (None, Some("h"), "/w/proj/h/.claude"),
+        (None, Some(""), "/Users//acct/.claude"),
+        (None, None, "/Users//acct/.claude"),
+    ] {
+        assert_eq!(
+            claude_dir_at(config, home, cwd, account),
+            Ok(PathBuf::from(want)),
+            "{config:?} {home:?}"
+        );
+    }
+    assert!(
+        claude_dir_at(None, None, cwd, || None)
+            .expect_err("no home anywhere")
+            .contains("no home for its account")
+    );
 }

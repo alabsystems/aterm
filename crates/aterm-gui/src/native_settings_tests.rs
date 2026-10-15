@@ -3127,7 +3127,7 @@ fn a_press_queued_behind_a_confirmed_alert_asks_nothing() {
 // THE DEBUGGER-ACCESS ROW (docs/DESIGN-macos-debugger-access-2026-09-29.md
 // §3.3, §3.4; owner rulings O7 and O8, 2026-09-29). Every press here goes
 // through the injected `confirm` arm: no test reaches `menu::confirm_owner`
-// (AGENTS.md rule 5, grep_guard B9f), and none reaches `run_devtools`,
+// (AGENTS.md, grep_guard B9f), and none reaches `run_devtools`,
 // which only the host calls.
 // -----------------------------------------------------------------------
 
@@ -5130,7 +5130,6 @@ fn the_developer_tools_button_opens_only_its_pane() {
                 crate::menu::PrivacyPane::FullDiskAccess => 1,
                 crate::menu::PrivacyPane::FilesAndFolders => 2,
                 crate::menu::PrivacyPane::DeveloperTools => 3,
-                crate::menu::PrivacyPane::SpotlightSearchPrivacy => 4,
             },
             Ordering::Release,
         );

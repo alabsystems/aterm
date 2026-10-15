@@ -1248,8 +1248,10 @@ pub fn model_registry() -> Vec<Model> {
         // The live upgrade never strands the agent it asked: never a notice
         // into a session at its usage limit, a late READY honoured after it
         // gave up asking, and one release line for every notice it abandons,
-        // at a break of the agent's own work too, and no stopped round a
-        // permanent wait (each re-armed once rested).
+        // at a break of the agent's own work too, no stopped round a
+        // permanent wait (each re-armed once rested), and no agent left
+        // holding by a build that fails to start (the round that asked it
+        // abandoned and its release typed, a pending round's owed one too).
         // Tier-1 in aterm-agent's `harness::upgrade_drive` tests over the real
         // reducer, gates and record transitions; no `#[refines]` anchors.
         harness_upgrade_never_strands_model(),
@@ -1521,6 +1523,11 @@ pub fn model_registry() -> Vec<Model> {
         forward_handshake_model(),
         // TLS-specific bind of the same no-fresh-read-before-buffer-drain wedge.
         tls_buffered_relay_model(),
+        // The network drive's slots: an unauthenticated connection's slot may go
+        // to a newcomer at capacity, an admitted relay's never, and the
+        // displaced one lets go before the newcomer starts. Tier-1 + `#[refines]`
+        // anchors in aterm-net's drive.rs (r13 NET-1).
+        net_slot_displacement_model(),
         // Generalized error-class models (F1 info-flow, ordering, reply-fidelity).
         capability_secrecy_model(),
         publish_ordering_model(),

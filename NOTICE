@@ -36,9 +36,10 @@ Bundled fonts and font fixtures retain their own terms:
 - JetBrains Mono test fixture: SIL Open Font License 1.1 in
   `crates/aterm-render/tests/fixtures/OFL.txt`.
 
-The bundled TERMINAL FONT STACK (non-macOS builds; `crates/aterm-render/
-assets/bundled/`, each face beside its own notice, held to the same
-`build.rs` grant gate as the display faces):
+The bundled TERMINAL FONT STACK (non-macOS builds, but for Iosevka Term,
+which every build carries; `crates/aterm-render/assets/bundled/`, each face
+beside its own notice, held to the same `build.rs` grant gate as the display
+faces):
 
 - JetBrains Mono 2.304 (Regular, Bold, Italic, Bold Italic), The JetBrains
   Mono Project Authors: SIL Open Font License 1.1 in
@@ -50,6 +51,12 @@ assets/bundled/`, each face beside its own notice, held to the same
   `crates/aterm-render/assets/bundled/CascadiaMonoPL-*.LICENSE.txt`.
   Compiled into Windows builds only. Cascadia Code is a trademark of the
   Microsoft group of companies.
+- Iosevka Term 34.9.0 (Regular, Bold, Italic, Bold Italic), Copyright
+  2015-2026, Renzhi Li (aka. Belleve Invis): SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/bundled/IosevkaTerm-*.LICENSE.txt`. A Modified
+  Version: a subset of the faces of the official unhinted release (Iosevka
+  declares no Reserved Font Name, so the subset keeps its name). Compiled into
+  every build, macOS included, and drawn only when a user names it.
 - Noto Sans Symbols 2 2.008, The Noto Project Authors: SIL Open Font License
   1.1 in `crates/aterm-render/assets/bundled/NotoSansSymbols2-Regular.LICENSE.txt`.
 - Noto Sans Math 3.000, Google LLC: SIL Open Font License 1.1 in

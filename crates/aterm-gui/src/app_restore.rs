@@ -22,6 +22,14 @@ use crate::{App, Session, TabIndex, WindowId, WindowState, pane, restore};
 use winit::event_loop::ActiveEventLoop;
 
 type BuiltRestoreTab = (crate::tab_model::Tab, Option<pane::PaneTree>);
+/// One agent a restore pass hands the host ([`App::take_restored_agents`]):
+/// its tab's sid, its snapshot there, and the explicit restart's cause its
+/// leaf carries.
+type RestoredTake = (
+    String,
+    aterm_agent::harness::relaunch::Snapshot,
+    Option<aterm_agent::harness::restart_stamp::Cause>,
+);
 type BuiltRestoreLeaf = (
     crate::tab_model::ViewId,
     crate::tab_model::TabPresentation,
@@ -781,6 +789,16 @@ impl App {
                             .sanitized()
                     })
                     .unwrap_or_default();
+                // THE AGENT A COLD RESTORE STILL OWES THIS TAB (round four,
+                // plan item 7), on the handoff layout only: the successor
+                // relaunches it at its Commit. A handoff leaf never carried
+                // an agent before, so the successor reads `Some` as exactly
+                // that (`carry_restored_identity`).
+                let owed = if carry_drafts {
+                    self.pending_restored_agent(terminal.session, true)
+                } else {
+                    None
+                };
                 Some(restore::RestoredView::Terminal(
                     restore::TerminalLeafRestore {
                         cwd,
@@ -798,14 +816,16 @@ impl App {
                             .pool
                             .get(terminal.session)
                             .and_then(|s| s.identity.clone()),
-                        // THE AGENT A COLD RESTORE STILL OWES THIS TAB (round
-                        // four, plan item 7), on the handoff layout only: the
-                        // successor relaunches it at its Commit. A handoff
-                        // leaf never carried an agent before, so the successor
-                        // reads `Some` as exactly that
-                        // (`carry_restored_identity`).
-                        agent: if carry_drafts {
-                            self.pending_restored_agent(terminal.session)
+                        agent: owed.clone(),
+                        // THE AGENT ITS HOST SUPERVISES HERE (round
+                        // eighteen), on the handoff layout only and only
+                        // where nothing is owed: the successor watches it from
+                        // its Commit (`hand_carried_restored_agents`), so an
+                        // exit this process reads after the layout is
+                        // captured — and will never act on — is the
+                        // successor's.
+                        supervised: if carry_drafts && owed.is_none() {
+                            self.hosted_agent(terminal.session).map(Box::new)
                         } else {
                             None
                         },
@@ -995,15 +1015,28 @@ impl App {
     /// leaf — and the layouts that keep the desk's agents
     /// ([`Self::fill_desk_agents`]) — carries it: `None` with no host, or when
     /// the tab owes nothing.
-    fn pending_restored_agent(&self, id: u64) -> Option<Box<restore::AgentRestore>> {
+    ///
+    /// THE EXPLICIT RESTART'S CAUSE RIDES THE `handoff` LAYOUT ALONE (round
+    /// eighteen, the review of its first cut; `restore::AgentRestore::cause`):
+    /// its successor adopts the very tab, its sid kept, and relaunches the
+    /// agent as the act's. A durable layout's agent is relaunched by a cold
+    /// restore in a REOPENED tab, a new sid, as aterm's own end
+    /// (`relaunch::after_host_ended`, which closes a relaunch the act left in
+    /// flight for the old tab): carried there, the cause made it the act's
+    /// (`relaunch::after_exit`), which reads that record as the
+    /// conversation's in another tab — a counted wait, eight of them, and the
+    /// tab said not to have come back.
+    fn pending_restored_agent(&self, id: u64, handoff: bool) -> Option<Box<restore::AgentRestore>> {
         let host = self.harness.as_ref()?;
         let sid = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             g.by_local(id)?.sid.as_str().to_string()
         };
-        let snap = host.pending_restored_for(&sid)?;
-        // The one conversion a restore leaf takes (a Codex's run rides it too).
-        Some(Box::new(restore::AgentRestore::of(snap)))
+        let owed = host.pending_restored_for(&sid)?;
+        // The one conversion a restore leaf takes (a Codex's run rides it
+        // too), the explicit restart's cause with it on a handoff alone.
+        let asked = owed.asked.filter(|_| handoff);
+        Some(Box::new(restore::AgentRestore::owed(owed.snap, asked)))
     }
 
     /// The agent pool session `id` hosts, as the supervisor host last read it
@@ -1046,7 +1079,7 @@ impl App {
     pub(crate) fn fill_desk_agents(&mut self, manifest: &mut restore::RestoreManifest) {
         manifest.fill_agents(&|id| {
             self.hosted_agent(id)
-                .or_else(|| self.pending_restored_agent(id).map(|agent| *agent))
+                .or_else(|| self.pending_restored_agent(id, false).map(|agent| *agent))
         });
         let pool = &self.pool;
         self.crash_journal
@@ -1332,7 +1365,7 @@ impl App {
             // come back (ruling 293).
             let restored = restored
                 .into_iter()
-                .map(|(sid, snap)| crate::harness_host::RestoredAgent {
+                .map(|(sid, snap, asked)| crate::harness_host::RestoredAgent {
                     place: self.upgrade_place(&sid),
                     // The layout's snapshot: no process was read for it.
                     // The home and the login its leaf names ride it, and
@@ -1341,6 +1374,9 @@ impl App {
                     cold: true,
                     sid,
                     snap,
+                    // The explicit restart's cause its leaf carries (round
+                    // eighteen): relaunched as the act's.
+                    asked,
                 })
                 .collect();
             host.relaunch_restored(restored);
@@ -1361,6 +1397,41 @@ impl App {
     pub(crate) fn hand_carried_restored_agents(&mut self) {
         self.queue_carried_restored_agents();
         self.hand_restored_agents();
+        self.watch_handed_agents();
+    }
+
+    /// THE AGENTS THE OUTGOING INSTANCE'S HOST SUPERVISED (round eighteen;
+    /// `restore::TerminalLeafRestore::supervised`), each in the shell this
+    /// process adopted under the id its leaf names, handed to this process's
+    /// host to watch from its Commit
+    /// ([`crate::harness_host::HostHandle::watch_handed`]): an exit of one
+    /// that came during the outgoing instance's Commit — read there, in a
+    /// process about to exit, and acted on by nobody — or before this
+    /// host's first pass names it is this host's to read and relaunch. One
+    /// whose shell this process did not adopt is dropped; with no host
+    /// nothing is watched. One-shot.
+    #[cfg(any(unix, test))]
+    fn watch_handed_agents(&mut self) {
+        let handed = std::mem::take(&mut self.handoff_supervised_agents);
+        let Some(host) = self.harness.as_ref() else {
+            return;
+        };
+        let agents: Vec<(String, aterm_agent::harness::relaunch::Snapshot)> = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            handed
+                .into_iter()
+                .filter_map(|(named, agent)| {
+                    let session = self
+                        .pool
+                        .iter()
+                        .find(|session| session.handoff_local_id == Some(named))?;
+                    let sid = g.by_local(session.id)?.sid.as_str().to_string();
+                    let shell = u32::try_from(session.pid).ok()?;
+                    Some((sid.clone(), agent.snapshot(sid, shell)))
+                })
+                .collect()
+        };
+        host.watch_handed(agents);
     }
 
     /// [`Self::hand_carried_restored_agents`]' first half: each carried agent
@@ -1420,7 +1491,10 @@ impl App {
     /// tabs. It goes to the first tab still here
     /// ([`restore::AgentRestore::ran_as`]), the place the reopened row names
     /// (`crash_journal::Reopened::resumed`).
-    fn take_restored_agents(&mut self) -> Vec<(String, aterm_agent::harness::relaunch::Snapshot)> {
+    ///
+    /// Each with the explicit restart's cause its leaf carries (round
+    /// eighteen, `restore::AgentRestore::cause`).
+    fn take_restored_agents(&mut self) -> Vec<RestoredTake> {
         let taken = std::mem::take(&mut self.restored_agents);
         if taken.is_empty() {
             return Vec::new();
@@ -1438,7 +1512,8 @@ impl App {
                         return None;
                     }
                     handed.push((pid, start.to_string()));
-                    Some((sid.clone(), agent.snapshot(sid, shell)))
+                    let asked = agent.asked();
+                    Some((sid.clone(), agent.snapshot(sid, shell), asked))
                 })
                 .collect()
         }
@@ -3050,6 +3125,24 @@ impl App {
                 self.handoff_restored_agents
                     .push((named, (**agent).clone()));
             }
+        }
+        // THE AGENT THE OUTGOING INSTANCE'S HOST SUPERVISED in the shell the
+        // leaf names (round eighteen; a handoff leaf alone, where nothing is
+        // owed): watched by this process's host from its Commit
+        // ([`Self::hand_carried_restored_agents`]), whose exit nobody else
+        // will act on — never before the Commit, while the outgoing instance
+        // still owns the sessions.
+        if ids == LeafIds::Retired
+            && self.handoff_successor
+            && leaf.agent.is_none()
+            && let (Some(named), Some(supervised)) = (leaf.local_id, &leaf.supervised)
+            && !self
+                .handoff_supervised_agents
+                .iter()
+                .any(|(watched, _)| *watched == named)
+        {
+            self.handoff_supervised_agents
+                .push((named, (**supervised).clone()));
         }
         let filling_adopted_as = match filling {
             FillingShell::Registered(session) => self

@@ -463,9 +463,9 @@ pub(crate) fn begin_launch(
 /// never activates (`begin_launch(.., false)`): activation at launch time pulled
 /// focus while the outgoing window was still the one on glass — a live screen
 /// with a dead keyboard — and under the late park the successor exists for as
-/// long as the parent waits for a quiet moment. So the parent samples whether an
-/// aterm window had focus at the PARK and, at Commit, immediately before its own
-/// `_exit`, asks AppKit to activate the successor: `NSRunningApplication
+/// long as the parent waits for a quiet moment. So at Commit, immediately before
+/// its own `_exit`, the parent reads whether an aterm window has focus and, if
+/// one has, asks AppKit to activate the successor: `NSRunningApplication
 /// runningApplicationWithProcessIdentifier:`, then `-[NSApp
 /// yieldActivationToApplication:]` where AppKit answers to it (macOS 14+, the
 /// cooperative half — an app may only take activation the front app yields),

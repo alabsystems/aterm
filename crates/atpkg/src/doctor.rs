@@ -397,10 +397,10 @@ pub struct Probes {
     /// ([`claude_defaults_state`]) — or `None` when this report does not read that
     /// file (the default: a fixture has no Claude settings).
     pub claude_defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>,
-    /// Whether Spotlight skips `~/Developer`, as MEASURED for this report
-    /// ([`crate::devroot::spotlight`]), or `None` when this report does not measure (the
-    /// default: a fixture plants nothing).
-    pub spotlight: Option<crate::devroot::Spotlight>,
+    /// Whether this aterm is on macOS's Developer Tools list ([`crate::devtools::facts`]),
+    /// or `None` when this report does not read it (the default: a fixture reads no
+    /// machine, and off macOS there is no list).
+    pub devtools: Option<crate::devtools::Facts>,
 }
 
 impl Default for Probes {
@@ -417,7 +417,7 @@ impl Default for Probes {
             index_head: false,
             cc: None,
             claude_defaults: None,
-            spotlight: None,
+            devtools: None,
         }
     }
 }
@@ -1051,20 +1051,7 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
-        spotlight: home.as_deref().map(|h| {
-            // The probe can take its whole clock on a loaded machine: say so first, so
-            // the wait never reads as a hang.
-            if let (root, crate::devroot::RootIs::Folder) = crate::devroot::root_at(h)
-                && crate::noindex::SUPPORTED
-            {
-                eprintln!(
-                    "{prefix}: measuring whether Spotlight skips {} (up to {}s)…",
-                    root.display(),
-                    crate::noindex::Timing::DEFAULT.worst_case().as_secs()
-                );
-            }
-            crate::devroot::spotlight(h)
-        }),
+        devtools: crate::devtools::facts(),
     };
     let mut report = Vec::new();
     let mut faults = Vec::new();
@@ -2091,32 +2078,14 @@ pub fn run_with(
         }
     }
 
-    // (7b) THE DEVELOPER ROOT ([`crate::devroot`], macOS): every checkout under `$HOME`
-    // belongs in `~/Developer`, the one folder the owner adds to Spotlight's Search Privacy
-    // list — a WARNING with the verb that moves them once that folder exists (a note before
-    // it does), never a PROBLEM (nothing is broken). Then whether Spotlight skips that
-    // folder, from a MEASUREMENT the caller made (a probe planted in it and a later
-    // control beside it), never from its name: `None` is a report that does not measure,
-    // and says nothing.
-    if crate::noindex::SUPPORTED
-        && let Some(home) = home
-    {
-        let row = crate::devroot::devroot_row(&crate::devroot::survey(home));
+    // (7b) THE DEVELOPER TOOLS LIST ([`crate::devtools`], macOS): whether macOS holds
+    // every new program aterm starts for its first-run check. A WARNING when aterm is not
+    // on it (builds and tests wait, timing tests flake; only the owner can add it), never
+    // a PROBLEM; `None` is a report that does not read the machine, and says nothing.
+    if let Some(row) = probes.devtools.as_ref().and_then(crate::devtools::row) {
         let _ = writeln!(
             out,
-            "{p}: {} — devroot: {}",
-            level_word(row.level),
-            row.text
-        );
-    }
-    if let Some(row) = probes
-        .spotlight
-        .as_ref()
-        .and_then(crate::devroot::spotlight_row)
-    {
-        let _ = writeln!(
-            out,
-            "{p}: {} — spotlight: {}",
+            "{p}: {} — devtools: {}",
             level_word(row.level),
             row.text
         );
@@ -4313,12 +4282,32 @@ fn upstream_index_on_path(
     })
 }
 
-/// A devroot row's weight in this report's words.
-fn level_word(level: crate::devroot::Level) -> &'static str {
+/// A doctor row's weight; each doctor spells it in its own marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Nothing to do.
+    Ok,
+    /// Something the owner should do; never a failure.
+    Warn,
+    /// A fact, or a measurement that could not be made.
+    Note,
+}
+
+/// One doctor row: its weight and its words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    /// Ok, warn or note.
+    pub level: Level,
+    /// The sentence after the mark.
+    pub text: String,
+}
+
+/// A row's weight in this report's words.
+fn level_word(level: Level) -> &'static str {
     match level {
-        crate::devroot::Level::Ok => "ok",
-        crate::devroot::Level::Warn => "warn",
-        crate::devroot::Level::Note => "note",
+        Level::Ok => "ok",
+        Level::Warn => "warn",
+        Level::Note => "note",
     }
 }
 

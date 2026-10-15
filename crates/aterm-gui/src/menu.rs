@@ -2570,7 +2570,7 @@ pub(crate) use macos::{
 /// guards is process-wide too: a headless process has no application object
 /// to present anything from (on macOS its display-free loop never builds an
 /// `NSApplication`, and creating one would open the WindowServer connection a
-/// headless process must not; AGENTS.md rule 5). A modal it tried to run
+/// headless process must not; AGENTS.md). A modal it tried to run
 /// (`choose_local_file`, `confirm`, `notify`) would park the main thread in a
 /// nested run loop nothing can see or dismiss, and an `NSWorkspace` open
 /// (`open_in_workspace`: Open Log, Help, a Privacy pane) would bring ANOTHER app
@@ -2766,25 +2766,15 @@ pub(crate) enum PrivacyPane {
     /// macOS 26 the same page also holds the Processor Trace switch, a
     /// different setting.
     DeveloperTools,
-    /// Spotlight's Search Privacy list (System Settings ▸ Spotlight), the one
-    /// mechanism Apple documents for keeping a folder out of the index: the
-    /// owner adds `~/Developer` there (`atpkg::devroot`), which no API can do.
-    /// Read off this Mac's Settings extension (macOS 27.0, 26A428):
-    /// `SpotlightPreferenceExtension.appex` is `com.apple.Spotlight-Settings.extension`,
-    /// declares `allowsXAppleSystemPreferencesURLScheme`, names the legacy id
-    /// `com.apple.preference.spotlight`, and registers the anchor `privacy`
-    /// ("Block search of private files") in its `SpotlightSearchTerms`.
-    SpotlightSearchPrivacy,
 }
 
 impl PrivacyPane {
     /// Every pane, for the tests that hold each to the same rules.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 3] = [
         Self::FullDiskAccess,
         Self::FilesAndFolders,
         Self::DeveloperTools,
-        Self::SpotlightSearchPrivacy,
     ];
 }
 
@@ -2815,33 +2805,16 @@ pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:c
 const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 
-/// The Developer Tools list, through the modern Settings extension.
+/// The Developer Tools list, through the modern Settings extension: the
+/// consent module's one spelling, which `aterm doctor` prints too.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str =
-    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools";
+pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str = aterm_containment::consent::DEVTOOLS_SETTINGS_URL;
 
-/// The Developer Tools list, through the legacy pane id.
+/// The Developer Tools list, through the legacy pane id: the consent module's
+/// one spelling, which `aterm doctor` opens too.
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_DEVELOPER_TOOLS_LEGACY: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools";
-
-/// Spotlight's Search Privacy section, through the modern Settings extension and
-/// its registered `privacy` anchor ([`PrivacyPane::SpotlightSearchPrivacy`]).
-#[cfg(any(target_os = "macos", test))]
-pub(crate) const SETTINGS_SPOTLIGHT_PRIVACY: &str =
-    "x-apple.systempreferences:com.apple.Spotlight-Settings.extension?privacy";
-
-/// Spotlight's Search Privacy section, through the legacy pane id the extension
-/// declares for itself.
-#[cfg(any(target_os = "macos", test))]
-const SETTINGS_SPOTLIGHT_PRIVACY_LEGACY: &str =
-    "x-apple.systempreferences:com.apple.preference.spotlight?privacy";
-
-/// The Spotlight page with NO anchor: its own degradation target (Search Privacy
-/// is a button on it, not a section of Privacy & Security).
-#[cfg(any(target_os = "macos", test))]
-const SETTINGS_SPOTLIGHT_ROOT: &str =
-    "x-apple.systempreferences:com.apple.Spotlight-Settings.extension";
+    aterm_containment::consent::DEVTOOLS_SETTINGS_URL_LEGACY;
 
 /// The Privacy & Security page with NO anchor — the degradation target. It
 /// carries no `?`, which is the invariant
@@ -2877,11 +2850,6 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
             SETTINGS_DEVELOPER_TOOLS_LEGACY,
             SETTINGS_PRIVACY_ROOT,
         ],
-        PrivacyPane::SpotlightSearchPrivacy => [
-            SETTINGS_SPOTLIGHT_PRIVACY,
-            SETTINGS_SPOTLIGHT_PRIVACY_LEGACY,
-            SETTINGS_SPOTLIGHT_ROOT,
-        ],
     }
 }
 
@@ -2901,10 +2869,7 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
         PrivacyPane::FilesAndFolders => {
             "System Settings \u{25b8} Privacy & Security \u{25b8} Files & Folders"
         }
-        PrivacyPane::DeveloperTools => {
-            "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools"
-        }
-        PrivacyPane::SpotlightSearchPrivacy => atpkg::devroot::SEARCH_PRIVACY,
+        PrivacyPane::DeveloperTools => aterm_containment::consent::DEVTOOLS_SETTINGS_WORDS,
     }
 }
 
@@ -5702,37 +5667,21 @@ mod tests {
             super::SETTINGS_DEVELOPER_TOOLS.ends_with("?Privacy_DevTools"),
             "the Developer Tools list is anchored at Privacy_DevTools"
         );
-        assert!(
-            super::SETTINGS_SPOTLIGHT_PRIVACY.ends_with("?privacy"),
-            "Spotlight's Search Privacy is anchored at its registered `privacy`"
-        );
     }
 
     /// NEVER A DEAD END. None of these URLs is Apple-documented, so the last
     /// candidate must be a page with NO anchor at all: if both anchors stop
     /// resolving, Privacy & Security still opens and the caller falls back to
     /// the route in words. Every pane must degrade to the SAME root — the
-    /// sections live on the one page (Search Privacy degrades to the Spotlight
-    /// page it is a button on) — and only the registered anchors may ever
-    /// appear, never a per-folder pseudo-anchor (`Privacy_DocumentsFolder` and
-    /// its siblings are not anchors; Appendix A.2).
+    /// sections live on the one page — and only the three registered anchors
+    /// may ever appear, never a per-folder pseudo-anchor
+    /// (`Privacy_DocumentsFolder` and its siblings are not anchors; Appendix
+    /// A.2).
     #[test]
     fn the_last_candidate_is_the_unanchored_pane_root() {
         let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
-        for pane in super::PrivacyPane::ALL {
-            let urls = super::privacy_settings_urls(pane);
-            if pane == super::PrivacyPane::SpotlightSearchPrivacy {
-                assert_eq!(
-                    urls[2],
-                    super::SETTINGS_SPOTLIGHT_ROOT,
-                    "Search Privacy degrades to the Spotlight page it is a button on"
-                );
-            } else {
-                assert_eq!(
-                    urls[2], fda[2],
-                    "every Privacy & Security pane degrades to the same page"
-                );
-            }
+        for urls in super::PrivacyPane::ALL.map(super::privacy_settings_urls) {
+            assert_eq!(urls[2], fda[2], "every pane degrades to the same page");
             let (root, anchored) = urls.split_last().expect("three candidates");
             assert!(
                 !root.contains('?'),
@@ -5754,10 +5703,7 @@ mod tests {
                 matches!(
                     anchor,
                     None | Some(
-                        "Privacy_AllFiles"
-                            | "Privacy_FilesAndFolders"
-                            | "Privacy_DevTools"
-                            | "privacy"
+                        "Privacy_AllFiles" | "Privacy_FilesAndFolders" | "Privacy_DevTools"
                     )
                 ),
                 "only a REGISTERED anchor may ship: {url:?}"

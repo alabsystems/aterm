@@ -14,7 +14,7 @@
 use std::sync::OnceLock;
 
 use aterm_core::selection::{SelectionSide, SelectionType, SmartSelection};
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{Terminal, smart_word_in_cells};
 
 use crate::host::SessionHost;
 use crate::wire::{
@@ -209,6 +209,7 @@ fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
 ///
 /// Event-driven: registers a subscriber and parks on its wake (every output
 /// burst notifies), re-checking on each wake; the deadline is the backstop.
+/// A session that ends first answers `ERR exited`, like every await.
 pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let timeout_ms = match rest.trim() {
         "" => WAIT_DEFAULT_MS,
@@ -246,6 +247,11 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
             && baseline.is_none_or(|b| id > b)
         {
             return reply(id, exit);
+        }
+        // The session ended: nothing more can complete. A completion it made
+        // first was answered just above.
+        if host.session_ended(sid) {
+            return "ERR exited\n".to_string();
         }
         // The caller hung up: nobody can read the completion, so stop now.
         if sub.caller_gone() {
@@ -293,10 +299,14 @@ const WORD_WINDOW_MAX_ROWS: usize = 64;
 /// selects just the clicked cell.
 ///
 /// The rules run over
-/// [`Terminal::logical_line_text`](aterm_core::terminal::Terminal::logical_line_text),
-/// soft-wrapped rows joined and column-aligned, so a word straddling the wrap
-/// is one word and the returned cells may sit on different rows. A hard
-/// newline still bounds the run.
+/// [`Terminal::line_range_cells`](aterm_core::terminal::Terminal::line_range_cells),
+/// soft-wrapped rows joined with the cells each was read from, so a word
+/// straddling the wrap is one word and the returned cells may sit on
+/// different rows. A hard newline still bounds the run. The click and the
+/// word are mapped through those cells
+/// ([`smart_word_in_cells`](aterm_core::terminal::smart_word_in_cells)), never
+/// by re-measuring the text, so the word is selected in the cells the grid
+/// drew it in (ruling 2026-10-11, r16 selection-stride).
 #[must_use]
 pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, u16))> {
     let cols = usize::from(t.cols());
@@ -309,35 +319,29 @@ pub fn word_span(t: &Terminal, row: i32, col: u16) -> Option<((i32, u16), (i32, 
     // a small window and widen only when the match reaches an edge that is not
     // the line's own end.
     let (line_first, line_last) = t.logical_line_span(row);
-    // Columns as the grid drew them: an East Asian Ambiguous character takes
-    // the cells the `ambiguous_width` policy gives it.
-    let ambiguous = t.ambiguous_width();
     let mut back = WORD_WINDOW_ROWS;
     let mut fwd = WORD_WINDOW_ROWS;
-    let (first_row, start, end) = loop {
+    let (first_row, (start, end)) = loop {
         let win_first = row
             .saturating_sub(i32::try_from(back).unwrap_or(i32::MAX))
             .max(line_first);
         let win_last = row
             .saturating_add(i32::try_from(fwd).unwrap_or(i32::MAX))
             .min(line_last);
-        let text = t.line_range_text(win_first, win_last)?;
+        let (text, cells) = t.line_range_cells(win_first, win_last)?;
         let offset = usize::try_from(row.checked_sub(win_first)?).ok()?;
         let global = offset.checked_mul(cols)?.checked_add(usize::from(col))?;
-        // A click right of the text is an empty cell: `None` from the rules.
-        let (start, end) =
-            smart_rules().word_boundaries_at_column_with(&text, global, ambiguous)?;
+        // A click right of the text is no cell: `None`, as on whitespace.
+        let (bytes, columns) = smart_word_in_cells(smart_rules(), &text, &cells, global)?;
         // A match touching the window edge may continue past it. Widen and re-ask, unless
         // the edge IS the logical line's end, where there is nothing more to read.
-        let open_up = start == 0 && win_first > line_first;
-        let open_down = end
-            >= aterm_core::grapheme::byte_to_column_with(&text, text.len(), ambiguous)
-            && win_last < line_last;
+        let open_up = bytes.start == 0 && win_first > line_first;
+        let open_down = bytes.end >= text.len() && win_last < line_last;
         if !open_up && !open_down {
-            break (win_first, start, end);
+            break (win_first, columns);
         }
         if back.saturating_add(fwd) >= WORD_WINDOW_MAX_ROWS {
-            break (win_first, start, end);
+            break (win_first, columns);
         }
         if open_up {
             back = back.saturating_mul(2);
@@ -660,11 +664,17 @@ mod gesture_tests {
     /// soft-wrap rule. Every gesture is checked against this as well as the
     /// clipboard, since the paint is what the user trusts.
     fn highlighted_text(term: &Terminal) -> String {
+        highlighted_text_from(term, 0)
+    }
+
+    /// [`highlighted_text`] from selection-space row `first_row` (negative:
+    /// scrollback) down to the screen's last row.
+    fn highlighted_text_from(term: &Terminal, first_row: i32) -> String {
         let cols = term.cols();
         let rows = i32::from(term.rows());
         let mut out = String::new();
         let mut first = true;
-        for row in 0..rows {
+        for row in first_row..rows {
             let sel = term.text_selection();
             let lo = (0..cols).find(|&c| sel.contains(row, c));
             let hi = (0..cols).rev().find(|&c| sel.contains(row, c));
@@ -934,6 +944,169 @@ mod gesture_tests {
         assert!(term.row_continues_previous(1), "precondition: a soft wrap");
         assert_eq!(select_word(&mut term, 1, 0), ((0, 8), (1, 1)));
         assert_eq!(term.selection_to_string().as_deref(), Some("abcd"));
+    }
+
+    /// A double-click on a wrapped run selects the word in the cells the grid
+    /// drew it in when a row holds a VS16 base the grid kept one cell wide in
+    /// its last column (it has no room for the spacer), on the screen and from
+    /// scrollback. Re-measuring the row's text counted that base two columns,
+    /// so the run was one column longer than its stride and every word on
+    /// every later row was looked up one cell left of where it is drawn (r16
+    /// selection-stride).
+    #[test]
+    fn a_word_click_after_a_last_column_vs16_base_selects_the_word_drawn_there() {
+        let mut term = Terminal::new(4, 10);
+        term.process("abcd efgh\u{2714}\u{fe0f}ij klm".as_bytes());
+        assert_eq!(
+            term.cell_grapheme(0, 9).as_deref(),
+            Some("\u{2714}\u{fe0f}"),
+            "precondition: the base and its VS16 are in the last column"
+        );
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(term.cell_grapheme(1, 0).as_deref(), Some("i"));
+        assert_eq!(term.cell_grapheme(1, 3).as_deref(), Some("k"));
+        let words = |row: i32| {
+            [
+                ((row - 1, 5), ((row - 1, 5), (row - 1, 8)), "efgh"),
+                ((row, 0), ((row, 0), (row, 1)), "ij"),
+                ((row, 1), ((row, 0), (row, 1)), "ij"),
+                ((row, 3), ((row, 3), (row, 5)), "klm"),
+                ((row, 5), ((row, 3), (row, 5)), "klm"),
+            ]
+        };
+        for ((row, col), span, word) in words(1) {
+            assert_eq!(
+                select_word(&mut term, row, col),
+                span,
+                "click at ({row}, {col})"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some(word));
+            assert_eq!(highlighted_text(&term), word);
+        }
+        // The same run from scrollback, where a row is drawn from its stored
+        // line: the base is still one cell in the last column.
+        term.process(b"\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(term.get_line_text(-1, None).as_deref(), Some("ij klm"));
+        assert!(term.row_continues_previous(-1), "precondition: a soft wrap");
+        for ((row, col), span, word) in words(-1) {
+            assert_eq!(
+                select_word(&mut term, row, col),
+                span,
+                "click at ({row}, {col})"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some(word));
+        }
+    }
+
+    /// A double-click selects the word in the cells the grid drew it in when
+    /// two regional indicators were drawn into neighbouring cells out of order:
+    /// the grid folds a flag half only into the cell before the cursor, so they
+    /// stay two cells, two columns each, where a walk of the row's text pairs
+    /// them into one two-column flag. That moved every word after them two
+    /// cells left, and padded the row's end, which split the word `pqr`
+    /// straddling the wrap in two (r16 selection-stride).
+    #[test]
+    fn a_word_click_after_regional_indicators_drawn_apart_selects_the_word_drawn_there() {
+        let mut term = Terminal::new(4, 10);
+        term.process("\x1b[1;3H\u{1f1e7}\x1b[1;1H\u{1f1e6}\x1b[1;5Hwx yzpqr st".as_bytes());
+        assert_eq!(term.cell_grapheme(0, 0).as_deref(), Some("\u{1f1e6}"));
+        assert_eq!(
+            term.cell_grapheme(0, 2).as_deref(),
+            Some("\u{1f1e7}"),
+            "precondition: the flag halves stay two cells"
+        );
+        assert_eq!(term.cell_grapheme(0, 4).as_deref(), Some("w"));
+        assert_eq!(term.cell_grapheme(0, 9).as_deref(), Some("p"));
+        assert!(term.row_continues_previous(1), "precondition: a soft wrap");
+        assert_eq!(term.cell_grapheme(1, 0).as_deref(), Some("q"));
+        for ((row, col), span, word) in [
+            ((0, 4), ((0, 4), (0, 5)), "wx"),
+            ((0, 5), ((0, 4), (0, 5)), "wx"),
+            ((0, 7), ((0, 7), (1, 1)), "yzpqr"),
+            ((0, 9), ((0, 7), (1, 1)), "yzpqr"),
+            ((1, 0), ((0, 7), (1, 1)), "yzpqr"),
+            ((1, 4), ((1, 3), (1, 4)), "st"),
+        ] {
+            assert_eq!(
+                select_word(&mut term, row, col),
+                span,
+                "click at ({row}, {col})"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some(word));
+            assert_eq!(highlighted_text(&term), word);
+        }
+        // A click on a flag half is no word: just that cell.
+        assert!(word_span(&term, 0, 2).is_none());
+
+        // The same run from scrollback, on the ring tier, which draws a row
+        // from its own cells: the halves are still two cells there. Reading
+        // a history row's cells from its stored line paired them, so on the
+        // review's probe a click on `w` found no word and the copy was empty
+        // (r16 selection-stride review).
+        term.process(b"\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(term.get_line_text(-1, None).as_deref(), Some("qr st"));
+        assert!(term.row_continues_previous(-1), "precondition: a soft wrap");
+        term.scroll_display(2);
+        assert_eq!(
+            term.display_cell_grapheme(0, 2).as_deref(),
+            Some("\u{1f1e7}"),
+            "precondition: the ring tier draws the halves as two cells"
+        );
+        assert_eq!(term.display_cell_grapheme(0, 4).as_deref(), Some("w"));
+        term.scroll_to_bottom();
+        for ((row, col), span, word) in [
+            ((-2, 4), ((-2, 4), (-2, 5)), "wx"),
+            ((-2, 5), ((-2, 4), (-2, 5)), "wx"),
+            ((-2, 7), ((-2, 7), (-1, 1)), "yzpqr"),
+            ((-2, 9), ((-2, 7), (-1, 1)), "yzpqr"),
+            ((-1, 0), ((-2, 7), (-1, 1)), "yzpqr"),
+            ((-1, 4), ((-1, 3), (-1, 4)), "st"),
+        ] {
+            assert_eq!(
+                select_word(&mut term, row, col),
+                span,
+                "scrollback click at ({row}, {col})"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some(word));
+        }
+        assert!(word_span(&term, -2, 2).is_none());
+    }
+
+    /// A word double-clicked in a history row written before a live switch
+    /// to `ambiguous_width = "wide"` copies the word drawn there. The row
+    /// keeps the cells it was drawn in (two one-cell arrows, `foo` in cells
+    /// 2-4); the copy of a history row re-measured its text under the policy
+    /// now in force, two cells an arrow, so the highlight covered `foo` and
+    /// the clipboard got `→f` (r16 selection-stride review; on origin/main
+    /// the click selected one cell and copied `→`).
+    #[test]
+    fn a_word_copied_from_history_after_a_live_ambiguous_switch_is_the_word_drawn_there() {
+        let mut term = Terminal::new(4, 20);
+        term.process("→→foo bar".as_bytes());
+        term.apply_config(&aterm_core::config::TerminalConfig {
+            ambiguous_width_double: true,
+            ..Default::default()
+        });
+        term.process(b"\r\n1\r\n2\r\n3\r\n4");
+        assert_eq!(term.get_line_text(-1, None).as_deref(), Some("→→foo bar"));
+        term.scroll_display(1);
+        assert_eq!(
+            term.display_cell_grapheme(0, 2).as_deref(),
+            Some("f"),
+            "precondition: the row keeps the cells it was drawn in"
+        );
+        term.scroll_to_bottom();
+        for col in 2..=4 {
+            assert_eq!(
+                select_word(&mut term, -1, col),
+                ((-1, 2), (-1, 4)),
+                "col {col}"
+            );
+            assert_eq!(term.selection_to_string().as_deref(), Some("foo"));
+            assert_eq!(highlighted_text_from(&term, -1), "foo");
+        }
+        assert_eq!(select_word(&mut term, -1, 6), ((-1, 6), (-1, 8)));
+        assert_eq!(term.selection_to_string().as_deref(), Some("bar"));
     }
 
     /// An ordinary unwrapped line still selects exactly itself, word and line

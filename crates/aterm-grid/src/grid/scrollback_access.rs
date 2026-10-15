@@ -276,6 +276,42 @@ impl Grid {
         Some(scroll_materialize::materialize_from_line(&line, cols))
     }
 
+    /// The cells history line `idx` (0 = oldest) is drawn in, when the ring
+    /// tier draws it from its own cells: `push(bytes, col, width, count)` in
+    /// column order, as [`stored_line_cells`](scroll_materialize::stored_line_cells)
+    /// yields them, `bytes` the first cell's text in `text`, the line's text
+    /// as read ([`history_line_rev`](Self::history_line_rev) or the dense
+    /// walk, bounded), and `true`.
+    ///
+    /// `false` when the row is drawn by
+    /// [`stored_line_cells`](scroll_materialize::stored_line_cells), the walk
+    /// to read it with: a line past the ring tier, or a ring row the fast
+    /// path declines. The cells pushed before a `false` are not the row's.
+    ///
+    /// Why (r16 selection-stride review, 2026-10-11): the ring tier draws a
+    /// row from its cells ([`materialize_scrollback_row_full`](Self::materialize_scrollback_row_full)),
+    /// which keep apart what the stored walk joins (two flag halves drawn out
+    /// of order stay two cells), so reading every history row's cells from
+    /// its stored line put a double-click's word, a copy's columns and a
+    /// find match up to two cells off where the ring tier draws them.
+    pub fn ring_history_cells(
+        &self,
+        idx: usize,
+        text: &str,
+        push: impl FnMut(std::ops::Range<usize>, u16, u16, u16),
+    ) -> bool {
+        let Some(rev_idx) = idx
+            .checked_add(1)
+            .and_then(|n| self.storage.scrollback_lines().checked_sub(n))
+        else {
+            return false;
+        };
+        let Some((row, extras)) = self.ring_history_row_at_rev(rev_idx) else {
+            return false;
+        };
+        scroll_materialize::ring_row_cells(row, extras, self.cols(), text, push)
+    }
+
     /// Total history lines; same as [`Self::scrollback_lines`].
     #[must_use]
     #[inline]

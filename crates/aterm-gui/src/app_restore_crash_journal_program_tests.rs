@@ -179,7 +179,7 @@ fn name_group(app: &App, id: u64, pgid: i32, program: &str) {
     timeline.set_program(pgid, Some(program.to_string()));
 }
 
-/// Kill everything this test started, by `SIGKILL` (AGENTS.md rule 6).
+/// Kill everything this test started, by `SIGKILL` (AGENTS.md).
 fn kill_all(pids: &[i32], masters: &[i32]) {
     for pid in pids {
         // SAFETY: each pid is a process this test started (or its job),
@@ -411,6 +411,7 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
         home: None,
         login: None,
         codex: None,
+        cause: None,
     };
     manifest.fill_agents(&|id| (id == 2).then(|| hosted.clone()));
     let programs = app.crash_journal_programs(&manifest);
@@ -580,6 +581,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
         dialect: None,
         login: None,
         home: None,
+        claude_dir: None,
     };
     crate::harness_host::publish_snapshot_for_test(&sid, Some(&agent));
     let hosted = app.capture_restore_manifest();

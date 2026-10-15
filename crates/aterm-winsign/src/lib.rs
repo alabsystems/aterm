@@ -34,8 +34,11 @@
 //!   default Authenticode policy, its leaf must be issued to exactly the
 //!   anchored publisher, and it must carry a timestamp — or the verb fails.
 //!   The anchor is the leaf certificate's subject Common Name as `signtool
-//!   verify /v` prints it after `Issued to:`; it is committed, never read from
-//!   the environment, so a build signed by the wrong identity cannot pass.
+//!   verify /v` prints it after the LAST, most indented `Issued to:` of the
+//!   signing chain (signtool lists the root first; see
+//!   [`parse_verify_output`]), and as `winsign verify` prints it after
+//!   `signed by`. It is committed, never read from the environment, so a build
+//!   signed by the wrong identity cannot pass.
 //!
 //! # Where each value comes from
 //!
@@ -702,8 +705,32 @@ pub struct VerifyReport {
 /// Parse signtool's verbose verify output. Tolerant of wording drift on
 /// purpose: absence of a marker reads as absence of the property, never as a
 /// panic, and the raw text is what the verb prints when something is off.
+///
+/// # The leaf is the LAST certificate of the chain, and the most indented
+///
+/// `signtool verify /pa /v` prints the Signing Certificate Chain from the ROOT
+/// down. Each certificate is indented one level deeper than its issuer, so the
+/// signer's own certificate comes last and deepest. Microsoft's documented
+/// `verify /v` example has this shape, and so does any Windows binary's output.
+/// The parser used to keep the first `Issued to:`, which is the root's name. A
+/// publisher pin copied from that would accept every exe chaining to the same
+/// root, and a pin on the real leaf would refuse every correctly signed one.
+///
+/// Ruling 2026-10-10: the leaf is the last certificate in the block, and only
+/// when it is indented deeper than every certificate before it. A block that
+/// does not have that shape, such as one listing two certificates at one depth,
+/// is not signtool's chain. Such a block yields no leaf, and an active tier
+/// refuses it ("printed no signing certificate chain"); a guess would pin the
+/// wrong certificate. A one-certificate chain (self-signed) is its own leaf.
 #[must_use]
 pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
+    /// One certificate of the printed chain: its depth (leading whitespace) and
+    /// its `Issued to:` / `Issued by:` values.
+    struct Cert {
+        depth: usize,
+        to: String,
+        by: Option<String>,
+    }
     let text = format!("{}\n{}", ran.stdout, ran.stderr);
     let mut report = VerifyReport {
         verified: ran.code == Some(0) && text.contains("Successfully verified"),
@@ -713,23 +740,35 @@ pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
         timestamped: text.contains("The signature is timestamped"),
         ..VerifyReport::default()
     };
+    let mut chain: Vec<Cert> = Vec::new();
     let mut in_chain = false;
     for line in text.lines() {
         let l = line.trim();
         if l.starts_with("Signing Certificate Chain:") {
-            in_chain = true;
+            // The primary signature's chain is the one that counts; a second
+            // block is never merged into it.
+            in_chain = chain.is_empty();
             continue;
         }
         if !in_chain {
             continue;
         }
+        // The indentation in bytes: where the first non-blank character starts.
+        let depth = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
         if let Some(v) = l.strip_prefix("Issued to:") {
-            if report.issued_to.is_none() {
-                report.issued_to = Some(v.trim().to_string());
-            }
+            chain.push(Cert {
+                depth,
+                to: v.trim().to_string(),
+                by: None,
+            });
         } else if let Some(v) = l.strip_prefix("Issued by:") {
-            if report.issued_by.is_none() {
-                report.issued_by = Some(v.trim().to_string());
+            if let Some(cert) = chain
+                .last_mut()
+                .filter(|c| c.depth == depth && c.by.is_none())
+            {
+                cert.by = Some(v.trim().to_string());
             }
         } else if l.starts_with("The signature is timestamped")
             || l.starts_with("Timestamp Verified by:")
@@ -738,6 +777,13 @@ pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
         {
             in_chain = false;
         }
+    }
+    let leaf = chain
+        .split_last()
+        .filter(|(leaf, issuers)| issuers.iter().all(|c| c.depth < leaf.depth));
+    if let Some((leaf, _)) = leaf {
+        report.issued_to = Some(leaf.to.clone());
+        report.issued_by.clone_from(&leaf.by);
     }
     report
 }
@@ -1226,28 +1272,59 @@ mod tests {
         }
     }
 
+    /// `signtool verify /pa /v` over an Artifact Signing signature, in the
+    /// layout signtool prints (Microsoft's documented `verify /v` example has
+    /// it too): each chain from the ROOT down, every certificate one level
+    /// deeper than its issuer, the signer's leaf last. The SHA1 values are
+    /// placeholders.
     const VERIFIED: &str = "Verifying: aterm.exe
+
 Signature Index: 0 (Primary Signature)
 Hash of file (sha256): AB
+
 Signing Certificate Chain:
-    Issued to: Andrew Yates
-    Issued by: Microsoft ID Verified CS EOC CA 01
-    Expires:   Wed Sep 16 00:00:00 2026
+    Issued to: Microsoft Identity Verification Root Certificate Authority 2020
+    Issued by: Microsoft Identity Verification Root Certificate Authority 2020
+    Expires:   Mon Apr 16 18:44:40 2045
     SHA1 hash: 11
 
-    Issued to: Microsoft ID Verified CS EOC CA 01
-    Issued by: Microsoft ID Verified Code Signing PCA 2021
-    Expires:   Mon Apr 13 00:00:00 2036
-    SHA1 hash: 22
+        Issued to: Microsoft ID Verified Code Signing PCA 2021
+        Issued by: Microsoft Identity Verification Root Certificate Authority 2020
+        Expires:   Mon Apr 01 20:05:20 2036
+        SHA1 hash: 22
+
+            Issued to: Microsoft ID Verified CS EOC CA 01
+            Issued by: Microsoft ID Verified Code Signing PCA 2021
+            Expires:   Mon Apr 13 17:31:53 2026
+            SHA1 hash: 33
+
+                Issued to: Andrew Yates
+                Issued by: Microsoft ID Verified CS EOC CA 01
+                Expires:   Wed Sep 16 00:00:00 2026
+                SHA1 hash: 44
 
 The signature is timestamped: Mon Sep 15 10:00:00 2026
 Timestamp Verified by:
-    Issued to: Microsoft Public RSA Timestamping CA 2020
+    Issued to: Microsoft Identity Verification Root Certificate Authority 2020
     Issued by: Microsoft Identity Verification Root Certificate Authority 2020
+    Expires:   Mon Apr 16 18:44:40 2045
+    SHA1 hash: 11
+
+        Issued to: Microsoft Public RSA Timestamping CA 2020
+        Issued by: Microsoft Identity Verification Root Certificate Authority 2020
+        Expires:   Mon Nov 19 20:42:31 2035
+        SHA1 hash: 55
+
+            Issued to: Microsoft Public RSA Time Stamping Authority
+            Issued by: Microsoft Public RSA Timestamping CA 2020
+            Expires:   Thu Feb 15 20:36:12 2027
+            SHA1 hash: 66
 
 Successfully verified: aterm.exe
 
 Number of files successfully Verified: 1
+Number of warnings: 0
+Number of errors: 0
 ";
 
     const UNTRUSTED: &str = "Verifying: aterm.exe
@@ -1284,15 +1361,72 @@ Number of errors: 1
         );
     }
 
+    /// THE SIGNER IS THE LEAF, which signtool prints LAST (ruling 2026-10-10).
+    /// The parser used to keep the chain's first `Issued to:`, the root. So
+    /// `winsign verify` printed the root as the signer, and a pin copied from
+    /// it accepted every exe under that root. Same reading with Windows line
+    /// endings.
     #[test]
-    fn a_verified_chain_is_read_back_leaf_first() {
-        let r = parse_verify_output(&ran(0, VERIFIED));
-        assert!(r.verified && r.signed && r.timestamped && !r.untrusted_root);
-        assert_eq!(r.issued_to.as_deref(), Some("Andrew Yates"));
-        assert_eq!(
-            r.issued_by.as_deref(),
-            Some("Microsoft ID Verified CS EOC CA 01")
+    fn a_verified_chain_is_read_back_as_its_leaf_not_its_root() {
+        for text in [VERIFIED.to_string(), VERIFIED.replace('\n', "\r\n")] {
+            let r = parse_verify_output(&ran(0, &text));
+            assert!(r.verified && r.signed && r.timestamped && !r.untrusted_root);
+            assert_eq!(r.issued_to.as_deref(), Some("Andrew Yates"));
+            assert_eq!(
+                r.issued_by.as_deref(),
+                Some("Microsoft ID Verified CS EOC CA 01")
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROLS. Another customer's leaf under the same root is
+    /// refused by the pin, and so is a pin on the root's name (what the old
+    /// parser printed as the signer). A block that is not signtool's chain
+    /// shape (two certificates at one depth, as this crate's old fixture was
+    /// written) names no leaf and is refused rather than guessed at.
+    #[test]
+    fn the_pin_names_one_leaf_and_never_the_root_it_chains_to() {
+        let root = "Microsoft Identity Verification Root Certificate Authority 2020";
+        let other = VERIFIED.replace(
+            "Issued to: Andrew Yates",
+            "Issued to: Mallory Unrelated Customer LLC",
         );
+        let e = judge(
+            &tier_from("Andrew Yates"),
+            &parse_verify_output(&ran(0, &other)),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("signed by `Mallory Unrelated Customer LLC`"),
+            "{e}"
+        );
+        for text in [VERIFIED, other.as_str()] {
+            let e = judge(&tier_from(root), &parse_verify_output(&ran(0, text))).unwrap_err();
+            assert!(
+                e.contains("is `Microsoft Identity Verification Root"),
+                "{e}"
+            );
+        }
+
+        let flat = "Verifying: aterm.exe
+Signing Certificate Chain:
+    Issued to: Andrew Yates
+    Issued by: Microsoft ID Verified CS EOC CA 01
+
+    Issued to: Microsoft ID Verified CS EOC CA 01
+    Issued by: Microsoft ID Verified Code Signing PCA 2021
+
+The signature is timestamped: Mon Sep 15 10:00:00 2026
+Successfully verified: aterm.exe
+";
+        let r = parse_verify_output(&ran(0, flat));
+        assert_eq!((r.issued_to, r.issued_by), (None, None));
+        let e = judge(
+            &tier_from("Andrew Yates"),
+            &parse_verify_output(&ran(0, flat)),
+        )
+        .unwrap_err();
+        assert!(e.contains("no signing certificate chain"), "{e}");
     }
 
     #[test]

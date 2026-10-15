@@ -66,9 +66,12 @@
 //!    own; it gives that watch its stamp's time.
 //! 7. THE KILL WAITS OUT ANOTHER HAND (ruling 11, review of 1a733ed60): a
 //!    hold, another driver's lease or named turn, or another supervisor's
-//!    claim that lands AFTER the act started — what the exit's reader leaves
-//!    to its holder ([`another_hand`]) — is read again right before each
-//!    discard and each `killpg(SIGKILL)`; while it stands nothing is sent and
+//!    claim that lands AFTER the act started ([`another_hand`]) is read again
+//!    right before each discard and each `killpg(SIGKILL)`, so that the
+//!    exit's reader reads the act's end with no such hand on the tab — under
+//!    a hold, a lease or a turn it carries an asked exit until the hand
+//!    lifts (ruling 20 of 2026-10-14), under a claim it leaves it to that
+//!    supervisor (ruling 17) — and while it stands nothing is sent and
 //!    the program is watched as one away from its tab is. Once the hand
 //!    clears the act finishes, and its exit is relaunched by the stamp; a
 //!    hand that outlasts the stamp lets the program go, as ruling 8 does.
@@ -76,6 +79,14 @@
 //!    12), nor in its last [`KILL_READ_MARGIN`], when its exit would be read
 //!    after the stamp went stale (ruling 16): neither by the act's watch nor
 //!    by a carrier.
+//! 8. THE KILL LEAVES ITS READER WHAT IT READS BY (rulings 21 and 22 of
+//!    2026-10-14): the exit's reader takes it for the act's by the tab's
+//!    stamp ON DISK and by the host's snapshot of the agent, so a watch reads
+//!    both again on every look ([`kill`]). One whose tab's stamp no longer
+//!    names its program — another act's replaced it (one per tab), or it was
+//!    taken — lets it go in that look ([`Watch::left`]); one whose host holds
+//!    no snapshot of the program (a successor that has not read the agent
+//!    since its Commit) holds its `SIGKILL` back until it does.
 //!
 //! A seamless update's Commit inside the grace ends the act's thread with
 //! the outgoing instance; the stamp is on disk, and the successor's CARRIER
@@ -446,7 +457,7 @@ impl Stamped<'_> {
                 } else {
                     renew(state, sid, stamp)
                 };
-                spawn_escalation(Arc::downgrade(ctx), pgrp, &stamp);
+                spawn_escalation(Arc::downgrade(ctx), state, pgrp, &stamp);
                 let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
                 format!("OK restarting pid {pgrp} cause={}{tail}\n", cause.word())
             }
@@ -600,6 +611,11 @@ pub(crate) struct Watch {
     pgrp: i32,
     pid: u32,
     start: String,
+    /// The harness state directory the tab's stamp lives in, read again on
+    /// every look ([`Watch::named`], ruling 21): handed down by the act or
+    /// the carrier that started the watch, since the watch's own thread
+    /// cannot read theirs (a test world's is per thread).
+    state: std::path::PathBuf,
 }
 
 /// THE ONE WATCH ON A PROCESS (ruling 19 of 2026-10-09, bug hunt 7): a
@@ -616,8 +632,10 @@ pub(crate) struct Watch {
 /// whole life, against a window that runs at 256 descriptors when launchd
 /// starts it. A watch that lets its program go unlists itself in the very
 /// look that decides it ([`Watch::left`]): an act after that finds none and
-/// gets a watch of its own, with its whole time (ruling 18).
-pub(crate) fn watch(pgrp: i32, stamp: &Stamp) -> Option<Watch> {
+/// gets a watch of its own, with its whole time (ruling 18). `state`: the
+/// harness state directory `stamp` was written in, which the watch reads the
+/// tab's stamp from again on every look (ruling 21).
+pub(crate) fn watch(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Option<Watch> {
     let until = stands_until(stamp);
     with_watches(|listed| {
         if let Some(running) = listed
@@ -627,7 +645,7 @@ pub(crate) fn watch(pgrp: i32, stamp: &Stamp) -> Option<Watch> {
             running.stands_until = running.stands_until.max(until);
             return None;
         }
-        Some(Watch::listed_in(listed, pgrp, stamp, until))
+        Some(Watch::listed_in(listed, state, pgrp, stamp, until))
     })
 }
 
@@ -635,9 +653,9 @@ pub(crate) fn watch(pgrp: i32, stamp: &Stamp) -> Option<Watch> {
 /// escalation's own tests, which run one with clocks of their own beside an
 /// act's.
 #[cfg(test)]
-pub(crate) fn watch_beside(pgrp: i32, stamp: &Stamp) -> Watch {
+pub(crate) fn watch_beside(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Watch {
     let until = stands_until(stamp);
-    with_watches(|listed| Watch::listed_in(listed, pgrp, stamp, until))
+    with_watches(|listed| Watch::listed_in(listed, state, pgrp, stamp, until))
 }
 
 /// How many watches run on `pgrp` now (one at most, outside
@@ -653,7 +671,8 @@ pub(crate) fn escalating(pgrp: i32) -> bool {
     watches(pgrp) > 0
 }
 
-/// [`ESCALATING`], locked for `f` alone (which takes no other lock).
+/// [`ESCALATING`], locked for `f` alone (which takes no other lock; it may
+/// read a tab's stamp file, [`Watch::left`]).
 fn with_watches<R>(f: impl FnOnce(&mut Vec<Watched>) -> R) -> R {
     f(&mut ESCALATING
         .lock()
@@ -678,8 +697,25 @@ fn kill_until_of(stands_until: Instant) -> Option<Instant> {
     stands_until.checked_sub(KILL_READ_MARGIN)
 }
 
+/// Why a watch lets its program go ([`Watch::left`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LetGo {
+    /// The latest stamp it watches by no longer stands long enough to be
+    /// read (rulings 12 and 16), or it is listed no more.
+    Lapsed,
+    /// The tab's stamp on disk no longer names its program (ruling 21):
+    /// another act's replaced it, or it was taken.
+    Unnamed,
+}
+
 impl Watch {
-    fn listed_in(listed: &mut Vec<Watched>, pgrp: i32, stamp: &Stamp, until: Instant) -> Self {
+    fn listed_in(
+        listed: &mut Vec<Watched>,
+        state: &std::path::Path,
+        pgrp: i32,
+        stamp: &Stamp,
+        until: Instant,
+    ) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         listed.push(Watched {
@@ -693,7 +729,25 @@ impl Watch {
             pgrp,
             pid: stamp.pid,
             start: stamp.start.clone(),
+            state: state.to_path_buf(),
         }
+    }
+
+    /// THE TAB'S STAMP ON DISK STILL NAMES ITS PROGRAM AND STANDS (ruling 21
+    /// of 2026-10-14): what the exit's reader looks up (`Acts::asked`,
+    /// [`restart_stamp::lookup`]) — read again on every look, not only the
+    /// time the watch was handed. Before, a stopped program whose tab then ran
+    /// another agent that was restarted (its stamp replacing this one's, one
+    /// per tab) was still `SIGKILL`ed by this watch after `fg`, and its exit,
+    /// which no stamp named any more, was read as the person's (the `fg`) or
+    /// a crash: never as the act's. A missing stamp is read as one that
+    /// names it no more (taken), which is final: so no reader of the tab's
+    /// stamp ever moves one it does not take ([`restart_stamp::take_if`]
+    /// judges it where it stands — moved aside to be judged, it was missing
+    /// for a moment, and a look then let its program go).
+    fn named(&self, tab: &str) -> bool {
+        let now = aterm_time::unix_secs().unwrap_or(0);
+        restart_stamp::standing(&self.state, tab, self.pid, &self.start, now).is_some()
     }
 
     /// Whether its last instant to send a `KILL` in ([`kill_until_of`]), by
@@ -710,23 +764,34 @@ impl Watch {
         })
     }
 
-    /// How long it may still wait for its program — or, that time passed,
-    /// `None`, and the watch is UNLISTED IN THE SAME LOOK, under the lock an
-    /// act that finds it takes: that act either gave it its time before this
-    /// look (and it waits on) or finds no watch after it (and starts its
-    /// own). Never a watch that lets go after an act gave it the time to
-    /// finish in, and spawned nothing (ruling 18).
-    fn left(&self) -> Option<Duration> {
+    /// How long it may still wait for its program in tab `tab` — or, that
+    /// time passed or the tab's stamp naming it no more ([`Self::named`]), why
+    /// it lets go, and the watch is UNLISTED IN THE SAME LOOK, under the lock
+    /// an act that finds it takes: that act either gave it its time — its
+    /// stamp written first — before this look (and it waits on) or finds no
+    /// watch after it (and starts its own). Never a watch that lets go after
+    /// an act gave it the time to finish in, and spawned nothing (ruling 18).
+    fn left(&self, tab: &str) -> Result<Duration, LetGo> {
         with_watches(|listed| {
-            let at = listed.iter().position(|w| w.id == self.id)?;
+            let at = listed
+                .iter()
+                .position(|w| w.id == self.id)
+                .ok_or(LetGo::Lapsed)?;
             let left = kill_until_of(listed[at].stands_until).map_or(Duration::ZERO, |until| {
                 until.saturating_duration_since(Instant::now())
             });
-            if left.is_zero() {
+            let gone = if left.is_zero() {
+                Some(LetGo::Lapsed)
+            } else if !self.named(tab) {
+                Some(LetGo::Unnamed)
+            } else {
+                None
+            };
+            if let Some(why) = gone {
                 listed.swap_remove(at);
-                return None;
+                return Err(why);
             }
-            Some(left)
+            Ok(left)
         })
     }
 }
@@ -741,12 +806,14 @@ impl Drop for Watch {
     }
 }
 
-/// The processes whose watch holds its `SIGKILL` back right now because
-/// another hand holds their tab ([`kill`], [`another_hand`]), by pid: what a
-/// test reads to see a watch wait a hand out.
+/// The processes whose watch holds its `SIGKILL` back right now for someone
+/// else ([`kill`]): another hand holds their tab ([`another_hand`]), or the
+/// host holds no snapshot of the program its exit's reader would read it by
+/// yet ([`read_by_host`]), by pid: what a test reads to see a watch wait.
 static HELD_OFF: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
-/// Whether the watch on `pgrp` is waiting out another hand on its tab now.
+/// Whether the watch on `pgrp` is waiting out another hand on its tab, or
+/// its host's read of it, now.
 #[cfg(test)]
 pub(crate) fn held_off(pgrp: i32) -> bool {
     HELD_OFF
@@ -782,15 +849,18 @@ impl Drop for Listed {
     }
 }
 
-/// ANOTHER HAND ON `ctx`'s SESSION at `now_us`: exactly what the reader of
-/// the agent's exit takes for the exit's owner and leaves to them
-/// (`harness_host`'s `claimed_by_another`, then
-/// [`aterm_agent::harness::relaunch::held_by_someone`]) — a live supervisor
+/// ANOTHER HAND ON `ctx`'s SESSION at `now_us`: what the act's `SIGKILL`
+/// waits out — the hands the reader of an UNASKED exit takes for the exit's
+/// owner and leaves to them (`harness_host`'s `claimed_by_another`, then
+/// [`aterm_agent::harness::relaunch::held_by_someone`]): a live supervisor
 /// claim that is no window host's
 /// ([`aterm_agent::harness::upgrade_drive::is_host_holder`]), a halt (a fleet
 /// hold, the bridge-lost auto-hold, the owner's local hold), a turn a NAMED
 /// driver runs, or another holder's live drive lease (this host's own hand
-/// is not another's; an unnamed turn is an owner-class caller's).
+/// is not another's; an unnamed turn is an owner-class caller's). The act's
+/// own end the reader leaves only under the claim; through a halt, a lease
+/// or a turn it carries it and relaunches it once that lifts (ruling 20 of
+/// 2026-10-14, [`aterm_agent::harness::relaunch::hand_on_tab`]).
 ///
 /// The act's `SIGKILL` waits it out ([`kill`], ruling 11 of 2026-10-08):
 /// sent under it, the reader left the agent the act had just killed at a
@@ -825,6 +895,23 @@ pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
 /// its tab ([`kill`]: a job stopped from elsewhere, its shell in front).
 pub(crate) const LOOK_AGAIN: Duration = Duration::from_secs(1);
 
+/// THE HOST HOLDS WHAT THE EXIT'S READER READS THE PROGRAM BY (ruling 22 of
+/// 2026-10-14): its published snapshot of tab `tab`'s agent names the process
+/// `pid` started at `start` ([`crate::harness_host::published_snapshot`]),
+/// as the act's fence required at the act (`not-the-hosts-agent`). The exit
+/// a `KILL` makes is read by the host's worker holding that snapshot — or,
+/// once it is handed no worker, by one the host starts on it — and relaunched
+/// by the stamp; with none, nothing reads that end at all. A successor
+/// after a Commit holds none until its host names the agent again: a program
+/// stopped across the Commit and resumed by `fg` was `SIGKILL`ed by the
+/// carrier as it led its tab again, before the successor's host had read it,
+/// and the agent the act ended was left at its shell (ruling 13's other
+/// order, driven 2026-10-14).
+fn read_by_host(tab: &str, pid: u32, start: &str) -> bool {
+    crate::harness_host::published_snapshot(tab)
+        .is_some_and(|snap| snap.pid == pid && snap.start == start)
+}
+
 /// HOW LONG A STAMP MUST STILL STAND FOR THE ACT'S `SIGKILL` (ruling 16 of
 /// 2026-10-08, review of 1a733ed60): the exit a `KILL` makes is read by
 /// LOOKUP — by the host's worker once the roster drops the agent, by a
@@ -843,15 +930,16 @@ pub(crate) const LOOK_AGAIN: Duration = Duration::from_secs(1);
 /// act's own.
 pub(crate) const KILL_READ_MARGIN: Duration = Duration::from_secs(30);
 
-/// Start the act's escalation thread for the leader `pgrp` its `stamp` names
-/// (step 6) — unless a watch already ends that very process ([`watch`]):
+/// Start the act's escalation thread for the leader `pgrp` its `stamp` (in the
+/// harness state directory `state`) names (step 6) — unless a watch already
+/// ends that very process ([`watch`]):
 /// then that watch is given `stamp`'s time and nothing starts. Listed in
 /// [`ESCALATING`] before this returns, so the verb's reply is never read
 /// before its watch.
 #[cfg(unix)]
-fn spawn_escalation(ctx: Weak<SessionCtx>, pgrp: i32, stamp: &Stamp) {
+fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, stamp: &Stamp) {
     let cause = stamp.cause;
-    let Some(watch) = watch(pgrp, stamp) else {
+    let Some(watch) = watch(state, pgrp, stamp) else {
         aterm_log::info!(
             "restart: pid {pgrp} (cause={}): already watched; that watch ends it by this \
              act's stamp",
@@ -925,9 +1013,13 @@ enum Withheld {
     /// Another hand holds the session ([`another_hand`], ruling 11).
     Hand,
     /// Its stamp no longer stands (ruling 12), or not for
-    /// [`KILL_READ_MARGIN`] more (ruling 16): no reader would take its exit
-    /// for the act's.
+    /// [`KILL_READ_MARGIN`] more (ruling 16), or the tab's stamp on disk
+    /// names it no more (ruling 21): no reader would take its exit for the
+    /// act's.
     Lapsed,
+    /// The host holds no snapshot of it yet ([`read_by_host`], ruling 22):
+    /// nobody would read its exit.
+    Unread,
 }
 
 impl Withheld {
@@ -938,6 +1030,7 @@ impl Withheld {
             Self::Away => "never led its tab again while its stamp stood; nothing sent",
             Self::Hand => "another hand held its tab while its stamp stood; nothing sent",
             Self::Lapsed => "its stamp no longer stands long enough to be read; nothing sent",
+            Self::Unread => "the host never read it again while its stamp stood; nothing sent",
         }
     }
 
@@ -946,6 +1039,7 @@ impl Withheld {
     fn ended(self) -> &'static str {
         match self {
             Self::Hand => "ended while another hand held its tab; nothing sent",
+            Self::Unread => "ended before the host read it again; nothing sent",
             Self::Away | Self::Lapsed => "ended away from its tab; nothing sent",
         }
     }
@@ -954,22 +1048,25 @@ impl Withheld {
 /// The act's (or the carrier's) `SIGKILL` of the leader its `watch` is on,
 /// after step 4's re-read on the session's own master: the input dropped
 /// first, the watch woken after. Right before the discard and again right
-/// before the `killpg`, three things are read: that it still leads its tab
+/// before the `killpg`, four things are read: that it still leads its tab
 /// (step 4), that no other hand holds the session ([`another_hand`]: ruling
 /// 11 — a hold, a lease, a named turn or another supervisor's claim that
-/// landed after the act started), and that its stamp still stands,
+/// landed after the act started), that its stamp still stands,
 /// [`KILL_READ_MARGIN`] to spare, so its exit is read while it does (rulings
 /// 12 and 16: never a `SIGKILL` its stamp no longer stands for) — the
 /// latest stamp the watch watches by, read again on every look: an act that
 /// found this watch running gave it its stamp's time instead of starting
-/// its own ([`watch`], ruling 19). A program that is alive but does not lead
-/// its tab — a job stopped from elsewhere inside the grace, its shell taking
-/// the terminal back — or whose tab another hand holds is WATCHED, not let
-/// go (review of 3eaa8f83c: let go, its stamp stood, and a person's own
-/// later exit read as the act's): looked at again every [`LOOK_AGAIN`] until
-/// it can be ended (then ended), exits, or that margin before the stamp's
-/// end passes — and the watch lets it go, unlisted in that same look
-/// ([`Watch::left`]). Its word, for the log.
+/// its own ([`watch`], ruling 19) — and names it ON DISK, as the reader
+/// looks it up (ruling 21), and that the host holds the snapshot its exit's
+/// reader reads it by ([`read_by_host`], ruling 22). A program that is
+/// alive but does not lead its tab — a job stopped from elsewhere inside the
+/// grace, its shell taking the terminal back — whose tab another hand
+/// holds, or that its host has not read again is WATCHED, not let go
+/// (review of 3eaa8f83c: let go, its stamp stood, and a person's own later
+/// exit read as the act's): looked at again every [`LOOK_AGAIN`] until it
+/// can be ended (then ended), exits, or that margin before the stamp's end
+/// passes — or the tab's stamp names it no more — and the watch lets it go,
+/// unlisted in that same look ([`Watch::left`]). Its word, for the log.
 #[cfg(unix)]
 #[cfg_attr(
     test,
@@ -981,19 +1078,22 @@ impl Withheld {
 )]
 fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
     let (pgrp, pid, start) = (watch.pgrp, watch.pid, watch.start.as_str());
-    let mut held_off: Option<Listed> = None;
+    let mut held_off: Option<(Withheld, Listed)> = None;
     loop {
         let Some(ctx) = ctx.upgrade() else {
             return "its session is gone; nothing sent";
         };
         let master = ctx.sink.master();
+        let tab = ctx.self_id.as_str().to_string();
         let withheld = || {
             if !leads(master, pgrp, start) {
                 Some(Withheld::Away)
             } else if another_hand(&ctx, crate::metrics::now_us()) {
                 Some(Withheld::Hand)
-            } else if watch.lapsed() {
+            } else if watch.lapsed() || !watch.named(&tab) {
                 Some(Withheld::Lapsed)
+            } else if !read_by_host(&tab, pid, start) {
+                Some(Withheld::Unread)
             } else {
                 None
             }
@@ -1016,20 +1116,33 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
         }
         drop(ctx);
         let why = why.unwrap_or(Withheld::Away);
-        if why != Withheld::Hand {
+        if !matches!(why, Withheld::Hand | Withheld::Unread) {
             held_off = None;
-        } else if held_off.is_none() {
-            aterm_log::info!(
-                "restart: pid {pgrp}: another hand holds its tab (a hold, another driver's lease \
-                 or turn, another supervisor's claim); its SIGKILL waits while its stamp stands"
-            );
-            held_off = Some(Listed::on(&HELD_OFF, pgrp));
+        } else if held_off.as_ref().is_none_or(|(was, _)| *was != why) {
+            if why == Withheld::Hand {
+                aterm_log::info!(
+                    "restart: pid {pgrp}: another hand holds its tab (a hold, another driver's \
+                     lease or turn, another supervisor's claim); its SIGKILL waits while its stamp \
+                     stands"
+                );
+            } else {
+                aterm_log::info!(
+                    "restart: pid {pgrp}: the host has not read it again (a successor that has not \
+                     named it since its Commit); its SIGKILL waits for that read while its stamp \
+                     stands"
+                );
+            }
+            held_off = Some((why, Listed::on(&HELD_OFF, pgrp)));
         }
         if !restart_stamp::alive_as(pid, start) {
             return "ended; nothing sent";
         }
-        let Some(left) = watch.left() else {
-            return why.gave_up();
+        let left = match watch.left(&tab) {
+            Ok(left) => left,
+            Err(LetGo::Lapsed) => return why.gave_up(),
+            Err(LetGo::Unnamed) => {
+                return "its tab's stamp names it no more (another act's replaced it); nothing sent";
+            }
         };
         if aterm_agent::harness::upgrade_wake::wait_exit(pid, left.min(LOOK_AGAIN)) {
             return why.ended();
@@ -1052,8 +1165,11 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
 /// Nor is one standing no more than [`KILL_READ_MARGIN`]: no `KILL` of
 /// [`kill`]'s would be sent for it (ruling 16). Listed as an act's watch is
 /// ([`watch`], ruling 19): a process a watch already ends gets no second
-/// one, that watch given the stamp's time. Returns whether a watch ends the
-/// program now: one started, or the one already on it.
+/// one, that watch given the stamp's time. The carrier's `KILL` waits until
+/// this instance's host has read the agent again (ruling 22: a program
+/// stopped across the Commit leads its tab again only at `fg`, before this
+/// host has named it). Returns whether a watch ends the program now: one
+/// started, or the one already on it.
 #[cfg(unix)]
 #[cfg_attr(
     test,
@@ -1075,7 +1191,7 @@ pub(crate) fn carry(ctx: &Arc<SessionCtx>, state: &std::path::Path) -> bool {
         return false;
     }
     let left = DEADLINE.saturating_sub(Duration::from_secs(stamp.age_s(now)));
-    let Some(watch) = watch(pgrp, &stamp) else {
+    let Some(watch) = watch(state, pgrp, &stamp) else {
         aterm_log::info!(
             "restart: pid {pgrp}: an act a Commit cut is watched already; that watch ends it"
         );
@@ -1158,15 +1274,16 @@ mod tests {
         }
     }
 
-    /// ANOTHER HAND IS WHAT THE EXIT'S READER LEAVES TO ITS HOLDER (ruling 11,
-    /// review of 1a733ed60): another supervisor's live claim, a halt, a turn a
-    /// named driver runs, another holder's live drive lease. NOT another
+    /// ANOTHER HAND IS WHAT THE ACT'S KILL WAITS OUT (ruling 11, review of
+    /// 1a733ed60) — the hands an unasked exit's reader leaves the exit to:
+    /// another supervisor's live claim, a halt, a turn a named driver runs,
+    /// another holder's live drive lease. NOT another
     /// hand: no claim at all, this host's own claim or a predecessor host's
     /// (a successor's carrier must finish under it — which
     /// `input_stall::host_hand_refusal`'s `not-supervised` would refuse), an
     /// unnamed (owner-class) turn, a lapsed lease, this host's own lease.
     #[test]
-    fn another_hand_is_what_the_exits_reader_leaves_to_its_holder() {
+    fn another_hand_is_what_the_acts_kill_waits_out() {
         let now = crate::metrics::now_us();
         let fresh = |n: u64| crate::session_store::test_handle_on(7400 + n, -1).ctx;
         let claimed = |ctx: &SessionCtx, holder: &str| {
@@ -1267,6 +1384,15 @@ mod tests {
         );
     }
 
+    /// A tab key for the registry's tests, and a state directory holding its
+    /// stamp as the act or the carrier writes it (`restart_stamp::write`),
+    /// which [`Watch::left`] reads again on every look (ruling 21).
+    const TAB: &str = "s-watch";
+
+    fn stamped(state: &aterm_tempfile::TempDir, stamp: &Stamp) {
+        restart_stamp::write(state.path(), TAB, stamp).expect("the stamp");
+    }
+
     /// A WATCH THAT LETS GO IS UNLISTED IN THAT VERY LOOK, AND A RAISE BEFORE
     /// THE LOOK KEEPS IT (ruling 19, which keeps ruling 18): the registry
     /// alone, no pty and no clock race. A watch on a stamp standing 10 s
@@ -1286,6 +1412,7 @@ mod tests {
     #[test]
     fn a_watch_that_lets_go_is_unlisted_in_that_look_and_a_raise_before_it_keeps_it() {
         let pid = 0x3fff_fff1_i32;
+        let state = aterm_tempfile::TempDir::new().expect("a state dir");
         let now = aterm_time::unix_secs().expect("clock");
         let stamp = |at: u64| Stamp {
             pid: pid.unsigned_abs(),
@@ -1294,27 +1421,124 @@ mod tests {
             at,
         };
         let short = stamp(now + 10 - aterm_agent::harness::relaunch::STALE_S);
-        let w = watch(pid, &short).expect("the first watch");
+        stamped(&state, &short);
+        let w = watch(state.path(), pid, &short).expect("the first watch");
         assert!(w.lapsed(), "10 s left: inside the read margin");
-        assert!(watch(pid, &stamp(now)).is_none(), "a join finds it running");
+        // A join writes its stamp first, then finds the watch running.
+        stamped(&state, &stamp(now));
+        assert!(
+            watch(state.path(), pid, &stamp(now)).is_none(),
+            "a join finds it running"
+        );
         assert!(!w.lapsed(), "its KILL may go: by the join's stamp");
-        assert!(w.left().is_some(), "raised before its look: it waits on");
+        assert!(w.left(TAB).is_ok(), "raised before its look: it waits on");
         assert_eq!(watches(pid), 1);
         drop(w);
         assert_eq!(watches(pid), 0, "unlisted as its thread drops it");
-        let w = watch(pid, &short).expect("a watch again");
-        assert!(w.left().is_none(), "not raised: it lets go");
+        stamped(&state, &short);
+        let w = watch(state.path(), pid, &short).expect("a watch again");
+        assert_eq!(w.left(TAB), Err(LetGo::Lapsed), "not raised: it lets go");
         assert_eq!(
             watches(pid),
             0,
             "unlisted in that same look, the watch itself still held"
         );
         assert!(w.lapsed(), "let go: no KILL");
-        let join = watch(pid, &stamp(now)).expect("a join after the let-go gets its own");
+        stamped(&state, &stamp(now));
+        let join =
+            watch(state.path(), pid, &stamp(now)).expect("a join after the let-go gets its own");
         assert_eq!(watches(pid), 1);
         drop(w);
         assert_eq!(watches(pid), 1, "the let-go watch's end leaves the join's");
         drop(join);
+        assert_eq!(watches(pid), 0);
+    }
+
+    /// A WATCH WHOSE TAB'S STAMP NAMES ANOTHER PROCESS LETS GO IN THAT LOOK
+    /// (ruling 21 of 2026-10-14): the registry and the stamp file alone, no
+    /// pty. A watch on a stamp with its whole life waits on while the tab's
+    /// stamp names its program; once another act's stamp replaces it (one per
+    /// tab) — or it is taken — the next look lets go, unlisted in that same
+    /// look, whatever time the watch was handed. A join after it — its own
+    /// stamp written first, naming the program again — gets a watch of its
+    /// own. The real watch over a real stopped job is `harness_host`'s
+    /// `a_watch_lets_its_program_go_once_its_tabs_stamp_names_another`.
+    ///
+    /// FAILS WITHOUT IT: the watch read only the time it was handed, waited
+    /// on, and its `KILL` landed on a program whose exit no reader would take
+    /// for the act's.
+    #[test]
+    fn a_watch_whose_tabs_stamp_names_another_lets_go_in_that_look() {
+        let pid = 0x3fff_fff3_i32;
+        let state = aterm_tempfile::TempDir::new().expect("a state dir");
+        let now = aterm_time::unix_secs().expect("clock");
+        let ours = Stamp {
+            pid: pid.unsigned_abs(),
+            start: "t".to_string(),
+            cause: Cause::Stall,
+            at: now,
+        };
+        stamped(&state, &ours);
+        let w = watch(state.path(), pid, &ours).expect("a watch");
+        assert!(w.left(TAB).is_ok(), "its stamp names it: it waits on");
+        stamped(
+            &state,
+            &Stamp {
+                pid: pid.unsigned_abs() + 1,
+                ..ours.clone()
+            },
+        );
+        assert_eq!(w.left(TAB), Err(LetGo::Unnamed), "another act's stamp");
+        assert_eq!(watches(pid), 0, "unlisted in that same look");
+        stamped(&state, &ours);
+        let join = watch(state.path(), pid, &ours).expect("a join gets its own");
+        assert!(join.left(TAB).is_ok());
+        let _ = restart_stamp::take_if(state.path(), TAB, |_| true);
+        assert_eq!(join.left(TAB), Err(LetGo::Unnamed), "its stamp taken");
+        assert_eq!(watches(pid), 0);
+        drop((w, join));
+    }
+
+    /// A WATCH WAITS ON WHILE ANOTHER SNAPSHOT'S TAKE JUDGES ITS TAB'S STAMP
+    /// (the review of ruling 21, 2026-10-14): the registry and the stamp file
+    /// alone, no pty. The tab's stamp names the watched program; the relaunch
+    /// of another snapshot of the same tab, filed as an asked exit, consumes
+    /// the tab's stamp only when it names that snapshot's process
+    /// (`relaunch::consume_stamp`, `restart_stamp::take_if`) — this one does
+    /// not. A look of the watch while that take judges the stamp still finds
+    /// it naming its program, and the watch waits on, listed.
+    ///
+    /// FAILS WITHOUT IT: `take_if` moved the stamp aside before judging it
+    /// and linked it back after, so a look in that window found no stamp —
+    /// read as one naming its program no more (`LetGo::Unnamed`), which is
+    /// final: the program was let go, unlisted, never `SIGKILL`ed, though its
+    /// stamp was back a moment later.
+    #[test]
+    fn a_watch_waits_on_while_another_take_judges_its_tabs_stamp() {
+        let pid = 0x3fff_fff4_i32;
+        let state = aterm_tempfile::TempDir::new().expect("a state dir");
+        let ours = Stamp {
+            pid: pid.unsigned_abs(),
+            start: "t".to_string(),
+            cause: Cause::Stall,
+            at: aterm_time::unix_secs().expect("clock"),
+        };
+        stamped(&state, &ours);
+        let w = watch(state.path(), pid, &ours).expect("a watch");
+        let mut looked = None;
+        let taken = restart_stamp::take_if(state.path(), TAB, |s| {
+            looked = Some(w.left(TAB));
+            s.names(pid.unsigned_abs() + 1, "t")
+        });
+        assert_eq!(taken, None, "not that snapshot's stamp");
+        assert!(
+            looked.is_some_and(|left| left.is_ok()),
+            "a look while it was judged: {looked:?}"
+        );
+        assert_eq!(watches(pid), 1, "still listed");
+        assert!(w.left(TAB).is_ok(), "it waits on");
+        assert_eq!(restart_stamp::read(state.path(), TAB), Some(ours));
+        drop(w);
         assert_eq!(watches(pid), 0);
     }
 
@@ -1329,7 +1553,9 @@ mod tests {
     #[test]
     fn a_stamp_dated_past_any_instant_gives_its_watch_no_time() {
         let pid = 0x3fff_fff2_i32;
+        let state = aterm_tempfile::TempDir::new().expect("a state dir");
         let w = watch(
+            state.path(),
             pid,
             &Stamp {
                 pid: pid.unsigned_abs(),
@@ -1340,7 +1566,7 @@ mod tests {
         )
         .expect("a watch");
         assert!(w.lapsed(), "no KILL");
-        assert!(w.left().is_none(), "let go at its first look");
+        assert_eq!(w.left(TAB), Err(LetGo::Lapsed), "let go at its first look");
         assert_eq!(watches(pid), 0);
     }
 }

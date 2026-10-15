@@ -265,7 +265,7 @@ mod waivers {
         machine = "native_update_successor_warm_before_claim",
         action = "WarmDone",
         reason = "The return of `warm_prologue`'s main-thread section (lib.rs): it builds a GPU \
-                  device and cannot run in a unit test (AGENTS.md rule 5); the conformance \
+                  device and cannot run in a unit test (AGENTS.md); the conformance \
                   realizes it as a stand-in that returns without joining its thread, and asserts \
                   that thread is still running at the real dial."
     )]
@@ -305,7 +305,7 @@ mod waivers {
         machine = "native_update_successor_warm_before_claim",
         action = "RealPresent",
         reason = "A window's first present of the carried screens (app_render's post-present \
-                  hook); a window cannot be driven from a unit test (AGENTS.md rule 5)."
+                  hook); a window cannot be driven from a unit test (AGENTS.md)."
     )]
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",

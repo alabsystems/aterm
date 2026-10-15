@@ -37,7 +37,7 @@ use crate::Wake;
 pub(crate) use aterm_messages::presence::{
     ChipLevel, Hand, HoldFact, LeaseMark, Link, MailFacts, MailLast, StoryVerb,
     TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, Words, fmt_dur, prompt_band_word, prompt_kind_words,
-    sanitize_token, short_sid,
+    short_sid,
 };
 // …and the ones only the tests name.
 #[cfg(test)]
@@ -128,6 +128,21 @@ impl aterm_messages::presence::Host for Native {
     fn pct_decode(s: &str) -> String {
         aterm_control::wire::pct_decode(s)
     }
+
+    /// The terminal grid's own walk ([`aterm_grapheme::str_grid_columns`]), so
+    /// the row lays a CJK role, a combining mark or an emoji out in the cells
+    /// the grid gives them, and the renderer draws a wide glyph across its
+    /// lead cell and continuation.
+    fn columns(s: &str) -> usize {
+        aterm_grapheme::str_grid_columns(s)
+    }
+}
+
+/// A free-text value as the presence row prints it (the engine's
+/// `sanitize_token`, capped in this host's grid cells, each holding at most
+/// what a grid cell holds).
+pub(crate) fn sanitize_token(s: &str, cap: usize) -> String {
+    aterm_messages::presence::sanitize_token::<Native>(s, cap)
 }
 
 /// A hold's reason as every human-facing surface prints and speaks it (the

@@ -216,6 +216,62 @@ fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
     );
 }
 
+/// Defence in depth (r15 C2): an extras run that creates map entries (an
+/// underline colour, OSC 8) starts each cell's entry fresh, so it never adopts
+/// an entry its cells did not claim, whatever left it there. The orphan is
+/// planted straight into the map, as the double-width ICH/DCH left one. A
+/// truecolor-only run writes the ring, not the map, and relies on orphans
+/// being closed where they are made (ruling 2026-10-11 in
+/// `CellExtras::set_range_uniform`), which the process fuzzers assert.
+#[test]
+fn an_extras_run_never_adopts_an_orphaned_entry() {
+    let url: Arc<str> = Arc::from("https://example.com/new");
+    // (pen, underline colour, link)
+    let pens = [
+        ("underline colour", Some(0x01_FF_00_00), None),
+        ("hyperlink", None, Some(&url)),
+    ];
+    for (pen, underline, link) in pens {
+        let mut grid = Grid::new(5, 30);
+        let orphan = CellCoord::new(0, 2);
+        grid.extras_mut()
+            .get_or_create(orphan)
+            .add_combining('\u{0301}');
+        grid.extras_mut()
+            .get_or_create(orphan)
+            .set_hyperlink(Some(Arc::from("https://example.com/old")));
+        assert!(!grid.cell(0, 2).unwrap().has_extras(), "planted unclaimed");
+
+        grid.set_cursor(0, 0);
+        let mut last = None;
+        grid.write_ascii_run_with_extras(
+            b"hello",
+            PackedColors::new(),
+            CellFlags::empty(),
+            None,
+            None,
+            underline,
+            0,
+            link,
+            None,
+            &mut last,
+        );
+
+        assert_eq!(grid.row_text(0).as_deref(), Some("hello"), "{pen}");
+        let extra = grid.cell_extra(0, 2).expect("the run's own entry");
+        assert!(
+            extra.combining().is_empty(),
+            "{pen}: the run adopted the orphan's mark: {extra:?}"
+        );
+        assert_eq!(
+            extra.hyperlink().map(|u| &**u),
+            link.map(|u| &**u),
+            "{pen}: the run adopted the orphan's link"
+        );
+        grid.assert_extras_claimed();
+    }
+}
+
 #[test]
 fn failed_wide_write_does_not_drop_live_extras() {
     // A wide char that cannot fit must leave the existing extras alone —

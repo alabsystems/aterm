@@ -1728,7 +1728,46 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> (crate::input::EgressReceipt, bool) {
-        if ui_writes_can_block || is_ordering(sink) || matches!(ev, InputEvent::Paste(..)) {
+        let queue = ui_writes_can_block || is_ordering(sink) || matches!(ev, InputEvent::Paste(..));
+        queued_or_inline(queue, term, modes, sink, echo, ev, ticket, hot_key)
+    }
+
+    /// A control socket lane's write into a session that is not on screen
+    /// (`crate::control`'s background arms): [`ordered_or_inline`]'s route —
+    /// behind whatever this session's ordered writer holds, through it always
+    /// where a write can block (Windows), otherwise inline through the
+    /// non-parking interactive egress — except that a paste with nothing queued
+    /// ahead of it is written inline too, into the sink's own spill, whose
+    /// drain the paste's reply waits on. Never parks the lane on the program.
+    pub(crate) fn unparked(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
+        ev: &InputEvent,
+    ) -> crate::input::EgressReceipt {
+        let queue = ui_writes_can_block() || is_ordering(sink);
+        queued_or_inline(queue, term, modes, sink, echo, ev, None, None).0
+    }
+
+    /// The tail [`ordered_or_inline_routed`] and [`unparked`] share: `queue`
+    /// submits `ev` to the session's FIFO (a refusal accepts nothing),
+    /// otherwise it is written inline through the interactive egress.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ordered_or_inline's handles plus the routing decision already made"
+    )]
+    fn queued_or_inline(
+        queue: bool,
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
+        ev: &InputEvent,
+        ticket: Option<DeliveryTicket>,
+        hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
+    ) -> (crate::input::EgressReceipt, bool) {
+        if queue {
             match enqueue(term, modes, sink, echo, ev.clone(), ticket, hot_key) {
                 Ok(()) => (crate::input::EgressReceipt::deferred_full(), false),
                 Err(_) => (crate::input::EgressReceipt::queue_full(), false),
@@ -1749,10 +1788,10 @@ pub(crate) mod paste_order {
         }
     }
 
-    /// The UI thread's report egress: mouse button, motion, wheel and focus reports
-    /// from the App's arms, and reports sent outside them ([`super::write_ui_report`]:
-    /// a tab switch's focus delta, a colour-scheme change); a control verb's reports
-    /// write on its own thread. A report follows the keys' route: while this
+    /// The report egress: mouse button, motion, wheel and focus reports from the
+    /// App's arms, reports sent outside them ([`super::write_ui_report`]: a tab
+    /// switch's focus delta, a colour-scheme change), and a control lane's mouse
+    /// report into a session not on screen. A report follows the keys' route: while this
     /// session's ordered writer holds anything, and on Windows always
     /// ([`UI_WRITES_CAN_BLOCK`]), the report is encoded here under the modes the
     /// gesture was judged by and queued behind everything submitted before it.
@@ -1763,7 +1802,7 @@ pub(crate) mod paste_order {
     /// admit (admitted like a paste, [`submit`]) is refused
     /// ([`crate::input::EgressReceipt::queue_full`]) and never written; one that
     /// writes nothing queues nothing.
-    pub(super) fn report_ordered_or_inline(
+    pub(crate) fn report_ordered_or_inline(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
@@ -1958,6 +1997,11 @@ mod egress_contract_tests;
 /// (`app_input/input_legs_tests.rs`).
 #[cfg(all(test, unix))]
 mod input_legs_tests;
+
+/// An input method's commit holding a control character is a paste
+/// (`app_input/ime_commit_paste_tests.rs`).
+#[cfg(all(test, unix))]
+mod ime_commit_paste_tests;
 
 #[cfg(test)]
 #[path = "app_input_paste_order_sink_isolation_tests.rs"]
@@ -10569,20 +10613,45 @@ impl App {
     /// Ends the composition and sends the text to the PTY via the engine path
     /// (each grapheme encoded as a `Character` key, not `& 0x1f`), so it goes
     /// out exactly as typed text. Clears the selection like any typing.
+    ///
+    /// Every host's input-method commit lands here: X11's XIM lookup, Wayland's
+    /// text-input `commit_string`, Windows' IMM result string, and macOS's
+    /// `insertText:` under marked text, dictation included. A commit holding a
+    /// control character beside other text is not typed text: it reaches the
+    /// terminal as a paste ([`Self::deliver_paste`]: the sanitizer, bracketed
+    /// framing and the multi-line guard), by the ruling of 2026-10-10 on
+    /// boundaries-hunt L2 recorded at [`keymap::committed_text_is_paste`]. A
+    /// commit that is one C0 or DEL character is the key X11 commits while an
+    /// XIM preedit is open (Return, Tab, BackSpace) and stays typed.
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
         // One routing decision (`ime_route`), read once and dispatched on below,
         // so the fence and the consumer cannot disagree about where the commit
         // lands.
         let route = self.ime_route(wid);
+        // A grid commit holding a control character is a paste (L2), unless it
+        // is one C0 or DEL key (`committed_text_is_paste`). Not while an
+        // overlay or the tab menu owns the window: the seam hands the commit to
+        // them as text and nothing reaches the PTY, whereas the paste path pins
+        // the session behind them.
+        let as_paste = matches!(route, PreeditOwner::Grid)
+            && keymap::committed_text_is_paste(&text)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none());
         // This fence precedes every consumer below (native tabs, rename/find
         // fields, the empty commit). A commit that reaches the PTY is more
         // typing, not a class change: it stamps its own typed licence in
         // `App::input` below, and the banked stamps of keys still in flight
         // ahead of it must survive, so it takes the bank-preserving supersede
         // the Text arm applies. A commit a native view, the rename field or the
-        // find bar consumes takes the full fence.
+        // find bar consumes takes the full fence, and one that pastes takes a
+        // paste press's fence ([`press_fence`]), at the gesture as ⌘V does,
+        // since the guard can hold the delivery.
         let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
-        if reaches_pty {
+        if as_paste {
+            self.clear_move_license_keeping_hand(wid);
+        } else if reaches_pty {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.fx.cursor_mut().glow.supersede_typed_press();
             }
@@ -10636,6 +10705,18 @@ impl App {
             // they would land in the shell behind an open find bar.
             PreeditOwner::Find => {
                 self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    w.request_redraw();
+                }
+            }
+            // A commit holding a control character pastes, by the path ⌘V
+            // takes: the viewport jumps to live at the gesture, and the paste
+            // names the terminal it was made in, so a guard question answered
+            // later still reaches only it.
+            PreeditOwner::Grid if as_paste => {
+                self.snap_to_bottom(wid);
+                let session = self.focused_session_id(wid);
+                self.deliver_paste(wid, session, text, Source::Human);
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                     w.request_redraw();
                 }
@@ -11632,8 +11713,6 @@ mod forwarded_release_handoff_activity_tests {
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             park_at: std::time::Instant::now(),
             proof_ready_at: None,
-            #[cfg(target_os = "macos")]
-            activate_at_commit: false,
             attempt_id: 1,
             nonce: None,
             live: Vec::new(),

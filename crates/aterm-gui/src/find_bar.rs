@@ -144,6 +144,9 @@ pub(crate) struct FindBarView {
     pub searched_lines: Option<usize>,
     /// The list stopped at the match limit: `1/100000+ (match limit)`.
     pub match_capped: bool,
+    /// A regex scan could not finish some line within its budget, so the rest
+    /// of that line went unsearched: `3/7+ (long line partly searched)`.
+    pub cut_short: bool,
     /// The terminal changed since `total` was counted — new output, a repaint, a
     /// `clear` — and the search is deliberately NOT re-run per PTY batch (that is
     /// one full scan per burst on the UI thread). The count is therefore a past
@@ -238,15 +241,17 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     // off the highlight), and never the marker.
     //
     // `+`: the count is a floor — the depth cap stopped the search (`newest
-    // 100,000 lines`), the list hit the match limit, or a rewrap held the
-    // history away. `…`: the terminal has changed since `total` was counted, so
-    // it is a past census and can be off in either direction.
+    // 100,000 lines`), the list hit the match limit, a regex could not finish a
+    // long line (`long line partly searched`), or a rewrap held the history
+    // away. `…`: the terminal has changed since `total` was counted, so it is a
+    // past census and can be off in either direction.
     let facts = crate::app_search::CountFacts {
         truncated: v.truncated,
         stale: v.stale,
         history_away: v.history_away,
         searched_lines: v.searched_lines,
         match_capped: v.match_capped,
+        cut_short: v.cut_short,
     };
     let mark = facts.mark();
     let stale_mark = if v.stale { "…" } else { "" };
@@ -281,6 +286,11 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             facts.none_base(false),
             parenthesized(&facts.none_words())
         )];
+        if let Some(word) = facts.cut_short_word(true) {
+            // A regex could not finish a long line: the miss is not a census,
+            // and the bar's zone has room to say why.
+            forms.push(format!("no matches ({word}){stale_mark}"));
+        }
         if let (Some(long), Some(short)) = (facts.depth(false), facts.depth(true)) {
             // The depth cap stopped it: how far it searched outlives every
             // other word, down to the bare mark.
@@ -639,6 +649,7 @@ mod tests {
             truncated: false,
             searched_lines: None,
             match_capped: false,
+            cut_short: false,
             stale: false,
             history_away: false,
         }
@@ -1049,6 +1060,38 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// A regex that could not finish a long line (R15 content-2) says so on
+    /// the bar, in the form that fits its status zone — never `bad regex`,
+    /// which a long soft-wrapped run used to make every regex find show, and
+    /// never a vague `partial history` — and keeps its `+` down to the
+    /// narrowest form.
+    #[test]
+    fn a_long_line_the_regex_could_not_finish_is_named() {
+        let bar = |total: usize, cols: usize| {
+            all(&paint(
+                &FindBarView {
+                    idx: 3,
+                    total,
+                    is_regex: true,
+                    truncated: true,
+                    cut_short: true,
+                    ..view("x=")
+                },
+                cols,
+            ))
+        };
+        let wide = bar(7, 220);
+        assert!(wide.contains("3/7+ (line cut short)"), "{wide}");
+        let none = bar(0, 220);
+        assert!(none.contains("no matches (line cut short)"), "{none}");
+        for row in [&wide, &none] {
+            assert!(!row.contains("bad regex"), "{row}");
+            assert!(!row.contains("partial history"), "{row}");
+        }
+        let narrow = bar(7, 90);
+        assert!(narrow.contains("3/7+"), "{narrow}");
     }
 
     /// The hints row teaches the emacs-isearch keymap in words that actually RENDER:

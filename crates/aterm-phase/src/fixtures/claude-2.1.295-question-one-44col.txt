@@ -1,0 +1,22 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (44x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · AskUserQuestion, one single-select question (`nextest (Recommended)` / `libtest`), raised by the stub's tool mode in a pane resized to 44 columns (`ctl resize 50 44`) before the call: the footer `Enter to select · ↑/↓ to navigate · Esc to cancel` (49 cells) is wrapped by Ink after `Esc to`, its `cancel` alone on the row under it at column zero
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.swEU/proj
+
+
+❯ toolstart
+────────────────────────────────────────────
+ ☐ Runner
+
+Which test runner should the repo use?
+
+❯ 1. nextest (Recommended)
+     Parallel
+  2. libtest
+     Built in
+  3. Type something.
+────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel

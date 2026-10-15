@@ -2923,7 +2923,7 @@ impl App {
     /// Leaf locks only, each released before the next; the notification is
     /// a `try_send` onto `notify.rs`'s bounded queue, so nothing here blocks
     /// the event loop. A headless instance has no menu bar and posts nothing:
-    /// it never reaches the notifier subprocesses (AGENTS.md rule 5).
+    /// it never reaches the notifier subprocesses (AGENTS.md).
     /// Which sessions the in-GUI supervisor host answers for, read ONCE per
     /// refresh and before the registry lock is taken (the host's state lock
     /// is never nested under it): all of its agent sessions while it
@@ -5102,7 +5102,8 @@ impl App {
     }
 
     /// LOGICAL core of the `Wake::Exit` handler (no winit/`el`): mark `session`
-    /// `Exited`, then close it in EVERY window that views it. A CO-VIEWED
+    /// `Exited`, wake every control verb parked on it, then close it in EVERY
+    /// window that views it. A CO-VIEWED
     /// (Cmd-Shift-O) session is displayed in more than one window but has a SINGLE
     /// reader thread, so its shell exit emits exactly ONE `Wake::Exit`; closing only
     /// the first owner would leave every OTHER viewer pinned to a dead, still-pooled
@@ -5122,8 +5123,22 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .set_state(session, session_store::SessionState::Exited);
+        // Its program is gone, kept pane or not: what is parked on it ends now
+        // (`SessionFabric::close`).
+        if let Some(ended) = self.pool.get(session) {
+            ended.ctx.fabric.close();
+        }
         // The exit ledger takes the child's status now, before teardown discards it.
         self.note_shell_exit_for_ledger(session);
+        // Wake every parked observer (`await`, `ready`, `wait`, `subscribe`) so it
+        // sees `Exited` and returns, a kept pane's too; these verbs are fully
+        // event-driven.
+        if self.subscribers.any() {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(session);
+        }
         // A shell that failed at start keeps its pane in every viewer, the way
         // `--hold` keeps one; otherwise its error shows for a frame and the tab
         // (with one tab, aterm itself) is gone with nothing saying why.
@@ -6370,6 +6385,15 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .deregister_local_as(id, reason, by);
+        // Wake every verb parked on the closed session's changes (`await`,
+        // `ready`, `wait`, `subscribe`) to read that it ended, now rather than at
+        // its next slice or deadline — as a shell's exit wakes them.
+        if self.subscribers.any() {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(id);
+        }
         if let Some(stable) = stable {
             crate::proxy::unpublish_session(&stable);
             // Through the App's own store handle (the process singleton in a
@@ -7779,6 +7803,7 @@ mod mixed_tab_tests {
                     questions: None,
                     identity: None,
                     agent: None,
+                    supervised: None,
                     held: false,
                 },
             )),

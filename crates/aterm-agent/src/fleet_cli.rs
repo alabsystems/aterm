@@ -693,22 +693,13 @@ fn err_record(pid: &str, msg: &str) -> String {
     )
 }
 
-/// Minimal JSON string escaping (no serde dep — the crate is std-only). Escapes the
-/// mandatory set plus control bytes as `\u00XX`.
+/// A JSON string body: the control path's one escape
+/// ([`aterm_codec::json::escape`]). A record carries a command's stdout — an
+/// `inbox get` body, a screen's text — and NDJSON on a terminal is read raw,
+/// so every character a terminal acts on is `\uXXXX` as well as RFC 8259's
+/// set (round fifteen, OUT-2).
 fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
+    aterm_codec::json::escape(s)
 }
 
 #[cfg(test)]

@@ -516,6 +516,13 @@ pub struct Row {
     /// before a restart was planned): the flags of the manual resume command
     /// ([`Row::resume_said`]) come from it.
     pub line: String,
+    /// The restart started its agent AFRESH (`St::cause`,
+    /// `relaunch::starts_afresh`: a conversation nobody had asked anything,
+    /// or one with no transcript): nothing of the conversation is there to
+    /// resume, so an agent it could not bring back is started again by hand
+    /// with a plain `claude` ([`Row::agent_down`]), never `claude --resume`,
+    /// which Claude refuses for a conversation with no message.
+    pub fresh: bool,
     /// When the record last MOVED (`St::progress_at`, unix seconds): stamped
     /// by its one writer when its progress key changes (design record
     /// 2026-09-28, §3.2 C1).
@@ -699,6 +706,7 @@ impl Row {
             own_work_at: st.own_work_at,
             goal: st.goal,
             line: st.line.clone(),
+            fresh: crate::harness::relaunch::starts_afresh(&st.cause),
             progress_at: st.progress_at,
             looked_at: st.looked_at,
             looked_by: st.looked_by.clone(),
@@ -2628,6 +2636,7 @@ impl Row {
             Cause::CouldNotType => "aterm could not type its notice".to_string(),
             Cause::Queued => "its notices wait unread behind its queue".to_string(),
             Cause::Unreached => "aterm cannot reach its tab to ask".to_string(),
+            Cause::BuildFails => "its new build fails to start".to_string(),
             Cause::NextPoint => NEXT_POINT_CAUSE.to_string(),
             Cause::NoLook => "no look has recorded what it waits on".to_string(),
             Cause::Unclassified(wait) => {
@@ -2686,6 +2695,7 @@ impl Row {
             (_, WaitClass::Notice) => Cause::CouldNotType,
             (_, WaitClass::Queued) => Cause::Queued,
             (_, WaitClass::Unreached) => Cause::Unreached,
+            (_, WaitClass::BuildFails) => Cause::BuildFails,
             (_, WaitClass::NextPoint) => Cause::NextPoint,
             (_, WaitClass::Unrecorded) => Cause::NoLook,
             (_, WaitClass::Unclassified) => Cause::Unclassified(wait.to_string()),
@@ -2779,6 +2789,9 @@ enum WaitClass {
     Queued,
     /// A tab or conversation aterm cannot reach to ask in.
     Unreached,
+    /// The build it would move to failed to start, and is not proved to
+    /// start since (`upgrade_drive`'s `build_start`).
+    BuildFails,
     /// Nothing holds it now ([`upgrade::NEXT_POINT`]): the round's next step
     /// is due at the session's next point. A record, never a row of its own;
     /// the move clock still applies ([`Row::stall`], [`Row::asks_on_its_own`]).
@@ -2804,6 +2817,7 @@ impl WaitClass {
             WaitClass::Notice => "notice",
             WaitClass::Queued => "queued",
             WaitClass::Unreached => "unreached",
+            WaitClass::BuildFails => "build-fails",
             WaitClass::NextPoint => "next-point",
             WaitClass::Unrecorded => "unrecorded",
             WaitClass::Unclassified => "unclassified",
@@ -2893,6 +2907,7 @@ fn wait_class(wait: &str) -> WaitClass {
             | "thread-locked",
             _,
         ) => WaitClass::Unreached,
+        (crate::harness::upgrade_drive::BUILD_FAILS, _) => WaitClass::BuildFails,
         (upgrade::NEXT_POINT, _) => WaitClass::NextPoint,
         ("", "") => WaitClass::Unrecorded,
         _ => WaitClass::Unclassified,
@@ -2946,6 +2961,10 @@ fn unworded_waiting_line(wait: &str) -> &'static str {
             }
             WaitClass::Unreached => {
                 "aterm cannot reach its tab to ask yet; it moves on its own once it can"
+            }
+            WaitClass::BuildFails => {
+                "its new build fails to start, so aterm moves no agent onto it; it moves once a \
+                 build that starts is installed"
             }
             // Never reached today ([`Row::waiting_line`] words the next point
             // as the ladder's comfort first); said as the mark says it.
@@ -3366,6 +3385,8 @@ enum Cause {
     UnderWay,
     /// A tab or conversation aterm cannot reach to ask in.
     Unreached,
+    /// The build it would move to fails to start.
+    BuildFails,
     /// Nothing holds it now: the last look found no gate, and its next step
     /// goes at the next point ([`upgrade::NEXT_POINT`]) - the upgrade working
     /// as the rest before it did, never a row for being about to take it.
@@ -3484,6 +3505,11 @@ impl Row {
             Phase::Failed(why) => {
                 if self.failed_after_exit() {
                     Attention::Interrupt(self.agent_down(why))
+                } else if why == crate::harness::upgrade_drive::BUILD_FAILS {
+                    // A round the build's hold stopped (its agent released,
+                    // `upgrade::build_hold`): the build is the fact, told as
+                    // the round after it, waiting on it, tells it.
+                    Attention::Fault(self.build_fails())
                 } else if why == upgrade::GAVE_UP {
                     self.or_backstop(self.own_work(now), now)
                 } else if refusal(why) {
@@ -3495,6 +3521,13 @@ impl Row {
                 }
             }
             Phase::Pending | Phase::Announced { .. } => {
+                // A BUILD THAT FAILS TO START holds the move
+                // (`upgrade_drive`'s `build_start`): nothing the owner does
+                // here moves it, and the build, not this tab, is the fact —
+                // ONE record per build, however many agents wait on it.
+                if self.wait == crate::harness::upgrade_drive::BUILD_FAILS {
+                    return Attention::Fault(self.build_fails());
+                }
                 if let Some(owner) = self.wait.strip_prefix("terminal:") {
                     return Attention::Digest(self.no_terminal(owner));
                 }
@@ -3922,6 +3955,18 @@ impl Row {
             (upgrade::Agent::Codex, "no-rollout") => {
                 (cut("Start Codex again in that tab", NEED_THEN_MAX), None)
             }
+            // Started afresh: there is no conversation of it to resume.
+            (upgrade::Agent::Claude, why) if self.fresh => {
+                let then = if why == "shell-gone" {
+                    "Open a new tab and start Claude Code there with this command"
+                } else {
+                    "Start Claude Code again in that tab with this command"
+                };
+                (
+                    cut(&self.resume_then(then), NEED_THEN_MAX),
+                    Some("claude".to_string()),
+                )
+            }
             (_, "shell-gone") => {
                 let (then, command) =
                     self.resume_said("Open a new tab and resume it there with this command");
@@ -4045,6 +4090,38 @@ impl Row {
             command: Some(command),
             since: self.wait_since,
             log_line: self.log_line("no-terminal", &format!("terminal owner: {owner}")),
+        }
+    }
+
+    /// A BUILD THAT FAILED TO START, NOT PROVED TO START SINCE
+    /// (`upgrade_drive`'s `build_start`): a fault, a record, keyed by the
+    /// BUILD — its version and install, never the tab — so the owner is told
+    /// once per build however many agents it holds back, and never by a stop
+    /// per agent moved onto it (handoff §4, round eighteen).
+    fn build_fails(&self) -> Need {
+        let who = self.agent.product();
+        Need {
+            kind: "build-fails",
+            fingerprint: format!("build-fails/{}/{}", word(&self.source), word(&self.to)),
+            title: "New build fails to start",
+            severity: NeedSeverity::Warn,
+            why: cut(
+                &format!(
+                    "{who} {} failed to start, so aterm moves no agent onto it",
+                    word(&self.to)
+                ),
+                NEED_WHY_MAX,
+            ),
+            then: cut(
+                "Nothing to do: agents stay on the build they run until one that starts",
+                NEED_THEN_MAX,
+            ),
+            command: None,
+            since: self.wait_since,
+            log_line: self.log_line(
+                "build-fails",
+                "the build failed to start and is not proved to start since",
+            ),
         }
     }
 
@@ -4712,6 +4789,9 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "queued" => "it has not read the upgrade's question yet",
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
+        // A build that failed to start, not proved to start since
+        // (`upgrade_drive`'s `build_start`): no agent is moved onto it.
+        crate::harness::upgrade_drive::BUILD_FAILS => "its new build fails to start",
         // Aterm's own notice, refused by its fence: what could not be done,
         // and by whom.
         "announce-refused:changed" => {
@@ -4890,6 +4970,9 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
         }
         "resumed-elsewhere" => {
             "the conversation was resumed by hand, outside this upgrade".to_string()
+        }
+        "build-fails" => {
+            format!("its new build fails to start, so the move was called off and {who} runs on")
         }
         _ => "the move stopped before it finished".to_string(),
     }
@@ -5099,7 +5182,7 @@ pub fn status_rows(opts: &Opts, claims: bool) -> (Vec<Row>, bool) {
     status_rows_with(
         opts,
         now_s(),
-        &|sessions| holders(&opts.home, sessions, None),
+        &|sessions| holders(opts, sessions, None),
         &|| claimed_tabs(opts, claims),
     )
 }
@@ -5243,28 +5326,33 @@ fn not_in_front(pid: u32) -> bool {
     super::ids(pid).is_some_and(|(_, group, front)| group > 0 && front > 0 && group != front)
 }
 
-/// The live holders of `sessions`, from Claude's session files: a file whose
+/// The live holders of `sessions`, from Claude's session files — the user's
+/// own `~/.claude` and every other Claude home the records of `sessions` name
+/// ([`St::home`]: where the visit found each agent; read in `~/.claude`
+/// alone, an agent under another home held nothing, and its upgrade was never
+/// shown or counted) — a file whose
 /// pid is alive and started when the file says ([`conversation_live`]; a
 /// recycled pid holds nothing). Its tab is proven by its process group being
 /// one tab's foreground group in `tabs` (the host's `who` roster), or by its
 /// environment's `ATERM_PARENT_SESSION_ID`; two disagreeing proofs prove
 /// nothing. One proven by environment alone is checked against its
 /// terminal's foreground ([`Holder::aside`]). `None` when the session files
-/// cannot be read whole; no sessions directory at all means nothing holds
-/// anything. Only the files of `sessions` cost a read (a `ps` and a
-/// `KERN_PROCARGS2` each).
+/// of any of those homes cannot be read whole; no sessions directory at all
+/// means nothing holds anything there. Only the files of `sessions` cost a
+/// read (a `ps` and a `KERN_PROCARGS2` each).
 fn holders(
-    home: &Path,
+    opts: &Opts,
     sessions: &BTreeSet<String>,
     tabs: Option<&[LiveTab]>,
 ) -> Option<Vec<Holder>> {
+    let home = opts.home.as_path();
     // A Codex upgrade (`codex-<tab>`) is held by the Codex TUI that leads its
     // tab now ([`super::codex::holders`]); Claude's files say nothing of it.
     let codex = super::codex::holders(home, sessions, tabs);
     if sessions.iter().all(|s| s.starts_with("codex-")) {
         return Some(codex);
     }
-    let files = match session_files(home) {
+    let first = match session_files(home) {
         Some(files) => files,
         None if matches!(
             std::fs::symlink_metadata(home.join(".claude/sessions")),
@@ -5275,6 +5363,7 @@ fn holders(
         }
         None => return None,
     };
+    let files = super::Homes::of_records(opts, sessions).roster(Some(first))?;
     Some(
         files
             .into_iter()
@@ -5477,7 +5566,7 @@ fn ask_within(
     // conversation left must not take the word meant for the live one), then
     // the newest upgrade that has not stopped, else the newest stopped one.
     let held = holders(
-        &opts.home,
+        opts,
         &candidates.iter().map(|(s, _)| s.clone()).collect(),
         None,
     )
@@ -5731,7 +5820,7 @@ impl View {
             opts,
             &tabs,
             now_s(),
-            &|sessions| holders(&opts.home, sessions, Some(&tabs)),
+            &|sessions| holders(opts, sessions, Some(&tabs)),
             summary,
         )
     }
@@ -6002,6 +6091,7 @@ impl View {
                 aterm_state: None,
                 ask: false,
                 several_logins: false,
+                instances: crate::harness::upgrade_drive::Instances::Machine,
             };
             self.mark(&opts, &BTreeMap::new());
         }
@@ -6206,6 +6296,7 @@ pub fn progress_projection(row: &Row, now: u64) -> BTreeMap<&'static str, i64> {
         | WaitClass::Notice
         | WaitClass::Queued
         | WaitClass::Unreached
+        | WaitClass::BuildFails
         | WaitClass::NextPoint
         | WaitClass::Unrecorded
         | WaitClass::Unclassified => 3,

@@ -1150,7 +1150,6 @@ fn verb_hint_matches_dispatch() {
             "lineage",
             &["--lineage-dormant", "--compiler", "--from"][..],
         ),
-        ("devroot", &["--all"][..]),
     ] {
         let usage = verb_usage(verb).expect("visible option parser has usage");
         for flag in flags {
@@ -4300,26 +4299,32 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The dev `atpkg` binary beside this test executable — `target/<profile>/atpkg`,
-/// two levels up from `deps/` — which `targo --unverified test -p atpkg` builds for
-/// the integration lanes before any test runs. LOUD when absent: a lane that drives
-/// the real child against a held lock must not pass on a fake one.
+/// The dev `atpkg` binary `targo --unverified test -p atpkg` builds for the
+/// integration lanes before any test runs: `<profile>/atpkg` two levels up from this
+/// test executable's `deps/` — or, when a build directory holds the intermediates
+/// (`crate::build_cache`), in the workspace's `target/<profile>/`. LOUD when absent: a
+/// lane that drives the real child against a held lock must not pass on a fake one.
 #[cfg(unix)]
 fn dev_atpkg_binary() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("this test executable");
-    let candidate = exe
+    let profile_dir = exe
         .parent()
         .and_then(std::path::Path::parent)
-        .map(|dir| dir.join("atpkg"))
-        .expect("target/<profile>/deps/<test> has a profile directory");
+        .expect("<profile>/deps/<test> has a profile directory");
+    let profile = profile_dir.file_name().expect("a profile name");
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let candidates = [
+        profile_dir.join("atpkg"),
+        workspace.join("target").join(profile).join("atpkg"),
+    ];
+    let found = candidates.iter().find(|c| crate::stub::is_live_atpkg(c));
     assert!(
-        crate::stub::is_live_atpkg(&candidate),
-        "no dev atpkg binary at {} — `targo --unverified test -p atpkg` builds it (the \
-         integration lanes need it too); this lane drives the real child against a \
-         lock it holds",
-        candidate.display()
+        found.is_some(),
+        "no dev atpkg binary at {candidates:?} — `targo --unverified test -p atpkg` builds \
+         it (the integration lanes need it too); this lane drives the real child against a \
+         lock it holds"
     );
-    candidate
+    found.cloned().unwrap_or_default()
 }
 
 /// DESIGN S7 on the `which` surface: a managed shim that exports its policy's
@@ -6967,44 +6972,9 @@ fn noindex_grammar_is_exact() {
         );
     }
     assert!(
-        !NAME_TAKING_VERBS
-            .iter()
-            .any(|(name, _)| *name == "noindex" || *name == "devroot"),
-        "noindex and devroot read args[1] as a subcommand, not a program name"
+        !NAME_TAKING_VERBS.iter().any(|(name, _)| *name == "noindex"),
+        "noindex reads args[1] as a subcommand, not a program name"
     );
-}
-
-/// The `devroot` grammar: bare is the plan, `move` wants `--all` OR checkouts (never
-/// nothing: it moves nothing unasked), `verify` takes nothing more.
-#[test]
-fn devroot_grammar_is_exact() {
-    use crate::devroot::Selection;
-    let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    let job = |s: &str| parse_devroot(&argv(s)).ok();
-    assert_eq!(job(""), Some(DevrootJob::Plan));
-    assert_eq!(job("verify"), Some(DevrootJob::Verify));
-    assert_eq!(job("move --all"), Some(DevrootJob::Move(Selection::All)));
-    assert_eq!(
-        job("move /h/a /h/b"),
-        Some(DevrootJob::Move(Selection::Named(vec![
-            std::path::PathBuf::from("/h/a"),
-            std::path::PathBuf::from("/h/b")
-        ])))
-    );
-    for wrong in [
-        "move",
-        "move --all /h/a",
-        "move /h/a --all",
-        "move --dry-run",
-        "verify /h/a",
-        "plan",
-        "--all",
-    ] {
-        assert!(
-            parse_devroot(&argv(wrong)).is_err(),
-            "`atpkg devroot {wrong}` must be a usage error"
-        );
-    }
 }
 
 /// `--help` must ANSWER, never act. `gc --help` used to reclaim the rollback
@@ -7096,9 +7066,6 @@ fn store_lock_verb_roster_is_exact() {
         // `noindex` writes nothing under <prefix> — its probe file is removed by a
         // Drop guard — so a measurement never queues behind an install.
         "noindex",
-        // `devroot` moves checkouts under $HOME and probes the root; nothing under
-        // <prefix> moves.
-        "devroot",
         // `machine` writes a per-host preference; nothing under <prefix> moves.
         "machine",
         // `lease` lays one file under `<prefix>/leases/` for the life of the command it

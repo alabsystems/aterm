@@ -11,6 +11,14 @@
 //! that it reads; whether a parser may take the carry is
 //! [`aterm_parser::Parser::restore_carry`]'s decision, made in
 //! `Terminal::restore_checkpoint`.
+//!
+//! The carry crosses builds in both directions, so a carry an older build
+//! would refuse rides in the form that build reads, with the exact one beside
+//! it under [`ParserRepr::exact`] (ruling 2026-10-10): a DCS header, carried as
+//! itself since then, goes out as `{"state":"DcsIgnore","exact":{…}}`. A build
+//! before the key reads the `DcsIgnore` it wrote itself for a header, and
+//! ignores the key; this build reads `exact`. An older producer's `DcsIgnore`
+//! reads here as it was meant.
 
 use aterm_parser::{ParserCarry, State};
 
@@ -54,6 +62,15 @@ pub struct ParserRepr {
     /// next `0x9C` as its ST); one after it reads its absence as no head.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub string_utf8_tail: String,
+    /// The carry itself, when the fields beside it are the coarser form a
+    /// build that predates it reads in its place
+    /// ([`ParserCarry::for_older_builds`]): a DCS header, which such a build
+    /// refuses (it would resume at Ground and print the string), rides there
+    /// as the `DcsIgnore` that build wrote itself. Such a build ignores the
+    /// key; this one reads only it, one level deep (an `exact` inside it is
+    /// not read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Box<ParserRepr>>,
 }
 
 #[allow(
@@ -107,9 +124,22 @@ fn from_hex(hex: &str) -> Option<Vec<u8>> {
 }
 
 impl ParserRepr {
-    /// The wire form of `carry`.
+    /// The wire form of `carry`: its fields, or the fields of the form a build
+    /// that predates it reads ([`ParserCarry::for_older_builds`]) with the
+    /// carry itself under [`Self::exact`].
     #[must_use]
     pub fn from_carry(carry: &ParserCarry) -> Self {
+        match carry.for_older_builds() {
+            Some(older) => Self {
+                exact: Some(Box::new(Self::fields(carry))),
+                ..Self::fields(&older)
+            },
+            None => Self::fields(carry),
+        }
+    }
+
+    /// `carry`'s own fields, with no [`Self::exact`].
+    fn fields(carry: &ParserCarry) -> Self {
         Self {
             state: carry.state.name().to_owned(),
             params: carry.params.clone(),
@@ -123,13 +153,20 @@ impl ParserRepr {
             utf8_tail: to_hex(&carry.utf8_tail),
             utf8_expected: carry.utf8_expected,
             string_utf8_tail: to_hex(&carry.string_utf8_tail),
+            exact: None,
         }
     }
 
-    /// The carry this names, or `None` for an unknown state name or non-hex
-    /// bytes. Not a validation of the carry (see the module docs).
+    /// The carry this names — [`Self::exact`] when there is one, else these
+    /// fields — or `None` for an unknown state name or non-hex bytes. Not a
+    /// validation of the carry (see the module docs).
     #[must_use]
     pub fn to_carry(&self) -> Option<ParserCarry> {
+        self.exact.as_deref().unwrap_or(self).fields_to_carry()
+    }
+
+    /// The carry these fields name, [`Self::exact`] aside.
+    fn fields_to_carry(&self) -> Option<ParserCarry> {
         Some(ParserCarry {
             state: State::from_name(&self.state)?,
             params: self.params.clone(),
@@ -201,6 +238,72 @@ mod tests {
         let repr = ParserRepr::from_carry(&string);
         assert_eq!(repr.string_utf8_tail, "e6");
         assert_eq!(repr.to_carry(), Some(string));
+    }
+
+    /// A DCS HEADER CROSSES BUILDS BOTH WAYS (round fifteen, R15-PARSER-P1;
+    /// ruling 2026-10-10). Carried as itself, it rides under `exact`, beside
+    /// the fields a build before the key reads: the `DcsIgnore` holding
+    /// nothing that such a build wrote for every header, which its
+    /// `restore_carry` accepts (without the key, which its `ParserRepr` does
+    /// not have and serde drops, it reads exactly that). This build reads the
+    /// header. An older producer's `DcsIgnore` reads here as it was meant, and
+    /// a carry an older build reads as it is crosses with no `exact`.
+    #[test]
+    fn a_dcs_header_rides_beside_the_form_an_older_build_reads() {
+        let header = ParserCarry {
+            state: State::DcsIntermediate,
+            params: vec![1],
+            current_param: 2,
+            param_started: true,
+            intermediates: vec![b'$'],
+            ..ParserCarry::default()
+        };
+        let repr = ParserRepr::from_carry(&header);
+        let older_reads = ParserRepr {
+            exact: None,
+            ..repr.clone()
+        };
+        assert_eq!(
+            older_reads,
+            ParserRepr {
+                state: "DcsIgnore".into(),
+                ..ParserRepr::default()
+            },
+            "nothing beside `exact` that an older build's restore refuses"
+        );
+        let older_carry = older_reads.to_carry().expect("reads");
+        assert_eq!(header.for_older_builds(), Some(older_carry.clone()));
+        aterm_parser::Parser::new()
+            .restore_carry(&older_carry)
+            .expect("the older form restores");
+        assert_eq!(repr.to_carry(), Some(header.clone()), "this build reads it");
+        let mut parser = aterm_parser::Parser::new();
+        parser
+            .restore_carry(&repr.to_carry().expect("reads"))
+            .expect("the header restores");
+        assert_eq!(parser.state(), State::DcsIntermediate);
+
+        let older_producer = ParserRepr {
+            state: "DcsIgnore".into(),
+            ..ParserRepr::default()
+        };
+        assert_eq!(older_producer.to_carry(), Some(older_carry));
+
+        for carry in [
+            ParserCarry {
+                state: State::CsiParam,
+                params: vec![38],
+                ..ParserCarry::default()
+            },
+            ParserCarry {
+                state: State::DcsIgnore,
+                ..ParserCarry::default()
+            },
+        ] {
+            let repr = ParserRepr::from_carry(&carry);
+            assert_eq!(repr.exact, None, "{carry:?}");
+            assert_eq!(repr.to_carry(), Some(carry));
+        }
     }
 
     #[test]

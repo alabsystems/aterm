@@ -27,3 +27,9 @@ aterm-core = { workspace = true }
 # this dependency-free leaf so clients that cannot link this crate share it.
 # Already in the graph through aterm-core.
 aterm-codec = { workspace = true }
+
+[dev-dependencies]
+# A real JSON reader for the tests that read a reply back (`blocks --json`'s
+# escaped cwd decodes to the bytes the program sent). Workspace crate; serde is
+# its one dependency, already in the graph.
+aterm-json = { workspace = true }

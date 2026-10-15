@@ -1444,6 +1444,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         questions: None,
         identity: None,
         agent: None,
+        supervised: None,
         held: false,
     }
 }
@@ -2192,6 +2193,7 @@ fn dead_agent() -> restore::AgentRestore {
         home: None,
         login: None,
         codex: None,
+        cause: None,
     }
 }
 
@@ -2232,6 +2234,7 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
         dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
         login: Some(OWED_LOGIN.into()),
         home: Some(OWED_HOME.into()),
+        claude_dir: None,
     }
 }
 
@@ -2270,7 +2273,7 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
     }
     let handed = cold.take_restored_agents();
     assert_eq!(handed.len(), 1, "{handed:?}");
-    let (sid, snap) = &handed[0];
+    let (sid, snap, _) = &handed[0];
     assert_eq!(&snap.tab, sid);
     assert_eq!(snap.session, agent.session);
     assert_eq!(
@@ -2408,7 +2411,7 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
         1,
         "only the adopted shell 8 owes one: {handed:?}"
     );
-    let (sid, snap) = &handed[0];
+    let (sid, snap, _) = &handed[0];
     let adopted_sid = {
         let g = successor.store.read().unwrap();
         g.by_local(eight)
@@ -2482,6 +2485,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
         snap: owed_relaunch(&owed_sid),
         place: "in tab 1".into(),
         cold: true,
+        asked: None,
     }]);
     app.harness = Some(host.clone());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2655,12 +2659,12 @@ fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
 /// Commit (the same step a cold restore takes) plans its line with both. It
 /// came back in the default home on the default account before.
 ///
-/// ITS CAUSE IS NOT CARRIED, by decision: the successor relaunches it as
-/// aterm's own end (`host`), as a failed Commit's rollback relaunches one
-/// stranded in this process — the restored queue's step, whose one try and
-/// at-once verdict are that cause's, from a process that did not read the
-/// exit; carried, it would change only the continuation's words and the
-/// record's label.
+/// An owed relaunch the explicit restart's act made carries its cause too
+/// since round eighteen (ruling 20's (iv): carried through a hand across the
+/// Commit, its relaunch is the act's, never a counted try):
+/// `an_owed_relaunchs_cause_rides_the_handoff_leaf`. Of every other — a
+/// crash's — none rides, and the successor relaunches it as aterm's own end
+/// (`host`), as before.
 ///
 /// NEGATIVE CONTROL: owed with neither, the successor's line is today's.
 #[cfg(unix)]
@@ -2711,7 +2715,7 @@ fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
         successor.queue_carried_restored_agents();
         let mut handed = successor.take_restored_agents();
         assert_eq!(handed.len(), 1, "{handed:?}");
-        let (_, snap) = handed.remove(0);
+        let (_, snap, _) = handed.remove(0);
         // In a zsh, as the relaunch's plan reads the adopted shell's dialect.
         let line = exit_line(&Snapshot {
             dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
@@ -2743,6 +2747,352 @@ fn an_owed_relaunch_keeps_its_home_and_login_across_the_commit() {
         line,
         Some(format!(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 {program}"))
     );
+}
+
+/// A CRASH DURING A SUCCESSFUL COMMIT'S HOLD REACHES THE SUCCESSOR (round
+/// eighteen; `HostHandle::pending_restored_for`'s stated residual: a crash
+/// read after the Commit's re-capture was on neither layout). The parent's
+/// host supervises the tab's Claude Code, published as every supervised
+/// agent is; a seamless update parks, its layout is captured, and its
+/// Commit goes ahead — and the agent crashes during the Commit's hold, read
+/// by the parent's exit watch in a process about to exit, typed into by
+/// nobody there (parked, then stopped). The successor's Commit hands it the
+/// tab: the agent its parent supervised there is watched from that Commit,
+/// its exit read as the successor sees it — the agent gone, a crash's record
+/// left — and it is relaunched once, by the successor alone.
+///
+/// FAILS ON 745d63b36: a handoff leaf carried an agent only where a
+/// relaunch was owed at the park (`TerminalLeafRestore::agent`), and nothing
+/// told the successor which agent ran in the tab: its first pass found no
+/// agent named there and started nothing, and the crash was relaunched by
+/// nobody and said to nobody (the wait for its relaunch runs out).
+#[cfg(unix)]
+#[test]
+fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
+    use aterm_agent::harness::relaunch::Snapshot;
+    // The parent: its host supervises the tab's agent, and published it.
+    let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+        std::sync::Arc::new(|_, _, _| "refused:inert".to_string()),
+    );
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    app.harness = Some(host.clone());
+    let supervised = Snapshot {
+        tab: sid.clone(),
+        home: None,
+        login: None,
+        ..owed_relaunch(&sid)
+    };
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&supervised));
+    // The park's layout, which the successor restores.
+    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+    let wire = app.capture_handoff_layout().to_toml().expect("the wire");
+    // The Commit goes ahead; the agent crashes during its hold, and the
+    // parent exits with what it read.
+    host.suspend();
+    host.shutdown_and_join();
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+    app.rollback_overlap(None, &[]);
+    // The successor: the leaf's shell adopted, its Commit.
+    let layout = restore::RestoreManifest::from_toml(&wire).expect("the successor reads it");
+    let leaf = layout
+        .handed_off_leaves()
+        .into_iter()
+        .find(|leaf| leaf.local_id == Some(0))
+        .expect("the tab's leaf");
+    let relaunched: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        std::sync::Arc::default();
+    let passes: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
+    let successor_host = crate::harness_host::HostHandle::for_successor_test(
+        std::sync::Arc::clone(&relaunched),
+        std::sync::Arc::clone(&passes),
+    );
+    let mut successor = App::headless_for_test();
+    successor.handoff_successor = true;
+    successor.restore_into_window(
+        WindowId(0),
+        window_of(vec![restore::RestoredSplitTree::leaf(
+            restore::RestoredView::Terminal(leaf),
+        )]),
+    );
+    let adopted = *successor.pool.sessions.keys().max().expect("a session");
+    adopt_as(&mut successor, adopted, 0);
+    for (&id, pooled) in successor.pool.sessions.iter_mut() {
+        pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+    }
+    let tab = {
+        let g = successor.store.read().unwrap();
+        g.by_local(adopted)
+            .expect("registered")
+            .sid
+            .as_str()
+            .to_string()
+    };
+    successor.harness = Some(successor_host.clone());
+    // Its Commit, in the run loop's order.
+    successor_host.resume_after_handoff(successor.handoff_carry_on_places());
+    successor.hand_carried_restored_agents();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the crash during the hold relaunched by the successor",
+        || (!relaunched.lock().unwrap().is_empty()).then_some(()),
+    );
+    // Once, on the crash's record: two whole passes since with no worker
+    // left — the one handed the exit ended — so no second worker, and no
+    // second relaunch, can follow.
+    let then = passes.load(std::sync::atomic::Ordering::SeqCst);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "two whole passes since, no worker left",
+        || {
+            crate::harness_host::ring();
+            (passes.load(std::sync::atomic::Ordering::SeqCst) >= then + 2
+                && successor_host.live().is_empty())
+            .then_some(())
+        },
+    );
+    assert_eq!(
+        relaunched.lock().unwrap().clone(),
+        vec![(tab, "survived".to_string())],
+        "(the tab, what the exit left): relaunched once"
+    );
+    successor_host.shutdown_and_join();
+}
+
+/// AN OWED RELAUNCH'S CAUSE RIDES THE HANDOFF LEAF (round eighteen; ruling
+/// 20's (iv)): a relaunch the explicit restart's act owes a tab (the
+/// worker's `OwedRelaunch::asked`) is named on that tab's handoff leaf with
+/// its cause, through the layout's wire, and the successor's Commit hands
+/// its restored queue the agent with it (`RestoredAgent::asked`), so the
+/// queue carries it through a hand and relaunches it as the act's.
+/// NEGATIVE CONTROL: a crash's owed relaunch writes no cause, and is handed
+/// with none.
+#[cfg(unix)]
+#[test]
+fn an_owed_relaunchs_cause_rides_the_handoff_leaf() {
+    use aterm_agent::harness::restart_stamp::Cause;
+    let carried = |asked: Option<Cause>| -> (bool, Option<Cause>) {
+        let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+            std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+        );
+        let mut app = App::headless_for_test();
+        let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        let sid = {
+            let g = app.store.read().unwrap();
+            g.by_local(0).expect("registered").sid.as_str().to_string()
+        };
+        app.harness = Some(host.clone());
+        host.owe_asked_for_test(&sid, Some(owed_relaunch(&sid)), asked);
+        assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+        let wire = app.capture_handoff_layout().to_toml().expect("the wire");
+        app.rollback_overlap(None, &[]);
+        let layout = restore::RestoreManifest::from_toml(&wire).expect("the successor reads it");
+        let agent = layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.agent)
+            .expect("the owed tab's leaf names its agent");
+        let mut successor = App::headless_for_test();
+        successor.handoff_successor = true;
+        successor.restore_into_window(WindowId(0), window_of(vec![leaf_hosting(8, Some(*agent))]));
+        let adopted = *successor.pool.sessions.keys().max().expect("a session");
+        adopt_as(&mut successor, adopted, 8);
+        for (&id, pooled) in successor.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+        }
+        successor.queue_carried_restored_agents();
+        let mut handed = successor.take_restored_agents();
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (_, _, asked) = handed.remove(0);
+        (wire.contains("cause = "), asked)
+    };
+    assert_eq!(
+        carried(Some(Cause::Asked)),
+        (true, Some(Cause::Asked)),
+        "(the wire names it, handed with it)"
+    );
+    assert_eq!(carried(Some(Cause::Stall)), (true, Some(Cause::Stall)));
+    // NEGATIVE CONTROL: a crash's.
+    assert_eq!(carried(None), (false, None));
+}
+
+/// THE HANDOFF LEAF NAMES THE AGENT ITS HOST SUPERVISES, WHERE NOTHING IS
+/// OWED (round eighteen): the agent the host last published for a tab rides
+/// that tab's handoff leaf (`TerminalLeafRestore::supervised`) — never a
+/// durable layout's, whose `agent` names what runs, and never a tab owed a
+/// relaunch, whose `agent` names that. The Commit compares the process it
+/// names: re-read with its conversation followed it is no change, and
+/// another process in its place refuses the Commit as activity, its exit
+/// decided by the outgoing instance. The topology does not change either
+/// way.
+#[cfg(unix)]
+#[test]
+fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
+    use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
+    use aterm_agent::harness::relaunch::Snapshot;
+    let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+        std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+    );
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    app.harness = Some(host.clone());
+    let supervised = Snapshot {
+        tab: sid.clone(),
+        ..owed_relaunch(&sid)
+    };
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&supervised));
+    let leaf = |layout: &restore::RestoreManifest| {
+        layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .expect("the tab's leaf")
+    };
+    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+    let pending = app.capture_handoff_layout();
+    let named = leaf(&pending);
+    assert_eq!(
+        (named.agent, named.supervised.map(|agent| *agent)),
+        (None, Some(restore::AgentRestore::of(supervised.clone()))),
+        "(owed, supervised): the handoff leaf names the agent its host supervises"
+    );
+    let wire = pending.to_toml().expect("the wire");
+    assert_eq!(
+        leaf(&restore::RestoreManifest::from_toml(&wire).expect("read back")).supervised,
+        leaf(&pending).supervised,
+        "through the wire"
+    );
+    assert_eq!(
+        leaf(&app.capture_restore_manifest()).supervised,
+        None,
+        "a durable layout names none"
+    );
+    // Its conversation followed: the same process, no change at the Commit.
+    crate::harness_host::publish_snapshot_for_test(
+        &sid,
+        Some(&Snapshot {
+            session: Some("11111111-2222-4333-8444-555555555555".to_string()),
+            ..supervised.clone()
+        }),
+    );
+    let live = app.capture_handoff_layout();
+    assert_eq!(commit_agent_carry(&live), commit_agent_carry(&pending));
+    // Another process in its place: refused as activity.
+    crate::harness_host::publish_snapshot_for_test(
+        &sid,
+        Some(&Snapshot {
+            pid: supervised.pid + 1,
+            ..supervised.clone()
+        }),
+    );
+    let live = app.capture_handoff_layout();
+    assert_ne!(commit_agent_carry(&live), commit_agent_carry(&pending));
+    assert_eq!(
+        commit_layout_topology(&live),
+        commit_layout_topology(&pending),
+        "the topology did not change"
+    );
+    // A tab owed a relaunch names that, and no supervised agent.
+    host.owe_for_test(&sid, Some(owed_relaunch(&sid)));
+    let owed = leaf(&app.capture_handoff_layout());
+    assert_eq!(
+        (owed.agent.is_some(), owed.supervised),
+        (true, None),
+        "(owed, supervised)"
+    );
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+    app.rollback_overlap(None, &[]);
+}
+
+/// A DURABLE LAYOUT NEVER CARRIES THE EXPLICIT RESTART'S CAUSE (round
+/// eighteen, the review of its first cut): the act's cause on a relaunch a
+/// tab is owed rides the seamless update's handoff layout alone, whose
+/// successor adopts the very tab (its sid kept) and relaunches it as the
+/// act's. The layouts an end nobody chose leaves the next launch — the
+/// crash journal's image and the quit layout (`App::fill_desk_agents`) —
+/// name the owed agent with none, and a cold restore of one hands its queue
+/// the agent as aterm's own end. Carried there, the next launch relaunched
+/// it on the act's cause (`relaunch::after_exit`) in a REOPENED tab, whose
+/// sid is new: a relaunch the act left in flight for the old tab then read
+/// as the conversation's in another tab (`wait:conversation-in-other-tab`),
+/// a counted wait — eight, and the tab said not to have come back — where
+/// aterm's own end (`relaunch::after_host_ended`) closes that record as
+/// `host-ended` and relaunches the agent (aterm-agent's
+/// `an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab` shows the
+/// two steps apart). POSITIVE CONTROL: the handoff layout's leaf names it.
+///
+/// FAILS ON 95d62f656: the durable leaf read `cause = "asked"` (the one
+/// reader, `App::pending_restored_agent`, served both layouts), and the cold
+/// restore handed its queue `Some(Asked)`.
+#[cfg(unix)]
+#[test]
+fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
+    use aterm_agent::harness::restart_stamp::Cause;
+    let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
+        std::sync::Arc::new(|_, _, _| "wait:shell-prompt".to_string()),
+    );
+    let mut app = App::headless_for_test();
+    let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+    let sid = {
+        let g = app.store.read().unwrap();
+        g.by_local(0).expect("registered").sid.as_str().to_string()
+    };
+    app.harness = Some(host.clone());
+    host.owe_asked_for_test(&sid, Some(owed_relaunch(&sid)), Some(Cause::Asked));
+    let owed_agent = |layout: &restore::RestoreManifest| {
+        layout
+            .handed_off_leaves()
+            .into_iter()
+            .find(|leaf| leaf.local_id == Some(0))
+            .and_then(|leaf| leaf.agent)
+            .map(|agent| *agent)
+    };
+    // The crash journal's image and the quit layout: the owed agent named,
+    // through the wire, with no cause.
+    let mut durable = app.capture_restore_manifest();
+    app.fill_desk_agents(&mut durable);
+    let wire = durable.to_toml().expect("the wire");
+    let named = owed_agent(&restore::RestoreManifest::from_toml(&wire).expect("read back"))
+        .expect("the durable leaf names the owed agent");
+    assert_eq!(
+        (named.session.as_deref(), named.cause.as_deref()),
+        (owed_relaunch(&sid).session.as_deref(), None),
+        "(the conversation, the cause): a durable layout names the agent alone"
+    );
+    // Its cold restore hands the queue aterm's own end.
+    let mut cold = App::headless_for_test();
+    cold.restore_into_window(WindowId(0), window_of(vec![leaf_hosting(8, Some(named))]));
+    for (&id, pooled) in cold.pool.sessions.iter_mut() {
+        pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+    }
+    let handed = cold.take_restored_agents();
+    assert_eq!(
+        handed
+            .iter()
+            .map(|(_, _, asked)| *asked)
+            .collect::<Vec<_>>(),
+        vec![None],
+        "a cold restore relaunches it as aterm's own end"
+    );
+    // POSITIVE CONTROL: the handoff layout's leaf names the cause.
+    assert!(app.park_all_readers(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN));
+    let handoff = app.capture_handoff_layout();
+    app.rollback_overlap(None, &[]);
+    assert_eq!(
+        owed_agent(&handoff).and_then(|agent| agent.asked()),
+        Some(Cause::Asked),
+        "the handoff layout carries it"
+    );
+    host.shutdown_and_join();
 }
 
 /// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
@@ -3497,6 +3847,7 @@ impl Successor {
             home: None,
             login: None,
             codex: None,
+            cause: None,
         };
         desk.fill_agents(&|id| (id == 1).then(|| claude.clone()));
         let owner = JournalOwner::create(dir.path(), parent).expect("armed");

@@ -2872,7 +2872,14 @@ pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
 /// weekly wall behind a background shell), 4 the
 /// loop has given up, 5 the wall's rows are OUT OF VIEW (scrolled off, a `/model`
 /// under them: the tab reads busy on its shell) and `mem` says the loop still
-/// remembers the wall it waits on. `bg` the agent's own background work. `clock` the ticks
+/// remembers the wall it waits on, 6 the wall's notice LEFT AN IDLE SCREEN (Esc
+/// on the vendor's own countdown, a person's local command on a tab with no
+/// shell: idle, no wall) and the loop waits on the reset the notice named —
+/// remembered across a loop's restart by its open ledger row (`mem` again).
+/// `ran` marks a person's turn served at a left wall that the loop did not
+/// see, the wait left standing over it. `other` 1 the left wall's screen
+/// shows ANOTHER conversation's history (a person `/resume`d it): an older
+/// limit's notice with turns served under it, this limit standing. `bg` the agent's own background work. `clock` the ticks
 /// since the wall appeared (saturating); the account has its tokens back at
 /// `due` (`ResetAt`, or `Skew` ticks later). `view` 0 the reset is placed where the notice
 /// says, 1 placed in the past (a bare clock time read by the session-window
@@ -2891,6 +2898,84 @@ pub fn supervisor_codex_rate_nudge_liveness() -> crate::derive::Liveness {
 /// into the standing wall every rung until the reset (24 lines in one
 /// incident), caught by `NoBlindAct`. Every act waits for the reset as
 /// placed AND its rung (the real `max(reset + grace, since + rung)`).
+///
+/// A notice that leaves an idle screen (`NoticeLeaves`, the `Leaves` dial) is
+/// waited on to the same reset, and acted on there as the wall that shows is
+/// (`Buggy`: `LeftReadAsTurnEnd`, the left limit decided as a turn's end — the
+/// continuation typed into the standing limit at once, caught by `NoBlindAct`).
+/// A person's turn there that the account serves (`PersonTurnServed`, its
+/// tokens back — at the named reset or before it, `LimitLiftedEarly`: a plan
+/// changed, usage bought) is work since the wall, and ends the wait however
+/// short it was (`Buggy`: `PersonTurnUnseen`, a turn no read saw busy read as
+/// no turn — the person's continuation held to the reset, caught by
+/// `NoWaitOverAServedTurn`). Another conversation's history on the screen
+/// (`ConversationResumed`) is no turn of this limit's, served or not
+/// (`Buggy`: `OtherLimitsTurnRead`, its older limit's served turn read as one
+/// since this limit — the wait ended and the continuation typed into the
+/// standing limit, caught by `NoBlindAct`; the review of 2026-10-14 measured
+/// it on 2.1.300).
+///
+/// `held` 1: an act of the policy's OWN is inside its take window — typed, no
+/// read has seen it taken, and its point not judged yet (30 s in the real
+/// policy, under a tick: the next `Tick` ends it, as does a turn the account
+/// serves, a point with work). Both of its acts have one (the `OwnAct` dial):
+/// the continue policy's at a turn's end (`OwnActTyped`), and the wall's own
+/// retry (`Act`). No act is decided while it is (`Act` waits for the window).
+/// A wall that answers the act at once (the stub's 429, no busy read: a
+/// `WallAppears` after `OwnActTyped`, a `MetInWindow` after `Act`) is read
+/// with `held` still 1, and may leave the screen inside the window
+/// (`NoticeLeaves`). The wall is the loop's from its first reading all the
+/// same; `Buggy`: `TakeWindowDropsWall`, the wall folded in only at a point,
+/// so its notice gone by the window's end reads as the act's short turn and
+/// the continue policy types into the standing limit (round 15's run on
+/// 2.1.300, 2026-10-14), caught by `NoBlindAct`; and `RetryReadAsTaken`, the
+/// wall's answer to a retry read inside its window but not kept as the
+/// retry's answer, so the retry, its answer's notice gone by the window's
+/// end, reads as taken and the wall is forgotten — the continue policy then
+/// typed into the standing limit (round 16's review), caught by
+/// `WallRemembered`.
+///
+/// `unread` 1: the wall's notice LEFT BEFORE ANY READ after the act it
+/// answered — the limit answered at once and a person's Esc on the vendor's
+/// countdown came before the loop's first read (round 16's residual (a), the
+/// lab's `tw16after` on 2.1.300): `WallAppearsLeft` after `OwnActTyped`,
+/// `MetLeftUnread` after `Act` (the `Unread` dial: 0 switches both off). The
+/// screen the loop reads shows only the
+/// vendor's cancel under the notice (`Automatic continue cancelled`), no
+/// wall; that notice is the act's answer all the same (the real
+/// `TurnEndState::left_answer`: a notice the act was not typed over, the
+/// cancel right under it, nothing served since), and the limit is waited on
+/// to the reset it named. `Buggy`: `UnreadLeftDropped`, the cancel read as
+/// no limit, so the act's window ends on its short turn and the continue
+/// policy types into the standing limit (measured on 1afcdade3), caught by
+/// `NoBlindAct`; and `UnreadAnswerReadAsTaken`, a retry's answer gone before
+/// any read, the retry read as taken and the wall forgotten, caught by
+/// `WallRemembered`. The next tick (the window's end) clears it: past the
+/// window the left wall is the track's, as any left wall is.
+///
+/// A PERSON'S turn answered the same way (`PersonWallLeft`, round 17's
+/// residual (a)): no act of the loop's is in flight; a person's prompt at a
+/// turn's end meets the limit at once and their Esc on the countdown comes
+/// before the loop's next read. The notice is new since the loop last
+/// looked, and it is that turn's answer all the same (the real
+/// `TurnEndState::left_answer`, confirmed by a transcript row written since
+/// that look where there is one): waited on to the reset it named. Read as
+/// no limit, the continue policy's next act goes into it —
+/// `UnreadLeftDropped` again (measured on 745d63b36, the lab's `pc18b1`), caught by
+/// `NoBlindAct`.
+///
+/// ANOTHER CONVERSATION'S OLDER CANCELLED LIMIT inside the own act's window
+/// (`OlderLeftResumed`, round 17's residual (a)): a person `/resume`s, before
+/// the loop's first read after its act, a conversation whose last thing is
+/// a limit cancelled on its countdown long ago. Nothing stands (`due` now),
+/// and with no transcript nothing tells that notice from the act's own
+/// answer: the loop reads it as the answer, and nothing dates its print
+/// (`sitting`), so its bare clock is placed never more than a session window
+/// out — a reset already past is passed (`view = 1`), the one try the
+/// policy accepts. `Buggy`: `OlderLeftPlacedTomorrow`, placed on the print
+/// of the act it was taken to answer, the past clock read as TOMORROW's
+/// (`view = 2`: no act for a day while the session is free; measured on
+/// 745d63b36), caught by `NoDayWait` and the liveness claim.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -2904,6 +2989,9 @@ pub fn supervisor_usage_wall_model() -> Model {
             const Skew = 8;
             const Cap = 12;
             const Hidden = 1;
+            const Leaves = 1;
+            const OwnAct = 1;
+            const Unread = 1;
             var wall = 0;
             var bg = 0;
             var due = 2;
@@ -2914,9 +3002,15 @@ pub fn supervisor_usage_wall_model() -> Model {
             var blind = 0;
             var mem = 1;
             var sitting = 0;
+            var ran = 0;
+            var other = 0;
+            var held = 0;
+            var unread = 0;
 
             // ---- the world ----
-            action BackgroundStarts when (bg == 0) {
+            // Background work starts under a turn: never on a screen the
+            // wall's notice left idle (`wall == 6`), where none runs.
+            action BackgroundStarts when (bg == 0 && wall <= 5) {
                 bg = 1;
             }
             action BackgroundEnds when (bg == 1) {
@@ -2927,6 +3021,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             action WallAppears when (wall == 0) {
                 wall = 1;
                 sitting = 0;
+                ran = 0;
                 blind = 0;
                 due = ResetAt;
                 clock = 0;
@@ -2937,6 +3032,7 @@ pub fn supervisor_usage_wall_model() -> Model {
             action WallAppearsLate when (wall == 0) {
                 wall = 1;
                 sitting = 0;
+                ran = 0;
                 blind = 0;
                 due = ResetAt + Skew;
                 clock = 0;
@@ -2948,9 +3044,10 @@ pub fn supervisor_usage_wall_model() -> Model {
             // redraws the conversation without its done row): nothing dates
             // its print, the session rule places its bare clock, and a clock
             // more than five hours ahead reads as passed.
-            action WallFoundSitting when (wall == 0) {
+            action WallFoundSitting when (wall == 0 && held == 0) {
                 wall = 1;
                 sitting = 1;
+                ran = 0;
                 blind = 0;
                 due = ResetAt;
                 clock = 0;
@@ -2961,6 +3058,8 @@ pub fn supervisor_usage_wall_model() -> Model {
             action Tick when (1 <= wall && clock <= Cap - 1) {
                 clock = clock + 1;
                 waited = if waited <= Rung2 - 1 { waited + 1 } else { waited };
+                held = 0;
+                unread = 0;
             }
 
             // The wall's rows leave the screen while the agent's shell keeps
@@ -2972,14 +3071,114 @@ pub fn supervisor_usage_wall_model() -> Model {
             action WallShows when (wall == 5) {
                 wall = 1;
             }
+            // The wall's notice LEAVES AN IDLE SCREEN (the `Leaves` dial: 0
+            // switches it off): Esc on the vendor's own countdown (`Automatic
+            // continue cancelled`), a person's `/usage` or `/model` under it on
+            // a tab with no shell. The screen reads idle, no wall, no work.
+            action NoticeLeaves when (Leaves == 1 && wall == 1 && bg == 0) {
+                wall = 6;
+            }
+            // A person's turn at the left wall, served — the account has its
+            // tokens back — and over before any read saw it busy (its prompt and
+            // reply drawn under the notice; the transcript's newest entry the
+            // model's): work since the wall, which ends the wait.
+            action PersonTurnServed when (wall == 6 && due <= clock && other == 0) {
+                wall = 0;
+                held = 0;
+                unread = 0;
+                tries = 0;
+                clock = 0;
+                waited = 0;
+                view = 0;
+                sitting = 0;
+                blind = 0;
+            }
+            // The account gets its tokens back BEFORE the reset the notice
+            // named (a plan changed, usage bought; the lab's `mode ok`): a
+            // turn served now is served before the reset.
+            action LimitLiftedEarly when (wall == 6 && clock <= due - 1) {
+                due = clock;
+            }
+            // A person `/resume`s ANOTHER conversation at the left wall: the
+            // screen redraws its history — an older limit's notice, lifted
+            // long ago, with turns served under it — and the host hands over
+            // its transcript. Nothing of this limit's.
+            action ConversationResumed when (Leaves == 1 && wall == 6 && other == 0) {
+                other = 1;
+            }
+            // The limit answers the own act at once AND a person's Esc on the
+            // vendor's countdown takes its notice off the screen's end before
+            // the loop's first read after the act: the screen it reads shows
+            // only the vendor's cancel under the notice, no wall.
+            action WallAppearsLeft when (
+                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+            ) {
+                wall = 6;
+                unread = 1;
+                sitting = 0;
+                ran = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+
+            // A PERSON'S prompt at a turn's end, no act of the loop's in
+            // flight, answered at once by the limit, AND their Esc on the
+            // vendor's countdown before the loop's next read: the screen it
+            // reads shows only the cancel under the notice under the person's
+            // prompt, no wall.
+            action PersonWallLeft when (
+                Unread == 1 && Leaves == 1 && held == 0 && wall == 0 && bg == 0
+            ) {
+                wall = 6;
+                unread = 1;
+                sitting = 0;
+                ran = 0;
+                blind = 0;
+                due = ResetAt;
+                clock = 0;
+                view = 0;
+                tries = 0;
+                waited = 0;
+            }
+            // Inside the own act's window, before the loop's first read
+            // after it, a person `/resume`s a conversation whose last thing
+            // is an OLDER limit cancelled on its countdown: nothing stands
+            // (the tokens are here now), the screen shows a cancel under a
+            // notice, and nothing dates that notice's print. Read as the
+            // act's answer, its bare clock is placed never more than a
+            // session window out: a reset already past is passed.
+            action OlderLeftResumed when (
+                Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+            ) {
+                wall = 6;
+                unread = 1;
+                sitting = 1;
+                ran = 0;
+                blind = 0;
+                due = 0;
+                clock = 0;
+                view = 1;
+                tries = 0;
+                waited = 0;
+            }
 
             // ---- the supervisor ----
+            // The continue policy's own act at a turn's end (the `OwnAct`
+            // dial: 0 switches it off): typed, its take window open.
+            action OwnActTyped when (OwnAct == 1 && wall == 0 && held == 0) {
+                held = 1;
+            }
             // The first act: `Grace` past the reset the notice names (150 s and a
             // session's share of a minute in the real policy); each
             // one after a wall that answered again: a rung, the last for every
-            // one after it — for ever.
+            // one after it — for ever. Its take window opens with it.
             action Act when (
-                (wall == 1 || (wall == 5 && mem == 1)) &&
+                held == 0 &&
+                (wall == 1 || ((wall == 5 || wall == 6) && mem == 1)) &&
                 ((view == 0 && ResetAt + Grace <= clock) || view == 1) && (
                     tries == 0 ||
                     (tries == 1 && Rung1 <= waited) ||
@@ -2990,6 +3189,8 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = if tries <= 2 { tries + 1 } else { tries };
                 wall = 2;
                 waited = 0;
+                other = 0;
+                held = OwnAct;
             }
             // What the act led to: the tokens are back (the worker works), or
             // the wall answers again.
@@ -3001,14 +3202,36 @@ pub fn supervisor_usage_wall_model() -> Model {
                 view = 0;
                 sitting = 0;
                 blind = 0;
+                ran = 0;
+                held = 0;
             }
             // ... the wall answers again: the next rung counts from THIS
             // appearance (the real `since`), as a fresh try's answer is
             // immediate but time may pass while it is in flight. The answer is
             // a print the loop watched: the reset is placed where the notice
-            // says.
+            // says. A turn ran into it (its point judges the act at once), or
+            // the act's window had passed.
             action Met when (wall == 2 && clock <= due - 1) {
                 wall = 1;
+                waited = 0;
+                view = 0;
+                held = 0;
+            }
+            // ... or answers it at once, no turn run (the stub's 429), INSIDE
+            // the act's take window: the same print, its point not judged yet.
+            action MetInWindow when (wall == 2 && held == 1 && clock <= due - 1) {
+                wall = 1;
+                waited = 0;
+                view = 0;
+            }
+            // ... or answers it at once and a person's Esc on the new
+            // countdown comes before the loop's first read: only the cancel
+            // under the answer's notice is ever read.
+            action MetLeftUnread when (
+                Unread == 1 && Leaves == 1 && wall == 2 && held == 1 && clock <= due - 1 && bg == 0
+            ) {
+                wall = 6;
+                unread = 1;
                 waited = 0;
                 view = 0;
             }
@@ -3029,8 +3252,97 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
             // The loop forgets the wall it waits on when its rows leave (a
-            // restart, an update): nothing remembers it, and no point forms.
-            action MemoryLost when (Buggy == 1 && wall == 5 && mem == 1) {
+            // restart, an update): nothing remembers it, and no point forms —
+            // and a left notice's wait, its ledger row closed at the idle
+            // screen, is lost the same way.
+            action MemoryLost when (Buggy == 1 && (wall == 5 || wall == 6) && mem == 1) {
+                mem = 0;
+            }
+            // A left notice read as a turn's end: the continue policy types
+            // into the standing limit at once, before its reset.
+            action LeftReadAsTurnEnd when (Buggy == 1 && wall == 6 && clock <= ResetAt - 1) {
+                blind = if blind <= 1 { blind + 1 } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+                other = 0;
+                unread = 0;
+            }
+            // A person's served turn at the left wall that no read saw busy,
+            // read as no turn: the wait stands over it, and the person's
+            // continuation is held to the reset (hours; days at a weekly limit).
+            action PersonTurnUnseen when (Buggy == 1 && wall == 6 && due <= clock && other == 0 && ran == 0) {
+                ran = 1;
+            }
+            // Another conversation's older limit, and a turn served under it,
+            // read as a turn served since THIS limit (evidence tied to no
+            // limit): the wait ends while the tokens are not back, and the
+            // continue policy types into the standing limit.
+            action OtherLimitsTurnRead when (Buggy == 1 && wall == 6 && other == 1 && clock <= due - 1) {
+                blind = if blind <= 1 { blind + 1 } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+                other = 0;
+                unread = 0;
+            }
+            // A wall read inside the own act's take window folded in only at
+            // a point: its notice gone by the window's end, the left limit
+            // reads as the act's short turn, and the continue policy types
+            // into the standing limit before its reset.
+            action TakeWindowDropsWall when (Buggy == 1 && wall == 6 && held == 1 && clock <= ResetAt - 1) {
+                blind = if blind <= 1 { blind + 1 } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+                other = 0;
+                held = 0;
+                unread = 0;
+            }
+            // The wall's answer to a retry, read inside the retry's window,
+            // not kept as its answer: its notice gone by the window's end,
+            // the retry reads as taken and the wall is forgotten (the continue
+            // policy types into the standing limit at its back-off).
+            action RetryReadAsTaken when (Buggy == 1 && wall == 6 && held == 1 && 1 <= tries && mem == 1) {
+                mem = 0;
+            }
+            // The limit that answered the own act, its notice gone before any
+            // read, read as no limit (only the vendor's cancel under it was
+            // read): the act's window ends on its short turn, and the
+            // continue policy types into the standing limit before its reset.
+            action UnreadLeftDropped when (
+                Buggy == 1 && wall == 6 && unread == 1 && tries == 0 && clock <= ResetAt - 1
+            ) {
+                blind = if blind <= 1 { blind + 1 } else { blind };
+                tries = if tries <= 2 { tries + 1 } else { tries };
+                wall = 2;
+                waited = 0;
+                other = 0;
+                held = 0;
+                unread = 0;
+            }
+            // That older cancelled limit placed on the print of the act it
+            // was taken to answer: its past clock read as tomorrow's, no act
+            // for a day while the session is free.
+            action OlderLeftPlacedTomorrow when (
+                Buggy == 1 && Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0
+            ) {
+                wall = 6;
+                unread = 1;
+                sitting = 1;
+                ran = 0;
+                blind = 0;
+                due = 0;
+                clock = 0;
+                view = 2;
+                tries = 0;
+                waited = 0;
+            }
+            // A retry's answer, its notice gone before any read, not read as
+            // its answer: the retry reads as taken and the wall is forgotten.
+            action UnreadAnswerReadAsTaken when (
+                Buggy == 1 && wall == 6 && unread == 1 && 1 <= tries && mem == 1
+            ) {
                 mem = 0;
             }
             // The loop gives up after three tries.
@@ -3062,9 +3374,14 @@ pub fn supervisor_usage_wall_model() -> Model {
             invariant NoBlindAct: blind <= sitting;
             // No wall is masked (`wall == 3`) and the ladder never gives up
             // (`wall == 4`): the defects' marks, each caught alone.
-            invariant NoStuckWall: wall <= 2 || wall == 5;
+            invariant NoStuckWall: wall <= 2 || 5 <= wall;
             // The loop remembers the wall it waits on.
             invariant WallRemembered: mem == 1;
+            // No wait stands over a turn the account served since the wall.
+            invariant NoWaitOverAServedTurn: ran == 0;
+            // No reset is placed a day out that nothing dated (`view == 2`:
+            // the defect's mark).
+            invariant NoDayWait: view <= 1;
         }
     }
 }
@@ -3077,7 +3394,10 @@ pub fn supervisor_usage_wall_model() -> Model {
 /// tokens (`Taken`). The world is NOT fair: background work may start and
 /// never end, and a wall may come late. Broken alone by `WallMasked` (a
 /// wall drawn behind background work, read as busy, so no
-/// point ever forms) and by `GivesUp` (a ladder with a last try).
+/// point ever forms), by `GivesUp` (a ladder with a last try), by
+/// `MemoryLost` and by `OlderLeftPlacedTomorrow` (an older cancelled limit
+/// nothing dated, its past clock placed a day out: no act while the tokens
+/// are here).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_liveness() -> Liveness {
@@ -3090,7 +3410,12 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
         ),
         weak: vec!["Tick", "Act", "Taken"],
         strong: vec![],
-        mutants: vec!["WallMasked", "GivesUp", "MemoryLost"],
+        mutants: vec![
+            "WallMasked",
+            "GivesUp",
+            "MemoryLost",
+            "OlderLeftPlacedTomorrow",
+        ],
     }
 }
 

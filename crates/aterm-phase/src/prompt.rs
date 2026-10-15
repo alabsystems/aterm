@@ -29,7 +29,12 @@
 //! your plan`), and the offer rows (`low-priority`, `limit-wall-promo`,
 //! `juniper-tide`, `cedar-ember`: reset claims and promotions; the two reset
 //! rows are read by [`crate::reset`], by their labels, and get no role
-//! here). Seen
+//! here). MEASURED on 2.1.295 (2026-10-09, `tools/real-claude-lab`'s `limit`
+//! mode): Claude Code types `/rate-limit-options` itself and draws the menu
+//! in place of the composer, two columns in under the inline renderer's `─`
+//! rule ("A FOOTED BOX IN A PANE"), `Stop and wait for limit to reset`, the
+//! dated wait row and `Upgrade your plan` under a subscription it knows no
+//! plan of ([`fixtures::LIMIT_OPTIONS_DIALOG`], `LIMIT_OPTIONS_WEEKLY`). Seen
 //! 2026-09-24 on the owner's Mac: a weekly limit (the vendor's
 //! `autoContinueAtUsageLimit` arms the wait WITHOUT this dialog only when
 //! the reset is under 24 h away) left it up for ~14 h, read as `other`. It
@@ -48,11 +53,12 @@
 //! of other rows, an async agent's latest activity) is read as a cursor too
 //! ONLY in a box titled `What do you want to do?` ([`cursors`]): the owner's
 //! report of that dialog showed `› 1. Stop and wait for limit to reset`, not
-//! captured as text, and a cursor missed there makes the options unsound
-//! (the first row is no option), which escalates the dialog again. That is a
-//! tolerance of the report, not evidence of the vendor's glyph. A box read
-//! with no title of its own (a footerless option block, a box whose head is
-//! off the screen) reads `❯` alone.
+//! captured as text (the 2.1.295 captures draw `❯`), and a cursor missed
+//! there makes the options unsound (the first row is no option), which
+//! escalates the dialog again. That is a tolerance of the report, not
+//! evidence of the vendor's glyph. A box read with no title of its own (a
+//! footerless option block, a box whose head is off the screen) reads `❯`
+//! alone.
 //!
 //! **DETECTION BY SHAPE** ([`find_box`]). A box is its key-hint FOOTER — a
 //! row of `<key> to <verb>` hints joined by ` · `, one of them `Esc …`, in
@@ -175,17 +181,23 @@
 //! line, the launch banner, a table row in the scrollback) is not theirs,
 //! or an idle or busy screen escalates.
 //!
-//! **A FOOTED BOX IN THE FULLSCREEN PANEL** ([`panel_box`]). Under the
-//! fullscreen renderer a Dialog drawn in the bottom panel has no `─` rule of
-//! its own: the panel's `▔` rule ([`is_panel_rule`], a toast may sit in it)
-//! is the rule over it, and its title, options and footer are padded three
-//! columns (2.1.287's `Po` under `Xa()`). The walk below does not stop at a
-//! `▔` row, so such a box read with its head off the screen, its first row
-//! the panel's rule: the usage-limit dialog was escalated five times on
-//! 2026-09-27 as `nothing that waits` with its dated wait row on the screen
-//! ([`fixtures::LIMIT_OPTIONS_PANEL`]). A footed box is read under the
-//! nearest panel rule above its footer when the row right under the rule is
-//! at column three, no row down to the footer sits left of it, and no
+//! **A FOOTED BOX IN A PANE** ([`pane_box`]). A Dialog that replaces the
+//! composer is padded in from its rule, in one of the two layouts the
+//! model-switch confirmation draws (below): under the fullscreen renderer
+//! the bottom panel's `▔` rule ([`is_panel_rule`], a toast may sit in it) and
+//! the title, options and footer three columns in (2.1.287's `Po` under
+//! `Xa()`); under the inline renderer a full-width `─` rule and all of it TWO
+//! columns in (MEASURED on 2.1.295: the usage-limit dialog,
+//! [`fixtures::LIMIT_OPTIONS_DIALOG`]). The walk below takes a box's title
+//! at column one: it does not stop at a `▔` row, and it reads a column-two
+//! title under a rule as a body row — either way a box with its head off the
+//! screen, escalated and never pressed. The usage-limit dialog was escalated
+//! five times on 2026-09-27 as `nothing that waits` with its dated wait row
+//! on the screen ([`fixtures::LIMIT_OPTIONS_PANEL`]), and on 2.1.295 every
+//! time it opened, the session standing past the reset (the real-Claude
+//! sweep of 2026-10-09). A footed box is read under the nearest rule of
+//! either kind above its footer when the row right under it is at that
+//! layout's column, no row down to the footer sits left of it, and no
 //! composer is under the footer; that row is its title.
 //!
 //! **A BOX WHOSE HEAD IS OFF SCREEN** ([`PromptV2::head_off_screen`]). A
@@ -315,6 +327,25 @@
 //! pressed within a second. The note is drawn `wrap="truncate"`, so in a pane
 //! narrower than the row its last item ends in `…`: a cut item is left out of
 //! the footer ([`is_hint_footer`]), not a reason to refuse the row.
+//!
+//! **A WRAPPED FOOTER** ([`unwrapped`]; MEASURED on 2.1.295, 2026-10-09, the
+//! fixtures `claude-2.1.295-*-NNcol.txt`). In a pane narrower than a footer
+//! Ink word-wraps it onto the rows under it, at its own column (the subagent
+//! note above is cut instead): the question dialog's `Enter to select · ↑/↓
+//! to navigate · Esc to cancel` (49 cells) at 48 columns or fewer, `… ·
+//! Tab/Arrow keys to navigate · …` (60) at 59, the usage-limit dialog's under
+//! 36, a permission box's under 30. Read row by row such a box had no footer
+//! (`… · Esc to` parses as none) or the wrong one (`Esc to cancel`, the last
+//! item alone, is a footer of its own and no question's): the screen read
+//! `idle`, and the dialog stood unanswered and unescalated until the dialog
+//! canary's ten minutes (the real-Claude sweep of 2026-10-09). Before any
+//! box is looked for, the screen's last footer is read across the rows Ink
+//! wrapped it onto ([`last_footer`]: each row as full as Ink's word wrap
+//! leaves one, [`wraps_onto`], the next at the same column, the rows joined
+//! with one space a footer), joined onto its last row, the rows above it
+//! blank; so the box's span ends at the footer's last row, and
+//! [`PromptV2::footer`] is the joined text, which a caller reads in place of
+//! the row.
 //!
 //! **READING THE COMMAND** ([`PromptV2::readings`]). The command's rows are
 //! the rows at its own column (its first row's; notes sit left of it, at
@@ -959,8 +990,14 @@ pub struct PromptV2 {
     /// whole.
     pub question: Option<usize>,
     /// The box's rows, title to footer (to its last row, for a footerless
-    /// box), inclusive.
+    /// box), inclusive: a footer wrapped over several rows to the last of
+    /// them.
     pub span: (usize, usize),
+    /// The key-hint footer's text, trimmed — a footer wrapped over several
+    /// rows read as one, its rows joined with one space (module header, "A
+    /// WRAPPED FOOTER") — so a caller never reads it off the footer's row;
+    /// `None` for a footerless box.
+    pub footer: Option<String>,
     /// Whether the box's title row is NOT on the screen (module header, "A
     /// BOX WHOSE HEAD IS OFF SCREEN"): a box taller than the pane, with its
     /// footer at the live bottom and no composer under it, whose rows run up
@@ -1338,6 +1375,9 @@ struct Found {
 }
 
 fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
+    // A footer wrapped over several rows is read as one (module header, "A
+    // WRAPPED FOOTER"): every reading below is of these rows.
+    let rows = &*unwrapped(rows);
     let mut b = find_box(rows)?;
     let title = without_position(crate::text::trim(&rows[b.title]));
     // A shell box draws its command between TWO dashed rules at column zero, or
@@ -1466,6 +1506,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         cancel,
         question,
         span: (b.title, b.last),
+        footer: footer.map(|f| crate::text::trim(f).to_string()),
         head_off_screen: b.head_off_screen,
         question_dialog,
         reason_rows: if kind == PromptKind::Question {
@@ -2101,7 +2142,7 @@ fn reads_as_prose(row: &str) -> bool {
 /// The inclusive row span of the box, its title row to its footer, for
 /// printing it verbatim.
 pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
-    find_box(rows).map(|b| (b.title, b.last))
+    find_box(&unwrapped(rows)).map(|b| (b.title, b.last))
 }
 
 /// The box's OWN first row — its title, the first row [`find_box`] reads as
@@ -2109,7 +2150,7 @@ pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
 /// transcript (a fixed window quotes transcript rows). `None` without a
 /// live box.
 pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
-    find_box(rows).map(|b| b.title)
+    find_box(&unwrapped(rows)).map(|b| b.title)
 }
 
 /// The box a worker is blocked on (module header, "DETECTION BY SHAPE"):
@@ -2161,11 +2202,11 @@ fn drawn_box(rows: &[String]) -> Option<Found> {
     }
 }
 
-/// The box over the LAST key-hint footer on the screen ([`is_hint_footer`])
-/// — unless that row is a copy in the transcript ([`under_gutter`],
-/// [`said_under`]), then `None`, because a live box would sit under every
-/// copy — with the box's rows above it ([`box_top`]) holding at least one
-/// option.
+/// The box over the LAST key-hint footer on the screen ([`is_hint_footer`];
+/// one Ink wrapped is one row here, [`unwrapped`]) — unless that row is a
+/// copy in the transcript ([`under_gutter`], [`said_under`]), then `None`,
+/// because a live box would sit under every copy — with the box's rows
+/// above it ([`box_top`]) holding at least one option.
 ///
 /// Where [`box_top`] stopped at a row that ends the box above it
 /// ([`Top::Under`]: a rule, the chrome's frame edge or spinner, a said
@@ -2208,6 +2249,74 @@ fn footer_box(rows: &[String]) -> Option<Found> {
         return Some(found);
     }
     walked_box(rows, footer).or_else(|| asks.then(|| question_fallback(rows, footer)).flatten())
+}
+
+/// The most rows one footer is read across ([`last_footer`]): the longest
+/// footer Claude Code draws, the question dialog's with an editor
+/// (`Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in VS
+/// Code · Esc to cancel`, 88 cells), takes four rows of a 28-column pane.
+const FOOTER_ROWS: usize = 4;
+
+/// `rows` with the screen's LAST key-hint footer read as one row (module
+/// header, "A WRAPPED FOOTER"): when Ink wrapped it over several rows
+/// ([`last_footer`]), their texts joined with one space stand on the LAST of
+/// them, at the first one's column, and the rows above it are blank — so
+/// every reader takes the footer as the one row under the box's options,
+/// with a blank row over it as it draws one, and the box's span still ends
+/// at its last row. Borrowed when the footer is one row, or there is none.
+fn unwrapped(rows: &[String]) -> std::borrow::Cow<'_, [String]> {
+    use std::borrow::Cow;
+    match last_footer(rows) {
+        Some((first, last)) if first < last => {
+            let mut out = rows.to_vec();
+            out[last] = crate::wrap::rejoined(&rows[first..=last]);
+            for r in &mut out[first..last] {
+                r.clear();
+            }
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(rows),
+    }
+}
+
+/// The first and last rows of the LAST key-hint footer on the screen: the
+/// lowest row that ends one, and the most rows above it that Ink wrapped the
+/// same line from ([`wraps_onto`], at most [`FOOTER_ROWS`]) whose texts,
+/// joined with one space, are a footer ([`is_hint_footer`]). A footer on one
+/// row is `(i, i)`: [`footer_box`]'s footer, as it always was. Wrapped, the
+/// row the first row runs on to is no footer of its own (`cancel`) or a
+/// footer that is not this box's (`Esc to cancel`, the question dialog's
+/// last item alone), and the first is none either (`… · Esc to`): read row
+/// by row, the box had no footer, or the wrong one.
+fn last_footer(rows: &[String]) -> Option<(usize, usize)> {
+    let width = crate::question::screen_width(rows);
+    (0..rows.len()).rev().find_map(|last| {
+        let mut found = is_hint_footer(&rows[last]).then_some(last);
+        let mut first = last;
+        while last - first + 1 < FOOTER_ROWS
+            && first > 0
+            && wraps_onto(&rows[first - 1], &rows[first], width)
+        {
+            first -= 1;
+            let run = &rows[first..=last];
+            if run.iter().any(|r| crate::text::contains(r, "Esc"))
+                && is_hint_footer(&crate::wrap::rejoined(run))
+            {
+                found = Some(first);
+            }
+        }
+        found.map(|first| (first, last))
+    })
+}
+
+/// Whether row `below` may be the rest of row `above`, wrapped there by Ink's
+/// word wrap ([`crate::wrap::continues`], the one rule: at the same column,
+/// both words, `above` too full to take `below`'s first word) — a footer's
+/// rows, at column three at most ([`is_hint_footer`]).
+fn wraps_onto(above: &str, below: &str, width: usize) -> bool {
+    let col = crate::phase::leading_spaces(above);
+    let room = crate::wrap::room(col, width);
+    col <= 3 && crate::wrap::continues(crate::text::trim(above), col, below, room)
 }
 
 /// The question dialog over its footer, read whole or with its head off the
@@ -2289,10 +2398,10 @@ fn question_items(footer: &str) -> (bool, bool) {
 }
 
 /// [`footer_box`]'s walk up from a footer that is no question dialog read
-/// whole ([`panel_box`], else [`box_top`]).
+/// whole ([`pane_box`], else [`box_top`]).
 fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
     use crate::phase::{composer_top, leading_spaces};
-    if let Some(found) = panel_box(rows, footer) {
+    if let Some(found) = pane_box(rows, footer) {
         return Some(found);
     }
     let top = box_top(rows, footer)?;
@@ -2345,28 +2454,33 @@ fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
         })
 }
 
-/// A FOOTED box in the fullscreen renderer's bottom panel (module header, "A
-/// FOOTED BOX IN THE FULLSCREEN PANEL"): the nearest panel rule above the
-/// footer ([`is_panel_rule`]), the row right under it at column three — the
-/// Dialog's `Po` pads three columns there and draws no `─` rule of its own
-/// (2.1.287 source; the model-switch box measured the column) — and every
-/// row from it down to the footer blank or at column three or further in,
-/// with no composer under the footer (the panel replaces it). That row is
-/// the box's title. Anything else is left to [`box_top`]'s walk, which does
-/// not stop at a `▔` row and so reads such a box with its head off the
-/// screen.
-fn panel_box(rows: &[String], footer: usize) -> Option<Found> {
-    use crate::phase::{composer_top, leading_spaces};
+/// A FOOTED box in a Pane (module header, "A FOOTED BOX IN A PANE"): the
+/// nearest rule above the footer — the fullscreen panel's `▔`
+/// ([`is_panel_rule`]: the Dialog's `Po` pads three columns there and draws
+/// no rule of its own, 2.1.287 source) or the inline renderer's `─` (two
+/// columns, MEASURED on 2.1.295), as [`model_switch_box`] reads the same two
+/// layouts — the row right under it at that column, and every row from it
+/// down to the footer blank or at that column or further in, with no
+/// composer under the footer (the Pane replaces it). That row is the box's
+/// title. Anything else is left to [`box_top`]'s walk, which takes a title
+/// at column one only, and so reads such a box with its head off the
+/// screen. A permission box's title under its `─` rule is at column one, and
+/// a question dialog's footer at column zero: neither is read here.
+fn pane_box(rows: &[String], footer: usize) -> Option<Found> {
+    use crate::phase::{composer_top, is_rule, leading_spaces};
     if composer_top(rows).is_some_and(|t| t > footer) {
         return None;
     }
-    let rule = (0..footer).rev().find(|&i| is_panel_rule(&rows[i]))?;
+    let rule = (0..footer)
+        .rev()
+        .find(|&i| is_panel_rule(&rows[i]) || is_rule(&rows[i]))?;
+    let col = if is_panel_rule(&rows[rule]) { 3 } else { 2 };
     let title = rule + 1;
     if title >= footer
-        || leading_spaces(&rows[title]) != 3
+        || leading_spaces(&rows[title]) != col
         || rows[title..=footer]
             .iter()
-            .any(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) < 3)
+            .any(|r| !crate::text::trim(r).is_empty() && leading_spaces(r) < col)
     {
         return None;
     }
@@ -2725,12 +2839,6 @@ fn bottom_block(rows: &[String]) -> Option<Block> {
         end,
         last,
     })
-}
-
-/// Whether `prompt`'s box on `rows` drew a key-hint footer: its last row is
-/// one ([`is_hint_footer`]). A footerless box's is its last option row.
-pub(crate) fn footed(rows: &[String], prompt: &PromptV2) -> bool {
-    rows.get(prompt.span.1).is_some_and(|r| is_hint_footer(r))
 }
 
 /// A row led by a key hint that is no box footer (it has no `Esc` item): the
@@ -3603,13 +3711,22 @@ pub mod fixtures {
     #[cfg(test)]
     pub const TRUST_AFTER_RESUMES: &str =
         include_str!("fixtures/claude-2.1.280-trust-after-resumes.txt");
-    /// HAND-BUILT from the owner's report (2026-09-24, Claude Code 2.1.282):
-    /// the usage-limit options dialog at a weekly limit, the cursor `›` (as
-    /// reported; the vendor's Select draws `❯`) on `Stop and wait for limit
-    /// to reset`, the wait row second, in the frame the 2.1.282 source
-    /// draws (`ge`/`Do`, its provenance line).
+    /// MEASURED on Claude Code 2.1.295 (2026-10-09, `tools/real-claude-lab`'s
+    /// `limit` mode on the subscriber login): the usage-limit options dialog
+    /// Claude Code opens by itself at a five-hour limit with
+    /// `autoContinueAtUsageLimit` off — under a full-width `─` rule, its
+    /// title, options and footer at column TWO (the `❯` on `Stop and wait for
+    /// limit to reset`, the dated wait row second, `Upgrade your plan`), no
+    /// composer. It replaces the hand-built 2.1.282 frame, which put the
+    /// title at column one and was never drawn so.
     pub const LIMIT_OPTIONS_DIALOG: &str =
-        include_str!("fixtures/claude-2.1.282-usage-limit-dialog.txt");
+        include_str!("fixtures/claude-2.1.295-usage-limit-menu.txt");
+    /// MEASURED the same way: the dialog at a WEEKLY limit under the default
+    /// settings (its reset 26 h out, so Claude Code arms no wait of its own),
+    /// the wait row `… at Oct 10 at 2:19pm`, the five-hour wall of the turn
+    /// before above it.
+    pub const LIMIT_OPTIONS_WEEKLY: &str =
+        include_str!("fixtures/claude-2.1.295-usage-limit-menu-weekly.txt");
     /// HAND-BUILT from the window supervisor's ledger of 2026-09-27 (Claude
     /// Code 2.1.287's frame, its provenance line): the usage-limit options
     /// dialog in the FULLSCREEN renderer's bottom panel — under the panel's
@@ -3905,6 +4022,77 @@ pub mod fixtures {
     /// its `⎿` output.
     pub const SESSION_LIMIT_THEN_LOCAL_COMMANDS_MEASURED: &str =
         include_str!("fixtures/claude-2.1.294-session-limit-then-local-commands.txt");
+    /// MEASURED on 2.1.296 (the lab, 2026-10-09): a five-hour limit with
+    /// Claude Code's own auto-continue armed under it (`⏺ Usage limit reached
+    /// · continuing automatically at 3:15pm · esc to cancel`, the footer's
+    /// countdown).
+    pub const WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.296-wall-session-auto-continue-armed.txt");
+    /// MEASURED on 2.1.296: the same kind of wall after Esc on the countdown,
+    /// minutes before its reset (`⏺ Automatic continue cancelled ·
+    /// /rate-limit-options to re-arm`, and the footer's notification), under
+    /// an earlier wall the vendor continued by itself.
+    pub const WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.296-wall-session-auto-continue-cancelled.txt");
+    /// MEASURED on 2.1.296: the wall past its reset, continued by the vendor
+    /// itself (`⏺ Usage limit reset · continuing automatically`), the stub's
+    /// reply under it: the turn ended before any read saw it busy.
+    pub const WALL_SESSION_RESUMED_BY_ITSELF_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.296-wall-session-resumed-by-itself.txt");
+    /// MEASURED on 2.1.299 (the lab, 2026-10-14): a five-hour limit after Esc
+    /// on the countdown (`⏺ Automatic continue cancelled · …`), then, the
+    /// limit lifted before its reset, a person's short turn under it (`❯ what
+    /// is left to do?`, the stub's reply, its done row): the turn ended before
+    /// any read saw it busy.
+    pub const WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.299-wall-session-cancelled-then-person-turn.txt");
+
+    // The same walls in a NARROW pane, MEASURED on 2.1.299 (the lab,
+    // 2026-10-14): Ink word-wraps each line of them onto the rows under it.
+
+    /// A five-hour limit, its auto-continue armed, the pane resized to 34
+    /// columns: the footer's banner `⚠ Usage limit reached · limit` over
+    /// `resets 10:25am` (column two), its countdown `Continuing automatically
+    /// at` over `10:25am · esc to cancel` (column four).
+    pub const WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-wall-session-auto-continue-armed-34col.txt");
+    /// A weekly limit at 34 columns after the harness answered the usage-limit
+    /// dialog `Wait here, …`: the banner's `resets Oct 15 at 12:33pm` on the
+    /// row under it, the countdown over three rows.
+    pub const WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-wall-weekly-auto-continue-armed-34col.txt");
+    /// A five-hour limit, its auto-continue armed, 26 columns from launch:
+    /// the turn's `⎿  You've hit your` over `session limit ·`, the banner
+    /// `⚠ Usage limit reached` over `· limit resets 10:51am`, the countdown's
+    /// `Continuing` alone on its first row.
+    pub const WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-wall-session-auto-continue-armed-26col.txt");
+    /// The same wall at 26 columns after Esc on the countdown, nothing typed:
+    /// `⏺ Automatic` over `continue` over `cancelled · /rat` (the command
+    /// broken mid-word), the footer's notification cut.
+    pub const WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-wall-session-auto-continue-cancelled-26col.txt");
+    /// The same at 26 columns after the cancel and a `keep going` the harness
+    /// typed: the limit's `⎿` notice again, the last thing said, no banner.
+    pub const WALL_SESSION_AFTER_CANCEL_26_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-wall-session-after-cancel-26col.txt");
+    /// A 529 every retry answered, at 34 columns: the `⏺ API Error: 529` row
+    /// over eight rows, the done row's `AM` on a row of its own.
+    pub const API_ERROR_529_34_2_1_299: &str =
+        include_str!("fixtures/claude-2.1.299-api-error-529-34col.txt");
+    /// The WORKER's own reply, MEASURED on 2.1.300 (the lab, 2026-10-14, the
+    /// stub's reply file) at 34 columns: four hard lines, the first opening
+    /// with the usage limit's words and a ` · ` (`⏺ Usage limit reached ·
+    /// pausing.`). A reply's prose runs to the pane's edge (`Done so far:
+    /// parser, lexer,` over `tests.`), where the vendor's notice and error
+    /// rows wrap ten columns short of it.
+    pub const PROSE_LIMIT_WORDS_34_2_1_300: &str =
+        include_str!("fixtures/claude-2.1.300-prose-opens-with-limit-words-34col.txt");
+    /// The same reply redrawn at 80 columns (`ctl resize 50 80`), a hard line
+    /// to a row, and under it a second reply: one paragraph opening with the
+    /// same words, which Ink word-wraps over four rows.
+    pub const PROSE_LIMIT_WORDS_80_2_1_300: &str =
+        include_str!("fixtures/claude-2.1.300-prose-opens-with-limit-words-80col.txt");
     /// HAND-BUILT: the same turn ending on the session limit.
     pub const END_SESSION_LIMIT: &str =
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");
@@ -4317,6 +4505,33 @@ pub mod fixtures {
     pub const QUESTION_OVER_DRAFT_AFTER: &str =
         include_str!("fixtures/claude-2.1.282-question-over-draft-after.txt");
 
+    // A FOOTER WRAPPED by a narrow pane (module header, "A WRAPPED FOOTER"),
+    // MEASURED on Claude Code 2.1.295, 2026-10-09 (`tools/real-claude-lab`,
+    // each file's line 1 names the grid): Ink word-wraps the key hints onto
+    // the row under them, at the footer's column.
+
+    /// One single-select question at 44 columns: `Enter to select · ↑/↓ to
+    /// navigate · Esc to` over `cancel`.
+    pub const QUESTION_ONE_44_2_1_295: &str =
+        include_str!("fixtures/claude-2.1.295-question-one-44col.txt");
+    /// The same dialog resized to 36: `… to navigate ·` over `Esc to cancel`,
+    /// a footer of its own, and the wrong one.
+    pub const QUESTION_ONE_36_2_1_295: &str =
+        include_str!("fixtures/claude-2.1.295-question-one-36col.txt");
+    /// Two questions (tabs) at 56 columns: `Enter to select · Tab/Arrow keys
+    /// to navigate · Esc to` over `cancel`.
+    pub const QUESTION_TABS_56_2_1_295: &str =
+        include_str!("fixtures/claude-2.1.295-question-tabs-56col.txt");
+    /// An ordinary Bash box at 26 columns: `Esc to cancel · Tab to` over
+    /// `amend`, the title's tip and the options wrapped too.
+    pub const BOX_BASH_26_2_1_295: &str =
+        include_str!("fixtures/claude-2.1.295-box-bash-26col.txt");
+    /// [`LIMIT_OPTIONS_DIALOG`] resized to 34 columns: the stop and wait rows
+    /// wrapped onto a second row, the footer `Enter to confirm · Esc to` over
+    /// `cancel`.
+    pub const LIMIT_OPTIONS_34: &str =
+        include_str!("fixtures/claude-2.1.295-usage-limit-menu-34col.txt");
+
     // The question dialog as Claude Code 2.1.283 draws it with a policy text
     // typed into its free-text row, MEASURED 2026-09-25 (`aterm ctl text` of
     // a private headless aterm at origin/main 63323e4a4, 120x44; each file's
@@ -4613,18 +4828,19 @@ pub mod fixtures {
     }
 
     /// [`LIMIT_OPTIONS_DIALOG`] with its option rows replaced by `labels`,
-    /// numbered from 1, the fixture's `›` cursor on option `focus` (0-based).
+    /// numbered from 1 in the Select's columns (`  ❯ 1. ` focused, `    2. `
+    /// not), the `❯` on option `focus` (0-based).
     #[must_use]
     pub fn limit_options_dialog(labels: &[&str], focus: usize) -> Vec<String> {
         let rows = screen(LIMIT_OPTIONS_DIALOG);
         let first = rows
             .iter()
-            .position(|r| r.starts_with(" › 1. "))
+            .position(|r| r.starts_with("  ❯ 1. "))
             .expect("the fixture's first option row");
         let mut out: Vec<String> = rows[..first].to_vec();
         for (k, label) in labels.iter().enumerate() {
-            let cursor = if k == focus { '›' } else { ' ' };
-            out.push(format!(" {cursor} {}. {label}", k + 1));
+            let cursor = if k == focus { "❯ " } else { "  " };
+            out.push(format!("  {cursor}{}. {label}", k + 1));
         }
         out.extend(
             rows[first..]
@@ -6057,43 +6273,68 @@ mod tests {
         }
     }
 
-    /// THE USAGE-LIMIT DIALOG (module header): the owner's screen of
-    /// 2026-09-24 is a box of its own kind, not `other`; the wait row is the
-    /// one option with a role, in each of its three spellings and wherever
-    /// it sits; a menu with no wait row (or with the armed wait's cancel in
-    /// its place) is still the dialog, with no role to choose; and the same
+    /// THE USAGE-LIMIT DIALOG (module header): the dialog Claude Code
+    /// 2.1.295 draws at a five-hour and at a weekly limit (MEASURED, both
+    /// at column two under the `─` rule) is a box of its own kind, read
+    /// whole — not `other` with its head off the screen, which escalated it
+    /// and left the session stalled past the reset; the wait row is the one
+    /// option with a role, in each of its three spellings and wherever it
+    /// sits; a menu with no wait row (or with the armed wait's cancel in its
+    /// place) is still the dialog, with no role to choose; and the same
     /// question over other rows is not it.
     #[test]
     fn the_limit_options_dialog_reads_its_wait_row_by_label() {
         const STOP: &str = "Stop and wait for limit to reset";
         const CREDITS: &str = "Switch to usage credits";
+        for (text, wait) in [
+            (
+                LIMIT_OPTIONS_DIALOG,
+                "Wait here, then continue automatically at 12:23pm",
+            ),
+            (
+                LIMIT_OPTIONS_WEEKLY,
+                "Wait here, then continue automatically at Oct 10 at 2:19pm",
+            ),
+        ] {
+            let r = screen(text);
+            assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+            let p = parse_prompt_v2(&r).expect("the dialog");
+            assert_eq!(p.kind, PromptKind::UsageLimit, "{wait}");
+            assert_eq!(p.kind.name(), "usage-limit");
+            assert!(!p.head_off_screen, "{wait}");
+            assert_eq!(p.title, "What do you want to do?");
+            assert_eq!(r[p.span.0], "  What do you want to do?");
+            assert_eq!(p.select, Select::Digits);
+            let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+            assert_eq!(labels, [STOP, wait, "Upgrade your plan"]);
+            let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+            assert_eq!(roles, [Role::Other, Role::AutoResume, Role::Other]);
+            assert_eq!(p.focused().map(|o| o.label.as_str()), Some(STOP));
+            assert_eq!(p.command, wait);
+            assert_eq!(parse_prompt(&r).expect("v1").command, p.command);
+            // The `›` of the owner's report reads the same (THE CURSOR).
+            let small: Vec<String> = r.iter().map(|x| x.replace("  ❯ 1. ", "  › 1. ")).collect();
+            assert_ne!(small, r);
+            assert_eq!(parse_prompt_v2(&small), Some(p.clone()));
+        }
+        // Controls: a row left of the title's column inside the box, and the
+        // composer under the footer (a copy in the transcript), are no Pane,
+        // and the dialog is not read whole there.
         let r = screen(LIMIT_OPTIONS_DIALOG);
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
-        let p = parse_prompt_v2(&r).expect("the dialog");
-        assert_eq!(p.kind, PromptKind::UsageLimit);
-        assert_eq!(p.kind.name(), "usage-limit");
-        assert_eq!(p.title, "What do you want to do?");
-        assert_eq!(p.select, Select::Digits);
-        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            [
-                STOP,
-                "Wait here, then continue automatically at Sep 27 at 7pm",
-                CREDITS
-            ]
-        );
-        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
-        assert_eq!(roles, [Role::Other, Role::AutoResume, Role::Other]);
-        assert_eq!(p.focused().map(|o| o.label.as_str()), Some(STOP));
-        assert_eq!(
-            p.command,
-            "Wait here, then continue automatically at Sep 27 at 7pm"
-        );
-        assert_eq!(parse_prompt(&r).expect("v1").command, p.command);
-        // The `❯` every measured box draws reads the same.
-        let arrow: Vec<String> = r.iter().map(|x| x.replace('›', "❯")).collect();
-        assert_eq!(parse_prompt_v2(&arrow), Some(p.clone()));
+        let title = r
+            .iter()
+            .position(|x| x == "  What do you want to do?")
+            .expect("the title");
+        let mut left = r.clone();
+        left.insert(title + 1, " a row the Pane does not draw".to_string());
+        let mut composed = r;
+        composed.extend(composer("  ? for shortcuts"));
+        for rows in [left, composed] {
+            assert!(
+                parse_prompt_v2(&rows).is_none_or(|p| p.kind != PromptKind::UsageLimit),
+                "{rows:#?}"
+            );
+        }
 
         // The three spellings, and the wait row first.
         for wait in [
@@ -6237,6 +6478,60 @@ mod tests {
         assert!(
             parse_prompt_v2(&composed).is_none_or(|p| p.kind != PromptKind::UsageLimit),
             "{composed:#?}"
+        );
+    }
+
+    /// A WRAPPED FOOTER (module header; the real-Claude sweep of 2026-10-09):
+    /// a permission box in a pane narrower than `Esc to cancel · Tab to amend`
+    /// (below 30 columns) and the usage-limit dialog in one narrower than
+    /// `Enter to confirm · Esc to cancel` (below 36), MEASURED on 2.1.295, are
+    /// read whole — their kind, subject, options and Esc — and each box runs
+    /// to its footer's last row. Read row by row neither had a footer: the
+    /// Bash box read `idle` and the dialog `limited`, and nothing answered or
+    /// escalated either.
+    #[test]
+    fn a_box_whose_footer_wraps_is_read_whole() {
+        let last = |r: &[String]| r.iter().rposition(|x| !x.trim().is_empty()).expect("a row");
+        let r = screen(BOX_BASH_26_2_1_295);
+        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        let p = parse_prompt_v2(&r).expect("the box");
+        assert_eq!(
+            (p.kind, p.command.as_str(), p.head_off_screen),
+            (PromptKind::Bash, "touch x", false)
+        );
+        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+        assert_eq!(
+            roles,
+            [Role::Once, Role::Persist, Role::ModeSwitch, Role::Deny]
+        );
+        assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Reject));
+        assert_eq!(p.span.1, last(&r));
+        assert_eq!(p.footer.as_deref(), Some("Esc to cancel · Tab to amend"));
+
+        let r = screen(LIMIT_OPTIONS_34);
+        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        let p = parse_prompt_v2(&r).expect("the dialog");
+        assert_eq!((p.kind, p.head_off_screen), (PromptKind::UsageLimit, false));
+        let read: Vec<(&str, Role)> = p
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.role))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("Stop and wait for limit to reset", Role::Other),
+                (
+                    "Wait here, then continue automatically at 12:23pm",
+                    Role::AutoResume
+                ),
+                ("Upgrade your plan", Role::Other)
+            ]
+        );
+        assert_eq!(p.span.1, last(&r));
+        assert_eq!(
+            p.footer.as_deref(),
+            Some("Enter to confirm · Esc to cancel")
         );
     }
 
@@ -7084,12 +7379,15 @@ mod tests {
         );
         // The numbered dialog under another title: `›` is text, so its row
         // is no option and `1.` has no cursor.
-        let mut d = limit_options_dialog(&["Keep the branch", "Drop it"], 0);
+        let mut d: Vec<String> = limit_options_dialog(&["Keep the branch", "Drop it"], 0)
+            .iter()
+            .map(|x| x.replace("  ❯ 1. ", "  › 1. "))
+            .collect();
         let t = d
             .iter()
             .position(|x| x.trim() == "What do you want to do?")
             .expect("the title");
-        d[t] = " Pick one".to_string();
+        d[t] = "  Pick one".to_string();
         let p = parse_prompt_v2(&d).expect("a box");
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(labels, ["Drop it"]);
@@ -7430,7 +7728,7 @@ mod tests {
             assert_eq!(roles, w.roles, "{name}: {:?}", p.options);
             assert_eq!(p.select, w.select, "{name}");
             assert_eq!(p.cancel.as_ref().map(|c| c.effect), w.cancel, "{name}");
-            assert_eq!(is_hint_footer(&r[p.span.1]), w.footer, "{name}");
+            assert_eq!(p.footer.is_some(), w.footer, "{name}");
             assert_eq!(r[p.span.0].trim(), w.title, "{name}");
             // The cursor starts on the first option — save the Chrome upsell,
             // whose defaultFocusValue is its second, `Not now`.

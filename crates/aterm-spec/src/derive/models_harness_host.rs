@@ -291,7 +291,8 @@ pub fn harness_restored_carry_model() -> Model {
 /// — 0 before the Commit, 1 the Commit holds the
 /// host (suspended: no pass hands an exit), 2 the Commit failed (the host
 /// supervises again), 3 rolled back (`relaunch_stranded`), 4 the next park,
-/// 5 its Commit went ahead; `done` — a worker relaunched the agent; `queued` — its relaunch is on the
+/// 5 its Commit went ahead; `done` — a worker relaunched the agent since its
+/// last crash; `queued` — its relaunch is on the
 /// restored queue; `stale` — an overtaken cold-restore relaunch of the same
 /// tab is still queued (an agent a person started there is the one that
 /// crashed); `captured` — what the next park's layout carries for the tab;
@@ -303,13 +304,33 @@ pub fn harness_restored_carry_model() -> Model {
 /// having forgotten the snapshot as it held the tab (only `SettleGone`
 /// marks one); `closed` — the host shut down (a quit) and its restored
 /// queue is closed: nothing more is queued, stepped or handed, and the quit
-/// layout carries what the queue and the sessions still owe.
+/// layout carries what the queue and the sessions still owe; `down` — the
+/// host thread panicked and waits out its restart's back-off: no pass hands
+/// an exit, a mark or starts a worker (round seventeen); `seen` — what the
+/// agent's last exit left was read as it was seen: by the worker a pass
+/// handed it at once, or by the exit watch where no pass would see it soon
+/// (`Kept::exit_watch`, round seventeen); `swept` — a Claude Code started
+/// since that exit and removed the crashed agent's session record, as every
+/// Claude Code that starts removes dead agents' records (D2 of the
+/// 2026-09-26 live test); `landed` — the agent a worker's relaunch landed,
+/// that no pass has named yet, is watched by the exit watch that hands its
+/// exit itself once read (`ExitWatched::hands`; round seventeen, the review
+/// of its first cut); `qlanded` — the restored queue's step landed an agent
+/// no read has reached yet (round eighteen, the review of its first cut):
+/// its attempt stays queued, the exit's holder, until a read reaches the
+/// agent (`QueueReadsLanded`: watched as `landed`), a pass names it
+/// (`Start`), or it crashes unread — its own relaunch's exit again, the
+/// attempt owed as before (`Crash`), stepped again.
 ///
 /// * `Crash` — the agent crashes, whatever the phase (before a quit), while
-///   a worker or the host's mark holds it; `Back` — an agent runs in the tab again (the
-///   relaunch's own, or one someone started) and the host reads it: in the
-///   tab of a worker handed its exit, and no stop since, it is the host's
-///   until its own worker starts (`Worker::back` marks it); `Settle` — that
+///   a worker, the host's mark or a landing's watch holds it — the agent a
+///   relaunch brought back too, which owes a relaunch again — and what it
+///   left is read as it is seen; `Sweep` — a Claude Code starts and removes
+///   the crashed agent's record; `Back` — an agent runs in the tab again (the
+///   relaunch's own, or one someone started) and the host reads it — a pass,
+///   so never while the host is down: in the tab of a worker handed its
+///   exit, and no stop since, it is the host's until its own worker starts
+///   (`Worker::back` marks it); `Settle` — that
 ///   worker reads the agent back, or its relaunch landed (an agent the host
 ///   read, or one at a Commit's stop, which marks it), and ends — the agent
 ///   running as it reads it; `Rearm` — it reads the agent back gone again
@@ -317,9 +338,19 @@ pub fn harness_restored_carry_model() -> Model {
 ///   the joint audit of 2026-10-01): no stop came, so the exit is its own
 ///   relaunch's again, the mark taken back (a stop's is `Decide`'s).
 /// * `Hand` — the host's pass hands the exit to a worker not stopped (never
-///   while suspended); `Read` — the worker reads it, stopped or not (round
-///   twelve: `left_at_commit`); `Relaunch` — its back-off lands, never while
-///   parked (phases 1, 2 and 4); `HandOver` — a changed `[harness]` policy
+///   while suspended, nor while the host is down); `Read` — the worker reads
+///   it, stopped or not (round twelve: `left_at_commit`): on what the exit
+///   left as it was seen, or — where nothing read it so — on the record now,
+///   which a sweep read as a graceful exit (the worker ends, nothing owed);
+///   `Relaunch` — its back-off lands, never while
+///   parked (phases 1, 2 and 4), and the worker ends, the agent it started
+///   left to the roster and watched until a pass names it (`landed`);
+///   `RelaunchUnread` — its back-off lands, but no read reaches the agent
+///   it started (round eighteen): the worker reads it again while it holds
+///   its tab and no pass names it (`harness_host::read_landed`), so it stays
+///   the exit's holder — a later read is `Relaunch`'s landing, and the
+///   agent's crash meanwhile is its own relaunch's again;
+///   `HandOver` — a changed `[harness]` policy
 ///   stops a worker whose agent the pass found in the tab, for a successor
 ///   the next pass starts (`Start`): its stop is set before any Commit's.
 /// * `Suspend` — the Commit's stop: every live worker stopped and marked;
@@ -332,10 +363,29 @@ pub fn harness_restored_carry_model() -> Model {
 ///   handed over (round fourteen), which the Commit's stop does not mark.
 /// * `Resume`, `Rollback` — the Commit failed: the host supervises again, then
 ///   a stranded relaunch is queued and a mark not decided becomes `TakenUp`;
-///   `HandUnwatched` — a host supervising (never while suspended) hands an
-///   exit no worker was handed to a worker that reads it alone; `Start` — a
-///   worker for an agent in the tab (both reset the marks); `QueueSteps` —
-///   the queue relaunches it.
+///   `HandUnwatched` — a host supervising (never while suspended, nor while
+///   it is down) hands an exit no worker was handed to a worker that reads it
+///   alone: the host's mark's, or a landing's watch's once it has read the
+///   exit; `Start` — a worker for an agent in the tab (both reset the
+///   marks), and ends a queued attempt whose unread landing it names;
+///   `QueueSteps` — the queue relaunches it, the agent it landed read and
+///   watched until a pass names it (`landed`; round eighteen,
+///   `harness_host::restored_landing_look`); `QueueStepsUnread` — the
+///   queue's step lands an agent no read reaches (`qlanded`), the attempt
+///   kept; `QueueReadsLanded` — a later look of the queue reads it (never
+///   while a park pauses the queue): the attempt over, the agent watched
+///   (`landed`). None waits for the host: the queue runs on its own
+///   thread, the host down or not.
+/// * `Panic` — the host thread's loop panics (round seventeen): what it held
+///   lives on in the host thread's own memory — its workers run on, each its
+///   tab's supervisor still, held to the policy as it is (a changed one hands
+///   them over: `HandOver`), and each one's agent's exit is watched, as is an
+///   agent a carried worker's relaunch lands — and the loop starts again
+///   after its back-off, or once news cuts it short (the policy changed, a
+///   Commit failed), `Up`, its first pass reading the roster again. A panic
+///   in the restart itself is one more panic in a row, caught as the run's
+///   is (round eighteen, `harness_host::restart_host`): nothing changes
+///   here, `down` stays.
 /// * `Overtook` — the cold restore's relaunch of the tab, overtaken by the
 ///   agent a person started there, still waits for its retry; `Park` — the
 ///   next park captures the queue for the tab; `Commit` — its Commit
@@ -349,11 +399,14 @@ pub fn harness_restored_carry_model() -> Model {
 ///
 /// * `NoOwedRelaunchLost` — past the rollback a crashed agent is relaunched,
 ///   queued, carried, or held by someone who will: a live worker, the
-///   rollback's stranded mark or the host's unwatched one. Past the next
-///   Commit (phase 5) a worker or a mark still holding it is
-///   `HostHandle::pending_restored_for`'s stated residual — a crash read
-///   after the Commit's re-capture is on neither layout — not this model's
-///   claim, whose next park carries the restored queue alone;
+///   rollback's stranded mark, the host's unwatched one or a landing's
+///   watch. Past the next
+///   Commit (phase 5) a worker or a mark still holding it is not this
+///   model's claim, whose next park carries the restored queue alone: a
+///   crash read after the Commit's re-capture is on neither layout as owed,
+///   and since round eighteen the successor takes it by watching the agent
+///   the leaf names supervised (`HostHandle::watch_handed`; pinned by
+///   `aterm-gui`'s App-level tests, not expressed here);
 /// * `NoQueuedRelaunchDropped` — no Commit goes ahead past a relaunch the
 ///   queue owes the tab that its layout does not carry.
 ///
@@ -384,7 +437,34 @@ pub fn harness_restored_carry_model() -> Model {
 /// and read a snapshot at a bare shell, as no live seam does),
 /// `DecideClosedDrops` (until round sixteen a worker told `TakenUp` that
 /// decided after a quit closed the queue had its relaunch refused and owed
-/// it no more: nothing held it for the quit layout — `NoOwedRelaunchLost`)
+/// it no more: nothing held it for the quit layout — `NoOwedRelaunchLost`),
+/// `PanicStops` (until round seventeen a panic of the host's loop dropped its
+/// workers, which stopped each with no hand-over and no Commit: a worker
+/// supervising ended leaving no exit to the host, and one handed its exit
+/// settled what it owed as a stop for good — `NoOwedRelaunchLost`),
+/// `CrashUnseen` (until round seventeen an exit left to the host while a
+/// Commit held it was read only by the worker the host handed it once it
+/// supervised again: a crash's record a Claude Code started during the hold
+/// had removed read as a graceful exit — `NoOwedRelaunchLost`),
+/// `LandedLost` (until the review of round seventeen's first cut the agent
+/// a relaunch landed was left to the roster with nothing watching it: its
+/// crash before a pass named it — the moment before the next pass, but a
+/// panic's whole back-off while the host was down, through which the worker
+/// carries on — was read by nobody — `NoOwedRelaunchLost`),
+/// `QueueLandedLost` (until round eighteen the restored queue's landing
+/// left its agent to the roster with nothing watching it, the queue's own
+/// thread running on through a host panic's back-off: its crash before a
+/// pass named it was read by nobody — `NoOwedRelaunchLost`),
+/// `UnreadLandedLost` (until round eighteen a landing whose agent no read
+/// reached ended its worker with nothing watching it — no process to watch,
+/// no mark: its crash before a pass named it was read by nobody —
+/// `NoOwedRelaunchLost`), `RestartPanicStops` (until round eighteen a panic
+/// in the host's restart, past the run's catch, unwound the host thread
+/// and dropped its workers, each stopped with no hand-over and no Commit —
+/// `NoOwedRelaunchLost`), `QueueUnreadLost` (round eighteen's first cut:
+/// the queue's landing no read reached ended its attempt, and the thread
+/// that read it again gave up once the agent no longer held its tab — its
+/// crash before any read was held by nobody — `NoOwedRelaunchLost`)
 /// and `ParkFirstFound` (round twelve's
 /// captures read the first relaunch queued for the tab, the overtaken one —
 /// ONE reader, so the mutant sets `firstfound` and the Commit's re-capture,
@@ -394,14 +474,23 @@ pub fn harness_restored_carry_model() -> Model {
 /// disagrees with the other and refuses the Commit, so neither alone is a
 /// defect a checker could catch (`ty --strict-vacuity`). Tier-1 (`aterm-gui`'s
 /// `harness_host` tests `the_real_commit_owed_relaunch_conforms_to_its_model`,
-/// `a_crash_after_a_hand_over_conforms_to_the_commit_owed_model` and
-/// `an_agent_back_and_gone_again_conforms_to_the_commit_owed_model`) drives
-/// the real host through both losses of round twelve, the control of the
+/// `a_crash_after_a_hand_over_conforms_to_the_commit_owed_model`,
+/// `an_agent_back_and_gone_again_conforms_to_the_commit_owed_model` and
+/// `exit_watch::an_exit_nobody_is_handed_conforms_to_the_commit_owed_model`)
+/// drives the real host through both losses of round twelve, the control of the
 /// first (the agent alive across the failed Commit), the hand-over's loss of
 /// round thirteen with a Commit and without, and a relaunch's agent back and
 /// gone again — read in the wait, landed, and across a failed Commit — or
-/// landed in a Commit's hold and gone there, projecting each observed state
-/// onto the model's.
+/// landed in a Commit's hold and gone there, a crash swept while the host
+/// is down after a panic or while a Commit holds it (round seventeen), and an
+/// agent a relaunch landed while the host is down that crashes before it is
+/// back (the review of round seventeen's first cut), projecting each
+/// observed state onto the model's; and (round eighteen,
+/// `exit_watch::the_landings_of_round_eighteen_conform_to_the_commit_owed_model`)
+/// the rollback queue's landing whose agent crashes before a pass names
+/// it, a panic in the host's restart, a landing no read reaches whose
+/// agent crashes while the host is down, and the rollback queue's landing
+/// no read reaches, whose agent crashes unread and is stepped again.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_commit_owed_model() -> Model {
@@ -424,14 +513,46 @@ pub fn harness_commit_owed_model() -> Model {
             var firstfound = 0;
             var blind = 0;
             var closed = 0;
+            var down = 0;
+            var seen = 0;
+            var swept = 0;
+            var landed = 0;
+            var qlanded = 0;
 
             action Crash when (
-                agent == 1 && (worker > 0 || unwatched == 1) && done == 0 && queued == 0
+                agent == 1
+                    && (worker > 0 || unwatched == 1 || landed == 1 || qlanded == 1)
+                    && (queued == 0 || qlanded == 1) && closed == 0
+            ) {
+                agent = 0;
+                done = 0;
+                seen = 1;
+                swept = 0;
+                qlanded = 0;
+            }
+            action CrashUnseen when (
+                Buggy == 1 && agent == 1 && phase == 1
+                    && (unwatched == 1 || (worker == 1 && stop == 1)) && queued == 0
                     && closed == 0
             ) {
                 agent = 0;
+                done = 0;
+                seen = 0;
+                swept = 0;
             }
-            action Back when (agent == 0) {
+            action LandedLost when (
+                Buggy == 1 && agent == 1 && landed == 1 && queued == 0 && closed == 0
+            ) {
+                agent = 0;
+                done = 0;
+                landed = 0;
+                seen = 0;
+                swept = 0;
+            }
+            action Sweep when (agent == 0 && swept == 0) {
+                swept = 1;
+            }
+            action Back when (agent == 0 && down == 0) {
                 agent = 1;
                 unwatched = if (worker > 1 && stop == 0) { 1 } else { unwatched };
             }
@@ -458,11 +579,13 @@ pub fn harness_commit_owed_model() -> Model {
                 commit = 0;
                 unwatched = 0;
             }
-            action Hand when (agent == 0 && worker == 1 && stop == 0 && (phase == 0 || phase > 1)) {
+            action Hand when (
+                agent == 0 && worker == 1 && stop == 0 && (phase == 0 || phase > 1) && down == 0
+            ) {
                 worker = 2;
             }
             action Read when (worker == 2) {
-                worker = 3;
+                worker = if (seen == 1 || swept == 0) { 3 } else { 0 };
             }
             action StopEndsUnread when (Buggy == 1 && worker == 2 && stop == 1) {
                 worker = 0;
@@ -471,6 +594,19 @@ pub fn harness_commit_owed_model() -> Model {
                 worker = 0;
                 agent = 1;
                 done = 1;
+                landed = 1;
+            }
+            action RelaunchUnread when (
+                worker == 3 && stop == 0 && agent == 0 && (phase == 0 || phase == 3)
+            ) {
+                agent = 1;
+                done = 1;
+            }
+            action UnreadLandedLost when (
+                Buggy == 1 && worker == 3 && stop == 0 && agent == 0 && (phase == 0 || phase == 3)
+            ) {
+                worker = 0;
+                done = 0;
             }
             action HandOver when (agent == 1 && worker == 1 && stop == 0) {
                 stop = 1;
@@ -521,8 +657,8 @@ pub fn harness_commit_owed_model() -> Model {
                 queued = if (commit == 2) { 1 } else { queued };
             }
             action HandUnwatched when (
-                worker == 0 && agent == 0 && unwatched == 1 && (phase == 0 || phase > 1)
-                    && closed == 0
+                worker == 0 && agent == 0 && (unwatched == 1 || (landed == 1 && seen == 1))
+                    && (phase == 0 || phase > 1) && closed == 0 && down == 0
             ) {
                 worker = if (blind == 1) { 0 } else { 2 };
                 stop = 0;
@@ -530,9 +666,11 @@ pub fn harness_commit_owed_model() -> Model {
                 commit = 0;
                 unwatched = 0;
                 blind = 0;
+                landed = 0;
             }
             action Start when (
                 worker == 0 && agent == 1 && (phase == 0 || phase > 1) && closed == 0
+                    && down == 0
             ) {
                 worker = 1;
                 stop = 0;
@@ -540,11 +678,41 @@ pub fn harness_commit_owed_model() -> Model {
                 commit = 0;
                 unwatched = 0;
                 blind = 0;
+                landed = 0;
+                queued = if (qlanded == 1) { 0 } else { queued };
+                qlanded = 0;
             }
-            action QueueSteps when (queued == 1 && phase == 3 && closed == 0) {
+            action QueueSteps when (queued == 1 && qlanded == 0 && phase == 3 && closed == 0) {
                 queued = 0;
                 agent = 1;
                 done = 1;
+                landed = 1;
+            }
+            action QueueStepsUnread when (
+                queued == 1 && qlanded == 0 && phase == 3 && closed == 0
+            ) {
+                agent = 1;
+                done = 1;
+                qlanded = 1;
+            }
+            action QueueReadsLanded when (
+                qlanded == 1 && agent == 1 && phase == 3 && closed == 0
+            ) {
+                queued = 0;
+                qlanded = 0;
+                landed = 1;
+            }
+            action QueueLandedLost when (
+                Buggy == 1 && queued == 1 && qlanded == 0 && phase == 3 && closed == 0
+            ) {
+                queued = 0;
+                done = 0;
+            }
+            action QueueUnreadLost when (Buggy == 1 && qlanded == 1 && agent == 1 && closed == 0) {
+                agent = 0;
+                done = 0;
+                queued = 0;
+                qlanded = 0;
             }
             action Overtook when (phase == 0 && stale == 0) {
                 stale = 1;
@@ -561,6 +729,23 @@ pub fn harness_commit_owed_model() -> Model {
             action Quit when (phase == 3 && commit == 3 && closed == 0) {
                 closed = 1;
             }
+            action Panic when (down == 0 && closed == 0) {
+                down = 1;
+            }
+            action PanicStops when (
+                Buggy == 1 && down == 0 && closed == 0 && worker > 0 && stop == 0
+            ) {
+                down = 1;
+                stop = 1;
+            }
+            action RestartPanicStops when (
+                Buggy == 1 && down == 1 && closed == 0 && worker > 0 && stop == 0
+            ) {
+                stop = 1;
+            }
+            action Up when (down == 1) {
+                down = 0;
+            }
             action Commit when (
                 phase == 4
                     && ((firstfound == 0 && captured == queued)
@@ -574,7 +759,7 @@ pub fn harness_commit_owed_model() -> Model {
             }
 
             invariant NoOwedRelaunchLost: phase <= 2 || agent == 1 || done == 1 || queued == 1
-                || succ == 1 || worker > 0 || unwatched == 1 || commit == 2;
+                || succ == 1 || worker > 0 || unwatched == 1 || commit == 2 || landed == 1;
             invariant NoQueuedRelaunchDropped: dropped == 0;
         }
     }
@@ -1561,11 +1746,18 @@ pub fn harness_upgrade_age_model() -> Model {
 /// `read` — the exit's reader (the worker that reads it, the exit-only
 /// worker, a successor's after a Commit): 0 not yet, 1 relaunched as the
 /// act's (`ExitCause::Asked`/`Stall`, a person's keystroke before it not read
-/// as their `/exit`), 2 read by the other rules (a graceful exit is left);
-/// `hand` — ANOTHER HAND holds the session (a hold, another driver's lease or
-/// named turn, another supervisor's claim: what the exit's reader leaves to
-/// its holder, `restart_act::another_hand`); `held_kill` — an act's `KILL`
-/// was sent while another hand held the session (review of 1a733ed60).
+/// as their `/exit`), 2 read by the other rules (a graceful exit is left), 3
+/// left to another supervisor that claims the session (ruling 17); `hand` —
+/// ANOTHER HAND on the session, what the act's `KILL` waits out
+/// (`restart_act::another_hand`): 0 none, 1 one the relaunch waits out too —
+/// a hold, a driver's lease or turn (`relaunch::hand_on_tab`) — and 2
+/// another supervisor's claim, which takes the exit, whether or not such a
+/// hand stands beside it: the reader asks the claim first, at every look of
+/// a carry (ruling 20 of 2026-10-14 and its review tell them apart:
+/// `relaunch::hand_on_tab` against `claimed_by_another`); `held_kill` —
+/// an act's `KILL` was sent while another hand held the session (review of
+/// 1a733ed60); `into_claim` — a relaunch was typed into a tab another
+/// supervisor claims (the relaunch line does not wait on a claim).
 ///
 /// * `Stamp` — an act's first half (`restart_act::begin`), while `P` leads
 ///   and no other hand holds the session (its fences): the stamp written —
@@ -1582,9 +1774,12 @@ pub fn harness_upgrade_age_model() -> Model {
 ///   `killpg`, ruling 11): `killpg(SIGKILL)`, its `held_kill` the hand it was
 ///   sent under. `EscalationSeesExit` — its wait on `NOTE_EXIT` ends.
 /// * `EndsOtherwise` — anyone ends `P`, at any point.
-/// * `HandOn` / `HandOff` — another hand lands on the session, or leaves
-///   it, at any point (a fleet halt, the bridge-lost auto-hold, the owner's
-///   local hold, a driver's lease or named turn, `drive watch`'s claim).
+/// * `HandOn` / `ClaimOn` / `HandOff` — another hand lands on the session,
+///   or leaves it, at any point: a fleet halt, the bridge-lost auto-hold,
+///   the owner's local hold, a driver's lease or turn (`HandOn`), or another
+///   supervisor's claim, `drive watch`'s (`ClaimOn`) — on a free session or
+///   beside a hand already standing, an end carried through it included (the
+///   review of ruling 20); `HandOff` lifts what stands.
 /// * `Commit` — at any point; `CarrierFinishes` — the successor's carrier
 ///   finds a stamp naming a live leader past the act's 30 s and finishes the
 ///   `KILL` (it holds the master now), no other hand on the session (its
@@ -1594,12 +1789,21 @@ pub fn harness_upgrade_age_model() -> Model {
 ///   runs (stopped away from its tab, its shell in front) is nobody's yet,
 ///   decided at its end as an exit's first read is, the stamp looked up and
 ///   another supervisor's claim asked again there (rulings 15 and 17) — and
-///   with no other hand on the session, its guard says: an exit read while
-///   another hand holds it is that holder's, the reader's documented rule
-///   (`relaunch::on_exit`'s `Held`), and not this model's.
+///   with no other hand on the session: an end the act's stamp names, read
+///   while a hold, a lease or a named turn holds it, is CARRIED through that
+///   hand and relaunched once it lifts (ruling 20 of 2026-10-14,
+///   `relaunch::WAIT_HAND_LIFTS`), which is this `Read` after `HandOff`; its
+///   `into_claim` is the claim standing at it, none. `ReadByClaim` — an end
+///   read while another supervisor claims the session is that supervisor's
+///   (`claimed_by_another`, ruling 17) — one carried through a hold when the
+///   claim landed included, asked at every look of the carry (the review of
+///   ruling 20): left to it, the stamp unconsumed, `read` 3.
 ///
 /// Invariants: `TheActsEndIsRelaunched` — an end an act made is relaunched
-/// whoever reads it, however many acts there were; `OnlyAStampedEndIsTheActs`
+/// whoever reads it, however many acts there were — or, read while another
+/// supervisor claims the session, left to that supervisor, the one end this
+/// host does not relaunch (`read` 3, ruling 17: a supervisor of the session
+/// relaunches what it holds); `OnlyAStampedEndIsTheActs`
 /// — nothing is relaunched as the act's unless the stamp stood at its end;
 /// `TheActEndsItsProgram` — a `P` an act signalled is never left alive with
 /// nobody to end it (its thread, or after a Commit the carrier);
@@ -1608,7 +1812,10 @@ pub fn harness_upgrade_age_model() -> Model {
 /// reader then left the agent the act had killed at a bare shell);
 /// `OneWatchPerProcess` — however many acts there were, one watch ends `P`
 /// (bug hunt 7: every joined act's thread held a kqueue of its own, a
-/// descriptor per request against the window's 256). Liveness
+/// descriptor per request against the window's 256);
+/// `NothingIsTypedIntoAClaim` — no relaunch is typed into a tab another
+/// supervisor claims (ruling 17's blocker: it relaunches what it holds).
+/// Liveness
 /// ([`harness_restart_stamp_liveness`]): a stamped `P` ends, once every
 /// other hand is released.
 ///
@@ -1624,7 +1831,16 @@ pub fn harness_upgrade_age_model() -> Model {
 /// (ruling 17). Saying it needs a stale flag threaded through every end, a
 /// relaunch invariant weakened to admit the documented heard-after-stale
 /// residual, and a record of a `KILL` apart from the program's own end: a
-/// rework, not an action; the Tier-1s
+/// rework, not an action. Nor what the watch reads on disk and of the host
+/// before its `KILL`: it lets its program go once the tab's stamp no longer
+/// names it (another act's replaced it: ruling 21 of 2026-10-14), and sends
+/// it only once the host holds the snapshot the exit's reader reads it by
+/// (a successor that has not read the agent yet: ruling 22) — a second
+/// process and the reader's snapshot, which this model of one `P` read by
+/// "whichever reader" does not have; the Tier-1s
+/// `a_watch_lets_its_program_go_once_its_tabs_stamp_names_another` and
+/// `a_program_stopped_across_a_commit_is_ended_once_its_successor_read_it`
+/// pin them, and the Tier-1s
 /// `a_stamped_program_stopped_inside_its_grace_is_ended_once_it_leads_again`,
 /// `a_stamp_that_no_longer_stands_is_no_acts_to_finish`,
 /// `a_restart_that_joins_a_stamp_near_its_end_renews_it_and_ends_its_program`
@@ -1632,7 +1848,7 @@ pub fn harness_upgrade_age_model() -> Model {
 /// on the real code. Nor a STOPPED `P` as a state of its own: `alive` covers it,
 /// and `Read`'s `alive == 0` is what the reader must wait for (ruling 15).
 ///
-/// `Buggy=1` adds eight mutants, each caught alone: `SignalBeforeStamp`
+/// `Buggy=1` adds ten mutants, each caught alone: `SignalBeforeStamp`
 /// (the signal sent first: a reader of the exit before the stamp lands reads
 /// a graceful exit — `TheActsEndIsRelaunched`), `CommitForgetsStamp` (the
 /// record in the instance's memory, `RemedySent`'s, lost across a Commit —
@@ -1651,16 +1867,27 @@ pub fn harness_upgrade_age_model() -> Model {
 /// runs — 1a733ed60's `not-exited` read as left, and the review's second
 /// round's `Held` under a hand that came and went while `P` was stopped —
 /// and the end the act makes after `fg` is nobody's to relaunch —
-/// `TheActsEndIsRelaunched`) and `WatchPerAct` (an act whose `SIGTERM` is
+/// `TheActsEndIsRelaunched`), `WatchPerAct` (an act whose `SIGTERM` is
 /// sent starts a watch of its own beside the one running — the act before
-/// bug hunt 7 — `OneWatchPerProcess`). Tier-1 (`aterm-gui`'s `harness_host` tests
+/// bug hunt 7 — `OneWatchPerProcess`), `LeftToTheHolder` (the reader
+/// before ruling 20: an end read while a hold, a lease or a named turn holds
+/// the session left to that holder, the agent a person asked to restart at
+/// its shell — `TheActsEndIsRelaunched`) and `CarriedIntoAClaim` (ruling
+/// 20's first reader, which asked the claim only at an exit's first read: a
+/// claim that landed while the end was carried through a hold was asked at
+/// no later look, and the relaunch was typed into the tab it claims once the
+/// hold lifted — `NothingIsTypedIntoAClaim`). Tier-1 (`aterm-gui`'s `harness_host` tests
 /// `the_real_restart_act_conforms_to_its_model`,
 /// `a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp`,
 /// `the_restart_acts_kill_waits_out_another_hand`, for `Read`'s
 /// `alive == 0`
 /// `a_stamped_program_read_as_gone_while_stopped_is_relaunched_once_the_act_ends_it`,
-/// and for its `hand == 0` at a stopped program's end
+/// for `ReadByClaim` at a stopped program's end
 /// `a_stopped_programs_end_under_another_supervisors_claim_is_that_supervisors`,
+/// for `Read` after a hold that landed between the end and the read
+/// `an_acts_end_read_under_a_hold_is_relaunched_once_it_lifts`, for
+/// `ReadByClaim` after a claim that landed during that carry
+/// `a_claim_that_lands_while_an_acts_end_is_carried_takes_it`,
 /// and for `esc`'s one watch `many_restarts_of_one_program_run_one_watch`)
 /// drives the real `restart` verb and its two halves over a real pty and a
 /// real stand-in, the real stamp, a real hold, and the real reader chain.
@@ -1682,6 +1909,7 @@ pub fn harness_restart_stamp_model() -> Model {
             var read = 0;
             var hand = 0;
             var held_kill = 0;
+            var into_claim = 0;
 
             action Stamp when (alive == 1 && inflight == 0 && committed == 0 && hand == 0) {
                 inflight = 1;
@@ -1722,7 +1950,10 @@ pub fn harness_restart_stamp_model() -> Model {
             action HandOn when (hand == 0) {
                 hand = 1;
             }
-            action HandOff when (hand == 1) {
+            action ClaimOn when (hand <= 1) {
+                hand = 2;
+            }
+            action HandOff when (hand > 0) {
                 hand = 0;
             }
             action Commit when (committed == 0) {
@@ -1742,6 +1973,10 @@ pub fn harness_restart_stamp_model() -> Model {
             action Read when (alive == 0 && read == 0 && hand == 0) {
                 read = if (stamped == 1) { 1 } else { 2 };
                 stamped = 0;
+                into_claim = if (hand == 2) { 1 } else { 0 };
+            }
+            action ReadByClaim when (alive == 0 && read == 0 && hand == 2) {
+                read = 3;
             }
             action SignalBeforeStamp when (
                 Buggy == 1 && alive == 1 && stamped == 0 && termed == 0 && committed == 0
@@ -1785,13 +2020,24 @@ pub fn harness_restart_stamp_model() -> Model {
                 termed = 1;
                 esc = 2;
             }
+            action LeftToTheHolder when (Buggy == 1 && alive == 0 && read == 0 && hand == 1) {
+                read = 2;
+            }
+            action CarriedIntoAClaim when (
+                Buggy == 1 && alive == 0 && read == 0 && hand == 2 && stamped == 1
+            ) {
+                read = 1;
+                stamped = 0;
+                into_claim = 1;
+            }
 
-            invariant TheActsEndIsRelaunched: read <= 1 || ended == 0 || ended == 2;
-            invariant OnlyAStampedEndIsTheActs: read == 0 || read == 2 || at_end == 1;
+            invariant TheActsEndIsRelaunched: read <= 1 || read == 3 || ended == 0 || ended == 2;
+            invariant OnlyAStampedEndIsTheActs: read == 0 || read == 2 || read == 3 || at_end == 1;
             invariant TheActEndsItsProgram: alive == 0 || termed == 0 || esc > 0
                 || committed == 1;
             invariant TheKillWaitsOutAnotherHand: held_kill == 0;
             invariant OneWatchPerProcess: esc <= 1;
+            invariant NothingIsTypedIntoAClaim: into_claim == 0;
         }
     }
 }

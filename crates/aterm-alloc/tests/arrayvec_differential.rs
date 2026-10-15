@@ -836,3 +836,64 @@ fn owning_elements_drop_parity() {
         "total drop count differs after the vectors go out of scope"
     );
 }
+
+/// `retain` whose predicate PANICS keeps what the predicate had kept and every
+/// element it had not yet returned for, closes the hole between them, and
+/// drops each element exactly once overall: std `Vec::retain`'s contract, which
+/// upstream's `BackshiftOnDrop` mirrors. Swept over every panic position and
+/// every keep/reject pattern before it, so a guard that drops the unprocessed
+/// tail (or the element under examination) shows up as missing elements.
+#[test]
+fn retain_with_a_panicking_predicate_parity() {
+    use std::cell::RefCell;
+
+    struct Tracked(u32, Rc<RefCell<Vec<u32>>>);
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    const LEN: u32 = 5;
+    for panic_at in 0..LEN {
+        for keep_mask in 0..(1u32 << LEN) {
+            let what = format!("retain panicking at {panic_at}, keep mask {keep_mask:#07b}");
+            let pred = move |t: &mut Tracked| {
+                assert!(t.0 != panic_at, "predicate panics at {panic_at}");
+                keep_mask & (1 << t.0) != 0
+            };
+            let mine_log = Rc::new(RefCell::new(Vec::new()));
+            let up_log = Rc::new(RefCell::new(Vec::new()));
+            let mut mine: MyArrayVec<Tracked, 8> =
+                (0..LEN).map(|i| Tracked(i, Rc::clone(&mine_log))).collect();
+            let mut up: UpArrayVec<Tracked, 8> =
+                (0..LEN).map(|i| Tracked(i, Rc::clone(&up_log))).collect();
+
+            assert!(panicked(|| mine.retain(pred)), "{what}: mine must unwind");
+            assert!(panicked(|| up.retain(pred)), "{what}: model must unwind");
+
+            let mine_ids: Vec<u32> = mine.iter().map(|t| t.0).collect();
+            let up_ids: Vec<u32> = up.iter().map(|t| t.0).collect();
+            let expected: Vec<u32> = (0..LEN)
+                .filter(|&i| i >= panic_at || keep_mask & (1 << i) != 0)
+                .collect();
+            assert_eq!(up_ids, expected, "{what}: the model's contract");
+            assert_eq!(mine_ids, up_ids, "{what}: contents after the panic differ");
+            assert_eq!(
+                *mine_log.borrow(),
+                *up_log.borrow(),
+                "{what}: elements dropped during the unwind differ"
+            );
+
+            drop(mine);
+            drop(up);
+            let mut all = mine_log.borrow().clone();
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (0..LEN).collect::<Vec<_>>(),
+                "{what}: every element must be dropped exactly once overall"
+            );
+        }
+    }
+}

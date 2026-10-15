@@ -1565,6 +1565,408 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     );
 }
 
+/// A CONTINUATION THE SERVER REFUSED FOR NOW IS TYPED ONCE IT CAN BE (the
+/// sweep of 2026-10-09, Claude Code 2.1.295, `continue`): an idle point's
+/// act meets `ERR halted` (an owner's `hold`) or `ERR busy …` (`ERR rate`
+/// takes the same branch);
+/// the loop parks on the hold (`HALTED`, then `UNHALTED` once `status` reads
+/// `hold=0`) or backs off, and decides the point again and types the act,
+/// though the screen never moves — on the guarded `turn` and on the fenced
+/// `send`. Measured before: after `UNHALTED` nothing was typed for 16 minutes
+/// and nobody was told, since an idle point that stands moves nothing the
+/// loop's wait latches on. The session ends on the fact (the second write),
+/// its stalls a hang detector.
+#[test]
+fn a_continuation_a_refusal_turned_away_is_typed_once_it_can_be() {
+    for refusal in ["halted reason=owner origin=local", "busy lease=s-9"] {
+        let (jdir, journal) = journal_file("refused-continue");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                ended("Fixed the parser; the suite is green."),
+            ],
+        );
+        m.verb_replies
+            .insert("turn", VecDeque::from([err(refusal)]));
+        if refusal.starts_with("halted") {
+            m.hold = "1";
+            m.hold_lifts_after = Some(2);
+        }
+        m.stall_sleep = Some(Duration::from_millis(20));
+        m.vanish_after = Some(1500);
+        m.exit_when = Some(|m| m.turns >= 2);
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..hosted(60)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(count(&m, "turn"), 2, "{refusal}: {:#?}", m.requests);
+        // The same point, read again as the wait reads it (the mock's seq
+        // moves with each read of the screen that never changed).
+        assert!(
+            lines.iter().any(|l| l.starts_with("CONTINUED seq=")
+                && l.ends_with(&format!("rule={RULE_CONTINUE} keep going"))),
+            "{refusal}: {lines:#?}"
+        );
+        let (records, _) = journal_records(&journal);
+        let notes: Vec<&str> = records.iter().map(|r| r.line.as_str()).collect();
+        let lifted = if refusal.starts_with("halted") {
+            "UNHALTED seq=102"
+        } else {
+            "REFUSED seq=102"
+        };
+        assert!(
+            notes.iter().any(|n| n.starts_with(lifted)),
+            "{refusal}: {notes:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&jdir);
+    }
+
+    // The fenced host's `send`, refused by the hold: written again once it
+    // lifts, on the screen that never moved.
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+        ],
+    );
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.help = FENCED_HELP.to_string();
+    m.send_replies
+        .push_back(err("halted reason=owner origin=local"));
+    m.hold = "1";
+    m.hold_lifts_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.vanish_after = Some(1500);
+    m.exit_when = Some(|m| m.requests.iter().filter(|r| r.starts_with("send ")).count() >= 2);
+    let _ = watch_lines(&mut m, &hosted(60));
+    let sends: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("send "))
+        .collect();
+    assert_eq!(sends.len(), 2, "{:#?}", m.requests);
+    assert_eq!(sends[0], "send if-gen=1.102 if=^❯\\s*$ -- keep going");
+    assert!(
+        sends[1].starts_with("send if-gen=1.") && sends[1].ends_with(" if=^❯\\s*$ -- keep going"),
+        "{sends:#?}"
+    );
+}
+
+/// A REFUSAL THAT PERSISTS IS JOURNALED ONCE, AND AGAIN WHEN IT CHANGES (the
+/// review of 2026-10-14). A continuation the server turns away is decided
+/// again a moment later and written again — nothing wrong is typed — and a
+/// refusal that stands (another driver's lease, `ERR busy lease=…`; a hold
+/// on a host whose `status` names none, so the park cannot wait it out)
+/// meets every retry, one every ~10 s for as long as it stands. The journal
+/// says it when it first appears and when it changes (another holder), not
+/// at every retry: before, each retry wrote its own `REFUSED`/`HALTED` line.
+/// The run ends on the fact (the write taken), its stalls a hang detector;
+/// the turns written show every retry was still made.
+#[test]
+fn a_refusal_that_persists_is_journaled_once_and_again_when_it_changes() {
+    let run = |tag: &str, refusals: &[&str], hold: &'static str| {
+        let (jdir, journal) = journal_file(tag);
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                ended("Fixed the parser; the suite is green."),
+            ],
+        );
+        m.verb_replies
+            .insert("turn", refusals.iter().map(|r| err(r)).collect());
+        m.hold = hold;
+        m.stall_sleep = Some(Duration::from_millis(20));
+        m.vanish_after = Some(3000);
+        let taken = refusals.len() + 1;
+        m.exit_when = Some(match taken {
+            3 => |m: &Mock| m.turns >= 3,
+            _ => |m: &Mock| m.turns >= 4,
+        });
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..hosted(90)
+        };
+        let _ = watch_lines(&mut m, &opts);
+        assert_eq!(count(&m, "turn"), taken, "{tag}: {:#?}", m.requests);
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        records
+            .into_iter()
+            .map(|r| r.line)
+            .filter(|l| l.starts_with("REFUSED ") || l.starts_with("HALTED "))
+            .map(|l| {
+                l.split(' ')
+                    .filter(|w| !w.starts_with("seq=") && !w.starts_with("backoff="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    // Another driver's lease, twice; then another holder's. A hold on a
+    // host whose `status` names none, twice.
+    let lease = run(
+        "refused-persists-lease",
+        &["busy lease=s-9", "busy lease=s-9", "busy lease=s-7"],
+        "0",
+    );
+    let hold = run(
+        "refused-persists-hold",
+        &["halted reason=owner origin=local"; 2],
+        "-",
+    );
+    assert_eq!(
+        (lease, hold),
+        (
+            vec![
+                "REFUSED ERR busy lease=s-9".to_string(),
+                "REFUSED ERR busy lease=s-7".to_string()
+            ],
+            vec!["HALTED ERR halted reason=owner origin=local".to_string()]
+        )
+    );
+}
+
+/// A REFUSAL THAT PERSISTS IS ONE REFUSAL, HOWEVER ITS COUNTERS MOVE (the
+/// review of 2026-10-14). The server's refusal of a write a person is typing
+/// over says how long ago they typed (`ERR busy person human_ms=<n>`,
+/// `control_input.rs`): a new number at every retry of the same act. Keyed
+/// on the whole text, each retry read as a new refusal and was journaled — the
+/// spam the episode exists to stop. The same refusal is said once.
+#[test]
+fn a_refusal_whose_counters_move_is_journaled_once() {
+    let (jdir, journal) = journal_file("refused-counters-move");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+        ],
+    );
+    m.verb_replies.insert(
+        "turn",
+        ["busy person human_ms=1200", "busy person human_ms=4810"]
+            .iter()
+            .map(|r| err(r))
+            .collect(),
+    );
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.vanish_after = Some(3000);
+    m.exit_when = Some(|m: &Mock| m.turns >= 3);
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(90)
+    };
+    let _ = watch_lines(&mut m, &opts);
+    assert_eq!(count(&m, "turn"), 3, "{:#?}", m.requests);
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&jdir);
+    let refused: Vec<String> = records
+        .into_iter()
+        .map(|r| r.line)
+        .filter(|l| l.starts_with("REFUSED "))
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:#?}");
+}
+
+/// A REFUSAL'S EPISODE, by its key and its last meeting
+/// ([`Session::refusal_news`]): the same refusal met again within
+/// [`REFUSAL_QUIET`] of its last meeting is no news, whatever its measures
+/// say (`human_ms=`, `bytes=`, a `…_ms=` wait); met again after that long
+/// unmet — across a wall's wait — it is a new appearance, and said. A new
+/// holder of the session is news: another lease, another turn, another
+/// supervisor, another hold's reason.
+#[test]
+fn a_refusals_episode_is_its_holder_and_ends_after_a_quiet_spell() {
+    assert_eq!(
+        super::super::lifecycle::refusal_key(
+            "REFUSED ERR busy input-unread bytes=4096 wait_ms=1200"
+        ),
+        "REFUSED ERR busy input-unread"
+    );
+    assert_eq!(
+        super::super::lifecycle::refusal_key("REFUSED ERR busy turn=17"),
+        "REFUSED ERR busy turn=17"
+    );
+    let mut m = Mock::new(true, vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    let t = Instant::now();
+    let person = |ms: u32| format!("REFUSED ERR busy person human_ms={ms}");
+    assert!(s.refusal_news(&person(1200), t), "first met");
+    let mut at = t;
+    // Met every few seconds for an hour: one episode.
+    for i in 0..400u32 {
+        at += Duration::from_secs(9);
+        assert!(!s.refusal_news(&person(1200 + i), at), "retry {i}");
+    }
+    // Unmet for the quiet spell, then met again: a new appearance.
+    at += REFUSAL_QUIET;
+    assert!(s.refusal_news(&person(5), at), "after the quiet spell");
+    // A new holder each time is news.
+    for said in [
+        "REFUSED ERR busy lease=s-9",
+        "REFUSED ERR busy lease=s-7",
+        "REFUSED ERR busy turn=17",
+        "REFUSED ERR busy turn=18",
+        "HALTED ERR halted reason=owner origin=local",
+        "HALTED ERR halted reason=fabric-lost origin=fleet",
+    ] {
+        at += Duration::from_secs(1);
+        assert!(s.refusal_news(said, at), "{said}");
+    }
+}
+
+/// A REFUSAL'S EPISODE ENDS AT A WRITE THE SERVER TAKES AND AT A HOLD SEEN
+/// LIFTED (the review of 2026-10-14: neither was tested). Another driver's
+/// lease refuses the act twice — said once — then a write is taken, and the
+/// same lease refusing again is a new appearance, said again; a write the
+/// server refuses in between ends nothing. A hold parks the loop, lifts
+/// (`UNHALTED`), and the same hold met again is said again. Without either
+/// end, the refusal that came back was never journaled.
+#[test]
+fn a_refusals_episode_ends_at_a_taken_write_and_at_a_lifted_hold() {
+    let refused_lines = |heard: &Heard| -> Vec<String> {
+        heard
+            .noted
+            .iter()
+            .filter(|l| l.starts_with("REFUSED ") || l.starts_with("HALTED "))
+            .map(|l| {
+                l.split(' ')
+                    .filter(|w| !w.starts_with("seq=") && !w.starts_with("backoff="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    let mut m = Mock::new(true, vec![ended("Fixed the parser; the suite is green.")]);
+    m.verb_replies.insert(
+        "turn",
+        VecDeque::from([
+            err("busy lease=s-9"),
+            ok("OK id=1 submitted=1 status=settled seq=100 dur_ms=600 hash=0\n"),
+        ]),
+    );
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let mut heard = Heard::default();
+    let lease = "ERR busy lease=s-9";
+    s.back_off(lease, 101, None, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    s.back_off(lease, 102, None, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    // Refused: the episode stands.
+    let r = s
+        .call(&["turn", "keep going"])
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(r.is_err("busy"), "{r:?}");
+    s.back_off(lease, 103, None, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(refused_lines(&heard), vec![format!("REFUSED {lease}")]);
+    // Taken: the episode is over.
+    let r = s
+        .call(&["turn", "keep going"])
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(r.ok(), "{r:?}");
+    s.back_off(lease, 104, None, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        refused_lines(&heard),
+        vec![format!("REFUSED {lease}"), format!("REFUSED {lease}")]
+    );
+
+    // A hold, lifted, met again.
+    let mut m = Mock::new(true, vec![ended("Fixed the parser; the suite is green.")]);
+    m.hold = "1";
+    m.hold_lifts_after = Some(1);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let mut heard = Heard::default();
+    let hold = "ERR halted reason=owner origin=local";
+    s.park_on_hold(hold, 101, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(
+        heard.noted.iter().any(|l| l.starts_with("UNHALTED ")),
+        "{:#?}",
+        heard.noted
+    );
+    s.park_on_hold(hold, 102, &mut heard)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        refused_lines(&heard),
+        vec![format!("HALTED {hold}"), format!("HALTED {hold}")]
+    );
+}
+
+/// THE FENCED PRESS A HOLD TURNED AWAY IS PRESSED AGAIN ONCE IT LIFTS (the
+/// review of 2026-10-14: [`a_continuation_a_refusal_turned_away_is_typed_once_it_can_be`]'s
+/// other door, `press_fenced`). The worker's own suggestion's accept key and
+/// a standing draft's Enter meet `ERR halted` (an owner's `hold`); the loop
+/// parks on the hold and, once `status` reads `hold=0`, decides the point
+/// again and presses the key again, though the screen never moved. Before,
+/// nothing was pressed after `UNHALTED`. The session ends on the fact (the
+/// second press), its stalls a hang detector.
+#[test]
+fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
+    let held = |screen: Vec<String>, key: &'static str| {
+        let mut m = Mock::new(true, vec![busy_screen(), screen]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = FENCED_HELP.to_string();
+        m.key_replies
+            .push_back(err("halted reason=owner origin=local"));
+        m.hold = "1";
+        m.hold_lifts_after = Some(2);
+        m.stall_sleep = Some(Duration::from_millis(20));
+        m.vanish_after = Some(1500);
+        m.exit_when = Some(match key {
+            "right" => |m: &Mock| m.presses().iter().filter(|p| p.ends_with(" right")).count() >= 2,
+            _ => |m: &Mock| m.presses().iter().filter(|p| p.ends_with(" enter")).count() >= 2,
+        });
+        m
+    };
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            answer_questions: false,
+            human_grace_s: 1,
+            ..SupervisorConfig::default()
+        },
+        ..auto(60, None)
+    };
+    // The suggestion's accept key.
+    let mut m = held(suggesting("Stage 1 is in."), "right");
+    let _ = watch_lines(&mut m, &opts);
+    let rights: Vec<&String> = m
+        .presses()
+        .into_iter()
+        .filter(|p| p.ends_with(" right"))
+        .collect();
+    assert_eq!(rights.len(), 2, "{:#?}", m.requests);
+    assert_eq!(
+        rights[0],
+        "key if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ right"
+    );
+    // A draft left standing: its Enter.
+    let mut m = held(typed_in("Stage 1 is in.", "also check the lexer"), "enter");
+    m.cursor_col = Some(24);
+    let _ = watch_lines(&mut m, &opts);
+    let enters: Vec<&String> = m
+        .presses()
+        .into_iter()
+        .filter(|p| p.ends_with(" enter"))
+        .collect();
+    assert_eq!(enters.len(), 2, "{:#?}", m.requests);
+    assert!(
+        enters
+            .iter()
+            .all(|p| p.starts_with("key if-gen=1.") && p.contains("lexer")),
+        "{enters:#?}"
+    );
+}
+
 /// Claude Code word-wraps its composer, so the guard is the end of the
 /// text's last word, which the cursor's row holds at every width. Negative
 /// control: a 40-character tail misses at some of the same widths.
@@ -5826,6 +6228,57 @@ fn memory_wall_in(span: &str) -> Vec<String> {
         .collect()
 }
 
+/// A TURN SERVED UNDER THE REMEMBERED WALL'S OWN NOTICE IS NO BACKGROUND
+/// WORK (the review of 2026-10-14: untested). The loop remembers the weekly
+/// wall of tab 1 (its shell still running); a screen that shows only the
+/// agent's background work stands for that wall — but not one where a
+/// person's turn, its prompt and the model's reply, was served under the
+/// wall's notice: the limit lifted, and the turn is work since it. NEGATIVE
+/// CONTROLS, each still the remembered wall: the screen with no such turn,
+/// and the same turn under ANOTHER limit's notice (its reset not the
+/// remembered wall's).
+#[test]
+fn a_turn_served_under_the_remembered_walls_notice_is_no_background_work() {
+    let walled = memory_wall_in("2s")
+        .into_iter()
+        .map(|r| r.replace("resets in 2s", "resets 4pm (America/Los_Angeles)"))
+        .collect::<Vec<_>>();
+    let with_turn = |rows: &[String]| {
+        let mut rows = rows.to_vec();
+        let at = rows
+            .iter()
+            .position(|r| r.starts_with("✻ Sautéed"))
+            .expect("the done row");
+        for (i, row) in [
+            "❯ what is left to do?",
+            "",
+            "⏺ Nothing is left: the suite is green.",
+            "",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.insert(at + i, (*row).to_string());
+        }
+        rows
+    };
+    let turned = with_turn(&walled);
+    let elsewhere: Vec<String> = turned.iter().map(|r| r.replace("4pm", "9pm")).collect();
+    for rows in [&walled, &turned, &elsewhere] {
+        assert!(aterm_phase::background_only(rows), "{rows:#?}");
+    }
+    let mut m = Mock::new(true, vec![walled.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    let reader = s.reader(&walled);
+    let mut reading = reader.read(&walled, Some(2));
+    assert!(reading.wall.is_some(), "{reading:#?}");
+    s.wall_memory_step(reader, &walled, &mut reading, 101);
+    assert!(s.remembered_wall(reader, &turned).is_none());
+    // NEGATIVE CONTROLS.
+    assert!(s.remembered_wall(reader, &walled).is_some());
+    assert!(s.remembered_wall(reader, &elsewhere).is_some());
+}
+
 /// The same screen with the wall's rows gone: the owner scrolled back up the
 /// transcript (Claude Code's fullscreen view keeps the status row, the
 /// composer and the footer where they are).
@@ -5900,6 +6353,18 @@ fn memory_run_for(
     sid: Option<&str>,
     setup: impl FnOnce(&mut Session<'_, Mock>),
 ) -> (Mock, Vec<String>, Vec<String>, PathBuf) {
+    memory_run_on(tag, screens, stop_s, sid, |_| {}, setup)
+}
+
+/// [`memory_run_for`] on a server `server` makes more of (a pushed verdict).
+fn memory_run_on(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    stop_s: u64,
+    sid: Option<&str>,
+    server: impl FnOnce(&mut Mock),
+    setup: impl FnOnce(&mut Session<'_, Mock>),
+) -> (Mock, Vec<String>, Vec<String>, PathBuf) {
     let sits = screens.len() - 1;
     let (dir, path) = journal_file(tag);
     let mut m = Mock::new(true, screens);
@@ -5909,6 +6374,7 @@ fn memory_run_for(
     m.dead_after_turns = Some(0);
     // The sat screen's waits sleep (a quarter second each).
     m.stall_sleep = Some(Duration::from_millis(250));
+    server(&mut m);
     let opts = SuperviseOpts {
         journal: Some(path.clone()),
         ..hosted(30)
@@ -6198,6 +6664,832 @@ fn a_hidden_wall_past_its_horizon_is_history() {
     assert_eq!(m.turns, 0, "{lines:#?}\n{:#?}", m.requests);
 }
 
+/// Claude Code 2.1.296's five-hour limit with its own auto-continue armed
+/// (the lab's capture), its reset `span` away: the loop places it on the
+/// print, so a test can cross it.
+fn auto_continue_wall_in(span: &str) -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+    )
+    .into_iter()
+    .map(|r| {
+        r.replace(
+            "resets 3:15pm (America/Los_Angeles)",
+            &format!("resets in {span}"),
+        )
+        .replace("limit resets 3:15pm", &format!("limit resets in {span}"))
+    })
+    .collect()
+}
+
+/// The same kind of limit after Esc on the countdown (the lab's capture):
+/// `⏺ Automatic continue cancelled · /rate-limit-options to re-arm`, an idle
+/// screen with no wall.
+fn auto_continue_cancelled() -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
+    )
+}
+
+/// A LIMIT WHOSE NOTICE LEFT IS WAITED ON ACROSS A LOOP'S RESTART (the review
+/// of 2026-10-14). A loop reads the limit, then Esc on the vendor's countdown
+/// leaves an idle screen with no wall, and the policy waits for the reset the
+/// notice named. A wait can last days, and the harness restarts its loops (each
+/// seamless update, each fault): the ledger keeps the wall open — no
+/// `wall-wait-end@v1` while the policy waits on it — and the loop that follows
+/// takes the named reset up from it. Measured before: the first loop wrote the
+/// wall's end at the idle screen and its successor seeded nothing, so it typed
+/// `continue@v1 keep going` into the standing limit after its first back-off
+/// (with `continue_policy = false`, nothing ever, and nobody told). Here the
+/// successor's back-off is a second, the reset seven seconds out: it waits by
+/// the wall's own rule (`usage-session resets`) for the reset and its grace,
+/// then types `keep going` once.
+#[test]
+fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
+    let dir = crate::supervise::test_scratch_path("wm-ledger", "left-restart");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let ledger = dir.join("s-1.jsonl");
+    let reset = Instant::now() + Duration::from_secs(7);
+    // The loop that reads the limit and then the cancel, stopped there.
+    let (m, lines, _, jdir) = memory_run_for(
+        "left-restart-1",
+        vec![
+            busy_screen(),
+            auto_continue_wall_in("7s"),
+            auto_continue_cancelled(),
+        ],
+        2,
+        Some("@s-1"),
+        |s| s.set_approval_ledger(Some(ledger.clone())),
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert_eq!(m.turns, 0, "{lines:#?}\n{rows}");
+    assert!(
+        crate::supervise::approvals::open_wall(&ledger, Some("@s-1")).is_some(),
+        "the wall is open for a loop that follows: {rows}"
+    );
+    // The loop that follows, on the cancelled screen.
+    let (m, lines, waits, jdir) = memory_run_for(
+        "left-restart-2",
+        vec![auto_continue_cancelled()],
+        14,
+        Some("@s-1"),
+        |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_turn_end_timing(TurnEndTiming {
+                reset_grace: Duration::from_secs(1),
+                reset_jitter: Duration::ZERO,
+                short_backoff: Duration::from_secs(1),
+                ..TurnEndTiming::default()
+            });
+        },
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+    let _ = std::fs::remove_dir_all(&dir);
+    // One turn, the session gone at it (the scripted server's end), and no
+    // sooner than the reset: the wait was the wall's, never the continue
+    // policy's back-off.
+    assert_eq!(m.turns, 1, "{lines:#?}\n{waits:#?}\n{:#?}", m.requests);
+    assert!(Instant::now() >= reset, "not before the reset: {waits:#?}");
+    assert!(
+        !waits.is_empty() && waits.iter().all(|w| w.ends_with("usage-session resets")),
+        "{waits:#?}"
+    );
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.contains(" turn submit=guarded:") && r.ends_with(" keep going")),
+        "{:#?}",
+        m.requests
+    );
+}
+
+/// The measured armed wall ([`auto_continue_wall_in`]'s) naming the bare
+/// clock `clock` for its reset and its countdown.
+fn auto_continue_wall_at(clock: &str) -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+    )
+    .into_iter()
+    .map(|r| r.replace("3:15pm", clock))
+    .collect()
+}
+
+/// The same kind of limit after Esc on the countdown, then — the limit
+/// lifted before its reset — a person's short turn under the cancel (Claude
+/// Code 2.1.299, the lab's capture): the limit's notice names `10:38am`.
+fn cancelled_then_a_persons_turn() -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED,
+    )
+}
+
+/// THE WAIT ON A LIMIT WHOSE NOTICE LEFT WAKES ON THE SCREEN, NOT ON THE
+/// SERVER'S VERDICT (the review of 2026-10-14; the lab, Claude Code 2.1.299).
+/// At an idle point the loop waits for the server's pushed agent verdict to
+/// move off `idle` (`await agent busy,prompt,…`): one wake per real turn,
+/// none per footer tick. The verdict is a sweep's, and a turn shorter than
+/// the sweep is never published busy — a person's turn the stub answers at
+/// once is not. At an ordinary point the policy's own deadline (a back-off
+/// of minutes) reads the screen again soon; at a limit whose notice left the
+/// screen it is the reset — hours, days at a weekly limit. Measured live
+/// before: the person's turn at 10:28:46, no point decided, then
+/// `usage-resume@v1 keep going` at the reset, 10:40:32. That wait is woken by
+/// the content, as a wall that shows is: the person's turn is read as the
+/// point it is, and decided (a turn since the limit: the continue policy's
+/// back-off, then its `keep going`, the session ending there). The
+/// script's verdict passes the person's idle screen over unread, as the
+/// server's sweep did.
+#[test]
+fn the_wait_on_a_left_limit_wakes_on_a_persons_short_turn() {
+    // The person's turn stands under THIS limit's notice (`10:38am`, an
+    // hour and 43 minutes past the watch tests' 08:55 PDT).
+    let (m, lines, waits, jdir) = memory_run_on(
+        "left-person-turn",
+        vec![
+            busy_screen(),
+            auto_continue_wall_at("10:38am"),
+            auto_continue_cancelled(),
+            cancelled_then_a_persons_turn(),
+        ],
+        12,
+        Some("@s-1"),
+        |m| {
+            m.sends_gen = true;
+            m.agent_pushes = true;
+        },
+        |s| {
+            s.set_clock(TEST_NOW, PDT);
+            s.set_turn_end_timing(TurnEndTiming {
+                reset_grace: Duration::from_secs(1),
+                reset_jitter: Duration::ZERO,
+                short_backoff: Duration::from_secs(1),
+                ..TurnEndTiming::default()
+            });
+        },
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.contains(" await agent busy,prompt")),
+        "the idle points are waited on by the verdict: {:#?}",
+        m.requests
+    );
+    assert!(
+        waits.iter().any(|w| w.contains("usage-session resets")),
+        "the left limit's wait: {waits:#?}"
+    );
+    // The person's turn read as its point, and decided by the continue
+    // policy (a turn since the limit: a short turn's back-off), whose
+    // `keep going` is then written — at the back-off, not the reset an hour
+    // off.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("EVENT idle seq=") && l.contains("(reply 3)")),
+        "the person's turn is a point: {lines:#?}"
+    );
+    assert!(
+        waits.last().is_some_and(|w| w.contains("short turn")),
+        "the continue policy's back-off: {waits:#?}"
+    );
+    assert_eq!(m.turns, 1, "{lines:#?}\n{waits:#?}\n{:#?}", m.requests);
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.contains(" turn ") && r.ends_with(" keep going")),
+        "{:#?}",
+        m.requests
+    );
+}
+
+/// The measured armed limit ([`auto_continue_wall_at`]'s, `clock` its reset)
+/// drawn under the loop's own `keep going`: the stub answered the line with
+/// its 429 at once, so no read saw the worker busy since it was typed.
+fn own_act_met_a_limit(clock: &str) -> Vec<String> {
+    auto_continue_wall_at(clock)
+        .into_iter()
+        .map(|r| r.replace("❯ carry on with the task", "❯ keep going"))
+        .collect()
+}
+
+/// [`own_act_met_a_limit`] after Esc on the vendor's countdown: the measured
+/// cancel (`⏺ Automatic continue cancelled`), an idle screen with no wall, its
+/// newest notice naming `clock`.
+fn own_act_limit_cancelled(clock: &str) -> Vec<String> {
+    auto_continue_cancelled()
+        .into_iter()
+        .map(|r| {
+            r.replace("3:50pm", clock)
+                .replace("❯ carry on with the task", "❯ keep going")
+        })
+        .collect()
+}
+
+/// A LIMIT MET WHILE THE LOOP'S OWN ACT IS STILL INSIDE ITS TAKE WINDOW IS
+/// TRACKED (round 15's left-wall run, lab tag `amlw15`, Claude Code 2.1.300,
+/// 2026-10-14): the loop typed `continue@v1 keep going`; the stub answered it
+/// with a five-hour limit at once (`resets 2:26pm`, no busy read), read as
+/// `WAITING … the worker to take the continue@v1 act`; a person's Esc on the
+/// vendor's countdown three seconds later took the notice off the screen,
+/// and at the take window's end the point was decided as the act's short
+/// turn — `3 short turn(s) in a row: 8 min back-off`, a continuation due into
+/// the limit, and `wall-wait-end@v1` written at the Esc. The point is not the
+/// act's until its window ends (its own bookkeeping, as before), but the wall
+/// it shows is the policy's to track now: when the notice leaves inside the
+/// window, the point is waited on to the reset the notice named
+/// (`usage-session resets`), the ledger keeps the wall open, and nothing is
+/// typed before the reset (10:38, an hour and 43 minutes past the test's
+/// 08:55). Measured before the fix: a second `keep going` at the continue
+/// policy's back-off, and the wall's end in the ledger.
+#[test]
+fn a_limit_met_inside_the_own_acts_take_window_is_waited_on_when_its_notice_leaves() {
+    let (dir, journal) = journal_file("te-takewin");
+    let (ldir, ledger) = ledger_at("takewin");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            own_act_met_a_limit("10:38am"),
+            own_act_limit_cancelled("10:38am"),
+        ],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(60);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&ldir);
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.as_str())
+        .collect();
+    let typed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        typed,
+        ["CONTINUED seq=102 rule=continue@v1 keep going"],
+        "the act that met the limit, and nothing typed into the limit: {lines:#?}\n{waits:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert!(
+        waits
+            .iter()
+            .any(|w| w.contains("the worker to take the continue@v1 act")),
+        "the act's own window still stands: {waits:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T17:38:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the notice named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(
+        rows.contains("\"rule_id\":\"wall-wait@v1\"")
+            && !rows.contains("\"rule_id\":\"wall-wait-end@v1\""),
+        "the wall is open in the ledger: {rows}"
+    );
+}
+
+/// A LIMIT CANCELLED BEFORE ANY READ AFTER THE OWN ACT IS WAITED ON (round
+/// 16's residual (a), lab tag `tw16after`, Claude Code 2.1.300, 2026-10-14):
+/// the loop typed `continue@v1 keep going`; the stub answered it with a
+/// five-hour limit at once, and a person's Esc on the vendor's countdown came
+/// before the loop's first read after its act — that read was already the
+/// cancel under the notice (`⏺ Automatic continue cancelled`), no wall. The
+/// newest limit notice no turn has been served since, under the vendor's word
+/// that it will not go on by itself, is the act's answer: the limit is
+/// tracked from that reading, its reset placed (10:38, an hour and 43 minutes
+/// past the test's 08:55), the ledger keeps the wall open, and nothing is
+/// typed before the reset. Measured before the fix: the window's end read the
+/// act's short turn (`2 short turn(s) in a row`), and the continue policy
+/// typed `keep going` into the standing limit at its back-off.
+#[test]
+fn a_limit_cancelled_before_any_read_after_the_own_act_is_waited_on_to_its_reset() {
+    let (dir, journal) = journal_file("te-leftesc");
+    let (ldir, ledger) = ledger_at("leftesc");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            own_act_limit_cancelled("10:38am"),
+        ],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(60);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&ldir);
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.as_str())
+        .collect();
+    let typed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        typed,
+        ["CONTINUED seq=102 rule=continue@v1 keep going"],
+        "the act the limit answered, and nothing typed into the limit: {lines:#?}\n{waits:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    // The first read after the act: the cancel's notice read as the limit
+    // point it was (its episode opened), as the same wall read before the
+    // cancel is.
+    assert!(
+        lines.iter().any(|l| l.starts_with("EVENT limited seq=103 ")
+            && l.contains("Usage limit reached")
+            && l.ends_with(" reset=10:38am")),
+        "{lines:#?}"
+    );
+    assert!(
+        waits
+            .iter()
+            .any(|w| w.contains("the worker to take the continue@v1 act")),
+        "the act's own window still stands: {waits:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T17:38:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the notice named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(
+        rows.contains("\"rule_id\":\"wall-wait@v1\"")
+            && !rows.contains("\"rule_id\":\"wall-wait-end@v1\""),
+        "the wall is open in the ledger: {rows}"
+    );
+}
+
+/// A RETRY THE LIMIT ANSWERS INSIDE ITS OWN TAKE WINDOW IS MET, NOT TAKEN
+/// (round 16's review, 2026-10-14): the loop's `keep going` met a limit two
+/// seconds from its reset; Esc on the vendor's countdown left its notice; at
+/// the reset the loop typed `usage-resume@v1 keep going`, and the limit
+/// answered that at once (no busy read) with a new notice an hour out — and
+/// Esc on the new countdown, inside the resume's window, left that notice
+/// too. The point that judges the resume finds no wall, but the wall
+/// answered it: the new limit is waited on to the reset it named
+/// (`usage-session resets`, 16:55 and its grace), the ledger keeps the wall
+/// open, and nothing more is typed. Measured before: the resume read as
+/// taken, `wall-wait-end@v1` written, and `continue@v1 keep going` typed into
+/// the standing limit at the continue policy's back-off.
+#[test]
+fn a_resume_the_limit_answers_inside_its_window_is_waited_on_to_the_new_reset() {
+    let (dir, journal) = journal_file("te-takewin-retry");
+    let (ldir, ledger) = ledger_at("takewin-retry");
+    let kept = |r: String| r.replace("❯ carry on with the task", "❯ keep going");
+    let armed =
+        |span: &str| -> Vec<String> { auto_continue_wall_in(span).into_iter().map(kept).collect() };
+    let cancelled = |span: &str| -> Vec<String> {
+        auto_continue_cancelled()
+            .into_iter()
+            .map(|r| {
+                kept(r)
+                    .replace(
+                        "resets 3:50pm (America/Los_Angeles)",
+                        &format!("resets in {span}"),
+                    )
+                    .replace(
+                        "resets 3:35pm (America/Los_Angeles)",
+                        &format!("resets in {span}"),
+                    )
+            })
+            .collect()
+    };
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            armed("2s"),
+            cancelled("2s"),
+            armed("1h"),
+            cancelled("1h"),
+        ],
+    );
+    m.turn_gates = vec![1, 3];
+    m.vanish_after = Some(100);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&ldir);
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.as_str())
+        .collect();
+    let typed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        typed,
+        [
+            "CONTINUED seq=102 rule=continue@v1 keep going",
+            "CONTINUED seq=104 rule=usage-resume@v1 keep going",
+        ],
+        "nothing typed into the limit that answered the resume: {lines:#?}\n{waits:#?}"
+    );
+    assert!(
+        waits
+            .iter()
+            .any(|w| w.contains("the worker to take the usage-resume@v1 act")),
+        "the resume's own window: {waits:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T16:55:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the answer named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(
+        !rows.contains("\"rule_id\":\"wall-wait-end@v1\""),
+        "the wall is open in the ledger: {rows}"
+    );
+}
+
+/// The measured cancel ([`auto_continue_cancelled`]) as a PERSON'S turn
+/// left it: their `carry on with the task` met a five-hour limit at once and
+/// their Esc on the vendor's countdown came before the loop's next read — the
+/// cancel under the notice (naming `clock`) under the person's prompt, no
+/// wall, and no act of the loop's under it.
+fn person_limit_cancelled(clock: &str) -> Vec<String> {
+    auto_continue_cancelled()
+        .into_iter()
+        .map(|r| r.replace("3:50pm", clock))
+        .collect()
+}
+
+/// The journal's waits, the `CONTINUED` lines and the ledger's rows of one
+/// hostless `watch` over `screens` (the policy's clocks short: a second's
+/// take window, a tenth of a second's back-off, a second's grace), the first
+/// `held` screens sitting until a turn is sent.
+fn left_run(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    held: Option<usize>,
+) -> (Vec<String>, Vec<String>, Vec<String>, String, Mock) {
+    let (dir, journal) = journal_file(&format!("te-{tag}"));
+    let (ldir, ledger) = ledger_at(tag);
+    let mut m = Mock::new(true, screens);
+    m.turn_releases = held;
+    m.vanish_after = Some(60);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&ldir);
+    let waits = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.clone())
+        .collect();
+    let typed = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .cloned()
+        .collect();
+    (lines, waits, typed, rows, m)
+}
+
+/// A PERSON'S TURN THE LIMIT ANSWERS AT ONCE, CANCELLED BEFORE ANY READ, IS
+/// WAITED ON TO ITS RESET (round 17's residual (a), what was left of it): the
+/// loop backs off at the first point it sees (an idle worker it attached to);
+/// a person's `carry on with the task` meets a five-hour limit at once, and
+/// their Esc on the vendor's countdown comes before the loop's next read — so
+/// that read shows only the cancel under the notice under the person's
+/// prompt: no wall, and no act of the loop's for it to answer. With no
+/// transcript to date the notice, the screen alone says it is NEW since the
+/// loop last looked (that look drew no cancelled limit), and the loop fails
+/// closed: the limit is tracked from that reading as its episode, its reset
+/// placed (10:38, an hour and 43 minutes past the test's 08:55), the ledger
+/// keeps the wall open, and nothing is typed before the reset. Measured
+/// before: no wall was read, and the continue policy's back-off typed `keep
+/// going` into the standing limit.
+#[test]
+fn a_persons_turn_the_limit_answers_cancelled_before_any_read_is_waited_on_to_its_reset() {
+    let (lines, waits, typed, rows, m) = left_run(
+        "personcancel",
+        vec![
+            ended("Fixed the parser; the suite is green."),
+            person_limit_cancelled("10:38am"),
+        ],
+        None,
+    );
+    assert!(
+        typed.is_empty(),
+        "nothing typed into the limit: {lines:#?}\n{waits:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l.starts_with("EVENT limited ")
+            && l.contains("Usage limit reached")
+            && l.ends_with(" reset=10:38am")),
+        "{lines:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T17:38:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the notice named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(
+        rows.contains("\"rule_id\":\"wall-wait@v1\"")
+            && !rows.contains("\"rule_id\":\"wall-wait-end@v1\""),
+        "the wall is open in the ledger: {rows}"
+    );
+}
+
+/// ANOTHER CONVERSATION'S OLDER CANCELLED LIMIT, `/resume`d INSIDE THE OWN
+/// ACT'S WINDOW, IS NO DAY'S WAIT (round 17's residual (a), what was left of
+/// it). The loop's `keep going` is awaited, and before its first read after
+/// it a person `/resume`s a conversation whose last thing is an older
+/// five-hour limit cancelled on its countdown (`continuing automatically at
+/// 7:30am`): the screen shows only that cancel under that notice, and with no
+/// transcript nothing tells it from the act's own answer. Read as the
+/// answer, nothing dates its print, so it is placed as a wall found sitting
+/// (its done row, `done 3:46 PM`, the session rule) and never more than a
+/// session window out: its clock, an hour and 25 minutes past at the test's
+/// 08:55, is PASSED, and the continuation goes at its grace — the limit, had
+/// it stood, would answer that with a notice the loop reads as it arrives.
+/// Measured before: placed on the print of the act it was taken to answer,
+/// `7:30am` was TOMORROW's — `WAITING until=2026-09-18T14:30:01Z`, 22 hours
+/// and 35 minutes with the session free.
+#[test]
+fn an_older_cancelled_limit_resumed_inside_the_acts_window_is_no_days_wait() {
+    let (lines, waits, typed, _, _) = left_run(
+        "resumedold",
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            person_limit_cancelled("7:30am"),
+        ],
+        Some(1),
+    );
+    assert!(
+        !waits.iter().any(|w| w.starts_with("until=2026-09-18")),
+        "no wait for tomorrow's 7:30: {waits:#?}\n{lines:#?}"
+    );
+    assert!(
+        typed.len() >= 2
+            && typed[0].ends_with(" rule=continue@v1 keep going")
+            && typed[1].ends_with(" rule=usage-resume@v1 keep going"),
+        "the act, then the continuation at the passed reset's grace: {lines:#?}\n{waits:#?}"
+    );
+}
+
+/// The measured armed limit (2.1.296's capture) as a WEEKLY limit whose bare
+/// clock reset is `clock` (no session window named: the vendor prints a bare
+/// clock for a reset within a day ahead), its countdown armed, drawn under
+/// the loop's own `keep going` — the stub's 429 answered the line at once,
+/// so the done row above it (`done 3:11 PM`) is an older turn's.
+fn weekly_met_by_own_act(clock: &str) -> Vec<String> {
+    auto_continue_wall_at(clock)
+        .into_iter()
+        .map(|r| {
+            r.replace("❯ carry on with the task", "❯ keep going")
+                .replace("session limit", "weekly limit")
+        })
+        .collect()
+}
+
+/// [`weekly_met_by_own_act`] after Esc on the vendor's countdown: the
+/// measured cancel, an idle screen with no wall, the newest notice naming
+/// `clock`.
+fn weekly_met_by_own_act_cancelled(clock: &str) -> Vec<String> {
+    auto_continue_cancelled()
+        .into_iter()
+        .map(|r| {
+            r.replace("3:50pm", clock)
+                .replace("3:35pm", clock)
+                .replace("❯ carry on with the task", "❯ keep going")
+                .replace("session limit", "weekly limit")
+        })
+        .collect()
+}
+
+/// A WALL READ INSIDE THE LOOP'S OWN ACT'S TAKE WINDOW ANSWERED THAT ACT, AND
+/// IS PLACED ON ITS PRINT (round 16's review, residual (b)): the loop's `keep
+/// going` met a weekly limit, `resets 6am` read at 08:55 under an older
+/// turn's `done 3:11 PM` — no turn ran for the line, so nothing on the screen
+/// dates the notice — and Esc on the countdown took it off the screen inside
+/// the act's window. The limit stands NOW (it answered the act), so `6am` is
+/// tomorrow's: waited on to 06:00 and its grace (13:00Z), nothing typed.
+/// Measured before: the window's reading placed the clock on the old done
+/// row (today's 06:00, three hours PASSED, the rule a wall found sitting
+/// gets), and the window's end typed `usage-resume@v1 keep going` into the
+/// standing limit at once. The same read past the window was always placed
+/// so ([`a_weekly_wall_that_answers_the_loops_own_continuation_is_waited_out_to_its_reset`]).
+#[test]
+fn a_wall_read_inside_the_own_acts_window_is_placed_on_its_print() {
+    let (dir, journal) = journal_file("te-takewin-placed");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            weekly_met_by_own_act("6am"),
+            weekly_met_by_own_act_cancelled("6am"),
+        ],
+    );
+    m.turn_gates = vec![1];
+    m.vanish_after = Some(60);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&dir);
+    let waits: Vec<&str> = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.as_str())
+        .collect();
+    let typed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        typed,
+        ["CONTINUED seq=102 rule=continue@v1 keep going"],
+        "the act the limit answered, and nothing typed into it: {lines:#?}\n{waits:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-18T13:00:0") && w.ends_with(" resets")),
+        "tomorrow's 06:00 and its grace: {waits:#?}\n{lines:#?}"
+    );
+}
+
+/// [`login_expired`] with a person's local command said under its row
+/// (`/model`, kept): the row is no longer the last thing said, and the
+/// screen reads idle with no wall — the login not back.
+fn login_left() -> Vec<String> {
+    let mut r = login_expired();
+    let at = r
+        .iter()
+        .position(|row| row.starts_with("⏺ Login expired"))
+        .expect("the wall row");
+    r.splice(
+        at + 1..at + 1,
+        rows(&["", "❯ /model", "  ⎿  Kept model as Opus 4.7"]),
+    );
+    r
+}
+
+/// A LOST LOGIN THAT ANSWERED THE LOOP'S OWN ACT AND LEFT THE SCREEN INSIDE
+/// THE ACT'S TAKE WINDOW IS TOLD (round 16's review, 2026-10-14): the loop's
+/// `keep going` was answered at once by `⏺ Login expired · Please run
+/// /login`, and a person's `/model` under it took the row off the screen
+/// before the window's end. No point decided the wall, so the point after
+/// the window does, as the wall it left: `/login` typed once under
+/// `auth-login@v1`, the owner told as it is typed — with the wall's words,
+/// the screen no longer showing them — and nothing more. Measured before:
+/// the track the window's reading opened held the point as a login already
+/// told of, and the loop sat silent with the login lost.
+#[test]
+fn a_lost_login_left_inside_the_own_acts_window_types_login_and_tells_the_owner() {
+    let (dir, journal) = journal_file("te-takewin-login");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            login_expired(),
+            login_left(),
+        ],
+    );
+    m.turn_gates = vec![1];
+    m.vanish_after = Some(40);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&dir);
+    let decided: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("TYPED") || l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        decided.len(),
+        2,
+        "the continuation, then `/login` once: {lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert_eq!(decided[0], "CONTINUED seq=102 rule=continue@v1 keep going");
+    assert!(
+        decided[1].starts_with("TYPED seq=") && decided[1].ends_with("rule=auth-login@v1 /login"),
+        "{lines:#?}"
+    );
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.starts_with("meta set attention owner=supervisor")
+                && r.contains("Login expired · Please run /login")
+                && r.contains("finish sign-in in the browser")),
+        "the owner told, with the wall's words: {:#?}",
+        m.requests
+    );
+    assert!(
+        records.iter().any(|r| r.kind == "escalated"),
+        "{records:#?}"
+    );
+}
+
 /// A weekly wall that says `resets 4pm`
 /// and is met again by a continuation is placed afresh on each reprint's own
 /// print. Tried at 16:02 and 16:12, the reprint at 16:13 is placed on 16:07 —
@@ -6231,6 +7523,7 @@ fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
             aterm_phase::WallKind::UsageWeekly,
             false,
             true,
+            false,
             false,
             &frame(clock),
         );
@@ -6308,6 +7601,7 @@ fn a_codex_walls_words_keep_their_first_placement() {
                     aterm_phase::WallKind::UsageWeekly,
                     false,
                     true,
+                    false,
                     false,
                     &rows_at(h, mi),
                 );
@@ -6456,6 +7750,7 @@ fn a_mac_that_slept_through_the_wait_decides_the_point_again_after_a_settle() {
         // offset: the call's own measured time is the slack, never a guess at
         // the machine's load.
         let before = Instant::now();
+        s.settle_wake(wall_now, Instant::now());
         s.woke(102, wall_now, &mut super::super::Alone);
         let took = before.elapsed();
         s.turn_end_due
@@ -6574,16 +7869,16 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
     assert!(lines.is_empty() && due.is_none(), "{lines:#?} {due:?}");
 }
 
-/// THE SLEEP BETWEEN TWO CALLS OF THE WAIT:
-/// a wait that ends on an owed look or a host wake is entered again on the SAME
-/// point, and the Mac may have slept in between — the marks of the check are
-/// the point's, not one call's, so the second call sees it, and the standing
-/// due the sleep carried past is decided again a settle later. NEGATIVE
-/// CONTROLS: the same two calls with no jump between them wake nothing, and a
-/// second call on ANOTHER seq starts its marks afresh (a sleep they miss
-/// delays nothing: the next test).
+/// THE SLEEP BETWEEN TWO CALLS OF THE WAIT, WHATEVER POINT SHOWS: a wait that
+/// ends on an owed look, a host wake or a repaint is entered again — on the
+/// same point, or on the same point at a NEW seq (Claude Code repaints at the
+/// wake) — and the Mac may have slept in between. The marks of the watch are
+/// the SESSION's ([`Session::watch_sleep`]), not one call's or one seq's, so
+/// the second call sees the sleep either way, and the standing due the sleep
+/// carried past is decided again a settle later. NEGATIVE CONTROL: the same
+/// two calls with no jump between them wake nothing.
 #[test]
-fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
+fn a_sleep_between_two_calls_of_the_wait_is_seen_by_the_second_whatever_point_shows() {
     let seen = |seq: u64| Turn {
         phase: Phase::Idle,
         screen: Screen {
@@ -6626,111 +7921,659 @@ fn a_sleep_between_two_calls_of_the_wait_on_one_point_is_seen_by_the_second() {
         assert!(second.is_ok(), "{:#?}", heard_lines(&review));
         (heard_lines(&review), s.turn_end_due.clone().map(|d| d.why))
     };
-    let (lines, why) = run(4 * 3600, 102);
-    assert!(
-        lines.iter().any(|l| l.starts_with("WAITING seq=102 until=")
-            && l.ends_with("the Mac woke: deciding again")),
-        "{lines:#?}"
-    );
-    assert_eq!(why.as_deref(), Some("the Mac woke"));
-    // NEGATIVE CONTROLS.
+    for seq in [102, 103] {
+        let (lines, why) = run(4 * 3600, seq);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("WAITING seq={seq} until="))
+                    && l.ends_with("the Mac woke: deciding again")),
+            "seq {seq}: {lines:#?}"
+        );
+        assert_eq!(why.as_deref(), Some("the Mac woke"), "seq {seq}");
+    }
+    // NEGATIVE CONTROL.
     let (lines, why) = run(0, 102);
     assert!(
         !lines.iter().any(|l| l.contains("the Mac woke")),
         "no sleep, no wake: {lines:#?}"
     );
     assert_eq!(why.as_deref(), Some("usage-weekly resets"));
-    let (lines, _) = run(4 * 3600, 103);
-    assert!(
-        !lines.iter().any(|l| l.contains("the Mac woke")),
-        "another seq starts afresh: {lines:#?}"
-    );
 }
 
-/// THE RESET A SLEEP CARRIED THE WAIT PAST, WHERE THE WAIT SAW NO SLEEP (the
-/// audit of 2026-10-09: `WAITING … usage-weekly resets` until the weekly
-/// reset, the Mac asleep 4.26 days across it, and no `CONTINUED …
-/// rule=usage-resume@v1` until a person resumed three tabs 11.6-14.1 h after
-/// it). A weekly limit decided before its reset waits for it; the Mac sleeps
-/// eleven hours past the reset — the wall clock jumps, the monotonic one
-/// stands still — and wakes on a repaint, so the loop waits again on the same
-/// point at a NEW seq, whose clock marks start afresh and see no sleep
-/// ([`Session::check_slept`]). The deadline falls at its wall time all the
-/// same ([`Session::due_at`]), at the wait's first step: the point is decided
-/// again on the reset now past, and the continuation is typed. NEGATIVE
-/// CONTROL: the same sleep with no wait standing types nothing.
+/// A DUE THE SLEEP FELL SHORT OF FALLS AT ITS WALL TIME (the audit of
+/// 2026-10-09: three tabs left 11.6-14.1 h past a weekly reset their
+/// `Instant` waits had slept through). A wait set three hours ahead; the Mac
+/// sleeps two of them — the wall clock jumps, the monotonic one stands still
+/// — and wakes on a repaint (a new seq). The watch sees the sleep, but the
+/// due is not one it carried past ([`Session::woke`] leaves it): it stands,
+/// at its WALL time ([`Session::due_at`]) — an hour from the wake, not the
+/// three its `Instant` still counts. (A due the sleep carried past waits for
+/// the wake's settle instead:
+/// [`a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_the_loop`].)
+/// NEGATIVE CONTROL: no sleep, three hours.
 #[test]
-fn a_reset_a_sleep_carried_the_wait_past_is_continued_though_the_wait_saw_no_sleep() {
-    let point = |seq: u64| Turn {
-        phase: Phase::Limited {
-            message: WEEKLY_TEXT.to_string(),
-            reset: Some(WEEKLY_RESET.to_string()),
-        },
+fn a_due_the_sleep_fell_short_of_falls_at_its_wall_time() {
+    let seen = |seq: u64| Turn {
+        phase: Phase::Idle,
         screen: Screen {
-            rows: weekly_limited(),
+            rows: ended("Stage done."),
             seq,
             ..Screen::default()
         },
         timed_out: false,
     };
-    let run = |decided: bool| {
+    let run = |slept: i64| {
+        let mut m = Mock::new(true, vec![busy_screen()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_due(
+            Instant::now() + Duration::from_secs(3 * 3600),
+            "usage-weekly resets",
+        );
+        let mut review = Heard::default();
+        let mut deadline = Instant::now() + Duration::from_millis(600);
+        let before = s.wait_for_next(seen(102), &hosted(30), &[], &mut deadline, &mut review);
+        assert!(before.is_ok(), "{:#?}", heard_lines(&review));
+        s.set_clock(TEST_NOW + slept, PDT);
+        let mut deadline = Instant::now() + Duration::from_millis(600);
+        let after = s.wait_for_next(seen(103), &hosted(30), &[], &mut deadline, &mut review);
+        assert!(after.is_ok(), "{:#?}", heard_lines(&review));
+        let left = s
+            .due_at()
+            .map(|t| t.saturating_duration_since(Instant::now()));
+        (s.turn_end_due.clone().map(|d| d.why), left)
+    };
+    let (why, left) = run(2 * 3600);
+    assert_eq!(why.as_deref(), Some("usage-weekly resets"));
+    let left = left.expect("a due");
+    assert!(
+        left > Duration::from_secs(3600 - 60) && left <= Duration::from_secs(3600),
+        "an hour from the wake: {left:?}"
+    );
+    // NEGATIVE CONTROL.
+    let (why, left) = run(0);
+    assert_eq!(why.as_deref(), Some("usage-weekly resets"));
+    let left = left.expect("a due");
+    assert!(left > Duration::from_secs(3 * 3600 - 60), "{left:?}");
+}
+
+/// What one wait of the loop's ([`Session::wait_for_next`]) said and left: the
+/// lines heard, and the due standing after it (its reason).
+struct Waited {
+    lines: Vec<String>,
+    due: Option<String>,
+}
+
+/// One wait on `point` (a 600 ms budget), into `heard`: what it said NEW, and
+/// the due it left.
+fn wait_once(
+    s: &mut Session<'_, Mock>,
+    point: &Turn,
+    opts: &SuperviseOpts,
+    heard: &mut Heard,
+) -> Waited {
+    let (said, noted) = (heard.said.len(), heard.noted.len());
+    let mut deadline = Instant::now() + Duration::from_millis(600);
+    let end = s.wait_for_next(point.clone(), opts, &[], &mut deadline, heard);
+    assert!(end.is_ok(), "{:#?}", heard_lines(heard));
+    Waited {
+        lines: heard.said[said..]
+            .iter()
+            .chain(&heard.noted[noted..])
+            .cloned()
+            .collect(),
+        due: s.turn_end_due.as_ref().map(|d| d.why.clone()),
+    }
+}
+
+/// `rows` at `seq` as the session's own reader takes the point.
+fn point_at(s: &Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
+    s.turn_of(Screen {
+        rows,
+        seq,
+        ..Screen::default()
+    })
+}
+
+/// Whether `lines` hold a continuation under `rule`.
+fn continued(lines: &[String], rule: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| l.starts_with("CONTINUED seq=") && l.contains(&format!("rule={rule}")))
+}
+
+/// THE WAKE'S FIRST EVENT IS A REPAINT (the audit of 2026-10-09: `WAITING …
+/// usage-weekly resets`, the Mac asleep 4.26 days across the reset, and no
+/// `CONTINUED … rule=usage-resume@v1` until a person resumed three tabs
+/// 11.6-14.1 h after it; and the handoff's residual (b) of the fix that
+/// followed). A weekly limit is decided before its reset and waited for; the
+/// Mac sleeps eleven hours past the reset, and what wakes the loop is Claude
+/// Code repainting — the same point at a NEW seq. The reset the sleep carried
+/// the wait past is decided after the wake's settle (the network is coming
+/// back: a continuation typed into an API that cannot be reached is a wall of
+/// its own), not at that first wait: nothing is typed there, the due stands
+/// at the settle (`WAITING … the Mac woke`), and once the settle has passed
+/// the point is continued, once — never held by the sleep. NEGATIVE CONTROL:
+/// the same waits with no sleep type nothing and leave the reset's wait
+/// standing.
+#[test]
+fn a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_the_loop() {
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    let run = |slept: bool| {
         let mut m = Mock::new(true, vec![weekly_limited()]);
         let opts = hosted(30);
         let mut heard = Heard::default();
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
-        if decided {
-            let action = s
-                .turn_end_at_point(&point(102), Some(Duration::from_secs(180)), &opts)
-                .expect("a decision");
-            assert!(
-                matches!(action, TurnEndAction::WaitUntil { .. }),
-                "{action:?}"
-            );
-            s.turn_end_execute(&point(102), action, &opts, &[], &mut heard)
-                .expect("the wait is set");
+        let at = |s: &Session<'_, Mock>, seq| point_at(s, weekly_limited(), seq);
+        let first = at(&s, 102);
+        let action = s
+            .turn_end_at_point(&first, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        s.turn_end_execute(&first, action, &opts, &[], &mut heard)
+            .expect("the wait is set");
+        let before = wait_once(&mut s, &first, &opts, &mut heard);
+        assert!(
+            !continued(&before.lines, RULE_LIMIT_RESUME),
+            "{:#?}",
+            before.lines
+        );
+        if slept {
+            s.set_clock(AFTER_RESET + 11 * 3600, PDT);
         }
-        // The wait before the sleep: the scripted server's first answer is
-        // a moved screen.
-        let mut deadline = Instant::now() + Duration::from_millis(600);
-        let before = s.wait_for_next(point(102), &opts, &[], &mut deadline, &mut heard);
-        assert!(before.is_ok(), "{:#?}", heard_lines(&heard));
-        // Asleep across the reset, woken on a repaint: the same point, a new
-        // seq.
-        s.set_clock(AFTER_RESET + 11 * 3600, PDT);
-        let mut deadline = Instant::now() + Duration::from_millis(600);
-        let after = s.wait_for_next(point(103), &opts, &[], &mut deadline, &mut heard);
-        assert!(after.is_ok(), "{:#?}", heard_lines(&heard));
+        let repainted = at(&s, 103);
+        let woke = wait_once(&mut s, &repainted, &opts, &mut heard);
+        s.pass_wake_settle();
+        let again = at(&s, 104);
+        let settled = wait_once(&mut s, &again, &opts, &mut heard);
         drop(s);
         let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
-        (heard_lines(&heard), typed)
+        (woke, settled, typed)
     };
-    let (lines, typed) = run(true);
+    let (woke, settled, typed) = run(true);
     assert!(
-        lines
+        !continued(&woke.lines, RULE_LIMIT_RESUME),
+        "nothing is typed at the wake's first wait: {:#?}",
+        woke.lines
+    );
+    assert!(
+        woke.lines
             .iter()
-            .any(|l| l.starts_with("WAITING seq=102 until=") && l.ends_with("usage-weekly resets")),
-        "the reset was waited for: {lines:#?}"
+            .any(|l| l.starts_with("WAITING seq=103 until=")
+                && l.ends_with("the Mac woke: deciding again")),
+        "{:#?}",
+        woke.lines
     );
+    assert_eq!(woke.due.as_deref(), Some("the Mac woke"));
     assert!(
-        !lines.iter().any(|l| l.contains("the Mac woke")),
-        "the wait saw no sleep: {lines:#?}"
+        continued(&settled.lines, RULE_LIMIT_RESUME),
+        "continued once the settle has passed: {:#?}",
+        settled.lines
     );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("CONTINUED seq=") && l.contains("rule=usage-resume@v1")),
-        "the reset passed in the sleep is continued at once: {lines:#?}"
-    );
-    assert!(typed > 0, "{lines:#?}");
+    assert_eq!(typed, 1);
     // NEGATIVE CONTROL.
-    let (lines, typed) = run(false);
+    let (woke, settled, typed) = run(false);
+    let lines: Vec<&String> = woke.lines.iter().chain(&settled.lines).collect();
     assert!(
-        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        !lines
+            .iter()
+            .any(|l| l.contains("the Mac woke") || l.starts_with("CONTINUED")),
         "{lines:#?}"
     );
-    assert_eq!(typed, 0, "{lines:#?}");
+    assert_eq!(settled.due.as_deref(), Some("usage-weekly resets"));
+    assert_eq!(typed, 0);
+}
+
+/// THE POLICY'S OWN BACK-OFF ACROSS A SLEEP (the handoff's residual (a) of
+/// 2026-10-09). A 529 is waited out on a rung of an hour; the Mac sleeps
+/// eight hours ten minutes into it and wakes on the same point (its seq
+/// unchanged, so the wake is seen and its settle placed). Once the settle has
+/// passed, the rung — counted on the wall clock, as every pause of the
+/// policy's is — is long over: the retry is typed (`api-retry@v1`), not
+/// another fifty minutes waited (the rung counted on `Instant`, which a sleep
+/// stops). NEGATIVE CONTROL: no sleep, the rung still stands and nothing is
+/// typed.
+#[test]
+fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
+    use crate::supervise::policy::turn_end::RULE_API_RETRY;
+    let end_529 = || aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_529);
+    let run = |slept: bool| {
+        let mut m = Mock::new(true, vec![end_529()]);
+        let opts = hosted(30);
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_turn_end_timing(TurnEndTiming {
+            retry_backoff: vec![Duration::from_secs(3600)],
+            ..TurnEndTiming::default()
+        });
+        let point = point_at(&s, end_529(), 102);
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        assert!(
+            matches!(&action, TurnEndAction::WaitUntil { why, .. } if why == "overloaded retry 1"),
+            "{action:?}"
+        );
+        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
+            .expect("the wait is set");
+        let _ = wait_once(&mut s, &point, &opts, &mut heard);
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        let woke = wait_once(&mut s, &point, &opts, &mut heard);
+        s.pass_wake_settle();
+        let settled = wait_once(&mut s, &point, &opts, &mut heard);
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (woke, settled, typed)
+    };
+    let (woke, settled, typed) = run(true);
+    assert_eq!(
+        woke.due.as_deref(),
+        Some("the Mac woke"),
+        "{:#?}",
+        woke.lines
+    );
+    assert!(
+        continued(&settled.lines, RULE_API_RETRY),
+        "the rung slept through is over: {:#?}",
+        settled.lines
+    );
+    assert_eq!(typed, 1, "{:#?}", settled.lines);
+    // NEGATIVE CONTROL.
+    let (_, settled, typed) = run(false);
+    assert_eq!(settled.due.as_deref(), Some("overloaded retry 1"));
+    assert_eq!(typed, 0, "{:#?}", settled.lines);
+}
+
+/// A RESET THE POLICY HOLDS AS AN `Instant` ACROSS A SLEEP (residual (a)'s
+/// other half). A five-hour limit's notice names its reset three hours out,
+/// and Esc on the vendor's countdown leaves `Automatic continue cancelled`,
+/// no wall: the policy waits for the reset the notice NAMED, kept from the
+/// last reading that showed it. The Mac sleeps eight hours, past it, and
+/// wakes on the same point. Once the settle has passed, the reset is behind
+/// the wall clock and the limit is continued (`usage-resume@v1`) — not
+/// waited for the three hours the kept `Instant` still counts. NEGATIVE
+/// CONTROL: no sleep, the named reset still stands.
+#[test]
+fn a_reset_whose_notice_left_is_not_held_late_by_a_sleep() {
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    let run = |slept: bool| {
+        let mut m = Mock::new(true, vec![auto_continue_cancelled()]);
+        let opts = hosted(30);
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.set_turn_end_timing(quick_turn_end(&[Duration::from_secs(600)]));
+        let armed = point_at(&s, auto_continue_wall_in("3h"), 101);
+        let action = s
+            .turn_end_at_point(&armed, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        s.turn_end_execute(&armed, action, &opts, &[], &mut heard)
+            .expect("the wall's wait");
+        let left = point_at(&s, auto_continue_cancelled(), 102);
+        let action = s.turn_end_at_point(&left, None, &opts).expect("a decision");
+        assert!(
+            matches!(&action, TurnEndAction::WaitUntil { why, .. } if why == "usage-session resets"),
+            "{action:?}"
+        );
+        s.turn_end_execute(&left, action, &opts, &[], &mut heard)
+            .expect("the reset's wait");
+        let _ = wait_once(&mut s, &left, &opts, &mut heard);
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        let woke = wait_once(&mut s, &left, &opts, &mut heard);
+        s.pass_wake_settle();
+        let settled = wait_once(&mut s, &left, &opts, &mut heard);
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (woke, settled, typed)
+    };
+    let (woke, settled, typed) = run(true);
+    assert_eq!(
+        woke.due.as_deref(),
+        Some("the Mac woke"),
+        "{:#?}",
+        woke.lines
+    );
+    assert!(
+        continued(&settled.lines, RULE_LIMIT_RESUME),
+        "the named reset is behind the wall clock: {:#?}",
+        settled.lines
+    );
+    assert_eq!(typed, 1, "{:#?}", settled.lines);
+    // NEGATIVE CONTROL.
+    let (_, settled, typed) = run(false);
+    assert_eq!(settled.due.as_deref(), Some("usage-session resets"));
+    assert_eq!(typed, 0, "{:#?}", settled.lines);
+}
+
+/// ANOTHER EVENT REACHES THE LOOP FIRST (residual (b): "whatever event
+/// reaches the loop first"). At a network wall waited on a rung of an hour,
+/// the Mac sleeps eight hours; at the wake the host's measure of the API
+/// turns `Up` — an edge that decides the point at once, ahead of the due.
+/// The wake is seen (the same seq) and the due placed at the settle, and the
+/// edge still decides inside it: the try is typed before the network has
+/// settled. It must wait for the settle like the due it overtook, and go
+/// once the settle has passed (`api-back@v1`). NEGATIVE CONTROL: the same
+/// edge with no sleep is acted on at once, as ever.
+#[test]
+fn an_edge_at_the_wake_types_nothing_before_the_settle() {
+    use crate::supervise::policy::turn_end::RULE_API_BACK;
+    let run = |slept: bool| {
+        let host = ReachHost::scripted(&[Reach::Unknown]);
+        let mut m = Mock::new(true, vec![enotfound()]);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.set_turn_end_timing(far_rungs());
+        let point = point_at(&s, enotfound(), 102);
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        assert!(
+            matches!(&action, TurnEndAction::WaitUntil { .. }),
+            "{action:?}"
+        );
+        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
+            .expect("the rung's wait");
+        let _ = wait_once(&mut s, &point, &opts, &mut heard);
+        host.script.lock().unwrap().push_back(Reach::Up {
+            since: Instant::now(),
+        });
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        let woke = wait_once(&mut s, &point, &opts, &mut heard);
+        s.pass_wake_settle();
+        let settled = wait_once(&mut s, &point, &opts, &mut heard);
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (woke, settled, typed)
+    };
+    let (woke, settled, typed) = run(true);
+    assert!(
+        !continued(&woke.lines, RULE_API_BACK),
+        "the edge types nothing inside the settle: {:#?}",
+        woke.lines
+    );
+    assert_eq!(
+        woke.due.as_deref(),
+        Some("the Mac woke"),
+        "{:#?}",
+        woke.lines
+    );
+    assert!(
+        continued(&settled.lines, RULE_API_BACK),
+        "the try goes once the settle has passed: {:#?}",
+        settled.lines
+    );
+    assert_eq!(typed, 1);
+    // NEGATIVE CONTROL.
+    let (woke, _, typed) = run(false);
+    assert!(continued(&woke.lines, RULE_API_BACK), "{:#?}", woke.lines);
+    assert_eq!(typed, 1);
+}
+
+/// A host that asks for a point once told to (`wanting`) and takes it with a
+/// step that TYPES into the agent — the live upgrade's carry-on — counted; it
+/// keeps the words of the guards the loop said withheld a point
+/// ([`IdleHost::withheld`]).
+#[derive(Debug, Default)]
+struct WakeHost {
+    wanting: AtomicBool,
+    steps: std::sync::atomic::AtomicUsize,
+    withheld: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl IdleHost for WakeHost {
+    fn wants(&self) -> bool {
+        self.wanting.load(Ordering::SeqCst)
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        self.steps.fetch_add(1, Ordering::SeqCst);
+        self.wanting.store(false, Ordering::SeqCst);
+        Some(HostStep {
+            line: "upgrade step=carry-on".to_string(),
+            moved: true,
+            typed: true,
+            repeat: false,
+        })
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn withheld(&self, guard: crate::supervise::Guard) {
+        self.withheld.lock().unwrap().push(guard.word());
+    }
+}
+
+/// THE HOST'S STEP AT THE WAKE (the review of 2026-10-14, its probe D). The
+/// wake's settle holds more than the turn-end policy's acts: the host's step
+/// at an idle point — the live upgrade's notice or carry-on, a relaunched
+/// agent's continuation — TYPES a turn into the agent too, into an API the
+/// network may not reach yet. An idle point is waited on; the Mac sleeps
+/// eight hours; at the wake the host asks for the point. Inside the settle
+/// the point is withheld from it, and it is told why (`guard=wake-settle`);
+/// once the settle has passed, its step goes. NEGATIVE CONTROL: the same ask
+/// with no sleep is stepped at once.
+#[test]
+fn the_hosts_step_at_the_wake_waits_for_the_settle() {
+    let run = |slept: bool| {
+        let host = Arc::new(WakeHost::default());
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = wait_once(&mut s, &point, &opts, &mut heard);
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        host.wanting.store(true, Ordering::SeqCst);
+        let woke = wait_once(&mut s, &point, &opts, &mut heard);
+        let at_wake = host.steps.load(Ordering::SeqCst);
+        s.pass_wake_settle();
+        let _ = wait_once(&mut s, &point, &opts, &mut heard);
+        let after = host.steps.load(Ordering::SeqCst);
+        let withheld = host.withheld.lock().unwrap().clone();
+        (woke.lines, at_wake, after, withheld)
+    };
+    let (lines, at_wake, after, withheld) = run(true);
+    assert_eq!(at_wake, 0, "no step inside the settle: {lines:#?}");
+    assert!(
+        !lines.iter().any(|l| l.starts_with("HOST seq=")),
+        "{lines:#?}"
+    );
+    assert_eq!(withheld, ["wake-settle"], "{lines:#?}");
+    assert_eq!(after, 1, "the step goes once the settle has passed");
+    // NEGATIVE CONTROL.
+    let (lines, at_wake, _, withheld) = run(false);
+    assert_eq!(at_wake, 1, "{lines:#?}");
+    assert!(withheld.is_empty(), "{withheld:?}");
+}
+
+/// A WAIT INSIDE THE WAKE'S SETTLE STEPS TO ITS FALL: what the settle
+/// withholds (the host's point) is offered at the top of the step that
+/// follows, not a whole step later ([`Session::wait_for_next`]'s step cap, as
+/// for [`IdleHost::wants_at`]). The settle falls 300 ms ahead under a
+/// five-second budget: the wait's first request asks no longer than that.
+/// NEGATIVE CONTROL: with no settle the step is the budget's.
+#[test]
+fn a_wait_inside_the_wakes_settle_steps_to_its_fall() {
+    use super::super::turn_end_loop::WAKE_SETTLE;
+    let run = |settling: bool| {
+        let host = Arc::new(WakeHost::default());
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.cursor_on_caret = true;
+        // The wait's first request is its last: what it asked is the test.
+        m.vanish_after = Some(0);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, None);
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        if settling {
+            // No session id, no share: the settle alone, placed so it falls
+            // 300 ms from now.
+            let woke = Instant::now() + Duration::from_millis(300) - WAKE_SETTLE;
+            s.settle_wake(TEST_NOW, woke);
+        }
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        let _ = s.wait_for_next(point, &opts, &[], &mut deadline, &mut Heard::default());
+        drop(s);
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("await "))
+            .find_map(|r| {
+                let mut words = r.split(' ');
+                words.find(|w| *w == "timeout")?;
+                words.next()?.parse::<u64>().ok()
+            })
+            .expect("the wait's request")
+    };
+    let asked = run(true);
+    assert!(asked <= 300, "stepped to the settle's fall: {asked} ms");
+    // NEGATIVE CONTROL.
+    let asked = run(false);
+    assert!(asked > 300, "the budget's step: {asked} ms");
+}
+
+/// THE HOST'S BACKGROUND STEP AT THE WAKE, and the sleep seen by a REQUEST
+/// (the review of 2026-10-14). A break in the agent's own background work is
+/// offered to the host on a busy read ([`Session::host_steps_in_background`]):
+/// the upgrade's notice typed there is a turn into the API like any other.
+/// The Mac sleeps between two busy reads; only the read itself — a request
+/// ([`Session::call`]) — can see the sleep, since no wait or decision runs
+/// on a busy turn. Inside the settle the break is withheld
+/// (`guard=wake-settle`); once it has passed, offered. NEGATIVE CONTROL: the
+/// same reads with no sleep offer the break at once.
+#[test]
+fn the_hosts_background_step_at_the_wake_waits_for_the_settle() {
+    let bg = || {
+        let mut r = rows(&[
+            "⏺ Waiting for the build.",
+            "",
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+        r
+    };
+    let run = |slept: bool| {
+        let host = Arc::new(BackgroundHost::default());
+        let mut m = Mock::new(true, vec![bg()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.background_settle = Duration::ZERO;
+        let _ = s.screen().expect("the busy read before the night");
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        let screen = s.screen().expect("the busy read at the wake");
+        let mut since = Some(Instant::now());
+        s.host_steps_in_background(&screen, &mut since, &mut Alone);
+        let at_wake = host.backgrounds.load(Ordering::SeqCst);
+        s.pass_wake_settle();
+        s.host_steps_in_background(&screen, &mut since, &mut Alone);
+        let after = host.backgrounds.load(Ordering::SeqCst);
+        let withheld: Vec<&str> = host
+            .withheld
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|g| g.word())
+            .collect();
+        (at_wake, after, withheld)
+    };
+    let (at_wake, after, withheld) = run(true);
+    assert_eq!(at_wake, 0, "no notice inside the settle");
+    assert_eq!(withheld, ["wake-settle"]);
+    assert!(after >= 1, "offered once the settle has passed");
+    // NEGATIVE CONTROL.
+    let (at_wake, _, withheld) = run(false);
+    assert_eq!(at_wake, 1);
+    assert!(withheld.is_empty(), "{withheld:?}");
+}
+
+/// THE SETTLE COUNTS FROM THE WAKE, NOT FROM THE FIRST ACT AFTER IT (the
+/// review of 2026-10-14, its probes A and B). The Mac sleeps through a
+/// request of a busy turn — the request sees the sleep — and the turn ends
+/// at a new point that the policy continues. Decided inside the settle, the
+/// act is held at it (`WAITING … the Mac woke`) and nothing is typed: the
+/// path of a sleep a request measured, through the act's own gate. Decided
+/// after a busy turn that OUTLASTED the settle, it is typed at once and the
+/// wake says nothing: the settle was placed when the sleep was measured, and
+/// it has passed. NEGATIVE CONTROL: no sleep, typed at once.
+#[test]
+fn a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle() {
+    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    // `slept`: whether the Mac slept; `outlasted`: whether the busy turn ran
+    // on past the settle before its point.
+    let run = |slept: bool, outlasted: bool| {
+        let mut m = Mock::new(true, vec![ended("Stage done.")]);
+        let opts = hosted(30);
+        let mut heard = Heard::default();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let _ = s.call(&["status"]).expect("a read before the night");
+        if slept {
+            s.set_clock(TEST_NOW + 8 * 3600, PDT);
+        }
+        let _ = s.call(&["status"]).expect("a read of the busy turn");
+        if outlasted {
+            s.pass_wake_settle();
+        }
+        let point = point_at(&s, ended("Stage done."), 102);
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
+            .expect("carried out");
+        let due = s.turn_end_due.as_ref().map(|d| d.why.clone());
+        drop(s);
+        let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send");
+        (heard_lines(&heard), due, typed)
+    };
+    let (lines, due, typed) = run(true, false);
+    assert_eq!(typed, 0, "held inside the settle: {lines:#?}");
+    assert_eq!(due.as_deref(), Some("the Mac woke"), "{lines:#?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("WAITING seq=102 until=")
+            && l.ends_with("the Mac woke: deciding again")),
+        "{lines:#?}"
+    );
+    let (lines, _, typed) = run(true, true);
+    assert!(continued(&lines, RULE_CONTINUE), "{lines:#?}");
+    assert_eq!(typed, 1, "{lines:#?}");
+    assert!(
+        !lines.iter().any(|l| l.contains("the Mac woke")),
+        "a settle long passed says nothing: {lines:#?}"
+    );
+    // NEGATIVE CONTROL.
+    let (lines, _, typed) = run(false, false);
+    assert!(continued(&lines, RULE_CONTINUE), "{lines:#?}");
+    assert_eq!(typed, 1, "{lines:#?}");
 }
 
 /// A screen as the loop reads one.
@@ -6829,14 +8672,14 @@ fn a_reset_cached_as_unix_follows_the_wall_clock() {
     let rows = memory_wall_in("2h");
     let began = Instant::now();
     let first = s
-        .wall_reset_at(Some("in 2h"), kind, false, false, false, &rows)
+        .wall_reset_at(Some("in 2h"), kind, false, false, false, false, &rows)
         .expect("a reset");
     let placed = s.wall_reset.clone().expect("cached");
     assert_eq!(placed.1, Some(TEST_NOW + 2 * 3600), "{placed:?}");
     // The Mac slept 4 hours: the wall clock is ahead, the monotonic clock not.
     s.set_clock(TEST_NOW + 4 * 3600, PDT);
     let second = s
-        .wall_reset_at(Some("in 2h"), kind, false, false, false, &rows)
+        .wall_reset_at(Some("in 2h"), kind, false, false, false, false, &rows)
         .expect("a reset");
     let took = began.elapsed();
     assert_eq!(
@@ -6853,6 +8696,63 @@ fn a_reset_cached_as_unix_follows_the_wall_clock() {
         gap <= Duration::from_secs(4 * 3600) && gap >= Duration::from_secs(4 * 3600) - took,
         "the reset now lies 2 hours BEHIND (it was 2 ahead): {gap:?} (the calls took {took:?})"
     );
+}
+
+/// A LIMIT A CANCEL LEFT THAT ONLY THE SCREEN READ IS NEVER A DAY'S WAIT
+/// (round 17's residual (a)): with no transcript row to date its notice — a
+/// conversation `/resume`d inside the act's window ends on its own older
+/// cancelled limit, which draws the same — its bare clock is placed as an
+/// answer's is (on the act's print, here: an act untaken) and then kept
+/// within a session window: at the test's 08:55, `7:30am` (TOMORROW's on the
+/// print) and `11:50pm` (fourteen hours ahead) are the day before's, PASSED;
+/// `10:38am` (an hour and 43 minutes ahead) stands; a dated reset (`Oct 18 at
+/// 7:30am`) and a span are what they name. NEGATIVE CONTROL: the same clocks
+/// dated by a transcript row (`undated` false) — `7:30am` is tomorrow's, as
+/// the print says.
+#[test]
+fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
+    let mut m = Mock::new(true, vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    s.set_zone_lookup(test_zones);
+    let kind = aterm_phase::WallKind::UsageSession;
+    let rows = auto_continue_cancelled();
+    let mut placed = |text: &str, undated: bool| -> i64 {
+        s.set_clock(TEST_NOW, PDT);
+        s.wall_reset = None;
+        let _ = s.wall_reset_at(Some(text), kind, false, false, true, undated, &rows);
+        s.wall_reset
+            .as_ref()
+            .and_then(|(_, u)| *u)
+            .expect("a placement")
+            - TEST_NOW
+    };
+    let min = 60;
+    let hour = 3600;
+    // 08:55 PDT is 15:55Z.
+    assert_eq!(placed("7:30am", true), -(hour + 25 * min), "passed");
+    assert_eq!(
+        placed("11:50pm", true),
+        -(9 * hour + 5 * min),
+        "yesterday's, passed"
+    );
+    assert_eq!(
+        placed("10:38am", true),
+        hour + 43 * min,
+        "within the window"
+    );
+    assert_eq!(
+        placed("Oct 18 at 7:30am", true),
+        30 * 86_400 + 22 * hour + 35 * min,
+        "a dated reset"
+    );
+    assert_eq!(placed("in 7h", true), 7 * hour, "a span");
+    // NEGATIVE CONTROL: dated by a transcript row.
+    assert_eq!(
+        placed("7:30am", false),
+        22 * hour + 35 * min,
+        "tomorrow's on the print"
+    );
+    assert_eq!(placed("11:50pm", false), 14 * hour + 55 * min);
 }
 
 /// ONE PLACEMENT IS ONE STAMP, whatever part of a second each read fell in.
@@ -6874,7 +8774,7 @@ fn one_placed_reset_stamps_as_its_own_second_across_a_turning_second() {
     let kind = aterm_phase::WallKind::UsageWeekly;
     let rows = memory_wall_in("2h");
     let first = s
-        .wall_reset_at(Some("in 2h"), kind, false, false, false, &rows)
+        .wall_reset_at(Some("in 2h"), kind, false, false, false, false, &rows)
         .expect("a reset");
     let placed = s
         .wall_reset
@@ -6884,7 +8784,7 @@ fn one_placed_reset_stamps_as_its_own_second_across_a_turning_second() {
     // The clock passes its second's turn (100 ms away).
     std::thread::sleep(Duration::from_millis(150));
     let second = s
-        .wall_reset_at(Some("in 2h"), kind, false, false, false, &rows)
+        .wall_reset_at(Some("in 2h"), kind, false, false, false, false, &rows)
         .expect("a reset");
     assert_eq!(
         s.wall_reset.as_ref().and_then(|(_, unix)| *unix),
@@ -7093,12 +8993,16 @@ fn the_wall_waited_on_is_written_to_the_ledger_and_its_end_too() {
     assert!(rows.is_empty() && open.is_none(), "{rows}");
 }
 
-/// AN IDLE SCREEN OR A QUESTION ENDS THE MEMORY. The screen that shows no wall
-/// and no work is the policy's own (it continues a screen that left a limit, or
-/// asks for a person); the memory must not outlive it, or a LATER screen that
-/// shows only background work would be read as the old wall and answered with a
-/// spurious `keep going`. NEGATIVE CONTROL: without the idle screen between,
-/// the same scrolled screen IS read as the wall.
+/// AN IDLE SCREEN OR A QUESTION ENDS THE MEMORY once the policy has folded it
+/// in ([`Session::observe_point`]) and waits on the wall no more: the worker
+/// worked since, so the limit is over, and the point is the policy's own (it
+/// continues, or asks for a person). The memory must not outlive it, or a
+/// LATER screen that shows only background work would be read as the old wall
+/// and answered with a spurious `keep going`. NEGATIVE CONTROLS: without the
+/// idle screen between, the same scrolled screen IS read as the wall; and an
+/// idle screen with no work since (Esc on the vendor's countdown, a person's
+/// `/usage`) leaves the policy waiting on the reset the notice named, and the
+/// memory with it — the wall it would end is standing still.
 #[test]
 fn an_idle_screen_or_a_question_ends_the_wall_memory() {
     let mut m = Mock::new(true, vec![busy_screen()]);
@@ -7118,8 +9022,14 @@ fn an_idle_screen_or_a_question_ends_the_wall_memory() {
         idle.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         read_screen(idle)
     };
+    // A point as the loop folds it: read, then into the policy and the memory.
+    let fold = |s: &mut Session<'_, Mock>, screen: &Screen, worked: Option<Duration>| {
+        let r = s.turn_end_reading(screen, worked, &opts);
+        s.observe_point(&r, Instant::now(), screen.seq);
+        r
+    };
     // CONTROL: the wall, then only its background work: read as the wall.
-    let _ = s.turn_end_reading(&wall, None, &opts);
+    let _ = fold(&mut s, &wall, None);
     assert!(s.wall_memory.is_some());
     let r = s.turn_end_reading(&scrolled, None, &opts);
     assert!(
@@ -7127,9 +9037,9 @@ fn an_idle_screen_or_a_question_ends_the_wall_memory() {
         "the scrolled screen is the remembered wall"
     );
     for said in ["All done.", "Should I rename the module?"] {
-        let _ = s.turn_end_reading(&wall, None, &opts);
+        let _ = fold(&mut s, &wall, None);
         assert!(s.wall_memory.is_some(), "{said}");
-        let _ = s.turn_end_reading(&quiet(said), None, &opts);
+        let _ = fold(&mut s, &quiet(said), Some(Duration::from_secs(182)));
         assert!(s.wall_memory.is_none(), "{said:?} ends the memory");
         let r = s.turn_end_reading(&scrolled, None, &opts);
         assert!(
@@ -7137,6 +9047,13 @@ fn an_idle_screen_or_a_question_ends_the_wall_memory() {
             "{said:?}: a stale memory would be read here"
         );
     }
+    // CONTROL: no work since the wall — the policy waits on its reset still.
+    let _ = fold(&mut s, &wall, None);
+    let _ = fold(&mut s, &quiet("All done."), None);
+    assert!(s.turn_end.waits_on_named_reset());
+    assert!(s.wall_memory.is_some(), "the wall stands: its memory too");
+    let r = s.turn_end_reading(&scrolled, None, &opts);
+    assert!(r.wall.is_some(), "the scrolled screen is the wall still");
 }
 
 /// TIER-1 FOR THE HIDING HALF OF `SupervisorUsageWall`
@@ -7162,9 +9079,18 @@ fn tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     type State = BTreeMap<&'static str, i64>;
     // The clock's range is shrunk (the memory does not read it); the dial is on.
+    // A notice that leaves an idle screen is the decider's to wait out, and
+    // bound in `tests/supervise_conformance_usage_wall.rs`: its dial is off;
+    // so is the own act's take window (`OwnAct`), the decider's too.
     let hidden_model = aterm_spec::interp::with_consts(
         &supervisor_usage_wall_model(),
-        &[("Hidden", 1), ("Cap", 5), ("Skew", 3)],
+        &[
+            ("Hidden", 1),
+            ("Leaves", 0),
+            ("OwnAct", 0),
+            ("Cap", 5),
+            ("Skew", 3),
+        ],
     );
     let idle = || {
         let mut idle = rows(&["⏺ All done.", "", "✻ Worked for 3m 2s · done 8:00 PM", ""]);
@@ -7179,29 +9105,22 @@ fn tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does() {
         s.set_clock(TEST_NOW, PDT);
         s.set_zone_lookup(test_zones);
         let opts = hosted(30);
+        // A point as the loop folds it: read, then into the policy and the
+        // memory ([`Session::observe_point`]).
+        let mut fold = |rows: Vec<String>, worked: Option<Duration>| {
+            let screen = read_screen(rows);
+            let r = s.turn_end_reading(&screen, worked, &opts);
+            s.observe_point(&r, Instant::now(), screen.seq);
+        };
         for action in path {
             match *action {
                 "WallAppears" | "WallAppearsLate" | "WallShows" | "Met" => {
-                    let _ = s.turn_end_reading(
-                        &read_screen(memory_wall_in("3h")),
-                        Some(Duration::from_secs(600)),
-                        &opts,
-                    );
+                    fold(memory_wall_in("3h"), Some(Duration::from_secs(600)));
                 }
                 // Found standing: read with no turn seen.
-                "WallFoundSitting" => {
-                    let _ = s.turn_end_reading(&read_screen(memory_wall_in("3h")), None, &opts);
-                }
-                "WallHides" => {
-                    let _ = s.turn_end_reading(&read_screen(memory_scrolled_in("3h")), None, &opts);
-                }
-                "Taken" => {
-                    let _ = s.turn_end_reading(
-                        &read_screen(idle()),
-                        Some(Duration::from_secs(600)),
-                        &opts,
-                    );
-                }
+                "WallFoundSitting" => fold(memory_wall_in("3h"), None),
+                "WallHides" => fold(memory_scrolled_in("3h"), None),
+                "Taken" => fold(idle(), Some(Duration::from_secs(600))),
                 // The world, the clock and the act: nothing the memory reads.
                 // `MemoryLost` is the defect: the real loop makes no such move.
                 _ => {}
@@ -10029,6 +11948,38 @@ fn due_probe_at_a_gate(
     (first, heard.said, probe_writes(&m), host.said("probe"))
 }
 
+/// The Mac slept eight hours after the point was decided, and a request
+/// saw it ([`Session::call`]): the wake's settle stands.
+fn a_night_slept(s: &mut Session<'_, Mock>, _: &Turn, _: &ProbeHost, _: &mut TurnEndAction) {
+    s.set_clock(PROBE_NOW + 8 * 3600, PDT);
+    let _ = s.call(&["status"]).expect("a read at the wake");
+}
+
+/// THE ACCOUNTS PROBE AT THE WAKE (the review of 2026-10-14): `/usage` is a
+/// command typed into the agent, and the Settings panel it opens reads the
+/// account's windows from the API — which the network may not reach in the
+/// wake's settle. A due probe at a point decided just before the Mac slept,
+/// asked once a request has seen the sleep, is not run: nothing written, and
+/// its one line says why (`gate=wake-settle`). NEGATIVE CONTROL: the same
+/// point with no sleep runs it.
+#[test]
+fn a_due_probe_at_the_wake_waits_for_the_settle() {
+    let (did, said, wrote, claims) =
+        due_probe_at_a_gate("probe-at-the-wake", Some(a_night_slept as Shut));
+    assert_eq!(did, Ok(Probed::No), "{said:#?}");
+    assert_eq!(
+        said,
+        ["SKIPPED seq=101 rule=usage-probe@v1 gate=wake-settle"],
+        "one line, once"
+    );
+    assert_eq!(wrote, Vec::<&str>::new(), "nothing written");
+    assert_eq!(claims, Vec::<&str>::new(), "no claim asked");
+    // NEGATIVE CONTROL.
+    let (did, _, wrote, _) = due_probe_at_a_gate("probe-at-the-wake-none", None);
+    assert_eq!(did, Ok(Probed::Done));
+    assert_eq!(wrote, ["/usage", "esc"]);
+}
+
 /// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT. One row a gate of
 /// the loop's — each the same world with ONE thing changed — and for each:
 /// nothing is written, and ONE line is said,
@@ -10045,7 +11996,7 @@ fn due_probe_at_a_gate(
 #[test]
 fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
     use crate::supervise::policy::turn_end::ProbeGate;
-    let gates: [(&str, Shut); 14] = [
+    let gates: [(&str, Shut); 15] = [
         ("watching", |s, _, _, _| {
             s.claim = claim::Claim::Behind {
                 holder: "another".to_string(),
@@ -10073,6 +12024,7 @@ fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
             host.wanting.store(true, Ordering::SeqCst);
         }),
         ("stalled", |s, _, _, _| s.stall_suspect = true),
+        ("wake-settle", a_night_slept),
         ("no-fence", |s, _, _, _| s.caps.gone = Some(false)),
         ("not-claude", |s, _, _, _| s.ctl.program = "zsh"),
         ("person", |s, _, _, _| s.ctl.human_ms = Some(5_000)),
@@ -11954,6 +13906,86 @@ fn an_enter_of_the_text_left_typed_that_does_not_take_is_written_again() {
         1
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN ENTER OF THE TEXT LEFT TYPED THAT THE SERVER TURNS AWAY IS WRITTEN AGAIN
+/// once it can be ([`Session::probe_left_enter`]'s refusal arms, the review
+/// of 2026-10-14): `ERR halted` (an owner's hold, parked on until `status`
+/// reads `hold=0`) or `ERR busy lease=…` (another driver's, backed off from)
+/// wrote nothing, and the screen — `/usage` standing in the composer — never
+/// moves, so no look would come: the point is decided again a moment later
+/// and the Enter written there, the run going on as
+/// [`usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed`]
+/// (the panel closed, the act typed). Parked or backed off and nothing
+/// more, the text stood unsent until something else moved the screen, and
+/// the act behind it with it. The run ends on the fact, its stalls a hang
+/// detector.
+#[test]
+fn an_enter_of_the_text_left_typed_that_the_server_turns_away_is_written_again() {
+    for refusal in ["halted reason=owner origin=local", "busy lease=s-9"] {
+        let tag = if refusal.starts_with("halted") {
+            "probe-left-halted"
+        } else {
+            "probe-left-busy"
+        };
+        let (dir, ledger) = ledger_at(tag);
+        let host = ProbeHost::probing(true);
+        let mut m = probe_world(&[panel_fx::USAGE_SETTLED], &host);
+        // The probe's own Enter is skipped (the screen moved); the first
+        // Enter of the text left typed is turned away; the next one is the
+        // world's to take.
+        m.key_replies
+            .push_back(ok("OK skipped reason=changed seq=104\n"));
+        m.key_replies.push_back(err(refusal));
+        if refusal.starts_with("halted") {
+            m.hold = "1";
+            m.hold_lifts_after = Some(1);
+        }
+        // The re-decisions are two seconds off, in 5 ms waits.
+        m.vanish_after = Some(700);
+        let (lines, journal) = probe_run(
+            &format!("te-{tag}"),
+            &mut m,
+            &host,
+            &ledger,
+            probe_policy(0),
+            |s| {
+                s.set_turn_end_timing(TurnEndTiming {
+                    take_within: Duration::from_millis(100),
+                    ..TurnEndTiming::default()
+                });
+            },
+        );
+        assert_eq!(
+            m.writes(),
+            [
+                "text:/usage",
+                "enter",
+                "enter",
+                "enter",
+                "esc",
+                "text:keep going",
+                "enter"
+            ],
+            "{refusal}: {lines:#?}\n{journal:#?}"
+        );
+        assert_eq!(probe_writes(&m), ["/usage", "esc"], "{refusal}");
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|l| l.starts_with("TYPED ")
+                    && l.contains(" rule=usage-probe@v1 /usage left typed"))
+                .count(),
+            1,
+            "{refusal}: {journal:#?}"
+        );
+        assert_eq!(
+            probe_rows(&ledger),
+            ["typed /usage the accounts probe", "waiting /usage closed"],
+            "{refusal}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// `rows` with `text` typed into its composer (the caret row).

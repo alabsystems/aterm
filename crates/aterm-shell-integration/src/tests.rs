@@ -4643,9 +4643,9 @@ impl LiveShell {
 
     /// The shell holds its three pipes and nothing else of this process
     /// (`inherit_nothing`; the callers' `Command`s are std's, built with the
-    /// hermetic [`ShellCommand`]): a std child under the pinned seal keeps any
-    /// descriptor another test thread had open unflagged at the spawn, and a
-    /// live shell would hold that pipe for as long as its test runs.
+    /// hermetic [`ShellCommand`]): a std child on a std without the SP-1 strip
+    /// keeps any descriptor another test thread had open unflagged at the
+    /// spawn, and a live shell would hold that pipe as long as its test runs.
     fn spawn(label: &str, cmd: &mut Command) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
         cmd.inherit_nothing()

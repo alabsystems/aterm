@@ -10,9 +10,7 @@ use crate::{CellCoord, Grid};
 /// Link column 0 of `row` to `url`; returns the url for later comparison.
 fn link(grid: &mut Grid, row: u16, url: &str) -> Arc<str> {
     let url: Arc<str> = Arc::from(url);
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(row, 0))
-        .set_hyperlink(Some(url.clone()));
+    grid.cell_extra_mut(row, 0).set_hyperlink(Some(url.clone()));
     url
 }
 

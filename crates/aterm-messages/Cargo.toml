@@ -18,7 +18,7 @@ description = "aterm's unified message engine — the platform-neutral model, gl
 # construction and links nothing the wasm canary would have to pin.
 aterm-time = { workspace = true }
 
-# Tier-1 binds (AGENTS.md, derived models): the tests drive the shipping
+# Tier-1 binds (aterm-spec's derive steps): the tests drive the shipping
 # `MessageCenter` in lock step with a `ty_model!` model. aterm-spec depends only
 # on aterm-spec-macros, so there is no cycle, and a dev-dependency
 # is not linked into the library (the wasm canary still sees one dependency).
@@ -29,6 +29,12 @@ aterm-spec = { workspace = true }
 # the bytes the socket carries. Dev-dependencies never enter the shipped or
 # wasm32 graph; the crate's one dependency above is unchanged.
 aterm-codec = { workspace = true }
+# TEST-ONLY: the terminal grid's measure (`str_grid_columns`), the one every
+# host injects as `presence::Host::columns`, so the presence row's width law
+# and painter are proven against the cells the grid really gives a CJK glyph,
+# a combining mark or a ZWJ sequence. Like the codec above, it never enters
+# the shipped or wasm32 graph.
+aterm-grapheme = { workspace = true }
 
 # The seal on a persistent hold (`Hold::Standing`, `Hold::Ask`) has no public
 # constructor, so a HOST's fixture that needs a bare persistent row cannot write

@@ -3,13 +3,16 @@
 
 //! The row's WORDS: the six slots composed from a [`Slot`] ([`words`]), laid
 //! out at a width and shed from the right in the design's order
-//! ([`Words::fit`], [`Words::pieces`]), and the vocabulary every free-text
-//! value is held to ([`sanitize_token`]).
+//! ([`Words::fit`], [`Words::pieces`]), the vocabulary every free-text
+//! value is held to ([`sanitize_token`]), and the CELLS the host's grid lays
+//! a string out in, which the width law, the token cap and the painter all
+//! measure by.
 
 use std::fmt::Write as _;
+use std::marker::PhantomData;
 
 use super::{AgentPhase, CTX_WARN_PCT, Hand, Host, Level, Link, Slot, StoryVerb, Tone, WallAnswer};
-use crate::text::truncate;
+use crate::text::{is_stripped, truncate};
 use crate::{Duration, Instant};
 
 /// The six slots, composed. Each is a whole string; [`Words::fit`] lays them
@@ -44,8 +47,6 @@ pub struct Words {
     pub tone: Tone,
 }
 
-/// Two spaces between slots, one between a glyph and its value.
-const SLOT_GAP: &str = "  ";
 /// The joint between since-clauses.
 const CLAUSE_SEP: &str = " \u{00b7} ";
 /// The empty-slot mark.
@@ -71,14 +72,15 @@ pub enum SlotKind {
 }
 
 impl Words {
-    /// Lay the slots out at `cols` cells. Elision right→left: the fabric slot
-    /// (`rtt`), then since-clauses shortest first (the longest stop survives),
-    /// then the role, then ctx; then the mail's `kind←from` and the hand's
-    /// detail fold to their short forms, so hand, phase and mail survive to
-    /// 24 columns — past which the line is cut.
+    /// Lay the slots out at `cols` cells of the host's grid
+    /// ([`Host::columns`]). Elision right→left: the fabric slot (`rtt`), then
+    /// since-clauses shortest first (the longest stop survives), then the
+    /// role, then ctx; then the mail's `kind←from` and the hand's detail fold
+    /// to their short forms, so hand, phase and mail survive to 24 columns —
+    /// past which the line is cut, between two cells.
     #[must_use]
-    pub fn fit(&self, cols: usize) -> String {
-        let pieces = self.pieces(cols);
+    pub fn fit<V: Host>(&self, cols: usize) -> String {
+        let pieces = self.pieces::<V>(cols);
         join_pieces(&pieces)
     }
 
@@ -86,7 +88,7 @@ impl Words {
     /// its slot: a `Since` piece follows its `Phase` by one space, every other
     /// piece follows its predecessor by two.
     #[must_use]
-    pub fn pieces(&self, cols: usize) -> Vec<(SlotKind, String)> {
+    pub fn pieces<V: Host>(&self, cols: usize) -> Vec<(SlotKind, String)> {
         let mut since = self.since.clone();
         let mut fabric = true;
         let mut role = true;
@@ -95,7 +97,7 @@ impl Words {
         let mut hand_full = true;
         loop {
             let pieces = self.compose(&since, role, ctx, fabric, hand_full, mail_full);
-            if width(&join_pieces(&pieces)) <= cols {
+            if line_width::<V>(&pieces) <= cols {
                 return pieces;
             }
             if fabric {
@@ -111,7 +113,7 @@ impl Words {
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| !is_stop(c))
-                .min_by_key(|(_, c)| width(c))
+                .min_by_key(|(_, c)| width::<V>(c))
                 .map(|(i, _)| i)
             {
                 since.remove(i);
@@ -147,12 +149,12 @@ impl Words {
                 (SlotKind::Mail, mail),
             ] = pieces.as_slice()
             {
-                let (pw, hw, mw) = (width(phase), width(hand), width(mail));
+                let (pw, hw, mw) = (width::<V>(phase), width::<V>(hand), width::<V>(mail));
                 if pw + hw + mw + 4 > cols && cols >= mw + 4 + 3 + 4 {
                     let hand_room = (cols - mw - 4).saturating_sub(pw).max(3);
-                    let hand_cut = truncate(hand, hand_room.min(hw));
-                    let phase_room = cols - mw - 4 - width(&hand_cut);
-                    let phase_cut = truncate(phase, phase_room.min(pw));
+                    let hand_cut = truncate_cells::<V>(hand, hand_room.min(hw));
+                    let phase_room = cols - mw - 4 - width::<V>(&hand_cut);
+                    let phase_cut = truncate_cells::<V>(phase, phase_room.min(pw));
                     return vec![
                         (SlotKind::Phase, phase_cut),
                         (SlotKind::Hand, hand_cut),
@@ -163,19 +165,13 @@ impl Words {
             let mut out = Vec::new();
             let mut used = 0usize;
             for (i, (kind, text)) in pieces.into_iter().enumerate() {
-                let gap = if i == 0 {
-                    0
-                } else if kind == SlotKind::Since {
-                    1
-                } else {
-                    2
-                };
+                let gap = gap_before(i, kind);
                 if used + gap >= cols {
                     break;
                 }
                 let room = cols - used - gap;
-                let cut = truncate(&text, room);
-                used += gap + width(&cut);
+                let cut = truncate_cells::<V>(&text, room);
+                used += gap + width::<V>(&cut);
                 out.push((kind, cut));
             }
             return out;
@@ -234,27 +230,274 @@ impl Words {
     }
 }
 
-/// Join laid-out pieces into the printed line: one space before a `Since`
-/// piece, two before every other.
+/// The blank cells before the `i`-th laid-out piece: none before the first,
+/// one before a `Since` piece (it follows its phase), two between slots.
+pub(super) fn gap_before(i: usize, kind: SlotKind) -> usize {
+    match (i, kind) {
+        (0, _) => 0,
+        (_, SlotKind::Since) => 1,
+        _ => 2,
+    }
+}
+
+/// Join laid-out pieces into the printed line, each after its
+/// [`gap_before`].
 pub(super) fn join_pieces(pieces: &[(SlotKind, String)]) -> String {
     let mut out = String::new();
     for (i, (kind, text)) in pieces.iter().enumerate() {
-        if i > 0 {
-            out.push_str(if *kind == SlotKind::Since {
-                " "
-            } else {
-                SLOT_GAP
-            });
-        }
+        out.extend(std::iter::repeat_n(' ', gap_before(i, *kind)));
         out.push_str(text);
     }
     out
 }
 
-/// Display width in cells (every glyph the row uses is one cell wide; the
-/// text-presentation rule in the painter keeps ✓ and ⚠ that way).
-fn width(s: &str) -> usize {
-    s.chars().count()
+/// The cells laid-out pieces take on the row: each piece's own ([`width`])
+/// and the gaps between them — measured piece by piece, as the painter lays
+/// each one out, so the law and the painted row agree cell for cell.
+fn line_width<V: Host>(pieces: &[(SlotKind, String)]) -> usize {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, text))| gap_before(i, *kind) + width::<V>(text))
+        .sum()
+}
+
+/// One cell of a string as the host's grid draws it ([`cells`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Cell {
+    /// The byte the cell opens at: its own characters run from here to the
+    /// next cell's `at` (or the string's end).
+    pub(super) at: usize,
+    /// The character that opened it — what a one-character cell paints.
+    pub(super) ch: char,
+    /// The columns it takes: 1, or 2 for a wide glyph (or one VS16 widened).
+    pub(super) width: usize,
+}
+
+/// The glyphs with an emoji form that the row pins to TEXT presentation, one
+/// cell each — the fleet lock included: U+1F512 is emoji-presentation by
+/// default, and a renderer would take its colour face two cells wide
+/// otherwise. All are the row's own ([`BAND_GLYPHS`]): no free text carries
+/// one. The measure ([`cells`]) and the painter's pin read this one list.
+pub(super) fn text_presentation(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2713}' | '\u{2717}' | '\u{26a0}' | '\u{2709}' | '\u{2715}' | '\u{1f512}'
+    )
+}
+
+/// The characters one grid cell holds: the one that opened it and at most 16
+/// more (aterm-grid's `CellExtra::MAX_COMBINING`, aterm-grapheme's
+/// `MAX_JOINED`). The grid drops the rest, and so does the row ([`CellWalk`]).
+const CELL_CHARS: usize = 1 + 16;
+
+/// What one character does to the row's cells ([`CellWalk::step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellStep {
+    /// It opens a cell of its own, this many columns wide.
+    Opens(usize),
+    /// It is drawn in the cell before it, which it widens by this many
+    /// columns: a combining mark 0, VS16 after `©` 1.
+    Joins(usize),
+    /// Nothing of it is kept: a zero-width character with no cell to join
+    /// (the grid keeps nothing of it either), or one more character for a
+    /// cell that already holds [`CELL_CHARS`].
+    Dropped,
+}
+
+/// The host's grid walked a character at a time, cell by cell, each cell
+/// held to what the grid's cell holds ([`CELL_CHARS`]) — the one walk the
+/// measure ([`cells`]) and the token's own pass ([`sanitize_token`]) share.
+///
+/// Whether a character opens a cell or is drawn in the one before it turns
+/// on that cell alone (its base, its width, its last stored character), so
+/// each character is measured against the current cell's characters and
+/// nothing before them; and since a cell holds at most [`CELL_CHARS`], each
+/// measure is bounded, and a walk is linear in its string whatever it holds.
+///
+/// THE CELL BOUND (ruling 2026-10-11, round fifteen content-6 review): the
+/// walk once measured each character against ALL of its cell's text, and a
+/// cell's text had no bound, so `1` and three thousand combining marks cost
+/// a quadratic walk, and a token capped in cells carried them all (a
+/// hostile screen row's reset became a 6 KB token, its sanitize, fit and
+/// paint tens of milliseconds on the window's thread). The grid keeps a
+/// cell's first 16 joined characters; the row keeps the same and drops the
+/// rest, so nothing the grid draws is lost and a token holds at most
+/// [`CELL_CHARS`] characters a cell. A VS16 past a full cell still widens
+/// the grid's cell; the row drops it with the rest, and a token never
+/// carries it, so a token's own grid width is still the row's measure of it.
+struct CellWalk<V> {
+    /// The current cell's characters, at most [`CELL_CHARS`] — stale while
+    /// [`Self::opener`] holds the cell's one character.
+    cell: String,
+    /// The character that opened the current cell, not yet copied into
+    /// [`Self::cell`]: most cells hold nothing else, so it is copied only
+    /// when a character is measured against it, and a row of letters and
+    /// glyphs never touches the buffer.
+    opener: Option<char>,
+    /// How many characters the current cell holds (0 before the first).
+    held: usize,
+    /// `V::columns` of the current cell, once measured.
+    cols: Option<usize>,
+    host: PhantomData<V>,
+}
+
+impl<V: Host> CellWalk<V> {
+    const fn new() -> Self {
+        Self {
+            cell: String::new(),
+            opener: None,
+            held: 0,
+            cols: None,
+            host: PhantomData,
+        }
+    }
+
+    /// Lay out `c` after everything kept so far. Printable ASCII opens a cell
+    /// of its own wherever it stands (the grid's bulk path never folds it),
+    /// and the glyphs pinned to [`text_presentation`] take one cell each;
+    /// a printing character opens its own after no cell or after a cell of
+    /// one ASCII character (the grid folds a character only into a cell
+    /// holding a ZWJ, a regional indicator or a wide emoji base); everything
+    /// else is measured.
+    fn step(&mut self, c: char) -> CellStep {
+        if c.is_ascii() || text_presentation(c) {
+            self.open(c, None);
+            return CellStep::Opens(1);
+        }
+        let own = V::columns(c.encode_utf8(&mut [0; 4]));
+        let full = self.held >= CELL_CHARS;
+        // A zero-width character joins the cell before it: with none, or a
+        // full one, nothing of it is kept, and it can open nothing.
+        if own == 0 && (self.held == 0 || full) {
+            return CellStep::Dropped;
+        }
+        if own > 0 && (self.held == 0 || self.opener.is_some_and(|o| o.is_ascii())) {
+            self.open(c, Some(own));
+            return CellStep::Opens(own);
+        }
+        if let Some(opener) = self.opener.take() {
+            self.cell.clear();
+            self.cell.push(opener);
+        }
+        let before = match self.cols {
+            Some(cols) => cols,
+            None => V::columns(&self.cell),
+        };
+        self.cell.push(c);
+        // What `c` adds to the cell it follows, in the grid's own walk.
+        let grew = V::columns(&self.cell).saturating_sub(before);
+        if own == 0 || grew == 0 {
+            // Drawn in the cell before it: a zero-width character (which may
+            // widen that cell), or one the grid folds into it.
+            if full {
+                self.cell.pop();
+                return CellStep::Dropped;
+            }
+            self.held += 1;
+            self.cols = Some(before + grew);
+            return CellStep::Joins(grew);
+        }
+        self.open(c, Some(own));
+        CellStep::Opens(grew)
+    }
+
+    /// Open a cell with `c`, `cols` wide once measured.
+    fn open(&mut self, c: char, cols: Option<usize>) {
+        self.opener = Some(c);
+        self.held = 1;
+        self.cols = cols;
+    }
+}
+
+/// `s` laid out in the host's grid ([`Host::columns`]), cell by cell, as the
+/// painter draws it ([`CellWalk`]): each character either OPENS a cell (a
+/// wide glyph's two columns, any other's one) or is drawn in the cell before
+/// it — a combining mark, a variation selector (VS16 widens the cell it
+/// joins: `©️`), the rest of a ZWJ sequence or a flag — and belongs to that
+/// cell; past a cell's [`CELL_CHARS`], or with no cell to join, it is
+/// dropped. Linear in `s`.
+///
+/// THE WIDTH LAW (ruling 2026-10-11, round fifteen content-6): the row
+/// counted one cell per `char`, so a CJK role was laid out in half the
+/// columns its glyphs take (and painted squeezed, one per cell), and a
+/// combining mark took a cell of its own. The row's cells are now the
+/// grid's, for its free text and its own glyphs alike: for ASCII and the
+/// row's glyphs (each one cell in the grid, the pinned lock one by the pin)
+/// the law is unchanged.
+pub(super) fn cells<V: Host>(s: &str) -> Cells<'_, V> {
+    Cells {
+        chars: s.char_indices(),
+        walk: CellWalk::new(),
+        open: None,
+    }
+}
+
+/// The cells of a string ([`cells`]), each yielded once the next one opens
+/// or the string ends: a character after a cell may still widen it.
+pub(super) struct Cells<'a, V> {
+    chars: std::str::CharIndices<'a>,
+    walk: CellWalk<V>,
+    /// The cell the walk is in, still open to the characters drawn in it.
+    open: Option<Cell>,
+}
+
+impl<V: Host> Iterator for Cells<'_, V> {
+    type Item = Cell;
+
+    fn next(&mut self) -> Option<Cell> {
+        for (at, ch) in self.chars.by_ref() {
+            match self.walk.step(ch) {
+                CellStep::Opens(width) => {
+                    if let Some(done) = self.open.replace(Cell { at, ch, width }) {
+                        return Some(done);
+                    }
+                }
+                CellStep::Joins(grew) => {
+                    if let Some(cell) = self.open.as_mut() {
+                        cell.width += grew;
+                    }
+                }
+                CellStep::Dropped => {}
+            }
+        }
+        self.open.take()
+    }
+}
+
+/// Display width in cells: the sum of [`cells`]. ASCII is its length (each
+/// printable character is one cell of its own), without the walk.
+fn width<V: Host>(s: &str) -> usize {
+    if s.is_ascii() {
+        return s.len();
+    }
+    cells::<V>(s).map(|c| c.width).sum()
+}
+
+/// `s` in at most `max` cells ([`cells`]), the last one `…` when it was cut:
+/// cut BETWEEN two cells, never inside one, so a mark stays with its letter
+/// and a wide glyph is never halved. `max == 0` is the empty string.
+fn truncate_cells<V: Host>(s: &str, max: usize) -> String {
+    if s.is_ascii() {
+        return truncate(s, max);
+    }
+    if width::<V>(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // The first cell that would leave no room for the `…`.
+    let mut used = 0usize;
+    let end = cells::<V>(s)
+        .find(|c| {
+            used += c.width;
+            used > max - 1
+        })
+        .map_or(s.len(), |c| c.at);
+    let mut t = s[..end].to_string();
+    t.push('\u{2026}');
+    t
 }
 
 /// The row's OWN vocabulary — the glyphs that spell a hand, a hold, mail, the
@@ -283,36 +526,48 @@ const BAND_GLYPHS: &[char] = &[
 ];
 
 /// A wire-safe token: printable, single-spaced, none of the row's own glyphs,
-/// at most `cap` chars, cut with `…`. Every free-text value the row prints (a
-/// role, a holder, a sender, a reason, a reset time, a told story's text)
-/// passes here, so a control byte, a bidi override or the row's grammar in
-/// an agent-chosen name can never reach the chrome or forge a slot.
+/// at most `cap` cells of the host's grid, cut with `…` between two cells
+/// (`truncate_cells`; a CJK token of `cap` characters would take twice the
+/// room). Each cell holds what the grid's cell holds, its opening character
+/// and at most 16 more, and a zero-width character with no cell to join is
+/// dropped (`CellWalk`), so a token is at most `17 × cap` characters
+/// whatever its input. Every free-text value the row prints (a role, a
+/// holder, a sender, a reason, a reset time, a told story's text) passes
+/// here, so a control byte, a bidi override, an invisible character or the
+/// row's grammar in an agent-chosen name can never reach the chrome or
+/// forge a slot.
+///
+/// The strip is the band's own (`text::is_stripped`, ruling
+/// 2026-10-11, round fifteen content-7): this token once kept its own
+/// shorter list, which passed the TAG characters (invisible ASCII an agent
+/// reading `chrome` still reads), ZWSP, WJ, the BOM, U+061C, the soft hyphen
+/// and U+180E that its siblings strip.
 #[must_use]
-pub fn sanitize_token(s: &str, cap: usize) -> String {
+pub fn sanitize_token<V: Host>(s: &str, cap: usize) -> String {
     let mut clean = String::with_capacity(s.len());
+    let mut walk = CellWalk::<V>::new();
+    let mut used = 0usize;
     let mut at_space = true;
     for c in s.chars() {
         let c = if c.is_whitespace() { ' ' } else { c };
-        if c.is_control()
-            || matches!(
-                c,
-                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            )
-            || BAND_GLYPHS.contains(&c)
-        {
+        if is_stripped(c) || BAND_GLYPHS.contains(&c) || (c == ' ' && at_space) {
             continue;
         }
-        if c == ' ' {
-            if at_space {
-                continue;
-            }
-            at_space = true;
-        } else {
-            at_space = false;
+        // The token's own cells, as the grid holds them: what the grid
+        // would keep nothing of is not kept.
+        match walk.step(c) {
+            CellStep::Dropped => continue,
+            CellStep::Opens(cols) | CellStep::Joins(cols) => used += cols,
         }
+        at_space = c == ' ';
         clean.push(c);
     }
-    truncate(clean.trim_end(), cap)
+    let token = clean.trim_end();
+    // The one trailing space `trim_end` drops was a cell of its own.
+    if used - (clean.len() - token.len()) <= cap {
+        return token.to_string();
+    }
+    truncate_cells::<V>(token, cap)
 }
 
 /// A hold's reason as every human-facing surface prints and speaks it: the
@@ -322,7 +577,7 @@ pub fn sanitize_token(s: &str, cap: usize) -> String {
 /// override, and the decode must not be the step that lets it through.
 #[must_use]
 pub fn hold_reason_words<V: Host>(reason: &str) -> String {
-    sanitize_token(&V::pct_decode(reason), 32)
+    sanitize_token::<V>(&V::pct_decode(reason), 32)
 }
 
 /// A duration as the row prints it: `12s`, `3m12s`, `2h05m`, `1d 22h`.
@@ -469,7 +724,7 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
     let role = slot
         .role
         .as_deref()
-        .map_or_else(|| DASH.to_string(), |r| sanitize_token(r, 64));
+        .map_or_else(|| DASH.to_string(), |r| sanitize_token::<V>(r, 64));
 
     // phase + since. A TOLD point (`ctl story`) takes the slot for three
     // seconds ahead of everything: it is the watcher's decision, and the
@@ -502,7 +757,7 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
         .as_ref()
         .filter(|_| !slot.attention_told_elsewhere)
     {
-        let t = sanitize_token(text, 48);
+        let t = sanitize_token::<V>(text, 48);
         (t.clone(), Vec::new(), format!("attention, {t}"))
     } else if level == Level::Story {
         story_phase(slot, now, watermark)
@@ -616,8 +871,8 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
     if m.unread > 0 {
         spoken_mail = format!("{} unread", m.unread);
         if let Some(last) = &m.last {
-            let kind = sanitize_token(&last.kind, 12);
-            let from = sanitize_token(&last.from, 24);
+            let kind = sanitize_token::<V>(&last.kind, 12);
+            let from = sanitize_token::<V>(&last.from, 24);
             let _ = write!(mail, " {kind}\u{2190}{}{from}", trust_glyph(&last.trust));
             let _ = write!(spoken_mail, ", {kind} from {from}, {}", last.trust);
         }
@@ -828,7 +1083,7 @@ fn hand_words<V: Host>(slot: &Slot<V>) -> (String, String, String) {
                 holder: Some(h),
             },
         ) => {
-            let h = sanitize_token(h, 32);
+            let h = sanitize_token::<V>(h, 32);
             (
                 format!("\u{25c2} {h} \u{00b7} turn {id}"),
                 format!("\u{25c2} turn {id}"),
@@ -841,15 +1096,15 @@ fn hand_words<V: Host>(slot: &Slot<V>) -> (String, String, String) {
             format!("driven, turn {id}"),
         ),
         (None, Hand::DrivenLease { holder }) => {
-            let h = sanitize_token(holder, 32);
+            let h = sanitize_token::<V>(holder, 32);
             (
                 format!("\u{25c2} {h}"),
-                format!("\u{25c2} {}", truncate(&h, 8)),
+                format!("\u{25c2} {}", truncate_cells::<V>(&h, 8)),
                 format!("driven by {h}"),
             )
         }
         (None, Hand::Driving { sid }) => {
-            let s = sanitize_token(sid, 12);
+            let s = sanitize_token::<V>(sid, 12);
             (
                 format!("\u{25b8} @{s}"),
                 format!("\u{25b8} @{s}"),

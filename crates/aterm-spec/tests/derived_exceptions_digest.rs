@@ -80,7 +80,7 @@ fn a_later_never_wants_a_row_and_a_dismissal_holds() {
     assert!(!buggy.check_invariant("OpenIsBounded", &over));
 }
 
-/// AGENTS.md step 4: the digest's end is a PROGRESS claim, so it is stated as a
+/// aterm-spec `derive` step 4: the digest's end is a PROGRESS claim, so it is stated as a
 /// liveness one and discharged by the interpreter and `ty`. The run that made it
 /// necessary is the second edition's: the upgrade sends a look only when its
 /// rows change, so a row that left in one change produced ONE empty look and no

@@ -1208,8 +1208,8 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        absolute path is outside the secrets list (.ssh, .aws,
                        Keychains, *.pem, .env, *.token, …); and the folder-
                        trust dialog when its folder is exactly the session's cwd
-                       and lies under a trust root (~/Developer/aterm*,
-                       ~/Developer/ay*, ~/Developer/trust*, /private/tmp/claude-*). Those rules decide first under
+                       and lies under a trust root (~/aterm*, ~/ay*, $HOME/trust*,
+                       /private/tmp/claude-*). Those rules decide first under
                        \"all\" too, so a proven read keeps its rule in the
                        ledger. \"none\" answers nothing. A person's keystroke
                        within `human_grace_s` (the server's `status

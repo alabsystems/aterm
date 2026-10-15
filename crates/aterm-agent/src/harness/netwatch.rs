@@ -11,8 +11,10 @@
 //! * [`Route`]: which route the agent's requests take. Only the default,
 //!   `api.anthropic.com:443` direct, is measured; a base URL, cloud provider,
 //!   socket or proxy named in the agent's environment or any settings `env`
-//!   block is [`Route::Custom`], and so is a source that cannot be read
-//!   ([`route_of`]). A custom route reads [`Reach::Unknown`].
+//!   block along the chain Claude Code reads
+//!   ([`crate::supervise::policy::claude_settings`]) is [`Route::Custom`],
+//!   and so is a source that cannot be read ([`route_of`]). A custom route
+//!   reads [`Reach::Unknown`].
 //! * [`Outcome`]: `Down` only on a definite failure (the name does not
 //!   resolve, or every address is refused or unreachable), `Up` on a completed
 //!   verified handshake, and `Unknown` for anything else (timeouts, TLS
@@ -27,7 +29,6 @@
 //!   of the measure's run, so the loop sees an edge only on a change.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::supervise::policy::turn_end::Reach;
@@ -78,16 +79,6 @@ pub const ROUTE_KEYS: &[&str] = &[
 /// Every variable under these prefixes counts too (`CLAUDE_CODE_PROXY_…`).
 pub const ROUTE_PREFIXES: &[&str] = &["CLAUDE_CODE_PROXY"];
 
-/// Where Claude Code's managed settings live on macOS (its
-/// `managed-settings.json` and the `managed-settings.d/*.json` drop-ins).
-pub const MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
-/// Where a managed preference domain would sit (`com.anthropic.claudecode`,
-/// read by the 2.1.282 binary): a plist this reader does not parse, so its
-/// presence alone makes the route custom.
-pub const MANAGED_PREFS_DIR: &str = "/Library/Managed Preferences";
-/// The managed preference domain's file name.
-pub const MANAGED_PREFS_FILE: &str = "com.anthropic.claudecode.plist";
-
 /// The route an agent's API requests take, as far as the host can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
@@ -103,10 +94,24 @@ pub enum Route {
 pub enum Source {
     /// Not there: it sets nothing.
     Missing,
-    /// There, and not readable (or not a file this reader takes).
+    /// There, and not readable (or not a file this reader takes), or where
+    /// it is cannot be told.
     Unreadable,
     /// Its text.
     Text(String),
+}
+
+impl From<Result<Option<String>, String>> for Source {
+    /// A document of Claude Code's settings chain as the chain's reader
+    /// returned it (`claude_settings::Source::text`): none, its text, or
+    /// why it cannot be read.
+    fn from(text: Result<Option<String>, String>) -> Self {
+        match text {
+            Ok(None) => Self::Missing,
+            Ok(Some(text)) => Self::Text(text),
+            Err(_) => Self::Unreadable,
+        }
+    }
 }
 
 /// What decides an agent's route, gathered by the host (aterm-gui
@@ -116,7 +121,10 @@ pub struct RouteFacts {
     /// The agent's exec environment, `KEY=value` (atpkg's `process_args`, the
     /// one KERN_PROCARGS2 reader); `None` when it could not be read.
     pub env: Option<Vec<String>>,
-    /// Every settings source, each named for the log.
+    /// Every settings source, each named for the log: the chain Claude
+    /// Code reads for the agent (`claude_settings::sources_under`) and its
+    /// managed preference domains (`claude_settings::managed_preferences`),
+    /// as aterm-gui's `harness_netprobe` gathers them.
     pub settings: Vec<(String, Source)>,
 }
 
@@ -188,13 +196,15 @@ pub struct Settings {
     pub api_key_helper: bool,
 }
 
-/// Read one settings file's text: THE ONE SETTINGS READER. `None` for text
-/// that is not a JSON object, or whose `env` is not one: what Claude Code
-/// would make of it is not this reader's to guess.
+/// Read one settings file's text: THE ONE SETTINGS READER, over the chain's
+/// one parse (`claude_settings::parse`: an empty or blank document is `{}`,
+/// a leading byte-order mark is dropped, as Claude Code reads them). `None`
+/// for text that is not a JSON object, or whose `env` is not one: what
+/// Claude Code would make of it is not this reader's to guess.
 #[must_use]
 pub fn settings_of(text: &str) -> Option<Settings> {
     use aterm_json::Value;
-    let value = aterm_json::from_str::<Value>(text).ok()?;
+    let value = crate::supervise::policy::claude_settings::parse(text).ok()?;
     let object = value.as_object()?;
     let env = match object.get("env") {
         None => Vec::new(),
@@ -235,74 +245,6 @@ pub fn settings_route(text: &str) -> SettingsEnv {
         .into_iter()
         .find(|(key, value)| names_a_route(key, value))
         .map_or(SettingsEnv::Quiet, |(key, _)| SettingsEnv::Names(key))
-}
-
-/// A `--settings` on the agent's command line: a file, or JSON inline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SettingsArg {
-    /// A path, as written (relative to the agent's directory when not
-    /// absolute).
-    File(PathBuf),
-    /// The JSON itself.
-    Inline(String),
-}
-
-/// Every `--settings <file|json>` (or `--settings=<…>`) in `argv`, in order.
-#[must_use]
-pub fn settings_args(argv: &[String]) -> Vec<SettingsArg> {
-    let mut out = Vec::new();
-    let mut words = argv.iter();
-    while let Some(word) = words.next() {
-        let value = if word == "--settings" {
-            words.next().cloned()
-        } else {
-            word.strip_prefix("--settings=").map(str::to_string)
-        };
-        if let Some(value) = value {
-            out.push(if value.trim_start().starts_with('{') {
-                SettingsArg::Inline(value)
-            } else {
-                SettingsArg::File(PathBuf::from(value))
-            });
-        }
-    }
-    out
-}
-
-/// The settings files Claude Code reads for an agent whose Claude directory
-/// is `claude_dir` and whose working directory is `cwd` — the user's, the
-/// project's and the project's local one, and the managed file under
-/// `managed` ([`MANAGED_DIR`]) — each named for the log. A Claude directory
-/// the agent's environment does not locate, a working directory not known
-/// (`cwd` `None` or relative: the project's two files are then left out
-/// here), the managed drop-ins and a `--settings` file are the gatherer's to
-/// add (an unreadable source, a directory listing, the agent's argv).
-#[must_use]
-pub fn settings_files(
-    claude_dir: Option<&Path>,
-    cwd: Option<&Path>,
-    managed: &Path,
-) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    if let Some(dir) = claude_dir {
-        out.push(("the user's settings".to_string(), dir.join("settings.json")));
-    }
-    if let Some(cwd) = cwd.filter(|c| c.is_absolute()) {
-        let project = cwd.join(".claude");
-        out.push((
-            "the project's settings".to_string(),
-            project.join("settings.json"),
-        ));
-        out.push((
-            "the project's local settings".to_string(),
-            project.join("settings.local.json"),
-        ));
-    }
-    out.push((
-        "the managed settings".to_string(),
-        managed.join("managed-settings.json"),
-    ));
-    out
 }
 
 /// What one probe concluded ([`NetState::finish`]).
@@ -686,10 +628,12 @@ mod tests {
 
     /// THE ONE SETTINGS READER: the `env` block's keys with their values as
     /// text, and whether an `apiKeyHelper` is named — and the route's own
-    /// answer is read through it, key for key. NEGATIVE CONTROLS: a helper
-    /// that is `null`, `false` or empty names none; a key of that name
-    /// INSIDE the `env` block is a variable, not the setting; text that is
-    /// not an object, or whose `env` is not one, is not read at all.
+    /// answer is read through it, key for key; an empty or blank document
+    /// is `{}` and a leading byte-order mark is dropped, as Claude Code
+    /// reads one. NEGATIVE CONTROLS: a helper that is `null`, `false` or
+    /// empty names none; a key of that name INSIDE the `env` block is a
+    /// variable, not the setting; text that is not an object, or whose `env`
+    /// is not one, is not read at all.
     #[test]
     fn one_reader_takes_a_settings_files_env_block_and_its_api_key_helper() {
         let text = r#"{"model":"opus","apiKeyHelper":"/usr/local/bin/key",
@@ -714,6 +658,15 @@ mod tests {
         );
         assert_eq!(settings_of("{}"), Some(Settings::default()));
         assert_eq!(settings_route("{}"), SettingsEnv::Quiet);
+        // As Claude Code reads a document (the chain's one parse): empty or
+        // blank is `{}`, and a leading byte-order mark is dropped.
+        for empty in ["", " \n\t", "\u{feff}", "\u{feff} \n"] {
+            assert_eq!(settings_of(empty), Some(Settings::default()), "{empty:?}");
+        }
+        assert_eq!(
+            settings_route("\u{feff}{\"env\":{\"HTTPS_PROXY\":\"http://gw.example:8080\"}}"),
+            SettingsEnv::Names("HTTPS_PROXY".to_string())
+        );
         for helper in ["null", "false", "\"\""] {
             let quiet = format!("{{\"apiKeyHelper\":{helper}}}");
             assert_eq!(settings_of(&quiet), Some(Settings::default()), "{helper}");
@@ -746,57 +699,5 @@ mod tests {
                 "{unparsed}"
             );
         }
-    }
-
-    /// `--settings` names a file or carries JSON, spaced or with `=`; the
-    /// settings files follow the agent's Claude directory and working
-    /// directory (a relative one is none), and the managed file is always
-    /// read.
-    #[test]
-    fn settings_come_from_the_command_line_the_user_the_project_and_the_manager() {
-        let argv: Vec<String> = [
-            "claude",
-            "--settings",
-            "team.json",
-            "--model",
-            "opus",
-            "--settings={\"env\":{}}",
-        ]
-        .map(String::from)
-        .to_vec();
-        assert_eq!(
-            settings_args(&argv),
-            [
-                SettingsArg::File(PathBuf::from("team.json")),
-                SettingsArg::Inline("{\"env\":{}}".to_string()),
-            ]
-        );
-        assert!(settings_args(&["claude".to_string()]).is_empty());
-        let managed = Path::new(MANAGED_DIR);
-        let files = settings_files(
-            Some(Path::new("/u/.claude")),
-            Some(Path::new("/w/p")),
-            managed,
-        );
-        let paths: Vec<PathBuf> = files.into_iter().map(|(_, p)| p).collect();
-        assert_eq!(
-            paths,
-            [
-                PathBuf::from("/u/.claude/settings.json"),
-                PathBuf::from("/w/p/.claude/settings.json"),
-                PathBuf::from("/w/p/.claude/settings.local.json"),
-                Path::new(MANAGED_DIR).join("managed-settings.json"),
-            ]
-        );
-        assert_eq!(
-            settings_files(
-                Some(Path::new("/u/.claude")),
-                Some(Path::new("rel")),
-                managed
-            )
-            .len(),
-            2
-        );
-        assert_eq!(settings_files(None, None, managed).len(), 1);
     }
 }

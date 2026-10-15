@@ -87,6 +87,10 @@ const CONVERSATION: Shape = Shape::Object(&[
     // reads a first prompt written after the rows that answer it
     // (`supervise/wall_confirm.rs`).
     ("parentUuid", Shape::Scalar),
+    // The row's own id: a usage limit's notice confirmed is remembered by
+    // it, so only a reply written after THAT row ends the wait on it
+    // (`supervise/wall_confirm.rs`'s `served_since_notice`).
+    ("uuid", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),

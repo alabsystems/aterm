@@ -31,7 +31,7 @@
 //! * `NSApp` stays nil. AppKit's global is only ever set by `+[NSApplication
 //!   sharedApplication]`, and reading it creates nothing. Before the display-free
 //!   loop existed, every `--headless` launch built the AppKit loop and made
-//!   WindowServer preflight the binary (AGENTS.md rule 5); `aterm`'s
+//!   WindowServer preflight the binary (AGENTS.md); `aterm`'s
 //!   `window_server_census_live_headless.rs` reads that from tccd's log, and
 //!   this is the in-process half.
 //! * Every CLONE of a proxy wakes the loop. The first cut of the backend gave

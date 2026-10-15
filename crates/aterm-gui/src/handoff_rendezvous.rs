@@ -1318,12 +1318,19 @@ impl Rendezvous {
     /// exists to clean up: the directory, then the path length, then the
     /// secret, and only then the bind.
     pub(crate) fn bind(nonce: &str) -> Result<Self, RendezvousError> {
+        let dir = rendezvous_dir().ok_or(RendezvousError::NoControlDir)?;
+        Self::bind_in(&dir, nonce)
+    }
+
+    /// [`Self::bind`] in `dir`, a directory already established as this uid's
+    /// own. Production binds only in [`rendezvous_dir`]; the tests also bind in
+    /// a short directory of their own where that one cannot hold the socket.
+    fn bind_in(dir: &Path, nonce: &str) -> Result<Self, RendezvousError> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = rendezvous_dir().ok_or(RendezvousError::NoControlDir)?;
         #[cfg(unix)]
-        sweep_dead_rendezvous(&dir);
-        let path = rendezvous_path(&dir, nonce);
+        sweep_dead_rendezvous(dir);
+        let path = rendezvous_path(dir, nonce);
         let text = path
             .to_str()
             .ok_or_else(|| RendezvousError::Bind("the control directory is not UTF-8".to_string()))?
@@ -1344,7 +1351,7 @@ impl Rendezvous {
             claim,
         };
         #[cfg(unix)]
-        prove_bound_socket_is_ours(&dir, &bound.path).map_err(RendezvousError::Bind)?;
+        prove_bound_socket_is_ours(dir, &bound.path).map_err(RendezvousError::Bind)?;
         // The 0700 directory is already the access boundary; 0600 on the node
         // itself is the same defence in depth the control socket takes, and it
         // buys a refusal here rather than a surprise at connect time. From this
@@ -3644,9 +3651,7 @@ mod tests {
     /// DIFFERENT numbers.
     #[test]
     fn a_claimed_rendezvous_carries_every_descriptor_to_the_dialer() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
@@ -3796,9 +3801,7 @@ mod tests {
     #[test]
     fn a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked() {
         for (chunks, sessions) in [(false, 1_usize), (true, 100)] {
-            let Some(rendezvous) = bind_for_test() else {
-                return;
-            };
+            let rendezvous = bind_for_test();
             let (reads, writes) = pipes_for_test(sessions);
             let (ready_rd, ready_wr) = pipe_for_test();
             let (commit_rd, commit_wr) = pipe_for_test();
@@ -3912,14 +3915,14 @@ mod tests {
     #[test]
     fn exec_dialer_stand_in() {
         use std::os::unix::process::CommandExt as _;
-        if let Some(fd) = std::env::var(EXEC_DIALER_FD)
-            .ok()
-            .and_then(|fd| fd.parse::<i32>().ok())
-        {
-            // SAFETY: the image before this one cleared FD_CLOEXEC on exactly
-            // this descriptor, its claimed connection, and exec'd; nothing else
-            // in this process owns it.
-            let stream = unsafe { CtlStream::from_raw_fd(fd) };
+        if std::env::var_os(EXEC_DIALER_FD).is_some() {
+            // The image before this one handed over exactly this descriptor,
+            // its claimed connection, and exec'd. CHECKED, not assumed
+            // (`test_alone::handed`): a number that held nothing, or something
+            // this image opened since, would read to its end with nothing
+            // received — "0 DESCRIPTORS", the very count the test expects of
+            // an image the gate refused.
+            let stream = CtlStream::from(crate::test_alone::handed(EXEC_DIALER_FD));
             let execd = std::env::var_os(EXEC_DIALER_EXECD).expect("the marker's path");
             std::fs::write(execd, b"").expect("say the new image runs");
             println!(
@@ -3951,17 +3954,13 @@ mod tests {
             return;
         }
         let fd = stream.into_raw_fd();
-        // SAFETY: plain fcntl on the descriptor this process just took from its
-        // stream; clearing FD_CLOEXEC is what keeps it open across the exec.
-        let kept = unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == 0
-        };
-        assert!(kept, "clear the claimed connection's close-on-exec flag");
-        let error = std::process::Command::new(std::env::current_exe().expect("this binary"))
-            .args(std::env::args_os().skip(1))
-            .env(EXEC_DIALER_FD, fd.to_string())
-            .exec();
+        let mut image = std::process::Command::new(std::env::current_exe().expect("this binary"));
+        image.args(std::env::args_os().skip(1));
+        // The claimed connection crosses the exec at its own number
+        // (`test_alone::hand` clears its close-on-exec flag right before the
+        // exec), named with what it is for the new image to check.
+        crate::test_alone::hand(&mut image, EXEC_DIALER_FD, fd);
+        let error = image.exec();
         panic!("exec the new image: {error}");
     }
 
@@ -3987,9 +3986,7 @@ mod tests {
     #[test]
     fn a_grant_is_not_sent_once_the_dialers_image_changed() {
         for stays in [true, false] {
-            let Some(rendezvous) = bind_for_test() else {
-                return;
-            };
+            let rendezvous = bind_for_test();
             let scratch = aterm_tempfile::TempDir::new().expect("a scratch dir");
             let (go, execd) = (scratch.path().join("go"), scratch.path().join("execd"));
             let mut stand_in =
@@ -4079,9 +4076,7 @@ mod tests {
     #[test]
     fn a_grant_whose_connection_closes_at_once_is_still_claimed() {
         for _ in 0..20 {
-            let Some(rendezvous) = bind_for_test() else {
-                return;
-            };
+            let rendezvous = bind_for_test();
             let (master, slave) = open_pty();
             let (ready_rd, ready_wr) = pipe_for_test();
             let (commit_rd, commit_wr) = pipe_for_test();
@@ -4173,9 +4168,7 @@ mod tests {
             return;
         }
 
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let term = pty_device_term(master).expect("a master answers fstat");
         let (ready_rd, ready_wr) = pipe_for_test();
@@ -4254,9 +4247,7 @@ mod tests {
     /// outcome.
     #[test]
     fn a_transfer_failure_says_whether_the_descriptors_left() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
         let (fake_master_rd, _fake_master_wr) = pipe_for_test();
@@ -4313,9 +4304,7 @@ mod tests {
 
         // (2) Closed after the header: the peer dequeues the descriptors, then
         //     closes without reading the body.
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         let dialer = std::thread::spawn(move || {
@@ -4367,9 +4356,7 @@ mod tests {
     /// what a field investigation reads first.
     #[test]
     fn a_dialer_without_the_secret_is_refused() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         // Connected and fully spoken inline, before the accept's deadline starts,
         // so no scheduling delay of a dialer thread can turn the refusal into a
         // bare deadline.
@@ -4398,9 +4385,7 @@ mod tests {
     /// the CONNECTION: the real successor, dialing second, still gets everything.
     #[test]
     fn a_wrong_dialer_does_not_end_the_attempt_and_the_successor_still_claims() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
@@ -4473,9 +4458,7 @@ mod tests {
     /// for the whole handoff.
     #[test]
     fn a_flood_of_wrong_dialers_is_bounded_rather_than_served_forever() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let path = rendezvous.path().to_path_buf();
         let wrong = claim_frame(&"f".repeat(CLAIM_HEX_LEN));
         // Queued before the accept loop starts, so the flood is what it finds.
@@ -4518,9 +4501,7 @@ mod tests {
     /// bounds the frame now is the deadline, so a dribbler is refused AT it.
     #[test]
     fn a_dribbling_dialer_is_refused_at_the_deadline_rather_than_stretching_it() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let path = rendezvous.path().to_path_buf();
         // The RIGHT secret, delivered too slowly: what is being tested is the
         // budget, so the frame must be one that would otherwise be accepted.
@@ -4643,9 +4624,7 @@ mod tests {
     /// socket is gone afterwards so a late dial fails closed.
     #[test]
     fn a_rendezvous_nobody_dials_expires_and_unlinks() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let path = rendezvous.path().to_path_buf();
         assert!(path.exists(), "the listener is on disk while it is bound");
         let expired = rendezvous.accept_claim(
@@ -4669,9 +4648,7 @@ mod tests {
     /// A cancel poke does not have to wait out the deadline.
     #[test]
     fn an_aborted_wait_returns_promptly() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         // A two-minute deadline, bounded at one: a wait that consulted the
         // abort predicate only once the deadline had passed would answer the
         // same `Cancelled` two minutes on. The minute is a hang detector, not a
@@ -4692,9 +4669,7 @@ mod tests {
         );
     }
 
-    /// Bind a rendezvous under a test-only nonce, or skip when this machine has
-    /// no usable control directory or a `$HOME` too long for `sun_path` — the
-    /// same two refusals production falls back to the fork lane on.
+    /// Dial and grant deadlines both `secs` from now.
     fn deadlines_in(secs: u64) -> ClaimDeadlines {
         let at = Instant::now() + Duration::from_secs(secs);
         ClaimDeadlines {
@@ -4710,9 +4685,7 @@ mod tests {
     /// time the parent parks does not end a legitimate wait.
     #[test]
     fn a_held_claim_is_granted_after_the_hold_under_the_grant_budget() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
@@ -4780,9 +4753,7 @@ mod tests {
     /// successor maps to "exit before any window", and no descriptor ever left.
     #[test]
     fn dropping_a_held_claim_ends_the_dialers_wait_with_eof_and_no_descriptors() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         // A two-minute grant budget, bounded at one: a dialer that did not take
@@ -4847,9 +4818,7 @@ mod tests {
         if !crate::control_auth::enter_low_nofile_test_child(64) {
             return;
         }
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         let parent = own_parent();
@@ -4945,9 +4914,7 @@ mod tests {
     /// unavailable (os error 35)")` — "the rendezvous grant is malformed".
     #[test]
     fn a_grant_that_never_arrives_ends_as_the_claim_deadline() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         let deadlines = ClaimDeadlines {
@@ -4997,9 +4964,7 @@ mod tests {
     /// before any transfer, so the attempt can be stood down without a park.
     #[test]
     fn a_dialer_that_dies_during_the_hold_reads_as_a_hangup() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         // The dialer dies once the parent has SEEN it alive, never after a guess
@@ -5056,12 +5021,61 @@ mod tests {
         assert!(seen.is_some(), "the closed dialer never read as a hangup");
     }
 
-    fn bind_for_test() -> Option<Rendezvous> {
-        let nonce = aterm_uds::rand::hex_token::<16>().ok()?;
-        match Rendezvous::bind(&nonce) {
-            Ok(rendezvous) => Some(rendezvous),
-            Err(RendezvousError::NoControlDir | RendezvousError::PathTooLong { .. }) => None,
+    /// A rendezvous a test bound, and the directory it made for it when
+    /// production's could not hold the socket. The fields drop in order: the
+    /// rendezvous unlinks its socket, then the directory goes.
+    struct BoundForTest {
+        rendezvous: Rendezvous,
+        _short_dir: Option<aterm_tempfile::TempDir>,
+    }
+
+    impl std::ops::Deref for BoundForTest {
+        type Target = Rendezvous;
+
+        fn deref(&self) -> &Rendezvous {
+            &self.rendezvous
+        }
+    }
+
+    /// Bind a rendezvous under a test-only nonce, so that the test RUNS: where
+    /// production binds it, or, on the two refusals production takes the fork
+    /// lane on (no usable control directory; a socket path too long for
+    /// `sun_path`, as under a long `$TMPDIR` or `$HOME`), in a fresh private
+    /// directory under `/tmp`, through the same [`Rendezvous::bind_in`]. A test
+    /// that cannot bind there either fails, naming both reasons. Before
+    /// 2026-10-14 it returned instead, and 20 tests reported `ok` having
+    /// asserted nothing under a 65-byte `$TMPDIR`.
+    fn bind_for_test() -> BoundForTest {
+        let nonce = aterm_uds::rand::hex_token::<16>()
+            .unwrap_or_else(|error| panic!("a rendezvous test cannot mint its nonce: {error}"));
+        let refused = match Rendezvous::bind(&nonce) {
+            Ok(rendezvous) => {
+                return BoundForTest {
+                    rendezvous,
+                    _short_dir: None,
+                };
+            }
+            Err(
+                refused @ (RendezvousError::NoControlDir | RendezvousError::PathTooLong { .. }),
+            ) => refused,
             Err(error) => panic!("bind: {error}"),
+        };
+        let short_dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap_or_else(|error| {
+            panic!(
+                "production refused the rendezvous ({refused}), and no directory for it could \
+                 be made under /tmp: {error}"
+            )
+        });
+        let rendezvous = Rendezvous::bind_in(short_dir.path(), &nonce).unwrap_or_else(|error| {
+            panic!(
+                "production refused the rendezvous ({refused}), and it could not bind in {} \
+                 either: {error}",
+                short_dir.path().display()
+            )
+        });
+        BoundForTest {
+            rendezvous,
+            _short_dir: Some(short_dir),
         }
     }
 
@@ -5762,9 +5776,7 @@ mod tests {
     #[test]
     fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
         for (sessions, chunks) in [(3_usize, false), (100, true)] {
-            let Some(rendezvous) = bind_for_test() else {
-                return;
-            };
+            let rendezvous = bind_for_test();
             let (_reads, writes) = pipes_for_test(sessions);
             let (_ready_rd, ready_wr) = pipe_for_test();
             let (commit_rd, _commit_wr) = pipe_for_test();
@@ -5829,9 +5841,7 @@ mod tests {
     /// (`TooManySessions`), and the update stood down as a producer failure.
     #[test]
     fn a_grant_of_100_sessions_crosses_in_chunks() {
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (reads, writes) = pipes_for_test(100);
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
@@ -5921,9 +5931,7 @@ mod tests {
         use std::io::Read as _;
 
         // An ATRZ1C claimant with a hundred sessions to take.
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (reads, writes) = pipes_for_test(100);
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
@@ -5979,9 +5987,7 @@ mod tests {
         drop((writes, ready_wr, commit_wr, ready_rd, commit_rd, reads));
 
         // An ATRZ2C claimant with three sessions: the one-message grant.
-        let Some(rendezvous) = bind_for_test() else {
-            return;
-        };
+        let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();

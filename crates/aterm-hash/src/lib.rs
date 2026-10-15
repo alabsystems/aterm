@@ -4,7 +4,10 @@
 //! Fast non-cryptographic hashing for aterm.
 //!
 //! - [`FxHasher`], [`FxBuildHasher`], [`FxHashMap`], [`FxHashSet`]: an inline
-//!   FxHash, bit-compatible with `rustc-hash` 2.1. In-process only.
+//!   FxHash, bit-compatible with `rustc-hash` 2.1. In-process only, and for
+//!   keys aterm makes or trusts.
+//! - [`KeyedHashMap`]: a map hashed under a per-process random key, for text
+//!   keys an untrusted party chooses (see its docs for the rule).
 //! - [`fnv1a_64`] and friends: FNV-1a/64, the one hash whose values may
 //!   persist or cross a crate boundary (see the `fnv` module).
 //!
@@ -30,6 +33,32 @@ pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 /// Type alias for a hash set using the Fx hashing algorithm.
 pub type FxHashSet<V> = HashSet<V, FxBuildHasher>;
 
+/// A hash map whose hash carries a per-process secret: std's [`HashMap`] under
+/// [`std::hash::RandomState`] (SipHash-1-3, keyed from the OS once per thread
+/// and stepped for every map).
+///
+/// Use it for a map keyed by TEXT that an untrusted party chooses and that
+/// holds many such keys at once: a render memo keyed by what a pane's program
+/// printed. [`FxHashMap`] has no secret, so one precomputed key set lands in a
+/// single bucket and control tag on every aterm, and each lookup then
+/// string-compares the whole chain. The same holds for an integer key that is
+/// an unkeyed hash of such text (a context fingerprint): mixing it well does
+/// not stop a search for colliding inputs.
+///
+/// Ruling 2026-10-10 (hashclock-1): through the real renderer, a 32x128
+/// screen of such cluster keys took a frame from 1.9 ms to 16 ms. Seeding
+/// [`FxHasher`]'s state would not have helped: its byte compression
+/// (`hash_bytes`) takes no seed, so keys whose compressed words collide still
+/// collide under any starting state. [`FxHashMap`] stays right for keys aterm
+/// makes or trusts (glyph ids, line numbers, addresses, shipped or configured
+/// data) and for key domains aterm fixes and an untrusted party only picks
+/// from, such as a `char` or a word-decoration ident (a grid column and a
+/// lexicon form). There few keys can share a probe class and each compare is
+/// an integer compare, so a hot path need not pay for SipHash. On a target
+/// with no OS entropy (wasm32-unknown-unknown), std derives the keys from
+/// addresses, which is no weaker than Fx.
+pub type KeyedHashMap<K, V> = HashMap<K, V, std::hash::RandomState>;
+
 // Multiplicative constant chosen for good distribution properties.
 // From "Computationally Easy, Spectrally Good Multipliers for Congruential
 // Pseudorandom Number Generators" by Guy Steele and Sebastiano Vigna.
@@ -42,7 +71,8 @@ const K: usize = 0x93d765dd;
 /// polynomial hash with a single bit rotation as a finishing step.
 ///
 /// **Do not use for cryptographic purposes or untrusted input where HashDoS
-/// resistance is required.**
+/// resistance is required:** a map keyed by text an untrusted party chooses
+/// is a [`KeyedHashMap`].
 #[derive(Clone)]
 pub struct FxHasher {
     hash: usize,

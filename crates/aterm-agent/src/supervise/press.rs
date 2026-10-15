@@ -649,9 +649,11 @@ impl<C: Ctl> Session<'_, C> {
                     self.read_back = still.map(|still| (back.clone(), still));
                     return Ok(Pressing::Done(Press::Typed { seq: back.seq }));
                 }
-                Back::Short | Back::Empty if !waited => {
-                    // Still drawing, or not read yet: once more, after the
-                    // screen held still.
+                Back::Short | Back::Empty | Back::Other(_) if !waited => {
+                    // Still drawing, not read yet, or read mid-redraw (a
+                    // loaded machine's read can catch the dialog half drawn
+                    // and read it as another): once more, after the screen
+                    // held still. Only reads: nothing is written again.
                     waited = true;
                     still = latched_for(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, IDLE_MS);
                     back = self.screen()?;

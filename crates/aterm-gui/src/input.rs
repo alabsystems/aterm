@@ -101,8 +101,10 @@ pub(crate) enum InputEvent {
         event_type: aterm_types::keyboard::KeyEventType,
     },
     /// Literal text to type: the `on_key` bare-`ev.text` fallback and the IME
-    /// `Ime::Commit` path. Each char is encoded as a `Character` key under the
-    /// current keyboard mode.
+    /// `Ime::Commit` path (a commit holding a control character beside other
+    /// text is a [`Self::Paste`] instead, `keymap::committed_text_is_paste`;
+    /// one C0 or DEL character alone is a key and stays here). Each char is
+    /// encoded as a `Character` key under the current keyboard mode.
     Text(String),
     /// Raw bytes from an aterm `[key_sequences]` INPUT-POLICY rule: written to the
     /// PTY VERBATIM (never re-encoded), so a chord the user mapped sends exactly the
@@ -925,20 +927,22 @@ fn wheel_scaled_lines(
 /// `bytes_human_eq_controller` byte-equality invariant holds for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressMode {
-    /// The UI event-loop thread: use the non-parking egress
+    /// The UI event-loop thread, and a control socket lane writing into a session
+    /// that is not on screen: use the non-parking egress
     /// (`SinkWriter::write_frame_interactive_with_receipt`) so a wedged foreground
-    /// can NEVER park the loop that serves rendering + input for every window/tab.
+    /// can NEVER park the loop that serves rendering + input for every window/tab,
+    /// nor a lane the socket's other clients need.
     /// At the sink's spill cap the frame is REFUSED instead ([`Delivery::Failed`],
     /// [`EgressReceipt::input_queue_full`]; decided 2026-09-25). On Windows, where
     /// ConPTY has no non-blocking write, keys and reports never take this mode
     /// inline: they go through the per-session ordered writer (`paste_order`),
     /// reports as [`Self::Encode`]d bytes, and one it does not admit is refused.
     Interactive,
-    /// An expendable egress thread (the per-session egress-order writer thread, the
-    /// cross-session control thread): use the blocking,
-    /// `SPILL_CAP`-enforcing egress, so a machine-rate producer into a wedged
-    /// foreground feels backpressure on THIS thread instead of growing the spill
-    /// without bound. MUST NOT be used on the UI thread.
+    /// An expendable egress thread (the per-session egress-order writer thread):
+    /// use the blocking, `SPILL_CAP`-enforcing egress, so a machine-rate producer
+    /// into a wedged foreground feels backpressure on THIS thread instead of
+    /// growing the spill without bound. MUST NOT be used on the UI thread or a
+    /// control socket lane.
     Backpressured,
     /// The UI thread where a write could block it (Windows: ConPTY has no
     /// non-blocking write), or behind a queued paste: produce exactly the bytes

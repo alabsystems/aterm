@@ -33,8 +33,7 @@
 //! # Which roots
 //!
 //! * the six per-folder services under `$HOME` ([`HOME_FOLDERS`]) — `Documents`,
-//!   `Desktop`, `Downloads`, `Pictures`, `Movies`, `Music` — which the developer-root
-//!   survey ([`crate::devroot`]) never opens, and which
+//!   `Desktop`, `Downloads`, `Pictures`, `Movies`, `Music` — which
 //!   `aterm_containment::sbpl::PRIVATE_SUBDIRS` denies;
 //! * the two file-provider domains under `~/Library` ([`LIBRARY_DOMAINS`]) — iCloud
 //!   Drive (`Mobile Documents`) and every third-party sync provider (`CloudStorage`),

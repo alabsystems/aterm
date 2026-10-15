@@ -24,10 +24,10 @@
 use std::path::{Path, PathBuf};
 
 /// The directories holding gated bundled faces, relative to the manifest: the
-/// display faces (`assets/game/`) and the non-macOS terminal font STACK
-/// (`assets/bundled/` — JetBrains Mono, Cascadia Mono PL and the Noto
-/// symbol/math faces), which is held to exactly the same exact-sibling grant
-/// rule.
+/// display faces (`assets/game/`) and the terminal font STACK
+/// (`assets/bundled/` — JetBrains Mono, Cascadia Mono PL, Iosevka Term and the
+/// Noto symbol/math faces), which is held to exactly the same exact-sibling
+/// grant rule.
 const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled"];
 
 /// The suffix that marks a file as a licence notice rather than an asset.

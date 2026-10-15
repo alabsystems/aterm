@@ -17,9 +17,10 @@ use aterm_verify::{Ctx, EnvSnapshot, Mode, Scope};
 /// WHY. The first exec of a file this process wrote waits on macOS's
 /// assessment of it, and later execs do not: 0.4 s idle, past 60 s under load.
 /// Every stand-in here is such a file, and under load a stand-in's first exec
-/// outran a run's 5 s `--version` deadline and the smoke's listen wait, so
-/// fixtures read false reds. Paying that first exec here, where nothing bounds
-/// it, keeps it out of the bound a run puts on the same file. The bounds stay
+/// outran a run's `--version` deadline (5 s until 2026-10-10) and the smoke's
+/// listen wait, so fixtures read false reds. Paying that first exec here,
+/// where nothing bounds it, keeps it out of the bound a run puts on the same
+/// file. The bounds stay
 /// a real run's: widening them would let a stand-in slow at EVERY exec — a
 /// real regression — pass a fixture that a real run fails.
 ///

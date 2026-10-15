@@ -1854,15 +1854,15 @@ fn a_focus_move_the_dialog_dropped_is_made_again_from_a_fresh_read() {
     assert_eq!(m.attention, None);
 }
 
-/// The usage-limit dialog (aterm-phase's hand-built fixture) with its three
-/// rows, the `›` cursor on option `focus`.
+/// The usage-limit dialog (aterm-phase's capture of Claude Code 2.1.295) with
+/// its rows replaced by `labels`, the `❯` on option `focus`.
 fn limit_dialog(labels: &[&str], focus: usize) -> Vec<String> {
     aterm_phase::prompt::fixtures::limit_options_dialog(labels, focus)
 }
 
 const LIMIT_STOP: &str = "Stop and wait for limit to reset";
-const LIMIT_WAIT: &str = "Wait here, then continue automatically at Sep 27 at 7pm";
-const LIMIT_CREDITS: &str = "Switch to usage credits";
+const LIMIT_WAIT: &str = "Wait here, then continue automatically at 12:23pm";
+const LIMIT_UPGRADE: &str = "Upgrade your plan";
 
 /// The usage-limit dialog in the loop: under the window's defaults the focus
 /// is moved from `Stop and wait …` onto `Wait here, then continue
@@ -1882,7 +1882,7 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG);
     let mut m = fenced(vec![
         first,
-        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
         idle_screen(),
     ]);
     m.vanish_after = Some(0);
@@ -1895,8 +1895,8 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
         format!("APPROVED seq=102 {LIMIT_WAIT}"),
         "{lines:?}"
     );
-    let title = crate::supervise::policy::row_guard(" What do you want to do?");
-    let wait = crate::supervise::policy::row_guard(&format!(" › 2. {LIMIT_WAIT}"));
+    let title = crate::supervise::policy::row_guard("  What do you want to do?");
+    let wait = crate::supervise::policy::row_guard(&format!("  ❯ 2. {LIMIT_WAIT}"));
     assert_eq!(
         m.presses(),
         [
@@ -1917,7 +1917,7 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
 
     // The wait row FIRST, the focus already on it: no move, Enter alone.
     let mut m = fenced(vec![
-        limit_dialog(&[LIMIT_WAIT, LIMIT_STOP, LIMIT_CREDITS], 0),
+        limit_dialog(&[LIMIT_WAIT, LIMIT_STOP, LIMIT_UPGRADE], 0),
         idle_screen(),
     ]);
     m.vanish_after = Some(0);
@@ -1936,8 +1936,8 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     // a fresh read and guarded on the focused wait row itself; never a digit,
     // never another row.
     let mut m = fenced(vec![
-        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 0),
-        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 0),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
     ]);
     m.vanish_after = Some(2);
     watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
@@ -1964,6 +1964,7 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
 #[test]
 fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     const WAIT: &str = "Wait here, then continue automatically at Oct 2 at 5am";
+    const CREDITS: &str = "Switch to usage credits";
     let (dir, ledger) = ledger_file("limit-wait-panel");
     let opts = SuperviseOpts {
         max: Duration::from_secs(30),
@@ -1971,11 +1972,8 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     };
     let first =
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_PANEL);
-    let moved = aterm_phase::prompt::fixtures::limit_options_panel(
-        &[LIMIT_STOP, WAIT, LIMIT_CREDITS],
-        1,
-        true,
-    );
+    let moved =
+        aterm_phase::prompt::fixtures::limit_options_panel(&[LIMIT_STOP, WAIT, CREDITS], 1, true);
     let mut m = fenced(vec![first, moved, idle_screen()]);
     m.vanish_after = Some(0);
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -2019,7 +2017,7 @@ fn the_limit_wait_is_chosen_under_approve_none_too() {
     };
     let mut m = fenced(vec![
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG),
-        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
         idle_screen(),
     ]);
     m.vanish_after = Some(0);
@@ -2047,13 +2045,13 @@ fn a_limit_options_dialog_without_a_wait_row_goes_to_the_owner() {
     for (cfg, screen, why) in [
         (
             &defaults,
-            limit_dialog(&[LIMIT_STOP, LIMIT_CREDITS], 0),
+            limit_dialog(&[LIMIT_STOP, LIMIT_UPGRADE], 0),
             "with no `Wait here",
         ),
         (
             &defaults,
             limit_dialog(
-                &[LIMIT_STOP, "Don’t continue automatically", LIMIT_CREDITS],
+                &[LIMIT_STOP, "Don’t continue automatically", LIMIT_UPGRADE],
                 0,
             ),
             "with no `Wait here",
@@ -2224,6 +2222,64 @@ fn full_power_trusts_the_folder_whatever_the_roots() {
             "{cwd}: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&ldir);
+    }
+}
+
+/// THE 2026-10-09 SWEEP'S WRONG ACTION, in the loop (Claude Code 2.1.295):
+/// the owner's bare ask rules `Write` and `Edit`, in the agent's own user
+/// settings (`settings.json` in its `CLAUDE_CONFIG_DIR`), send every Write and
+/// Edit to a person, and Claude Code draws the box an unruled call gets (the
+/// captures: no reason row). Under the host's default (full power) the box
+/// is held: escalated naming the rule, nothing pressed. Negative control: the
+/// same captured box with the rules gone is pressed `1`.
+#[test]
+fn a_file_box_the_agents_own_ask_rule_sends_is_held_in_the_loop() {
+    const WRITE: &str = include_str!("policy/fixtures/claude-2.1.295-box-write-ask-rule.txt");
+    const EDIT: &str = include_str!("policy/fixtures/claude-2.1.295-box-edit-ask-rule.txt");
+    let scratch = crate::supervise::ScratchDir::new("ask-rule", "loop");
+    let claude = scratch.join("claude");
+    std::fs::create_dir_all(&claude).expect("the Claude Code directory");
+    let settings = claude.join("settings.json");
+    let worker = WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()));
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    for (name, text, rule) in [("write", WRITE, "Write"), ("edit", EDIT, "Edit")] {
+        let rows = aterm_phase::prompt::fixtures::screen(text);
+        for ruled in [true, false] {
+            if ruled {
+                std::fs::write(&settings, r#"{"permissions":{"ask":["Write","Edit"]}}"#)
+                    .expect("the owner's settings");
+            } else {
+                std::fs::remove_file(&settings).expect("the rules gone");
+            }
+            let mut m = Mock::new(true, vec![rows.clone(), busy_screen()]);
+            m.vanish_after = Some(0);
+            let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+                s.set_approval_env(ApprovalEnv {
+                    worker: WorkerSource::Fixed(Ok(worker.clone())),
+                    ..owner_env()
+                });
+            });
+            if ruled {
+                assert!(m.presses().is_empty(), "{name}: {:?}", m.requests);
+                assert!(lines[0].starts_with("EVENT prompt "), "{name}: {lines:?}");
+                let held = m
+                    .requests
+                    .iter()
+                    .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
+                    .unwrap_or_else(|| panic!("{name}: no badge: {:?}", m.requests));
+                assert!(
+                    held.contains(&format!("(an ask rule): `{rule}` in ")),
+                    "{held}"
+                );
+            } else {
+                assert_eq!(m.presses().len(), 1, "{name}: {:?}", m.requests);
+                assert!(m.presses()[0].ends_with(" 1"), "{name}: {:?}", m.requests);
+                assert!(lines[0].starts_with("APPROVED seq="), "{name}: {lines:?}");
+            }
+        }
     }
 }
 
@@ -8750,6 +8806,31 @@ fn a_question_key_refused_busy_input_unread_is_backed_off_then_answered() {
         "{:?}",
         m.requests
     );
+}
+
+/// A WRAPPED FOOTER (aterm-phase's prompt.rs): the question dialog in a
+/// 44-column pane (MEASURED on 2.1.295, `… · Esc to` over `cancel`) read
+/// `idle` and sat unanswered and unescalated for ten minutes; read whole, it
+/// is answered as at any width: one fenced Enter on the focused recommended
+/// option, and nothing asked of the owner.
+#[test]
+fn a_question_whose_footer_wraps_is_answered() {
+    use aterm_phase::prompt::fixtures as f;
+    let mut m = questioned(vec![q(f::QUESTION_ONE_44_2_1_295), idle_screen()]);
+    m.vanish_after = Some(1);
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    let _ = s.supervise(&answering(30, None));
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "{:?}", m.requests);
+    assert!(
+        presses[0].ends_with(&format!(
+            " if={} enter",
+            guarded("❯ 1. nextest (Recommended)")
+        )),
+        "{presses:?}"
+    );
+    assert_eq!(m.attention, None, "nothing asked of the owner");
 }
 
 /// A draft typed into the composer while the turn ran does not withhold the

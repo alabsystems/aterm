@@ -1,0 +1,27 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (34x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the same usage-limit options dialog after `ctl resize 50 34`: the stop and wait rows wrap onto a second row at column seven, and the footer wraps after `Esc to`, its `cancel` alone on the row under it at column two
+           Claude Code v2.1.295
+ ▐▛███▛█   Sonnet 5.5
+▝▜██████▀  Claude API
+ ▝▝   ▝▝   /…/tmp/at.yhp3/proj
+
+
+❯ carry on with the task
+  ⎿  You've hit your session limit
+     · resets 12:23pm
+     (America/Los_Angeles)
+
+✻ Cogitated for 0s · done 12:18 PM
+
+❯ /rate-limit-options
+
+──────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to
+       reset
+    2. Wait here, then continue
+       automatically at 12:23pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc to
+  cancel

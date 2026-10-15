@@ -162,7 +162,14 @@ fn harness_work_in_flight_at_a_commit_is_carried_never_dropped() {
 /// policy starts at the next pass — is handed by the host once it
 /// supervises again; and the next park carries the relaunch the rollback
 /// queued, an overtaken one of the same tab notwithstanding; and one a quit
-/// keeps the queue from taking stays owed for the quit layout. NEGATIVE
+/// keeps the queue from taking stays owed for the quit layout. Round
+/// seventeen: a panic of the host's loop loses no exit its workers held, and
+/// an exit no pass sees as it comes is read as it is seen, whatever a Claude
+/// Code started before the host hands it removes — and an agent a relaunch
+/// lands is watched until a pass names it, the host down or not. Round
+/// eighteen: the rollback queue's landing is watched as a worker's is, a
+/// landing no read reaches keeps its worker — and the queue's keeps its
+/// attempt — and a panic in the host's restart loses no worker. NEGATIVE
 /// CONTROLS: the mutants that shipped, each caught by its invariant.
 #[test]
 fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
@@ -329,6 +336,254 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
     for action in ["QueueSteps", "Park", "Start", "HandUnwatched"] {
         assert!(!model.action_enabled(action, &quit), "{action}: {quit:?}");
     }
+    // Round seventeen: the host's loop panics, and the agent crashes while
+    // it waits out its back-off — a Claude Code started meanwhile sweeping
+    // the record. The workers lived on: nothing is handed while the host is
+    // down, and its first pass back hands the exit, read as it was seen.
+    let down = run(&model, &["Panic", "Crash", "Sweep"]);
+    assert!(!model.action_enabled("Hand", &down), "{down:?}");
+    let back = run(
+        &model,
+        &["Panic", "Crash", "Sweep", "Up", "Hand", "Read", "Relaunch"],
+    );
+    assert_eq!((back["done"], back["down"]), (1, 0));
+    // A crash while a Commit holds the host, swept during the hold: the exit
+    // left to the host was read as it was seen, and is relaunched once the
+    // Commit fails — and so when the panic and the Commit coincide, once the
+    // host is back.
+    let held = run(
+        &model,
+        &[
+            "Suspend",
+            "EndUnhanded",
+            "Crash",
+            "Sweep",
+            "Resume",
+            "Rollback",
+            "HandUnwatched",
+            "Read",
+            "Relaunch",
+        ],
+    );
+    assert_eq!((held["done"], held["unwatched"]), (1, 0));
+    let both = run(
+        &model,
+        &[
+            "Panic",
+            "Suspend",
+            "EndUnhanded",
+            "Crash",
+            "Sweep",
+            "Resume",
+            "Rollback",
+        ],
+    );
+    assert!(!model.action_enabled("HandUnwatched", &both), "{both:?}");
+    let both = run(
+        &model,
+        &[
+            "Panic",
+            "Suspend",
+            "EndUnhanded",
+            "Crash",
+            "Sweep",
+            "Resume",
+            "Rollback",
+            "Up",
+            "HandUnwatched",
+            "Read",
+            "Relaunch",
+        ],
+    );
+    assert_eq!((both["done"], both["unwatched"]), (1, 0));
+    // The review of round seventeen's first cut: a worker's relaunch lands
+    // while the host is down, and the agent it started crashes before the
+    // host is back — no pass read it back (`Back` needs one), so no worker
+    // holds it and no mark, but its watch does: the host's first pass hands
+    // that exit, read as it was seen, and it is relaunched again. With the
+    // host up the pass that names it starts its worker and ends the watch.
+    let landed = run(
+        &model,
+        &[
+            "Crash", "Hand", "Read", "Panic", "Relaunch", "Crash", "Sweep",
+        ],
+    );
+    assert!(!model.action_enabled("Back", &landed), "{landed:?}");
+    assert!(
+        !model.action_enabled("HandUnwatched", &landed),
+        "{landed:?}"
+    );
+    let relaunched = run(
+        &model,
+        &[
+            "Crash",
+            "Hand",
+            "Read",
+            "Panic",
+            "Relaunch",
+            "Crash",
+            "Sweep",
+            "Up",
+            "HandUnwatched",
+            "Read",
+            "Relaunch",
+        ],
+    );
+    assert_eq!(
+        (
+            relaunched["done"],
+            relaunched["landed"],
+            relaunched["worker"]
+        ),
+        (1, 1, 0)
+    );
+    let named = run(&model, &["Crash", "Hand", "Read", "Relaunch", "Start"]);
+    assert_eq!((named["worker"], named["landed"]), (1, 0));
+    // Round eighteen: the rollback queue's landing is watched too — its
+    // agent crashing before a pass names it is handed by the host and
+    // relaunched once more.
+    let queue_landed = run(
+        &model,
+        &[
+            "Crash",
+            "Hand",
+            "Read",
+            "Suspend",
+            "Decide",
+            "Resume",
+            "Rollback",
+            "QueueSteps",
+        ],
+    );
+    assert_eq!(
+        (queue_landed["landed"], queue_landed["queued"]),
+        (1, 0),
+        "{queue_landed:?}"
+    );
+    let queue_relaunched = run(
+        &model,
+        &[
+            "Crash",
+            "Hand",
+            "Read",
+            "Suspend",
+            "Decide",
+            "Resume",
+            "Rollback",
+            "QueueSteps",
+            "Crash",
+            "Sweep",
+            "HandUnwatched",
+            "Read",
+            "Relaunch",
+        ],
+    );
+    assert_eq!(
+        (queue_relaunched["done"], queue_relaunched["landed"]),
+        (1, 1)
+    );
+    // A landing no read reaches keeps its worker, while the host is down
+    // too: its agent's crash is its own relaunch's again, and a later read
+    // is a landing watched as any.
+    let unread = run(
+        &model,
+        &["Crash", "Hand", "Read", "Panic", "RelaunchUnread", "Crash"],
+    );
+    assert_eq!((unread["worker"], unread["agent"]), (3, 0), "{unread:?}");
+    let reread = run(
+        &model,
+        &[
+            "Crash",
+            "Hand",
+            "Read",
+            "Panic",
+            "RelaunchUnread",
+            "Crash",
+            "Relaunch",
+        ],
+    );
+    assert_eq!(
+        (reread["done"], reread["landed"], reread["worker"]),
+        (1, 1, 0)
+    );
+    // The review of round eighteen's first cut: the rollback queue's landing
+    // no read reaches keeps its attempt, the exit's holder — read later, it
+    // is watched; crashed unread, it is owed again and stepped again.
+    let rollback_queued = [
+        "Crash", "Hand", "Read", "Suspend", "Decide", "Resume", "Rollback",
+    ];
+    let unread_queued = run(
+        &model,
+        &[&rollback_queued[..], &["QueueStepsUnread"]].concat(),
+    );
+    assert_eq!(
+        (
+            unread_queued["queued"],
+            unread_queued["qlanded"],
+            unread_queued["agent"]
+        ),
+        (1, 1, 1),
+        "{unread_queued:?}"
+    );
+    let read_late = run(
+        &model,
+        &[
+            &rollback_queued[..],
+            &["QueueStepsUnread", "QueueReadsLanded"],
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        (
+            read_late["queued"],
+            read_late["qlanded"],
+            read_late["landed"]
+        ),
+        (0, 0, 1)
+    );
+    let crashed_unread = run(
+        &model,
+        &[&rollback_queued[..], &["QueueStepsUnread", "Crash"]].concat(),
+    );
+    assert_eq!(
+        (
+            crashed_unread["queued"],
+            crashed_unread["qlanded"],
+            crashed_unread["agent"]
+        ),
+        (1, 0, 0),
+        "{crashed_unread:?}"
+    );
+    let stepped_again = run(
+        &model,
+        &[
+            &rollback_queued[..],
+            &["QueueStepsUnread", "Crash", "QueueSteps"],
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        (
+            stepped_again["done"],
+            stepped_again["landed"],
+            stepped_again["queued"]
+        ),
+        (1, 1, 0)
+    );
+    // A pass that names the unread landing's agent ends the attempt: its
+    // own worker's.
+    let named_unread = run(
+        &model,
+        &[&rollback_queued[..], &["QueueStepsUnread", "Start"]].concat(),
+    );
+    assert_eq!(
+        (
+            named_unread["worker"],
+            named_unread["queued"],
+            named_unread["qlanded"]
+        ),
+        (1, 0, 0)
+    );
 
     // Each mutant, alone, breaks its claim.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
@@ -425,6 +680,109 @@ fn a_relaunch_owed_through_a_failed_commit_is_never_lost() {
         "Rollback",
         "Quit",
         "DecideClosedDrops",
+    ]);
+    // Until round seventeen: the host's panic dropped its workers, stopping
+    // each — one supervising ended leaving no exit to the host, one handed
+    // its exit settled what it owed — and the crash while the host was down
+    // was never relaunched.
+    lost(&[
+        "PanicStops",
+        "Crash",
+        "EndUnhanded",
+        "Up",
+        "Suspend",
+        "Resume",
+        "Rollback",
+    ]);
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "PanicStops",
+        "Decide",
+        "Up",
+        "Suspend",
+        "Resume",
+        "Rollback",
+    ]);
+    // Until round seventeen: an exit left to the host while a Commit held it
+    // was read only by the worker it was handed after the hold, the record
+    // swept by then: a graceful exit.
+    lost(&[
+        "Suspend",
+        "EndUnhanded",
+        "CrashUnseen",
+        "Sweep",
+        "Resume",
+        "Rollback",
+        "HandUnwatched",
+        "Read",
+    ]);
+    // Until the review of round seventeen's first cut: the agent a relaunch
+    // landed was left to the roster with nothing watching it, and its crash
+    // before a pass named it was read by nobody.
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "Panic",
+        "Relaunch",
+        "LandedLost",
+        "Up",
+        "Suspend",
+        "Resume",
+        "Rollback",
+    ]);
+    // Until round eighteen: the rollback queue's landing was watched by
+    // nobody, and its agent's crash before a pass named it was read by
+    // nobody.
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "Suspend",
+        "Decide",
+        "Resume",
+        "Rollback",
+        "QueueLandedLost",
+    ]);
+    // Until round eighteen: a landing no read reached ended its worker with
+    // nothing watching its agent, whose crash was read by nobody.
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "Panic",
+        "UnreadLandedLost",
+        "Up",
+        "Suspend",
+        "Resume",
+        "Rollback",
+    ]);
+    // Round eighteen's first cut: the queue's landing no read reached ended
+    // its attempt, and its crash before any read was held by nobody.
+    lost(&[
+        "Crash",
+        "Hand",
+        "Read",
+        "Suspend",
+        "Decide",
+        "Resume",
+        "Rollback",
+        "QueueStepsUnread",
+        "QueueUnreadLost",
+    ]);
+    // Until round eighteen: a panic in the host's restart dropped its
+    // workers, as the run's own panic had before round seventeen.
+    lost(&[
+        "Panic",
+        "RestartPanicStops",
+        "Crash",
+        "EndUnhanded",
+        "Up",
+        "Suspend",
+        "Resume",
+        "Rollback",
     ]);
     // Round twelve: both captures read the overtaken relaunch first.
     let dropped = run(

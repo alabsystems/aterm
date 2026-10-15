@@ -82,8 +82,6 @@ fn reduce_one_returned_failure(
     app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id: 1,
         nonce: None,
         live: Vec::new(),
@@ -218,8 +216,6 @@ fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
     app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id: 2,
         nonce: None,
         live: Vec::new(),

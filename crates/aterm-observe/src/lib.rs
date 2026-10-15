@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use aterm_core::terminal::RowMatch;
+use aterm_core::terminal::{RowMatch, RowVerdict};
 
 /// Re-export the regex compile error so dependents (e.g. `aterm-agent`) can name
 /// it without taking a direct `aterm-regex` dependency — the regex boundary stays
@@ -40,14 +40,19 @@ pub struct RegexRowMatch {
 
 impl RowMatch for RegexRowMatch {
     #[inline]
-    fn matches(&self, row: &str) -> bool {
-        // FAIL CLOSED on a refused match (the engine's budget ran out). The
-        // alternative — latching the watcher on a row the engine never finished
-        // reading — would fire an agent's `await match <re>` on evidence that was
-        // never gathered, and a false latch releases a turn early. "Not yet" is
-        // the answer that stays correct if the budget was the only thing in the
-        // way, so the row is reported as a non-match.
-        self.re.try_is_match(row).unwrap_or(false)
+    fn verdict(&self, row: &str) -> RowVerdict {
+        // A refused scan (the engine's budget ran out) is UNDECIDED, never a
+        // non-match. Either guess would latch some watcher on evidence that was
+        // never gathered. A match would fire an agent's `await match <re>` early.
+        // A non-match, which is what this used to answer, fires the inverse
+        // predicate (`await gone`, `turn … settle=gone:`, the supervisor's busy
+        // test) while the row is still on the screen. Undecided keeps both kinds
+        // of wait pending, which stays correct if the budget was the only thing
+        // in the way (see `RowMatch`, ruling 2026-10-10).
+        match self.re.try_is_match(row) {
+            Ok(matched) => matched.into(),
+            Err(_) => RowVerdict::Undecided,
+        }
     }
 }
 
@@ -121,9 +126,10 @@ const REGEX_STEP_LIMIT: u64 = 1 << 22;
 /// multi-megabyte NFA; and the matcher carries [`REGEX_STEP_LIMIT`], which
 /// bounds the *scan* — the cost of running the admitted program over a row,
 /// which the size ceiling alone does not bound. A row that exhausts it is
-/// reported as a non-match. This
-/// mirrors the search verb (`aterm-search`); the live PTY-driven watcher path
-/// shares the same choke point.
+/// [`RowVerdict::Undecided`]: neither a match nor shown clear, so `await match`
+/// and `await gone` both keep waiting. This mirrors the search verb
+/// (`aterm-search`); the live PTY-driven watcher path shares the same choke
+/// point.
 ///
 /// # Errors
 /// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length ceiling,
@@ -248,6 +254,55 @@ mod tests {
         assert!(sat.seq > 0);
     }
 
+    /// `gone` WAITS ON A ROW THE SCAN BUDGET COULD NOT READ (ruling 2026-10-10).
+    ///
+    /// A 4,001-character row that really ends in the match exhausts
+    /// [`REGEX_STEP_LIMIT`] under `(?:x?){1020}z`. The refusal used to read as
+    /// "no match", so `await gone` latched with the row still on screen, and
+    /// `turn … settle=gone:` and the supervisor's busy test went with it. Now
+    /// both predicates keep waiting. `await match` is unchanged: it never
+    /// latched on the refused row, and it latches once the row can be read.
+    #[test]
+    fn row_gone_waits_while_a_visible_row_exhausts_the_scan_budget() {
+        let base = Instant::now();
+        let mut t = Terminal::new(24, 4096);
+        let heavy = format!("{}z\r\n", "x".repeat(4000));
+        t.process_at(heavy.as_bytes(), clock_at(base, 5));
+        let m = row_matcher("(?:x?){1020}z").expect("compile");
+        let shown = t
+            .watch_rows(m.clone(), RowRange::All, base)
+            .expect("arm match");
+        let gone = t.watch_rows_gone(m, RowRange::All, base).expect("arm gone");
+        assert!(
+            t.watch_poll(shown).is_none(),
+            "a row the budget refused is not a match"
+        );
+        assert!(
+            t.watch_poll(gone).is_none(),
+            "a row the budget refused is not gone: it is still on screen"
+        );
+
+        // More output with the heavy row still visible: still pending.
+        t.process_at(b"still working\r\n", clock_at(base, 10));
+        assert!(
+            t.watch_poll(gone).is_none(),
+            "still unread => still pending"
+        );
+
+        // The screen is redrawn with a readable match: `await match` latches,
+        // `gone` holds.
+        t.process_at(b"\x1b[H\x1b[2Jxxxz\r\n", clock_at(base, 20));
+        assert!(t.watch_poll(shown).is_some(), "a readable match latches");
+        assert!(
+            t.watch_poll(gone).is_none(),
+            "a readable match holds `gone`"
+        );
+
+        // The match leaves: every row is read and clear, so `gone` latches.
+        t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 30));
+        assert!(t.watch_poll(gone).is_some(), "the row left => `gone`");
+    }
+
     #[test]
     fn bad_pattern_is_a_clean_error_not_a_panic() {
         assert!(row_matcher(r"(unclosed").is_err());
@@ -308,11 +363,11 @@ mod tests {
     /// from a pattern nothing else in this file refuses. [`REGEX_STEP_LIMIT`]
     /// is what refuses it.
     ///
-    /// The refusal must be a NON-match rather than a latch: latching on a row
-    /// the engine never finished reading would release an agent's `await` on
-    /// evidence that was never gathered. That the budget is what ended the scan
-    /// is read off the compiled pattern's sticky flag (shared with its clone in
-    /// the matcher), never a stopwatch.
+    /// The refusal must be UNDECIDED, neither a match nor clear: latching on a
+    /// row the engine never finished reading would release an agent's `await`
+    /// (`match` or `gone`) on evidence that was never gathered. That the budget
+    /// is what ended the scan is read off the compiled pattern's sticky flag
+    /// (shared with its clone in the matcher), never a stopwatch.
     #[test]
     fn row_matcher_fails_closed_when_a_row_exhausts_the_scan_budget() {
         let pattern = "(?:x?){1020}z";
@@ -323,9 +378,10 @@ mod tests {
         let re = bounded_regex(pattern).expect("compiles: the size ceiling admits this one");
         let matcher = RegexRowMatch { re: re.clone() };
         let row = "x".repeat(4096);
+        assert_eq!(matcher.verdict(&row), RowVerdict::Undecided);
         assert!(
-            !matcher.matches(&row),
-            "an unfinishable row is a non-match, never a latch"
+            !matcher.matches(&row) && !matcher.clears(&row),
+            "an unfinishable row is neither a match nor clear"
         );
         assert!(
             re.step_limit_exceeded(),
@@ -338,7 +394,7 @@ mod tests {
     }
 
     /// Ordinary watcher patterns over ordinary rows never touch the budget: a
-    /// row the budget refused would read as a non-match.
+    /// row the budget refused would read as undecided, not as a match.
     #[test]
     fn ordinary_patterns_never_reach_the_scan_budget() {
         let row = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);

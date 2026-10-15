@@ -21,7 +21,7 @@ use aterm_spec::{interp, verify};
 
 /// The defects the fix and its reviews found, one knob each, and the
 /// invariant that catches each alone.
-const KNOBS: [(&str, &str); 11] = [
+const KNOBS: [(&str, &str); 13] = [
     ("Terminal", "NeverStalls"),
     ("NoF1", "NoNoticeWhileLimited"),
     ("NoF2", "NeverStranded"),
@@ -33,6 +33,8 @@ const KNOBS: [(&str, &str); 11] = [
     ("UnansweredDirection", "NeverStranded"),
     ("ReadyOverDirection", "NoRestartOverDirection"),
     ("IdleOnlyRelease", "NeverStranded"),
+    ("HeldAsked", "NeverStranded"),
+    ("HeldRelease", "NeverStranded"),
 ];
 
 #[test]
@@ -107,10 +109,11 @@ fn each_defect_is_caught_on_its_own() {
 }
 
 /// THE LAST WORD IS THE REDUCER'S OWN GUARDS NEGATED: on every reachable state
-/// of the upgrade's last phases (gave up, stopped) at a point the agent can
-/// read, `Look` is enabled exactly where none of `Restart`, `Release`,
-/// `DropRelease` and `Rearm` is — at a break, where no restart is taken, the
-/// drain's `Void` of a gave-up upgrade's READY standing for it —
+/// of the upgrade's last phases (gave up, stopped) — and, while the build
+/// fails to start, of a pending or announced round — at a point the agent can
+/// read, `Look` is enabled exactly where none of `Restart`, `BuildHold`,
+/// `Release`, `DropRelease` and `Rearm` is — at a break, where no restart is
+/// taken, the drain's `Void` of a gave-up upgrade's READY standing for it —
 /// at the committed configuration and under every knob but `LastWhileOwed`,
 /// whose defect IS a last word said over a release (there it fires where
 /// `Release` also does, at a stop — never over a new round). No `Buggy`
@@ -129,13 +132,16 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
     for (name, m) in &configs {
         let mut looked = 0;
         for s in reachable(m) {
-            if !(s["phase"] == 2 || s["phase"] == 4) || s["limited"] != 0 || s["stuck"] != 0 {
+            let quiet_phase =
+                s["phase"] == 2 || s["phase"] == 4 || (s["fails"] == 1 && s["phase"] <= 1);
+            if !quiet_phase || s["limited"] != 0 || s["stuck"] != 0 {
                 assert!(!m.action_enabled("Look", &s), "{name}: {s:?}");
                 continue;
             }
             let restart = m.action_enabled("Restart", &s)
                 || (s["brk"] == 1 && s["phase"] == 2 && m.action_enabled("Void", &s));
             let last = !restart
+                && !m.action_enabled("BuildHold", &s)
                 && !m.action_enabled("Release", &s)
                 && !m.action_enabled("DropRelease", &s)
                 && !m.action_enabled("Rearm", &s);
@@ -143,7 +149,10 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
             if *name == "LastWhileOwed" {
                 assert_eq!(
                     look,
-                    last || (s["phase"] == 4 && !restart && !m.action_enabled("Rearm", &s)),
+                    last || (s["phase"] == 4
+                        && !restart
+                        && !m.action_enabled("BuildHold", &s)
+                        && !m.action_enabled("Rearm", &s)),
                     "{name}: {s:?}"
                 );
             } else {
@@ -415,11 +424,13 @@ fn no_reachable_state_is_a_permanent_wait() {
         let late = s["phase"] == 2 && s["ready"] == 1 && s["live"] == 1;
         if late {
             // The answer is acted on — or the environment holds it: the
-            // limit (the restart waits it out), or the drain's void.
+            // limit (the restart waits it out), or the drain's void — or, the
+            // build failing to start, the round is abandoned.
             assert!(
                 m.action_enabled("Restart", &s)
                     || s["limited"] == 1
-                    || m.action_enabled("Void", &s),
+                    || m.action_enabled("Void", &s)
+                    || m.action_enabled("BuildHold", &s),
                 "{s:?}"
             );
         } else {
@@ -431,10 +442,11 @@ fn no_reachable_state_is_a_permanent_wait() {
                 (0, 0, 0, 0),
                 "a fresh round: {next:?}"
             );
-            if next["limited"] == 0 {
+            if next["limited"] == 0 && next["fails"] == 0 {
                 assert!(m.action_enabled("Announce", &next), "asked: {next:?}");
             } else {
-                // A limited session is re-armed but never asked.
+                // A limited session is re-armed but never asked, nor one
+                // whose build fails to start.
                 assert!(!m.action_enabled("Announce", &next), "{next:?}");
             }
         }
@@ -501,4 +513,100 @@ fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
         terminal.check_invariant("NeverStranded", &s),
         "the agent was released: stalled, not stranded"
     );
+}
+
+/// A BUILD THAT FAILS TO START STRANDS NO AGENT IT HOLDS (round eighteen's
+/// upgradebuild lane and its review): no notice and no restart go onto it,
+/// and every agent the round asked is released. Walked: an announced round,
+/// its agent winding down (and one that answered READY), abandoned at once
+/// and released; a given-up round's late READY abandoned and released; a
+/// pending round that still owes a release (re-armed over one) types it,
+/// since no notice comes to supersede it. Each strand the review found is
+/// its knob's: under `HeldAsked` (the hold only a wait where the round
+/// would move) the announced round's and the late READY's last word find
+/// the agent holding; under `HeldRelease` the pending round's does.
+#[test]
+fn a_build_that_fails_to_start_strands_no_agent_it_holds() {
+    let m = harness_upgrade_never_strands_model();
+    let released = |m: &Model, path: &[&'static str]| {
+        let mut s = walk(m, path);
+        assert_eq!(s["holding"], 0, "{path:?}: released: {s:?}");
+        for invariant in ["NeverStranded", "NeverStalls"] {
+            assert!(m.check_invariant(invariant, &s), "{invariant}: {s:?}");
+        }
+        if m.fire("Look", &mut s) {
+            assert!(m.check_invariant("NeverStranded", &s), "{s:?}");
+        }
+    };
+    let announced = ["Announce", "BuildFails"];
+    let s = walk(&m, &announced);
+    assert!(!m.action_enabled("Announce", &s) && !m.action_enabled("Look", &s));
+    released(&m, &["Announce", "BuildFails", "BuildHold", "Release"]);
+    let ready = ["Announce", "AgentReady", "BuildFails"];
+    let s = walk(&m, &ready);
+    assert!(!m.action_enabled("Restart", &s), "no move onto it: {s:?}");
+    released(
+        &m,
+        &[
+            "Announce",
+            "AgentReady",
+            "BuildFails",
+            "BuildHold",
+            "Release",
+        ],
+    );
+    let late = [
+        "Announce",
+        "Elapse",
+        "Announce",
+        "Elapse",
+        "GiveUp",
+        "AgentReady",
+        "BuildFails",
+    ];
+    let s = walk(&m, &late);
+    assert!(!m.action_enabled("Restart", &s) && !m.action_enabled("Release", &s));
+    released(&m, &[&late[..], &["BuildHold", "Release"][..]].concat());
+    // Given up, the release left owed past the rest, re-armed: a pending
+    // round that owes it, and no notice to come.
+    let owed = [
+        "Announce",
+        "Elapse",
+        "Announce",
+        "Elapse",
+        "GiveUp",
+        "Rests",
+        "Rearm",
+        "BuildFails",
+    ];
+    let s = walk(&m, &owed);
+    assert_eq!((s["phase"], s["owed"], s["holding"]), (0, 1, 1), "{s:?}");
+    assert!(!m.action_enabled("Announce", &s) && !m.action_enabled("Look", &s));
+    released(&m, &[&owed[..], &["Release"][..]].concat());
+    // And the build proved to start since: the next round is asked.
+    let mut proved = walk(&m, &[&owed[..], &["Release", "BuildStarts"][..]].concat());
+    assert!(m.fire("Announce", &mut proved), "{proved:?}");
+
+    // THE BRANCH AS REVIEWED, knob by knob.
+    let held = interp::with_consts(&m, &[("HeldAsked", 1)]);
+    for path in [&announced[..], &ready[..], &late[..]] {
+        let mut s = walk(&held, path);
+        assert!(
+            !held.action_enabled("Restart", &s) && !held.action_enabled("Announce", &s),
+            "{path:?}"
+        );
+        if path == &announced[..] {
+            assert!(held.fire("Elapse", &mut s), "the window runs out: {s:?}");
+        }
+        assert!(held.fire("Look", &mut s), "{path:?}: {s:?}");
+        assert!(
+            !held.check_invariant("NeverStranded", &s),
+            "{path:?}: {s:?}"
+        );
+    }
+    let unreleased = interp::with_consts(&m, &[("HeldRelease", 1)]);
+    let mut s = walk(&unreleased, &owed);
+    assert!(!unreleased.action_enabled("Release", &s), "{s:?}");
+    assert!(unreleased.fire("Look", &mut s), "{s:?}");
+    assert!(!unreleased.check_invariant("NeverStranded", &s), "{s:?}");
 }

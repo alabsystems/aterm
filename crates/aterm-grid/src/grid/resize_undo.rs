@@ -210,10 +210,7 @@ impl Grid {
                 "a resize undo is only kept on a grid with no history"
             );
             let storage = &mut self.storage;
-            if storage.ring_head != 0 {
-                storage.rows.rotate_left(storage.ring_head);
-                storage.ring_head = 0;
-            }
+            storage.linearize_ring();
             // Popped newest first; the oldest demoted row is the top one.
             demoted.reverse();
             let pages = &mut storage.pages;

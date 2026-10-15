@@ -18,7 +18,7 @@
 //! (`LaunchCorroboration::poll`). LaunchServices is SCRIPTED — with the
 //! answers it was measured to give (see `LaunchError::ExitedBeforeCheckIn`
 //! and `launch_answer_names_pid`) — because a unit test may not launch an
-//! application (AGENTS.md rule 5). The live half, this build's own successor
+//! application (AGENTS.md). The live half, this build's own successor
 //! dying before its dial through `ATERM_DEBUG_DIE_BEFORE_DIAL`, is measured in
 //! the design doc.
 //!
@@ -824,7 +824,7 @@ mod waivers {
         action = "Die",
         reason = "The environment: a successor that dies before its dial (a warm-prologue fatal, \
                   a boot crash). Driven live through the ATERM_DEBUG_DIE_BEFORE_DIAL seam in \
-                  main_entry; a unit test may not launch an application (AGENTS.md rule 5), so \
+                  main_entry; a unit test may not launch an application (AGENTS.md), so \
                   the named-pid half ends a real stand-in process instead."
     )]
     #[aterm_spec::spec_unmodeled(

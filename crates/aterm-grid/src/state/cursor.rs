@@ -75,7 +75,9 @@ impl DerefMut for GridCursorState {
 impl GridCursorState {
     /// Create default tab stops (every 8 columns).
     pub(crate) fn default_tab_stops(cols: u16) -> Vec<bool> {
-        (0..cols).map(|c| c > 0 && c % 8 == 0).collect()
+        (0..usize::from(cols))
+            .map(crate::is_default_tab_stop)
+            .collect()
     }
 
     /// Get the current cursor position.

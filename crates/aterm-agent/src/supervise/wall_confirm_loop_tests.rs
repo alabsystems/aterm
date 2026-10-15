@@ -38,6 +38,9 @@ fn transcript(name: &str) -> &'static str {
         "session-limit-then-local-commands" => include_str!(
             "fixtures/claude-2.1.294-transcript-session-limit-then-local-commands.jsonl"
         ),
+        "session-limit-cancelled-then-person-turn" => include_str!(
+            "fixtures/claude-2.1.299-transcript-session-limit-cancelled-then-person-turn.jsonl"
+        ),
         other => panic!("no transcript {other}"),
     }
 }
@@ -60,6 +63,13 @@ impl TranscriptHost {
 
     fn asks(&self) -> usize {
         self.asks.load(Ordering::SeqCst)
+    }
+
+    /// From now on, every ask reads `tail` (`None`: none to read).
+    fn reads(&self, tail: Option<&str>) {
+        let mut tails = self.tails.lock().unwrap();
+        tails.clear();
+        tails.push_back(tail.map(str::to_owned));
     }
 }
 
@@ -1283,4 +1293,635 @@ fn a_limit_still_stands_after_a_persons_local_commands() {
         "{lines:#?}\n{records:#?}"
     );
     assert!(host.asks() >= 1);
+}
+
+/// `rows` as a point the loop reads: the whole screen at `seq`, the cursor at
+/// the composer's column.
+fn point_at(s: &mut Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
+    s.turn_of(Screen {
+        rows,
+        seq,
+        cursor_col: 2,
+        ..Screen::default()
+    })
+}
+
+/// A PERSON'S TURN THE TRANSCRIPT HOLDS ENDS A LEFT LIMIT'S WAIT (the review
+/// of 2026-10-14; Claude Code 2.1.299 in the lab, its transcript measured).
+/// A five-hour limit, confirmed; Esc on the vendor's countdown leaves it
+/// waited on to the reset its notice named; then — the limit lifted early —
+/// a person's short turn, over before any read saw it busy, its rows on a
+/// screen that no longer shows the notice above them (a reply long enough
+/// to scroll it off the rows read): the screen cannot order that turn
+/// against the limit, and the session's transcript can — its newest entry
+/// is the model's reply, written after the notice. The point is the continue
+/// policy's, a short turn's back-off. Measured before: the wait for the
+/// reset, the transcript not asked. NEGATIVE CONTROLS on the same screen,
+/// each the wait for the reset: the transcript still ending on the limit's
+/// notice (its cancel and nothing since), and no transcript to read.
+#[test]
+fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_cancel = rows[..=cancel].join("\n");
+    let armed: Vec<String> = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)
+        .into_iter()
+        .map(|r| {
+            r.replace("resets 3:15pm (America/Los_Angeles)", "resets in 1h")
+                .replace("limit resets 3:15pm", "limit resets in 1h")
+        })
+        .collect();
+    let cancelled = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
+    // The person's turn, the rows from the limit's prompt to the cancel off
+    // the screen.
+    let notice_rows = [
+        "carry on with the task",
+        "You've hit your session limit",
+        "/upgrade to increase",
+        "Usage limit reached",
+        "Brewed for",
+        "Automatic continue cancelled",
+    ];
+    let turned: Vec<String> = fx::screen(fx::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED)
+        .into_iter()
+        .filter(|r| !notice_rows.iter().any(|n| r.contains(n)))
+        .collect();
+    assert_eq!(
+        aterm_phase::since_limit(&turned),
+        None,
+        "the screen cannot order it"
+    );
+    let decided = |after: Option<&str>| {
+        let host = TranscriptHost::of(&[Some(at_cancel.as_str())]);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(true, vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        let wall = point_at(&mut s, armed.clone(), 101);
+        assert!(
+            matches!(wall.phase, Phase::Limited { .. }),
+            "{:?}",
+            wall.phase
+        );
+        let a = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { .. }),
+            "the confirmed wall's wait: {a:?}"
+        );
+        let left = point_at(&mut s, cancelled.clone(), 102);
+        let a = s
+            .turn_end_at_point(&left, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
+            "the left limit's wait: {a:?}"
+        );
+        host.reads(after);
+        let point = point_at(&mut s, turned.clone(), 103);
+        s.turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    let a = decided(Some(measured));
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("short turn")),
+        "the continue policy's back-off: {a:?}"
+    );
+    // NEGATIVE CONTROLS.
+    for (name, after) in [
+        ("nothing since the cancel", Some(at_cancel.as_str())),
+        ("no transcript", None),
+    ] {
+        let a = decided(after);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
+            "{name}: {a:?}"
+        );
+    }
+}
+
+/// A LIMIT A CANCEL LEFT ANSWERS THE ACT ONLY BY A NOTICE WRITTEN SINCE IT
+/// (round 17; Claude Code 2.1.299's rows and its transcript, measured in the
+/// lab). The loop's `keep going` is awaited, and the next read shows only
+/// `⏺ Automatic continue cancelled` under a five-hour limit's notice. Where
+/// the session's transcript ends on that limit's notice row written since
+/// the act (17:28:33Z, the act a second later on the loop's clock), the
+/// notice is the act's answer: confirmed, its point read `limited`, the
+/// limit waited on. Where the same row was written an hour before the act —
+/// a conversation `/resume`d inside the act's window, ending on its own
+/// older cancelled limit — it is refused, and nothing is waited on: the
+/// point is the act's, as any. With no transcript the screen alone decides,
+/// and it is waited on.
+#[test]
+fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
+    const NOTICE_AT: i64 = 1_791_998_913;
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_cancel = rows[..=cancel].join("\n");
+    assert_eq!(
+        super::super::wall_confirm::transcript_ends_on(&at_cancel).at,
+        Some(NOTICE_AT),
+        "the notice row's own stamp"
+    );
+    // The screen at the cancel: the person's later turn not drawn yet.
+    let mut cancelled = fx::screen(fx::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED);
+    let asked = cancelled
+        .iter()
+        .position(|r| r == "❯ what is left to do?")
+        .expect("the person's turn");
+    let done = cancelled
+        .iter()
+        .position(|r| r.starts_with("✻ Churned for"))
+        .expect("its done row");
+    cancelled.drain(asked..=done + 1);
+    assert!(
+        aterm_phase::left_wall(&cancelled).is_some(),
+        "{cancelled:#?}"
+    );
+    let decided = |clock: i64, tail: Option<&str>| {
+        let host = tail.map(|t| TranscriptHost::of(&[Some(t)]));
+        let opts = SuperviseOpts {
+            idle_host: host.map(|h| h as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(true, vec![cancelled.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(clock, PDT);
+        // The act the loop typed at a turn's end.
+        let busy = busy_screen();
+        let at_act = TurnEndReading::of(
+            &aterm_phase::read(Some("claude"), &busy, Some(2)),
+            &busy,
+            false,
+            None,
+            None,
+            None,
+        );
+        s.turn_end.acted(
+            &TurnEndAction::Type {
+                text: "keep going".to_string(),
+                rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+            },
+            &at_act,
+            Instant::now(),
+        );
+        let mut point = point_at(&mut s, cancelled.clone(), 102);
+        let a = s
+            .turn_end_at_point(&point, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        s.point_as_decided(&mut point);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. }
+                if why == "the worker to take the continue@v1 act"),
+            "the act's own window: {a:?}"
+        );
+        (point.phase, s.turn_end.waits_on_named_reset())
+    };
+    let (phase, waits) = decided(NOTICE_AT + 1, Some(at_cancel.as_str()));
+    assert!(
+        matches!(phase, Phase::Limited { .. }) && waits,
+        "the act's answer: {phase:?}"
+    );
+    // NEGATIVE CONTROL: an hour older than the act.
+    let (phase, waits) = decided(NOTICE_AT + 3600, Some(at_cancel.as_str()));
+    assert!(
+        phase == Phase::Idle && !waits,
+        "an older limit's notice: {phase:?}"
+    );
+    // No transcript: the screen alone.
+    let (phase, waits) = decided(NOTICE_AT + 3600, None);
+    assert!(
+        matches!(phase, Phase::Limited { .. }) && waits,
+        "hostless: {phase:?}"
+    );
+}
+
+/// `jsonl` with every row's `timestamp` moved `by` seconds (its fraction
+/// dropped): the measured rows, as if written at another time.
+fn shifted(jsonl: &str, by: i64) -> String {
+    const KEY: &str = "\"timestamp\":\"";
+    let mut out = String::new();
+    let mut rest = jsonl;
+    while let Some(i) = rest.find(KEY) {
+        let (head, tail) = rest.split_at(i + KEY.len());
+        out.push_str(head);
+        let end = tail.find('"').expect("a closed stamp");
+        let at = crate::harness::upgrade_models::parse_utc(&tail[..end]).expect("a stamp");
+        let moved = i64::try_from(at).expect("a small stamp") + by;
+        out.push_str(&aterm_types::rfc3339::format_rfc3339(
+            u64::try_from(moved).expect("after the epoch"),
+        ));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// When the measured 2.1.299 transcript's five-hour notice says it was
+/// written (2026-10-14T17:28:33Z).
+const MEASURED_NOTICE_AT: i64 = 1_791_998_913;
+
+/// The measured 2.1.299 conversation up to the vendor's cancel (a person's
+/// `hi` and its reply, then their `carry on with the task` met by the
+/// five-hour limit, its countdown cancelled), its notice written at `at`.
+fn limit_cancelled_at(at: i64) -> String {
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    let rows: Vec<&str> = measured.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    shifted(&rows[..=cancel].join("\n"), at - MEASURED_NOTICE_AT)
+}
+
+/// The measured 2.1.299 screen (`resets 10:38am`) with the rows from the
+/// first one that opens with `from` up to the composer's top rule taken
+/// out: the screen as it stood before them.
+fn measured_screen_before(from: &str) -> Vec<String> {
+    let mut rows = fx::screen(fx::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with(from))
+        .unwrap_or_else(|| panic!("no row {from}"));
+    let rule = rows
+        .iter()
+        .position(|r| r.starts_with("────"))
+        .expect("the composer's rule");
+    rows.drain(at..rule);
+    rows
+}
+
+/// The journal's waits, the `CONTINUED` lines, the server's record and
+/// the journal's refusals of one `watch` over `screens` under a host whose
+/// transcript tail is each of `tails` in turn (the last repeats), the
+/// continue policy on, its clocks short (a
+/// second's take window, a tenth of a second's back-off, a second's grace),
+/// the first `held` screens sitting until a turn is sent.
+fn transcript_run(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    held: Option<usize>,
+    tails: &[&str],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Mock) {
+    let (dir, path) = journal_file(tag);
+    let tails: Vec<Option<&str>> = tails.iter().map(|t| Some(*t)).collect();
+    let host = TranscriptHost::of(&tails);
+    let mut m = Mock::new(true, screens);
+    m.turn_releases = held;
+    m.vanish_after = Some(40);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    let opts = SuperviseOpts {
+        journal: Some(path.clone()),
+        idle_host: Some(host as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            reset_grace: Duration::from_secs(1),
+            reset_jitter: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let waits = records
+        .iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary.clone())
+        .collect();
+    let typed = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .cloned()
+        .collect();
+    let refused = refusals(&records);
+    (lines, waits, typed, refused, m)
+}
+
+/// A PERSON'S TURN THE LIMIT ANSWERS AT ONCE, CANCELLED BEFORE ANY READ, IS
+/// READ FROM THE TRANSCRIPT (round 17's residual (a), what was left of it;
+/// Claude Code 2.1.299's rows and transcript, measured in the lab). The loop
+/// backs off at the first point it sees (a person's `hi` answered); a
+/// person's `carry on with the task` meets a five-hour limit at once and
+/// their Esc on the countdown comes before the loop's next read, which shows
+/// only `⏺ Automatic continue cancelled` under the notice: no wall, no act of
+/// the loop's. The session's transcript tells this limit from the older one a
+/// `/resume`d conversation ends on: its notice row was written since the loop
+/// last looked (a second after the loop's clock here) — the limit is read as
+/// that turn's answer, its episode opened and its reset waited on (10:38 and
+/// its grace), and nothing is typed into it. Measured before: no wall, and
+/// the continue policy's back-off typed `keep going` into the standing limit.
+/// NEGATIVE CONTROL: the same rows written an hour before the loop looked (a
+/// conversation `/resume`d to its older cancelled limit) — refused, said
+/// once, and the point is the continue policy's, as before.
+#[test]
+fn a_persons_turn_the_limit_answers_cancelled_before_any_read_is_read_from_the_transcript() {
+    let before = measured_screen_before("❯ carry on with the task");
+    let cancelled = measured_screen_before("❯ what is left to do?");
+    assert!(aterm_phase::left_wall(&before).is_none(), "{before:#?}");
+    assert!(
+        aterm_phase::left_wall(&cancelled).is_some(),
+        "{cancelled:#?}"
+    );
+    let (lines, waits, typed, refused, m) = transcript_run(
+        "wc-personcancel",
+        vec![before.clone(), cancelled.clone()],
+        None,
+        &[&limit_cancelled_at(TEST_NOW + 1)],
+    );
+    assert!(
+        typed.is_empty(),
+        "nothing typed into the limit: {lines:#?}\n{waits:#?}\n{refused:#?}"
+    );
+    assert_eq!(m.turns, 0, "{:#?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l.starts_with("EVENT limited ")
+            && l.contains("Usage limit reached")
+            && l.ends_with(" reset=10:38am")),
+        "{lines:#?}"
+    );
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T17:38:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the notice named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(refused.is_empty(), "{refused:#?}");
+    // NEGATIVE CONTROL: an hour older than the loop's look.
+    let (lines, waits, typed, refused, _) = transcript_run(
+        "wc-personcancel-old",
+        vec![before, cancelled],
+        None,
+        &[&limit_cancelled_at(TEST_NOW - 3600)],
+    );
+    assert!(
+        typed
+            .first()
+            .is_some_and(|t| t.ends_with("rule=continue@v1 keep going")),
+        "the point is the continue policy's: {lines:#?}\n{waits:#?}"
+    );
+    assert_eq!(refused.len(), 1, "said once: {refused:#?}");
+    assert!(
+        refused[0].contains("written before the turn it would answer"),
+        "{refused:#?}"
+    );
+}
+
+/// AN ACT TYPED OVER A CANCELLED LIMIT, ANSWERED BY THE SAME RESET AND
+/// CANCELLED BEFORE ANY READ, IS READ FROM THE TRANSCRIPT (round 17's
+/// residual (a), what was left of it). The loop attaches to a session whose
+/// screen ends on a five-hour limit cancelled on its countdown (`resets
+/// 10:38am`), which nothing tells it still stands; it backs off and types
+/// `keep going`; the same limit answers at once and a person's Esc on the new
+/// countdown comes before the loop's first read after the act. (Measured on
+/// Claude Code 2.1.300 in the lab, 2026-10-15: a process that cancelled a
+/// limit's countdown draws no new one when the SAME reset answers again —
+/// the notice is then the last thing said, and read as a wall — but a
+/// process that resumed the conversation does: `claude --resume` redraws the
+/// cancel, the harness's first look meets it, and its act's answer arms a
+/// countdown, lab `pc18b3`.) That read
+/// shows the act's prompt, a notice naming the SAME reset and the cancel: the
+/// screen cannot tell it from the notice the act was typed over (a screen
+/// that has not moved yet draws the same), and the transcript can — its
+/// newest notice row was written since the act (until the act it ends on the
+/// older one, which the decision that types the act reads and refuses: no
+/// answer of any turn's since the last look). Read as the act's answer:
+/// the limit waited on to 10:38 and its grace, nothing typed again. Measured
+/// before: the act's window ended on its short turn and the continue policy
+/// typed `keep going` into the standing limit a second time. NEGATIVE
+/// CONTROL: the transcript's newest notice the one the act was typed over
+/// (ten minutes older): no answer, refused with no word (the screen read no
+/// wall), and the continue policy goes on as before.
+#[test]
+fn an_act_over_a_cancelled_limit_answered_by_the_same_reset_is_read_from_the_transcript() {
+    let first = measured_screen_before("❯ what is left to do?");
+    let mut answered = first.clone();
+    let rule = answered
+        .iter()
+        .position(|r| r.starts_with("────"))
+        .expect("the composer's rule");
+    let act: Vec<String> = [
+        "❯ keep going",
+        "  ⎿  You've hit your session limit · resets 10:38am (America/Los_Angeles)",
+        "     /upgrade to increase your usage limit.",
+        "",
+        "⏺ Usage limit reached · continuing automatically at 10:38am · esc to cancel",
+        "",
+        "✻ Brewed for 0s · done 8:55 AM",
+        "",
+        "⏺ Automatic continue cancelled · /rate-limit-options to re-arm",
+        "",
+    ]
+    .iter()
+    .map(|r| (*r).to_string())
+    .collect();
+    answered.splice(rule..rule, act);
+    assert!(aterm_phase::left_wall(&answered).is_some(), "{answered:#?}");
+    let older = limit_cancelled_at(TEST_NOW - 600);
+    // The act's own rows: its prompt, the notice, the cancel — written since.
+    let acts = {
+        let ours = another_conversation(&limit_cancelled_at(TEST_NOW + 1));
+        let rows: Vec<&str> = ours.lines().collect();
+        let prompt = rows
+            .iter()
+            .position(|r| r.contains("carry on with the task"))
+            .expect("the prompt");
+        rows[prompt..]
+            .join("\n")
+            .replace("carry on with the task", "keep going")
+    };
+    let (lines, waits, typed, refused, m) = transcript_run(
+        "wc-samereset",
+        vec![first.clone(), answered.clone()],
+        Some(0),
+        &[&older, &format!("{older}\n{acts}")],
+    );
+    assert!(
+        typed.len() == 1 && typed[0].ends_with(" rule=continue@v1 keep going"),
+        "the act the limit answered, and nothing typed into it: {lines:#?}\n{waits:#?}"
+    );
+    assert_eq!(m.turns, 1, "{:#?}", m.requests);
+    assert!(
+        waits
+            .last()
+            .is_some_and(|w| w.starts_with("until=2026-09-17T17:38:0")
+                && w.ends_with("usage-session resets")),
+        "the reset the notice named and its grace: {waits:#?}\n{lines:#?}"
+    );
+    assert!(refused.is_empty(), "{refused:#?}");
+    // NEGATIVE CONTROL: the newest notice the one the act was typed over.
+    let (lines, waits, typed, refused, _) = transcript_run(
+        "wc-samereset-old",
+        vec![first, answered],
+        Some(0),
+        &[&older],
+    );
+    assert!(
+        typed.len() >= 2,
+        "the continue policy goes on: {lines:#?}\n{waits:#?}"
+    );
+    assert!(refused.is_empty(), "no wall the screen read: {refused:#?}");
+}
+
+/// `jsonl` as ANOTHER conversation wrote it: every id in it (each row's
+/// `uuid`, its parent's, its session's, its prompt's) another, consistently,
+/// so its rows chain as before.
+fn another_conversation(jsonl: &str) -> String {
+    let is_id = |s: &str| {
+        s.len() == 36
+            && s.char_indices().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            })
+    };
+    let ids: std::collections::BTreeSet<&str> = jsonl
+        .match_indices('"')
+        .filter_map(|(i, _)| jsonl.get(i + 1..i + 37))
+        .filter(|s| is_id(s))
+        .collect();
+    let mut out = jsonl.to_string();
+    for id in ids {
+        let first = id.chars().next().expect("an id");
+        let other = if first == 'e' { 'f' } else { 'e' };
+        out = out.replace(id, &format!("{other}{}", &id[1..]));
+    }
+    out
+}
+
+/// A `<task-notification>` row Claude Code writes itself when a background
+/// task ends (its shape as `harness/upgrade_login_wall_tests.rs` keeps it),
+/// chained under `parent`.
+fn task_notification(parent: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"{parent}","isSidechain":false,"type":"user","message":{{"role":"user","content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"}},"uuid":"00000000-0000-4000-8000-00000000000a","origin":{{"kind":"task-notification"}},"promptSource":"system","timestamp":"2026-10-14T17:29:00.000Z"}}"#
+    )
+}
+
+/// THE TRANSCRIPT'S WITNESS OF A TURN SINCE A LEFT LIMIT IS THE LIMIT'S OWN
+/// ROW, FOLLOWED BY A REPLY THE API SERVED (the review of 2026-10-14, the lab
+/// on Claude Code 2.1.300). A five-hour limit confirmed by this session's
+/// transcript, its notice the newest entry; Esc on the countdown leaves it
+/// waited on. Each of these left the wait standing on the base of 9d9ae75bb
+/// and ended it on the branch of 44ed0f339, which read "went on" off
+/// whatever tail the host handed it:
+/// * a person `/resume`s ANOTHER conversation, whose rows the screen shows
+///   with no limit's notice among them (scrolled off) and whose transcript
+///   the host now hands over: its own older limit, a reply under it —
+///   measured live, `wall-wait-end@v1` and `keep going` typed into the
+///   standing limit (the stub's 429);
+/// * this conversation's tail ending on a `<task-notification>` row Claude
+///   Code wrote itself (a background task's end), no turn served — measured
+///   live, in the same second as the wake's 429;
+/// * the screen still drawing this limit's notice with nothing after it,
+///   where the screen orders the conversation by itself, and the transcript
+///   is not asked (the design note's rule).
+#[test]
+fn a_left_limits_wait_ends_on_its_own_rows_alone() {
+    let measured = transcript("session-limit-cancelled-then-person-turn");
+    // This session's conversation: the same limit and turn, its own ids.
+    let ours = another_conversation(measured);
+    let rows: Vec<&str> = ours.lines().skip(1).collect();
+    let cancel = rows
+        .iter()
+        .position(|r| r.contains("Automatic continue cancelled"))
+        .expect("the cancel");
+    let at_cancel = rows[..=cancel].join("\n");
+    let cancel_id = {
+        let row = rows[cancel];
+        let from = row.find("\"uuid\":\"").expect("its uuid") + "\"uuid\":\"".len();
+        row[from..from + 36].to_string()
+    };
+    let armed: Vec<String> = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)
+        .into_iter()
+        .map(|r| {
+            r.replace("resets 3:15pm (America/Los_Angeles)", "resets in 1h")
+                .replace("limit resets 3:15pm", "limit resets in 1h")
+        })
+        .collect();
+    let cancelled = fx::screen(fx::WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
+    let notice_rows = [
+        "carry on with the task",
+        "You've hit your session limit",
+        "/upgrade to increase",
+        "Usage limit reached",
+        "Brewed for",
+        "Automatic continue cancelled",
+    ];
+    let unordered: Vec<String> = fx::screen(fx::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED)
+        .into_iter()
+        .filter(|r| !notice_rows.iter().any(|n| r.contains(n)))
+        .collect();
+    let decided = |point: &[String], after: &str| {
+        let host = TranscriptHost::of(&[Some(at_cancel.as_str())]);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(true, vec![armed.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        let wall = point_at(&mut s, armed.clone(), 101);
+        let a = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(60)), &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { .. }),
+            "the confirmed wall's wait: {a:?}"
+        );
+        let left = point_at(&mut s, cancelled.clone(), 102);
+        let a = s
+            .turn_end_at_point(&left, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")),
+            "the left limit's wait: {a:?}"
+        );
+        host.reads(Some(after));
+        let p = point_at(&mut s, point.to_vec(), 103);
+        s.turn_end_at_point(&p, None, &opts)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    let notified = format!("{at_cancel}\n{}", task_notification(&cancel_id));
+    let ended: Vec<String> = [
+        ("another conversation resumed", &unordered, measured),
+        ("a task notification", &unordered, notified.as_str()),
+        ("the notice still the screen's last", &cancelled, ours.as_str()),
+    ]
+    .into_iter()
+    .filter_map(|(name, point, after)| {
+        let a = decided(point, after);
+        (!matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-session resets")))
+            .then(|| format!("{name}: {a:?}"))
+    })
+    .collect();
+    assert!(ended.is_empty(), "the wait ended: {ended:#?}");
 }

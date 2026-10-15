@@ -181,7 +181,7 @@ pub struct SupervisorConfig {
     pub approve: Approve,
     /// Folders whose trust dialog is answered under [`Approve::Safe`]. A
     /// leading `~/` is the home directory; a trailing `*` matches any suffix
-    /// of the last component (`~/Developer/aterm*` is every aterm worktree).
+    /// of the last component (`~/aterm*` is every aterm worktree).
     pub trust_roots: Vec<String>,
     /// Under `approve = "safe"`, hand an unproven rm circuit breaker to a
     /// person. Off (the default): the vendor's `rm` on a possibly-empty
@@ -363,14 +363,9 @@ impl Default for SupervisorConfig {
             enabled: true,
             headless: true,
             approve: Approve::All,
-            trust_roots: [
-                "~/Developer/aterm*",
-                "~/Developer/ay*",
-                "~/Developer/trust*",
-                "/private/tmp/claude-*",
-            ]
-            .map(String::from)
-            .to_vec(),
+            trust_roots: ["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]
+                .map(String::from)
+                .to_vec(),
             rm_breaker_ask: false,
             answer_questions: true,
             question_priority: QuestionPriority::Recommended,
@@ -2104,16 +2099,15 @@ mod tests {
         );
         // trust_roots is read only where `safe` consults it: fewer roots
         // there are a limit, more are the owner's own; under `all` neither.
-        let roots = "trust_roots = [\"~/Developer/aterm*\"]\n";
+        let roots = "trust_roots = [\"~/aterm*\"]\n";
         assert!(read(&format!("[harness]\n{roots}")).against_default() == Written::default());
         assert_eq!(
             read(&format!("[harness]\napprove = \"safe\"\n{roots}"))
                 .against_default()
                 .limits,
-            ["approve: safe", "trust_roots: ~/Developer/aterm*"]
+            ["approve: safe", "trust_roots: ~/aterm*"]
         );
-        let more = "trust_roots = [\"~/Developer/aterm*\", \"~/Developer/ay*\", \
-                    \"~/Developer/trust*\", \"/private/tmp/claude-*\", \"~/x\"]\n";
+        let more = "trust_roots = [\"~/aterm*\", \"~/ay*\", \"$HOME/trust*\", \"/private/tmp/claude-*\", \"~/x\"]\n";
         let w = read(&format!("[harness]\napprove = \"safe\"\n{more}")).against_default();
         assert_eq!((w.limits.len(), w.own), (1, vec!["trust_roots"]));
     }

@@ -59,6 +59,7 @@ use super::upgrade_catalog::{self as catalog, Baked};
 use super::upgrade_models::{self as models, ModelRecord, ModelVerdict, Priority};
 use crate::RelayClient;
 use crate::supervise::approvals;
+use crate::supervise::policy::git_config::claude_dir_at;
 use crate::supervise::policy::server_fences_gen;
 use crate::supervise::run::composer_guard;
 use crate::supervise::screen::HumanInput;
@@ -72,6 +73,10 @@ mod codex;
 
 #[path = "upgrade_watch.rs"]
 mod watch;
+
+#[path = "upgrade_build_start.rs"]
+mod build_start;
+pub use build_start::BUILD_FAILS;
 #[cfg(test)]
 pub(crate) use upgrade_status::pin_awake_since;
 #[cfg(any(test, feature = "spec-anchors"))]
@@ -787,20 +792,58 @@ pub struct Opts {
     /// a model is judged by the build's own catalog alone. `false` — one
     /// login, the packaged state — reads them as ever.
     pub several_logins: bool,
+    /// Where a pass with no roster of its own learns the live tabs
+    /// ([`Instances`], [`instance_tabs`]): the machine's for the product, a
+    /// test's own stand-ins in a test.
+    pub instances: Instances,
 }
 
-/// CLAUDE CODE'S OWN FILES ABOUT MODELS, for one sweep's judgments
-/// ([`models::read_evidence`]) — or THE UNKNOWN ([`models::Evidence`]'s
-/// default: no served catalog, no denial, no disabled option, no
-/// announcement) while two or more accounts are listed
-/// ([`Opts::several_logins`]). NEVER OBSERVED with two real logins: that the
-/// caches then follow the login that started last is read in the bundle, not
-/// measured.
-fn model_evidence(opts: &Opts) -> models::Evidence {
-    if opts.several_logins {
-        return models::Evidence::default();
+/// WHERE A PASS WITH NO ROSTER OF ITS OWN (the CLI's sweep) LEARNS THE LIVE
+/// TABS whose leaders name the Claude homes it reads ([`instance_tabs`],
+/// [`Homes::read`]). A field, not a `cfg(test)` arm: the machine's instances
+/// are the owner's, and a test — a unit test, or one in `tests/` built
+/// without `cfg(test)` — names the sockets it may dial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Instances {
+    /// Every instance `aterm ctl ls` lists ([`aterm_ctl::local_instances`]);
+    /// where that directory cannot be listed, or lists none, the one
+    /// instance [`connect`] reaches. The product's.
+    Machine,
+    /// The instances at these control sockets and no other (none: no
+    /// instance at all): a test's own stand-ins, never the machine's.
+    Listed(Vec<String>),
+}
+
+/// CLAUDE CODE'S OWN FILES ABOUT MODELS for the home `records` names, for
+/// one sweep's judgments ([`models::read_evidence`]: the served catalog
+/// cache in its directory and the profile Claude Code keeps for it,
+/// [`Records::profile`]: for an EMPTY `CLAUDE_CONFIG_DIR`, `$HOME`'s)
+/// — or THE UNKNOWN ([`models::Evidence`]'s default: no served catalog, no
+/// denial, no disabled option, no announcement) while two or more accounts
+/// are listed ([`Opts::several_logins`]), in every home alike. NEVER
+/// OBSERVED with two real logins: that the caches then follow the login
+/// that started last is read in the bundle, not measured.
+fn model_evidence(opts: &Opts, records: &Records) -> models::Evidence {
+    match (records.dir(), records.profile(&opts.home)) {
+        (Some(dir), Some(profile)) if !opts.several_logins => models::read_evidence(dir, &profile),
+        _ => models::Evidence::default(),
     }
-    models::read_evidence(&opts.home.join(".claude"), &opts.home.join(".claude.json"))
+}
+
+/// THE GLOBAL CONFIG CLAUDE CODE KEEPS FOR THE CLAUDE HOME `claude_dir`
+/// (onboarding, the profile, the model access caches), read by the
+/// directory alone: `~/.claude.json` BESIDE the user's own
+/// `user_home/.claude`, and `<dir>/.claude.json` INSIDE any other home a
+/// `CLAUDE_CONFIG_DIR=<dir>` names (measured 2026-10-09,
+/// `super::relaunch`'s module docs). An EMPTY `CLAUDE_CONFIG_DIR` keeps its
+/// records in a directory whose profile is `$HOME`'s: a reader that knows the
+/// home's raw value asks [`profile_apart`] ([`Records::profile`]).
+fn claude_profile(user_home: &Path, claude_dir: &Path) -> PathBuf {
+    if claude_dir == user_home.join(".claude") {
+        user_home.join(".claude.json")
+    } else {
+        claude_dir.join(".claude.json")
+    }
 }
 
 /// What a sweep did with one session.
@@ -2117,17 +2160,17 @@ pub(super) fn status_line(c: &mut Client, sid: &str) -> Option<String> {
     c.request_line(&format!("@{sid} status")).ok()
 }
 
-/// [`held`] over one `status` reply; anything but `OK` reads as held. A
+/// [`held`] over one `status` reply; anything but `OK` reads as held. Its
+/// halt and hands are [`super::relaunch::hand_on_tab`]'s — the one list the
+/// host carries an asked exit through (ruling 20 of 2026-10-14). A
 /// `human_ms=` under the grace is a person at the keyboard, who wins; `-` or
 /// no field (an older server) is nobody.
 pub(super) fn held_by_status(line: &str, grace_s: u32) -> bool {
     !line.starts_with("OK")
+        || super::relaunch::hand_on_tab(line)
         || line.split_whitespace().any(|t| {
-            t == "hold=1"
-                || t.strip_prefix("hand=")
-                    .is_some_and(|hand| hand != "-" && !our_hand(hand))
-                || t.strip_prefix("input=")
-                    .is_some_and(|input| !matches!(input, "-" | "clear"))
+            t.strip_prefix("input=")
+                .is_some_and(|input| !matches!(input, "-" | "clear"))
         })
         || super::relaunch::person_present(line, grace_s)
 }
@@ -2622,17 +2665,36 @@ fn turn_verdict(head: &str) -> Result<(), Typed> {
 /// every model a restart on it may ask for ([`models::offered`]; each
 /// conversation moves to the newest of its own family first, then by the
 /// list, [`models::model_due`]), and the person's saved default.
+///
+/// THE OFFER IS A CLAUDE HOME'S: Claude Code's model caches (the served
+/// catalog, the login's denials, [`model_evidence`]) are kept per home, and
+/// a Claude Code started with `CLAUDE_CONFIG_DIR=<dir>` reads `<dir>`'s
+/// alone. Read once per pass for the user's own `~/.claude`; an agent under
+/// another home is judged by that home's ([`ModelCtx::at`]). THE ALLOWLIST
+/// AND THE DEFAULT ARE THE AGENT'S SETTINGS CHAIN'S ([`agent_settings`]:
+/// managed, `--settings`, project, user — the highest that sets each), cut
+/// into the offer for each agent judged ([`ModelCtx::settle`]); until round
+/// eighteen the home's `settings.json` alone.
+#[derive(Clone)]
 pub(super) struct ModelCtx {
     list: Priority,
     baked: Option<Baked>,
+    /// Every model a restart on the managed build may ask for under the
+    /// home's caches — before an agent's allowlist cuts it
+    /// ([`ModelCtx::settle`]).
     offered: Vec<String>,
-    /// The person's saved default model (`~/.claude/settings.json` `model`):
-    /// a choice of theirs, which the list never moves across families.
+    /// The saved default model (`model`, the highest document of the judged
+    /// agent's settings chain that sets it, [`ModelCtx::settle`]): a choice of
+    /// the person's, which the list never moves across families.
     default_model: Option<String>,
     /// The native build's own baked catalog and offer, for a session running
     /// the vendor's native install rather than the managed twin. `None` when no
     /// native build is installed.
     native: Option<(Option<Baked>, Vec<String>)>,
+    /// The versions the offers are made for, the managed build's and the
+    /// native build's (empty: none): what another home's offers are made for
+    /// too ([`ModelCtx::at`]).
+    versions: (String, String),
 }
 
 impl ModelCtx {
@@ -2655,13 +2717,14 @@ impl ModelCtx {
             offered: Vec::new(),
             default_model: None,
             native: None,
+            versions: Default::default(),
         }
     }
 
     fn read(opts: &Opts, targets: &Targets) -> ModelCtx {
         let now = i64::try_from(now_s()).unwrap_or(0);
         let path = state_dir(opts).join("models.json");
-        let Ok(mut list) = (if opts.dry_run {
+        let Ok(list) = (if opts.dry_run {
             std::fs::read_to_string(&path).map_or_else(
                 |_| Ok(Priority::seed(now)),
                 |t| Priority::parse(&t).ok_or_else(String::new),
@@ -2677,11 +2740,31 @@ impl ModelCtx {
             .and_then(|twin| catalog::twin_binary(&twin))
             .and_then(|bin| catalog::baked_cached(&bin, &state_dir(opts).join("builds")));
         let label = managed.map(|m| m.version.to_string()).unwrap_or_default();
-        let ev = model_evidence(opts);
-        let recs = models::recommendations(&ev, baked.as_ref(), &label);
-        let changes = models::ingest(&mut list, &recs, baked.as_ref(), now);
+        let ev = model_evidence(opts, &Records::of(&opts.home, None));
+        // The native build is judged by its own version and catalog (the two
+        // builds may know different models); its file is the binary itself.
+        let native = targets.native.as_ref().map(|n| {
+            (
+                n.version.to_string(),
+                catalog::baked_cached(&n.exe, &state_dir(opts).join("builds")),
+            )
+        });
+        let mut ctx = ModelCtx {
+            list,
+            baked,
+            offered: Vec::new(),
+            default_model: None,
+            versions: (
+                label,
+                native.as_ref().map(|(v, _)| v.clone()).unwrap_or_default(),
+            ),
+            native: native.map(|(_, nb)| (nb, Vec::new())),
+        };
+        // The user's home's growth is the pass's list: written and journaled
+        // (`models-changed`), but for a dry run.
+        let changes = ctx.grow(&ev);
         if !changes.is_empty() && !opts.dry_run {
-            let _ = models::write_atomic(&path, &list.render());
+            let _ = models::write_atomic(&path, &ctx.list.render());
             for ch in &changes {
                 let r = Report {
                     pid: 0,
@@ -2694,31 +2777,201 @@ impl ModelCtx {
                 ledger(opts, &r, &format!("{} ({})", ch.placed, ch.source));
             }
         }
-        let user = std::fs::read_to_string(opts.home.join(".claude").join("settings.json"))
-            .map(|t| models::parse_user_settings(&t))
-            .unwrap_or_default();
-        let offered = models::offered(&list, &label, &ev, baked.as_ref(), user.allowed.as_deref());
-        // The native build is judged by its own version and catalog (the two
-        // builds may know different models); its file is the binary itself.
-        let native = targets.native.as_ref().map(|n| {
-            let nb = catalog::baked_cached(&n.exe, &state_dir(opts).join("builds"));
-            let no = models::offered(
-                &list,
-                &n.version.to_string(),
-                &ev,
-                nb.as_ref(),
-                user.allowed.as_deref(),
-            );
-            (nb, no)
-        });
-        ModelCtx {
-            list,
-            baked,
-            offered,
-            default_model: user.default,
-            native,
+        ctx.offer(&ev);
+        ctx
+    }
+
+    /// THE LIST GROWS FROM WHAT CLAUDE CODE RECOMMENDS UNDER A HOME
+    /// ([`models::recommendations`]: the launch announcements its login was
+    /// shown, `ev`, then the managed build's own `latest_per_family`), each
+    /// admitted by [`models::ingest`] (known to the build, of a family on the
+    /// list, newer than its best): the changes made, in memory. Asked for
+    /// the user's home as the pass reads it ([`ModelCtx::read`], which writes
+    /// and journals them: the pass's list) and for every other home an agent
+    /// is judged under ([`ModelCtx::at`], that agent's alone): grown from the
+    /// user's home alone, a model announced to an agent's own login, which
+    /// the build knows but does not yet name its family's latest, was never
+    /// offered to it, and the agent never moved to it, while the same agent
+    /// under the user's home was (the homes lane's stated limit, handoff §4).
+    fn grow(&mut self, ev: &models::Evidence) -> Vec<models::Change> {
+        let now = i64::try_from(now_s()).unwrap_or(0);
+        let recs = models::recommendations(ev, self.baked.as_ref(), &self.versions.0);
+        models::ingest(&mut self.list, &recs, self.baked.as_ref(), now)
+    }
+
+    /// THE CONTEXT AN AGENT IS JUDGED BY, `sf` its record: this pass's own
+    /// catalogs and list for an agent in the user's `~/.claude`; for one
+    /// under another Claude home (the directory its record was read from,
+    /// [`Records::of_file`]), the list grown from THAT home's recommendations
+    /// ([`ModelCtx::grow`]) and that home's offer ([`ModelCtx::offer`]); for
+    /// every agent, the allowlist and saved default of its own settings chain
+    /// ([`ModelCtx::settle`]). Judged by the user's (the
+    /// review of `fix/upgrade-homes`, 2026-10-14), such an agent was moved
+    /// across families against its home's saved default and allowlist, onto
+    /// a model its login may be denied, and restarted with that `--model`.
+    /// That growth is this agent's alone, kept in memory and made again at
+    /// each judgment: written to the pass's `models.json` and journaled
+    /// (`models-changed`) once per agent, another login's announcement was
+    /// the list the user's own agents were judged by on the next pass — a
+    /// model their login was never offered — and two homes' growths
+    /// overwrote each other's (the review of `fix/r17-homes2`).
+    ///
+    /// AND EVERY AGENT'S OFFER AND DEFAULT ARE ITS SETTINGS CHAIN'S
+    /// ([`agent_settings`]): Claude Code takes `model` and `availableModels`
+    /// from the highest of its managed, `--settings`, project and user
+    /// documents that sets each, so the project the agent stands in — never
+    /// one pass-wide file — decides them (handoff §4, round eighteen).
+    fn at(&self, opts: &Opts, sf: &SessionFile) -> std::borrow::Cow<'_, ModelCtx> {
+        let records = Records::of_file(&opts.home, sf);
+        let mut ctx = self.clone();
+        if records.home_word(&opts.home).is_some() {
+            let ev = model_evidence(opts, &records);
+            ctx.grow(&ev);
+            ctx.offer(&ev);
+        }
+        let settings = records.dir().and_then(|dir| agent_settings(opts, sf, dir));
+        ctx.settle(settings);
+        std::borrow::Cow::Owned(ctx)
+    }
+
+    /// A Claude home's offer, in place of any other: what each build offers
+    /// under that home's caches (`ev`), before any allowlist — which is the
+    /// judged agent's settings' ([`ModelCtx::settle`]).
+    fn offer(&mut self, ev: &models::Evidence) {
+        self.offered = models::offered(&self.list, &self.versions.0, ev, self.baked.as_ref(), None);
+        if let Some((nb, no)) = &mut self.native {
+            *no = models::offered(&self.list, &self.versions.1, ev, nb.as_ref(), None);
         }
     }
+
+    /// THE OFFER AND THE DEFAULT UNDER `settings`: the offer cut to the
+    /// allowlist they name ([`models::allowed_by`]: the same cut
+    /// [`models::offered`] makes, in the same order) and their saved
+    /// default — the user's own `settings.json` for the pass's report
+    /// ([`models_report`]), an agent's settings chain for its judgment
+    /// ([`ModelCtx::at`]). `None`, a chain that could not be read whole:
+    /// nothing is offered, and nothing is moved.
+    fn settle(&mut self, settings: Option<models::UserModelSettings>) {
+        let Some(user) = settings else {
+            self.offered.clear();
+            if let Some((_, no)) = &mut self.native {
+                no.clear();
+            }
+            self.default_model = None;
+            return;
+        };
+        let allowed = user.allowed.as_deref();
+        self.offered.retain(|id| models::allowed_by(allowed, id));
+        if let Some((_, no)) = &mut self.native {
+            no.retain(|id| models::allowed_by(allowed, id));
+        }
+        self.default_model = user.default;
+    }
+}
+
+/// THE `model` AND `availableModels` CLAUDE CODE TAKES FOR THE AGENT `sf`
+/// ([`ModelCtx::at`]), whose records are in the Claude home `claude_dir`:
+/// read through the ONE settings chain
+/// ([`crate::supervise::policy::claude_settings::sources_under`]) — the
+/// managed file and its drop-ins, a `--settings` the agent was launched
+/// with (its argv, read off the process while it is the record's own: a
+/// gone agent's record is judged without its flag), the project's local and shared
+/// files in the directory it stands in ([`SessionFile::cwd`]), and the
+/// user's `settings.json` in `claude_dir` — each parsed by the chain's one
+/// parse, and each key taken from the HIGHEST document that sets it, as
+/// Claude Code merges them (READ in the 2.1.300 bundle: sources ordered
+/// user, project, local, flag, policy, a later one overriding; the
+/// restriction allowlists, `availableModels` among them, owned whole by the
+/// highest that sets one; within the managed tier the drop-ins, sorted,
+/// over the file). Read in `claude_dir/settings.json` alone, a managed or
+/// project allowlist or saved model was not the rule's: an agent was judged
+/// due onto a model its own settings disallow, and restarted with that
+/// `--model`. FAIL-CLOSED: a document that is there and cannot be read
+/// whole or does not parse — one inside a file-provider domain of the
+/// user's home is never opened ([`Opts::home`] is the chain's fence) — makes
+/// the chain unknown, `None`: nothing is offered.
+fn agent_settings(
+    opts: &Opts,
+    sf: &SessionFile,
+    claude_dir: &Path,
+) -> Option<models::UserModelSettings> {
+    use crate::supervise::policy::claude_settings;
+    use crate::supervise::policy::git_config::WorkerEnv;
+    // The user's document is the one in `claude_dir`, where the agent's
+    // records are ([`Records`], the one resolver): named so to the chain.
+    // The process's argv (its `--settings`) is read only off the record's
+    // OWN process (its kernel start, Claude's `procStart`): a record of an
+    // agent gone — a relaunch on exit's — names a pid another process may
+    // hold now, whose flag is no allowlist of the agent's.
+    let own = kernel_start(sf.pid).as_deref() == Some(squash(&sf.proc_start).as_str());
+    let mut process = own
+        .then(|| atpkg::caller_shell::process_args(sf.pid))
+        .flatten()
+        .unwrap_or_default();
+    process.env.insert(
+        0,
+        format!("{}={}", super::accounts::HOME_ENV, claude_dir.display()),
+    );
+    let worker = WorkerEnv::new(process);
+    let managed = managed_settings_dir();
+    let sources = claude_settings::sources_under(
+        &worker,
+        Path::new(&sf.cwd),
+        managed.as_deref(),
+        Some(&opts.home),
+    );
+    let in_managed = |name: &str| {
+        managed
+            .as_deref()
+            .is_some_and(|dir| Path::new(name).starts_with(dir))
+    };
+    const KEYS: [&str; 2] = ["model", "availableModels"];
+    let mut managed_said = Map::new();
+    let mut said_below = Map::new();
+    for source in sources {
+        let Some(text) = source.text.ok()? else {
+            continue;
+        };
+        let doc = claude_settings::parse(&text).ok()?;
+        for key in KEYS {
+            let Some(value) = doc.get(key) else {
+                continue;
+            };
+            if in_managed(&source.name) {
+                // The drop-ins, in order, over the file.
+                managed_said.insert(key.to_string(), value.clone());
+            } else if !said_below.contains_key(key) {
+                // The first below the managed tier is the highest.
+                said_below.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    for (key, value) in managed_said {
+        said_below.insert(key, value);
+    }
+    Some(models::model_settings_of(&Value::Object(said_below)))
+}
+
+/// Claude Code's managed settings directory the model rule reads
+/// ([`agent_settings`]): this platform's
+/// ([`crate::supervise::policy::claude_settings::MANAGED_DIR`]).
+#[cfg(not(test))]
+fn managed_settings_dir() -> Option<PathBuf> {
+    crate::supervise::policy::claude_settings::MANAGED_DIR.map(PathBuf::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The managed settings directory a test's model rule reads (none
+    /// unless the test names one): the machine's own is never a test's.
+    pub(super) static MANAGED_SETTINGS: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`managed_settings_dir`] in a test: the one it named on this thread.
+#[cfg(test)]
+fn managed_settings_dir() -> Option<PathBuf> {
+    MANAGED_SETTINGS.with(|dir| dir.borrow().clone())
 }
 
 fn model_record_path(opts: &Opts, session: &str) -> PathBuf {
@@ -2820,13 +3073,15 @@ fn model_read_for(
     let before = load_model_record(opts, &sf.session_id);
     let mut record = before.clone();
     let tail = std::cell::OnceCell::new();
+    // Judged by the Claude home the agent runs under.
+    let mctx = mctx.at(opts, sf);
     let (read, rows) = model_judge(
         opts,
         sf,
         &mut record,
         &tail,
         launch,
-        mctx,
+        &mctx,
         native,
         now_s(),
         carried,
@@ -2892,7 +3147,9 @@ fn model_judge(
     };
     let step = models::model_read_step(record, &view, || {
         tail.get_or_init(|| {
-            transcript(&opts.home, &sf.session_id)
+            // The conversation's transcript, where its agent keeps it.
+            Records::of_file(&opts.home, sf)
+                .transcript(&sf.session_id)
                 .map(|p| tail_to_end(&p, TAIL_BYTES).0)
                 .unwrap_or_default()
         })
@@ -3075,6 +3332,8 @@ fn same_build(
 /// model is due (the launch's own `--model` is not read here — it is in
 /// [`visit_with_claim`]).
 fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
+    // Judged by the Claude home the agent runs under, as the visit judges it.
+    let mctx = &*mctx.at(opts, sf);
     // Which build the session runs is not read here, to stay cheap: a look is
     // wanted when a move is due under either view, and the visit judges it by
     // the real build.
@@ -3117,12 +3376,18 @@ fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
 pub fn models_report(opts: &Opts) -> String {
     use std::fmt::Write as _;
     let targets = Targets::read(&opts.home);
-    let ctx = ModelCtx::read(opts, &targets);
+    let mut ctx = ModelCtx::read(opts, &targets);
+    // The user's own home's view: its `settings.json` allowlist and default.
+    ctx.settle(Some(
+        std::fs::read_to_string(opts.home.join(".claude/settings.json"))
+            .map(|t| models::parse_user_settings(&t))
+            .unwrap_or_default(),
+    ));
     let label = targets
         .managed
         .as_ref()
         .map_or_else(|| "?".to_string(), |m| m.version.to_string());
-    let ev = model_evidence(opts);
+    let ev = model_evidence(opts, &Records::of(&opts.home, None));
     let (_, verdicts) = models::target(&ctx.list, &label, &ev, ctx.baked.as_ref());
     let mut out = format!("Claude Code (managed): {label}\n");
     for (i, (id, a)) in verdicts.iter().enumerate() {
@@ -3371,6 +3636,13 @@ pub(super) struct St {
     /// prompt is judged against the prompt as it came back, never against
     /// their own half-typed command.
     pub(super) prompt: Option<PromptMark>,
+    /// The shell integration's command block the relaunch line was typed
+    /// into (`super::relaunch::line_block`, read right before it was;
+    /// `None`: the tab's shell marks none, or none was read): its end is the
+    /// shell's own word that the line's command ran and ended
+    /// (`super::relaunch::ShellBack`). Stamped with every line typed. On
+    /// disk the key is WRITTEN ONLY WHEN SET, as `home` is.
+    pub(super) line_block: Option<u64>,
     /// The last held-back reason the ledger was told ([`held_back`]), so it is
     /// said once, or the stuck restart it reported (`stuck:<what>`,
     /// [`note_stuck`]).
@@ -3418,20 +3690,48 @@ pub(super) struct St {
     /// none.
     pub(super) login: Option<String>,
     /// THE CLAUDE HOME THE RELAUNCHED AGENT KEEPS ITS RECORDS UNDER
-    /// ([`Records`]): the RAW `CLAUDE_CONFIG_DIR` of the ended process, as
-    /// the relaunch on exit and the restart in place read it
-    /// ([`super::relaunch::Snapshot::home`]) and their line carries
-    /// ([`super::relaunch::Launch::home`]). The relaunched process files its
+    /// ([`Records`]): the directory the ended process's records were read
+    /// from ([`Records::home_word`]), as the relaunch on exit and the restart
+    /// in place read them ([`Records::of_snapshot`]) — its
+    /// `CLAUDE_CONFIG_DIR`, which their line carries raw
+    /// ([`super::relaunch::Launch::home`]), resolved by the one resolver (a
+    /// relative one, empty included, under the directory the process ran in;
+    /// until 2026-10-14 the raw value was kept, and a relative one named
+    /// nothing). The relaunched process files its
     /// record and its transcript under that home, so every step that carries
     /// the relaunch on after the line — finding the new process, waiting for
     /// its first idle, typing its continuation, reading its model — looks
-    /// there ([`St::records`]). `None`: the user's own `~/.claude` — the
-    /// process had no such variable, or the record is the upgrade's, whose
-    /// sweep finds every agent it moves there. On disk the key `home` is
-    /// WRITTEN ONLY WHEN SET: a record with none is byte for byte what it
-    /// was, an older record reads as none (where every step looked before),
-    /// and an older build ignores the key.
+    /// there ([`St::agent_records`]). AN UPGRADE'S RECORD names it from the
+    /// visit that finds its agent ([`Records::home_word`] of the directory the
+    /// agent's record was read from, a relative `CLAUDE_CONFIG_DIR` resolved
+    /// as Claude Code resolves it, [`Homes`]), and every retarget carries it:
+    /// the restart's relaunch, the view's holders, the watch and a pass with
+    /// no roster read the agent there. `None`: the user's own `~/.claude` —
+    /// the process had no such variable. On disk the key `home` is WRITTEN
+    /// ONLY WHEN SET: a record with none is byte for byte what it was, an
+    /// older record reads as none (where every step looked before), and an
+    /// older build ignores the key.
     pub(super) home: Option<String>,
+    /// THE PROFILE THAT HOME KEEPS APART FROM ITS DIRECTORY
+    /// ([`profile_apart`]: `$HOME/.claude.json` for a `CLAUDE_CONFIG_DIR` set
+    /// and EMPTY, whose records are in the directory [`St::home`] names): the
+    /// login Claude Code keeps for the agent, which its model rule judges it
+    /// by ([`Records::profile`]). Kept with the home ([`St::keep_home`]) and
+    /// read back with it ([`St::agent_records`]): from the directory alone a
+    /// pass that learns the home from this record (the CLI's sweep with no
+    /// roster, [`recorded_homes`]) judged an empty home's agent by
+    /// `<dir>/.claude.json`, nobody's — its login's denials the unknown, a
+    /// model it is denied offered (the review of `fix/r17-homes2`). `None`
+    /// for every other home. On disk the key `home_profile` is WRITTEN ONLY
+    /// WHEN SET, as `home` is.
+    pub(super) home_profile: Option<String>,
+    /// THE BUILD THAT FAILED TO START FOR THE CONVERSATION, KEPT BY A
+    /// RESTART'S RECORD ON ITS OWN PROGRAM ([`St::kept_by_restart`]) from the
+    /// record it was written over — the stop's own record holds it as its
+    /// stop ([`St::failed_start`]). The round after the restart rests as that
+    /// stop's would ([`St::retarget`]). On disk the key `failed_start_kept`
+    /// is WRITTEN ONLY WHEN SET ([`FailedStart::word`]), as `home` is.
+    pub(super) failed_start_kept: Option<FailedStart>,
     /// Set once the continuation is typed while the resumed session's first
     /// answer is still unread ([`super::relaunch::confirm`]): the epoch second
     /// past which a sweep still finding none records the model unconfirmed.
@@ -3779,6 +4079,12 @@ pub(super) enum Retarget {
     InPlace,
     /// Rebuilt: a new pending round, any release the old notice owes carried.
     Anew,
+    /// Rebuilt for a NEW PROCESS of a conversation whose round stopped because
+    /// its target failed to start for it ([`St::failed_start`]), or after a
+    /// restart on its own program that carried such a stop: the stop, its
+    /// rest and its streak kept, so that build is not tried again for the
+    /// conversation until the rest runs out.
+    Rested,
 }
 
 /// HOW A RETARGET LEFT THE ROUND, in the words the ledger says it in — the
@@ -3797,6 +4103,7 @@ pub(super) fn retarget_how(how: Retarget, st: &St) -> &'static str {
         (Retarget::Kept | Retarget::InPlace, Phase::Failed(_)) => "kept as it stopped",
         (Retarget::Kept | Retarget::InPlace, _) => "still pending",
         (Retarget::Anew, _) => "started over",
+        (Retarget::Rested, _) => "kept stopped: that build failed to start for this conversation",
     }
 }
 
@@ -3809,6 +4116,59 @@ pub const FIRSTS_KEPT: usize = 32;
 /// at every look — one summary to the window and a wake on its GUI thread a
 /// minute at a break.
 pub const OWN_WORK_RESTAMP_S: u64 = upgrade_status::OWN_WORK_HOLD_S / 4;
+
+/// A BUILD THAT FAILED TO START FOR A CONVERSATION ([`St::failed_start`]):
+/// the build — its version and its install ([`Source`]'s word) — the instant
+/// the stop's rest counts from ([`St::failed_at`], which a stop that repeats
+/// sets later: the rest ends [`upgrade::RETRY_S`] past it) and the stop in a
+/// row ([`St::stop_streak`]). What a new process of the conversation keeps
+/// ([`St::keep_stop`]) and a restart on its own program carries
+/// ([`St::kept_by_restart`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FailedStart {
+    to: String,
+    source: String,
+    failed_at: u64,
+    stop_streak: u32,
+}
+
+impl FailedStart {
+    /// Whether this is the build `to`: its version, in its install.
+    fn of(&self, to: &Candidate) -> bool {
+        self.is(&to.version, to.source.as_str())
+    }
+
+    /// Whether this is build `version` in the install `source` names.
+    fn is(&self, version: &Version, source: &str) -> bool {
+        self.source == source && Version::parse(&self.to).as_ref() == Some(version)
+    }
+
+    /// Whether its rest still stands at `now`: the round it stopped re-arms
+    /// [`upgrade::RETRY_S`] past [`St::failed_at`] ([`upgrade::retry_due`]).
+    fn rests(&self, now: u64) -> bool {
+        now < self.failed_at.saturating_add(upgrade::RETRY_S)
+    }
+
+    /// `<version> <source> <failed_at> <streak>`, as [`St::to_json`] writes it.
+    fn word(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.to, self.source, self.failed_at, self.stop_streak
+        )
+    }
+
+    /// [`FailedStart::word`] read back; anything else is none.
+    fn parse(word: &str) -> Option<FailedStart> {
+        let mut it = word.split_whitespace();
+        let read = FailedStart {
+            to: it.next()?.to_string(),
+            source: it.next()?.to_string(),
+            failed_at: it.next()?.parse().ok()?,
+            stop_streak: it.next()?.parse().ok()?,
+        };
+        it.next().is_none().then_some(read)
+    }
+}
 
 /// What one process has answered ([`St::history`]), carried onto the record
 /// for the next build while it is the same process ([`St::adopt`]).
@@ -3847,9 +4207,27 @@ pub const WATCH_GAP: u64 = upgrade::REASK_S;
 impl St {
     /// Where the agent this record relaunches keeps its records, for a user
     /// whose home is `user_home`: under the Claude home its line carries
-    /// ([`St::home`], [`Records::of`]); a record with none, the user's own.
+    /// ([`St::home`], [`Records::of`]), with the profile that home keeps
+    /// apart ([`St::home_profile`]); a record with none, the user's own.
     pub(super) fn agent_records(&self, user_home: &Path) -> Records {
-        Records::of(user_home, self.home.as_deref())
+        Records::of_recorded(
+            user_home,
+            self.home.as_deref(),
+            self.home_profile.as_deref(),
+        )
+    }
+
+    /// Keeps the Claude home `records` names on this record, for a user whose
+    /// home is `user_home`, as [`St::agent_records`] reads it back: its
+    /// directory ([`St::home`], [`Records::home_word`]) and the profile it
+    /// keeps apart ([`St::home_profile`], [`Records::profile_word`]). Every
+    /// writer of the home writes both here. Whether either changed.
+    pub(super) fn keep_home(&mut self, records: &Records, user_home: &Path) -> bool {
+        let (home, profile) = (records.home_word(user_home), records.profile_word());
+        let changed = self.home != home || self.home_profile != profile;
+        self.home = home;
+        self.home_profile = profile;
+        changed
     }
 
     /// The relaunch line was typed at `at_s`: the phase, and the move's
@@ -3950,9 +4328,7 @@ impl St {
             // rest: `failed_at` sits `rest_extension()` past the stop, and
             // the end of the agent's work asks at once whatever the rest
             // (the ladder binds the clock's asks, never this one).
-            Phase::Failed(_) => {
-                now.saturating_sub(self.failed_at.saturating_sub(self.rest_extension()))
-            }
+            Phase::Failed(_) => now.saturating_sub(self.stopped_at()),
             _ => return false,
         };
         since >= upgrade::WORK_END_FLOOR_S && self.work_end_left(now) > 0
@@ -4092,6 +4468,58 @@ impl St {
         Version::parse(&self.from).is_none_or(|from| from == *running)
     }
 
+    /// THE BUILD THAT FAILED TO START FOR THIS RECORD'S CONVERSATION: a
+    /// Claude Code relaunch onto it (the upgrade's, or a relaunch on exit the
+    /// upgrade rode) that never registered the conversation (`no-resume`: the
+    /// new process crashed at start, or refused the conversation, and its
+    /// shell had the tab back) — this stopped record's own target, else the
+    /// one a restart's record keeps ([`St::failed_start_kept`]). The failure is the conversation's on that
+    /// build — the line resumes it there, whichever process holds it — never
+    /// its process's alone, as every other stop's is (a refused signal, a
+    /// launch line, a resume elsewhere). A relaunch that kept its program
+    /// ([`SAME_PROGRAM`]) is no such failure.
+    pub(super) fn failed_start(&self) -> Option<FailedStart> {
+        if self.agent != upgrade::Agent::Claude {
+            return None;
+        }
+        match &self.phase {
+            Phase::Failed(why) if why == "no-resume" && self.source != SAME_PROGRAM => {
+                Some(FailedStart {
+                    to: self.to.clone(),
+                    source: self.source.clone(),
+                    failed_at: self.failed_at,
+                    stop_streak: self.stop_streak,
+                })
+            }
+            _ => self.failed_start_kept.clone(),
+        }
+    }
+
+    /// THE STOP A NEW PROCESS OF THE CONVERSATION KEEPS (handoff §4, lab run
+    /// `urfx1`, 2026-10-14): `old` stopped because its target failed to start
+    /// for the conversation ([`St::failed_start`]), or carries such a stop
+    /// over a restart on its own program. The person who
+    /// follows the stop's remedy (`claude --resume <id>` by hand) starts a new
+    /// process, and a round minted afresh for it — no rest, no streak — moved
+    /// it onto the same broken build at the next quiet moment (34 s later in
+    /// the lab), stopped again, and undid the remedy every time. This record
+    /// keeps the stop, the instant its rest counts from
+    /// ([`St::failed_at`]) and the stop in a row ([`St::stop_streak`]): that
+    /// build is not tried again for the conversation until the rest the
+    /// streak defines runs out ([`upgrade::Step::Rearm`], each repeat resting
+    /// longer, [`upgrade::rest_extension`], and told as a stop that repeats),
+    /// or a newer build is offered (another arm of [`St::retarget`]); the
+    /// owner's `--now` re-arms no stop but a give-up, and says when this one's
+    /// new round starts. Everything else is the new process's, as a fresh
+    /// record's is: nothing was asked of it, its agent is not down, and the
+    /// restart that stopped brought up nothing of its.
+    fn keep_stop(&mut self, kept: FailedStart) {
+        self.phase = Phase::Failed("no-resume".to_string());
+        self.failed_at = kept.failed_at;
+        "no-resume".clone_into(&mut self.streak_why);
+        self.stop_streak = kept.stop_streak;
+    }
+
     /// WHAT A PROCESS HAS ANSWERED, to carry onto the next build's record
     /// while the same process is still behind: the stops in a row (the
     /// notices it left unanswered — a whole round given up on is the digest's
@@ -4169,6 +4597,12 @@ impl St {
             .as_ref()
             .map(|p| (p.left_typed.clone(), p.left_at))
             .unwrap_or_default();
+        // The Claude home the conversation's agent keeps its records under
+        // ([`St::home`]) is the conversation's, whatever arm makes the record:
+        // a visit binds it to the agent that holds it now.
+        let home = prior
+            .as_ref()
+            .map(|p| (p.home.clone(), p.home_profile.clone()));
         let (mut st, how) = match prior {
             // Reused when still Pending, for the same model, or Failed: every
             // `Failed` reason concerns the process or its launch line, so the
@@ -4367,6 +4801,10 @@ impl St {
             // hurried.
             Some(old) if matches!(old.phase, Phase::Failed(_)) => {
                 let same = old.same_process(from, who);
+                // A BUILD THAT FAILED TO START FOR THE CONVERSATION stays
+                // failed for it: see [`St::keep_stop`]. (Its own process's
+                // stop of it is kept whole by the first arm.)
+                let rested = old.failed_start().filter(|f| f.of(to));
                 let history = same.then(|| old.history());
                 let pending_since = if same { old.behind_since() } else { now };
                 let fallback_from = fallback_origin(&old);
@@ -4394,7 +4832,12 @@ impl St {
                 if let Some(history) = history {
                     st.adopt(history);
                 }
-                (st, Retarget::Anew)
+                if let Some(kept) = rested {
+                    st.keep_stop(kept);
+                    (st, Retarget::Rested)
+                } else {
+                    (st, Retarget::Anew)
+                }
             }
             // A finished move, or a restart's own record (a relaunch, a
             // restart in place). One that kept the session ON ITS OWN PROGRAM
@@ -4404,14 +4847,18 @@ impl St {
             // long the session has been behind, and the owner's hold that
             // still keeps it off THIS build — a skip of it, a deferral
             // standing — or a new round would move the session onto the very
-            // build the owner skipped. A finished MOVE, or an under-way one,
-            // begins a new wait, its word gone, whatever process holds the
-            // conversation.
+            // build the owner skipped; and a build that failed to start for
+            // the conversation, whose round rests as the stopped arm's does
+            // (the review of `fix/upgrade-homes`, 2026-10-14: minted afresh,
+            // the quiet flow moved the hand-resumed agent onto it inside the
+            // rest). A finished MOVE, or an under-way one, begins a new wait,
+            // its word gone, whatever process holds the conversation.
             Some(old) => {
                 let kept =
                     old.source == SAME_PROGRAM && Version::parse(&old.to).as_ref() == Some(from);
                 let hold = (kept && old.request.holds_build(&to.version.to_string(), now))
                     .then(|| (old.request.clone(), old.request_tab.clone(), old.request_at));
+                let rested = old.failed_start().filter(|f| f.of(to));
                 let mut st = St {
                     fallback_from: fallback_origin(&old),
                     release: old.release,
@@ -4428,13 +4875,24 @@ impl St {
                     (st.request, st.request_tab, st.request_at) =
                         (request, request_tab, request_at);
                 }
-                (st, Retarget::Anew)
+                if let Some(kept) = rested {
+                    st.keep_stop(kept);
+                    (st, Retarget::Rested)
+                } else {
+                    (st, Retarget::Anew)
+                }
             }
             None => (St::fresh(from, to, who, now), Retarget::Anew),
         };
         if st.left_typed.is_empty() {
             st.left_typed = left;
             st.left_at = left_at;
+        }
+        if st.home.is_none()
+            && let Some((home, profile)) = home
+        {
+            st.home = home;
+            st.home_profile = profile;
         }
         (st, how)
     }
@@ -4512,6 +4970,41 @@ impl St {
         }
     }
 
+    /// WHETHER THIS RECORD KEEPS THE CONVERSATION IN `tab` OFF THE BUILD `to`
+    /// AT `now`, whatever its round: the owner's hold ([`St::owners_hold`],
+    /// round eight, #24), or a build that failed to start for the
+    /// conversation while its stop's rest stands ([`St::failed_start`]). What
+    /// a relaunch on exit is no target of
+    /// ([`super::relaunch::relaunch_target`]): read for the owner's word
+    /// alone, a hand resume that crashed inside the rest — or was ended by
+    /// the stall remedy, by `aterm ctl restart`, or with aterm itself — was
+    /// relaunched straight onto the build that had just failed to start for
+    /// its conversation (the review of `fix/upgrade-homes`, 2026-10-14).
+    pub(super) fn holds_off(&self, tab: &str, to: &Candidate, now: u64) -> bool {
+        self.owners_hold(tab)
+            .is_some_and(|word| word.holds_build(&to.version.to_string(), now))
+            || self
+                .failed_start()
+                .is_some_and(|failed| failed.of(to) && failed.rests(now))
+    }
+
+    /// WHAT A RELAUNCH ONTO A BUILD THAT FAILED TO START FOR THE CONVERSATION
+    /// KEEPS of this record, written onto its own record `st` (the build it
+    /// relaunches onto: `st.to`, `st.source`): the stop in a row, so that
+    /// build failing to start again is a stop that repeats ([`St::fail`]) and
+    /// rests longer, as the upgrade's own round re-armed past the rest keeps
+    /// it ([`St::rearm`]). A relaunch on exit reaches that build only once the
+    /// rest has run out ([`St::holds_off`]).
+    pub(super) fn retried_by(&self, st: &mut St) {
+        let Some(build) = Version::parse(&st.to) else {
+            return;
+        };
+        if let Some(failed) = self.failed_start().filter(|f| f.is(&build, &st.source)) {
+            "no-resume".clone_into(&mut st.streak_why);
+            st.stop_streak = failed.stop_streak;
+        }
+    }
+
     /// WHAT A RESTART OR A RELAUNCH OF THE CONVERSATION ON ITS OWN PROGRAM
     /// KEEPS of this record in `tab`, written onto its own record `st`
     /// (round eight, #24): the owner's hold ([`St::owners_hold`]) — a skip of
@@ -4543,12 +5036,22 @@ impl St {
     /// out is the side that never moves a session against the owner's word
     /// (a stopped round's skip of the build it names holds it in the
     /// retarget's first arm, whatever the session has moved to since).
+    ///
+    /// AND A BUILD THAT FAILED TO START FOR THE CONVERSATION
+    /// ([`St::failed_start`]): neither restart tried it, so its stop, its
+    /// rest and its streak are the conversation's still, and the round after
+    /// the restart rests as the stop's would ([`St::retarget`]). Written over,
+    /// the stop was the record's alone: the next visit minted a fresh round
+    /// for that very build, and the quiet flow moved the agent the person had
+    /// resumed by hand onto it inside the rest (the review of
+    /// `fix/upgrade-homes`, 2026-10-14).
     pub(super) fn kept_by_restart(&self, tab: &str, st: &mut St) {
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
             st.request_tab.clone_from(&self.request_tab);
             st.request_at = self.request_at;
         }
+        st.failed_start_kept = self.failed_start();
         let behind = match &self.phase {
             Phase::Pending | Phase::Announced { .. } => self.is_upgrade(),
             Phase::Failed(_) => self.is_upgrade() || self.source == SAME_PROGRAM,
@@ -4888,6 +5391,15 @@ impl St {
         if let Some(home) = &self.home {
             o.insert("home".into(), Value::from(home.as_str()));
         }
+        if let Some(profile) = &self.home_profile {
+            o.insert("home_profile".into(), Value::from(profile.as_str()));
+        }
+        if let Some(failed) = &self.failed_start_kept {
+            o.insert("failed_start_kept".into(), Value::from(failed.word()));
+        }
+        if let Some(block) = self.line_block {
+            o.insert("line_block".into(), Value::from(block));
+        }
         for (k, v) in [
             ("at", at),
             ("asks", u64::from(asks)),
@@ -5027,6 +5539,7 @@ impl St {
             tab: s("tab"),
             line: s("line"),
             prompt: PromptMark::parse(&s("prompt")),
+            line_block: v.get("line_block").and_then(Value::as_u64),
             noted: s("noted"),
             cause: s("cause"),
             model_before: s("model_before"),
@@ -5040,6 +5553,14 @@ impl St {
             },
             login: v.get("login").and_then(Value::as_str).map(str::to_owned),
             home: v.get("home").and_then(Value::as_str).map(str::to_owned),
+            home_profile: v
+                .get("home_profile")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            failed_start_kept: v
+                .get("failed_start_kept")
+                .and_then(Value::as_str)
+                .and_then(FailedStart::parse),
             confirm_by: n("confirm_by"),
             resumed_on: s("resumed_on"),
             resumed_pid: small("resumed_pid"),
@@ -5187,6 +5708,66 @@ impl St {
         self.stop(why, now);
     }
 
+    /// THE RELAUNCH THIS RECORD STOPPED AS NEVER PICKED UP, PICKED UP AFTER
+    /// ALL (the review of the 2026-10-09 sweep fixes): a Claude Code restart
+    /// that ended its agent and stopped `no-resume` after that exit — a
+    /// reading of the tab, which a start slower than the stale bound or a
+    /// stop read early makes wrong — whose conversation `sf` holds now in a
+    /// process its recorded shell started ([`relaunch_of`]: not the agent it
+    /// ended) that can be THE LINE'S OWN ([`Self::started_by_line`]): that
+    /// line's agent came up. Only a stop that is final
+    /// (`relaunch::ends_at_once`: nothing types its line again); the live
+    /// relaunch on exit's own loop tries its stop again. A parent that
+    /// cannot be read now is no landing.
+    pub(super) fn landed_after_stop(&self, sf: &SessionFile, k: &dyn Kernel) -> bool {
+        self.agent == upgrade::Agent::Claude
+            && matches!(&self.phase, Phase::Failed(why) if why == "no-resume")
+            && self.exited_at != 0
+            && super::relaunch::ends_at_once(&self.cause)
+            && self.started_by_line(sf)
+            && relaunch_of(k, sf, &sf.session_id, self.pid, self.shell) == Relaunch::Ours
+    }
+
+    /// WHETHER `sf`'s PROCESS CAN BE THE ONE THIS STOPPED RECORD'S LINE
+    /// STARTED, by what the stop knew (the review of the late-landing reopen):
+    /// it started no later than the stop was said ([`Self::stopped_at`]), and
+    /// runs the build the line ran ([`St::to`], where that was known). The
+    /// stop's own remedy is a person's `claude --resume <id>` at that very
+    /// shell — a child of it holding the conversation, as the line's late
+    /// agent is — and a person types it only after reading the stop, while
+    /// the line's agent was started before it; on another build than the
+    /// line's it is not the line's, whenever it started. Read as the line's,
+    /// a hand resume was reopened as `came up after all`, a restart's
+    /// continuation (`nobody is here to answer`) typed into the conversation
+    /// the person had just taken over, and an upgrade resumed on the old
+    /// build closed as moved onto the target. Claude's own record of the
+    /// start (`procStart`, the kernel's `lstart`) is read; a stop with no
+    /// stamp (an older build's) or a start not recorded is none.
+    fn started_by_line(&self, sf: &SessionFile) -> bool {
+        let stop = self.stopped_at();
+        stop != 0
+            && models::parse_lstart(&sf.proc_start).is_some_and(|start| start <= stop)
+            && (self.to.is_empty() || self.to == "-" || sf.version == self.to)
+    }
+
+    /// [`Self::landed_after_stop`]'s record REOPENED at `now`: in flight again
+    /// as a relaunch that landed ([`Phase::Relaunched`]), the move carried on
+    /// from there as any landed relaunch is, and the stop taken back — no
+    /// rest to count from ([`St::failed_at`]), and not counted as a stop
+    /// that repeats ([`St::stop_streak`]).
+    pub(super) fn reopen_landed(&mut self, now: u64) {
+        if let Phase::Failed(why) = &self.phase
+            && *why == self.streak_why
+        {
+            self.stop_streak = self.stop_streak.saturating_sub(1);
+            if self.stop_streak == 0 {
+                self.streak_why.clear();
+            }
+        }
+        self.phase = Phase::Relaunched { at_s: now };
+        self.failed_at = 0;
+    }
+
     /// WHETHER THIS RECORD IS A RELAUNCH OF AGENT `pid`'S OWN EXIT: a
     /// relaunch on exit ([`super::relaunch::CAUSE_EXIT`], or
     /// [`super::relaunch::CAUSE_FRESH`] for one with nothing to resume)
@@ -5225,11 +5806,22 @@ impl St {
     }
 
     /// The signalled agent seen gone at `now` ([`St::exited_at`]): kept from
-    /// the first look that saw it, never stamped while [`St::pid`] lives (a
+    /// the first look that saw it, never stamped while [`St::pid`] runs (a
     /// refused signal or an unfinished exit is no exit). Returns whether it
     /// was newly seen.
+    ///
+    /// GONE IS EXITED, REAPED OR NOT ([`super::upgrade_wake::wait_exit`],
+    /// asked without a wait): the SIGTERMed agent is a zombie until its
+    /// shell reaps it, which `kill(pid, 0)` still finds. Asked of that, the
+    /// relaunch's own look right after the exit stamped nothing (the live
+    /// re-check of 2026-10-09), and a relaunch stopped at once left a record
+    /// with no exit on it: read as an upgrade still owed, hidden from the
+    /// owner, its old agent's exit taken for a graceful one of its own.
     pub(super) fn seen_gone(&mut self, now: u64) -> bool {
-        if self.exited_at != 0 || self.pid == 0 || alive(self.pid) {
+        if self.exited_at != 0
+            || self.pid == 0
+            || !super::upgrade_wake::wait_exit(self.pid, Duration::ZERO)
+        {
             return false;
         }
         self.exited_at = now;
@@ -5330,6 +5922,17 @@ impl St {
         self.failed_at = now.saturating_add(self.rest_extension());
     }
 
+    /// WHEN THIS STOPPED ROUND STOPPED (unix seconds): [`St::failed_at`] less
+    /// the longer rest a stop that repeats carries ([`Self::rest_extension`]),
+    /// or the void's instant that began the rest again ([`Self::void`]). `0`
+    /// for a stop with no stamp (an older build's) and every other phase.
+    pub(super) fn stopped_at(&self) -> u64 {
+        if self.failed_at == 0 || !matches!(self.phase, Phase::Failed(_)) {
+            return 0;
+        }
+        self.failed_at.saturating_sub(self.rest_extension())
+    }
+
     /// HOW MUCH LATER THAN [`upgrade::RETRY_S`] the next round starts, for the
     /// stop the streak is on: a whole round the agent declined rests by the
     /// ladder of its own ([`upgrade::unanswered_rest_extension`]: 2 h, 4 h,
@@ -5352,8 +5955,8 @@ impl St {
     /// `--now` spent (it hurried the round that stopped; the new one keeps
     /// every wait a person is owed), the stop's stamp cleared and why it
     /// stopped kept as [`St::last_stop`] until the new round's first notice.
-    /// The stopped round's saved prompt position ([`St::prompt`]) goes with
-    /// it: a relaunch that was refused left the prompt as it stood then, and
+    /// The stopped round's saved prompt position ([`St::prompt`]) and the
+    /// block its line was typed into ([`St::line_block`]) go with it: a relaunch that was refused left the prompt as it stood then, and
     /// the new round's relaunch reads the prompt it finds. A release still owed stays owed: the new
     /// round's first notice supersedes it, and a hold of the owner's that
     /// waits it types it. A relaunch's record re-armed is the upgrade's own
@@ -5374,6 +5977,7 @@ impl St {
         self.new_round(now);
         self.failed_at = 0;
         self.prompt = None;
+        self.line_block = None;
         self.exited_at = 0;
         self.resumed_pid = 0;
         self.relaunched_pid = 0;
@@ -5740,7 +6344,15 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
         else {
             continue;
         };
-        if st.agent == upgrade::Agent::Claude && settled(&st) {
+        // A conversation held under the Claude home its record names
+        // ([`St::home`]: one this pass may not have read) is live too; one
+        // whose records cannot be read whole is kept.
+        let held_elsewhere = st.home.is_some()
+            && st
+                .agent_records(&opts.home)
+                .session_files()
+                .is_none_or(|files| conversation_live(&files, id));
+        if st.agent == upgrade::Agent::Claude && settled(&st) && !held_elsewhere {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -5768,12 +6380,33 @@ pub(super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
     let key = st.progress_key();
     let on_disk = load(opts, session);
     let mut out = st.clone();
-    match on_disk {
+    match &on_disk {
         Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
         _ => out.progress_at = now,
     }
     out.progress_key = key;
     write_verbatim(opts, session, &out);
+    // A BUILD THAT FAILED TO START is the build's fact too, noted — and a
+    // stop taken back, retracted — by the one writer every stop and every
+    // reopening is saved through ([`build_start::note`]).
+    build_start::note(opts, session, on_disk.as_ref(), st, now);
+}
+
+/// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`
+/// ([`build_start::starts`]): no failure to start noted against the build,
+/// or one a probe run since proved to start without an agent — or, for a
+/// build no probe proves any more, a probe run for the move the owner asked
+/// for (`owner_now`). What the upgrade's visit and a relaunch on exit both
+/// ask before they take `to`; a probe run here is said on the ledger as row
+/// `r`.
+pub(super) fn build_starts(
+    opts: &Opts,
+    r: &Report,
+    to: &Candidate,
+    now: u64,
+    owner_now: bool,
+) -> Result<(), &'static str> {
+    build_start::starts(opts, r, to, now, owner_now)
 }
 
 /// Writes `st` as `session`'s record exactly as it is, progress stamp
@@ -5923,7 +6556,10 @@ pub(super) fn session_files_in(claude_dir: &Path) -> Option<Vec<SessionFile>> {
             .ok()
             .and_then(|text| upgrade::parse_session_file(&text).ok());
         match file {
-            Some(file) if file.pid == file_pid => files.push(file),
+            Some(file) if file.pid == file_pid => files.push(SessionFile {
+                claude_dir: Some(claude_dir.to_path_buf()),
+                ..file
+            }),
             Some(file) if !alive(file_pid) && !alive(file.pid) => {}
             None if !alive(file_pid) => {}
             _ => return None,
@@ -5950,12 +6586,15 @@ pub(super) struct SessionRosterCache {
 }
 
 impl SessionRosterCache {
+    /// The records in `records`' directory, read as every reader of them
+    /// reads them ([`Records::session_files`]: each stamped with the profile
+    /// its home keeps apart), behind the cache.
     pub(super) fn files(&mut self, records: &Records, now: Instant) -> Option<&[SessionFile]> {
         let dir = records.dir()?;
         let stamp = std::fs::metadata(dir.join("sessions"))
             .and_then(|m| m.modified())
             .ok();
-        self.files_at(stamp, now, || session_files_in(dir))
+        self.files_at(stamp, now, || records.session_files())
     }
 
     fn files_at(
@@ -6017,10 +6656,11 @@ fn preliminary_unique_owner(
 }
 
 /// Fresh, complete directory read for every decision that can type, signal or
-/// consume a notice. The initial sweep roster is only a candidate index.
+/// consume a notice. The initial sweep roster is only a candidate index. Read
+/// where `wanted` was read ([`Records::of_file`]: the Claude home its agent
+/// keeps its records under; `home` is the user's).
 pub(super) fn require_unique_owner(home: &Path, wanted: &SessionFile) -> Result<(), &'static str> {
-    let files = session_files(home);
-    preliminary_unique_owner(files.as_deref(), wanted)
+    Records::of_file(home, wanted).unique_owner(wanted)
 }
 
 pub(super) fn conversation_live(files: &[SessionFile], session: &str) -> bool {
@@ -6132,6 +6772,12 @@ fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&
     {
         return true;
     }
+    // A relaunch stopped as never picked up whose own agent holds the
+    // conversation now, whatever its build: the visit reopens and carries it
+    // on ([`St::landed_after_stop`]).
+    if prior.is_some_and(|st| st.landed_after_stop(sf, &Live)) {
+        return true;
+    }
     let Some(running) = Version::parse(&sf.version) else {
         return true;
     };
@@ -6146,6 +6792,7 @@ fn claim_still_live(c: &mut Client, pid: u32, claim: &HostClaim) -> bool {
     process_in_tab(c, pid, &claim.tab, Some(claim.group), Some(claim.parent))
 }
 
+#[cfg(test)]
 pub(super) fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
     session_file_in(&home.join(".claude"), pid)
 }
@@ -6153,22 +6800,38 @@ pub(super) fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
 /// [`session_file_of`] in the Claude Code directory `claude_dir` itself.
 pub(super) fn session_file_in(claude_dir: &Path, pid: u32) -> Option<SessionFile> {
     let t = std::fs::read_to_string(claude_dir.join(format!("sessions/{pid}.json"))).ok()?;
-    upgrade::parse_session_file(&t).ok()
+    let file = upgrade::parse_session_file(&t).ok()?;
+    Some(SessionFile {
+        claude_dir: Some(claude_dir.to_path_buf()),
+        ..file
+    })
 }
 
-/// Whether any transcript of `session` exists (`None`: the projects directory
-/// cannot be read). Claude files a transcript only once the conversation has
-/// a message, and one without cannot be resumed (`--resume` answers "No
-/// conversation found with session ID").
+/// Whether any transcript of `session` exists (`None`: nobody can say).
+/// Claude files a transcript only once the conversation has a message, and
+/// one without cannot be resumed (`--resume` answers "No conversation found
+/// with session ID").
 pub(super) fn transcript_exists(home: &Path, session: &str) -> Option<bool> {
     transcript_exists_in(&home.join(".claude"), session)
 }
 
 /// [`transcript_exists`] in the Claude Code directory `claude_dir` itself.
+///
+/// A CLAUDE HOME WITH NO `projects/` HOLDS NO TRANSCRIPT: Claude Code makes
+/// the directory with the home's first message, so a fresh home — a new
+/// machine's first run, a new `CLAUDE_CONFIG_DIR` — has none until then.
+/// Read as "nobody can say", an idle session never asked anything there was
+/// restarted `--resume <id>`, which Claude refused, and its tab was left
+/// with no agent (the real-Claude sweep of 2026-10-09). `None` only where
+/// the projects exist and cannot be listed, or the home itself is not there
+/// (then nothing here is the agent's: it keeps its records elsewhere).
 pub(super) fn transcript_exists_in(claude_dir: &Path, session: &str) -> Option<bool> {
     let name = format!("{session}.jsonl");
-    let dirs = std::fs::read_dir(claude_dir.join("projects")).ok()?;
-    Some(dirs.flatten().any(|e| e.path().join(&name).is_file()))
+    match std::fs::read_dir(claude_dir.join("projects")) {
+        Ok(dirs) => Some(dirs.flatten().any(|e| e.path().join(&name).is_file())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && claude_dir.is_dir() => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// WHERE ONE AGENT'S CLAUDE CODE KEEPS ITS OWN RECORDS: its process's
@@ -6184,47 +6847,400 @@ pub(super) fn transcript_exists_in(claude_dir: &Path, session: &str) -> Option<b
 /// relaunched process was never found (`wait:resume`). So every relaunch of
 /// an agent reads ITS records: [`Records::of`] the home its snapshot read
 /// ([`super::relaunch::Snapshot::home`]), and a relaunch left in flight the
-/// home its record keeps ([`St::home`]). The live upgrade's sweep reads
-/// `~/.claude` alone, so every agent it finds keeps its records there.
+/// home its record keeps ([`St::home`]). The live upgrade's sweep reads every
+/// home an agent in its tabs runs under ([`Homes`]), and every step about an
+/// agent it found reads where its record was read ([`Records::of_file`]); a
+/// relaunch's snapshot keeps where it read its agent's record
+/// ([`super::relaunch::Snapshot::claude_dir`], [`Records::of_snapshot`]), and
+/// the window host's readers of the agent's limit, wall and task read there.
+/// ONE RESOLVER names every such directory from a process's exec
+/// environment ([`Records::at`], [`home_dir_at`]; for a running agent,
+/// where it filed its record, [`Records::of_process`]), and the profile
+/// Claude Code keeps for it ([`profile_apart`], [`Records::profile`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Records(Option<PathBuf>);
+pub(super) struct Records {
+    /// The Claude Code directory, where one is known.
+    dir: Option<PathBuf>,
+    /// The profile, where the home's raw value keeps it apart from what the
+    /// directory alone says ([`profile_apart`]: an EMPTY `CLAUDE_CONFIG_DIR`'s,
+    /// `$HOME/.claude.json`); `None` for every other home, whose profile is
+    /// read by its directory ([`claude_profile`]).
+    profile: Option<PathBuf>,
+}
+
+/// THE GLOBAL CONFIG — THE PROFILE — CLAUDE CODE KEEPS FOR A HOME: its
+/// onboarding, its login, and the login's model caches (the denials, the
+/// disabled options, the announcements: [`models::read_evidence`]). Claude
+/// Code keeps it at `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`
+/// (READ in the 2.1.300 bundle), where the records are under
+/// `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")` ([`Records::at`]): the
+/// two differ where `CLAUDE_CONFIG_DIR` is set and EMPTY, which `??` keeps
+/// (the records in the directory the process runs in) and `||` reads as
+/// unset (the profile in `$HOME`). MEASURED in the real-Claude lab
+/// (2026-10-14, 2.1.299, and 2026-10-14, 2.1.300): under
+/// `CLAUDE_CONFIG_DIR=` it read and wrote `$HOME/.claude.json`, never one in
+/// its working directory. So the directory alone ([`claude_profile`]: the
+/// user's own `~/.claude` keeps it beside it, any other inside it) names
+/// every home's but an empty one's, whose directory is the one the process
+/// runs in: `Some(user_home/.claude.json)` for the raw `home` set and empty,
+/// `None` (the directory's) for any other — `.` names the same directory as
+/// an empty home and keeps its profile inside it.
+///
+/// AND THE AGENT'S OWN `HOME` (`homedir()`, [`HomeVars::home`]): an unset
+/// `CLAUDE_CONFIG_DIR` keeps the records in `<HOME>/.claude` and the profile
+/// BESIDE it, `<HOME>/.claude.json` — apart from what the directory alone
+/// says wherever that `HOME` is not the user's (`dir`, the records'
+/// directory, names it: its parent); an empty one keeps it in that `HOME`,
+/// else the user's.
+pub(super) fn profile_apart(
+    user_home: &Path,
+    vars: HomeVars<'_>,
+    dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match vars.config {
+        Some("") => Some(homedir(user_home, vars.home).join(".claude.json")),
+        Some(_) => None,
+        None => dir
+            .filter(|dir| *dir != user_home.join(".claude"))
+            .and_then(Path::parent)
+            .map(|home| home.join(".claude.json")),
+    }
+}
+
+/// WHAT A CLAUDE CODE'S EXEC ENVIRONMENT SAYS OF ITS HOME ([`Records::at`],
+/// [`claude_home_dir`]): its raw `CLAUDE_CONFIG_DIR` (`None`: unset) and its
+/// raw `HOME` (`None`: unset, or not read).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HomeVars<'a> {
+    /// The raw `CLAUDE_CONFIG_DIR`.
+    pub(super) config: Option<&'a str>,
+    /// The raw `HOME`: Claude Code's `homedir()`.
+    pub(super) home: Option<&'a str>,
+}
+
+impl<'a> HomeVars<'a> {
+    /// The two, as the exec record `args` holds them.
+    pub(super) fn of(args: &'a atpkg::caller_shell::ProcArgs) -> Self {
+        Self {
+            config: args.env_var(super::accounts::HOME_ENV),
+            home: args.env_var("HOME"),
+        }
+    }
+
+    /// A raw `CLAUDE_CONFIG_DIR` alone, its process's `HOME` not known (the
+    /// user's is taken).
+    pub(super) fn config(config: Option<&'a str>) -> Self {
+        Self { config, home: None }
+    }
+}
+
+/// Claude Code's `homedir()` for a process whose raw `HOME` is `home`: that
+/// directory where it is absolute, else the user's (`user_home`).
+fn homedir(user_home: &Path, home: Option<&str>) -> PathBuf {
+    home.map(Path::new)
+        .filter(|home| home.is_absolute())
+        .map_or_else(|| user_home.to_path_buf(), Path::to_path_buf)
+}
+
+/// THE ONE RESOLVER OF A CLAUDE CODE DIRECTORY from an exec environment
+/// (`vars`), as Claude Code resolves it: `CLAUDE_CONFIG_DIR ??
+/// join(homedir(), ".claude")` — a set one by [`home_dir_at`] (absolute as
+/// it is; relative, EMPTY INCLUDED, under the working directory `cwd`
+/// reads), an unset one under the process's OWN `HOME`, else `fallback`'s
+/// (the user's home; `None`: none, and nothing is named). Lexical, as
+/// Claude Code's own joins are. Every reader asks it: [`Records::at`] (the
+/// relaunch snapshot, the sweep's homes, the wall's tail) and the footer's
+/// own ([`super::footer::claude_dir_of`]: the footer, netprobe, the disk
+/// census) — until round eighteen the footer read an EMPTY one as unset and
+/// a relative one as none, and every other reader took an unset one as the
+/// window's own `~/.claude` where Claude Code takes the agent's `HOME`.
+pub(super) fn claude_home_dir(
+    fallback: Option<&Path>,
+    vars: HomeVars<'_>,
+    cwd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match vars.config {
+        Some(config) => home_dir_at(config, cwd),
+        None => vars
+            .home
+            .map(Path::new)
+            .filter(|home| home.is_absolute())
+            .or(fallback)
+            .map(|home| home.join(".claude")),
+    }
+}
+
+/// Whether `a` and `b` name the same directory however spelled (a link, a
+/// `..`).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+}
+
+/// THE CLAUDE CODE DIRECTORY A SET `CLAUDE_CONFIG_DIR` NAMES (`home`, its
+/// raw value), for a process whose working directory `cwd` reads, as Claude
+/// Code resolves it ([`Records::at`]): an absolute one as it is; a RELATIVE
+/// one — EMPTY INCLUDED — under that working directory, read only then, and
+/// `None` where it is not read (or reads relative). Lexically, as Claude
+/// Code's own path joins are ([`claude_dir_at`]).
+pub(super) fn home_dir_at(home: &str, cwd: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    let base = if Path::new(home).is_absolute() {
+        PathBuf::from("/")
+    } else {
+        cwd().filter(|cwd| cwd.is_absolute())?
+    };
+    claude_dir_at(Some(home), None, &base, || None).ok()
+}
 
 impl Records {
-    /// The records of an agent whose exec environment held `home` — the RAW
-    /// `CLAUDE_CONFIG_DIR`, `None` where unset — for a user whose home is
-    /// `user_home`: that directory where it is absolute, `user_home/.claude`
-    /// where it is unset or empty (empty read as unset, as every reader of
-    /// the variable here reads it, [`super::footer::claude_dir_of`]). A
-    /// RELATIVE value names a directory that depends on where the process
-    /// started, which nothing here knows: nothing is read, and every lookup
-    /// answers that it cannot say — no record, no transcript, the
-    /// projects unreadable (so a relaunch still resumes), the owners not
-    /// known (so no line is typed over them).
+    /// THE ONE RESOLVER: the records of a Claude Code whose exec environment
+    /// held `home` — the RAW `CLAUDE_CONFIG_DIR`, `None` where unset — for a
+    /// user whose home is `user_home`, where Claude Code files them: it keeps
+    /// them under `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`, each
+    /// path joined onto that and opened from the directory it runs in (READ
+    /// in the 2.1.300 bundle; MEASURED for an empty one in the real-Claude
+    /// lab, 2026-10-14: 2.1.299 under `CLAUDE_CONFIG_DIR=` filed
+    /// `sessions/<pid>.json` and `projects/` in its working directory). So:
+    /// `user_home/.claude` where it is unset; that directory where it is
+    /// absolute; and where it is RELATIVE — EMPTY INCLUDED, which `??` keeps
+    /// — under the working directory `cwd` reads, asked for only then
+    /// ([`home_dir_at`]). A relative home whose working directory is not
+    /// read names nothing: every lookup answers that it cannot say — no
+    /// record, no transcript, the projects unreadable (so a relaunch still
+    /// resumes), the owners not known (so no line is typed over them).
+    ///
+    /// AN UNSET ONE IS THE PROCESS'S OWN `HOME`'s (`vars.home`, Claude
+    /// Code's `homedir()`: READ in the 2.1.300 bundle), the user's only where
+    /// that is not known: read as the window's own `~/.claude`, an agent
+    /// launched with another `HOME` had no record there ([`claude_home_dir`]).
+    pub(super) fn at(
+        user_home: &Path,
+        vars: HomeVars<'_>,
+        cwd: impl FnOnce() -> Option<PathBuf>,
+    ) -> Self {
+        let dir = claude_home_dir(Some(user_home), vars, cwd);
+        Self::in_dir(user_home, vars, dir)
+    }
+
+    /// THE RECORDS OF THE RUNNING CLAUDE CODE `pid`, whose exec environment
+    /// held the raw home `home`, WHERE IT FILED THEM. Claude Code keeps
+    /// `CLAUDE_CONFIG_DIR` raw — 2.1.300's `ve()` is a memoize keyed by the
+    /// variable's value, holding `CLAUDE_CONFIG_DIR ?? join(homedir(),
+    /// ".claude")` unresolved — and opens every path under a relative one
+    /// (empty included) from the directory it runs in at that moment. So its
+    /// session record, written once as it starts, stays under the directory
+    /// it STARTED in, while a later `process.chdir` (2.1.300's worktree enter
+    /// and exit) moves where it writes next: MEASURED in the real-Claude lab
+    /// (2026-10-14, `other/.claude`, then `EnterWorktree`), the record stayed
+    /// in `<start>/other/.claude/sessions` (its status frozen: its updates
+    /// under the worktree fail), the transcript went on under the worktree's
+    /// own `other/.claude`; at `/exit` it went back and removed the record.
+    /// Resolved against the LIVE directory alone, a reader of its record lost
+    /// such an agent: the relaunch snapshot named no conversation, the sweep
+    /// never found it. So the home resolves from the
+    /// directory that holds its record: its working directory now (`cwd`),
+    /// else the one it was started in (`started_in`: its exec `PWD`, as the
+    /// shell that exec'd it set it, taken canonical) — the first under which
+    /// its own record stands (`sessions/<pid>.json` naming this process's
+    /// start, [`kernel_start`]); with neither (no record yet, the start
+    /// directory unknown), its working directory now, as [`Records::at`].
+    /// An unset or absolute home names its directory by itself. Every reader
+    /// of a running agent's RECORD asks it: the relaunch snapshot
+    /// ([`super::relaunch::snapshot`]), the sweep's homes ([`Homes::read`])
+    /// and the wall confirmation's tail for the conversation's id
+    /// ([`process_transcript_tail`]). What it WRITES NOW — the conversation's
+    /// transcript — is where its home resolves from the directory it runs in
+    /// now ([`Records::at`]): the wall's tail reads it there, and a sweep's
+    /// look at an agent whose two differ waits ([`Records::left_by`]).
+    pub(super) fn of_process(
+        user_home: &Path,
+        vars: HomeVars<'_>,
+        pid: u32,
+        cwd: impl FnOnce() -> Option<PathBuf>,
+        started_in: Option<&str>,
+    ) -> Self {
+        let Some(relative) = vars.config.filter(|home| Path::new(home).is_relative()) else {
+            return Self::at(user_home, vars, || None);
+        };
+        let vars = HomeVars {
+            config: Some(relative),
+            ..vars
+        };
+        let now = cwd();
+        let started = started_in
+            .map(Path::new)
+            .filter(|dir| dir.is_absolute())
+            .and_then(|dir| std::fs::canonicalize(dir).ok());
+        let start = std::cell::OnceCell::new();
+        for base in [now.clone(), started].into_iter().flatten() {
+            let records = Self::at(user_home, vars, || Some(base));
+            let its_own = records.session_file(pid).is_some_and(|sf| {
+                start.get_or_init(|| kernel_start(pid)).as_deref()
+                    == Some(squash(&sf.proc_start).as_str())
+            });
+            if its_own {
+                return records;
+            }
+        }
+        Self::at(user_home, vars, || now)
+    }
+
+    /// WHETHER THE RUNNING CLAUDE CODE WHOSE RECORD THESE RECORDS HOLD HAS
+    /// LEFT THEM: its raw home `home` relative (empty included), resolving
+    /// from the directory it runs in now (`cwd`) to another directory than
+    /// these, or to none (that directory unread). A worktree's `process.chdir`
+    /// since it filed its record ([`Records::of_process`]) does that: its
+    /// record keeps the status it had as it moved (`busy`: its updates under
+    /// the new directory fail), while its conversation goes on under the home
+    /// that directory names ([`process_transcript_tail`]) — MEASURED in the
+    /// real-Claude lab (2026-10-14, 2.1.300, `h2wtobs1`). An unset or
+    /// absolute home names one directory wherever it runs.
+    pub(super) fn left_by(
+        &self,
+        user_home: &Path,
+        home: Option<&str>,
+        cwd: impl FnOnce() -> Option<PathBuf>,
+    ) -> bool {
+        let Some(relative) = home.filter(|home| Path::new(home).is_relative()) else {
+            return false;
+        };
+        match (
+            self.dir(),
+            Self::at(user_home, HomeVars::config(Some(relative)), cwd).dir(),
+        ) {
+            (Some(filed), Some(now)) => !same_dir(filed, now),
+            _ => true,
+        }
+    }
+
+    /// The records in `dir` of a Claude Code whose raw home was `home`, its
+    /// profile kept apart where that home keeps it so ([`profile_apart`]).
+    fn in_dir(user_home: &Path, vars: HomeVars<'_>, dir: Option<PathBuf>) -> Self {
+        Self {
+            profile: profile_apart(user_home, vars, dir.as_deref()),
+            dir,
+        }
+    }
+
+    /// [`Records::at`] of a home that names its directory by itself: unset
+    /// (the user's own) or absolute — what a record of the agent names
+    /// ([`St::home`], written as [`Records::home_word`] gives it). A relative
+    /// one here (an older build's record kept a raw one) names nothing.
     pub(super) fn of(user_home: &Path, home: Option<&str>) -> Self {
-        Self(match home.filter(|h| !h.is_empty()) {
-            None => Some(user_home.join(".claude")),
-            Some(_) => super::footer::claude_dir_of(home, None),
-        })
+        Self::at(user_home, HomeVars::config(home), || None)
     }
 
-    /// The process `pid`'s record ([`session_file_in`]).
+    /// The records a record of the agent names ([`St::agent_records`]): the
+    /// directory its home word names ([`Records::of`]) and the profile it
+    /// kept apart (`profile`, [`Records::profile_word`]) — the records they
+    /// were written from ([`St::keep_home`]), an empty home's profile
+    /// included, which its directory alone does not name.
+    pub(super) fn of_recorded(user_home: &Path, home: Option<&str>, profile: Option<&str>) -> Self {
+        let of = Self::of(user_home, home);
+        Self {
+            profile: profile.map(PathBuf::from).or(of.profile),
+            dir: of.dir,
+        }
+    }
+
+    /// The records of the agent the relaunch snapshot `snap` is of: where
+    /// its record was read as the snapshot was taken
+    /// ([`super::relaunch::Snapshot::claude_dir`]: [`Records::of_process`]
+    /// then), else — a snapshot no process was
+    /// read for, a reopened layout's — where its home resolves from the
+    /// directory its line starts it in ([`super::relaunch::Snapshot::cwd`]),
+    /// which is where its relaunched process files its record.
+    pub(super) fn of_snapshot(user_home: &Path, snap: &super::relaunch::Snapshot) -> Self {
+        match &snap.claude_dir {
+            Some(dir) => Self::in_dir(
+                user_home,
+                HomeVars::config(snap.home.as_deref()),
+                Some(dir.clone()),
+            ),
+            None => Self::at(user_home, HomeVars::config(snap.home.as_deref()), || {
+                Some(PathBuf::from(&snap.cwd))
+            }),
+        }
+    }
+
+    /// The records of the agent whose record `sf` is: the Claude Code
+    /// directory it was read from ([`SessionFile::claude_dir`]) and the
+    /// profile of the home it was read under ([`SessionFile::profile`]),
+    /// else — a record parsed from text alone — the user's own
+    /// `user_home/.claude`.
+    pub(super) fn of_file(user_home: &Path, sf: &SessionFile) -> Self {
+        Self {
+            dir: Some(
+                sf.claude_dir
+                    .clone()
+                    .unwrap_or_else(|| user_home.join(".claude")),
+            ),
+            profile: sf.profile.clone(),
+        }
+    }
+
+    /// What a record of the agent keeping these records names as its home
+    /// ([`St::home`]), for a user whose home is `user_home`: `None` for the
+    /// user's own `~/.claude` (such a record is byte for byte what it was),
+    /// else the directory, which [`Records::of`] reads back.
+    pub(super) fn home_word(&self, user_home: &Path) -> Option<String> {
+        self.dir
+            .as_ref()
+            .filter(|dir| **dir != user_home.join(".claude"))
+            .map(|dir| dir.to_string_lossy().into_owned())
+    }
+
+    /// What a record of the agent keeping these records names as the profile
+    /// its home keeps apart ([`St::home_profile`]): `None` but for an empty
+    /// home's ([`profile_apart`]), which [`Records::of_recorded`] reads back.
+    pub(super) fn profile_word(&self) -> Option<String> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.to_string_lossy().into_owned())
+    }
+
+    /// The process `pid`'s record ([`session_file_in`]), stamped with the
+    /// profile these records keep apart ([`SessionFile::profile`]).
     pub(super) fn session_file(&self, pid: u32) -> Option<SessionFile> {
-        session_file_in(self.0.as_deref()?, pid)
+        session_file_in(self.dir.as_deref()?, pid).map(|sf| self.stamped(sf))
     }
 
-    /// Every record, complete or `None` ([`session_files_in`]).
+    /// Every record, complete or `None` ([`session_files_in`]), each stamped
+    /// with the profile these records keep apart.
     pub(super) fn session_files(&self) -> Option<Vec<SessionFile>> {
-        session_files_in(self.0.as_deref()?)
+        session_files_in(self.dir.as_deref()?)
+            .map(|files| files.into_iter().map(|sf| self.stamped(sf)).collect())
+    }
+
+    /// `sf`, read here, as the home it was read under keeps it: whoever judges
+    /// its agent by its login's model caches reads its profile
+    /// ([`Records::of_file`]). Only an empty home's differs from what the
+    /// directory says, so every other record is as it was read.
+    fn stamped(&self, sf: SessionFile) -> SessionFile {
+        SessionFile {
+            profile: self.profile.clone(),
+            ..sf
+        }
+    }
+
+    /// The profile Claude Code keeps for this home, for a user whose home is
+    /// `user_home`: the one kept apart ([`profile_apart`]), else the
+    /// directory's ([`claude_profile`]). `None` with no directory.
+    pub(super) fn profile(&self, user_home: &Path) -> Option<PathBuf> {
+        self.profile.clone().or_else(|| {
+            self.dir
+                .as_deref()
+                .map(|dir| claude_profile(user_home, dir))
+        })
     }
 
     /// The one transcript of `session` ([`transcript_in`]).
     pub(super) fn transcript(&self, session: &str) -> Option<PathBuf> {
-        transcript_in(self.0.as_deref()?, session)
+        transcript_in(self.dir.as_deref()?, session)
     }
 
     /// Whether any transcript of `session` exists ([`transcript_exists_in`]).
     pub(super) fn transcript_exists(&self, session: &str) -> Option<bool> {
-        transcript_exists_in(self.0.as_deref()?, session)
+        transcript_exists_in(self.dir.as_deref()?, session)
     }
 
     /// [`require_unique_owner`] over these records.
@@ -6234,12 +7250,12 @@ impl Records {
 
     /// [`tasked`] over these records.
     pub(super) fn tasked(&self, session: &str, ours: &[approvals::Typed]) -> Option<bool> {
-        Tasked::default().of_in(self.0.as_deref()?, session, ours)
+        Tasked::default().of_in(self.dir.as_deref()?, session, ours)
     }
 
     /// The directory, where one is known.
     pub(super) fn dir(&self) -> Option<&Path> {
-        self.0.as_deref()
+        self.dir.as_deref()
     }
 }
 
@@ -6247,10 +7263,12 @@ impl Records {
 /// once: `Some(false)` when nobody but the harness has asked it anything —
 /// no transcript at all (no message yet) among readable projects, or one
 /// holding only the harness's own turns — `Some(true)` once it holds a
-/// prompt of someone else's, and `None` when nobody can say (the projects cannot
-/// be read — none yet on a machine that never held a conversation — two
-/// transcripts claim it, or it is longer than [`Tasked`] reads at once): the
-/// caller then does what it did before it asked.
+/// prompt of someone else's, and `None` when nobody can say (the projects exist
+/// and cannot be read, the Claude home is not there, two transcripts claim
+/// it, or it is longer than [`Tasked`] reads at once): the caller then does
+/// what it did before it asked. A home with no projects at all — none yet
+/// on a machine that never held a conversation — holds no message, so no
+/// task ([`transcript_exists_in`]).
 /// `ours`: what the session's supervisor typed, and when
 /// ([`supervisor_typed`]) — a row of its, recorded as it was typed, is no one
 /// else's prompt.
@@ -6299,6 +7317,26 @@ impl Tasked {
     /// row it wrote can be read here.
     pub fn of(&mut self, home: &Path, session: &str, ours: &[approvals::Typed]) -> Option<bool> {
         self.of_in(&home.join(".claude"), session, ours)
+    }
+
+    /// [`Tasked::of`] of the conversation the relaunch snapshot `snap` names,
+    /// in THE AGENT'S OWN RECORDS ([`Records::of_snapshot`]; `user_home` is
+    /// the user's), as every relaunch reads them. Read in the user's
+    /// `~/.claude` instead, an agent under another home (an identity's, a
+    /// lab's) was asked about a directory that holds nothing of it: none
+    /// where it had no projects read as no task (the review of the
+    /// 2026-10-09 sweep fixes), and the turn-end policy typed nothing into a
+    /// tasked conversation. `None` where it names no conversation, or its
+    /// records cannot be found (a relative home whose directory is unknown).
+    pub fn of_snapshot(
+        &mut self,
+        user_home: &Path,
+        snap: &super::relaunch::Snapshot,
+        ours: &[approvals::Typed],
+    ) -> Option<bool> {
+        let session = snap.session.as_deref()?;
+        let records = Records::of_snapshot(user_home, snap);
+        self.of_in(records.dir()?, session, ours)
     }
 
     /// [`Tasked::of`] in the Claude Code directory `claude_dir` itself.
@@ -6359,7 +7397,9 @@ impl Tasked {
 /// the agent ran.
 pub(super) const TAIL_BYTES: u64 = 262_144;
 
-/// The one transcript holding `session`.
+/// The one transcript holding `session` under the user's home `home` (every
+/// reader of an agent's own reads it in its records: [`Records::transcript`]).
+#[cfg(test)]
 pub(super) fn transcript(home: &Path, session: &str) -> Option<PathBuf> {
     transcript_in(&home.join(".claude"), session)
 }
@@ -6382,16 +7422,31 @@ pub(super) fn transcript_in(claude_dir: &Path, session: &str) -> Option<PathBuf>
     found
 }
 
-/// The reset conversation `session`'s standing usage limit names now
-/// ([`upgrade::transcript_limit_reset`] over its transcript tail, past or
-/// future; `None`: none named or no transcript read). A supervisor loop whose
-/// limit episode read no reset of its own, or a clock time with no day, asks
-/// its host for this (`supervise::IdleHost::limit_until`): a notice left on
-/// screen [`LIMIT_GRACE_S`] past its reset counts as an idle point.
+/// The tail of the transcript of the conversation the relaunch snapshot
+/// `snap` names, in ITS AGENT'S OWN RECORDS ([`Records::of_snapshot`];
+/// `user_home` is the user's): the one bounded read ([`TAIL_BYTES`]) of
+/// [`named_limit_reset`], [`named_standing_wall`] and [`named_reset_line`].
+/// Read under the user's home instead, an agent started under another Claude
+/// home (`CLAUDE_CONFIG_DIR`) had no transcript there: its limit's reset was
+/// never named, and neither its wall nor its reset line read (the
+/// upgrade-homes lane's stated limit, handoff §4). `None`: no conversation
+/// named, or no transcript read.
+fn snapshot_tail(user_home: &Path, snap: &super::relaunch::Snapshot) -> Option<String> {
+    let session = snap.session.as_deref()?;
+    let path = Records::of_snapshot(user_home, snap).transcript(session)?;
+    Some(tail_to_end(&path, TAIL_BYTES).0)
+}
+
+/// The reset the standing usage limit of the conversation `snap` names
+/// names now ([`upgrade::transcript_limit_reset`] over its transcript's tail
+/// in its agent's own records, [`snapshot_tail`]; past or future; `None`:
+/// none named or no transcript read). A supervisor loop whose limit episode
+/// read no reset of its own, or a clock time with no day, asks its host for
+/// this (`supervise::IdleHost::limit_until`): a notice left on screen
+/// [`LIMIT_GRACE_S`] past its reset counts as an idle point.
 #[must_use]
-pub fn named_limit_reset(home: &Path, session: &str) -> Option<u64> {
-    let path = transcript(home, session)?;
-    upgrade::transcript_limit_reset(&tail_to_end(&path, TAIL_BYTES).0)
+pub fn named_limit_reset(user_home: &Path, snap: &super::relaunch::Snapshot) -> Option<u64> {
+    upgrade::transcript_limit_reset(&snapshot_tail(user_home, snap)?)
 }
 
 /// THE TAIL OF THE TRANSCRIPT CLAUDE CODE PROCESS `pid` WRITES NOW — what a
@@ -6399,28 +7454,73 @@ pub fn named_limit_reset(home: &Path, session: &str) -> Option<u64> {
 /// (`supervise::IdleHost::transcript_tail`, H6-HARNESS-1) — found the way
 /// the window's footer finds a process's conversation: its Claude Code
 /// directory from its own exec environment (`config_dir`, its
-/// `CLAUDE_CONFIG_DIR`, else `home`'s `.claude`: [`super::footer::claude_dir_of`]),
-/// the record that directory keeps of the process (`sessions/<pid>.json`,
-/// which `/clear` and `/resume` rewrite; its `procStart` must be `start`,
-/// the kernel's, so a reused pid's record is no one's:
-/// [`super::footer::session_of_pid`]), and its transcript — the project's own
-/// place first, else the one project holding the id
-/// ([`super::footer::sole_transcript_path`]). The same bounded read as
-/// [`named_limit_reset`] (the last [`TAIL_BYTES`]), of a regular file
-/// only. `None`: no record of the process, no transcript yet, two and none
-/// in the project's own place, or one that cannot be opened. It reads; it
-/// judges nothing.
+/// `CLAUDE_CONFIG_DIR`, else `home`'s `.claude`:
+/// [`super::footer::claude_dir_of`]), the record that directory keeps of the
+/// process (`sessions/<pid>.json`, which `/clear` and `/resume` rewrite; its
+/// `procStart` must be `start`, the kernel's, so a reused pid's record is no
+/// one's: [`super::footer::session_of_pid`]), and its transcript — the own
+/// place of the project it runs in now first, else the one project holding
+/// the id ([`super::footer::sole_transcript_path`]). The same bounded read as
+/// [`named_limit_reset`] (the last [`TAIL_BYTES`]), of a regular file only.
+/// `None`: no record of the process, no transcript yet, two and none in the
+/// project's own place, or one that cannot be opened. It reads; it judges
+/// nothing.
+///
+/// A RELATIVE home (empty included) names two directories once its Claude
+/// Code changes directory (2.1.300's worktree enter): the record is where it
+/// was filed at start ([`Records::of_process`]: the directory it runs in, or
+/// the one it was started in, `started_in`, its exec `PWD`), the
+/// conversation goes on under the home its directory NOW names
+/// ([`Records::at`]). MEASURED in the real-Claude lab (2026-10-14, 2.1.300,
+/// `other/.claude`, `EnterWorktree`, then a usage limit; `h2wtobs1`,
+/// `h2am-wlpre1`): the start home's transcript stood still while the
+/// worktree home's grew and took the limit's notice. Read where the record
+/// is, the tail ended before the move and confirmed no wall: `SKIPPED …
+/// unconfirmed wall: usage-session — the transcript ends on the model's
+/// reply` (the review of `fix/r17-homes2`). So the id comes from the record,
+/// the transcript from where it writes now, and with nothing written there
+/// yet — or its directory unread — there is no tail: the screen decides.
+/// Under an unset or absolute home the two are one directory, and its
+/// worktree's transcript is the project it runs in now (MEASURED, the lab's
+/// absolute home, `h2am-wlpreabs1`: 2.1.300 moved the file into the
+/// worktree's project).
 #[must_use]
 pub fn process_transcript_tail(
     config_dir: Option<&str>,
     home: Option<&str>,
+    started_in: Option<&str>,
     pid: u32,
     start: &str,
 ) -> Option<String> {
-    let dir = super::footer::claude_dir_of(config_dir, home)?;
+    let cwd = aterm_sysprobe::process_cwd(pid);
+    // Where its record is filed, and where it writes its conversation now,
+    // by the one resolver: an unset home under its own `HOME`, else this
+    // account's.
+    let vars = HomeVars {
+        config: config_dir,
+        home,
+    };
+    let user_home = home
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .or_else(atpkg::platform::account_home);
+    let user_home = match (config_dir, user_home) {
+        (_, Some(user_home)) => user_home,
+        // A set home names its directory without one.
+        (Some(_), None) => PathBuf::new(),
+        (None, None) => return None,
+    };
+    let filed = Records::of_process(&user_home, vars, pid, || cwd.clone(), started_in);
+    let writes = Records::at(&user_home, vars, || cwd.clone());
+    let (filed, writes) = (filed.dir()?.to_path_buf(), writes.dir()?.to_path_buf());
     let started = models::parse_lstart(start)?;
-    let entry = super::footer::session_of_pid(&dir, pid, Some(started))?;
-    let path = super::footer::sole_transcript_path(&dir, &entry)?;
+    let entry = super::footer::session_of_pid(&filed, pid, Some(started))?;
+    // The project's own place is the directory it runs in now.
+    let entry = super::footer::SessionEntry {
+        cwd: cwd.unwrap_or(entry.cwd),
+        ..entry
+    };
+    let path = super::footer::sole_transcript_path(&writes, &entry)?;
     let mut f = super::footer::open_regular(&path)?;
     let len = f.metadata().ok()?.len();
     Some(tail_window(&mut f, len, TAIL_BYTES).0)
@@ -6437,35 +7537,45 @@ pub fn snapshot_transcript_tail(snap: &super::relaunch::Snapshot) -> Option<Stri
     }
     let args = atpkg::caller_shell::process_args(snap.pid);
     let home = aterm_types::dirs::home_dir();
-    let (config_dir, home) = match &args {
-        Some(args) => (args.env_var("CLAUDE_CONFIG_DIR"), args.env_var("HOME")),
-        None => (None, home.as_deref().and_then(Path::to_str)),
+    let (config_dir, home, started_in) = match &args {
+        Some(args) => (
+            args.env_var("CLAUDE_CONFIG_DIR"),
+            args.env_var("HOME"),
+            args.env_var("PWD"),
+        ),
+        None => (None, home.as_deref().and_then(Path::to_str), None),
     };
-    process_transcript_tail(config_dir, home, snap.pid, &snap.start)
+    process_transcript_tail(config_dir, home, started_in, snap.pid, &snap.start)
 }
 
-/// THE QUOTA WALL conversation `session` stands at now
-/// ([`upgrade::transcript_standing_wall`] over its transcript's tail, the
-/// same bounded read as [`named_limit_reset`]; `None`: no quota rejection
-/// stands last, or no transcript read) — what the window's host hands the
-/// accounts recorder (`accounts::record_wall`) with the facts of the
-/// session's process. It reads; it records nothing.
+/// THE QUOTA WALL the conversation `snap` names stands at now
+/// ([`upgrade::transcript_standing_wall`] over its transcript's tail in its
+/// agent's own records, the same bounded read as [`named_limit_reset`];
+/// `None`: no quota rejection stands last, or no transcript read) — what the
+/// window's host hands the accounts recorder (`accounts::record_wall`) with
+/// the facts of the session's process. It reads; it records nothing.
 #[must_use]
-pub fn named_standing_wall(home: &Path, session: &str) -> Option<upgrade::StandingWall> {
-    let path = transcript(home, session)?;
-    upgrade::transcript_standing_wall(&tail_to_end(&path, TAIL_BYTES).0)
+pub fn named_standing_wall(
+    user_home: &Path,
+    snap: &super::relaunch::Snapshot,
+) -> Option<upgrade::StandingWall> {
+    upgrade::transcript_standing_wall(&snapshot_tail(user_home, snap)?)
 }
 
-/// THE LINE conversation `session`'s usage-limit dialog ended with since
-/// `since` (unix seconds; [`upgrade::transcript_reset_line`] over its
-/// transcript's tail, the same bounded read as [`named_standing_wall`];
-/// `None`: no such row yet, or no transcript read) — what the window's host
-/// reads a claimed limit reset's outcome from, `since` being the second the
-/// attempt was claimed. It reads; it classifies and records nothing.
+/// THE LINE the usage-limit dialog of the conversation `snap` names ended
+/// with since `since` (unix seconds; [`upgrade::transcript_reset_line`] over
+/// its transcript's tail in its agent's own records, the same bounded read
+/// as [`named_standing_wall`]; `None`: no such row yet, or no transcript
+/// read) — what the window's host reads a claimed limit reset's outcome
+/// from, `since` being the second the attempt was claimed. It reads; it
+/// classifies and records nothing.
 #[must_use]
-pub fn named_reset_line(home: &Path, session: &str, since: u64) -> Option<String> {
-    let path = transcript(home, session)?;
-    upgrade::transcript_reset_line(&tail_to_end(&path, TAIL_BYTES).0, since)
+pub fn named_reset_line(
+    user_home: &Path,
+    snap: &super::relaunch::Snapshot,
+    since: u64,
+) -> Option<String> {
+    upgrade::transcript_reset_line(&snapshot_tail(user_home, snap)?, since)
 }
 
 /// WHETHER CONVERSATION `session` IS KEPT UNDER `home`: a transcript of that
@@ -6653,7 +7763,13 @@ fn due_after_codex(opts: &Opts, tabs: &[LiveTab], codex_due: Option<Due>) -> Due
     let Some(tab) = opts.only_sid.as_deref() else {
         return Due::No;
     };
-    let Some(files) = claude_records(&opts.home) else {
+    let homes = Homes::read(
+        opts,
+        Some(tabs),
+        atpkg::caller_shell::process_args,
+        aterm_sysprobe::process_cwd,
+    );
+    let Some(files) = homes.roster(claude_records(&opts.home)) else {
         return Due::Unread(UNREAD_FILES);
     };
     match due_among(
@@ -6665,6 +7781,9 @@ fn due_after_codex(opts: &Opts, tabs: &[LiveTab], codex_due: Option<Due>) -> Due
         process_group,
         ids,
     ) {
+        // No record of the tab's agent, whose home could not be named: one
+        // may stand where nothing was read.
+        Due::Unread(UNREAD_RECORD) if homes.unnamed(tab) => Due::Unread(UNREAD_PROCESS),
         Due::Unread(UNREAD_RECORD) => no_record(tabs, tab, started_s, alive, now_s()),
         due => due,
     }
@@ -6676,6 +7795,237 @@ fn due_after_codex(opts: &Opts, tabs: &[LiveTab], codex_due: Option<Due>) -> Due
 /// listing and the read).
 fn claude_records(home: &Path) -> Option<Vec<SessionFile>> {
     session_files(home).or_else(|| (!home.join(".claude/sessions").is_dir()).then(Vec::new))
+}
+
+/// THE CLAUDE HOMES ONE PASS READS past the user's own `~/.claude` (which
+/// each reader reads first, by its own rule): every directory a Claude Code
+/// in the instance's tabs may keep its records under. A Claude Code started
+/// with `CLAUDE_CONFIG_DIR=<dir>` — an account's relaunch
+/// ([`super::accounts::HOME_ENV`]), an owner's wrapper, the real-Claude lab —
+/// files `sessions/<pid>.json` and its transcripts in `<dir>`, never in
+/// `~/.claude`. Read in `~/.claude` alone, the live upgrade never found such
+/// an agent: never due, never visited, never counted, while its relaunch on
+/// exit and its restart in place carried its home (the handoff's §4
+/// residual, 2026-10-14).
+///
+/// A home is learned where the harness learns it everywhere else: the exec
+/// environment of the tab's foreground job's leader — the agent, or the twin
+/// that execs it in place (`relaunch::snapshot` reads the same process) —
+/// its `CLAUDE_CONFIG_DIR` resolved where Claude Code filed its record, by
+/// the one resolver of a running agent's home ([`Records::of_process`]: a
+/// relative one — set and empty included — against the leader's working
+/// directory, or the one it was started in where a worktree has moved it
+/// since). Only the tab
+/// `opts.only_sid` names, when
+/// it names one (the window's step and its [`due`]): another tab's home is
+/// that tab's to read. With no roster of its own (the CLI's sweep), the
+/// same read over the tabs of every instance on the machine
+/// ([`instance_tabs`]), and the homes the conversations' own records name
+/// ([`St::home`], written by the visit that found each agent): read from
+/// the records alone, an agent under another home that no window visit had
+/// recorded yet was never listed by `aterm harness upgrade`, though its tab
+/// was live and its record stood in its own home.
+///
+/// A LIVE leader whose home cannot be named — its exec record not read, a
+/// relative home whose working directory is not — is never read as one
+/// under the user's home: its tab is [`Homes::unnamed`], and a look that
+/// finds no record of its agent waits on it ([`UNREAD_PROCESS`]). One gone
+/// since the roster leads nothing. Only a pass's own roster names such
+/// tabs: the instances' tabs a pass with none reads teach it homes alone —
+/// every tab whose leader it cannot read (a `sudo` shell, another user's
+/// process, none of them Claude) was a `wait:no-process` row of the CLI's
+/// sweep (the review of `fix/r17-homes2`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Homes {
+    /// The homes' records, the user's own excluded, each directory once.
+    dirs: Vec<Records>,
+    /// The tabs whose leader's home could not be named.
+    unnamed: Vec<String>,
+}
+
+impl Homes {
+    /// The homes of `tabs` (with none, of every instance's tabs, then of the
+    /// records), each leader's exec record read by `read_args` and, for a
+    /// relative home, its working directory by `read_cwd`. A home read off a
+    /// live leader comes first: [`Homes::add`] keeps the first reading of a
+    /// directory, and a record's word is only as fresh as the visit that
+    /// wrote it (one an older build wrote names no profile apart).
+    pub(super) fn read(
+        opts: &Opts,
+        tabs: Option<&[LiveTab]>,
+        mut read_args: impl FnMut(u32) -> Option<atpkg::caller_shell::ProcArgs>,
+        mut read_cwd: impl FnMut(u32) -> Option<PathBuf>,
+    ) -> Self {
+        let mut homes = Homes::default();
+        // With no roster of its own, the instances' tabs only teach homes:
+        // none of their waits is this pass's to report.
+        let every;
+        let (tabs, learned) = match tabs {
+            Some(tabs) => (tabs, false),
+            None => {
+                every = instance_tabs(opts);
+                (every.as_slice(), true)
+            }
+        };
+        let ours = tabs
+            .iter()
+            .filter(|tab| opts.only_sid.as_deref().is_none_or(|only| only == tab.sid));
+        for tab in ours {
+            let Some(leader) = tab.fgpgid.and_then(|group| u32::try_from(group).ok()) else {
+                continue;
+            };
+            // A leader gone since the roster leads nothing: no agent is there.
+            let unnamed = |homes: &mut Homes| {
+                if !learned && alive(leader) {
+                    homes.unnamed.push(tab.sid.clone());
+                }
+            };
+            let Some(args) = read_args(leader) else {
+                unnamed(&mut homes);
+                continue;
+            };
+            // Unset: under the leader's own `HOME` — the user's own, which
+            // every reader reads first, unless it was launched with another.
+            let records = Records::of_process(
+                &opts.home,
+                HomeVars::of(&args),
+                leader,
+                || read_cwd(leader),
+                args.env_var("PWD"),
+            );
+            if records.dir().is_some() {
+                homes.add(&opts.home, records);
+            } else {
+                unnamed(&mut homes);
+            }
+        }
+        if learned {
+            for records in recorded_homes(opts) {
+                homes.add(&opts.home, records);
+            }
+        }
+        homes
+    }
+
+    /// `records`, unless their directory is the user's own
+    /// `user_home/.claude` or already here — the same directory however
+    /// spelled (a link, a `..`): read twice, every record in it would read
+    /// as a second owner of its own conversation.
+    fn add(&mut self, user_home: &Path, records: Records) {
+        let Some(dir) = records.dir() else {
+            return;
+        };
+        if !same_dir(dir, &user_home.join(".claude"))
+            && !self
+                .dirs
+                .iter()
+                .filter_map(Records::dir)
+                .any(|d| same_dir(d, dir))
+        {
+            self.dirs.push(records);
+        }
+    }
+
+    /// The homes the records of `sessions` name ([`St::home`]): where the
+    /// owner's view reads their holders (`upgrade_status`'s `holders`).
+    pub(super) fn of_records(opts: &Opts, sessions: &std::collections::BTreeSet<String>) -> Self {
+        let mut homes = Homes::default();
+        for session in sessions {
+            if let Some(st) = load(opts, session).filter(|st| st.home.is_some()) {
+                homes.add(&opts.home, st.agent_records(&opts.home));
+            }
+        }
+        homes
+    }
+
+    /// The homes' directories, in the order read.
+    #[cfg(test)]
+    pub(super) fn dirs(&self) -> Vec<PathBuf> {
+        self.dirs
+            .iter()
+            .filter_map(Records::dir)
+            .map(Path::to_path_buf)
+            .collect()
+    }
+
+    /// Whether tab `sid`'s leader's home could not be named.
+    pub(super) fn unnamed(&self, sid: &str) -> bool {
+        self.unnamed.iter().any(|tab| tab == sid)
+    }
+
+    /// The records of the user's home (`first`, read by the caller's own
+    /// rule) and of every home here ([`session_files_in`]), as one roster:
+    /// `None` when any could not be read whole, as the user's own fails a
+    /// pass. A home with no `sessions/` at all keeps none yet (a Claude Code
+    /// files its record moments after it starts, [`RECORD_WINDOW_S`]).
+    pub(super) fn roster(&self, first: Option<Vec<SessionFile>>) -> Option<Vec<SessionFile>> {
+        let mut files = first?;
+        for records in &self.dirs {
+            match records.session_files() {
+                Some(more) => files.extend(more),
+                None if records.dir().is_some_and(|dir| {
+                    matches!(
+                        std::fs::symlink_metadata(dir.join("sessions")),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
+                }) => {}
+                None => return None,
+            }
+        }
+        Some(files)
+    }
+}
+
+/// EVERY LIVE TAB ON THE MACHINE, for a pass with no roster of its own (the
+/// CLI's sweep, [`Homes::read`]): the `who` roster of every instance
+/// [`Opts::instances`] names — the product's, every instance `aterm ctl ls`
+/// lists ([`aterm_ctl::local_instances`]) — each bounded by
+/// [`CLAIMS_WAIT`]; tab ids are unique across instances. An explicit socket
+/// (`--sock`), or a machine directory that cannot be listed, asks the one
+/// instance it names. None where nothing answers.
+fn instance_tabs(opts: &Opts) -> Vec<LiveTab> {
+    let roster = |mut c: Client| {
+        c.transport().set_read_timeout(Some(CLAIMS_WAIT)).ok()?;
+        host_roster(&mut c)
+    };
+    let one = || {
+        connect(opts, opts.only_sid.as_deref().unwrap_or(""))
+            .ok()
+            .and_then(roster)
+            .unwrap_or_default()
+    };
+    if opts.sock.is_some() {
+        return one();
+    }
+    let socks = match &opts.instances {
+        Instances::Machine => match aterm_ctl::local_instances() {
+            Ok(instances) if !instances.is_empty() => {
+                instances.into_iter().map(|(_, sock)| sock).collect()
+            }
+            _ => return one(),
+        },
+        Instances::Listed(socks) => socks.clone(),
+    };
+    socks
+        .iter()
+        .filter_map(|sock| Client::connect_local_beside(sock).ok())
+        .filter_map(roster)
+        .flatten()
+        .collect()
+}
+
+/// The Claude homes the conversations' records name ([`St::home`]): what a
+/// pass with no roster reads past the user's own ([`Homes::read`]).
+fn recorded_homes(opts: &Opts) -> Vec<Records> {
+    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| St::from_json(&std::fs::read_to_string(e.path()).ok()?))
+        .filter(|st| st.agent == upgrade::Agent::Claude && st.home.is_some())
+        .map(|st| st.agent_records(&opts.home))
+        .collect()
 }
 
 /// [`due`]'s Claude Code half for tab `opts.only_sid`, over a complete read of
@@ -6850,6 +8200,11 @@ pub const UNREAD_PROCESS: &str = "no-process";
 /// [`Due::Unread`]'s word for a look that could not read Claude Code's
 /// session records whole: the sweep's own wait for it.
 pub const UNREAD_FILES: &str = "session-files-unreadable";
+/// The wait of a look at a behind agent that has LEFT ITS RECORD
+/// ([`Records::left_by`]: a worktree under a relative Claude home since it
+/// filed it), whose status that record no longer keeps: nothing is asked of
+/// it or restarted until it is back where its record is.
+pub const HOME_MOVED: &str = "home-moved";
 /// [`Due::Unread`]'s word for a look whose tab agent is behind nothing that
 /// answered while a build it could move to did not answer `--version` within
 /// [`VERSION_WAIT`] (a first-run check, a loaded machine): unknown until the
@@ -6887,7 +8242,13 @@ pub fn note_behind(opts: &Opts, since: u64) -> Behind {
     if let Some(noted) = codex::note_behind(opts, &tabs, since) {
         return noted;
     }
-    let Some(files) = claude_records(&opts.home) else {
+    let homes = Homes::read(
+        opts,
+        Some(&tabs),
+        atpkg::caller_shell::process_args,
+        aterm_sysprobe::process_cwd,
+    );
+    let Some(files) = homes.roster(claude_records(&opts.home)) else {
         return Behind::Unread(UNREAD_FILES);
     };
     let sf = match tab_agent(
@@ -6902,6 +8263,7 @@ pub fn note_behind(opts: &Opts, since: u64) -> Behind {
         TabAgent::Claimed(sf) => sf,
         TabAgent::Nothing => return Behind::Nothing,
         TabAgent::Unread => return Behind::Unread(UNREAD_PROCESS),
+        TabAgent::NoRecord if homes.unnamed(tab) => return Behind::Unread(UNREAD_PROCESS),
         TabAgent::NoRecord => {
             return match no_record(&tabs, tab, started_s, alive, now_s()) {
                 Due::Unread(word) => Behind::Unread(word),
@@ -6978,6 +8340,7 @@ fn mint_behind(
     let mut st = St::for_target(prior, &running, &target, None, who, now_s());
     st.pending_since = st.pending_since.min(since);
     st.tab = tab.to_string();
+    st.keep_home(&Records::of_file(&opts.home, sf), &opts.home);
     save(opts, &sf.session_id, &st);
     true
 }
@@ -7016,11 +8379,24 @@ fn retab(
         start: &who,
         started_s: models::parse_lstart(&sf.proc_start).unwrap_or(0),
     };
-    let (mut st, how) = St::retarget(prior, running, target, None, who, now_s());
+    let now = now_s();
+    let (mut st, how) = St::retarget(prior, running, target, None, who, now);
     if matches!(st.phase, Phase::Pending | Phase::Failed(_)) {
         tab.clone_into(&mut st.tab);
     }
+    st.keep_home(&Records::of_file(&opts.home, sf), &opts.home);
     save(opts, &sf.session_id, &st);
+    if how == Retarget::Rested {
+        let r = Report {
+            pid: sf.pid,
+            tab: tab.to_string(),
+            session: sf.session_id.clone(),
+            from: running.to_string(),
+            to: format!("{}({})", target.version, target.source.as_str()),
+            step: String::new(),
+        };
+        rested_said(opts, &r, &st, now);
+    }
     if Version::parse(&old).as_ref() != Some(&target.version) {
         let r = Report {
             pid: sf.pid,
@@ -7041,6 +8417,37 @@ fn retab(
         );
     }
     true
+}
+
+/// THE STOP A NEW PROCESS OF THE CONVERSATION KEEPS ([`St::keep_stop`]),
+/// saved and said once on the ledger (`kept-stopped:<why>`): the build that
+/// failed to start for the conversation, and when it is tried again. A dry
+/// run writes and says nothing.
+fn rested_said(opts: &Opts, r: &Report, st: &St, now: u64) {
+    if opts.dry_run {
+        return;
+    }
+    let Phase::Failed(why) = &st.phase else {
+        return;
+    };
+    save(opts, &r.session, st);
+    // The rest counts from [`St::failed_at`], which a repeated stop sets later.
+    let rests = st
+        .failed_at
+        .saturating_add(upgrade::RETRY_S)
+        .saturating_sub(now);
+    ledger(
+        opts,
+        &said(r.clone(), format!("kept-stopped:{why}")),
+        &format!(
+            "a new process holds the conversation (resumed by hand after the stop), running {}; \
+             {} failed to start for this conversation, so it is not tried again for it until the \
+             stop's rest ends in {} (a newer build is tried at once)",
+            st.from,
+            st.to,
+            upgrade::span(rests)
+        ),
+    );
 }
 
 /// What the window's host does after one [`step`] on a session.
@@ -7674,8 +9081,8 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
     // file needed.
     let codex = codex::sweep(opts, live_tabs);
     // A tab whose foreground job is Codex belongs to the Codex branch alone:
-    // the Claude pass's machine-wide waits (no `~/.claude` on a Codex-only
-    // machine) are not that tab's.
+    // the Claude pass's machine-wide waits (Claude's records unreadable) are
+    // not that tab's.
     let codex_tab = opts
         .only_sid
         .as_ref()
@@ -7732,7 +9139,17 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     if live_tabs.is_some_and(<[LiveTab]>::is_empty) {
         return Vec::new();
     }
-    let Some(files) = session_files(&opts.home) else {
+    // Every Claude home an agent in the tabs runs under, the user's first: a
+    // user's home that keeps no records at all (no `sessions/`: every agent
+    // runs under another home) holds none, as [`due`] reads it, and never
+    // waits the pass for good.
+    let homes = Homes::read(
+        opts,
+        live_tabs,
+        atpkg::caller_shell::process_args,
+        aterm_sysprobe::process_cwd,
+    );
+    let Some(files) = homes.roster(claude_records(&opts.home)) else {
         return vec![Report {
             pid: 0,
             tab: "-".to_string(),
@@ -7822,6 +9239,20 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
             })
             .collect()
     });
+    // A tab whose agent's home could not be named, and whose agent no record
+    // read here names: its look waits, never "current".
+    for sid in &homes.unnamed {
+        if !reports.iter().any(|r| r.tab == *sid) {
+            reports.push(Report {
+                pid: 0,
+                tab: sid.clone(),
+                session: "-".to_string(),
+                from: "-".to_string(),
+                to: "-".to_string(),
+                step: format!("wait:{UNREAD_PROCESS}"),
+            });
+        }
+    }
     if !opts.background {
         reports.extend(orphans(opts, &files, live_tabs));
     }
@@ -7943,7 +9374,8 @@ fn visit(
     targets: &Targets,
     k: &dyn Kernel,
 ) -> Report {
-    let files = session_files(&opts.home);
+    // The roster of the home the record was read in, as a pass reads it.
+    let files = Records::of_file(&opts.home, sf).session_files();
     visit_with_claim(opts, sf, files.as_deref(), t, targets, k, None, None)
 }
 
@@ -8167,6 +9599,35 @@ fn visit_models(
             ),
         );
     }
+    // A RELAUNCH STOPPED AS NEVER PICKED UP, PICKED UP AFTER ALL (the review
+    // of the 2026-10-09 sweep fixes): the agent its line started holds the
+    // conversation in its tab ([`St::landed_after_stop`]). Left stopped, the
+    // owner kept the interrupt `agent-down`, and its command to resume by
+    // hand, while that agent ran idle in the tab: a second holder of the
+    // conversation, or the command typed into the running agent. The record
+    // is reopened as the relaunch that landed (ledgered once) and goes on
+    // below as any relaunch in flight a visit finds landed.
+    if let Some(st) = prior
+        .as_mut()
+        .filter(|st| st.tab == tab && st.landed_after_stop(sf, k))
+    {
+        let reopen = Report {
+            to: format!("{}({})", st.to, st.source),
+            ..r.clone()
+        };
+        if opts.dry_run {
+            return said(reopen, "would-reopen:relaunch-landed");
+        }
+        st.reopen_landed(now_s());
+        save(opts, &sf.session_id, st);
+        ledger(
+            opts,
+            &said(reopen, "reopened:relaunch-landed"),
+            "the relaunch stopped as never picked up came up after all: the process its \
+             shell started holds the conversation, so it is carried on as a relaunch that \
+             landed",
+        );
+    }
     if let Some(mut st) = prior.clone().filter(St::in_flight) {
         r.to = format!("{}({})", st.to, st.source);
         if st.tab != tab {
@@ -8236,8 +9697,8 @@ fn visit_models(
     let hand_model = || {
         hand_model_in(
             opts,
-            // The sweep found this agent in `~/.claude`: its records are there.
-            &Records::of(&opts.home, None),
+            // Its records are where the sweep found it.
+            &Records::of_file(&opts.home, sf),
             &sf.session_id,
             &args.argv,
             models::parse_lstart(&sf.proc_start),
@@ -8327,6 +9788,22 @@ fn visit_models(
         };
     };
     r.to = format!("{}({})", target.version, target.source.as_str());
+    // AN AGENT THAT LEFT ITS RECORD ([`Records::left_by`]: a worktree under a
+    // relative home since it filed it): the record's status is frozen at what
+    // it was as the agent moved, and its conversation goes on under another
+    // home. Read here, that status lagged the idle screen, so under the ask
+    // flow the notice and its re-asks were typed, then a release, for a
+    // restart that waits on a status that cannot move (the review of
+    // `fix/r17-homes2`). Nothing is announced, restarted or recorded until it
+    // is back where its record is (`ExitWorktree`, or an exit and the
+    // relaunch on it).
+    if Records::of_file(&opts.home, sf).left_by(
+        &opts.home,
+        args.env_var(super::accounts::HOME_ENV),
+        || aterm_sysprobe::process_cwd(sf.pid),
+    ) {
+        return said(r, format!("wait:{HOME_MOVED}"));
+    }
     // The restart before this one has not said its model yet: a new upgrade
     // would start from a fresh state and lose that outcome's `done` row.
     if prior.as_ref().is_some_and(St::confirming) {
@@ -8351,9 +9828,22 @@ fn visit_models(
         })
         .map(|p| p.to.clone());
     let (mut st, how) = St::retarget(prior, &running, &target, model_to.as_deref(), who, now);
+    // THE CLAUDE HOME ITS AGENT KEEPS ITS RECORDS UNDER, named on the record
+    // ([`St::home`]): the view's holders, the watch, a pass with no roster and
+    // the relaunch after its restart read the agent there. Saved at once
+    // where it moved, as a retarget is below: a look that cannot read the
+    // tab returns without saving.
+    if st.keep_home(&Records::of_file(&opts.home, sf), &opts.home) {
+        save(opts, &sf.session_id, &st);
+    }
     // A dropped ride is said with how this retarget left its round.
     if let Some(dropped) = &dropped {
         dropped.say(opts, &r, &st, how);
+    }
+    // A stop kept for a new process of the conversation: said once, saved
+    // at once (a look that cannot read the tab returns without saving).
+    if how == Retarget::Rested {
+        rested_said(opts, &r, &st, now);
     }
     // The tab a PENDING upgrade waits in: what the owner names (`aterm
     // harness upgrade <sid> --now`) and what the window shows it under. From
@@ -8428,9 +9918,12 @@ fn visit_models(
     // ([`login_facts`]); once announced or with a release owed, for READY; at
     // a restart, for the model the agent ran and where the resumed session's
     // turns will start.
-    let recent = transcript(&opts.home, &sf.session_id).map(|p| tail_to_end(&p, TAIL_BYTES));
+    let records = Records::of_file(&opts.home, sf);
+    let recent = records
+        .transcript(&sf.session_id)
+        .map(|p| tail_to_end(&p, TAIL_BYTES));
     let tail = recent.as_ref().map(|(text, _)| text.as_str());
-    let rearmed = login_facts(opts, &sf.session_id, &mut st, &mut facts, tail, now);
+    let rearmed = login_facts(&records, &sf.session_id, &mut st, &mut facts, tail, now);
     // A usage limit the transcript says stands, and a notice queued behind
     // one: what the screen alone cannot say ([`queue_facts`]).
     let asked = st.request_for(&tab);
@@ -8493,6 +9986,25 @@ fn visit_models(
             Err(why) => step = Step::Wait(why),
         }
     }
+    // A BUILD THAT FAILED TO START — for any conversation, this one's own
+    // rested round included — is moved onto by no agent until it is proved
+    // to start without one ([`build_starts`]; the owner's `--now` probes a
+    // build no probe proves any more, for this agent): an announcement asks
+    // for a move that would not come, and a restart ends a working agent
+    // onto a build that exits at once (handoff §4, round eighteen). A model
+    // move on the build the agent already runs moves it onto no other build.
+    // Asked wherever the round would move, and wherever it has asked its
+    // agent, whatever its step: such a round is abandoned and its agent
+    // released at once, never left winding down, or stopped for a restart,
+    // that the hold keeps from coming; a round that asked nothing waits, any
+    // release it owes typed ([`upgrade::build_hold`]).
+    if target.version != running
+        && (upgrade::asked_for_a_move(&asked_about, ready)
+            || matches!(step, Step::Announce | Step::Terminate | Step::Fresh))
+        && build_starts(opts, &r, &target, now, request == Request::Now).is_err()
+    {
+        step = upgrade::build_hold(step, &asked_about, ready);
+    }
     // Where a dry read that would act stands ([`upgrade::held_point`]): the
     // give-up and re-arm are taken whatever the session shows, so a read off
     // any point (the host's watch) says what holds the point they wait for,
@@ -8526,21 +10038,22 @@ fn visit_models(
             );
             r
         }
+        Step::Void(BUILD_FAILS) => build_held(opts, r, &mut st, now),
         Step::Void(why) => drain_expired(opts, r, &mut st, why, &facts, now),
         Step::Announce => {
             if let Err(why) = require_unique_owner(&opts.home, sf) {
                 return said(r, format!("wait:{why}"));
             }
             // The look's pill: no read of its own, the upgrade's exchanges
-            // with the host are fenced and counted. (Its transcript is in
-            // `~/.claude`, where the sweep found the agent.)
-            let mode = resume_mode(
-                &Records::of(&opts.home, None),
-                &sf.session_id,
-                shown_mode.clone(),
-            );
+            // with the host are fenced and counted. (Its transcript is where
+            // the sweep found the agent.)
+            let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
             let model = model_to.clone().or_else(hand_model);
             let planned = proven.map_or(Err(NoPlan::Wait("ids")), |shell| {
+                // The home and the login this very process runs under, off
+                // the exec environment the visit already read.
+                let home = args.env_var(super::accounts::HOME_ENV);
+                home_carried(&opts.home, home, &sf.cwd, &records)?;
                 plan(
                     opts,
                     &launch_of(
@@ -8550,10 +10063,7 @@ fn visit_models(
                         model.as_deref(),
                         mode.as_deref(),
                         true,
-                        // The home and the login this very process runs
-                        // under, off the exec environment the visit already
-                        // read.
-                        args.env_var(super::accounts::HOME_ENV),
+                        home,
                         args.env_var(super::accounts::LOGIN_ENV),
                     ),
                     shell,
@@ -8951,7 +10461,9 @@ fn look(
         background_point: opts.background,
         // Asked only where it can move the step: before anything is ended.
         taskless: matches!(st.phase, Phase::Pending | Phase::Announced { .. })
-            && tasked(&opts.home, &sf.session_id, &supervisor_typed(opts, tab)) == Some(false),
+            && Records::of_file(&opts.home, sf)
+                .tasked(&sf.session_id, &supervisor_typed(opts, tab))
+                == Some(false),
         limited: upgrade::limited(upgrade::Agent::Claude, &scr.rows),
         // The screen's word; the transcript's is added by the visit, which
         // reads the tail ([`visit_models`]).
@@ -9083,7 +10595,7 @@ const GAVE_UP_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 /// the recorded markers or, for an older state, as they were minted
 /// ([`upgrade::round_markers`]).
 fn login_facts(
-    opts: &Opts,
+    records: &Records,
     session: &str,
     st: &mut St,
     f: &mut Facts,
@@ -9106,7 +10618,9 @@ fn login_facts(
         f.undelivered = said.undelivered == Some(true);
         return None;
     }
-    let deep = transcript(&opts.home, session).map(|p| tail_to_end(&p, GAVE_UP_TAIL_BYTES).0);
+    let deep = records
+        .transcript(session)
+        .map(|p| tail_to_end(&p, GAVE_UP_TAIL_BYTES).0);
     let text = deep.as_deref().or(tail)?;
     f.undelivered = upgrade::notice_fate(text, &st.marker) == Some(true);
     let markers = if st.asked.is_empty() {
@@ -9358,7 +10872,9 @@ fn release_visit(
     host_claim: Option<&HostClaim>,
 ) -> Report {
     let now = now_s();
-    let recent = transcript(&opts.home, &sf.session_id).map(|p| tail_to_end(&p, TAIL_BYTES));
+    let recent = Records::of_file(&opts.home, sf)
+        .transcript(&sf.session_id)
+        .map(|p| tail_to_end(&p, TAIL_BYTES));
     let tail = recent.as_ref().map(|(text, _)| text.as_str());
     if let Some(why) = release_void(&st, sf, tab, tail) {
         if opts.dry_run {
@@ -9483,7 +10999,15 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {
             continue;
         }
-        if registered_since(&fresh, &opts.home, &session) {
+        // Read where the record says its agent keeps its records ([`St::home`]).
+        let held = if st.home.is_some() {
+            st.agent_records(&opts.home)
+                .session_files()
+                .is_some_and(|files| conversation_live(&files, &session))
+        } else {
+            registered_since(&fresh, &opts.home, &session)
+        };
+        if held {
             continue; // `visit` has it, or the loop's `resume`.
         }
         let r = Report {
@@ -9770,6 +11294,31 @@ fn drain_expired(opts: &Opts, r: Report, st: &mut St, why: &str, f: &Facts, now:
     r
 }
 
+/// A ROUND THAT ASKED ITS AGENT, ITS BUILD FAILING TO START
+/// ([`upgrade::build_hold`]): stopped at `now` ([`St::stop`],
+/// `failed:build-fails`) — its markers forgotten, so no READY given to them
+/// restarts the agent later, and the agent it asked owed its release, which
+/// the visit types where the notice's gate lets it ([`release`]). The round
+/// rests as any stop does ([`upgrade::RETRY_S`]); its next round waits on
+/// the build ([`BUILD_FAILS`]), asking nothing until a probe proves the
+/// build starts or a newer one is the target. A dry run only says it.
+fn build_held(opts: &Opts, r: Report, st: &mut St, now: u64) -> Report {
+    if opts.dry_run {
+        return said(r, format!("would-fail:{BUILD_FAILS}"));
+    }
+    st.stop(BUILD_FAILS, now);
+    let r = said(r, format!("failed:{BUILD_FAILS}"));
+    ledger(
+        opts,
+        &r,
+        "the build this round would move the agent onto failed to start and is not proved to \
+         start since, so no move comes: the round stops, the agent it asked is owed its \
+         release, and the next round asks nothing until the build is proved to start or a \
+         newer one is the target",
+    );
+    r
+}
+
 /// Records that the agent is no job of a job-control shell
 /// ([`Job::NoJobControl`]): the upgrade stops for this (session, target),
 /// ledgered once. No release is owed: the line is typed under the notice's
@@ -9940,6 +11489,76 @@ fn launch_of<'a>(
         home,
         login,
     }
+}
+
+/// THE LINE STARTS THE AGENT UNDER THE CLAUDE HOME ITS RECORDS ARE IN. A
+/// RELATIVE `CLAUDE_CONFIG_DIR` — set and empty included (`home`, the raw
+/// value the line carries) — is resolved against the directory the process
+/// runs in, by the one resolver ([`home_dir_at`], as Claude Code resolves
+/// it), and the relaunch line starts the new process in `cwd` (its `cd`,
+/// [`super::relaunch::plan`]; empty: where the agent runs now, where its
+/// home was resolved). Where that names another directory than `records` —
+/// where this agent's record was read: the sweep's ([`Homes`]), the relaunch
+/// snapshot's ([`Records::of_snapshot`]) — the relaunched Claude Code would
+/// look for its conversation, and file its record, under another home, and
+/// nothing could find it again: REFUSED, a launch line a resume cannot
+/// repeat (`refused:home`). Every planner asks it: the upgrade's restart,
+/// the restart in place and the relaunch on exit. An absolute home is
+/// carried as it is.
+///
+/// AN UNSET ONE UNDER ANOTHER `HOME` THAN THE USER'S (`user_home`): Claude
+/// Code takes `homedir()`, the process's own `HOME`, and the one resolver
+/// now reads such an agent's records there ([`claude_home_dir`], round
+/// eighteen) — but the relaunch line carries no `HOME`, so the relaunched
+/// process would take its shell's and look for its conversation, and file
+/// its record, under another home: REFUSED the same way, where until then
+/// the agent was never found at all (the snapshot read it as no Claude Code,
+/// the sweep never listed its home). Carrying its `HOME` on the line is not
+/// done here (the handoff's §4 states it).
+pub(super) fn home_carried(
+    user_home: &Path,
+    home: Option<&str>,
+    cwd: &str,
+    records: &Records,
+) -> Result<(), NoPlan> {
+    let Some(home) = home else {
+        return match records.dir() {
+            Some(dir) if !same_dir(dir, &user_home.join(".claude")) => Err(NoPlan::Refused {
+                why: "line:home".to_string(),
+                what: "home".to_string(),
+                detail: format!(
+                    "it runs under another HOME than its shell's (its records are in {}), and \
+                     the relaunch line, which carries no HOME, would start it under another \
+                     Claude home",
+                    dir.display()
+                ),
+            }),
+            _ => Ok(()),
+        };
+    };
+    if Path::new(home).is_absolute() {
+        return Ok(());
+    }
+    if cwd.is_empty() {
+        return Ok(());
+    }
+    let at = home_dir_at(home, || Some(PathBuf::from(cwd)));
+    if at.is_some() && at.as_deref() == records.dir() {
+        return Ok(());
+    }
+    let named = if home.is_empty() {
+        "is set and empty, which names the directory it runs in".to_string()
+    } else {
+        format!("({home}) is relative")
+    };
+    Err(NoPlan::Refused {
+        why: "line:home".to_string(),
+        what: "home".to_string(),
+        detail: format!(
+            "its CLAUDE_CONFIG_DIR {named}, and the relaunch line would start it in {cwd}, under \
+             another Claude home than the one its records are in"
+        ),
+    })
 }
 
 /// The last look before typing into Claude's composer: a fresh read with an
@@ -10371,6 +11990,15 @@ fn restart(
         login,
         home,
     } = *how;
+    // NEVER `--resume` OF A CONVERSATION WITH NO TRANSCRIPT, whatever the
+    // step read ([`transcript_exists_in`]): Claude refuses it and exits, and
+    // the tab is left with no agent (the real-Claude sweep of 2026-10-09).
+    // Such a restart starts the agent afresh, as [`Step::Fresh`] does, and
+    // its record says so: the relaunch adopts the new process whatever
+    // conversation it holds, and carries nothing on.
+    // Its records, where the sweep found it.
+    let records = Records::of_file(&opts.home, sf);
+    let fresh = fresh || records.transcript_exists(&sf.session_id) == Some(false);
     let status_holds = |a: &SessionFile| status_lets_signal(a, sf, lagging);
     // The notice this restart answers is the process's own — or, afresh,
     // there is none, and the conversation must still have no task — or,
@@ -10378,7 +12006,7 @@ fn restart(
     // looked at, in its tab.
     let ours = |st: &St, a: &SessionFile| {
         if fresh {
-            tasked(&opts.home, &sf.session_id, &supervisor_typed(opts, tab)) == Some(false)
+            records.tasked(&sf.session_id, &supervisor_typed(opts, tab)) == Some(false)
         } else if quiet {
             st.tab == tab && a.pid == sf.pid && squash(&a.proc_start) == squash(&sf.proc_start)
         } else {
@@ -10414,12 +12042,7 @@ fn restart(
     // The model the list moves it to, else a model a person chose by hand
     // since the launch: its `--model` would undo that `/model`.
     let model = recorded(&st.model_list).or(hand_model);
-    // (Its transcript is in `~/.claude`, where the sweep found the agent.)
-    let mode = resume_mode(
-        &Records::of(&opts.home, None),
-        &sf.session_id,
-        shown_mode.map(str::to_owned),
-    );
+    let mode = resume_mode(&records, &sf.session_id, shown_mode.map(str::to_owned));
     let launch = launch_of(
         sf,
         argv,
@@ -10430,7 +12053,9 @@ fn restart(
         home,
         login,
     );
-    let Plan { shell, line, .. } = match plan(opts, &launch, proven, t) {
+    let planned = home_carried(&opts.home, home, &sf.cwd, &records)
+        .and_then(|()| plan(opts, &launch, proven, t));
+    let Plan { shell, line, .. } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, st, no),
     };
@@ -10447,7 +12072,7 @@ fn restart(
         // still its shell's foreground job, composer empty, nothing running
         // under it, no hand and no unread input (a person's within `grace`,
         // never zero).
-        let again = session_file_of(&opts.home, sf.pid);
+        let again = records.session_file(sf.pid);
         let scr = screen(c, tab);
         let still = again.is_some_and(|a| {
             a.session_id == sf.session_id
@@ -10487,7 +12112,7 @@ fn restart(
         // A second owner, a job-control change or a moved terminal during the
         // state write must veto the signal: re-read the session file and
         // kernel claims right before SIGTERM.
-        let current = session_file_of(&opts.home, sf.pid);
+        let current = records.session_file(sf.pid);
         let owns_notice = current.as_ref().is_some_and(|a| {
             a.session_id == sf.session_id
                 && status_holds(a)

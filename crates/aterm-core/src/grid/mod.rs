@@ -70,7 +70,7 @@ pub mod extra_collection {
 // ============================================================================
 
 pub use aterm_grid::grid::Grid;
-pub use aterm_grid::grid::{MaterializedRow, materialize_from_line};
+pub use aterm_grid::grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 
 // The scrollback-reflow offload job types appear in
 // `Terminal::resize_offloading_scrollback`'s public signature; hosts that hold
@@ -107,5 +107,8 @@ pub use aterm_grid::{CurrentStyle, Cursor, SavedCursor, SavedCursorState};
 
 // Grid dimension ingress bounds (§5.8): constructors and resize clamp to these.
 pub use aterm_grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
+// The every-8 default tab stop: a host carrying stops compactly names the
+// default by the grid's own rule.
+pub use aterm_grid::is_default_tab_stop;
 
 pub(crate) use aterm_grid::row_u16;

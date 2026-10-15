@@ -7,7 +7,10 @@
 //! ends the program it stamped, its KILL waiting out another hand on the
 //! session and its exit decided only once its program ended (review of
 //! 1a733ed60), and however many acts there were, one watch ends it (bug hunt
-//! 7).
+//! 7); an end read under a hold, a lease or a turn is carried through it,
+//! and one read under another supervisor's claim is that supervisor's — a
+//! claim that lands during that carry included, nothing ever typed into the
+//! tab it claims (ruling 20 of 2026-10-14 and its review).
 
 use aterm_spec::derive::{Model, harness_restart_stamp_liveness, harness_restart_stamp_model};
 use aterm_spec::verify;
@@ -120,22 +123,70 @@ fn the_restart_act_is_read_by_its_stamp_and_ends_its_program() {
     );
     // WHOSE EXIT IT WAS IS DECIDED AT ITS END (ruling 15): a program that
     // still runs — stopped away from its tab while the hand came and went —
-    // is no exit to read; and an end read under a hand is the holder's, not
-    // this model's. Lifted, the act's end is read as the act's.
+    // is no exit to read. An end read under a hold, a lease or a named turn
+    // is CARRIED through it (ruling 20 of 2026-10-14): its relaunch waits for
+    // the hand, so no `Read` while it stands and nothing else either — never
+    // left to the holder — and, lifted, the act's end is read as the act's.
     assert!(
         !model.action_enabled("Read", &held),
         "nothing is decided while the act's program runs"
     );
     let heard_held = run(&model, &["Stamp", "Term", "HandOn", "Hears"]);
-    assert!(
-        !model.action_enabled("Read", &heard_held),
-        "an end read under another hand is the holder's (the documented rule)"
-    );
+    for action in ["Read", "ReadByClaim", "LeftToTheHolder"] {
+        assert!(
+            !model.action_enabled(action, &heard_held),
+            "{action}: an end read under a hand that waits is carried through it"
+        );
+    }
     let read_lifted = run(
         &model,
         &["Stamp", "Term", "HandOn", "Hears", "HandOff", "Read"],
     );
     assert_eq!((read_lifted["ended"], read_lifted["read"]), (1, 1));
+    // ANOTHER SUPERVISOR'S CLAIM (ruling 17, kept by ruling 20): it holds the
+    // act's KILL off as any hand does, and an end read under it is that
+    // supervisor's — left to it, the stamp unconsumed; one lifted before the
+    // read leaves the end to the act's reader.
+    let claimed = run(&model, &["Stamp", "Term", "ClaimOn"]);
+    assert!(
+        !model.action_enabled("Escalate", &claimed) && !model.action_enabled("Stamp", &claimed),
+        "the act's KILL waits a claim out, and no act starts under one"
+    );
+    let by_claim = run(
+        &model,
+        &["Stamp", "Term", "ClaimOn", "Hears", "ReadByClaim"],
+    );
+    assert_eq!(
+        (by_claim["ended"], by_claim["read"], by_claim["stamped"]),
+        (1, 3, 1)
+    );
+    assert!(!model.action_enabled("Read", &run(&model, &["Stamp", "Term", "ClaimOn", "Hears"])));
+    let claim_lifted = run(
+        &model,
+        &["Stamp", "Term", "ClaimOn", "Hears", "HandOff", "Read"],
+    );
+    assert_eq!((claim_lifted["ended"], claim_lifted["read"]), (1, 1));
+    // A CLAIM THAT LANDS WHILE THE END IS CARRIED THROUGH A HOLD (the review
+    // of ruling 20): the reader asks it at every look of the carry, so the
+    // end is that supervisor's — never relaunched into its tab once the hold
+    // lifts.
+    let carried_claim = run(&model, &["Stamp", "Term", "HandOn", "Hears", "ClaimOn"]);
+    assert!(
+        !model.action_enabled("Read", &carried_claim),
+        "nothing is typed while the claim stands"
+    );
+    let by_carried_claim = run(
+        &model,
+        &["Stamp", "Term", "HandOn", "Hears", "ClaimOn", "ReadByClaim"],
+    );
+    assert_eq!(
+        (
+            by_carried_claim["read"],
+            by_carried_claim["stamped"],
+            by_carried_claim["into_claim"]
+        ),
+        (3, 1, 0)
+    );
     // EACH MUTANT ALONE, ON THE SAFE BUGGY BASELINE, BREAKS ITS OWN
     // INVARIANT: the counterexample's first violated invariant is named.
     for (mutant, broken) in [
@@ -147,6 +198,8 @@ fn the_restart_act_is_read_by_its_stamp_and_ends_its_program() {
         ("KillUnderHand", "TheKillWaitsOutAnotherHand"),
         ("DecidedWhileRunning", "TheActsEndIsRelaunched"),
         ("WatchPerAct", "OneWatchPerProcess"),
+        ("LeftToTheHolder", "TheActsEndIsRelaunched"),
+        ("CarriedIntoAClaim", "NothingIsTypedIntoAClaim"),
     ] {
         let alone = verify::buggy_baseline_with(&model, mutant);
         let (state, invariant) =

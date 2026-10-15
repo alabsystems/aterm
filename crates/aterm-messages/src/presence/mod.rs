@@ -43,7 +43,9 @@
 //! a host-local uninhabited marker: the vocabulary of an agent's WALL (its
 //! kind type and its two spellings), the host's published INPUT STALL (its
 //! type and three reads), which drive-lease holder is the host's own harness,
-//! and the wire's percent codec.
+//! the wire's percent codec, and the GRID's measure — how many cells a string
+//! takes ([`Host::columns`]), which the width law and the painter lay every
+//! word out by.
 
 use core::fmt::Debug;
 
@@ -109,6 +111,17 @@ pub trait Host: Copy + Eq + Debug {
     fn pct_encode(s: &str) -> String;
     /// The wire's percent decoding of a token.
     fn pct_decode(s: &str) -> String;
+    /// The cells the host's terminal GRID lays `s` out in, written from a
+    /// line's first column (aterm's: `aterm_grapheme::str_grid_columns`): a
+    /// wide glyph two, a combining mark or a character the grid folds into
+    /// the cell before it none. The row's width law, its token cap and its
+    /// painter all measure with it ([`Words::fit`], [`sanitize_token`],
+    /// [`paint_row`]), so a CJK role is laid out, shed and painted in the
+    /// cells the grid would give it (round fifteen content-6: they counted
+    /// one cell per `char`). This crate links no width tables of its own (its
+    /// one dependency is the clock), so the measure is the host's; there is
+    /// no default, because a char count is the very law it replaced.
+    fn columns(s: &str) -> usize;
 }
 
 /// The story ring's capacity (design §4: `Ring<256, …>`).

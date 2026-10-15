@@ -901,6 +901,33 @@ pub struct CellExtras {
     any_image: bool,
 }
 
+/// The empty entry a writer's new cell takes at internal key `key`: the one
+/// rule [`CellExtras::fresh`] and [`CellExtras::set_range_uniform`]'s map path
+/// write a cell's map extras by, so such a write never adopts an orphan's mark
+/// or link (the ring path writes no entry; see `set_range_uniform`).
+///
+/// Returns the entry and whether the one it replaced carried a link, which the
+/// caller refunds. Only an occupied slot is reset: the common case, a vacant
+/// slot, is a plain insert, so an OSC 8 run costs what `or_default` did
+/// (r15 review, 2026-10-11: resetting every slot cost +8% instructions on
+/// densely linked text; this is back at the pre-C2 count).
+#[inline]
+fn fresh_slot(
+    data: &mut FxHashMap<CellCoord, CellExtra>,
+    key: CellCoord,
+) -> (&mut CellExtra, bool) {
+    use std::collections::hash_map::Entry;
+    match data.entry(key) {
+        Entry::Vacant(slot) => (slot.insert(CellExtra::default()), false),
+        Entry::Occupied(slot) => {
+            let extra = slot.into_mut();
+            let had_link = extra.hyperlink().is_some();
+            *extra = CellExtra::default();
+            (extra, had_link)
+        }
+    }
+}
+
 impl CellExtras {
     /// Create empty extras storage.
     #[must_use]
@@ -1263,6 +1290,35 @@ impl CellExtras {
         extra
     }
 
+    /// A fresh entry for a cell a writer has just written, replacing whatever
+    /// entry is keyed to the coordinate.
+    ///
+    /// The writers drop the entry of every cell they overwrite that carries
+    /// HAS_EXTRAS (`grid::write::StaleExtras`), so an entry still keyed here
+    /// belongs to no cell: an orphan an operation left behind. Merging the new
+    /// cell's extras into it, as [`Self::get_or_create`] would, revives an old
+    /// combining mark, skin tone or link on the new glyph. Ruling 2026-10-10
+    /// (r15 C2, defence in depth): a fresh write never adopts an entry, whatever
+    /// left it there. That holds for every write that creates an entry (this
+    /// and [`Self::set_range_uniform`]'s map path); a truecolor-only run keeps
+    /// its colours in the ring and relies on orphans being closed at their
+    /// source (ruling 2026-10-11 in `set_range_uniform`).
+    ///
+    /// Charges the hyperlink budget as `get_or_create` does (the handout may
+    /// receive a link) and refunds the replaced entry's link, as
+    /// [`Self::remove`] does. One hash lookup.
+    #[inline]
+    pub fn fresh(&mut self, coord: CellCoord) -> &mut CellExtra {
+        let key = self.internal_coord(coord);
+        let bound = &mut self.hyperlink_upper_bound;
+        let (extra, had_link) = fresh_slot(&mut self.data, key);
+        if had_link {
+            *bound = bound.saturating_sub(1);
+        }
+        *bound += 1;
+        extra
+    }
+
     /// Whether an inline image has ever been placed here (see the
     /// [`any_image`](Self::any_image) field). `false` proves no cell carries an
     /// image ref; `true` merely permits the scroll-off scan.
@@ -1334,6 +1390,31 @@ impl CellExtras {
             self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(1);
         }
         true
+    }
+
+    /// Strip what a cell without HAS_EXTRAS cannot own from its entry
+    /// ([`CellExtra::retain_overflow_colors`]): everything but truecolor fg/bg
+    /// bytes, which a BCE blank owns through its RGB marker. The entry goes
+    /// when nothing is left. Refunds a dropped link, as [`Self::remove`] does.
+    pub(crate) fn strip_unclaimed(&mut self, coord: CellCoord) {
+        let key = self.internal_coord(coord);
+        let Some(extra) = self.data.get_mut(&key) else {
+            return;
+        };
+        if extra.has_claimable_data() {
+            if extra.hyperlink().is_some() {
+                self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(1);
+            }
+            if extra.retain_overflow_colors() {
+                return;
+            }
+        } else if extra.has_data() {
+            // Truecolor bytes alone: a BCE blank's, kept.
+            return;
+        }
+        // Nothing left, or nothing ever (the extras run hands every written
+        // cell an entry, empty when its style's extras carry no value).
+        self.data.remove(&key);
     }
 
     /// Strip character-bearing fields (combining marks + complex-char string)
@@ -1549,6 +1630,18 @@ impl CellExtras {
         let is_rgb_only =
             vals.hyperlink.is_none() && vals.underline_color.is_none() && vals.extended_flags == 0;
         if is_rgb_only && (vals.fg_rgb.is_some() || vals.bg_rgb.is_some()) {
+            // The ring path writes no map entry, so it cannot start its cells
+            // fresh as the map path does: an orphan keyed under the run would
+            // be claimed as-is by the HAS_EXTRAS bit the writer set. Ruling
+            // 2026-10-11 (r15 C2 review): no sweep here. Dropping the run's
+            // keys costs a hash probe per cell whenever the map holds entries
+            // anywhere (measured: +10% instructions and cycles on truecolor
+            // text with an OSC 8 link every six lines, +6% under a linked
+            // header), so orphans are closed where they are made:
+            // every operation that blanks or moves cells drops what they no
+            // longer claim (`Grid::drop_unclaimed_extras`), and the process
+            // fuzzers and the read-boundary differential assert
+            // `Grid::assert_extras_claimed` after every step.
             self.set_rgb_ring_range(
                 row,
                 col_start,
@@ -1573,12 +1666,17 @@ impl CellExtras {
         });
 
         let internal_row = self.internal_row(row);
-        // Exact charge for the run: only a cell without a link raises the
-        // population, so repainting the same OSC 8 row costs the budget nothing.
-        let mut new_links = 0usize;
+        // Exact charge for the run: every cell ends up holding the link, and a
+        // replaced entry's link is refunded, so repainting the same OSC 8 row
+        // costs the budget nothing.
+        let mut replaced_links = 0usize;
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
-            let extra = self.data.entry(coord).or_default();
+            // The writer just wrote these cells and dropped the entries of those
+            // that carried HAS_EXTRAS, so an entry still keyed here is an orphan:
+            // start each cell fresh rather than merge into it (`Self::fresh`).
+            let (extra, had_link) = fresh_slot(&mut self.data, coord);
+            replaced_links += usize::from(had_link);
             if let Some(rgb) = vals.fg_rgb {
                 extra.set_fg_rgb(Some(rgb));
             }
@@ -1592,16 +1690,14 @@ impl CellExtras {
                 extra.set_extended_flags(vals.extended_flags);
             }
             if let Some(data) = &hyperlink {
-                if extra.hyperlink().is_none() {
-                    new_links += 1;
-                }
                 extra.set_hyperlink_data(Some(Arc::clone(data)));
             }
         }
 
+        self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(replaced_links);
         // Enforce hyperlink limit after batch insertion.
         if vals.hyperlink.is_some() {
-            self.hyperlink_upper_bound += new_links;
+            self.hyperlink_upper_bound += usize::from(col_end - col_start);
             self.enforce_hyperlink_limit();
         }
     }

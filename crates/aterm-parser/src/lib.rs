@@ -16,7 +16,6 @@
 //!
 //! ## Verification
 //!
-//! - TLA+ spec: `tla/Parser.tla`
 //! - Exhaustive tests (`src/tests/`): representative states at every bound
 //!   (each state, each bound the invariant names, every UTF-8 lead and each
 //!   Table 3-7 row's pending prefixes) x every two-byte tail x both C1 modes
@@ -25,7 +24,9 @@
 //!   introducer terminates; parameter accumulation saturates and finalizing
 //!   clamps; every carry `restore_carry` accepts keeps the invariant through
 //!   one more byte, and a refusal installs nothing.
-//! - Fuzz target: `fuzz/fuzz_targets/parser.rs`
+//! - Deterministic fuzz (`tests/fuzz_parser.rs`): 400,000 pseudo-random
+//!   chunks, raw and shaped like escape sequences, through `advance` and
+//!   `advance_fast` with state carried across chunks; any panic fails it.
 //!
 //! ## Performance
 //!

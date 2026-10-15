@@ -3312,3 +3312,52 @@ fn the_stubs_decision_restated_matches_the_stub() {
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
+
+/// AN UPSTREAM CARGO GETS THE BUILD CACHE ONLY WHERE ITS RELEASE READS IT
+/// ([`crate::build_cache`]), and TRUST'S OWN `cargo` (which is `targo`) BY `targo`'S RULE:
+/// a stock 1.97.1 gets the line `decide` made for `cargo`; Trust gets the one made for
+/// `targo` (none for its verified lane); an older or unidentified cargo, or a line `decide`
+/// left alone, runs as typed.
+#[test]
+fn an_upstream_cargo_gets_the_build_cache_only_where_its_release_reads_it() {
+    use crate::build_cache::Tool;
+    let typed = args(&["build"]);
+    let decided = |tool: Tool| args(&["--config", &format!("{tool:?}"), "build"]);
+    let on = |identity: Identity, decide: &Decide<'_>| {
+        let machine = Machine {
+            passthrough: false,
+            announced: false,
+            announce: &|| true,
+            strict: &|| false,
+            upstream: &|| Some(PathBuf::from(UP)),
+            branded: &|_, _| Install::Absent,
+            pin: &|| None,
+            resolve: &|_, _| Resolved {
+                real: PathBuf::from(UP),
+                rustup: None,
+                identity: identity.clone(),
+            },
+            trust_checkout: &|| None,
+        };
+        upstream_cargo_args(Path::new(UP), typed.clone(), &machine, decide)
+    };
+    let release = |r: &str| match stock_at("cargo", "x", Picked::Unsaid).identity {
+        Identity::Known(vv) => Identity::Known(Vv {
+            release: r.into(),
+            ..vv
+        }),
+        other @ Identity::Unknown { .. } => other,
+    };
+    let always = |_: &[String], tool: Tool| Some(decided(tool));
+    let trust = || trust_at("cargo", Picked::Unsaid).identity;
+    assert_eq!(on(release("1.97.1"), &always), decided(Tool::Cargo));
+    assert_eq!(on(trust(), &always), decided(Tool::Targo));
+    let verified_lane = |_: &[String], tool: Tool| (tool == Tool::Cargo).then(|| decided(tool));
+    assert_eq!(on(trust(), &verified_lane), typed);
+    assert_eq!(on(release("1.85.0"), &always), typed);
+    let unknown = Identity::Unknown {
+        why: "/usr/bin/up -vV exited 3".into(),
+    };
+    assert_eq!(on(unknown, &always), typed);
+    assert_eq!(on(release("1.97.1"), &|_, _| None), typed);
+}

@@ -778,10 +778,10 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 /// name lives there only until both ends are open.
 ///
 /// The instance holds its stdio (the lifeline on stdin) and NOTHING ELSE of
-/// this process (`inherit_nothing`): a std child under the pinned seal keeps
-/// any descriptor another test thread had open unflagged at the spawn — a
-/// `ps` or `lsof` pipe between its `pipe()` and its `F_SETFD` — and an
-/// instance lives as long as its world, so that read would wait as long.
+/// this process (`inherit_nothing`): a std child on a std without the SP-1
+/// strip keeps any descriptor another test thread had open unflagged at the
+/// spawn — a `ps` or `lsof` pipe between its `pipe()` and its `F_SETFD` — and
+/// an instance lives as long as its world, so that read would wait as long.
 ///
 /// # Panics
 /// The FIFO could not be made in `dir` — a broken fixture, never a reason to boot
@@ -1172,11 +1172,21 @@ fn stale_binary_verdict(bin: &std::path::Path, krate: &str, env_var: &str) -> Re
 fn built_as_a_dependency(bin: &std::path::Path, krate: &str) -> Option<Vec<PathBuf>> {
     let meta = std::fs::metadata(bin).ok()?;
     let (len, modified) = (meta.len(), meta.modified().ok()?);
-    let deps = bin.parent()?.join("deps");
     let stem = krate.replace('-', "_");
     let mut inputs = None;
     let mut newest_rlib: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(&deps).ok()?.flatten() {
+    // `deps/` beside the binary — or, with a build directory holding the
+    // intermediates, the one this test runs from, under the binary's profile.
+    let profile = bin.parent()?.file_name()?;
+    let deps = [
+        bin.parent()?.join("deps"),
+        own_build_root()?.join(profile).join("deps"),
+    ];
+    let entries = deps
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten());
+    for entry in entries {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -1293,10 +1303,24 @@ fn push_input(out: &mut Vec<PathBuf>, token: String, target_root: &std::path::Pa
         return;
     }
     let path = PathBuf::from(token);
-    let stamp = path.components().any(|c| c.as_os_str() == ".git") || path.starts_with(target_root);
+    let stamp = path.components().any(|c| c.as_os_str() == ".git")
+        || path.starts_with(target_root)
+        || own_build_root().is_some_and(|r| path.starts_with(r));
     if !stamp {
         out.push(path);
     }
+}
+
+/// The directory THIS test binary was built into (`<dir>/<profile>/deps/<test>`): the
+/// target dir — or, under Cargo's `build.build-dir` (aterm's `targo` sets one on macOS),
+/// the build directory that holds every intermediate, build scripts' `OUT_DIR`s included.
+fn own_build_root() -> Option<&'static std::path::Path> {
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.parent()?.parent()?.to_path_buf())
+    })
+    .as_deref()
 }
 
 /// The build directory a found binary was written into — `target/<profile>/<name>`'s

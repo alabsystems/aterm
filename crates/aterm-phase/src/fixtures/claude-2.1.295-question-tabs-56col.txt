@@ -1,0 +1,30 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (56x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · AskUserQuestion, two single-select questions (tabs `Storage`, `TTL`, then `Submit`), raised in a pane resized to 56 columns before the call: the footer `Enter to select · Tab/Arrow keys to navigate · Esc to cancel` (60 cells) is wrapped by Ink after `Esc to`, its `cancel` alone on the row under it at column zero; above it an earlier question, declined with Esc
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.swEU/proj
+
+
+❯ toolstart
+
+⏺ User declined to answer questions
+  ⎿  · Which test runner should the repo use? (nextest
+     (Recommended) / libtest)
+
+✻ Cogitated for 0s · done 12:20 PM
+
+❯ toolstart
+────────────────────────────────────────────────────────
+←  ☐ Storage  ☐ TTL  ✔ Submit  →
+
+Which storage backend should the cache use?
+
+❯ 1. Disk (Recommended)
+     Survives a restart
+  2. Memory
+     Fastest
+  3. Type something.
+────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to
+cancel

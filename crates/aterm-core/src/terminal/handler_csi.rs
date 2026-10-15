@@ -263,12 +263,16 @@ impl TerminalHandler<'_> {
                     let is_ascii = (0x20..0x7F).contains(&cp);
                     let has_extras =
                         self.style.has_style_extras() || self.transient.has_transient_extras;
+                    // Not from outside a DECSLRM span: the fill clamps at the
+                    // right margin only from a start inside it
+                    // (`Grid::cursor_outside_margin_span`).
                     if is_ascii
                         && self.charset.is_ascii_passthrough()
                         && !has_extras
                         && self.modes.auto_wrap
                         && !self.modes.insert_mode
                         && count >= 4
+                        && !self.grid.cursor_outside_margin_span()
                     {
                         let flags = if self.style.protected {
                             self.style.flags.union(CellFlags::PROTECTED)

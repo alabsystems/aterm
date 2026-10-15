@@ -251,7 +251,7 @@
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_LIMIT_RESET,
-    RULE_LIMIT_WAIT, RULE_READ_ONLY, decide,
+    RULE_LIMIT_WAIT, RULE_READ_ONLY, decide, unvoiced_tools,
 };
 use super::super::policy::approval::{
     NudgeCtx, RULE_GOAL_RESUME, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH, RULE_RM_BREAKER_WARN,
@@ -713,6 +713,17 @@ fn shown_subject(subject: &str, command: &str) -> String {
     }
 }
 
+/// What [`Session::approval_ctx`] reads of the worker for the box at hand.
+#[derive(Debug, Clone, Copy)]
+struct Reads {
+    /// A Bash box whose command may run git ([`may_run_git`]).
+    git: bool,
+    /// A Bash box.
+    bash: bool,
+    /// A Claude Code box drawn with no ask reason ([`unvoiced_tools`]).
+    asks: bool,
+}
+
 /// The box needs the session's working directory: the vendor's rm/rmdir
 /// circuit breaker of any kind ([`aterm_phase::PromptV2::rm_breaker`]), the
 /// folder-trust dialog, and a Bash box that may run git ([`may_run_git`]) —
@@ -824,21 +835,23 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The approval policy's context: the session's cwd (`meta` read fresh
-    /// when `fresh_cwd`); for a box that may run git (`git`) the worker's
-    /// environment ([`ApprovalCtx::worker`]) and the directories its Bash tool
-    /// may stand in ([`ApprovalCtx::shell_cwds`]); for any Bash box (`bash`)
-    /// the worker's environment and, when read from the session
-    /// ([`WorkerSource::Session`]), its Bash tool's shell startup
-    /// ([`ApprovalCtx::shell`]); the footer's mode, the process's
+    /// when `fresh_cwd`); for a box that may run git (`reads.git`) the
+    /// worker's environment ([`ApprovalCtx::worker`]) and the directories its
+    /// Bash tool may stand in ([`ApprovalCtx::shell_cwds`]); for any Bash box
+    /// (`reads.bash`) the worker's environment and, when read from the
+    /// session ([`WorkerSource::Session`]), its Bash tool's shell startup
+    /// ([`ApprovalCtx::shell`]); for a box Claude Code draws no ask reason on
+    /// (`reads.asks`) the bare-tool ask rules of the worker's own settings
+    /// ([`ApprovalCtx::owner_asks`]); the footer's mode, the process's
     /// home/uid/`$TMPDIR`, and the approve level and trust roots `opts` sets.
     fn approval_ctx(
         &mut self,
         fresh_cwd: bool,
-        git: bool,
-        bash: bool,
+        reads: Reads,
         opts: &SuperviseOpts,
         allow: &[String],
     ) -> Result<ApprovalCtx, Fail> {
+        let Reads { git, bash, asks } = reads;
         if fresh_cwd {
             let r = self.call(&["meta"])?;
             if self.unserved(&r) {
@@ -887,7 +900,7 @@ impl<C: Ctl> Session<'_, C> {
         // again at a dialog mount the reset was passed over for.
         ctx.limit_reset = opts.policy.limit_reset && !self.reset_passed_here();
         ctx.python_allow = allow.to_vec();
-        if git || bash {
+        if git || bash || asks {
             let session = matches!(env.worker, WorkerSource::Session);
             let worker = match env.worker {
                 WorkerSource::Session => self.worker_env(),
@@ -895,7 +908,7 @@ impl<C: Ctl> Session<'_, C> {
             };
             if git
                 && let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref())
-                && let Some(claude) = w.claude_dir()
+                && let Ok(claude) = w.claude_dir(cwd)
             {
                 ctx.shell_cwds = crate::harness::footer::shell_cwds(&claude, cwd);
             }
@@ -904,6 +917,15 @@ impl<C: Ctl> Session<'_, C> {
                     (Ok(w), Some(cwd)) => crate::supervise::policy::shell_startup::read(w, cwd),
                     (Err(why), _) => Err(format!("the worker's environment is unknown: {why}")),
                     (Ok(_), None) => Err("the session's cwd is unknown (meta cwd=-)".to_string()),
+                };
+            }
+            if asks {
+                ctx.owner_asks = match (&worker, cwd.as_deref()) {
+                    (Ok(w), Some(cwd)) => {
+                        crate::supervise::policy::claude_settings::bare_asks(w, cwd)
+                    }
+                    (Err(why), _) => Err(format!("its environment is unknown: {why}")),
+                    (Ok(_), None) => Err("its directory is unknown (meta cwd=-)".to_string()),
                 };
             }
             ctx.worker = worker;
@@ -1035,9 +1057,17 @@ impl<C: Ctl> Session<'_, C> {
             .prompt
             .as_ref()
             .is_some_and(|p| p.kind == PromptKind::Bash);
+        // A box Claude Code draws no ask reason on: the agent's own settings
+        // say whether an ask rule sent it (`policy::approval::settings_ask`).
+        let asks = reading.program == aterm_phase::Program::Claude
+            && reading
+                .prompt
+                .as_ref()
+                .is_some_and(|p| !unvoiced_tools(p).is_empty());
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
+            || asks
             || bash && matches!(self.approval_env.worker, WorkerSource::Session);
-        let mut ctx = self.approval_ctx(fresh_cwd, git, bash, opts, allow)?;
+        let mut ctx = self.approval_ctx(fresh_cwd, Reads { git, bash, asks }, opts, allow)?;
         // Codex's rate-limit nudge is answered by what Codex's own records
         // say of its usage window, and by the model the footer last showed
         // (the box covers the footer).

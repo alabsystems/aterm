@@ -888,8 +888,7 @@ pub fn staged_bundle_liveness_gate(
 // ---------------------------------------------------------------------------
 
 /// Where the publication engine keeps its ledger: `$PUBLICATION_ENGINE/mappings.json`,
-/// default `~/Developer/publication/mappings.json` (the engine checkout under the
-/// developer root, `atpkg::devroot`) — the same location knob (a LOCATION, not a
+/// default `~/publication/mappings.json` — the same location knob (a LOCATION, not a
 /// skip switch) `ship release` reads. `pub publish` writes a row there
 /// for every source publication: the dev commit it exported, keyed by its full sha.
 /// A real cut releases the newest aterm row's commit ([`published_source`]).
@@ -898,10 +897,7 @@ pub fn publication_mappings_path() -> PathBuf {
     env::var_os("PUBLICATION_ENGINE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(|home| atpkg::devroot::publication_engine(std::path::Path::new(&home)))
-        })
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join("publication")))
         .unwrap_or_else(|| PathBuf::from("publication"))
         .join("mappings.json")
 }
@@ -3100,11 +3096,11 @@ pub const HANDOFF_FIXTURE_GUARD_TARGET: &str = "target-fixture-guard";
 ///
 /// Its target directory is [`HANDOFF_FIXTURE_GUARD_TARGET`], made afresh and
 /// removed after the run whatever its outcome: a few GiB the cut does not keep,
-/// and a `deps/` holding one test binary (AGENTS.md, "Keep `target/debug/deps`
-/// small"). These tests open PTYs and never reach WindowServer. The build's
-/// steering variables (`RUSTFLAGS`, `RUSTC`, …) are scrubbed, as for the
-/// release build: an inherited `RUSTFLAGS` replaces the config's rustflags and
-/// would turn Trust verification on for every unit.
+/// and a `deps/` holding one test binary (AGENTS.md, "Keep a test binary's
+/// `deps/` under six figures"). These tests open PTYs and never reach
+/// WindowServer. The build's steering variables (`RUSTFLAGS`, `RUSTC`, …) are
+/// scrubbed, as for the release build: an inherited `RUSTFLAGS` replaces the
+/// config's rustflags and would turn Trust verification on for every unit.
 ///
 /// `run` is the process runner, so a test can hand it any outcome.
 pub fn handoff_fixture_guard_gate(

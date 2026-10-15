@@ -1170,8 +1170,9 @@ impl ProcessLogin {
 
     /// With THE SETTINGS FILES Claude Code reads for the process, as the
     /// host's gatherer read them (`super::netwatch::RouteFacts::settings`:
-    /// the user's, the project's two, the managed ones, a `--settings`),
-    /// each through the ONE settings reader ([`super::netwatch::settings_of`]).
+    /// the chain Claude Code reads, `claude_settings::sources_under`, and its
+    /// managed preference domains), each through the ONE settings reader
+    /// ([`super::netwatch::settings_of`]).
     /// PURE. It is no stored login where any source:
     ///
     /// * sets, in its `env` block, a name the environment is read for

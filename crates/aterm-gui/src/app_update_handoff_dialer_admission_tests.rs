@@ -23,7 +23,7 @@
 //! (`LaunchCorroboration::poll`) against live, exited-and-unreaped and reaped
 //! processes. LaunchServices is scripted, with the answers it was measured to
 //! give (`LaunchError::ExitedBeforeCheckIn`), because a unit test may not launch
-//! an application (AGENTS.md rule 5).
+//! an application (AGENTS.md).
 //!
 //! Negative controls: the gate at the same-uid floor — the launched lane before
 //! 2026-10-02, the secret alone — run for real, grants the stranger every
@@ -1285,7 +1285,7 @@ mod waivers {
         action = "LaunchServicesDisowns",
         reason = "The environment: LaunchServices' answer naming another pid, or reporting the \
                   launched process exited; scripted with the measured answers, since a unit test \
-                  may not launch an application (AGENTS.md rule 5)."
+                  may not launch an application (AGENTS.md)."
     )]
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_rendezvous_admission",

@@ -553,9 +553,10 @@ pub struct TaskOpts {
     /// first one ends it.
     pub reconnect: Duration,
     /// Stdout is a terminal: the answer's body is printed escaped
-    /// ([`terminal_safe`]), so a reply cannot move the cursor over, or reorder,
-    /// the `MAIL … from=` line that says who sent it. Raw bytes otherwise —
-    /// what a pipe or a file is given.
+    /// ([`aterm_codec::tty::safe`], the one rendering `aterm ctl inbox get`
+    /// uses too), so a reply cannot move the cursor over, or reorder, the
+    /// `MAIL … from=` line that says who sent it. Raw bytes otherwise — what a
+    /// pipe or a file is given.
     pub escape: bool,
 }
 
@@ -833,7 +834,7 @@ fn task_with_clock<C: Ctl>(
                 return Err(format!("inbox get {}: {}", row.id, r.err_text()));
             }
             let body = if opts.escape {
-                std::borrow::Cow::Owned(terminal_safe(&r.stdout))
+                aterm_codec::tty::safe(r.stdout.as_bytes())
             } else {
                 std::borrow::Cow::Borrowed(r.stdout.as_str())
             };
@@ -870,33 +871,6 @@ pub(super) fn secs(d: Duration) -> String {
             .trim_end_matches('0')
             .to_string()
     }
-}
-
-/// A mail body for a terminal: its lines kept, and in them every C0 control
-/// but the tab, DEL, every C1 control and every bidi override escaped —
-/// `\r` by name, the rest as `\xNN` / `\u{…}`, the classes
-/// `aterm_link::render::safe` escapes. A body is the sender's bytes, and on a
-/// terminal those are instructions: a cursor-up and an erase would wipe the
-/// `MAIL … from=` line above it and draw a forged one, and a bidi override
-/// would reorder what is left.
-fn terminal_safe(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    for c in body.chars() {
-        match c {
-            '\n' | '\t' => out.push(c),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c if ('\u{80}'..='\u{9f}').contains(&c)
-                || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') =>
-            {
-                out.push_str(&format!("\\u{{{:04x}}}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Write one line and flush it.

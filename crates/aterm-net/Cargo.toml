@@ -13,6 +13,13 @@ description = "aterm L3 — network transport for the control protocol: a transp
 [lints]
 workspace = true
 
+[features]
+# Compile the `#[refines]` anchors of `NetSlotDisplacement` (the listener's
+# slots and the watchdog's claim, drive.rs) into the library so aterm-gui's
+# `spec_xref_closure` gate collects them. Off by default: production builds
+# carry no aterm-spec.
+spec-anchors = ["dep:aterm-spec"]
+
 [dependencies]
 # The capability the network hop carries (the same EdgeToken the local one-hop
 # proxy mints), and the session/op identity it binds to.
@@ -27,6 +34,8 @@ aterm-digest = { workspace = true }
 # The workspace's one hex codec: the AUTH tag and the certificate fingerprint.
 aterm-codec = { workspace = true }
 rustls = { workspace = true }
+# The `#[refines]` anchors only (`spec-anchors`).
+aterm-spec = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Readiness wait for the non-blocking network-drive listener. `libc` is already

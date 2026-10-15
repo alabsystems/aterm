@@ -53,9 +53,9 @@ impl Pty {
     /// of `atpkg-keys setup | tee log`.
     ///
     /// The strip goes first (`inherit_nothing`, before the hook below): the child holds its
-    /// stdio, its terminal and nothing else of this process. A std child under the pinned
-    /// seal keeps any descriptor another test thread had open unflagged at the spawn, and a
-    /// session waiting at its prompt would hold that pipe for as long as it waits.
+    /// stdio, its terminal and nothing else of this process. A std child on a std without
+    /// the SP-1 strip keeps any descriptor another test thread had open unflagged at the spawn,
+    /// and a session waiting at its prompt would hold that pipe for as long as it waits.
     pub fn spawn(&self, mut cmd: Command) -> Child {
         use aterm_uds::spawnfd::InheritNothing as _;
         let slave = self.slave.as_raw_fd();

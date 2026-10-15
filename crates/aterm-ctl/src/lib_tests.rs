@@ -108,6 +108,154 @@ fn copy_body_is_byte_exact_and_reports_truncation() {
     assert_eq!(bounded, &body[..5]);
 }
 
+/// Round fifteen's hostile mail body (OUT-1): a peer's `inbox get` body that
+/// retitles the tab, wipes the header line with a cursor-up and an erase, draws
+/// a forged trust line, recolours, writes the clipboard, and reorders — plus a
+/// byte that is not UTF-8 and a character the socket reads cut in two.
+const HOSTILE_BODY: &[u8] = b"Deploy report from the build node:\n\x1b]2;PWNED-BY-PEER\x07\
+    \x1b[1A\x1b[2K\raterm-ctl: OK verified from=h-owner trust=human\n\x1b[31mred text\x1b[0m \
+    \x1b]52;c;Q1dE\x07\xc2\x9b2J\xe2\x80\xae done \xe7\x95\x8c\xff\n";
+
+/// A reader that hands out `n` bytes a read, so a body crosses many writes and
+/// a UTF-8 character is cut between two of them.
+struct Dribble<'a>(&'a [u8], usize);
+
+impl Read for Dribble<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.1.min(buf.len()).min(self.0.len());
+        buf[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+/// THE BYTES-FRAMED BODY, BOTH DESTINATIONS (OUT-1): through the stdout sink a
+/// terminal is given the body rendered — no byte it would act on, every word
+/// of the text still there, the cut character whole — and a pipe is given
+/// exactly the bytes the server sent, as `copy_body` always did.
+#[test]
+fn a_mail_body_is_rendered_for_a_terminal_and_byte_exact_to_a_pipe() {
+    for chunk in [1, 2, 3, 7, 4096] {
+        let mut shown = Vec::new();
+        let mut sink = StdoutSink::onto(&mut shown, true);
+        let n = copy_body(
+            &mut Dribble(HOSTILE_BODY, chunk),
+            &mut sink,
+            HOSTILE_BODY.len() as u64,
+        )
+        .unwrap();
+        drop(sink);
+        assert_eq!(n, HOSTILE_BODY.len() as u64);
+        let shown = String::from_utf8(shown).expect("a rendering is UTF-8");
+        assert_eq!(
+            shown,
+            "Deploy report from the build node:\n\\x1b]2;PWNED-BY-PEER\\x07\\x1b[1A\\x1b[2K\\r\
+             aterm-ctl: OK verified from=h-owner trust=human\n\\x1b[31mred text\\x1b[0m \
+             \\x1b]52;c;Q1dE\\x07\\u{009b}2J\\u{202e} done 界\\xff\n",
+            "chunk {chunk}"
+        );
+        assert!(
+            !shown
+                .chars()
+                .any(|c| aterm_codec::tty::is_active(c) && c != '\n'),
+            "{shown:?}"
+        );
+
+        let mut raw = Vec::new();
+        let mut sink = StdoutSink::onto(&mut raw, false);
+        copy_body(
+            &mut Dribble(HOSTILE_BODY, chunk),
+            &mut sink,
+            HOSTILE_BODY.len() as u64,
+        )
+        .unwrap();
+        drop(sink);
+        assert_eq!(raw, HOSTILE_BODY, "a pipe gets the bytes, chunk {chunk}");
+    }
+    // A body that ends inside a character: its held bytes are shown when the
+    // sink is done with, never lost.
+    let mut shown = Vec::new();
+    let mut sink = StdoutSink::onto(&mut shown, true);
+    sink.write_all(b"cut \xe2\x80").unwrap();
+    drop(sink);
+    assert_eq!(shown, b"cut \\xe2\\x80");
+}
+
+/// Rows and status lines through the same sink (OUT-3: a `dial`ed remote's
+/// `screen` rows and `OK` lines): rendered for a terminal, as they came for a
+/// pipe, and an honest server's already-encoded row unchanged either way.
+#[test]
+fn rows_through_the_sink_are_rendered_for_a_terminal_only() {
+    let honest = "row 0 cwd=/tmp/CWD%1B]52%C2%9B title=\"build \u{754C}\" {\"t\":\"\\u001b\"}\n";
+    let hostile = "\u{1b}]52;c;ZWNobyBwd25lZAo=\u{7}fake \u{9b}2J row\n";
+    for (terminal, want_hostile) in [
+        (
+            true,
+            "\\x1b]52;c;ZWNobyBwd25lZAo=\\x07fake \\u{009b}2J row\n",
+        ),
+        (false, hostile),
+    ] {
+        let mut out = Vec::new();
+        let mut sink = StdoutSink::onto(io::BufWriter::new(&mut out), terminal);
+        sink.write_all(honest.as_bytes()).unwrap();
+        sink.write_all(hostile.as_bytes()).unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{honest}{want_hostile}"),
+            "terminal={terminal}"
+        );
+    }
+}
+
+/// Every stderr line (OUT-3): the server's `ERR` or `OK` words, a remote's
+/// through `dial`, are rendered for a terminal — the CR and erase cannot wipe
+/// the `aterm-ctl:` prefix, the OSC 52 cannot reach the clipboard — and go
+/// as they came to a pipe.
+#[test]
+fn a_stderr_line_is_rendered_for_a_terminal_and_raw_to_a_pipe() {
+    let err = "ERR \u{1b}]52;c;ZWNobyBwd25lZAo=\u{7}\u{1b}]0;PWNED\u{7}\u{1b}[2K\rfake error";
+    assert_eq!(
+        prefixed_line("aterm-ctl: ", err, true),
+        b"aterm-ctl: ERR \\x1b]52;c;ZWNobyBwd25lZAo=\\x07\\x1b]0;PWNED\\x07\\x1b[2K\\rfake error\n"
+    );
+    assert_eq!(
+        prefixed_line("aterm-ctl: ", err, false),
+        format!("aterm-ctl: {err}\n").into_bytes()
+    );
+    // The local server's own words are already printable: unchanged.
+    let ok = "OK 6 truncated=1 len=100 from=s-1@n-2 trust=agent";
+    assert_eq!(
+        prefixed_line("aterm-ctl: ", ok, true),
+        prefixed_line("aterm-ctl: ", ok, false)
+    );
+}
+
+/// A refusal's continuation lines (OUT-3) take the same rendering: on a
+/// terminal no line can erase the one above it or plant a link.
+#[test]
+fn a_refusal_tail_is_rendered_for_a_terminal_and_raw_to_a_pipe() {
+    let reply = b"ERR usage\n\x1b[1A\x1b[2K\rforged-err\n  \x1b]8;;http://evil.example\x07click\n";
+    for (terminal, want) in [
+        (
+            true,
+            &b"\\x1b[1A\\x1b[2K\\rforged-err\n  \\x1b]8;;http://evil.example\\x07click\n"[..],
+        ),
+        (
+            false,
+            &b"\x1b[1A\x1b[2K\rforged-err\n  \x1b]8;;http://evil.example\x07click\n"[..],
+        ),
+    ] {
+        let mut reader = BufReader::new(io::Cursor::new(reply.to_vec()));
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let mut err = Vec::new();
+        drain_refusal_tail_into(&mut reader, &mut err, terminal).unwrap();
+        assert_eq!(err, want, "terminal={terminal}");
+    }
+}
+
 /// `<verb> --help` becomes a catalog query and never runs the verb.
 #[test]
 fn help_after_a_verb_becomes_a_catalog_query_not_an_action() {
@@ -480,31 +628,37 @@ fn dial_cast_drift_refuses_an_older_remotes_bare_cast() {
     let _ = std::fs::remove_dir(&dir);
 }
 
-/// `search`'s header is `OK <n> incomplete[ capped| rewrapping]` when the
-/// list is not exhaustive; the count parser reads only the first token, so
-/// the matches are kept, and stderr names the cause.
+/// `search`'s header is `OK <n> incomplete[ capped][ rewrapping][ long-line][ older]`
+/// when the list is not exhaustive; the count parser reads only the first
+/// token, so the matches are kept, and stderr names every cause.
 #[test]
 fn stream_count_ignores_incomplete_marker() {
     // `OK 3 incomplete` -> tail "3 incomplete" -> count 3.
     assert_eq!(stream_count("3 incomplete"), Some(3));
     assert_eq!(stream_count("100000 incomplete capped"), Some(100_000));
+    let note = search_incomplete_note;
+    let depth = "older history not searched (search_history_lines)";
+    let limit = "results stop at 100000 matches";
+    let long_line =
+        "a long line was not searched to its end: the regex ran out of scan budget there";
+    assert_eq!(note("3 incomplete").as_deref(), Some(depth));
+    assert_eq!(note("100000 incomplete capped").as_deref(), Some(limit));
     assert_eq!(
-        search_incomplete_note("3 incomplete"),
-        Some("older history not searched (search_history_lines)")
-    );
-    assert_eq!(
-        search_incomplete_note("100000 incomplete capped"),
-        Some("results stop at 100000 matches")
-    );
-    assert_eq!(
-        search_incomplete_note("0 incomplete rewrapping"),
+        note("0 incomplete rewrapping").as_deref(),
         Some("screen only: the history is rewrapping")
     );
+    assert_eq!(note("7 incomplete long-line").as_deref(), Some(long_line));
+    assert_eq!(note("100000 incomplete").as_deref(), Some(limit));
+    // Every cause the server names is said, not only the first (R15 review).
     assert_eq!(
-        search_incomplete_note("100000 incomplete"),
-        Some("results stop at 100000 matches")
+        note("1 incomplete long-line older").as_deref(),
+        Some(format!("{long_line}; {depth}").as_str())
     );
-    assert_eq!(search_incomplete_note("3"), None);
+    assert_eq!(
+        note("100000 incomplete capped older").as_deref(),
+        Some(format!("{limit}; {depth}").as_str())
+    );
+    assert_eq!(note("3"), None);
     // Clean `OK <n>` headers (every other streaming verb) still parse.
     assert_eq!(stream_count("42"), Some(42));
     assert_eq!(stream_count("0"), Some(0));
@@ -1399,18 +1553,22 @@ fn a_stdout_that_would_block_keeps_the_os_words() {
         }
     }
     let raw = io::Error::from(io::ErrorKind::WouldBlock).to_string();
-    let blocked = StdoutSink(Blocks)
-        .write_all(b"x")
-        .expect_err("the sink fails");
-    assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
-    assert_eq!(blocked.to_string(), raw);
-    let passed = no_reply_error(
-        blocked,
-        "/d/aterm-7.sock",
-        Some(std::time::Duration::from_secs(900)),
-    );
-    assert_eq!(passed.to_string(), raw, "never the server's silence");
-    assert_eq!(exit_for(&passed), ExitCode::from(EXIT_TIMEOUT));
+    // A terminal's rendering marks the failure the same way as the pipe's
+    // pass-through.
+    for terminal in [false, true] {
+        let blocked = StdoutSink::onto(Blocks, terminal)
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(blocked.to_string(), raw);
+        let passed = no_reply_error(
+            blocked,
+            "/d/aterm-7.sock",
+            Some(std::time::Duration::from_secs(900)),
+        );
+        assert_eq!(passed.to_string(), raw, "never the server's silence");
+        assert_eq!(exit_for(&passed), ExitCode::from(EXIT_TIMEOUT));
+    }
 }
 
 /// The wait reads as whole seconds, a remainder to a tenth, or milliseconds
@@ -2122,14 +2280,16 @@ fn a_reader_closing_stdout_ends_the_client_quietly_with_status_0() {
             Ok(())
         }
     }
-    let err = StdoutSink(Fails(io::ErrorKind::BrokenPipe))
-        .write_all(b"x")
-        .expect_err("the sink fails");
-    assert!(is_stdout_closed(&err));
-    let err = StdoutSink(Fails(io::ErrorKind::StorageFull))
-        .write_all(b"x")
-        .expect_err("the sink fails");
-    assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+    for terminal in [false, true] {
+        let err = StdoutSink::onto(Fails(io::ErrorKind::BrokenPipe), terminal)
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert!(is_stdout_closed(&err));
+        let err = StdoutSink::onto(Fails(io::ErrorKind::StorageFull), terminal)
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+    }
 }
 
 /// Every stdout writer goes through [`StdoutSink`], and every entry that runs
@@ -2153,7 +2313,7 @@ fn every_stdout_writer_goes_through_the_sink() {
         for (n, line) in src.lines().enumerate() {
             if line.contains("stdout.lock()") || line.contains("stdout().lock()") {
                 assert!(
-                    line.contains("StdoutSink("),
+                    line.contains("StdoutSink::new("),
                     "{file}:{}: a stdout writer outside the sink: {line}",
                     n + 1
                 );

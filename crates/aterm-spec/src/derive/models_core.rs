@@ -2033,6 +2033,113 @@ pub fn net_dial_after_grant_model() -> Model {
     })
 }
 
+/// NETWORK-DRIVE SLOT DISPLACEMENT — `aterm-net`'s `serve` keeps at most
+/// `Cap` connections in flight, handshaking or relaying, and at capacity lets a
+/// newcomer take the slot of one that has NOT authenticated (r13 NET-1, ruling
+/// 2026-10-10: idle sockets renewed against the handshake deadline used to hold
+/// every slot and lock token holders out). Which slot is the address policy's
+/// (`drive::pick_displaced`, unit-tested); this is the machine that policy
+/// runs on, and the law it must never break: an admitted relay is never cut.
+///
+/// Each connection holding a slot is `pending` (its watchdog state is still
+/// `WD_RUNNING`), `authed` (its handshake claimed `WD_AUTHED`: relaying, or
+/// tearing down after a denied capability) or `cut` (the deadline claimed
+/// `WD_FIRED` or the listener `WD_EVICTED`: its socket force-closed, its
+/// threads ending). One compare-and-swap out of `WD_RUNNING` decides between
+/// the three claimants — the handshake (`Authenticate`, `HandshakeWatchdog::
+/// finish`), the watchdog's deadline (`Deadline`) and the listener
+/// (`Evict`, `Evictor::evict`) — so each connection is claimed exactly once.
+/// `Evict` is the accept loop at capacity: it claims a pending connection and
+/// then WAITS (`waiting`) for that connection's threads to end (`Release`)
+/// before the newcomer takes the slot (`Accept`), or gives up after
+/// `ACCEPT_POLL` and refuses the newcomer (`Refuse`). `Close` is a relay's or a
+/// denied connection's end. `arrivals` counts connections given a slot and
+/// `claims` the claims won on them: ghost counters for the exactly-once law.
+///
+/// `Buggy = 1` is four defects, each caught by its own invariant alone:
+/// `Accept` takes a slot while the displaced connection still holds it (the
+/// loop returning on its claim, not on the freed slot), which
+/// `InFlightBounded` catches; `Authenticate` STORES `WD_AUTHED` over a cut
+/// connection's claim (a relay on a force-closed socket), which
+/// `ClaimExactlyOnce` catches; the watchdog force-closes a connection its
+/// handshake claimed (the close decided by the deadline alone, not by who won
+/// the claim), which `AuthedNeverCut` catches; and `Evict` STORES
+/// `WD_EVICTED` over an authenticated connection instead of a
+/// compare-and-swap, which both of the last two catch. Each mutant fires only
+/// from a state that has not slipped yet, so the `Buggy = 1` space stays
+/// finite.
+///
+/// Tier-1: aterm-net's `drive::tests::serve_slots_conform_to_net_slot_displacement`
+/// drives the real `Slots` and `HandshakeWatchdog` over real sockets at the
+/// production capacity (`Cap` overridden to `MAX_INFLIGHT`), projects every
+/// slot's claim onto these counts after each step, and validates each
+/// transition; every action is anchored by `#[refines]` in `drive.rs`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn net_slot_displacement_model() -> Model {
+    crate::ty_model! {
+        NetSlotDisplacement {
+            const Buggy = 0;
+            const Cap = 2;
+            // Bounds the connections the checker walks.
+            const Arrivals = 4;
+            var pending = 0;
+            var authed = 0;
+            var cut = 0;
+            var waiting = 0;
+            var arrivals = 0;
+            var claims = 0;
+            // An authenticated connection's socket was force-closed.
+            var authed_cut = 0;
+            action Accept when (
+                arrivals <= Arrivals - 1 &&
+                pending + authed + cut <= if Buggy == 1 { Cap } else { Cap - 1 }
+            ) {
+                pending = pending + 1;
+                arrivals = arrivals + 1;
+                waiting = 0;
+            }
+            action Authenticate when (
+                pending > 0 || (Buggy == 1 && cut > 0 && claims + pending == arrivals)
+            ) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                cut = if pending > 0 { cut } else { cut - 1 };
+                authed = authed + 1;
+                claims = claims + 1;
+            }
+            action Deadline when (pending > 0 || (Buggy == 1 && authed > 0 && authed_cut == 0)) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                cut = if pending > 0 { cut + 1 } else { cut };
+                claims = if pending > 0 { claims + 1 } else { claims };
+                authed_cut = if pending > 0 { authed_cut } else { 1 };
+            }
+            action Evict when (
+                waiting == 0 && Cap <= pending + authed + cut &&
+                (pending > 0 || (Buggy == 1 && authed > 0 && claims + pending == arrivals))
+            ) {
+                pending = if pending > 0 { pending - 1 } else { pending };
+                authed = if pending > 0 { authed } else { authed - 1 };
+                authed_cut = if pending > 0 { authed_cut } else { 1 };
+                cut = cut + 1;
+                claims = claims + 1;
+                waiting = 1;
+            }
+            action Release when (cut > 0) {
+                cut = cut - 1;
+            }
+            action Close when (authed > 0) {
+                authed = authed - 1;
+            }
+            action Refuse when (waiting == 1) {
+                waiting = 0;
+            }
+            invariant InFlightBounded: pending + authed + cut <= Cap;
+            invariant ClaimExactlyOnce: claims + pending == arrivals;
+            invariant AuthedNeverCut: authed_cut == 0;
+        }
+    }
+}
+
 /// **ALT-SCREEN ARCHIVE POOL, CHARGED AGAINST THE PROCESS** — the retention
 /// budget belongs to the machine's memory, so it is charged against EVERY live
 /// archive at once.

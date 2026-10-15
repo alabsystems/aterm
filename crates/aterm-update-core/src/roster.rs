@@ -33,14 +33,19 @@
 //! schema      = 1
 //! roster_seq  = 3                       # monotonic; the replay counter
 //! valid_until = "9999-12-31T00:00:00Z"  # checked; minted as "forever"
+//! revoked     = ["m11"]                 # ABOVE the first [[machine]], always
 //!
 //! [[machine]]
 //! id       = "m3"
 //! pubkey   = "<base64 Ed25519>"
 //! added_at = "2026-08-04T00:00:00Z"
-//!
-//! revoked = ["m11"]
 //! ```
+//!
+//! Every top-level key comes before the first `[[machine]]`: TOML gives a bare key written
+//! after an array of tables to the LAST table, so `revoked` placed at the end would be a
+//! key of the last machine. The schema's key set is closed (see [`Roster`]), so that
+//! layout is refused as [`RosterReject::Malformed`] rather than read as "nothing
+//! revoked".
 //!
 //! # ONE roster, not per-machine delegation files
 //!
@@ -253,7 +258,13 @@ pub fn verify_roster(
 
 /// One authorized machine. `id` is the ATTRIBUTION handle — the thing a verifier reports
 /// and a human reads later — and it is what the deny-list names.
+///
+/// The key set of a `[[machine]]` table is closed: a key not declared here is refused as
+/// [`RosterReject::Malformed`]. This matters most for keys written after the tables, which
+/// TOML assigns to the last machine. See [`Roster`] for the ruling and why it is safe
+/// for forward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Machine {
     /// The machine identity, e.g. `"m3"`. Stable for the life of the key, and NEVER
     /// reused: see [`Roster::machine`] for why re-minting under an old id creates two
@@ -274,10 +285,39 @@ pub struct Machine {
 
 /// The master-signed roster: who may sign, and who no longer may.
 ///
-/// Field order is meaningful for EMISSION only (serde's TOML serializer writes keys in
-/// declaration order, and `[[machine]]` tables must follow the scalar head or they would
-/// swallow the keys after them). Parsing is order-insensitive as always.
+/// Emission puts every plain key before the `[[machine]]` tables whatever the declaration
+/// order (`aterm_toml` writes values before sub-tables), so [`Roster::to_toml`] never
+/// produces a key that a table would swallow.
+///
+/// # The key set of a schema is closed (ruling 2026-10-10)
+///
+/// Within the one schema this build knows ([`SUPPORTED_SCHEMA`]), a key that neither this
+/// head nor [`Machine`] declares is refused as [`RosterReject::Malformed`]. Before this,
+/// both types ignored unknown keys. The roster's job is to WITHDRAW authority, and an
+/// ignored key is an instruction that was dropped. TOML assigns a bare key written after
+/// the `[[machine]]` tables to the last machine. So a `revoked = [..]` placed there (which
+/// is how this module's own example was laid out) or a misspelt `revoke = [..]` parsed as
+/// "nothing is revoked", and the machine the owner withdrew went on signing.
+///
+/// Forward compatibility, which is what makes this safe: a refused roster ends the update
+/// check (`aterm_update::github`'s head that cannot be authorized), so a client that
+/// refuses its channel's roster is stranded. A new field can reach the fleet in only two
+/// ways. It can come as a key that older builds ignore, which is fail-open for any field
+/// that narrows authority (a per-machine scope, a `not_before`). Or it can come under a
+/// new `schema` number. Every build since the roster began has refused a newer schema by
+/// version, so that path strands old builds exactly as it did before this ruling. A new
+/// key therefore arrives only with a new schema number. Adding a field to either type is
+/// a schema change: bump [`SUPPORTED_SCHEMA`], and have the producer (`atpkg-keys`'
+/// `roster_ops`) stamp the new number on any roster that carries the field.
+/// [`Roster::parse`] reads the schema BEFORE the strict parse, so a newer roster is refused
+/// as [`RosterReject::Schema`] for its version, never as `Malformed` for a key it is
+/// entitled to add.
+///
+/// No published roster is refused. Every master signature goes through
+/// [`Roster::to_toml`] of this type, and its field set has not changed since the type was
+/// introduced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Roster {
     /// Format version; `> SUPPORTED_SCHEMA` is refused rather than misread.
     pub schema: u32,
@@ -300,9 +340,10 @@ pub struct Roster {
     /// Withdrawn machine IDS — never public keys. A revoked id is refused before any
     /// artifact crypto, and an id never returns from the dead.
     ///
-    /// Emitted AFTER `[[machine]]` would be invalid TOML (a scalar key following an array
-    /// of tables belongs to the last table), so this is declared before it and serialized
-    /// in that order.
+    /// On the wire this key must come BEFORE the first `[[machine]]`. Written after the
+    /// tables it would belong to the last machine, which refuses it (the closed key set
+    /// above). It is declared after `machines` here, and that is harmless: the serializer
+    /// writes plain keys ahead of tables whatever the declaration order.
     #[serde(default)]
     pub revoked: Vec<String>,
 }
@@ -336,13 +377,24 @@ impl Roster {
     /// Taking `&VerifiedRoster` is what makes the ordering unrepresentable rather than
     /// merely tested: there is no way to call this on unverified bytes.
     pub fn parse(verified: &VerifiedRoster) -> Result<Self, RosterReject> {
+        /// The schema alone, read with every other key ignored. A newer schema may add keys,
+        /// and it is refused for its version before the closed key set below can call
+        /// those keys malformed.
+        #[derive(Deserialize)]
+        struct Head {
+            schema: u32,
+        }
         let text = std::str::from_utf8(verified.as_slice()).map_err(|_| RosterReject::Malformed)?;
-        let roster: Roster = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
+        let head: Head = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
         // Reject-newer BEFORE any semantic use of the fields: a newer schema may mean
-        // something different by them.
-        if roster.schema > SUPPORTED_SCHEMA {
+        // something different by them, and may carry keys this build has never heard of.
+        if head.schema > SUPPORTED_SCHEMA {
             return Err(RosterReject::Schema);
         }
+        // The strict parse: within a known schema every key is one these types declare
+        // (`deny_unknown_fields` on both), so a misplaced or misspelt key is refused,
+        // never dropped.
+        let roster: Roster = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
         roster.validate()?;
         Ok(roster)
     }
@@ -929,6 +981,82 @@ mod tests {
         let sig = sign(&master, &raw);
         let v = verify_roster(&[&anchor], raw, &sig).unwrap();
         assert_eq!(Roster::parse(&v), Err(RosterReject::Schema));
+    }
+
+    /// A KEY THE SCHEMA DOES NOT DECLARE IS REFUSED, NEVER DROPPED (ruling 2026-10-10).
+    ///
+    /// The case that matters is the layout this module's own example used to show:
+    /// `revoked` written after the `[[machine]]` tables. TOML gives that key to the last
+    /// machine. When unknown keys were ignored, the master-signed roster parsed with
+    /// NOTHING revoked, and the machine the owner withdrew stayed authorized. The same
+    /// went for a misspelt head key and for a key a machine table does not declare.
+    ///
+    /// Negative controls: the same roster with `revoked` above the tables revokes, and
+    /// the emitter's own output round-trips. A NEWER schema that adds a key is refused
+    /// for its version (`Schema`), not as `Malformed`, because the closed key set is
+    /// per schema.
+    #[test]
+    fn a_key_the_schema_does_not_declare_is_refused_not_dropped() {
+        let master = kp(&MASTER_SEED);
+        let anchor = pk(&master);
+        let parse = |text: &str| {
+            let raw = text.as_bytes().to_vec();
+            let sig = sign(&master, &raw);
+            Roster::parse(&verify_roster(&[&anchor], raw, &sig).expect("master-signed"))
+        };
+        let head = "schema      = 1\nroster_seq  = 3\nvalid_until = \"9999-12-31T00:00:00Z\"\n";
+        let tables = format!(
+            "\n[[machine]]\nid       = \"m3\"\npubkey   = \"{}\"\nadded_at = \"2026-08-04T00:00:00Z\"\n\
+             \n[[machine]]\nid       = \"m11\"\npubkey   = \"{}\"\nadded_at = \"2026-08-04T00:00:00Z\"\n",
+            pk(&kp(&M3_SEED)),
+            pk(&kp(&M11_SEED)),
+        );
+        let m11_appcast = b"schema = 1\nmachine_id = \"m11\"\nroster_seq = 3\n";
+        let m11_sig = sign(&kp(&M11_SEED), m11_appcast);
+
+        // The control first: `revoked` ABOVE the tables withdraws m11, so its otherwise
+        // valid signature authorizes nothing.
+        let above = parse(&format!("{head}revoked     = [\"m11\"]\n{tables}"))
+            .expect("the documented layout parses");
+        assert!(above.is_revoked("m11"));
+        assert_eq!(
+            above.authorize_appcast(m11_appcast, &m11_sig, NOW),
+            Err(RosterReject::Verify),
+            "a revoked machine's signature is never checked"
+        );
+
+        // THE DEFECT: the same deny-list written after the tables. Before the ruling this
+        // parsed as `revoked == []`, and the m11-signed appcast was authorized.
+        assert_eq!(
+            parse(&format!("{head}{tables}\nrevoked = [\"m11\"]\n")),
+            Err(RosterReject::Malformed),
+            "a revocation the parser cannot place must refuse, not vanish"
+        );
+        // A misspelt head key, and a key no machine table declares.
+        assert_eq!(
+            parse(&format!("{head}revoke      = [\"m11\"]\n{tables}")),
+            Err(RosterReject::Malformed)
+        );
+        assert_eq!(
+            parse(&format!("{head}{tables}scope    = [\"atpkg\"]\n")),
+            Err(RosterReject::Malformed)
+        );
+
+        // Forward compatibility: a newer schema may add keys, and it is refused for its
+        // version before the closed key set is applied.
+        let newer = format!(
+            "schema = {}\nroster_seq = 3\nvalid_until = \"9999-12-31T00:00:00Z\"\nhorizon = 7\n{}",
+            SUPPORTED_SCHEMA + 1,
+            tables.replacen("[[machine]]\n", "[[machine]]\nscope = [\"atpkg\"]\n", 1),
+        );
+        assert_eq!(parse(&newer), Err(RosterReject::Schema));
+
+        // The emitter's own layout carries every key it declares and round-trips.
+        let mut emitted = roster();
+        emitted.revoked = vec!["m2".into()];
+        emitted.machines[0].not_after = Some("2027-01-01T00:00:00Z".into());
+        let text = emitted.to_toml().expect("emits");
+        assert_eq!(parse(&text), Ok(emitted));
     }
 
     /// Structural invariants a signature cannot check: duplicate ids (two live authorities

@@ -8,6 +8,7 @@
 //! performing smart selection (URLs, paths, etc.) for triggers and UI.
 
 use crate::grid::{Grid, Row, row_u16};
+use crate::search::LineCells;
 
 use super::Terminal;
 
@@ -80,6 +81,39 @@ pub(crate) fn visible_row_bounds_to_string(
     end_col: u16,
     trailing: TrailingBlanks,
 ) -> String {
+    visible_row_text(grid, row, start_col, end_col, trailing, None)
+}
+
+/// Live-frame row `row` as written (every cell up to `Row::len`, trailing
+/// blanks kept: [`TrailingBlanks::Written`]) with the cells its text was read
+/// from: each cell's bytes in the text, its column and its width, 2 for a
+/// wide glyph whose right half follows it. What the search index reports a
+/// visible row's matches in.
+#[must_use]
+pub(crate) fn visible_row_written(grid: &Grid, row: u16) -> (String, LineCells) {
+    let mut cells = LineCells::new();
+    let text = visible_row_text(
+        grid,
+        row,
+        0,
+        grid.cols().saturating_sub(1),
+        TrailingBlanks::Written,
+        Some(&mut cells),
+    );
+    (text, cells)
+}
+
+/// [`visible_row_bounds_to_string`], recording into `cells`, when given, the
+/// cell each piece of the text was read from, its column counted from the
+/// range's first.
+fn visible_row_text(
+    grid: &Grid,
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+    trailing: TrailingBlanks,
+    mut cells: Option<&mut LineCells>,
+) -> String {
     // Clamp end_col to the grid width: `side_adjusted_bounds` uses u16::MAX as
     // an "entire row" sentinel.
     let last_col = grid.cols().saturating_sub(1);
@@ -114,14 +148,29 @@ pub(crate) fn visible_row_bounds_to_string(
     let mut line = String::with_capacity(
         usize::from(end_col.saturating_sub(effective_start)).saturating_add(1),
     );
-    if let Some(cells) = grid.row_at_screen(row) {
+    if let Some(row_cells) = grid.row_at_screen(row) {
         let end_col = match trailing {
             TrailingBlanks::Trim => Some(end_col),
-            TrailingBlanks::Written => cells.len().checked_sub(1).map(|last| end_col.min(last)),
+            TrailingBlanks::Written => row_cells.len().checked_sub(1).map(|last| end_col.min(last)),
         };
         if let Some(end_col) = end_col {
             for col in effective_start..=end_col {
-                push_row_cell_text(grid, row, cells, col, &mut line);
+                let start = line.len();
+                push_row_cell_text(grid, row, row_cells, col, &mut line);
+                if let Some(cells) = cells.as_deref_mut() {
+                    // A wide glyph's right half pushes no text, so it is no
+                    // cell of its own: the left half covers both columns.
+                    let width = if row_cells.is_cell_wide_continuation(col.saturating_add(1)) {
+                        2
+                    } else {
+                        1
+                    };
+                    cells.push(
+                        start..line.len(),
+                        usize::from(col.saturating_sub(effective_start)),
+                        width,
+                    );
+                }
             }
         }
     }
@@ -289,30 +338,26 @@ impl Terminal {
     /// `None` if out of bounds.
     #[must_use]
     pub fn display_row_text(&self, display_row: usize) -> Option<String> {
-        let offset = self.grid.display_offset();
-        if offset == 0 {
+        if self.grid.display_offset() == 0 {
             // Fast path: no scrollback scroll — display row == live grid row.
             return self.row_text(display_row);
         }
+        self.get_line_text(self.display_terminal_row(display_row)?, None)
+    }
 
-        // terminal_row = display_row - display_offset; negative is scrollback.
-        let visible_rows = usize::from(self.grid.rows());
-        if display_row >= visible_rows {
+    /// The terminal-relative row (negative is scrollback) display row
+    /// `display_row` shows: `display_row - display_offset`. `None` past the
+    /// viewport's bottom.
+    fn display_terminal_row(&self, display_row: usize) -> Option<i32> {
+        if display_row >= usize::from(self.grid.rows()) {
             return None;
         }
-
-        // display_row < visible_rows (u16::MAX), offset <= scrollback_lines (bounded).
-        // Both fit in i64; subtraction cannot overflow.
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "both values bounded well within i64 range"
-        )]
-        let terminal_row = (display_row as i64) - (offset as i64);
-
-        // Clamp to i32 range for get_line_text.
-        let terminal_row_i32 = i32::try_from(terminal_row).ok()?;
-
-        self.get_line_text(terminal_row_i32, None)
+        // display_row < visible_rows (u16::MAX), offset <= scrollback_lines
+        // (bounded): both fit in i64, so the subtraction cannot overflow.
+        let terminal_row = i64::try_from(display_row)
+            .ok()?
+            .checked_sub(i64::try_from(self.grid.display_offset()).ok()?)?;
+        i32::try_from(terminal_row).ok()
     }
 
     // ========================================================================
@@ -321,12 +366,14 @@ impl Terminal {
 
     /// How wide the grid writes an East Asian Ambiguous character (`→`, `─`,
     /// `°`): the `ambiguous_width` policy. Every text measurer that maps text
-    /// back to grid columns (find, a scrollback copy, a double-click's word
-    /// bounds) measures under it, so its columns are the cells the grid drew.
+    /// back to grid columns (a scrollback copy) measures under it, so its
+    /// columns are the cells the grid drew.
     ///
     /// The policy in force now: a row written before a live switch keeps the
-    /// geometry it was written with (`apply_config` reflows nothing), and is
-    /// measured under the new policy.
+    /// geometry it was written with (`apply_config` reflows nothing). Find
+    /// and a double-click (and a web host's word under a cell) read a row's
+    /// cells, so they report such a row where it is drawn; the text measurers
+    /// measure it under the new policy.
     #[must_use]
     pub fn ambiguous_width(&self) -> aterm_types::text_shaping::AmbiguousWidth {
         if self.modes.ambiguous_width_double {
@@ -372,6 +419,16 @@ impl Terminal {
     /// boundaries. Reads scrollback when the viewport is scrolled back. `row`
     /// is display-relative (0 is the viewport's top). Returns `(start_col,
     /// end_col)`, or `None` on whitespace or out of bounds.
+    ///
+    /// The row is read with the cells it is drawn in, as far as they draw it
+    /// ([`written_line_cells`](Self::written_line_cells): a live row's cells,
+    /// a ring-tier history row's own cells, a row past the ring as its stored
+    /// line lays it out) and the word mapped through them
+    /// ([`smart_word_in_cells`](super::smart_word_in_cells)), as the desktop
+    /// double-click maps it: a walk of the row's text pairs two flag halves
+    /// the grid drew apart into one, and put the word or link under a cell
+    /// two cells left of where it is drawn (ruling 2026-10-11, r16
+    /// selection-stride; the ring tier's rows by its review).
     #[must_use]
     pub fn smart_word_at(
         &self,
@@ -379,8 +436,27 @@ impl Terminal {
         col: usize,
         smart: &crate::selection::SmartSelection,
     ) -> Option<(usize, usize)> {
-        let text = self.display_row_text(row)?;
-        smart.word_boundaries_at_column_with(&text, col, self.ambiguous_width())
+        self.smart_word_text_at(row, col, smart)
+            .map(|(_, start, end)| (start, end))
+    }
+
+    /// [`smart_word_at`](Self::smart_word_at) with the word's text:
+    /// `(word, start_col, end_col)`, the text read from the same cells the
+    /// columns name. A host that shows or opens the word (a web host's link
+    /// under the pointer) takes it from here rather than slicing the row's
+    /// text by columns, which counted one column a character and so read the
+    /// wrong characters after any wide one (ruling 2026-10-11, r16
+    /// selection-stride).
+    #[must_use]
+    pub fn smart_word_text_at(
+        &self,
+        row: usize,
+        col: usize,
+        smart: &crate::selection::SmartSelection,
+    ) -> Option<(String, usize, usize)> {
+        let (text, cells) = self.drawn_line_cells(self.display_terminal_row(row)?)?;
+        let (bytes, (start, end)) = super::smart_word_in_cells(smart, &text, &cells, col)?;
+        Some((text.get(bytes)?.to_owned(), start, end))
     }
 }
 

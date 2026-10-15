@@ -226,6 +226,10 @@ fn erase_chars_at_content_boundary() {
 }
 
 // ECH/ICH/DCH extras management
+//
+// The fixtures attach extras through `cell_extra_mut`, which sets the cell's
+// HAS_EXTRAS claim as every engine path does: an entry under a cell without it
+// is an orphan these operations drop (`Grid::drop_unclaimed_extras`).
 
 use crate::extra::CellCoord;
 
@@ -239,9 +243,7 @@ fn erase_chars_clears_extras() {
     }
     // Add extras at cols 1, 2, 3
     for col in 1..4u16 {
-        grid.extras_mut()
-            .get_or_create(CellCoord::new(0, col))
-            .add_combining('\u{0301}');
+        grid.cell_extra_mut(0, col).add_combining('\u{0301}');
     }
     // Verify all 3 extras exist before operation
     assert!(grid.extras().get(CellCoord::new(0, 1)).is_some());
@@ -276,12 +278,8 @@ fn insert_chars_shifts_extras_right() {
         grid.write_char(c);
     }
     // Add extras at cols 1 and 4
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 1))
-        .add_combining('\u{0301}');
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 4))
-        .add_combining('\u{0302}');
+    grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
+    grid.cell_extra_mut(0, 4).add_combining('\u{0302}');
 
     // ICH 2 at col 2 → shifts cols 2+ right by 2
     grid.set_cursor(0, 2);
@@ -321,15 +319,9 @@ fn delete_chars_shifts_extras_left() {
         grid.write_char(c);
     }
     // Add extras at cols 1, 3, 6
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 1))
-        .add_combining('\u{0301}');
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 3))
-        .add_combining('\u{0302}');
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 6))
-        .add_combining('\u{0303}');
+    grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
+    grid.cell_extra_mut(0, 3).add_combining('\u{0302}');
+    grid.cell_extra_mut(0, 6).add_combining('\u{0303}');
 
     // DCH 2 at col 2 → deletes cols 2-3, shifts cols 4+ left by 2
     grid.set_cursor(0, 2);

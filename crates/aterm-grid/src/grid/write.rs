@@ -20,53 +20,119 @@ use super::{
     Cell, CellCoord, CellFlags, ColorType, ExtendedStyle, Grid, PackedColor, PackedColors, StyleId,
 };
 
-/// Collect columns in `[start, end)` whose cell carries the HAS_EXTRAS flag,
-/// i.e. whose extras-map entry must be removed when a write overwrites them.
-/// Returns an empty `Vec` (no allocation) when none do. Call only when the
-/// extras map is non-empty, keeping plain writes branch-only.
-#[cold]
-#[inline(never)]
-pub(super) fn stale_extras_cols(row: &crate::Row, start: u16, end: u16) -> Vec<u16> {
-    let mut stale = Vec::new();
-    for col in start..end {
-        if row.get(col).is_some_and(Cell::has_extras) {
-            if stale.is_empty() {
-                stale.reserve_exact(usize::from(end.saturating_sub(col)));
+/// The extras-map entries a write over `[start, end)` of `row` is about to
+/// leave without a cell to claim them, probed before it lands (the write
+/// clears the HAS_EXTRAS bits this reads).
+///
+/// Two kinds, removed differently once the write has landed
+/// ([`Grid::remove_stale_extras`]):
+///
+/// - `overwritten`: cells in the span that carry HAS_EXTRAS. Their entries go
+///   unconditionally: the write replaced the cell, and a writer that sets the
+///   bit on its new cell (the extras run, the preflagged per-glyph path) must
+///   not merge the old entry into it.
+/// - `halves`: the wide halves outside the span that the write's fixup
+///   blanks (`Row::orphaned_wide_halves`), when they carry HAS_EXTRAS. Their
+///   entries go only if the cell lost the bit
+///   ([`Grid::drop_unclaimed_extras`]): a narrow glyph over a toned emoji's
+///   right half blanks the head, whose skin tone a truecolor write there
+///   would otherwise adopt.
+#[derive(Debug, Default)]
+pub(super) struct StaleExtras {
+    overwritten: Vec<u16>,
+    halves: [Option<u16>; 2],
+}
+
+impl StaleExtras {
+    /// Nothing to remove: the extras map is empty.
+    pub(super) const NONE: Self = Self {
+        overwritten: Vec::new(),
+        halves: [None, None],
+    };
+
+    /// Probe `row` before a write over `[start, end)`. Call only when the
+    /// extras map is non-empty, keeping plain writes branch-only; allocates
+    /// only when an overwritten cell carries an entry.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn probe(row: &crate::Row, start: u16, end: u16) -> Self {
+        let mut overwritten = Vec::new();
+        for col in start..end {
+            if row.get(col).is_some_and(Cell::has_extras) {
+                if overwritten.is_empty() {
+                    overwritten.reserve_exact(usize::from(end.saturating_sub(col)));
+                }
+                overwritten.push(col);
             }
-            stale.push(col);
+        }
+        Self {
+            overwritten,
+            halves: orphan_halves_with_extras(row, start, end),
         }
     }
-    stale
+
+    fn is_empty(&self) -> bool {
+        self.overwritten.is_empty() && self.halves == [None, None]
+    }
+}
+
+/// The wide halves outside `[start, end)` that a write over it orphans and
+/// whose cells carry HAS_EXTRAS (see [`StaleExtras`]).
+#[inline]
+pub(super) fn orphan_halves_with_extras(
+    row: &crate::Row,
+    start: u16,
+    end: u16,
+) -> [Option<u16>; 2] {
+    row.orphaned_wide_halves(start, end)
+        .map(|half| half.filter(|&col| row.get(col).is_some_and(Cell::has_extras)))
+}
+
+/// [`StaleExtras`] for a one- or two-cell glyph write, held inline: the
+/// per-glyph writers probe once per glyph, and rewriting cells that carry
+/// extras (a truecolor redraw) must not allocate per glyph.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StaleGlyph {
+    overwritten: [bool; 2],
+    halves: [Option<u16>; 2],
 }
 
 impl Grid {
-    /// Remove the extras-map entries captured by [`stale_extras_cols`] for a
-    /// row that has just been overwritten.
+    /// Remove what [`StaleExtras::probe`] found for a row that has just been
+    /// overwritten.
     ///
     /// Otherwise an overwritten cell's entry (hyperlink, combining marks,
-    /// underline color, RGB overflow) would linger, invisible (readers gate on
-    /// HAS_EXTRAS) but leaking, and a later styled write's `get_or_create` at
-    /// that coordinate would merge the stale data (e.g. an old hyperlink) into
-    /// the new cell.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn remove_stale_extras(&mut self, row: u16, cols: Vec<u16>) {
-        for col in cols {
-            self.storage.extras.remove(CellCoord::new(row, col));
+    /// underline color, RGB overflow) would linger, and a later styled write's
+    /// `get_or_create` at that coordinate would merge the stale data (e.g. an
+    /// old hyperlink) into the new cell.
+    #[inline]
+    pub(super) fn remove_stale_extras(&mut self, row: u16, stale: StaleExtras) {
+        if !stale.is_empty() {
+            self.remove_stale_extras_cold(row, stale);
         }
     }
 
-    /// Probe the old cell pair at `(row, col[, col+1])` for the HAS_EXTRAS
-    /// flag before a 1- or 2-cell overwrite. Returns which of the two columns
-    /// carry a (possibly stale) extras-map entry.
+    #[cold]
+    #[inline(never)]
+    fn remove_stale_extras_cold(&mut self, row: u16, stale: StaleExtras) {
+        for col in stale.overwritten {
+            self.storage.extras.remove(CellCoord::new(row, col));
+        }
+        for col in stale.halves.into_iter().flatten() {
+            self.drop_unclaimed_extras(row, col..col.saturating_add(1));
+        }
+    }
+
+    /// [`StaleExtras`] for a 1- or 2-cell overwrite at `(row, col)`.
     ///
     /// Cost: one branch when the extras map is empty (the plain-text case);
-    /// otherwise one flag read per overwritten column, and a hash removal
-    /// ([`Self::remove_stale_extras_pair`]) only for flagged columns.
+    /// otherwise a flag read per overwritten column and per orphaned wide
+    /// half, and a hash removal ([`Self::remove_stale_extras_pair`]) only for
+    /// flagged columns.
     #[inline]
-    pub(crate) fn stale_extras_pair(&self, row: u16, col: u16, width: u16) -> (bool, bool) {
+    pub(crate) fn stale_extras_pair(&self, row: u16, col: u16, width: u16) -> StaleGlyph {
         if self.storage.extras.is_empty() {
-            return (false, false);
+            return StaleGlyph::default();
         }
         self.stale_extras_pair_cold(row, col, width)
     }
@@ -75,18 +141,23 @@ impl Grid {
     /// the extras map is non-empty, keeping the hot write bodies lean.
     #[cold]
     #[inline(never)]
-    fn stale_extras_pair_cold(&self, row: u16, col: u16, width: u16) -> (bool, bool) {
-        let r = self.row(row);
-        let probe = |c: u16| r.and_then(|r| r.get(c)).is_some_and(Cell::has_extras);
-        (probe(col), width == 2 && probe(col.saturating_add(1)))
+    fn stale_extras_pair_cold(&self, row: u16, col: u16, width: u16) -> StaleGlyph {
+        let Some(r) = self.row(row) else {
+            return StaleGlyph::default();
+        };
+        let probe = |c: u16| r.get(c).is_some_and(Cell::has_extras);
+        StaleGlyph {
+            overwritten: [probe(col), width == 2 && probe(col.saturating_add(1))],
+            halves: orphan_halves_with_extras(r, col, col.saturating_add(width)),
+        }
     }
 
     /// Remove the extras-map entries flagged by [`Self::stale_extras_pair`]
     /// after the overwrite landed. Call only when the write happened; a failed
     /// write must not drop live extras.
     #[inline]
-    pub(crate) fn remove_stale_extras_pair(&mut self, row: u16, col: u16, stale: (bool, bool)) {
-        if stale.0 || stale.1 {
+    pub(crate) fn remove_stale_extras_pair(&mut self, row: u16, col: u16, stale: StaleGlyph) {
+        if stale.overwritten != [false, false] || stale.halves != [None, None] {
             self.remove_stale_extras_pair_cold(row, col, stale);
         }
     }
@@ -94,14 +165,71 @@ impl Grid {
     /// Out-of-line removal for [`Self::remove_stale_extras_pair`].
     #[cold]
     #[inline(never)]
-    fn remove_stale_extras_pair_cold(&mut self, row: u16, col: u16, stale: (bool, bool)) {
-        if stale.0 {
+    fn remove_stale_extras_pair_cold(&mut self, row: u16, col: u16, stale: StaleGlyph) {
+        if stale.overwritten[0] {
             self.storage.extras.remove(CellCoord::new(row, col));
         }
-        if stale.1 {
+        if stale.overwritten[1] {
             self.storage
                 .extras
                 .remove(CellCoord::new(row, col.saturating_add(1)));
+        }
+        for half in stale.halves.into_iter().flatten() {
+            self.drop_unclaimed_extras(row, half..half.saturating_add(1));
+        }
+    }
+
+    /// Drop the extras-map entries in `cols` of visible row `row` whose cells
+    /// no longer claim one.
+    ///
+    /// A cell's HAS_EXTRAS bit is its claim on the entry keyed to its
+    /// coordinate (`HAS_EXTRAS ⇔ entry`, which [`Self::assert_extras_claimed`]
+    /// checks). An operation that blanks or replaces cells outside the writers'
+    /// stale-entry probe clears the bit with the cell and leaves the entry
+    /// keyed to it: a wide pair's orphaned half, a pair bisected by ICH, DCH,
+    /// ECH or EL, a selective erase, a rectangle copy or shift, VS16 or VS15
+    /// reshaping a pair. A later write there with an extras style adopts it
+    /// (`get_or_create`), so an old combining mark, skin tone, link or underline
+    /// colour reappears on new text, and the readers that do not gate on the
+    /// bit (`cell_extra`, `hyperlink_at`, checkpoint serialization) see it at
+    /// once. Every such operation calls this over the columns it may have
+    /// blanked. A cell that kept the bit keeps its entry: a protected cell a
+    /// selective erase skipped, a cell a shift moved together with its entry.
+    /// A cell without the bit keeps only truecolor fg/bg bytes, which a BCE
+    /// blank owns through the RGB marker in its packed colours (reflow harvests
+    /// them from the dense ring into the map); stale bytes under a cell whose
+    /// colours are not truecolor are never read.
+    ///
+    /// Ruling 2026-10-10 (r15 C2): the bit, not each caller's knowledge of
+    /// which cells its fixups touched, decides; the one primitive serves every
+    /// such operation, and the writers' probe ([`StaleExtras`]) reaches it for
+    /// the halves their fixups blank.
+    ///
+    /// Cost: nothing while the map is empty or holds no entry on the row; else
+    /// a flag read per column and a hash probe per column without the bit.
+    pub fn drop_unclaimed_extras(&mut self, row: u16, cols: core::ops::Range<u16>) {
+        if self.storage.extras.is_empty() || cols.is_empty() {
+            return;
+        }
+        let width = usize::from(cols.end - cols.start);
+        if !self.storage.extras.map_may_have_row(row, width) {
+            return;
+        }
+        let Some(idx) = self.storage.row_index(row) else {
+            return;
+        };
+        for col in cols {
+            let claimed = self
+                .storage
+                .rows
+                .get(idx)
+                .and_then(|r| r.get(col))
+                .is_some_and(Cell::has_extras);
+            if !claimed {
+                self.storage
+                    .extras
+                    .strip_unclaimed(CellCoord::new(row, col));
+            }
         }
     }
 
@@ -299,6 +427,9 @@ impl Grid {
     /// Returns the total number of cells written.
     ///
     /// REQUIRES: `byte` is printable ASCII (0x20..=0x7E), insert mode OFF, auto-wrap ON
+    /// REQUIRES: the cursor is not outside a DECSLRM span
+    /// (`Grid::cursor_outside_margin_span`): the right-margin clamp is derived
+    /// once per row from the column the row's batch starts at
     /// ENSURES: result <= count, self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn write_cell_run(
@@ -369,17 +500,15 @@ impl Grid {
             // HAS_EXTRAS flags; the entries are removed after the row borrow
             // ends.
             let stale = if scan_stale {
-                stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
+                StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
-                Vec::new()
+                StaleExtras::NONE
             };
 
             // Bulk fill — Row::fill_cell_run uses slice::fill() (memset-like).
             row.fill_cell_run(cursor_col, to_write_u16, template);
 
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Mark damage for the row (row-level is faster than per-cell).
             self.storage.mark_content_row(cursor_row);
@@ -410,6 +539,9 @@ impl Grid {
     /// Fast path: write printable ASCII bytes directly as u64 cells.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, default style, insert mode OFF, auto-wrap ON
+    /// REQUIRES: the cursor is not outside a DECSLRM span
+    /// (`Grid::cursor_outside_margin_span`): the right-margin clamp is derived
+    /// once per row from the column the row's batch starts at
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn write_ascii_blast(&mut self, ascii: &[u8]) -> usize {
@@ -472,9 +604,9 @@ impl Grid {
             // HAS_EXTRAS flags; the entries are removed after the row borrow
             // ends.
             let stale = if scan_stale {
-                stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
+                StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
-                Vec::new()
+                StaleExtras::NONE
             };
 
             // Write directly to row cells
@@ -488,9 +620,7 @@ impl Grid {
             // Update row len to include written content
             row.update_len(cursor_col + to_write_u16);
 
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Mark damage for the row (mark_row is faster than per-cell)
             self.storage.mark_content_row(cursor_row);
@@ -543,6 +673,9 @@ impl Grid {
     /// to avoid redundant `convert_colors` when the caller already has them.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, no RGB overflow, insert mode OFF
+    /// REQUIRES: the cursor is not outside a DECSLRM span
+    /// (`Grid::cursor_outside_margin_span`): the right-margin clamp is derived
+    /// once per row from the column the row's batch starts at
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn write_ascii_run_styled_packed(
@@ -616,9 +749,9 @@ impl Grid {
             // HAS_EXTRAS flags; the entries are removed after the row borrow
             // ends.
             let stale = if scan_stale {
-                stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
+                StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
-                Vec::new()
+                StaleExtras::NONE
             };
 
             // Write styled cells directly to row
@@ -632,9 +765,7 @@ impl Grid {
             // Update row len to include written content
             row.update_len(cursor_col + to_write_u16);
 
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Mark damage for the row (mark_row is faster than per-cell)
             self.storage.mark_content_row(cursor_row);

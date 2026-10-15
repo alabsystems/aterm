@@ -113,12 +113,9 @@ impl Rig {
     }
 
     fn key(&self) -> JournalDocumentKey {
-        JournalDocumentKey::for_canonical_uri(
-            self.parent
-                .document_store
-                .canonical_uri(self.document)
-                .unwrap(),
-        )
+        self.parent
+            .document_journal_key_for_test(self.document)
+            .unwrap()
     }
 
     fn image(&self) -> Vec<u8> {
@@ -325,8 +322,6 @@ fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
     crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id,
         nonce: None,
         live: Vec::new(),

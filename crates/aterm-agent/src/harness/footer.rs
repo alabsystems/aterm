@@ -151,8 +151,21 @@ pub const UPGRADE_MARK: char = '\u{21E3}'; // ⇣
 /// caught up, the footer names no tokens.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// Spaces between the footer's marked values (the default layout).
-pub const GAP: usize = 3;
+/// The pitch the facts are SET at, in cells ([`set_facts`]). A fact glyph is
+/// drawn at seven tenths of its cell (`aterm_render::SCRIPT_SCALE`), so one
+/// centred per cell its letters stand far apart and read one by one (owner,
+/// 2026-10-08: "the kerning is too wide"). Four fifths of a cell is the
+/// scaled face's own pitch and a little air, as text this small wants.
+pub const FACT_PITCH: f32 = 0.8;
+
+/// The space between two facts, in pitches: three, so a fact's words (one
+/// pitch apart) hold together and the facts read as four, not as one line.
+pub const GAP: f32 = 3.0;
+
+/// The steps a cell is divided into for a fact glyph's sideways move
+/// ([`SetGlyph::nudge`]): `aterm_core::terminal::Script::NUDGES_PER_CELL`,
+/// which the painter asserts is this.
+pub const NUDGES_PER_CELL: i8 = 16;
 
 /// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]),
 /// so the rule still reads as a rule however much it carries.
@@ -367,17 +380,31 @@ pub struct Segment {
     pub text: String,
 }
 
-/// The Claude Code directory of one process, from its environment at exec:
-/// `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`. Never aterm's own environment
-/// (aterm strips `CLAUDE_*` from its shells). A relative `CLAUDE_CONFIG_DIR`
-/// yields `None`.
-pub fn claude_dir_of(config_dir: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(dir) = config_dir.filter(|d| !d.is_empty()) {
-        let dir = PathBuf::from(dir);
-        return dir.is_absolute().then_some(dir);
-    }
-    let home = PathBuf::from(home.filter(|h| !h.is_empty())?);
-    home.is_absolute().then(|| home.join(".claude"))
+/// The Claude Code directory of one process, from its environment at exec
+/// (`config_dir`, its raw `CLAUDE_CONFIG_DIR`; `home`, its raw `HOME`) and
+/// the directory it runs in (`cwd`, asked only for a relative one), by THE
+/// ONE RESOLVER every reader asks (`upgrade_drive::claude_home_dir`, as
+/// Claude Code resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`):
+/// a set one absolute as it is, relative — EMPTY INCLUDED — under `cwd`
+/// (`None` where that is not read), an unset one `$HOME/.claude` (`None`
+/// with no absolute `HOME`). Never aterm's own environment (aterm strips
+/// `CLAUDE_*` from its shells). Until round eighteen this reader took an
+/// empty one as unset (the user's `~/.claude`, where Claude Code files under
+/// the directory it runs in) and a relative one as none.
+pub fn claude_dir_of(
+    config_dir: Option<&str>,
+    home: Option<&str>,
+    cwd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    use super::upgrade_drive::{HomeVars, claude_home_dir};
+    claude_home_dir(
+        None,
+        HomeVars {
+            config: config_dir,
+            home,
+        },
+        cwd,
+    )
 }
 
 /// Open `path` for reading, non-blocking, so a FIFO planted where a `HEAD`
@@ -2114,11 +2141,14 @@ fn is_eperm(error: &std::io::Error) -> bool {
 
 /// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a
 /// third-party sync provider): the one class a Full Disk Access grant does not
-/// cover, whose open raises a system dialog that has no timeout and parks the ONE
-/// footer-resolver thread every Claude session shares. The path is resolved first
-/// (`realpath` is not gated, docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5), so a
-/// symlink out of an ordinary folder is caught; the predicate itself is lexical.
-fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bool {
+/// cover, whose open raises a system dialog that has no timeout and parks the
+/// thread that opened it — here the ONE footer-resolver thread every Claude
+/// session shares, and in the settings chain's fenced reader the route's
+/// (`claude_settings::sources_under`). The path is resolved first (`realpath` is
+/// not gated, docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.5), so a symlink out
+/// of an ordinary folder is caught; the predicate itself is lexical. No `home`:
+/// nothing to fence against.
+pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bool {
     let Some(home) = home else {
         return false;
     };
@@ -2769,15 +2799,156 @@ pub fn text_width(text: &str) -> usize {
         .sum()
 }
 
-/// The cells `segments` take: each mark, a space and its value, [`GAP`]
-/// apart.
+/// The cells `segments` take on the glass, set ([`set_facts`]).
 #[must_use]
 pub fn segments_width(segments: &[Segment]) -> usize {
-    segments
-        .iter()
-        .map(|s| aterm_grapheme::char_width(s.mark) + 1 + text_width(&s.text))
-        .sum::<usize>()
-        + GAP * segments.len().saturating_sub(1)
+    set_facts(segments).cells
+}
+
+/// One glyph of the facts as [`set_facts`] places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetGlyph {
+    /// The character.
+    pub ch: char,
+    /// Its cell in the set run (its lead cell: a wide char takes the next
+    /// one too).
+    pub cell: usize,
+    /// The cells it takes: 1, or 2 for a wide char.
+    pub cols: usize,
+    /// How far its glyph is drawn from the middle of its cells, in
+    /// [`NUDGES_PER_CELL`]ths of a cell (negative: left).
+    pub nudge: i8,
+    /// A fact's MARK (`◆`, `⌂`, ...) rather than a character of its value.
+    pub mark: bool,
+}
+
+/// The facts SET as a line of small type ([`set_facts`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetFacts {
+    /// The cells the line takes, a whole number: the rule meets it on a cell
+    /// boundary at either end.
+    pub cells: usize,
+    /// Every glyph, in reading order, each in a cell of its own.
+    pub glyphs: Vec<SetGlyph>,
+}
+
+/// SET THE FACTS AS A LINE OF TYPE (owner, 2026-10-14: the spacing): each
+/// fact a mark, a space and its value, its letters and words [`FACT_PITCH`]
+/// apart, the facts [`GAP`] pitches apart — the same gap between every two,
+/// whatever their lengths — and the line exactly as long as that, so the
+/// rule runs on up to it.
+///
+/// One character still takes one cell, so each glyph stands in a cell of its
+/// own and is moved ([`SetGlyph::nudge`]) from that cell's middle to where
+/// the line puts it. A space takes no cell: it is room on the line, not a
+/// glyph. That is what lets a tighter pitch SHORTEN the line instead of
+/// leaving its slack in the gaps between the facts (which made them drift
+/// six to nine cells apart). The line's length is rounded up to a whole
+/// cell by setting it a hair looser (under a cell over the whole line); a
+/// line whose glyphs need more cells than that — long names with few
+/// spaces among them — is set as loose as they need, every letter alike,
+/// the gaps between the facts still [`GAP`] pitches. The glyphs are given
+/// the cells nearest their places, in order, the
+/// largest move as small as it can be (a long word lends its excess cells
+/// to the spaces either side of it evenly). Where a move would pass the
+/// nudge's reach (a word of some eighty letters) the line is set looser, a
+/// cell at a time, until none does; at one cell a pitch nothing moves.
+#[must_use]
+pub fn set_facts(segments: &[Segment]) -> SetFacts {
+    // Each glyph's place on the line, in pitches from its start.
+    let mut glyphs: Vec<SetGlyph> = Vec::new();
+    let mut place: Vec<f32> = Vec::new();
+    let mut line = 0.0f32;
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            line += GAP;
+        }
+        let chars = std::iter::once((segment.mark, true))
+            .chain(std::iter::once((' ', false)))
+            .chain(segment.text.chars().map(|ch| (ch, false)));
+        for (ch, mark) in chars {
+            let cols = if ch.is_control() {
+                0
+            } else {
+                aterm_grapheme::char_width(ch)
+            };
+            if cols == 0 {
+                continue;
+            }
+            if ch.is_whitespace() {
+                line += cols as f32;
+                continue;
+            }
+            place.push(line);
+            glyphs.push(SetGlyph {
+                ch,
+                cell: 0,
+                cols,
+                nudge: 0,
+                mark,
+            });
+            line += cols as f32;
+        }
+    }
+    let ink: usize = glyphs.iter().map(|g| g.cols).sum();
+    if glyphs.is_empty() {
+        return SetFacts::default();
+    }
+    let reach = f32::from(i8::MAX) / f32::from(NUDGES_PER_CELL);
+    // A line of at most a few hundred pitches; the hair under `ceil` keeps a
+    // whole product (`25 * 0.8`) from rounding up a cell.
+    let mut cells = ((line * FACT_PITCH - 1e-3).ceil() as usize).max(ink);
+    loop {
+        let pitch = cells as f32 / line;
+        // The cells before each glyph's, and the cell it would lead from if
+        // it stood centred on its place: an isotonic fit of the difference
+        // (L-infinity, the midpoint of the running max and the running min
+        // from the end) keeps them in order with the largest move least.
+        let mut before = Vec::with_capacity(glyphs.len());
+        let mut used = 0usize;
+        for g in &glyphs {
+            before.push(used);
+            used += g.cols;
+        }
+        let want: Vec<f32> = glyphs
+            .iter()
+            .zip(&place)
+            .zip(&before)
+            .map(|((g, &at), &b)| {
+                (at + g.cols as f32 / 2.0) * pitch - g.cols as f32 / 2.0 - b as f32
+            })
+            .collect();
+        let mut high = Vec::with_capacity(want.len());
+        let mut most = f32::MIN;
+        for &w in &want {
+            most = most.max(w);
+            high.push(most);
+        }
+        let mut low = vec![0.0f32; want.len()];
+        let mut least = f32::MAX;
+        for (i, &w) in want.iter().enumerate().rev() {
+            least = least.min(w);
+            low[i] = least;
+        }
+        let slack = (cells - ink) as f32;
+        let mut fits = true;
+        let mut set = glyphs.clone();
+        for (i, g) in set.iter_mut().enumerate() {
+            let lead = ((high[i] + low[i]) / 2.0).clamp(0.0, slack).round() as usize + before[i];
+            let moved =
+                (place[i] + g.cols as f32 / 2.0) * pitch - (lead as f32 + g.cols as f32 / 2.0);
+            if moved.abs() > reach {
+                fits = false;
+                break;
+            }
+            g.cell = lead;
+            g.nudge = (moved * f32::from(NUDGES_PER_CELL)).round() as i8;
+        }
+        if fits {
+            return SetFacts { cells, glyphs: set };
+        }
+        cells += 1;
+    }
 }
 
 /// The run of the composer's bottom rule aterm may write into: the widest run

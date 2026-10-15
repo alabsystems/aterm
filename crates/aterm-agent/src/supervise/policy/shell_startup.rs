@@ -437,8 +437,8 @@ pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
     }
     worker.settings_env_where(launch, shell_relevant, "a command")?;
     let claude = worker
-        .claude_dir()
-        .ok_or("the worker's Claude Code directory is unknown (no CLAUDE_CONFIG_DIR or HOME)")?;
+        .claude_dir(launch)
+        .map_err(|why| format!("the worker's Claude Code directory is unknown: {why}"))?;
     hook_env_scripts(&claude)?;
     let kinds = tool_kinds(worker);
     let snapshots = snapshots(&claude, &kinds)?;

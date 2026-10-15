@@ -109,6 +109,16 @@
 //! first four words as often as not. What an API error says went wrong on
 //! the way is its [`ApiCause`].
 //!
+//! **A notice Ink wrapped is read as one line** (`crate::wrap`). In a pane
+//! narrower than a notice Ink word-wraps it onto the rows under it — the
+//! footer's `⚠ Usage limit reached · limit` over `resets 10:25am` at 34
+//! columns, the turn's `⎿  You've hit your` over `session limit ·` at 26
+//! (measured on 2.1.299, the fixtures `claude-2.1.299-*-NNcol.txt`) — and
+//! read a row at a time the banner named no reset and the notice was no wall.
+//! Every placement reads a notice across the rows its line was wrapped onto
+//! (`phase`'s `line_at`); a `⏺` row's text is its message, the rows under it
+//! at column two, as it always was.
+//!
 //! **Not every `… limit reached` is a wall.** The binary's full set (2.1.280,
 //! read with `rg -a 'limit reached'`) includes a subagent quota (`Concurrent
 //! subagent limit reached. You can run 5 subagents at once. Do not retry.`),
@@ -727,22 +737,385 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
 /// the last thing said, and this says why. A `/login` that did NOT finish —
 /// its dialog dismissed — leaves no such row, and a login finished in ANOTHER
 /// tab says nothing here: the wall's row stays the last thing said until
-/// something is typed into this one.
+/// something is typed into this one. In a pane narrower than the row Ink
+/// wraps it (`crate::wrap`), and the last thing said is its rest
+/// (`organization changed`): the row is read as the line the last thing said
+/// belongs to.
 #[must_use]
 pub fn login_restored(rows: &[String]) -> bool {
-    let Some(last) = crate::phase::last_said_index(rows) else {
+    use crate::phase::{gutter_open, last_said_index, line_at};
+    let Some(last) = last_said_index(rows) else {
         return false;
     };
-    let restored = rows[last]
-        .trim_start()
-        .strip_prefix('⎿')
-        .is_some_and(|out| crate::text::trim_start(out).starts_with("Login successful"));
+    let Some(open) = gutter_open(rows, last) else {
+        return false;
+    };
+    let (end, line) = line_at(rows, open, rows.len(), crate::question::screen_width(rows));
+    let restored = end >= last
+        && crate::text::trim_start(&line)
+            .strip_prefix('⎿')
+            .is_some_and(|out| crate::text::trim_start(out).starts_with("Login successful"));
     restored
-        && rows[..last]
+        && rows[..open]
             .iter()
             .rev()
             .find(|r| !crate::text::trim(r).is_empty() && crate::phase::leading_spaces(r) == 0)
             .is_some_and(|r| crate::text::trim_end(r) == "❯ /login")
+}
+
+/// How Claude Code's OWN AUTO-CONTINUE of a usage limit ended, by the
+/// vendor's word on the screen ([`auto_continue_end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoContinue {
+    /// It went on: the vendor sent the continuation itself — `Usage limit
+    /// reset · continuing automatically` at the reset, `Usage limit available
+    /// again · continuing now` before it.
+    Fired,
+    /// It will not go on by itself: `Automatic continue cancelled · …` (Esc
+    /// on its countdown; the session moved, relaunched or exited), `Automatic
+    /// continue stopped · …`, `Automatic continue was turned off · …`, or a
+    /// reset that passed with nothing sent (`Usage limit has reset · press
+    /// enter to continue`).
+    Unkept,
+}
+
+/// What the screen last says of Claude Code's own auto-continue, once the
+/// limit it was armed for has left the screen. Measured on 2.1.296 (the lab,
+/// 2026-10-09): Esc on `Continuing automatically at 3:50pm · esc to cancel`
+/// draws `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` in
+/// the transcript and as the footer's notification; at the reset the vendor
+/// draws `⏺ Usage limit reset · continuing automatically` and sends the
+/// continuation itself, with no `❯` row, its reply under it. Either way the
+/// limit's notice is no longer the last thing said, so [`wall`] finds none,
+/// and only these rows say which way the limit's end went.
+///
+/// Read where the vendor draws them: the footer's notification first (when it
+/// shows it is the newest word), then up from the composer through the
+/// transcript, the first row or wide-gapped item that OPENS with one of the
+/// words ([`crate::anchors`]' `wall.auto_continue.*`, a leading glyph
+/// passed over) — each row read as the line it opens, across the rows Ink
+/// wrapped it onto (`crate::wrap`; a `⏺` row's, its message: at 26 columns
+/// `⏺ Automatic` stands over `continue` over `cancelled · /rat…`, 2.1.299).
+/// The walk up ends at the turn's own `❯` row — a person's `/usage` after the
+/// cancel is a new turn, and what came before it is that turn's history — and
+/// at a limit notice: a limit below the vendor's word stands (its
+/// continuation met the limit again). `None` when nothing says.
+#[must_use]
+pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
+    use crate::phase::{footer_end, line_at};
+    let frame = crate::phase::composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let until = footer_end(rows, frame.bottom + 1);
+    if let Some(end) = (frame.bottom + 1..until).find_map(|i| {
+        let (_, line) = line_at(rows, i, until, width);
+        gapped_items(&line).find_map(auto_continue_said)
+    }) {
+        return Some(end);
+    }
+    for (i, row) in rows[..frame.top].iter().enumerate().rev() {
+        if crate::phase::leading_spaces(row) == 0 && crate::text::trim_start(row).starts_with('❯')
+        {
+            return None;
+        }
+        let (_, line) = line_at(rows, i, frame.top, width);
+        for item in gapped_items(&line) {
+            if let Some(end) = auto_continue_said(item) {
+                return Some(end);
+            }
+            if classify_wall(item).is_some_and(|k| k.reads_limited()) {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// The screen's NEWEST USAGE LIMIT NOTICE and what was served since it
+/// ([`since_limit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinceLimit {
+    /// The notice's kind ([`classify_wall`]).
+    pub kind: WallKind,
+    /// The reset it names, as printed ([`crate::notice_reset`]: `10:38am`,
+    /// `Oct 20 at 9am (…)`): what tells one limit's notice from another's.
+    pub reset: Option<String>,
+    /// A TURN WAS SERVED since it: a person's prompt below it (a `❯` row in
+    /// column zero with text, no local command — `❯ /usage`, `❯ /model`, a
+    /// `/resume`: no turn) with the model's reply drawn under that prompt (a
+    /// `⏺` row in column zero that is no notice of the vendor's: the model's
+    /// words or a tool's call).
+    pub served: bool,
+}
+
+/// THE NEWEST USAGE LIMIT NOTICE THE SCREEN DRAWS and whether a turn was
+/// SERVED since it ([`SinceLimit`]): up from the composer, the first line (or
+/// wide-gapped item) Claude Code's limit notice opens (`You've hit your
+/// session limit · …`, its `Usage limit reached · continuing automatically …`
+/// row; a line that names no reset — the `/goal` echo of the notice above it —
+/// takes its reset from that notice), and the rows below it. The screen's
+/// order is the conversation's, so
+/// a prompt drawn below the notice was submitted after it; where the limit
+/// still stood, its turn met it again and drew a notice below the prompt,
+/// which the walk meets first; where the API never answered it (an Esc
+/// before its reply: `⎿  Interrupted · …`), no `⏺` row hangs under it. The
+/// notice's reset says WHICH limit it is: a conversation `/resume`d redraws
+/// its own history, an older limit's notice with turns served under it, and
+/// the caller ties the notice to the limit it waits on by that reset (the
+/// review of 2026-10-14, the lab on 2.1.300). `None` where the screen above
+/// the composer draws no limit's notice (scrolled off, cleared) or no
+/// composer: the screen says nothing of the limit. Read where the limit's
+/// notice has LEFT the screen's end (Esc on the vendor's countdown), and a
+/// person's turn ran there that no read saw busy (measured on 2.1.299: `❯
+/// what is left to do?`, the reply and its done row under `⏺ Automatic
+/// continue cancelled · …`). A shell-mode `! cmd` is drawn without the `❯`
+/// and is not read here.
+///
+/// Each row is read as the line it opens, across the rows Ink wrapped it
+/// onto (`crate::wrap`, as [`auto_continue_end`] reads them): in a pane
+/// narrower than the notice (`⏺ Usage limit` over `reached ·` over
+/// `continuing` at 26 columns, 2.1.299) a row at a time named no limit, and
+/// the cancel's own `⏺ Automatic` row read as a reply of the model's.
+#[must_use]
+pub fn since_limit(rows: &[String]) -> Option<SinceLimit> {
+    newest_limit(rows).map(|newest| newest.since)
+}
+
+/// What [`newest_limit`] read: the notice ([`SinceLimit`]), the row its line
+/// opens on, its words as said (the item, its leading glyph dropped), and the
+/// row its `/goal` echo opens on below it, if one took its reset from it.
+struct Newest {
+    since: SinceLimit,
+    row: usize,
+    message: String,
+    echo: Option<usize>,
+}
+
+/// [`since_limit`]'s walk, keeping the notice's row and words for
+/// [`left_wall`].
+fn newest_limit(rows: &[String]) -> Option<Newest> {
+    use crate::phase::line_at;
+    let frame = crate::phase::composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let words = |item: &str| {
+        item.trim_start_matches(|c: char| !c.is_alphanumeric())
+            .to_string()
+    };
+    // A reply of the model's below the rows walked so far, and a prompt
+    // that drew one.
+    let (mut replied, mut served) = (false, false);
+    // The newest limit line met, where it named no reset: an ECHO of the
+    // notice above it (`⏺ Goal paused · usage limit reached · send a message
+    // after it resets to continue`), whose reset the notice names. The walk
+    // goes on up to it, through no prompt.
+    let mut echo: Option<(WallKind, usize, String)> = None;
+    let echoed = |(kind, row, message): (WallKind, usize, String), served| Newest {
+        since: SinceLimit {
+            kind,
+            reset: None,
+            served,
+        },
+        row,
+        message,
+        echo: None,
+    };
+    for (i, row) in rows[..frame.top].iter().enumerate().rev() {
+        let column0 = crate::phase::leading_spaces(row) == 0;
+        let text = crate::text::trim(row);
+        if column0 && let Some(prompt) = text.strip_prefix('❯') {
+            if let Some(echo) = echo {
+                return Some(echoed(echo, served));
+            }
+            let prompt = crate::text::trim(prompt);
+            served |= replied && !prompt.is_empty() && !prompt.starts_with('/');
+            replied = false;
+            continue;
+        }
+        let (_, line) = line_at(rows, i, frame.top, width);
+        if let Some((kind, item)) = gapped_items(&line).find_map(|item| {
+            classify_wall(item)
+                .filter(|k| k.reads_limited())
+                .map(|k| (k, item))
+        }) {
+            match crate::phase::notice_reset(item) {
+                Some(reset) => {
+                    return Some(Newest {
+                        since: SinceLimit {
+                            kind,
+                            reset: Some(reset),
+                            served,
+                        },
+                        row: i,
+                        message: words(item),
+                        echo: echo.map(|(_, row, _)| row),
+                    });
+                }
+                None => {
+                    echo.get_or_insert_with(|| (kind, i, words(item)));
+                    continue;
+                }
+            }
+        }
+        if echo.is_none()
+            && column0
+            && let Some(said) = crate::text::trim(&line).strip_prefix('⏺')
+            && classify_wall(said).is_none()
+            && auto_continue_said(said).is_none()
+        {
+            replied = true;
+        }
+    }
+    echo.map(|echo| echoed(echo, served))
+}
+
+/// THE LIMIT A CANCEL LEFT ON THE SCREEN: the vendor's own word that its
+/// auto-continue will NOT go on ([`auto_continue_end`] `Unkept`: Esc on its
+/// countdown, `⏺ Automatic continue cancelled · /rate-limit-options to
+/// re-arm`) drawn as the LAST THING SAID, its `⏺` row in column 0, right
+/// under the screen's newest usage limit notice ([`since_limit`]: the first
+/// thing said above the cancel is that notice's block, or its `/goal` echo)
+/// — a notice that names
+/// its reset and that no turn has been served since — read as the wall that
+/// notice was before the cancel took it off the screen's end: its kind, its
+/// words, its reset, the row it opens on ([`Placement::ErrorRow`] for the
+/// vendor's `⏺` row, its countdown's `Usage limit reached · continuing
+/// automatically at …`; [`Placement::Gutter`] for a `⎿` notice), never under
+/// a call. [`wall`] reads none there: the cancel is the last thing said.
+///
+/// Measured on 2.1.300 (the lab, `tw16after`, 2026-10-14): the supervisor's
+/// `keep going` met a five-hour limit at once, and a person's Esc on the
+/// countdown came before the supervisor's first read after its act — that
+/// read was already the cancel, no wall, and nothing tracked the limit. This
+/// says only what the screen draws; whether the notice is the limit a
+/// supervisor must wait on — the answer to an act of its own, not an older
+/// limit a `/resume`d conversation redraws — is the caller's (aterm-agent,
+/// `policy/turn_end.rs`'s `left_answer`). `None` where the vendor's last word
+/// is not the cancel, anything is said after it or between it and the
+/// notice (a tool's output that quotes both lines ends on the model's reply,
+/// and its rows are no `⏺` row in column 0), the newest notice names no
+/// reset or has a turn served under it, or the screen draws no composer.
+#[must_use]
+pub fn left_wall(rows: &[String]) -> Option<Wall> {
+    use crate::phase::{is_said, leading_spaces, line_at};
+    if auto_continue_end(rows)? != AutoContinue::Unkept {
+        return None;
+    }
+    let frame = crate::phase::composer_frame(rows)?;
+    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    // The cancel is the last thing said: its `⏺` row and the rows Ink
+    // wrapped it onto.
+    let last = crate::phase::last_said_index(rows)?;
+    let cancel = (0..=last)
+        .rev()
+        .find(|&i| rows[i].starts_with(['⏺', '●']))?;
+    let (end, line) = line_at(rows, cancel, frame.top, width);
+    let said = crate::text::trim(&line).trim_start_matches(['⏺', '●']);
+    if end < last || auto_continue_said(said) != Some(AutoContinue::Unkept) {
+        return None;
+    }
+    let newest = newest_limit(rows)?;
+    if newest.since.served || newest.row >= cancel {
+        return None;
+    }
+    let reset = newest.since.reset?;
+    // Right under the notice: the first thing said above the cancel is a row
+    // of the notice's block (its wrapped rows, a gutter block's rows under
+    // it, up to the first blank row or row in column 0), or of its `/goal`
+    // echo (`⏺ Goal paused · usage limit reached · continues automatically
+    // when it resets`, whose reset the notice names).
+    let block_end = match newest.echo {
+        Some(echo) => line_at(rows, echo, frame.top, width).0,
+        None => {
+            (newest.row + 1..cancel)
+                .find(|&i| crate::text::trim(&rows[i]).is_empty() || leading_spaces(&rows[i]) == 0)
+                .unwrap_or(cancel)
+                - 1
+        }
+    };
+    // The first thing said above the cancel; a wrapped row of a line that
+    // is no thing said (`✻ Brewed for 0s · done` over `10:40 AM` at 26
+    // columns) is that line's.
+    let opener = |i: usize| {
+        (0..=i)
+            .rev()
+            .find(|&j| leading_spaces(&rows[j]) == 0 || crate::text::trim(&rows[j]).is_empty())
+    };
+    let mut i = cancel;
+    let above = loop {
+        i = i.checked_sub(1)?;
+        if !is_said(&rows[i], Some(width)) {
+            continue;
+        }
+        match opener(i) {
+            Some(j)
+                if j < i
+                    && !crate::text::trim(&rows[j]).is_empty()
+                    && !is_said(&rows[j], Some(width)) =>
+            {
+                i = j;
+            }
+            _ => break i,
+        }
+    };
+    if !(newest.row..=block_end).contains(&above) {
+        return None;
+    }
+    let placement = match crate::text::trim_start(&rows[newest.row]).chars().next() {
+        Some('⎿') => Placement::Gutter,
+        _ => Placement::ErrorRow,
+    };
+    Some(Wall {
+        kind: newest.since.kind,
+        message: newest.message,
+        reset: Some(reset),
+        row: newest.row,
+        placement,
+        under_call: false,
+    })
+}
+
+/// A row's items: its text split at each run of two or more spaces (a
+/// footer's notification is drawn right of its mode line).
+fn gapped_items(row: &str) -> impl Iterator<Item = &str> {
+    crate::text::trim(row)
+        .split("  ")
+        .map(crate::text::trim)
+        .filter(|item| !item.is_empty())
+}
+
+/// The auto-continue's end an item opens with ([`auto_continue_end`]).
+fn auto_continue_said(item: &str) -> Option<AutoContinue> {
+    let text = item
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .replace('\u{2219}', "\u{b7}");
+    let opens = |id: &str| {
+        let words = crate::anchors::anchor(id);
+        // `Your usage limit has reset · …` is the stale notice too.
+        [text.as_str(), strip_ci(&text, "your ").unwrap_or("")]
+            .iter()
+            .any(|t| strip_ci(t, words).is_some())
+    };
+    if opens("wall.auto_continue.fired") || opens("wall.auto_continue.now") {
+        Some(AutoContinue::Fired)
+    } else if [
+        "wall.auto_continue.cancelled",
+        "wall.auto_continue.stopped",
+        "wall.auto_continue.off",
+        "wall.auto_continue.stale",
+    ]
+    .iter()
+    .any(|id| opens(id))
+    {
+        Some(AutoContinue::Unkept)
+    } else {
+        None
+    }
+}
+
+/// `text` past its opening `prefix`, ignoring ASCII case.
+fn strip_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 /// How far above the composer's top rule [`memory_wall`] looks: the live
@@ -2057,6 +2430,745 @@ mod tests {
             ),
         ] {
             assert!(!login_restored(&v), "{name}");
+        }
+    }
+
+    /// THE LOGIN BACK, ITS ROW WRAPPED (HAND-BUILT: the measured row `⎿  Login
+    /// successful · account or organization changed` as Ink's word wrap breaks
+    /// it in a pane narrower than its 56 columns, here 40; the lab cannot
+    /// finish a `/login`, having no egress). The last thing said is the row's
+    /// rest, `organization changed`: read a row at a time, nothing said the
+    /// login is back. NEGATIVE CONTROL: the same rows under a tool's call.
+    #[test]
+    fn a_login_back_wrapped_in_a_narrow_pane_is_read() {
+        let rule = "─".repeat(40);
+        let screen_with = |call: &str| {
+            let mut v = rows(&[
+                "⏺ Login expired · Please run /login",
+                "",
+                call,
+                "  ⎿  Login successful · account or",
+                "     organization changed",
+                "",
+            ]);
+            v.extend(rows(&[&rule, "❯", &rule, "  ? for shortcuts"]));
+            v
+        };
+        let back = screen_with("❯ /login");
+        assert_eq!(wall(&back), None);
+        assert!(login_restored(&back));
+        assert!(!login_restored(&screen_with("⏺ Bash(tail -2 login.log)")));
+    }
+
+    /// HOW THE VENDOR'S OWN AUTO-CONTINUE ENDED, on the lab's captures of
+    /// Claude Code 2.1.296: armed, the wall stands and nothing ended it; after
+    /// Esc on its countdown, unkept — the transcript's row and the footer's
+    /// notification each say so alone; past the reset, fired. The lifecycle's
+    /// other words in the cancelled row's place read as theirs. NEGATIVE
+    /// CONTROLS: a turn's `❯` row under the word makes it history (a person's
+    /// `/usage` after the cancel); a limit notice under it stands (the
+    /// vendor's continuation met the limit again); the armed countdown is no
+    /// end; a screen with no composer says nothing.
+    #[test]
+    fn the_auto_continues_end_is_read_off_the_vendors_word() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED, WALL_SESSION_RESUMED_BY_ITSELF_MEASURED,
+            screen,
+        };
+        let armed = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
+        let cancelled = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
+        let resumed = screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED);
+        assert!(wall(&armed).is_some());
+        assert_eq!(auto_continue_end(&armed), None);
+        for left in [&cancelled, &resumed] {
+            assert_eq!(wall(left), None);
+        }
+        assert_eq!(auto_continue_end(&cancelled), Some(AutoContinue::Unkept));
+        assert_eq!(auto_continue_end(&resumed), Some(AutoContinue::Fired));
+        let row = |rows: &[String], opens: &str| {
+            rows.iter()
+                .position(|r| r.starts_with(opens))
+                .unwrap_or_else(|| panic!("no {opens:?} row"))
+        };
+        let cancel_row = row(&cancelled, "⏺ Automatic continue cancelled");
+        let footer = row(&cancelled, "  ⏵⏵ auto mode on");
+        // Each place says it alone.
+        let mut only_footer = cancelled.clone();
+        only_footer[cancel_row] = String::new();
+        assert_eq!(auto_continue_end(&only_footer), Some(AutoContinue::Unkept));
+        let mut only_transcript = cancelled.clone();
+        only_transcript[footer] =
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_string();
+        assert_eq!(
+            auto_continue_end(&only_transcript),
+            Some(AutoContinue::Unkept)
+        );
+        // The lifecycle's other words, in the transcript row's place.
+        for (said, want) in [
+            (
+                "⏺ Usage limit available again · continuing now",
+                AutoContinue::Fired,
+            ),
+            (
+                "⏺ Automatic continue stopped · the usage limit now resets more than 24 hours \
+                 out, so this task will not resume on its own",
+                AutoContinue::Unkept,
+            ),
+            (
+                "⏺ Automatic continue was turned off · this task will not resume on its own",
+                AutoContinue::Unkept,
+            ),
+            (
+                "⏺ Usage limit has reset · press enter to continue",
+                AutoContinue::Unkept,
+            ),
+            (
+                "⏺ Your usage limit has reset · press enter to continue",
+                AutoContinue::Unkept,
+            ),
+            (
+                "⚠ Usage limit reset ∙ continuing automatically",
+                AutoContinue::Fired,
+            ),
+        ] {
+            let mut v = only_transcript.clone();
+            v[cancel_row] = said.to_string();
+            assert_eq!(auto_continue_end(&v), Some(want), "{said}");
+        }
+        // NEGATIVE CONTROLS. A turn after the word.
+        let mut later = only_transcript.clone();
+        later.splice(
+            cancel_row + 1..cancel_row + 1,
+            ["", "❯ /usage", "  ⎿  Status dialog dismissed"].map(str::to_string),
+        );
+        assert_eq!(auto_continue_end(&later), None);
+        // A limit under the vendor's word: its continuation met it again.
+        let fired = row(&resumed, "⏺ Usage limit reset");
+        let mut again = resumed.clone();
+        again.splice(
+            fired + 1..fired + 1,
+            [
+                "",
+                "⏺ Usage limit reached again · continuing automatically at 8:50pm · esc to cancel",
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(auto_continue_end(&again), None);
+        // The countdown alone is no end, and no composer says nothing.
+        let mut countdown = only_transcript.clone();
+        countdown[cancel_row] = "  Continuing automatically at 3:50pm · esc to cancel".to_string();
+        assert_eq!(auto_continue_end(&countdown), None);
+        let top = cancelled
+            .iter()
+            .rposition(|r| r.starts_with('─'))
+            .expect("rule");
+        assert_eq!(auto_continue_end(&cancelled[..top]), None);
+    }
+
+    /// THE NEWEST LIMIT AND A TURN SERVED SINCE IT, read off the screen's
+    /// order (Claude Code 2.1.299 in the lab): Esc on the countdown, then a
+    /// person's short turn under the cancel — the prompt drawn below the
+    /// limit's notice, the reply under the prompt — is a served turn since
+    /// that notice, whose reset (`10:38am`) says which limit it is; so is one
+    /// after a person's `/usage`. NEGATIVE CONTROLS, none served: the armed
+    /// wall and the cancel alone (the only prompt is the one that met the
+    /// limit, above its notice); the vendor's own continuation (no `❯` row);
+    /// a local command in the prompt's place; a turn that met the limit again
+    /// (its notice below the prompt, the newest, with its own reset); a prompt
+    /// the API never answered (Esc before its reply, `⎿  Interrupted · …`).
+    /// No limit at all: the same turn with the notice off the screen (nothing
+    /// orders it), and a screen with no composer.
+    #[test]
+    fn the_newest_limit_and_a_turn_served_since_are_read_off_the_screens_order() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
+            WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED,
+            WALL_SESSION_RESUMED_BY_ITSELF_MEASURED, screen,
+        };
+        let since = |kind: WallKind, reset: &str, served: bool| {
+            Some(SinceLimit {
+                kind,
+                reset: Some(reset.to_string()),
+                served,
+            })
+        };
+        let turned = screen(WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED);
+        assert_eq!(wall(&turned), None);
+        let countdown = classify_wall(
+            "⏺ Usage limit reached · continuing automatically at 10:38am · esc to cancel",
+        )
+        .expect("the countdown reads as the limit");
+        assert_eq!(since_limit(&turned), since(countdown, "10:38am", true));
+        let row = |opens: &str| {
+            turned
+                .iter()
+                .position(|r| r.starts_with(opens))
+                .unwrap_or_else(|| panic!("no {opens:?} row"))
+        };
+        let prompt = row("❯ what is left to do?");
+        let mut after_usage = turned.clone();
+        after_usage.splice(
+            prompt..prompt,
+            ["❯ /usage", "  ⎿  Status dialog dismissed", ""].map(str::to_string),
+        );
+        assert_eq!(since_limit(&after_usage), since(countdown, "10:38am", true));
+        // NEGATIVE CONTROLS: a limit, nothing served since.
+        for (name, text, reset) in [
+            ("armed", WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED, "3:15pm"),
+            (
+                "cancelled",
+                WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
+                "3:50pm",
+            ),
+            ("resumed", WALL_SESSION_RESUMED_BY_ITSELF_MEASURED, "3:35pm"),
+        ] {
+            let read = since_limit(&screen(text)).unwrap_or_else(|| panic!("{name}: no limit"));
+            assert_eq!(
+                (read.served, read.reset.as_deref()),
+                (false, Some(reset)),
+                "{name}"
+            );
+        }
+        let mut local = turned.clone();
+        local[prompt] = "❯ /usage".to_string();
+        assert_eq!(since_limit(&local), since(countdown, "10:38am", false));
+        let reply = row("⏺ Hi! I am the local lab stub, not a model. (reply 3)");
+        let mut met_again = turned.clone();
+        met_again[reply] =
+            "  ⎿  You've hit your session limit · resets 11:38am (America/Los_Angeles)".to_string();
+        assert_eq!(
+            since_limit(&met_again),
+            since(
+                WallKind::UsageSession,
+                "11:38am (America/Los_Angeles)",
+                false
+            )
+        );
+        let mut unanswered = turned.clone();
+        unanswered[reply] = "  ⎿  Interrupted · What should Claude do instead?".to_string();
+        assert_eq!(since_limit(&unanswered), since(countdown, "10:38am", false));
+        // A `/goal` echo names no reset: the notice it echoes does (2.1.283,
+        // the weekly wall measured on the owner's tab).
+        let weekly = screen(include_str!(
+            "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
+        ));
+        assert_eq!(
+            since_limit(&weekly),
+            since(WallKind::UsageWeekly, "4pm (America/Los_Angeles)", false)
+        );
+        // No limit on the screen.
+        let notice = row("❯ carry on with the task");
+        let cancel = row("⏺ Automatic continue cancelled");
+        let mut unordered = turned.clone();
+        unordered.drain(notice..=cancel);
+        assert_eq!(since_limit(&unordered), None);
+        let top = turned
+            .iter()
+            .rposition(|r| r.starts_with('─'))
+            .expect("rule");
+        assert_eq!(since_limit(&turned[..top]), None);
+    }
+
+    /// THE LIMIT A CANCEL LEFT is read as the wall its notice was (round 16's
+    /// residual (a), measured on 2.1.296 and, at 26 columns, 2.1.299): the
+    /// vendor's `Automatic continue cancelled` under the newest notice, nothing
+    /// served since — the notice's kind, its words, its reset, its row, the
+    /// vendor's `⏺` row's placement. At 26 columns the countdown's line is
+    /// read across its rows (`⏺ Usage limit` over `reached ·` over
+    /// `continuing`), and so is the cancel's (`⏺ Automatic` over `continue`),
+    /// which a row at a time read as a reply of the model's. NEGATIVE
+    /// CONTROLS: the armed wall (no cancel: the reader's own wall), the
+    /// vendor's own continuation (`Fired`), a person's turn served under the
+    /// cancel, a local command after it (a new turn: the cancel is history),
+    /// a turn sent into the limit after the cancel (its notice is the newest
+    /// and stands: the reader's wall), a notice naming no reset, and no
+    /// composer.
+    #[test]
+    fn the_limit_a_cancel_left_is_read_as_the_wall_it_was() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AFTER_CANCEL_26_2_1_299, WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
+            WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED,
+            WALL_SESSION_RESUMED_BY_ITSELF_MEASURED, screen,
+        };
+        let cancelled = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED);
+        let countdown = cancelled
+            .iter()
+            .rposition(|r| r.starts_with("⏺ Usage limit reached"))
+            .expect("the countdown row");
+        assert_eq!(wall(&cancelled), None);
+        assert_eq!(
+            left_wall(&cancelled),
+            Some(Wall {
+                kind: WallKind::UsageSession,
+                message: "Usage limit reached · continuing automatically at 3:50pm · esc to cancel"
+                    .to_string(),
+                reset: Some("3:50pm".to_string()),
+                row: countdown,
+                placement: Placement::ErrorRow,
+                under_call: false,
+            })
+        );
+        // At 26 columns, every line wrapped.
+        let narrow = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299);
+        assert_eq!(wall(&narrow), None);
+        assert_eq!(
+            since_limit(&narrow),
+            Some(SinceLimit {
+                kind: WallKind::UsageSession,
+                reset: Some("10:50am".to_string()),
+                served: false,
+            })
+        );
+        let left = left_wall(&narrow).expect("the narrow cancel's limit");
+        assert_eq!(
+            (
+                left.kind,
+                left.reset.as_deref(),
+                left.placement,
+                narrow[left.row].as_str()
+            ),
+            (
+                WallKind::UsageSession,
+                Some("10:50am"),
+                Placement::ErrorRow,
+                "⏺ Usage limit"
+            )
+        );
+        assert!(
+            left.message
+                .starts_with("Usage limit reached · continuing automatically at 10:50am"),
+            "{left:?}"
+        );
+        // Under a `/goal` echo of the notice (2.1.283's weekly wall, the
+        // owner's tab), the cancel drawn under the echo: the notice under the
+        // `⎿` gutter, its reset the echo's.
+        let mut goal = screen(include_str!(
+            "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
+        ));
+        let done = goal
+            .iter()
+            .position(|r| r.starts_with("✻ Sautéed"))
+            .expect("the done row");
+        goal.splice(
+            done..done,
+            [
+                "⏺ Automatic continue cancelled · /rate-limit-options to re-arm",
+                "",
+            ]
+            .map(str::to_string),
+        );
+        let notice = goal
+            .iter()
+            .position(|r| r.contains("You've hit your weekly limit"))
+            .expect("the notice");
+        let left = left_wall(&goal).expect("the goal's limit");
+        assert_eq!(
+            (left.kind, left.reset.as_deref(), left.placement, left.row),
+            (
+                WallKind::UsageWeekly,
+                Some("4pm (America/Los_Angeles)"),
+                Placement::Gutter,
+                notice
+            ),
+            "{left:?}"
+        );
+        // NEGATIVE CONTROLS.
+        for (name, rows) in [
+            ("armed", screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)),
+            ("fired", screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED)),
+            (
+                "served",
+                screen(WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED),
+            ),
+            ("met again", screen(WALL_SESSION_AFTER_CANCEL_26_2_1_299)),
+        ] {
+            assert_eq!(left_wall(&rows), None, "{name}");
+        }
+        let cancel = cancelled
+            .iter()
+            .position(|r| r.starts_with("⏺ Automatic continue cancelled"))
+            .expect("the cancel row");
+        let mut local = cancelled.clone();
+        local.splice(
+            cancel + 1..cancel + 1,
+            ["", "❯ /usage", "  ⎿  Status dialog dismissed"].map(str::to_string),
+        );
+        let footer = local
+            .iter()
+            .position(|r| r.starts_with("  ⏵⏵ auto mode on"))
+            .expect("the footer");
+        local[footer] = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_string();
+        assert_eq!(left_wall(&local), None, "a local command after the cancel");
+        let mut no_reset = cancelled.clone();
+        no_reset[countdown] = "⏺ Usage limit reached · esc to cancel".to_string();
+        for r in &mut no_reset {
+            *r = r.replace("resets 3:50pm (America/Los_Angeles)", "limit reached");
+        }
+        assert_eq!(left_wall(&no_reset), None, "no reset named");
+        // A tool's output that quotes the notice and the cancel: with the
+        // model's reply after it, or as the last thing said (its rows no `⏺`
+        // row in column 0), it is no cancel of the vendor's.
+        let asked = cancelled
+            .iter()
+            .rposition(|r| r == "❯ carry on with the task")
+            .expect("the prompt the limit met");
+        let quoting = |reply: bool| {
+            let mut q = cancelled.clone();
+            let mut rows = vec![
+                "❯ read the notes",
+                "",
+                "⏺ Bash(cat notes.txt)",
+                "  ⎿  You've hit your session limit · resets 3:50pm (America/Los_Angeles)",
+                "     ⏺ Automatic continue cancelled · /rate-limit-options to re-arm",
+            ];
+            if reply {
+                rows.extend(["", "⏺ The notes quote a limit notice."]);
+            }
+            q.splice(asked..=cancel, rows.into_iter().map(str::to_string));
+            q
+        };
+        for reply in [true, false] {
+            let q = quoting(reply);
+            assert_eq!(
+                auto_continue_end(&q),
+                Some(AutoContinue::Unkept),
+                "the footer still says it"
+            );
+            assert_eq!(left_wall(&q), None, "quoted by a tool (reply {reply})");
+        }
+        let top = cancelled
+            .iter()
+            .rposition(|r| r.starts_with('─'))
+            .expect("rule");
+        assert_eq!(left_wall(&cancelled[..top]), None, "no composer");
+    }
+
+    /// A WALL'S LINE INK WRAPPED IN A NARROW PANE IS READ AS ONE (found live by
+    /// the 2026-10-09 sweep's reader review; measured on Claude Code 2.1.299
+    /// in the lab, 2026-10-14). In a pane narrower than one of its lines Ink
+    /// word-wraps the line onto the rows under it: the footer's banner
+    /// (`⚠ Usage limit reached · limit` over `resets 10:25am` at 34 columns,
+    /// `⚠ Usage limit reached` over `· limit resets 10:51am` at 26), its
+    /// countdown (`Continuing automatically at` over `10:25am · esc to
+    /// cancel`; `Continuing` alone at 26), the turn's `⎿` notice (`You've hit
+    /// your` over `session limit ·` at 26) and the cancel's `⏺` row (`⏺
+    /// Automatic` over `continue` over `cancelled · /rat`). Read a row at a
+    /// time, the banner named no reset — the harness waited on its 30-minute
+    /// backstop (`WAITING until=…17:50:32Z` for a 17:25:30Z reset) and, after
+    /// Esc on the countdown, typed `keep going` into the standing limit at
+    /// once — the countdown at 26 columns said nothing, the turn's notice was
+    /// no wall at all (`idle`: the continue policy typed `keep going` into it
+    /// every back-off), and the cancel no word of the vendor's.
+    #[test]
+    fn a_walls_line_ink_wrapped_is_read_as_one() {
+        use crate::prompt::fixtures::{
+            WALL_SESSION_AFTER_CANCEL_26_2_1_299, WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299,
+            WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299,
+            WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299,
+        };
+        let footer = |text: &str, banner: &str, countdown: &str, reset: &str| {
+            let r = screen(text);
+            let w = wall(&r).expect("the wall");
+            assert_eq!(
+                (w.kind, w.placement),
+                (WallKind::UsageSession, Placement::Footer)
+            );
+            assert_eq!(w.message, format!("{banner} \u{2014} {countdown}"));
+            assert_eq!(w.reset.as_deref(), Some(reset));
+            assert_eq!(limit_notice(&r), Some((w.message, w.reset)));
+        };
+        footer(
+            WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299,
+            "⚠ Usage limit reached · limit resets 10:25am",
+            "Continuing automatically at 10:25am · esc to cancel",
+            "10:25am",
+        );
+        footer(
+            WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299,
+            "⚠ Usage limit reached · limit resets Oct 15 at 12:33pm",
+            "Continuing automatically at Oct 15 at 12:33pm · esc to cancel",
+            "Oct 15 at 12:33pm",
+        );
+        footer(
+            WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
+            "⚠ Usage limit reached · limit resets 10:51am",
+            "Continuing automatically at 10:51am · esc to cancel",
+            "10:51am",
+        );
+
+        // The turn's notice, the last thing said once the banner has gone.
+        let r = screen(WALL_SESSION_AFTER_CANCEL_26_2_1_299);
+        let w = wall(&r).expect("the turn's notice");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::UsageSession, Placement::Gutter)
+        );
+        assert_eq!(
+            w.message,
+            "You've hit your session limit · resets 10:51am (America/Los_Angeles) /upgrade to \
+             increase your usage limit."
+        );
+        assert_eq!(w.reset.as_deref(), Some("10:51am (America/Los_Angeles)"));
+        assert_eq!(
+            worker_phase(&r),
+            Phase::Limited {
+                message: w.message,
+                reset: w.reset,
+            }
+        );
+
+        // The cancel: no wall, and the vendor's word that it will not go on.
+        let r = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299);
+        assert_eq!(wall(&r), None);
+        assert_eq!(auto_continue_end(&r), Some(AutoContinue::Unkept));
+
+        // The transcript's own `⏺ Usage limit reached · continuing
+        // automatically at 10:25am · esc to cancel`, the last thing said above
+        // the composer (the footer's banner and countdown left out, as the
+        // footer is read first): four rows at 34 columns, two at 80, where it
+        // is read.
+        let mut r = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299);
+        let at = |r: &[String], opens: &str| r.iter().position(|x| x.starts_with(opens));
+        let banner = at(&r, "  ⚠ Usage limit").expect("the banner");
+        let mode = at(&r, "  ⏵⏵").expect("the mode line");
+        r.drain(banner..mode);
+        let w = wall(&r).expect("the transcript's notice");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::UsageSession, Placement::ErrorRow)
+        );
+        assert_eq!(
+            w.message,
+            "Usage limit reached · continuing automatically at 10:25am · esc to cancel"
+        );
+        assert_eq!(w.reset.as_deref(), Some("10:25am"));
+    }
+
+    /// The control: a line Ink wrapped where the reader always joined its
+    /// rows — the `⏺ API Error` row (`error_row_notice`), here a 529 over
+    /// eight rows of a 34-column pane, the done row's `AM` on a row of its own
+    /// under it.
+    #[test]
+    fn an_api_error_row_wrapped_in_a_narrow_pane_is_read_whole() {
+        let r = screen(crate::prompt::fixtures::API_ERROR_529_34_2_1_299);
+        let w = wall(&r).expect("the 529");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::Overloaded, Placement::ErrorRow)
+        );
+        assert!(
+            w.message
+                .starts_with("API Error: 529 Overloaded. This is a server-side issue,")
+                && w.message.ends_with("inference gateway (127.0.0.1:58931)."),
+            "{}",
+            w.message
+        );
+    }
+
+    /// EVERY NOTICE'S LINE RUNS ON OVER THE ROWS INK WRAPPED IT ONTO, in the
+    /// three places no capture shows a wrapped one in (the review of
+    /// fix/r15-banner, 2026-10-14: each join could be undone with every test
+    /// still green). HAND-PLACED, each a pane 26 or 34 columns wide:
+    /// * the `⎿` notice's rows Claude Code 2.1.300 drew at 34 columns in UTC
+    ///   while its own continue was armed (the lab, 2026-10-14: `⎿  You've
+    ///   hit your session limit` over `· resets 8:15pm (UTC)`), here the last
+    ///   thing said. Its last row opens with `·`, which reads as a status row,
+    ///   so the last thing said ends on the row above it: the notice's line
+    ///   runs on past it, or the reset is lost;
+    /// * the footer's notification `Automatic continue cancelled ·
+    ///   /rate-limit-options to re-arm`, wrapped as the banner and its
+    ///   countdown wrap there (the measured one is cut instead, `Automatic
+    ///   continue ca…`, and the transcript's own row says it);
+    /// * the usage banner above the composer, wrapped as the footer's is at
+    ///   26 columns (`⚠ Usage limit reached` over `· limit resets 10:51am`;
+    ///   2.1.295 and later draw it in the footer, where it is measured).
+    #[test]
+    fn every_notices_line_runs_on_over_its_wrapped_rows() {
+        let framed_at = |width: usize, body: &[&str], footer: &[&str]| {
+            let rule = "─".repeat(width);
+            let mut r = rows(body);
+            r.extend([rule.clone(), "❯".to_string(), rule]);
+            r.extend(rows(footer));
+            r
+        };
+        let r = framed_at(
+            34,
+            &[
+                "❯ carry on with the task",
+                "  ⎿  You've hit your session limit",
+                "     · resets 8:15pm (UTC)",
+                "",
+                "✻ Cogitated for 0s · done 8:05 PM",
+                "",
+            ],
+            &["  ⏵⏵ auto mode on (shift+tab to"],
+        );
+        let w = wall(&r).expect("the turn's notice");
+        assert_eq!(
+            (w.kind, w.placement, w.reset.as_deref()),
+            (
+                WallKind::UsageSession,
+                Placement::Gutter,
+                Some("8:15pm (UTC)")
+            )
+        );
+        assert_eq!(
+            limit_notice(&r),
+            Some((
+                "You've hit your session limit · resets 8:15pm (UTC)".to_string(),
+                Some("8:15pm (UTC)".to_string())
+            ))
+        );
+
+        let r = framed_at(
+            26,
+            &[
+                "❯ carry on with the task",
+                "  ⎿  You've hit your",
+                "     session limit ·",
+                "     resets 10:51am",
+                "     (America/Los_Angeles)",
+                "",
+                "✻ Worked for 0s · done",
+                "  10:36 AM",
+                "",
+            ],
+            &[
+                "  ⏵⏵ auto mode on      ·",
+                "  Automatic continue",
+                "  cancelled ·",
+                "  /rate-limit-options to",
+                "  re-arm",
+            ],
+        );
+        assert_eq!(auto_continue_end(&r), Some(AutoContinue::Unkept));
+
+        let r = framed_at(
+            26,
+            &[
+                "❯ carry on with the task",
+                "",
+                "⏺ On it.",
+                "",
+                "  ⚠ Usage limit reached",
+                "  · limit resets 10:51am",
+                "",
+            ],
+            &["  ? for shortcuts"],
+        );
+        let w = wall(&r).expect("the banner");
+        assert_eq!(
+            (w.kind, w.placement, w.reset.as_deref()),
+            (WallKind::UsageSession, Placement::Banner, Some("10:51am"))
+        );
+        assert_eq!(w.message, "⚠ Usage limit reached · limit resets 10:51am");
+    }
+
+    /// `text` as Claude Code draws its error row or notice in a pane `width`
+    /// columns wide (2.1.300's `su` and `ig`: a column `columns - 10` cells
+    /// wide beside the `⏺`, Ink's greedy word wrap), the last thing said over
+    /// a composer `width` cells wide. Panics on a word wider than the column
+    /// (Ink would break it).
+    fn vendor_box(text: &str, width: usize) -> Vec<String> {
+        let room = width - 10;
+        let mut lines: Vec<String> = vec![String::new()];
+        for word in text.split(' ') {
+            let n = word.chars().count();
+            assert!(n <= room, "{word:?} is wider than {room} cells");
+            let line = lines.last_mut().expect("a line");
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.chars().count() + 1 + n <= room {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                lines.push(word.to_string());
+            }
+        }
+        let mut r = rows(&["❯ carry on with the task", ""]);
+        for (k, line) in lines.iter().enumerate() {
+            r.push(format!("{}{line}", if k == 0 { "⏺ " } else { "  " }));
+        }
+        r.push(String::new());
+        let rule = "─".repeat(width);
+        r.extend([
+            rule.clone(),
+            "❯".to_string(),
+            rule,
+            "  ? for shortcuts".to_string(),
+        ]);
+        r
+    }
+
+    /// THE WORKER'S PROSE IS NO ERROR ROW, IN A PANE OF ANY WIDTH (the review
+    /// of fix/r15-banner, 2026-10-14; measured on Claude Code 2.1.300 in the
+    /// lab). The vendor's error row and notices are drawn in a column ten
+    /// columns short of the pane (2.1.300's `su` and `ig`), the worker's reply
+    /// to the pane's edge; and at 80 columns or wider a `<notice> · <remedy>`
+    /// row is the vendor's only in at most three rows (`phase`'s
+    /// `ERROR_ROWS`).
+    /// The narrow-pane bound counted the rows a message would take at 80
+    /// columns as its cells over 70, its rows joined wherever a row was too
+    /// full for the next word in the vendor's column, and it applied at 80
+    /// columns too: the worker's reply `Usage limit reached · pausing.` and
+    /// three more hard lines at 34 columns, and its one paragraph over four
+    /// rows at 80, read as the usage wall (`limited`, where main read both
+    /// idle). NEGATIVE CONTROL: the vendor's own notice, drawn in its column,
+    /// is its wall at every width, and a text as long as that paragraph drawn
+    /// in the vendor's column is no wall at any width under 80, as it is none
+    /// at 80 (four rows there by Ink's greedy wrap, three by cells over 70).
+    #[test]
+    fn the_workers_prose_is_no_error_row_in_a_pane_of_any_width() {
+        use crate::prompt::fixtures::{PROSE_LIMIT_WORDS_34_2_1_300, PROSE_LIMIT_WORDS_80_2_1_300};
+        for (label, text) in [
+            ("34 columns", PROSE_LIMIT_WORDS_34_2_1_300),
+            ("80 columns", PROSE_LIMIT_WORDS_80_2_1_300),
+        ] {
+            let r = screen(text);
+            assert_eq!(wall(&r), None, "{label}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{label}");
+        }
+        // HAND-BUILT: four hard lines at 80 columns, the first and the third
+        // a word short of the 70 cells of the vendor's column there. Counted
+        // as that column's lines re-wrapped, they take two rows; at 80
+        // columns and wider the rows themselves are counted, as on main.
+        let rule = "─".repeat(80);
+        let mut r = rows(&[
+            "❯ status?",
+            "",
+            "⏺ Usage limit reached · the parser is done and the lexer is next",
+            "  today.",
+            "  Then the migration, the docs and the review of every one of the",
+            "  notes.",
+            "",
+        ]);
+        r.extend([
+            rule.clone(),
+            "❯".to_string(),
+            rule,
+            "  ? for shortcuts".to_string(),
+        ]);
+        assert_eq!(wall(&r), None);
+        let notice = "Usage limit reached · continuing automatically at 10:25am · esc to cancel";
+        let long = "Usage limit reached · the next step edits the files named \
+                    crates/aterm-agent/src/supervise/limit.rs and then \
+                    crates/aterm-agent/src/supervise/run.rs and also \
+                    crates/aterm-phase/src/wall.rs.";
+        for width in [26, 34, 52, 60, 70, 79, 80] {
+            let w = wall(&vendor_box(notice, width)).expect("the vendor's notice");
+            assert_eq!(
+                (w.kind, w.placement, w.reset.as_deref()),
+                (WallKind::UsageSession, Placement::ErrorRow, Some("10:25am")),
+                "{width} columns"
+            );
+            if width >= 52 {
+                assert_eq!(wall(&vendor_box(long, width)), None, "{width} columns");
+            }
         }
     }
 

@@ -7,7 +7,8 @@
 //! on the chrome band's material ([`BandInks`]). The host maps the cells onto
 //! its own cell type.
 
-use super::{SlotKind, Tone, Words};
+use super::words::{cells, gap_before, text_presentation};
+use super::{Host, SlotKind, Tone, Words};
 use crate::MARGIN;
 use crate::ink::{BandInks, ForcedPalette, InkedCell, bg_is_light, ensure_contrast, forced_ink};
 
@@ -106,8 +107,24 @@ pub const fn text_cols(cols: usize) -> usize {
 /// hue for the two seconds after a settled turn. The trust glyph and `⚠` are
 /// text-presentation on purpose (a colour emoji would be two cells wide in
 /// one). Exactly `cols` cells; the row carries no closing seam of its own.
+///
+/// Each word is painted in the cells the host's grid lays it out in
+/// ([`Host::columns`], the measure the width law fits by): a wide glyph is
+/// its lead cell and a CONTINUATION ([`InkedCell::continuation`]), and a
+/// character the grid draws in the cell before it (a combining mark, a
+/// variation selector, the rest of a ZWJ sequence or a flag) takes no cell —
+/// the lead cell holds one character, so it is drawn nowhere on the glass,
+/// while the row's words (`chrome`, the a11y sentence) keep it (ruling
+/// 2026-10-11, round fifteen content-6: a host row carries no combining or
+/// cluster lane). A wide glyph that would straddle the row's end is not
+/// painted at all, never halved.
 #[must_use]
-pub fn paint_row(words: &Words, cols: usize, c: &BandInks, p: &PresenceTones) -> Vec<InkedCell> {
+pub fn paint_row<V: Host>(
+    words: &Words,
+    cols: usize,
+    c: &BandInks,
+    p: &PresenceTones,
+) -> Vec<InkedCell> {
     let mut row = vec![
         InkedCell {
             ch: ' ',
@@ -115,15 +132,14 @@ pub fn paint_row(words: &Words, cols: usize, c: &BandInks, p: &PresenceTones) ->
             bg: c.bar_bg,
             bold: false,
             text_presentation: false,
+            continuation: false,
         };
         cols
     ];
-    let pieces = words.pieces(text_cols(cols));
+    let pieces = words.pieces::<V>(text_cols(cols));
     let mut col = MARGIN;
     for (i, (kind, text)) in pieces.iter().enumerate() {
-        if i > 0 {
-            col += if *kind == SlotKind::Since { 1 } else { 2 };
-        }
+        col += gap_before(i, *kind);
         let (ink, bold) = match kind {
             SlotKind::Role => (c.value, true),
             SlotKind::Phase => match words.tone {
@@ -159,26 +175,31 @@ pub fn paint_row(words: &Words, cols: usize, c: &BandInks, p: &PresenceTones) ->
                 }
             }
         };
-        for (k, ch) in text.chars().enumerate() {
-            let Some(cell) = row.get_mut(col + k) else {
-                break;
-            };
-            *cell = InkedCell {
-                ch,
-                fg: ink,
-                bg: c.bar_bg,
-                bold,
-                // The glyphs that have an emoji form are pinned to one cell —
-                // the fleet lock included: U+1F512 is emoji-presentation by
-                // default, and a renderer would take its colour face two
-                // cells wide otherwise.
-                text_presentation: matches!(
-                    ch,
-                    '\u{2713}' | '\u{2717}' | '\u{26a0}' | '\u{2709}' | '\u{2715}' | '\u{1f512}'
-                ),
-            };
+        for cell in cells::<V>(text) {
+            if let Some([lead, rest @ ..]) = row.get_mut(col..col + cell.width) {
+                *lead = InkedCell {
+                    ch: cell.ch,
+                    fg: ink,
+                    bg: c.bar_bg,
+                    bold,
+                    // The glyphs that have an emoji form are pinned to one
+                    // cell ([`text_presentation`]).
+                    text_presentation: text_presentation(cell.ch),
+                    continuation: false,
+                };
+                for k in rest {
+                    *k = InkedCell {
+                        ch: ' ',
+                        fg: ink,
+                        bg: c.bar_bg,
+                        bold,
+                        text_presentation: false,
+                        continuation: true,
+                    };
+                }
+            }
+            col += cell.width;
         }
-        col += text.chars().count();
     }
     row
 }

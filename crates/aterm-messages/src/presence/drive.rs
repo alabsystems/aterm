@@ -916,11 +916,11 @@ pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
 /// side, [`text_cols`], so the wire never reports a slot the human cannot
 /// see) — empty with no row — and the rim's name.
 #[must_use]
-pub fn report(v: &View, cols: usize) -> (String, &'static str) {
+pub fn report<V: Host>(v: &View, cols: usize) -> (String, &'static str) {
     let line = v
         .words
         .as_ref()
-        .map(|w| w.fit(text_cols(cols)))
+        .map(|w| w.fit::<V>(text_cols(cols)))
         .unwrap_or_default();
     (line, v.rim.wire())
 }
@@ -952,7 +952,7 @@ pub fn chrome_line<D: Desk>(d: &D, front: Option<D::Win>, cols: usize) -> String
     // a handoff's freeze, a window one row tall — is not on the glass, so the
     // line prints it empty and says why it waits (`held=`).
     let drawn = view.filter(|v| v.rows > 0);
-    let (band, _) = drawn.map(|v| report(v, cols)).unwrap_or_default();
+    let (band, _) = drawn.map(|v| report::<D::V>(v, cols)).unwrap_or_default();
     let rim = view.map(|v| v.rim.wire()).unwrap_or_default();
     let level = view.map_or(Level::Quiet, |v| v.level).wire();
     let sentence = drawn

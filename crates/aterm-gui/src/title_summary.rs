@@ -1916,7 +1916,7 @@ impl App {
     }
 
     /// [`Self::next_title_summary_retry`] read at `now`.
-    fn next_title_summary_retry_at(&self, now: Instant) -> Option<Instant> {
+    pub(crate) fn next_title_summary_retry_at(&self, now: Instant) -> Option<Instant> {
         let scheduled = self.title_summaries.next_retry();
         let missing = smart_titles_enabled(&self.config)
             && self
@@ -3441,6 +3441,357 @@ mod tests {
         assert!(allowed.managed_process.is_none());
         assert!(ollama.ensure(&make_job(false), &authority).is_err());
         drop(listener);
+    }
+
+    /// A one-answer HTTP stand-in on `listener` (127.0.0.1): it reads one whole
+    /// request, answers `status_line` with the JSON `body`, and hands back the
+    /// request it read. A connection that sends nothing (`ensure`'s bare
+    /// reachability probe) is skipped. A read waits at most a minute: a hang
+    /// detector.
+    fn answer_once(
+        listener: std::net::TcpListener,
+        status_line: &'static str,
+        body: String,
+    ) -> mpsc::Receiver<Vec<u8>> {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for accepted in listener.incoming() {
+                let Ok(mut stream) = accepted else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                if request.is_empty() {
+                    continue;
+                }
+                let answer = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+                let _ = seen_tx.send(request);
+                return;
+            }
+        });
+        seen_rx
+    }
+
+    /// A consented (`allow_remote`) job for `provider` at the configured
+    /// `endpoint`, and the authority it was minted under. Direct, so the
+    /// runner's proxy environment never decides what a test dials.
+    fn configured_http_job(
+        provider: TitleSummaryProvider,
+        endpoint: &str,
+    ) -> (Job, Arc<AtomicU64>) {
+        let authority_epoch = 31;
+        let config = Config {
+            title_summary_provider: Some(provider),
+            title_summary_endpoint: Some(endpoint.to_string()),
+            title_summary_allow_remote: Some(true),
+            title_summary_proxy_mode: Some(TitleSummaryProxyMode::Direct),
+            title_summary_timeout_seconds: Some(60),
+            ..Config::default()
+        };
+        let job = Job {
+            session: 1,
+            session_epoch: 1,
+            session_authority: Arc::new(AtomicU64::new(1)),
+            generation: 1,
+            authority_epoch,
+            config_fingerprint: config_fingerprint(&config),
+            settings: provider_settings(&config).unwrap(),
+            snapshot: snap("cargo test", ActivityState::Executing, None),
+        };
+        (job, Arc::new(AtomicU64::new(authority_epoch)))
+    }
+
+    /// The worker's request for `job`, through `clients`, with no managed daemon.
+    fn summarize_with(
+        job: &Job,
+        authority: &Arc<AtomicU64>,
+        clients: &mut WorkerClientCache,
+    ) -> Result<String, String> {
+        let controller = ManagedOllamaController::new(Some(job.authority_epoch));
+        let mut ollama = ManagedOllama::new(controller);
+        let result =
+            request_summary(job, authority, &mut ollama, clients).map(|outcome| outcome.activity);
+        ollama.stop();
+        result
+    }
+
+    /// One answer at a fresh 127.0.0.1 endpoint `path`, summarized as `provider`.
+    fn summarize_answer(
+        provider: TitleSummaryProvider,
+        path: &str,
+        status_line: &'static str,
+        body: &str,
+    ) -> Result<String, String> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
+        let _seen = answer_once(listener, status_line, body.to_string());
+        let (job, authority) = configured_http_job(provider, &endpoint);
+        summarize_with(&job, &authority, &mut WorkerClientCache::default())
+    }
+
+    /// NET-2 (2026-10-10). `aterm_http` returns every final status as `Ok`, and
+    /// the summary request used to read any answer's body as a completion: a
+    /// bad token (401), a rate limit (429) or Ollama's out-of-memory (500) read
+    /// as "response did not contain message content", and a 503 whose body
+    /// held a well-formed completion was ADOPTED as the title. A refused answer
+    /// is an error naming its status and a bounded, sanitized excerpt of the
+    /// provider's own `error` field, and never a summary.
+    #[test]
+    fn a_refused_provider_answer_names_its_status_and_is_never_a_summary() {
+        use TitleSummaryProvider::{Ollama, OpenAiCompatible};
+        const OPENAI: &str = "/v1/chat/completions";
+        const OLLAMA: &str = "/api/chat";
+        let completion = r#"{"choices":[{"message":{"content":"{\"description\":\"Running the unit tests\"}"}}]}"#;
+        let oom = r#"{"error":"model requires more system memory (12.0 GiB) than is available (3.1 GiB)"}"#;
+        // An excerpt reaches the log and Settings as one bounded line: control
+        // and bidi characters go, and it stops at 160 characters.
+        let hostile = format!(
+            r#"{{"error":"slow\u001b[31m down\u202e\r\nnow {}"}}"#,
+            "x".repeat(400)
+        );
+        let bounded = format!(
+            "provider answered HTTP 400: slow[31m downnow {}",
+            "x".repeat(160 - "slow[31m downnow ".chars().count())
+        );
+        // The privacy check reads the WHOLE message, as written and as the one
+        // line it becomes, before the cut (review of NET-2, 2026-10-10): an
+        // echoed token that straddles the 160th character, too short on the
+        // near side of the cut to look like a credential, is withheld, never
+        // shown as its head ...
+        let token = concat!(
+            // Split, as this file's other credential fixtures are, so the
+            // export's secret scanners do not take it for a committed one.
+            "Qx7fK2mZp9LwT4vB8nR1sY6hD3jG5cA0",
+            "eU2iO8kM4qW7zX1yV9bN3tF6gH0lP5rS"
+        );
+        let lead: String = "Request rejected by upstream gateway because the presented \
+                            credential was not recognised for this deployment; please check \
+                            configuration now"
+            .chars()
+            .take(130)
+            .collect();
+        let straddling = format!(r#"{{"error":{{"message":"{lead} {token}"}}}}"#);
+        // ... and a key on a line of its own is checked as that line holds it,
+        // not only as the stripped excerpt glues it to the word before.
+        let glued = concat!(r#"{"error":"unknown key id\nAKIA"#, r#"IOSFODNN7EXAMPLE"}"#);
+        let withheld = || -> Result<String, String> {
+            Err("provider answered HTTP 401: [redacted potentially sensitive line]".into())
+        };
+        let cases: [(_, _, _, &str, Result<String, String>); 9] = [
+            // Control: a 2xx completion is read as before.
+            (OpenAiCompatible, OPENAI, "200 OK", completion, Ok("Running the unit tests".into())),
+            // The excerpt passes the one privacy boundary terminal context
+            // does: an answer that mentions or echoes a credential is
+            // withheld, and the status still names the refusal.
+            (
+                OpenAiCompatible,
+                OPENAI,
+                "401 Unauthorized",
+                r#"{"error":{"message":"Incorrect API key provided: sk-proj-****abcd. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+                withheld(),
+            ),
+            (OpenAiCompatible, OPENAI, "401 Unauthorized", &straddling, withheld()),
+            (Ollama, OLLAMA, "401 Unauthorized", glued, withheld()),
+            // Explicit loopback Ollama, consented: the unattested-loopback lane.
+            (
+                Ollama,
+                OLLAMA,
+                "500 Internal Server Error",
+                oom,
+                Err("provider answered HTTP 500: model requires more system memory (12.0 GiB) than is available (3.1 GiB)".into()),
+            ),
+            (
+                OpenAiCompatible,
+                OPENAI,
+                "429 Too Many Requests",
+                r#"{"error":{"message":"Rate limit reached for requests","type":"requests","code":"rate_limit_exceeded"}}"#,
+                Err("provider answered HTTP 429: Rate limit reached for requests".into()),
+            ),
+            // A refused answer's body is never adopted, however well-formed.
+            (
+                OpenAiCompatible,
+                OPENAI,
+                "503 Service Unavailable",
+                completion,
+                Err("provider answered HTTP 503".into()),
+            ),
+            // A body that is not the provider's JSON adds no excerpt.
+            (
+                OpenAiCompatible,
+                OPENAI,
+                "502 Bad Gateway",
+                "<html><body>502 Bad Gateway</body></html>",
+                Err("provider answered HTTP 502".into()),
+            ),
+            (Ollama, OLLAMA, "400 Bad Request", &hostile, Err(bounded)),
+        ];
+        let (observed, expected): (Vec<_>, Vec<_>) = cases
+            .into_iter()
+            .map(|(provider, path, status, body, expected)| {
+                let observed = summarize_answer(provider, path, status, body);
+                ((status, observed), (status, expected))
+            })
+            .unzip();
+        assert_eq!(observed, expected);
+    }
+
+    /// A stand-in for the system resolver, behind the connector seam: every
+    /// name it is asked resolves to 192.0.2.1 (TEST-NET-1, RFC 5737), the
+    /// answer a hostile network resolver gives. It records each name and dials
+    /// nothing.
+    #[derive(Debug, Default)]
+    struct HostileResolver {
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl aterm_http::Connect for HostileResolver {
+        fn connect(
+            &self,
+            host: &str,
+            port: u16,
+            _deadline: aterm_http::Deadline,
+        ) -> std::io::Result<std::net::TcpStream> {
+            self.asked.lock().unwrap().push(format!("{host}:{port}"));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("{host} resolved to 192.0.2.1:{port}, which this stand-in never dials"),
+            ))
+        }
+    }
+
+    /// NET-3 (2026-10-10). The locality policy calls an endpoint loopback by
+    /// its NAME (`localhost`, `*.localhost`), and that drops the HTTPS
+    /// requirement and the proxy; the unmanaged transports then dialed
+    /// whatever the system resolver answered for the name, so a resolver that
+    /// answered elsewhere received terminal context and the bearer token in
+    /// plaintext. A loopback-classified endpoint is dialed at the loopback
+    /// address the policy computed, and the resolver is never asked.
+    #[test]
+    fn a_loopback_classified_name_is_dialed_at_loopback_whatever_it_resolves_to() {
+        let completion = r#"{"choices":[{"message":{"content":"{\"description\":\"Running the unit tests\"}"}}]}"#;
+        let resolver = Arc::new(HostileResolver::default());
+        let mut clients = WorkerClientCache::with_resolver(resolver.clone());
+        let mut summarize = |endpoint: &str| {
+            let (job, authority) =
+                configured_http_job(TitleSummaryProvider::OpenAiCompatible, endpoint);
+            summarize_with(&job, &authority, &mut clients)
+        };
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = answer_once(listener, "200 OK", completion.to_string());
+        let endpoint = format!("http://evil.localhost:{port}/v1/chat/completions");
+        let summary = summarize(&endpoint);
+        let asked = std::mem::take(&mut *resolver.asked.lock().unwrap());
+        assert_eq!(
+            (summary, asked),
+            (Ok("Running the unit tests".to_string()), Vec::new()),
+            "{endpoint} is dialed at 127.0.0.1:{port}, never at what its name resolves to"
+        );
+        let request = seen.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&request).contains(&format!("Host: evil.localhost:{port}\r\n")),
+            "the request still names the endpoint's host"
+        );
+
+        // A NAME is pinned to both loopback addresses RFC 6761 gives it, IPv4
+        // first: a local server that listens on `::1` alone still answers.
+        match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            Ok(listener) => {
+                let port = listener.local_addr().unwrap().port();
+                // Nothing may answer on 127.0.0.1 at this port, or the IPv4
+                // attempt would reach it first.
+                drop(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap());
+                let _seen = answer_once(listener, "200 OK", completion.to_string());
+                let endpoint = format!("http://localhost:{port}/v1/chat/completions");
+                let summary = summarize(&endpoint);
+                let asked = std::mem::take(&mut *resolver.asked.lock().unwrap());
+                assert_eq!(
+                    (summary, asked),
+                    (Ok("Running the unit tests".to_string()), Vec::new()),
+                    "{endpoint} falls back to [::1]:{port}"
+                );
+            }
+            Err(error) => eprintln!("IPv6 loopback NOT RUN: this host has no ::1 ({error})"),
+        }
+
+        // Negative control: the seam is live. A remote name is still the
+        // resolver's to answer.
+        let summary = summarize("https://models.example.test/v1/chat/completions");
+        let asked = std::mem::take(&mut *resolver.asked.lock().unwrap());
+        assert!(summary.is_err(), "{summary:?}");
+        assert_eq!(asked, vec!["models.example.test:443".to_string()]);
+    }
+
+    /// NET-2 (2026-10-10). The managed warm-up exists to load and pin the
+    /// verified weights with non-terminal data, and it took ANY JSON answer as
+    /// that load: Ollama's 500 (the model failed to load) passed, the daemon
+    /// was kept, and the first terminal-bearing request became the load. A
+    /// refused warm-up is a failure, which stops the daemon.
+    #[test]
+    fn a_refused_managed_warm_up_is_a_failure() {
+        let warm_up = |status_line: &'static str, body: &'static str| {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let endpoint = format!("http://{}/api/chat", listener.local_addr().unwrap());
+            let seen = answer_once(listener, status_line, body.to_string());
+            let client = aterm_http::Client::new(
+                aterm_http::Trust::PlatformVerifier,
+                aterm_http::ProxyMode::Direct,
+                Duration::from_secs(60),
+            );
+            let result = send_warm_up(
+                &client,
+                &endpoint,
+                "qwen3.5:4b",
+                test_request_write_authority(),
+            );
+            let request = seen.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&request).contains("cargo test"),
+                "the warm-up carries no terminal context"
+            );
+            result
+        };
+        assert_eq!(
+            warm_up(
+                "200 OK",
+                r#"{"message":{"role":"assistant","content":"READY"},"done":true}"#
+            ),
+            Ok(()),
+            "control: a loaded model's answer warms"
+        );
+        assert_eq!(
+            warm_up(
+                "500 Internal Server Error",
+                r#"{"error":"model requires more system memory (12.0 GiB) than is available (3.1 GiB)"}"#,
+            ),
+            Err(
+                "managed model warm-up failed: provider answered HTTP 500: model requires more system memory (12.0 GiB) than is available (3.1 GiB)"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

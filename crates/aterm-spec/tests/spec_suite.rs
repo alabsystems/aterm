@@ -90,6 +90,7 @@ mod derived_launched_dial_wait;
 mod derived_main_stall_refusal;
 mod derived_metal_drawable_acquire_ty;
 mod derived_native_leaf_cache;
+mod derived_net_slot_displacement;
 mod derived_output_echo_ty;
 mod derived_output_retention;
 mod derived_paste_order_ty;

@@ -1,0 +1,26 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the usage-limit options dialog at a WEEKLY limit with the default settings (`autoContinueAtUsageLimit` on: Claude Code arms its own wait without the dialog only for a reset under 24 h, so a reset 26 h out opens it): `lab.sh limit TAG seven_day 93600`, the dated wait row second; above it the five-hour wall of the turn before, its dialog cancelled with Esc
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.yhp3/proj
+
+
+❯ carry on with the task
+  ⎿  You've hit your session limit · resets 12:23pm (America/Los_Angeles)
+
+✻ Cogitated for 0s · done 12:18 PM
+
+❯ carry on with the task
+  ⎿  You've hit your weekly limit · resets Oct 10 at 2:19pm (America/Los_Angeles)
+
+✻ Cooked for 0s · done 12:19 PM
+
+❯ /rate-limit-options
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at Oct 10 at 2:19pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc to cancel

@@ -24,10 +24,11 @@
 // (e.g. `aterm-wasm`'s `resize`, aterm-gui's `cross_resize`). Such a resize
 // stages rows into `lazy_buffer` with no PTY scroll-off: the height-shrink
 // front/back ring pushes in `adjust_row_count`, the viewport overflow in
-// `finalize_reflow` (ungated, so it can fire in the resize that opens the
-// window), and the rewrapped-ring overflow in `prepend_ring_scrollback_lines`
-// (only inside a window). Adding a resize step is a model change that must be
-// made together with the `StagedWithinProduced` note below.
+// `finalize_reflow`, and the rewrapped-ring overflow in
+// `prepend_ring_scrollback_lines` (only inside a window, which the opening
+// resize already is: the window opens with the store out, before it). Adding a
+// resize step is a model change that must be made together with the
+// `StagedWithinProduced` note below.
 //
 // Invariants:
 //   NoLoss            on a clean Reattach or replacement-backed Abort, every

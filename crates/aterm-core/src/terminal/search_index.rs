@@ -42,6 +42,7 @@
 use aterm_types::text_shaping::AmbiguousWidth;
 
 use super::Terminal;
+use super::search_rows::history_row_for_search;
 use crate::search::{DEFAULT_MAX_CACHED_LINES, TerminalSearch};
 
 /// A cached search index plus the cache key it was built for (see
@@ -236,7 +237,6 @@ impl Terminal {
         // Replace + Append: re-feed from the older of the two visible bases.
         // `SearchIndex::index_line` skips unchanged rows cheaply.
         let refresh_start = cached.visible_base.min(visible_base).max(hist_base);
-        use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
         if refresh_start < visible_base {
             let start_hist = refresh_start.saturating_sub(hist_base);
             let count = visible_base.saturating_sub(refresh_start);
@@ -249,21 +249,16 @@ impl Terminal {
                 .history_lines_from(start_hist)
                 .chain(std::iter::repeat_with(|| None))
                 .take(count);
-            index.index_numbered_content_owned(lines.enumerate().map(|(j, line)| {
-                let absolute_row = refresh_start.saturating_add(j);
-                let text = line
-                    .map(|l| {
-                        line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
-                    })
-                    .unwrap_or_default();
-                (absolute_row, text)
+            index.index_numbered_cells_owned(lines.enumerate().map(|(j, line)| {
+                let (text, cells) =
+                    history_row_for_search(&self.grid, start_hist.saturating_add(j), line);
+                (refresh_start.saturating_add(j), text, cells)
             }));
         }
         let rows = self.rows();
-        index.index_numbered_content_owned((0..rows).map(|r| {
-            let absolute_row = visible_base.saturating_add(usize::from(r));
-            let text = self.written_line_text(i32::from(r)).unwrap_or_default();
-            (absolute_row, text)
+        index.index_numbered_cells_owned((0..rows).map(|r| {
+            let (text, cells) = self.written_line_cells(i32::from(r)).unwrap_or_default();
+            (visible_base.saturating_add(usize::from(r)), text, cells)
         }));
         Some(index)
     }
@@ -289,32 +284,28 @@ impl Terminal {
         // whole scrollback text is never resident twice. The walk borrows the
         // grid immutably, so nothing can change mid-build. The `legacy_results`
         // oracle keeps the per-line collect form and checks equality.
-        use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
+        //
+        // Every row comes with the cells its text was read from
+        // (`search_rows`), so a match is reported in the cells that hold it.
         let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
         let history = grid
             .history_lines_from(0)
             .chain(std::iter::repeat_with(|| None))
             .take(scrollback);
-        search.index_numbered_content_owned(history.enumerate().map(|(i, line)| {
-            let absolute_row = hist_base.saturating_add(i);
-            let text = line
-                .map(|l| {
-                    line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
-                })
-                .unwrap_or_default();
-            (absolute_row, text)
+        search.index_numbered_cells_owned(history.enumerate().map(|(i, line)| {
+            let (text, cells) = history_row_for_search(grid, i, line);
+            (hist_base.saturating_add(i), text, cells)
         }));
 
         // Visible rows 0..rows at absolute oldest + scrollback + r, via the
-        // combining-aware `written_line_text` so accents and ZWJ clusters
+        // combining-aware `written_line_cells` so accents and ZWJ clusters
         // survive. Read as written, trailing blanks kept, as each history line
         // stores its row: a row's matches must not change when it scrolls off
         // (`foo$`, a query ending in spaces). Streamed like the history.
         let vis_base = hist_base.saturating_add(scrollback);
-        search.index_numbered_content_owned((0..rows).map(|r| {
-            let absolute_row = vis_base.saturating_add(usize::from(r));
-            let text = self.written_line_text(i32::from(r)).unwrap_or_default();
-            (absolute_row, text)
+        search.index_numbered_cells_owned((0..rows).map(|r| {
+            let (text, cells) = self.written_line_cells(i32::from(r)).unwrap_or_default();
+            (vis_base.saturating_add(usize::from(r)), text, cells)
         }));
 
         search
@@ -367,20 +358,29 @@ pub(crate) mod tests {
         let scrollback = grid.scrollback_lines();
         let rows = t.rows() as usize;
         let mut search = TerminalSearch::new().with_ambiguous_width(t.ambiguous_width());
-        let history: Vec<String> = (0..scrollback)
+        let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
+        let history: Vec<_> = (0..scrollback)
             .map(|i| {
-                grid.get_history_line(i)
-                    .map(|l| l.to_string())
-                    .unwrap_or_default()
+                let (text, cells) = grid
+                    .get_history_line(i)
+                    .map(|l| {
+                        let text = l.to_string();
+                        let cells = super::super::history_line_text_cells(grid, i, &l, &text);
+                        (text, cells)
+                    })
+                    .unwrap_or_default();
+                (hist_base + i, text, cells)
             })
             .collect();
-        let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-        search.index_visible_content(hist_base, &history);
-        let visible: Vec<String> = (0..rows)
-            .map(|r| t.written_line_text(r as i32).unwrap_or_default())
-            .collect();
+        search.index_numbered_cells_owned(history);
         let vis_base = hist_base.saturating_add(scrollback);
-        search.index_visible_content(vis_base, &visible);
+        let visible: Vec<_> = (0..rows)
+            .map(|r| {
+                let (text, cells) = t.written_line_cells(r as i32).unwrap_or_default();
+                (vis_base + r, text, cells)
+            })
+            .collect();
+        search.index_numbered_cells_owned(visible);
         let res = search
             .search_results_opts(pat, false, false)
             .expect("search ok");
@@ -442,6 +442,53 @@ pub(crate) mod tests {
         // The corrupt block's placeholder rows sit between the two needles.
         assert_eq!(got[0].0, oldest + 2);
         assert_eq!(got[1].0, oldest + 38 + corrupt);
+    }
+
+    /// R15 content-1: absolute rows only grow, and a tab's numbering survives
+    /// live upgrades, so a long-lived tab passes row `u32::MAX`. Find must
+    /// keep answering there — the full build, the incremental refresh after
+    /// more output, regex and literal — at the rows the terminal numbers.
+    #[test]
+    fn find_keeps_working_once_absolute_rows_pass_u32_max() {
+        for start in [(1u64 << 32) - 30, (1u64 << 32) + 10] {
+            let mut t = Terminal::new(6, 40);
+            t.grid_mut().continue_absolute_numbering(start);
+            for i in 0..40 {
+                t.process(format!("filler {i}\r\n").as_bytes());
+            }
+            t.process(b"hello world\r\n");
+            let first = cached_results(&mut t, "hello");
+            assert_eq!(first, legacy_results(&t, "hello"), "start={start}");
+            assert_eq!(first.len(), 1, "start={start}: {first:?}");
+            let row = first[0].0;
+            assert!(row as u64 >= start, "start={start}: row {row} is absolute");
+            let regex = t
+                .indexed_search()
+                .search_results_opts("hel+o", false, true)
+                .expect("valid regex");
+            assert_eq!(
+                regex.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
+                vec![row],
+                "start={start}"
+            );
+
+            let refreshes = t.search_index_refreshes();
+            for i in 0..10 {
+                t.process(format!("more {i}\r\n").as_bytes());
+            }
+            t.process(b"hello again\r\n");
+            let second = cached_results(&mut t, "hello");
+            assert!(
+                t.search_index_refreshes() > refreshes,
+                "the incremental refresh served it"
+            );
+            assert_eq!(second, legacy_results(&t, "hello"), "start={start}");
+            assert_eq!(second.len(), 2, "start={start}: {second:?}");
+            assert_eq!(
+                second[0].0, row,
+                "start={start}: the first hit kept its row"
+            );
+        }
     }
 
     pub(crate) fn cached_results(t: &mut Terminal, pat: &str) -> Vec<(usize, usize, usize)> {
@@ -533,6 +580,279 @@ pub(crate) mod tests {
         assert_eq!(t.abs_row_text(0).as_deref(), Some("foo   "), "the snippet");
     }
 
+    /// Where the grid paints `needle`'s first character on visible `row`.
+    fn painted_col(t: &Terminal, row: usize, needle: char) -> Option<usize> {
+        let cols = usize::from(t.cols());
+        (0..cols).find(|&col| {
+            t.cell_grapheme(row, col).as_deref() == Some(needle.encode_utf8(&mut [0; 4]))
+        })
+    }
+
+    /// R15 content-5: the grid folds a character into the cell before it
+    /// only when that cell is the one before the cursor as it arrives, so
+    /// cells written out of order, or brought together by a delete-character,
+    /// stay apart where a walk of the row's text joins them. Find reports a
+    /// match in the cells that hold it: on each row `XYZ` is found where the
+    /// grid paints it, by the cached index (full build and the refresh after
+    /// more output), the from-scratch oracle, the budgeted search, literal
+    /// and regex. On origin/main every case but the control reported it 1-2
+    /// cells left of where it is drawn.
+    #[test]
+    fn find_reports_matches_in_the_cells_the_grid_drew_them_in() {
+        let cases: &[(&str, &str)] = &[
+            // Control: written in order, the grid pairs the flag.
+            ("in order", "\u{1f1e6}\u{1f1e7}XYZ"),
+            (
+                "flag halves, right one first",
+                "\x1b[1;3H\u{1f1e7}\x1b[1;1H\u{1f1e6}\x1b[1;5HXYZ",
+            ),
+            (
+                "skin tone before its base",
+                "\x1b[1;3H\u{1f3fd}\x1b[1;1H\u{1f44d}\x1b[1;5HXYZ",
+            ),
+            (
+                "a cell ending in ZWJ, the next drawn first",
+                "\x1b[1;2H\u{e9}\x1b[1;1Ha\u{200d}\x1b[1;3HXYZ",
+            ),
+            (
+                "flag halves brought together by DCH",
+                "\u{1f1e6}q\u{1f1e7}XYZ\x1b[1;3H\x1b[P",
+            ),
+            (
+                "skin tone brought to its base by DCH",
+                "\u{1f44d}q\u{1f3fd}XYZ\x1b[1;3H\x1b[P",
+            ),
+            // VS15 narrows a wide glyph and empties its right half, which the
+            // row reads as a blank: a walk of that text counts the glyph's two
+            // columns AND the blank.
+            ("a wide glyph narrowed by VS15", "\u{231a}\u{fe0e}XYZ"),
+        ];
+        let budgeted = |t: &mut Terminal, pat: &str, regex: bool| -> Vec<(usize, usize, usize)> {
+            let step = t
+                .search_budgeted(pat, false, regex, None, 100)
+                .expect("budgeted search");
+            assert!(step.complete, "one step covers the fixture");
+            step.results
+                .matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for (label, input) in cases {
+            let mut t = Terminal::new(4, 20);
+            t.process(input.as_bytes());
+            let painted = painted_col(&t, 0, 'X').expect("X is painted");
+            let expected = vec![(0, painted, 3)];
+            let regex = t
+                .indexed_search()
+                .search_results_opts("X.Z", false, true)
+                .expect("regex search")
+                .matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect::<Vec<_>>();
+            let found = [
+                ("cached", cached_results(&mut t, "xyz")),
+                ("oracle", legacy_results(&t, "xyz")),
+                ("budgeted", budgeted(&mut t, "XYZ", false)),
+                ("regex", regex),
+                ("budgeted regex", budgeted(&mut t, "X.Z", true)),
+            ];
+            for (reader, got) in found {
+                if got != expected {
+                    wrong.push(format!(
+                        "{label} ({reader}): painted {expected:?}, found {got:?}"
+                    ));
+                }
+            }
+            // More output on the screen: the refresh re-reads the row.
+            let refreshes = t.search_index_refreshes();
+            t.process(b"\x1b[3;1Hmore");
+            let refreshed = cached_results(&mut t, "xyz");
+            assert!(
+                t.search_index_refreshes() > refreshes,
+                "{label}: a refresh served it"
+            );
+            if refreshed != expected {
+                wrong.push(format!(
+                    "{label} (refresh): painted {expected:?}, found {refreshed:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "find names cells the match is not drawn in:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// The same text with its cells moved under it: a redraw that writes the
+    /// flag halves apart, then in order, leaves the row's text unchanged and
+    /// its cells not, and the refreshed index follows the cells.
+    #[test]
+    fn a_redraw_that_moves_cells_under_the_same_text_moves_the_matches() {
+        let mut t = Terminal::new(4, 20);
+        t.process("\x1b[1;3H\u{1f1e7}\x1b[1;1H\u{1f1e6}\x1b[1;5HXYZ".as_bytes());
+        assert_eq!(cached_results(&mut t, "xyz"), vec![(0, 4, 3)]);
+        t.process("\x1b[1;1H\x1b[2K\u{1f1e6}\u{1f1e7}XYZ".as_bytes());
+        assert_eq!(
+            t.written_line_text(0).as_deref(),
+            Some("\u{1f1e6}\u{1f1e7}XYZ")
+        );
+        assert_eq!(
+            painted_col(&t, 0, 'X'),
+            Some(2),
+            "precondition: the pair folded"
+        );
+        assert_eq!(cached_results(&mut t, "xyz"), vec![(0, 2, 3)]);
+    }
+
+    /// R15 search-columns review: printable ASCII after a cell that ends in a
+    /// ZWJ. The live grid draws the `Q` of `❤️‍Qa` in a cell of its own, two
+    /// columns right of the emoji. Scrolled into history, the ring tier draws
+    /// the row from those cells and a row past the ring from its stored
+    /// `Line`: both must draw `Q` there, and find must report it there. The
+    /// lane's first cut read history columns from the `Line` walk, which
+    /// joined ASCII after a ZWJ, so find said column 0 on the ring tier where
+    /// the glass drew column 2; on origin/main a row past the ring drew `Q`
+    /// inside the emoji's cell.
+    #[test]
+    fn ascii_after_a_zwj_is_found_where_either_history_tier_draws_it() {
+        use aterm_grid::test_counters::take_ring_fast_materialize;
+        for (tier, ring) in [("ring tier", None), ("past the ring", Some(1))] {
+            let mut t = match ring {
+                None => Terminal::new(3, 12),
+                Some(ring) => Terminal::with_scrollback(
+                    3,
+                    12,
+                    ring,
+                    crate::scrollback::Scrollback::with_defaults(),
+                ),
+            };
+            t.process("\u{2764}\u{fe0f}\u{200d}Qa\r\nmore\r\n\r\n\r\n\r\n".as_bytes());
+            let oldest = t.grid().scrollback_lines() - 1;
+            let _ = take_ring_fast_materialize();
+            let _ = t.grid().materialize_scrollback_row_full(oldest, t.cols());
+            assert_eq!(
+                take_ring_fast_materialize(),
+                usize::from(ring.is_none()),
+                "precondition: the row is read from the {tier}"
+            );
+            t.scroll_to_top();
+            let painted: Vec<_> = (0..4)
+                .map(|col| t.display_cell_grapheme(0, col).expect("in range"))
+                .collect();
+            t.scroll_to_bottom();
+            assert_eq!(
+                painted,
+                ["\u{2764}\u{fe0f}\u{200d}", "", "Q", "a"],
+                "{tier}: the glass draws Q in a cell of its own"
+            );
+            assert_eq!(cached_results(&mut t, "q"), vec![(0, 2, 1)], "{tier}");
+            let step = t
+                .search_budgeted("Q", false, false, None, 100)
+                .expect("budgeted search");
+            assert!(step.complete, "one step covers the fixture");
+            let budgeted: Vec<_> = step
+                .results
+                .matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect();
+            assert_eq!(budgeted, vec![(0, 2, 1)], "{tier}: the budgeted search");
+        }
+    }
+
+    /// The shapes `find_reports_matches_in_the_cells_the_grid_drew_them_in`
+    /// writes, scrolled into history: find reports `XYZ` where either history
+    /// tier draws the row, by the cached index, the oracle and the budgeted
+    /// search. The ring tier draws a row from its own cells, which keep the
+    /// shapes apart; a row past the ring is drawn from its stored line, whose
+    /// walk joins them. Reading every history row's cells from that walk put
+    /// the ring tier's matches up to two cells left of where they are drawn
+    /// (r16 selection-stride review; the r15 lead `stored_line_cells` named).
+    #[test]
+    fn find_reports_matches_where_either_history_tier_draws_them() {
+        use aterm_grid::test_counters::take_ring_fast_materialize;
+        let cases: &[(&str, &str)] = &[
+            ("in order", "\u{1f1e6}\u{1f1e7}XYZ"),
+            (
+                "flag halves, right one first",
+                "\x1b[1;3H\u{1f1e7}\x1b[1;1H\u{1f1e6}\x1b[1;5HXYZ",
+            ),
+            (
+                "skin tone before its base",
+                "\x1b[1;3H\u{1f3fd}\x1b[1;1H\u{1f44d}\x1b[1;5HXYZ",
+            ),
+            (
+                "a cell ending in ZWJ, the next drawn first",
+                "\x1b[1;2H\u{e9}\x1b[1;1Ha\u{200d}\x1b[1;3HXYZ",
+            ),
+            (
+                "flag halves brought together by DCH",
+                "\u{1f1e6}q\u{1f1e7}XYZ\x1b[1;3H\x1b[P",
+            ),
+            ("a wide glyph narrowed by VS15", "\u{231a}\u{fe0e}XYZ"),
+        ];
+        let mut wrong = Vec::new();
+        for (tier, ring) in [("ring tier", None), ("past the ring", Some(1))] {
+            for (label, input) in cases {
+                let mut t = match ring {
+                    None => Terminal::new(4, 20),
+                    Some(ring) => Terminal::with_scrollback(
+                        4,
+                        20,
+                        ring,
+                        crate::scrollback::Scrollback::with_defaults(),
+                    ),
+                };
+                t.process(input.as_bytes());
+                t.process(b"\x1b[4;1H\r\n\r\n\r\n\r\n");
+                let oldest = t.grid().scrollback_lines() - 1;
+                let _ = take_ring_fast_materialize();
+                let _ = t.grid().materialize_scrollback_row_full(oldest, t.cols());
+                assert_eq!(
+                    take_ring_fast_materialize(),
+                    usize::from(ring.is_none()),
+                    "{tier}, {label}: precondition: the row is drawn from the {tier}"
+                );
+                t.scroll_to_top();
+                let painted = (0..usize::from(t.cols()))
+                    .find(|&col| t.display_cell_grapheme(0, col).as_deref() == Some("X"))
+                    .expect("X is painted");
+                t.scroll_to_bottom();
+                let expected = vec![(0, painted, 3)];
+                let step = t
+                    .search_budgeted("XYZ", false, false, None, 100)
+                    .expect("budgeted search");
+                assert!(step.complete, "one step covers the fixture");
+                let budgeted: Vec<_> = step
+                    .results
+                    .matches
+                    .iter()
+                    .map(|m| (m.line, m.start_col, m.len()))
+                    .collect();
+                for (reader, got) in [
+                    ("cached", cached_results(&mut t, "xyz")),
+                    ("oracle", legacy_results(&t, "xyz")),
+                    ("budgeted", budgeted),
+                ] {
+                    if got != expected {
+                        wrong.push(format!(
+                            "{tier}, {label} ({reader}): painted {expected:?}, found {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "find names history cells the match is not drawn in:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
     /// A terminal whose `ambiguous_width` policy is `"wide"`.
     fn wide_terminal(rows: u16, cols: u16) -> Terminal {
         let mut t = Terminal::new(rows, cols);
@@ -587,10 +907,17 @@ pub(crate) mod tests {
     }
 
     /// A live switch with no new output moves no content generation, and no
-    /// cache serves an answer measured under the old policy: the cached index,
+    /// cache serves an answer a fresh build would not give: the cached index,
     /// a resumed budgeted search and the summary each answer as a fresh build
-    /// under the policy now in force (which measures every row, see
-    /// `Terminal::ambiguous_width`).
+    /// under the policy now in force.
+    ///
+    /// A row written before the switch keeps the cells it was drawn in
+    /// (`apply_config` reflows nothing), and find reads those cells, so the
+    /// fresh answer is where the grid paints the row: the arrows still take
+    /// one cell each. (Ruling 2026-10-11, r15 content-5: until find read the
+    /// grid's cells it re-measured such a row under the new policy and put
+    /// `foo` two cells right of where it is drawn; this test pinned that as
+    /// its precondition.)
     #[test]
     fn a_live_switch_with_no_new_output_is_not_served_from_a_cache() {
         let mut t = Terminal::new(4, 20);
@@ -610,7 +937,16 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let fresh = legacy_results(&t, "foo");
-        assert_ne!(fresh, narrow, "precondition: the policy moves a match");
+        assert_eq!(
+            painted_col(&t, 0, 'f'),
+            Some(2),
+            "the grid reflowed nothing"
+        );
+        assert_eq!(
+            fresh, narrow,
+            "a row keeps the cells it was drawn in: {fresh:?}"
+        );
+        assert_eq!(fresh.first(), Some(&(0, 2, 3)));
         assert_eq!(cached_results(&mut t, "foo"), fresh, "the cached index");
 
         let resumed = t

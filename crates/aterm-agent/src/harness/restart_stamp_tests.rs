@@ -49,8 +49,10 @@ fn a_stamp_is_one_file_per_tab_written_whole() {
 }
 
 /// TAKING A STAMP TAKES ONLY THE ONE MEANT: one `ours` accepts is removed and
-/// returned; one it refuses is put back as it was — and a newer stamp written
-/// while the refused one was aside is never replaced by it.
+/// returned; one it refuses is never moved — a reader of the tab's stamp
+/// finds it while it is judged (the review of ruling 21, 2026-10-14) — and a
+/// newer stamp written meanwhile is never replaced or taken: one landing
+/// between the judgement and the move is put back.
 #[test]
 fn taking_a_stamp_takes_only_the_one_meant() {
     let tmp = scratch();
@@ -72,6 +74,28 @@ fn taking_a_stamp_takes_only_the_one_meant() {
         Some(newer.clone()),
         "the newer one stands"
     );
+    // Judged where it stands: a reader of the tab's stamp finds it while a
+    // take judges it (the act's watch, which lets its program go when its
+    // tab's stamp names it no more).
+    assert_eq!(
+        take_if(state, "s-1", |_| {
+            assert_eq!(read(state, "s-1"), Some(newer.clone()), "in place");
+            false
+        }),
+        None
+    );
+    // A newer stamp landing between the judgement and the move is put back,
+    // never taken for the one judged.
+    let newest = stamp(4244, "Wed Sep 23 20:14:05 2026", Cause::Stall, 102);
+    assert_eq!(
+        take_if(state, "s-1", |_| {
+            write(state, "s-1", &newest).expect("a newer act still");
+            true
+        }),
+        None
+    );
+    assert_eq!(read(state, "s-1"), Some(newest.clone()), "put back");
+    write(state, "s-1", &newer).expect("the act's again");
     assert_eq!(take_if(state, "s-1", |t| t.pid == 4243), Some(newer));
     assert_eq!(read(state, "s-1"), None, "taken");
     assert_eq!(take_if(state, "s-1", |_| true), None, "nothing to take");
@@ -269,6 +293,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     };
     let snap = Snapshot {
         tab: "s-1".to_string(),
@@ -284,6 +309,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp_and_says_why() {
         dialect: None,
         login: None,
         home: None,
+        claude_dir: None,
     };
     let ours = stamp(4242, "Wed Sep 23 20:13:55 2026", Cause::Asked, 1);
     write(&opts.state, "s-1", &ours).expect("written");

@@ -368,8 +368,8 @@ fn seq_watcher_latches_on_the_buffer_swap_itself() {
 #[derive(Debug)]
 struct ContainsReady;
 impl aterm_core::terminal::RowMatch for ContainsReady {
-    fn matches(&self, row: &str) -> bool {
-        row.contains("READY")
+    fn verdict(&self, row: &str) -> aterm_core::terminal::RowVerdict {
+        row.contains("READY").into()
     }
 }
 
@@ -383,8 +383,8 @@ fn dialog(label: &str) -> Vec<u8> {
 #[derive(Debug)]
 struct ContainsBoxB;
 impl aterm_core::terminal::RowMatch for ContainsBoxB {
-    fn matches(&self, row: &str) -> bool {
-        row.contains("rm-box-B")
+    fn verdict(&self, row: &str) -> aterm_core::terminal::RowVerdict {
+        row.contains("rm-box-B").into()
     }
 }
 

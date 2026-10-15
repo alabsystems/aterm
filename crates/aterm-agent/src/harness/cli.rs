@@ -279,8 +279,8 @@ removal is off (`disk.apply`, `disk.auto_free_gib`, `disk.dead_build_dirs`) for 
 and for the window's automatic cleanup until it is fixed; this verb says why on stderr.
 Build directories are the ones you NAME on the line; named none, it SEARCHES for them,
 as the window's automatic cleanup does: this working directory and its worktree,
-the checkouts in $HOME and in ~/Developer and their git worktrees two levels down (a
-`target -> target.noindex` link resolved), x.py's bootstrap build directories (`build/<host>/stage<N>-<kind>`, never
+$HOME's checkouts and their git worktrees two levels down (a `target -> target.noindex`
+link resolved), x.py's bootstrap build directories (`build/<host>/stage<N>-<kind>`, never
 a sysroot, stage0 or llvm), Claude Code's temp root (each session's scratchpad) and the cells
 cache — on this working directory's volume only, never into a mount point or (macOS)
 ~/Desktop, ~/Documents or ~/Downloads. Under the rows it lists the largest build
@@ -963,19 +963,25 @@ impl Env {
         let cwd = std::env::current_dir()
             .map_err(|e| format!("the working directory cannot be read: {e}"))?;
         let now = crate::supervise::limit::unix_now();
-        let config_dir = std::env::var("CLAUDE_CONFIG_DIR")
-            .ok()
-            .filter(|d| !d.is_empty());
-        let claude_dir =
-            footer::claude_dir_of(config_dir.as_deref(), std::env::var("HOME").ok().as_deref());
-        let claude_config_unusable = config_dir.filter(|_| claude_dir.is_none());
-        let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
-            .ok()
-            .filter(|id| footer::is_session_id(id));
         let claude_pid = std::env::var("CLAUDE_PID")
             .ok()
             .and_then(|p| p.parse::<u32>().ok())
             .filter(|&p| p > 0);
+        // RAW, as Claude Code reads it: an EMPTY one is set (`??`), and it and
+        // a relative one name a directory under the one the Claude Code this
+        // command runs under runs in (`CLAUDE_PID`'s), never this command's
+        // own (its Bash tool's `cd` moves that) — by the one resolver
+        // ([`footer::claude_dir_of`]).
+        let config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let claude_dir = footer::claude_dir_of(
+            config_dir.as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+            || claude_pid.and_then(aterm_sysprobe::process_cwd),
+        );
+        let claude_config_unusable = config_dir.filter(|_| claude_dir.is_none());
+        let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|id| footer::is_session_id(id));
         let xdg_cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
         let cells = home
             .as_deref()
@@ -2164,8 +2170,8 @@ fn default_store_dir(home: &Path) -> PathBuf {
 /// Where `disk` looks. Every path is derived HERE and handed to
 /// [`disk::scan`], which reads no environment of its own. With no build
 /// directory named on the line it SEARCHES ([`disk::discover::discover`]):
-/// this working directory and its worktree, the checkouts in `$HOME` and in
-/// `~/Developer` and their worktrees, Claude Code's temp root and the cells cache.
+/// this working directory and its worktree, `$HOME`'s checkouts and their
+/// worktrees, Claude Code's temp root and the cells cache.
 fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
     let home = env.home.clone();
     // Who may hold a session: the running Claude Codes
@@ -2612,7 +2618,7 @@ pub struct DiskLook<'a> {
     pub targets: &'a [PathBuf],
     /// Where to SEARCH for build directories below the floor
     /// ([`disk::discover::discover`]): the agents' working directories and
-    /// their worktrees, `$HOME`'s and `~/Developer`'s checkouts, the agents' `CARGO_TARGET_DIR`,
+    /// their worktrees, `$HOME`'s checkouts, the agents' `CARGO_TARGET_DIR`,
     /// Claude Code's temp root, the cells cache. Searched only below the
     /// floor, and only what is on [`Self::volume`]'s volume is surveyed.
     pub discover: Option<&'a disk::discover::Roots>,
@@ -3266,6 +3272,7 @@ fn run_upgrade_models(
         // Two or more accounts listed: the home's model caches are whichever
         // login started last, and are not read (`Opts::several_logins`).
         several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        instances: crate::harness::upgrade_drive::Instances::Machine,
     };
     match set {
         Some(list) => match super::upgrade_drive::set_models(&opts, list) {
@@ -3341,6 +3348,7 @@ fn upgrade_opts(
         // Two or more accounts listed: the home's model caches are whichever
         // login started last, and are not read (`Opts::several_logins`).
         several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        instances: crate::harness::upgrade_drive::Instances::Machine,
     })
 }
 

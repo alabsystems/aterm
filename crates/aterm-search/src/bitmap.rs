@@ -59,8 +59,8 @@ pub(crate) struct SparseBitmap {
     first: u32,
     /// The largest value (the append-fast-path pivot; meaningless when empty).
     last: u32,
-    /// Number of values held. `u32` because doc ids are bounded by the
-    /// scrollback cap, so the count is too.
+    /// Number of values held. `u32` because the values are distinct `u32`
+    /// keys below `u32::MAX` (the index's key window), so the count is too.
     count: u32,
 }
 
@@ -305,6 +305,28 @@ impl SparseBitmap {
             shift = 0;
         }
         self.compact_prefix();
+    }
+
+    /// Move every value by `by`: up when `up`, down otherwise. This is the
+    /// whole of re-keying a posting list under a new base row
+    /// (`SearchIndex::make_room_for`): the gaps between values do not change,
+    /// so only the two cached endpoints move — `O(1)`, nothing decoded.
+    ///
+    /// The caller keeps every value inside `u32` (`first >= by` going down,
+    /// `last + by <= u32::MAX` going up). The arithmetic wraps rather than
+    /// checks, as [`to_vec`](Self::to_vec)'s does, so it carries no overflow
+    /// obligation.
+    pub(crate) fn shift(&mut self, up: bool, by: u32) {
+        if self.count == 0 {
+            return;
+        }
+        if up {
+            self.first = self.first.wrapping_add(by);
+            self.last = self.last.wrapping_add(by);
+        } else {
+            self.first = self.first.wrapping_sub(by);
+            self.last = self.last.wrapping_sub(by);
+        }
     }
 
     /// Keep consumed bytes strictly below live bytes (or empty both). Moving

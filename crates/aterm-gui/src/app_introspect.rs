@@ -1019,7 +1019,7 @@ pub(crate) fn begin_snapshot_generation(
     let file_name = path
         .file_name()
         .ok_or_else(|| "snapshot path has no filename".to_string())?;
-    if std::path::Path::new(file_name).components().count() != 1 {
+    if !crate::pinned_dir::is_one_component(file_name) {
         return Err("snapshot filename is not one path component".to_string());
     }
     let parent = path
@@ -7845,7 +7845,7 @@ impl App {
 /// object is exactly what makes it one (`-[NSApplication init]` checks the
 /// process in with LaunchServices and opens its SkyLight connection, and
 /// WindowServer then runs a synchronous TCC preflight of the binary on ITS main
-/// thread — AGENTS.md rule 5). Measured 2026-09-26: with that loop in place an
+/// thread — AGENTS.md). Measured 2026-09-26: with that loop in place an
 /// idle headless instance drew no WindowServer preflight, and one `aterm ctl
 /// chrome` against it drew one, from this send reached through
 /// `read_native_chrome`. So a headless instance and every unit test get
@@ -7998,7 +7998,7 @@ pub(crate) fn read_app_menu_bar(mtm: crate::appkit::MainThread) -> Vec<String> {
 /// asking AppKit. [`read_app_menu_bar`] would have to create the application
 /// object to ask, and with it a WindowServer connection (see there). The same
 /// injection as `keymap::no_lock_modifiers` / `platform::no_recent_user_input_event`,
-/// for the same reason (AGENTS.md rule 5's injected-field pattern). The in-app menu MODEL stays
+/// for the same reason (AGENTS.md's injected-field pattern). The in-app menu MODEL stays
 /// introspectable headless through `controls menu`.
 #[cfg(target_os = "macos")]
 pub(crate) fn no_app_menu_bar(_mtm: crate::appkit::MainThread) -> Vec<String> {

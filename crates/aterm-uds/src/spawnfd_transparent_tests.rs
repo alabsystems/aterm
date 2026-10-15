@@ -5,8 +5,8 @@
 //! would hand on and nothing flagged, where [`command`]'s and [`spawn`]'s hold
 //! their stdio alone; and a transparent run is the `std::process::Command` run
 //! it replaced — the same exit status, stdio, signal mask and dispositions,
-//! and the same errors. Every comparison with `std` holds on the installed
-//! seal and on Trust's std since SP-1 (6eb03c9a18), which differ only in what
+//! and the same errors. Every comparison with `std` holds on a std without
+//! SP-1 and on Trust's std since SP-1 (6eb03c9a18), which differ only in what
 //! a `std` child inherits above stdio, which no comparison here reads.
 
 use super::tests::{STAGE_ENV, park, run_staged, unflagged_at_or_above};

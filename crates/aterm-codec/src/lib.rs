@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Base64, hex, the wire's percent escape, CRC-32 and DEFLATE for aterm.
+//! Base64, hex, the wire's percent escape, the JSON string escape, the
+//! terminal-safe rendering, CRC-32 and DEFLATE for aterm.
 //!
 //! Zero external dependencies. Provides:
 //!
@@ -10,8 +11,12 @@
 //!   "exactly N hex digits" checks.
 //! - [`inflate`] — RFC 1951 (DEFLATE) + RFC 1950 (zlib) decompression with a
 //!   decompression-bomb output ceiling.
+//! - [`json`] — the control path's JSON string escape: RFC 8259's, plus every
+//!   character a terminal acts on as `\uXXXX`.
 //! - [`pct`] — the control wire's percent escape (uppercase `%XX` for every
 //!   non-graphic byte and `%`) and its total decoder.
+//! - [`tty`] — text for a terminal: what a terminal acts on or reorders text
+//!   around, shown as text (`\xNN`, `\u{…}`), whole or as it streams.
 //!
 //! ## Usage
 //!
@@ -32,7 +37,9 @@ pub mod base64;
 pub mod crc32;
 pub mod hex;
 pub mod inflate;
+pub mod json;
 pub mod pct;
+pub mod tty;
 
 use std::fmt;
 

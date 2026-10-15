@@ -54,6 +54,7 @@ mod bitmap;
 mod bloom;
 mod budgeted;
 mod bytesearch;
+mod cells;
 mod grapheme;
 mod index;
 mod iterators;
@@ -63,12 +64,13 @@ mod types;
 
 pub use bloom::BloomFilter;
 pub use budgeted::BudgetedSearch;
+pub use cells::LineCells;
 pub use grapheme::{display_columns, display_columns_with};
 pub use index::{
     DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch, SearchIndex, SearchOptionsError,
     max_cached_for_retained,
 };
-pub use types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
+pub use types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchResults};
 
 #[cfg(test)]
 mod tests;
@@ -232,12 +234,15 @@ impl TerminalSearch {
     ) {
         for (offset, line) in lines.into_iter().enumerate() {
             // Saturating: `base_line + offset` cannot overflow for real grids
-            // (line numbers are bounded by scrollback limits), so this is
+            // (absolute rows stay far below `usize::MAX`), so this is
             // identical to `+` on every reachable path while carrying the
-            // no-overflow proof for the Trust L0 gate.
+            // no-overflow proof for the Trust L0 gate. Rows past `u32::MAX`
+            // are fine: the index keys them from its own base
+            // (`SearchIndex::make_room_for`).
             self.index.index_line_cow(
                 base_line.saturating_add(offset),
                 Cow::Borrowed(line.as_ref()),
+                None,
             );
         }
         self.bump_generation();
@@ -253,7 +258,27 @@ impl TerminalSearch {
         lines: impl IntoIterator<Item = (usize, String)>,
     ) {
         for (absolute_row, line) in lines {
-            self.index.index_line_cow(absolute_row, Cow::Owned(line));
+            self.index
+                .index_line_cow(absolute_row, Cow::Owned(line), None);
+        }
+        self.bump_generation();
+    }
+
+    /// Index owned grid rows at explicit absolute row numbers, each with the
+    /// cells its text was read from ([`LineCells`]), so every match is
+    /// reported in the cells that hold it.
+    ///
+    /// The terminal's readers use this: a row's text alone cannot say what
+    /// the grid did with it (two flag halves written apart stay two cells; a
+    /// VS16 base in the last column stays one). Otherwise as
+    /// [`index_numbered_content_owned`](Self::index_numbered_content_owned).
+    pub fn index_numbered_cells_owned(
+        &mut self,
+        lines: impl IntoIterator<Item = (usize, String, LineCells)>,
+    ) {
+        for (absolute_row, line, cells) in lines {
+            self.index
+                .index_line_cow(absolute_row, Cow::Owned(line), Some(&cells));
         }
         self.bump_generation();
     }
@@ -358,7 +383,7 @@ impl TerminalSearch {
         &self,
         query: &str,
         case_sensitive: bool,
-        prev_lines: Option<&[u32]>,
+        prev_lines: Option<&LineFrame>,
     ) -> NarrowedSearch {
         self.index
             .search_literal_narrowed(query, case_sensitive, prev_lines)

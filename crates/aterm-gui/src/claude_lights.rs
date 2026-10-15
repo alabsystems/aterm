@@ -1957,11 +1957,9 @@ mod gesture_tests {
         app.windows[&wid].input_scratch.cells[row][col]
     }
 
+    /// The row as it reads on the glass (the footer's facts read as set).
     fn row_text(app: &App, wid: WindowId, row: usize) -> String {
-        app.windows[&wid].input_scratch.cells[row]
-            .iter()
-            .map(|c| c.ch)
-            .collect()
+        crate::claude_footer::read_glass(&app.windows[&wid].input_scratch.cells[row])
     }
 
     /// The window pixel at the centre of frame cell `(row, col)` — the
@@ -2188,8 +2186,9 @@ mod gesture_tests {
             );
             let text = row_text(&app, wid, mode.0);
             assert!(
-                text.contains("\u{23F5}\u{23F5} bypass  bypass ") && text.contains(WHOLE_FACTS),
-                "the hover's title, short in an 80-column pane beside the whole facts: {text:?}"
+                text.contains("\u{23F5}\u{23F5} bypass  Permission mode: bypass ")
+                    && text.contains(WHOLE_FACTS),
+                "the hover's title, whole in an 80-column pane beside the whole facts: {text:?}"
             );
             // A click on the chip while it says so presses nothing.
             click(&mut app, wid, Light::Mode);
@@ -2408,8 +2407,10 @@ mod gesture_tests {
     /// PENDING mode toggle's title (`Permission mode: switching…  `) never
     /// pushes the lights out of the rule — and never the facts either: the
     /// transient title gives way FIRST (`footer::fit_rule`), so the facts
-    /// stay whole and the title comes short (`switching…`); the chip it names
-    /// does not move.
+    /// stay whole; set as a line of type (`footer::set_facts`) they leave
+    /// the whole title room beside them in 80 columns, and a pane too narrow
+    /// for it gets it short (`footer::fit_rule`'s own tests); the chip it
+    /// names does not move.
     #[test]
     fn a_pending_mode_toggle_keeps_its_lights_in_an_80_column_pane() {
         let (mut app, wid, session, mut reader) = app();
@@ -2434,8 +2435,8 @@ mod gesture_tests {
             "the facts stay whole while the toggle is in flight: {text:?}"
         );
         assert!(
-            text.contains("switching\u{2026}") && !text.contains("Permission mode"),
-            "the title gives way first: short, beside the lights: {text:?}"
+            text.contains("Permission mode: switching\u{2026}"),
+            "the title, whole beside the lights and the facts: {text:?}"
         );
         assert_eq!(
             hit(&app, wid, Light::Mode),

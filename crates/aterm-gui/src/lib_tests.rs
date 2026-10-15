@@ -2148,6 +2148,88 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     assert_eq!(t.selection_to_string().as_deref(), Some("wrapmatch"));
 }
 
+/// R15 content-4: a VS16 base in the last column of a soft-wrapped row stays
+/// one cell wide (the grid has no room to widen it), so the row is exactly
+/// the grid's width. Find reports every hit on the run's later rows in the
+/// cells the grid drew it in, on the screen and after the run scrolls into
+/// history: each reported span selects exactly the needle. On origin/main
+/// the joined run measured one column wider than its stride per such row, so
+/// `Q` was reported one cell right, `Y` (the last column) at column 0 of the
+/// next row, and `Z` two cells right after the second such row.
+#[test]
+fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
+    use crate::app_search::map_matches;
+    use crate::control::search_full_history;
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use aterm_core::terminal::Terminal;
+    use std::sync::{Arc, Mutex};
+
+    let run = concat!(
+        "aaaaaaaaa\u{2714}\u{fe0f}",
+        "QbbbbbbbbY",
+        "cccccccc\u{26a0}\u{fe0f}",
+        "ddZ",
+    );
+    let mut wrong = Vec::new();
+    for (place, trailer) in [
+        ("on the screen", ""),
+        ("in history", "\r\n\r\n\r\n\r\n\r\n\r\n"),
+    ] {
+        let term = Arc::new(Mutex::new(Terminal::new(6, 10)));
+        term.lock()
+            .unwrap()
+            .process(format!("{run}{trailer}").as_bytes());
+        {
+            let t = term.lock().unwrap();
+            if place == "on the screen" {
+                let g = t.grid();
+                assert!(
+                    !g.cell(0, 9).unwrap().is_wide() && !g.cell(2, 9).unwrap().is_wide(),
+                    "precondition: both bases stay one cell wide"
+                );
+                assert_eq!(t.cell_grapheme(1, 0).as_deref(), Some("Q"));
+                assert_eq!(t.cell_grapheme(1, 9).as_deref(), Some("Y"));
+                assert_eq!(t.cell_grapheme(3, 2).as_deref(), Some("Z"));
+            } else {
+                assert!(
+                    t.grid().scrollback_lines() >= 4,
+                    "precondition: the run is history"
+                );
+            }
+        }
+        let base_y = i64::try_from(term.lock().unwrap().grid().base_y()).unwrap();
+        let cols = usize::from(term.lock().unwrap().grid().cols());
+        for needle in ["Q", "Y", "Z", "bY", "Ycc"] {
+            let results = search_full_history(&term, needle, true, false).unwrap();
+            let matches = map_matches(&results.results.matches, base_y);
+            let picked: Vec<_> = matches
+                .iter()
+                .map(|&(row, c0, c1)| {
+                    let mut t = term.lock().unwrap();
+                    let sel = t.text_selection_mut();
+                    sel.start_selection(row, c0, SelectionSide::Left, SelectionType::Simple);
+                    sel.update_selection(
+                        row + i32::try_from(c1 as usize / cols).unwrap(),
+                        u16::try_from(c1 as usize % cols).unwrap(),
+                        SelectionSide::Right,
+                    );
+                    t.selection_to_string()
+                })
+                .collect();
+            if picked != [Some(needle.to_string())] {
+                wrong.push(format!(
+                    "{place}: {needle:?} reported at {matches:?}, which selects {picked:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "find names cells the hit is not drawn in:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
 /// The join pads a continued row back out to the grid's width before it
 /// appends the next one. Grid rows are read TRIMMED, so without that padding
 /// a run whose row ends in blanks would splice its neighbour's first column

@@ -15379,7 +15379,7 @@ fn smart_title_health_card(
 // Opening System Settings touches `NSWorkspace`, and `tccutil reset` mutates
 // the human's privacy state. Both are reachable from a reducer that a unit test
 // can drive, which is the exact shape that killed `WindowServer` on 2026-08-17
-// (`AGENTS.md` rule 5, `tools/grep_guard.sh` B9). So they take the
+// (`AGENTS.md`, `tools/grep_guard.sh` B9). So they take the
 // `lock_modifiers` / `ConsentProbes` treatment: [`ConsentGestures`] is a bundle
 // of injected pointers whose default is the INERT arm, and only a windowed host
 // installs the live one.
@@ -15812,7 +15812,7 @@ fn inert_run_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
 /// Settings reducer, and `tccutil` talks to `tccd`. A synchronous main-thread
 /// wait on `tccd` is the exact shape that killed WindowServer on this machine
 /// on 2026-08-17 (its main thread sat in a `tccd` preflight for forty seconds
-/// and the watchdog took the whole GUI session down — `AGENTS.md` rule 5). An
+/// and the watchdog took the whole GUI session down — `AGENTS.md`). An
 /// owner gesture may cost a visible moment; it may never cost the event loop.
 const RESET_INVOCATION_CEILING: std::time::Duration = std::time::Duration::from_millis(1000);
 

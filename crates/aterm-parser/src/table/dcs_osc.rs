@@ -8,6 +8,34 @@ use crate::state::State;
 use super::set_range;
 use super::types::{ActionType, Transition};
 
+/// A DCS HEADER IGNORES A GR BYTE (`0xA0..=0xFF`: every UTF-8 lead and most
+/// continuations, Latin-1 or binary data) and stays where it was, as vte's
+/// header states do (`anywhere`, which ignores it); the DEC parser reads GR as
+/// GL, which keeps the string too. Without these entries the table's default
+/// sent such a byte to Ground, and the string after it — a sixel, a tmux
+/// passthrough wrapper, a query — printed and ran as terminal input: the
+/// class V2 (7a1cf597b) fixed for `DcsIgnore`, left in the three header states
+/// (round fifteen, R15-PARSER-P2). `0x80..=0x9F` keep their C1 entries, behind
+/// dispatch.rs's C1 guard: with C1 controls off they are dropped there.
+///
+/// The escape and CSI states keep the abort (ruling 2026-10-10): a GR byte
+/// there drops the sequence to Ground where vte ignores it. What an abort
+/// costs there is the one short sequence, whose bytes print as text, not a
+/// string that may run to megabytes; ignoring would keep the sequence open
+/// across text, so `ESC [` followed by UTF-8 text would dispatch a CSI on the
+/// first letter after it, a sequence the program never wrote, where the abort
+/// dispatches nothing; and the CSI fast path the VT write path runs
+/// (`try_parse_csi_fast`) would have to change in step with the table.
+const fn ignore_gr_bytes(table: &mut [[Transition; 256]; State::COUNT], state: State) {
+    set_range(
+        table,
+        state,
+        0xA0,
+        0xFF,
+        Transition::new(state, ActionType::Ignore),
+    );
+}
+
 pub(super) const fn apply_dcs_entry_transitions(table: &mut [[Transition; 256]; State::COUNT]) {
     set_range(
         table,
@@ -55,6 +83,7 @@ pub(super) const fn apply_dcs_entry_transitions(table: &mut [[Transition; 256]; 
         Transition::new(State::DcsPassthrough, ActionType::DcsHook),
     );
     table[State::DcsEntry as usize][0x7F] = Transition::new(State::DcsEntry, ActionType::Ignore);
+    ignore_gr_bytes(table, State::DcsEntry);
 }
 
 pub(super) const fn apply_dcs_param_transitions(table: &mut [[Transition; 256]; State::COUNT]) {
@@ -104,6 +133,7 @@ pub(super) const fn apply_dcs_param_transitions(table: &mut [[Transition; 256]; 
         Transition::new(State::DcsPassthrough, ActionType::DcsHook),
     );
     table[State::DcsParam as usize][0x7F] = Transition::new(State::DcsParam, ActionType::Ignore);
+    ignore_gr_bytes(table, State::DcsParam);
 }
 
 pub(super) const fn apply_dcs_intermediate_transitions(
@@ -148,6 +178,7 @@ pub(super) const fn apply_dcs_intermediate_transitions(
     );
     table[State::DcsIntermediate as usize][0x7F] =
         Transition::new(State::DcsIntermediate, ActionType::Ignore);
+    ignore_gr_bytes(table, State::DcsIntermediate);
 }
 
 pub(super) const fn apply_dcs_passthrough_transitions(

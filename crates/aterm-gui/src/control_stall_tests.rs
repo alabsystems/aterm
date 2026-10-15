@@ -332,6 +332,92 @@ fn a_frame_refused_on_its_header_closes_without_waiting_for_its_body() {
     rig.settle("the connection closed", |census| census.open == 0);
 }
 
+/// The stub, with `@<sid> paste-bin <n>` a wait (as the real classifier has it
+/// for a paste into another session) whose body it reads before answering.
+struct FramedWaits;
+
+impl LaneService for FramedWaits {
+    fn authenticate(
+        &self,
+        stream: &CtlStream,
+        reader: &mut LaneReader<'_>,
+    ) -> Option<(Scope, Option<String>)> {
+        Stub::default().authenticate(stream, reader)
+    }
+
+    fn serve_line(
+        &self,
+        line: String,
+        scope: Scope,
+        stream: &CtlStream,
+        reader: &mut LaneReader<'_>,
+        out: &mut Vec<u8>,
+    ) -> Option<ServeDisposition> {
+        match line.split_once(" paste-bin ") {
+            Some((_, n)) => {
+                Stub::default().serve_line(format!("feed-bin {n}"), scope, stream, reader, out)
+            }
+            None => Stub::default().serve_line(line, scope, stream, reader, out),
+        }
+    }
+
+    fn is_wait(&self, line: &str, _scope: Scope) -> bool {
+        line.contains(" paste-bin ")
+    }
+
+    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+
+    fn release(&self, _id: u64) {}
+}
+
+/// A framed wait refused busy (no wait lane takes it, no inline place is
+/// free) is closed once its busy line is out. Before, the connection was kept
+/// and the next turn served the unread body line by line AS REQUESTS, under
+/// the connection's scope: a paste's text became control verbs. With a parker
+/// and without one.
+#[test]
+fn a_framed_wait_refused_busy_closes_and_serves_none_of_its_body() {
+    for open in [16, 0] {
+        let lanes = Lanes::new(LaneLimits {
+            rpc: 1,
+            wait: 0,
+            inline: 0,
+            open,
+        });
+        assert_eq!(lanes.start(), 1, "the request lane started");
+        lanes.publish(Arc::new(FramedWaits) as Arc<dyn LaneService>);
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(HANG))
+            .expect("bound client reads");
+        assert!(lanes.admit(server).is_ok(), "admitted");
+        let body = b"signal kill\n@1 send rm -rf ~\n";
+        let mut wire = format!("AUTH ok\n@2 paste-bin {}\n", body.len()).into_bytes();
+        wire.extend_from_slice(body);
+        wire.extend_from_slice(b"ping\n");
+        (&client).write_all(&wire).expect("the frame");
+        let mut reader = BufReader::new(&client);
+        let mut next = || {
+            let mut answer = String::new();
+            match reader.read_line(&mut answer) {
+                Ok(0) => "<EOF>".to_string(),
+                Ok(_) => answer.trim_end().to_string(),
+                Err(error) => format!("<{error}>"),
+            }
+        };
+        assert_eq!(
+            next(),
+            aterm_types::control_verbs::CONTROL_BUSY_LINE.trim_end(),
+            "open={open}"
+        );
+        assert_eq!(
+            next(),
+            "<EOF>",
+            "open={open}: the refused frame's body was served as requests"
+        );
+    }
+}
+
 /// The forwarding service: the genuine classifier ([`super::is_wait_request`])
 /// and forward ([`super::try_proxy_forward`]) over a session store and socket
 /// dir of its own. `AUTH ok` authenticates as the owner; a line nothing

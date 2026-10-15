@@ -17,8 +17,10 @@ use crate::presence::{
 use crate::{Duration, Instant};
 
 /// A test host: its walls are a usage window and a full context, its stall
-/// is `(since, stopped, survived, restart)`, its harness is `harness@1`, and
-/// its percent codec spells a space `%20`.
+/// is `(since, stopped, survived, restart)`, its harness is `harness@1`, its
+/// percent codec spells a space `%20`, and its grid is the terminal's own
+/// (`aterm_grapheme::str_grid_columns`, the measure aterm's host injects),
+/// which counts the characters it measures on this thread ([`MEASURED`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestHost {}
 
@@ -90,6 +92,24 @@ impl Host for TestHost {
     fn pct_decode(s: &str) -> String {
         s.replace("%20", " ")
     }
+
+    fn columns(s: &str) -> usize {
+        MEASURED.with(|m| m.set(m.get() + s.chars().count()));
+        aterm_grapheme::str_grid_columns(s)
+    }
+}
+
+thread_local! {
+    /// The characters [`TestHost::columns`] has measured on this thread: the
+    /// WORK a walk of the row's cells does, read without a clock.
+    static MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The characters `f` has the host measure.
+fn measured(f: impl FnOnce()) -> usize {
+    MEASURED.with(|m| m.set(0));
+    f();
+    MEASURED.with(std::cell::Cell::get)
 }
 
 type TSlot = Slot<TestHost>;
@@ -353,7 +373,7 @@ fn the_row_prints_no_unknown_phase_and_no_empty_mail_slot() {
         later,
         0,
     );
-    let row = w.fit(120);
+    let row = w.fit::<TestHost>(120);
     assert!(!row.contains("unknown"), "{row}");
     assert!(
         !row.contains("3m35s"),
@@ -378,7 +398,7 @@ fn the_row_prints_no_unknown_phase_and_no_empty_mail_slot() {
         later,
         0,
     );
-    let row = busy.fit(120);
+    let row = busy.fit::<TestHost>(120);
     assert!(row.contains("busy 3m35s"), "{row}");
     assert!(row.contains("\u{2709}1"), "{row}");
     let queued = words(
@@ -410,29 +430,29 @@ fn elision_keeps_phase_hand_and_mail_to_24_and_all_three_to_13() {
     let now = Instant::now();
     let w = words(&driven(now), now + Duration::from_secs(192), 0);
     assert_eq!(
-        w.fit(120),
+        w.fit::<TestHost>(120),
         "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
     );
-    assert!(!w.fit(90).contains('\u{27df}'), "rtt first");
-    assert!(!w.fit(83).contains("3m12s"), "then since");
-    assert!(!w.fit(75).contains("worker"), "then role");
-    assert!(!w.fit(50).contains("ctx"), "then ctx");
-    let n24 = w.fit(24);
+    assert!(!w.fit::<TestHost>(90).contains('\u{27df}'), "rtt first");
+    assert!(!w.fit::<TestHost>(83).contains("3m12s"), "then since");
+    assert!(!w.fit::<TestHost>(75).contains("worker"), "then role");
+    assert!(!w.fit::<TestHost>(50).contains("ctx"), "then ctx");
+    let n24 = w.fit::<TestHost>(24);
     assert_eq!(n24, "busy  \u{25c2} turn 41  \u{2709}2");
     for cols in 13..=24 {
-        let kinds: Vec<SlotKind> = w.pieces(cols).iter().map(|(k, _)| *k).collect();
+        let kinds: Vec<SlotKind> = w.pieces::<TestHost>(cols).iter().map(|(k, _)| *k).collect();
         assert_eq!(
             kinds,
             [SlotKind::Phase, SlotKind::Hand, SlotKind::Mail],
             "{cols}: {}",
-            w.fit(cols)
+            w.fit::<TestHost>(cols)
         );
     }
     for cols in 0..=200 {
         assert!(
-            w.fit(cols).chars().count() <= cols,
+            w.fit::<TestHost>(cols).chars().count() <= cols,
             "{cols}: {}",
-            w.fit(cols)
+            w.fit::<TestHost>(cols)
         );
     }
 }
@@ -441,16 +461,23 @@ fn elision_keeps_phase_hand_and_mail_to_24_and_all_three_to_13() {
 /// control byte, and the cap cuts with `…`.
 #[test]
 fn sanitize_refuses_band_glyphs_bidi_and_control_characters() {
-    let s = sanitize_token(
+    let s = sanitize_token::<TestHost>(
         "\u{2298} hold pause \u{00b7}fleet\u{1f512}  \u{25c2} evil\u{202e}gnp\u{7}\t\nname\u{2066}",
         64,
     );
     assert_eq!(s, "hold pause fleet evilgnp name");
-    assert_eq!(sanitize_token(&"x".repeat(200), 8), "xxxxxxx\u{2026}");
+    assert_eq!(
+        sanitize_token::<TestHost>(&"x".repeat(200), 8),
+        "xxxxxxx\u{2026}"
+    );
     for c in [
         '\u{200e}', '\u{200f}', '\u{202a}', '\u{2069}', '\u{1b}', '~', '\u{2192}',
     ] {
-        assert_eq!(sanitize_token(&format!("a{c}b"), 8), "ab", "{c:?}");
+        assert_eq!(
+            sanitize_token::<TestHost>(&format!("a{c}b"), 8),
+            "ab",
+            "{c:?}"
+        );
     }
     // Every free-text slot goes through it.
     let now = Instant::now();
@@ -484,6 +511,74 @@ fn sanitize_refuses_band_glyphs_bidi_and_control_characters() {
     );
 }
 
+/// Round fifteen content-7: the token strips what the band strips — the TAG
+/// characters (invisible ASCII an agent reading `chrome` still reads), the
+/// zero-width space, the word joiner, the BOM, the Arabic letter mark, the
+/// soft hyphen, the Mongolian vowel separator, the joiners, a Hangul filler,
+/// CGJ — on every path a free-text value takes: the token itself, a hold
+/// reason the host's codec decoded, and the slots and sentence it lands in.
+#[test]
+fn sanitize_strips_invisible_characters_on_every_path() {
+    let hidden = [
+        '\u{e0049}',
+        '\u{e0047}',
+        '\u{e004e}',
+        '\u{e0001}',
+        '\u{200b}',
+        '\u{2060}',
+        '\u{feff}',
+        '\u{061c}',
+        '\u{00ad}',
+        '\u{180e}',
+        '\u{200c}',
+        '\u{200d}',
+        '\u{3164}',
+        '\u{034f}',
+    ];
+    for c in hidden {
+        assert_eq!(
+            sanitize_token::<TestHost>(&format!("a{c}b"), 8),
+            "ab",
+            "{c:?}"
+        );
+    }
+    let smuggled = format!("ok{}end", hidden.iter().collect::<String>());
+    assert_eq!(sanitize_token::<TestHost>(&smuggled, 64), "okend");
+    // A hold reason the host decodes (`%20` is a space here) is held to it.
+    assert_eq!(
+        crate::presence::hold_reason_words::<TestHost>(
+            "main%20broken\u{e0049}\u{e0047}\u{200b}\u{feff}"
+        ),
+        "main broken"
+    );
+    let now = Instant::now();
+    let w = words(
+        &slot_of(
+            TFacts {
+                role: Some("rev\u{e0049}\u{e0047}iewer".into()),
+                hand: Hand::DrivenLease {
+                    holder: "boss\u{200b}\u{2060}".into(),
+                },
+                ..TFacts::default()
+            },
+            now,
+        ),
+        now,
+        0,
+    );
+    assert_eq!(w.role, "reviewer");
+    assert_eq!(w.hand, "\u{25c2} boss");
+    for (name, text) in [
+        ("fit", w.fit::<TestHost>(200)),
+        ("sentence", w.sentence.clone()),
+    ] {
+        assert!(
+            !text.chars().any(|c| hidden.contains(&c)),
+            "{name}: {text:?}"
+        );
+    }
+}
+
 /// The painter: exactly `cols` cells at every width, the text is the fitted
 /// line inside one margin cell each side, and the emoji-capable glyphs are
 /// pinned to text presentation.
@@ -514,10 +609,10 @@ fn paint_row_is_exactly_cols_wide_with_the_glyphs_in_text_presentation() {
     );
     let w: Words = words(&s, now, 0);
     for cols in [0usize, 1, 2, 3, 13, 24, 40, 80, 120, 200] {
-        let row: Vec<InkedCell> = paint_row(&w, cols, &c, &p);
+        let row: Vec<InkedCell> = paint_row::<TestHost>(&w, cols, &c, &p);
         assert_eq!(row.len(), cols);
         let text: String = row.iter().map(|k| k.ch).collect();
-        assert_eq!(text.trim(), w.fit(text_cols(cols)), "{cols}");
+        assert_eq!(text.trim(), w.fit::<TestHost>(text_cols(cols)), "{cols}");
         for k in &row {
             assert_eq!(k.bg, c.bar_bg, "on the band");
             assert_eq!(
@@ -529,12 +624,296 @@ fn paint_row_is_exactly_cols_wide_with_the_glyphs_in_text_presentation() {
                 "{:?}",
                 k.ch
             );
+            // The row's own glyphs are one cell each under the grid's
+            // measure too (the lock by its pin): no continuation.
+            assert!(!k.continuation, "{cols}: {:?}", k.ch);
         }
     }
-    let row = paint_row(&w, 120, &c, &p);
+    let row = paint_row::<TestHost>(&w, 120, &c, &p);
     let hold = row.iter().find(|k| k.ch == '\u{2298}').expect("the hold");
     assert_eq!(hold.fg, p.stop);
     assert!(hold.bold);
+}
+
+/// The band's inks and the presence text inks on the mock's dark theme.
+fn band_inks() -> (BandInks, PresenceTones) {
+    let c = BandInks::derive(
+        crate::ink::ThemeInks {
+            bg: [0x1e, 0x1e, 0x2e],
+            fg: [0xcd, 0xd6, 0xf4],
+            cursor: [0xf5, 0xe0, 0xdc],
+        },
+        None,
+        crate::ink::BarBase::Blend,
+    );
+    let tones = crate::presence::tones([0x1e, 0x1e, 0x2e], &c, None);
+    let p = crate::presence::inks(tones, c.bar_bg);
+    (c, p)
+}
+
+/// A row with only `role` free: phase `busy`, no hand.
+fn role_row(role: &str) -> Words {
+    Words {
+        role: sanitize_token::<TestHost>(role, 64),
+        phase: "busy".into(),
+        hand: "\u{2014}".into(),
+        hand_short: "\u{2014}".into(),
+        ..Words::default()
+    }
+}
+
+/// `line` as the terminal grid draws it, one `(char, continuation)` per
+/// column: each character that opens a cell, a wide one followed by its
+/// continuation, and nothing for a character drawn in the cell before it.
+/// Walked with the grid's own `GridColumns`, independent of the row's
+/// measure.
+fn grid_cells(line: &str) -> Vec<(char, bool)> {
+    let mut grid = aterm_grapheme::GridColumns::new();
+    let mut out = Vec::new();
+    for c in line.chars() {
+        match grid.step(c) {
+            aterm_grapheme::GridStep::Opens { width, .. } => {
+                out.push((c, false));
+                out.extend(std::iter::repeat_n((' ', true), width - 1));
+            }
+            aterm_grapheme::GridStep::Joins { widened: true } => out.push((' ', true)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Round fifteen content-6: the width law measures in the GRID's cells. A
+/// role of seven CJK characters is fourteen columns, not seven, so at 22
+/// columns (`レビュー担当者  busy  —` is 23) it is shed, where a char count
+/// kept it and painted fourteen columns of glyphs into seven cells; a
+/// combining mark is no column at all, so `cafe\u{301} lead` keeps its slot
+/// in exactly 18. The token cap counts cells and cuts between two of them.
+/// At every width the line fits the grid's own count of it.
+#[test]
+fn a_cjk_or_combining_role_is_laid_out_in_the_grids_cells() {
+    let cjk = role_row("\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}\u{5f53}\u{8005}");
+    assert_eq!(
+        cjk.fit::<TestHost>(23),
+        "\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}\u{5f53}\u{8005}  busy  \u{2014}"
+    );
+    assert_eq!(
+        cjk.fit::<TestHost>(22),
+        "busy  \u{2014}",
+        "the role is 14 columns"
+    );
+    let marked = role_row("cafe\u{301} lead");
+    assert_eq!(
+        marked.fit::<TestHost>(18),
+        "cafe\u{301} lead  busy  \u{2014}",
+        "the mark takes no column"
+    );
+    assert_eq!(marked.fit::<TestHost>(17), "busy  \u{2014}");
+    // The cap: 8 cells hold three wide glyphs and the `…`, never half a
+    // fourth; a mark stays with its letter at the cut.
+    assert_eq!(
+        sanitize_token::<TestHost>("\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}", 8),
+        "\u{30ec}\u{30d3}\u{30e5}\u{2026}"
+    );
+    assert_eq!(
+        sanitize_token::<TestHost>("abcde\u{301}fgh", 6),
+        "abcde\u{301}\u{2026}"
+    );
+    // Every width, every shape: the fitted line is never wider than asked in
+    // the grid's own count, and a cut never splits a cell.
+    for role in [
+        "\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}\u{5f53}\u{8005}",
+        "cafe\u{301} lead",
+        "dev \u{1f468}\u{200d}\u{1f4bb}",
+        "\u{d55c}\u{ad6d}\u{c5b4} \u{c5ed}\u{d560} reviewer",
+        "\u{a9}\u{fe0f} keeper",
+    ] {
+        let w = Words {
+            hand: format!(
+                "\u{25c2} {} \u{00b7} turn 4",
+                sanitize_token::<TestHost>(role, 32)
+            ),
+            hand_short: "\u{25c2} turn 4".into(),
+            since: vec![sanitize_token::<TestHost>(role, 48), "2m03s".into()],
+            ..role_row(role)
+        };
+        for cols in 0..=80 {
+            let line = w.fit::<TestHost>(cols);
+            assert!(
+                aterm_grapheme::str_grid_columns(&line) <= cols,
+                "{role:?} at {cols}: {line:?}"
+            );
+        }
+        // Where the grid opens a cell in the clean token: the only places a
+        // cut may fall.
+        let clean = sanitize_token::<TestHost>(role, usize::MAX);
+        let mut grid = aterm_grapheme::GridColumns::new();
+        let opens: Vec<usize> = clean
+            .char_indices()
+            .filter(|&(_, c)| matches!(grid.step(c), aterm_grapheme::GridStep::Opens { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        for cap in 0..=40 {
+            let t = sanitize_token::<TestHost>(role, cap);
+            assert!(
+                aterm_grapheme::str_grid_columns(&t) <= cap,
+                "{role:?} cap {cap}: {t:?}"
+            );
+            if let Some(head) = t.strip_suffix('\u{2026}') {
+                assert!(
+                    clean.starts_with(head) && opens.contains(&head.len()),
+                    "{role:?} cap {cap}: {t:?} cuts inside a cell"
+                );
+            }
+        }
+    }
+}
+
+/// Round fifteen content-6: the painter draws each word in the cells the grid
+/// gives it — a wide glyph as its lead cell and a continuation (no glyph of
+/// its own, the renderer's `wide`), a combining mark in none — so the
+/// painted row is the fitted line as the grid lays it out, cell for cell,
+/// at every width.
+#[test]
+fn the_painter_draws_a_wide_glyph_in_two_cells_and_a_mark_in_none() {
+    let (c, p) = band_inks();
+    let row = paint_row::<TestHost>(&role_row("\u{62c5}\u{5f53}"), 40, &c, &p);
+    let painted: Vec<(char, bool)> = row.iter().map(|k| (k.ch, k.continuation)).collect();
+    assert_eq!(
+        &painted[..11],
+        &[
+            (' ', false),
+            ('\u{62c5}', false),
+            (' ', true),
+            ('\u{5f53}', false),
+            (' ', true),
+            (' ', false),
+            (' ', false),
+            ('b', false),
+            ('u', false),
+            ('s', false),
+            ('y', false),
+        ]
+    );
+    let row = paint_row::<TestHost>(&role_row("cafe\u{301}"), 40, &c, &p);
+    assert!(row.iter().all(|k| k.ch != '\u{301}'), "no cell of its own");
+    let text: String = row.iter().map(|k| k.ch).collect();
+    assert!(text.starts_with(" cafe  busy  \u{2014}"), "{text:?}");
+    for role in [
+        "\u{30ec}\u{30d3}\u{30e5}\u{30fc}\u{62c5}\u{5f53}\u{8005}",
+        "cafe\u{301} lead",
+        "dev \u{1f468}\u{200d}\u{1f4bb}",
+        "\u{a9}\u{fe0f} keeper",
+    ] {
+        let w = role_row(role);
+        for cols in 0..=60 {
+            let row = paint_row::<TestHost>(&w, cols, &c, &p);
+            assert_eq!(row.len(), cols);
+            let mut want = vec![(' ', false)];
+            want.extend(grid_cells(&w.fit::<TestHost>(text_cols(cols))));
+            want.resize(cols.max(want.len()), (' ', false));
+            want.truncate(cols);
+            let got: Vec<(char, bool)> = row.iter().map(|k| (k.ch, k.continuation)).collect();
+            assert_eq!(got, want, "{role:?} at {cols}");
+            for k in row.iter().filter(|k| k.continuation) {
+                assert!(!k.text_presentation && k.bg == c.bar_bg);
+            }
+        }
+    }
+}
+
+/// Round fifteen content-6 review: a cell holds what the grid's cell holds,
+/// its opening character and 16 more (aterm-grid's `MAX_COMBINING`), and the
+/// row drops the rest, as the grid does. A wall's reset read off a hostile
+/// screen row — `1`, then 190 `~` (a band glyph the token strips) each
+/// carrying the grid's 16 marks — is ONE cell: the token is `1` and its first
+/// 16 marks, where a cap counted in cells alone let all 3,041 characters
+/// through. A token of many such cells is at most 17 characters a cell of
+/// its cap, a mark with no cell to join is dropped, and the row still
+/// measures and paints every cell as the grid lays it out.
+#[test]
+fn a_cell_holds_what_the_grids_cell_holds() {
+    let marks = |n: usize| "\u{301}".repeat(n);
+    let mut reset = String::from("1");
+    for _ in 0..190 {
+        reset.push('~');
+        reset.push_str(&marks(16));
+    }
+    let one = sanitize_token::<TestHost>(&reset, 32);
+    assert_eq!(one.chars().count(), 17, "one cell: `1` and 16 marks");
+    assert_eq!(one, format!("1{}", marks(16)));
+    // A zero-width character with no cell to join — at the front, or left
+    // there by a stripped glyph — is kept by neither the grid nor the token.
+    assert_eq!(sanitize_token::<TestHost>("\u{301}lead", 8), "lead");
+    assert_eq!(
+        sanitize_token::<TestHost>("\u{2713}\u{301} \u{1f512}\u{301}x", 8),
+        "x"
+    );
+    let many: String = (b'a'..=b'z')
+        .chain(b'a'..=b'n')
+        .map(|c| format!("{}{}", char::from(c), marks(40)))
+        .collect();
+    for cap in [1usize, 2, 8, 32] {
+        let t = sanitize_token::<TestHost>(&many, cap);
+        assert!(t.chars().count() <= 17 * cap, "cap {cap}: {t:?}");
+        assert!(aterm_grapheme::str_grid_columns(&t) <= cap, "cap {cap}");
+    }
+    let (c, p) = band_inks();
+    for token in [one, sanitize_token::<TestHost>(&many, 32)] {
+        let w = Words {
+            since: vec![format!("\u{2192} {token}"), "1h59m".into()],
+            ..role_row("x")
+        };
+        let full = w.fit::<TestHost>(200);
+        assert!(full.contains(&token), "{full:?}");
+        for cols in 0..=80 {
+            let line = w.fit::<TestHost>(cols);
+            assert!(aterm_grapheme::str_grid_columns(&line) <= cols, "{cols}");
+            let row = paint_row::<TestHost>(&w, cols, &c, &p);
+            let mut want = vec![(' ', false)];
+            want.extend(grid_cells(&w.fit::<TestHost>(text_cols(cols))));
+            want.resize(cols.max(want.len()), (' ', false));
+            want.truncate(cols);
+            let got: Vec<(char, bool)> = row.iter().map(|k| (k.ch, k.continuation)).collect();
+            assert_eq!(got, want, "at {cols}");
+        }
+    }
+}
+
+/// Round fifteen content-6 review: the walk of the row's cells is LINEAR in
+/// what it is given. Each character is measured alone and against its own
+/// cell, which holds at most 17, so the token, the fit and the painter cost
+/// a bounded few characters measured per character — counted in what the
+/// host measured, never a clock — even on a raw string no token pass bounded
+/// (one cell of 4,096 marks). The walk that measured each mark against all
+/// of its cell measured millions.
+#[test]
+fn the_cell_walk_is_linear_in_its_string() {
+    let (c, p) = band_inks();
+    for n in [256usize, 4096] {
+        let raw = format!("a{}", "\u{301}".repeat(n));
+        let w = Words {
+            role: raw.clone(),
+            ..role_row("x")
+        };
+        for (name, work) in [
+            (
+                "sanitize",
+                measured(|| drop(sanitize_token::<TestHost>(&raw, 32))),
+            ),
+            ("fit", measured(|| drop(w.fit::<TestHost>(200)))),
+            (
+                "paint",
+                measured(|| drop(paint_row::<TestHost>(&w, 200, &c, &p))),
+            ),
+        ] {
+            assert!(
+                work <= 8 * (n + 1),
+                "{name}: {work} characters measured for {}",
+                n + 1
+            );
+        }
+    }
 }
 
 /// THE IDLE LAW: a quiet view's fingerprint is exactly 0 at every instant,
@@ -660,7 +1039,7 @@ fn the_six_slots_read_like_the_approved_mock() {
     let s = driven(now);
     let w = words(&s, now + Duration::from_secs(192), 0);
     assert_eq!(
-        w.fit(120),
+        w.fit::<TestHost>(120),
         "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
     );
     assert_eq!(
@@ -679,7 +1058,7 @@ fn elision_sheds_from_the_right_and_keeps_hand_phase_mail_to_24_columns() {
     let now = Instant::now();
     let s = driven(now);
     let w = words(&s, now + Duration::from_secs(192), 0);
-    let at = |cols| w.fit(cols);
+    let at = |cols| w.fit::<TestHost>(cols);
     assert_eq!(width(&at(120)), 94, "the whole line: {}", at(120));
     assert!(!at(90).contains("\u{27df}"), "rtt goes first: {}", at(90));
     assert!(at(90).contains("3m12s"));
@@ -977,12 +1356,16 @@ fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
         vec!["2m03s".to_string(), "not reading input".to_string()]
     );
     assert!(
-        w.fit(120)
+        w.fit::<TestHost>(120)
             .contains("frozen 2m03s \u{00b7} not reading input"),
         "{}",
-        w.fit(120)
+        w.fit::<TestHost>(120)
     );
-    assert!(!w.fit(120).contains("answer this box"), "{}", w.fit(120));
+    assert!(
+        !w.fit::<TestHost>(120).contains("answer this box"),
+        "{}",
+        w.fit::<TestHost>(120)
+    );
     assert!(
         w.sentence
             .contains("frozen, not reading input for 2m03s; restart it"),
@@ -1122,7 +1505,7 @@ fn a_story_summarises_since_the_watermark_and_the_watermark_folds_it() {
         ]
     );
     // The longest stop survives elision: at 40 columns the counts go first.
-    let narrow = w.fit(44);
+    let narrow = w.fit::<TestHost>(44);
     assert!(narrow.contains("held 1m00s"), "{narrow}");
     assert!(s.calm());
     assert_eq!(s.level(s.story_seq), Level::Quiet);
@@ -1295,7 +1678,7 @@ fn free_text_is_sanitized_and_the_limit_message_never_appears() {
     assert_eq!(w.phase, "limited");
     assert_eq!(w.since, vec!["\u{2192} 7:30pm".to_string()], "{w:?}");
     assert_eq!(
-        sanitize_token("You've reached your limit", 8),
+        sanitize_token::<TestHost>("You've reached your limit", 8),
         "You've \u{2026}"
     );
 }
@@ -1471,7 +1854,7 @@ fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
     assert!(
         !w.since.iter().any(|c| c == "0s"),
         "the hold's age is unknown, the band says: {} / since={:?}",
-        w.fit(120),
+        w.fit::<TestHost>(120),
         w.since
     );
     assert!(w.since.is_empty(), "{:?}", w.since);

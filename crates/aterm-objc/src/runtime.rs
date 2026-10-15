@@ -175,6 +175,18 @@ impl std::fmt::Debug for Sel {
 /// ```
 ///
 /// A newtype so its [`crate::Encode`] can say so; [`ProtocolPtr`] encodes `"@"`.
+///
+/// # Invariant
+///
+/// Null, or a class object the runtime registered. Classes are never disposed
+/// (nothing here binds `objc_disposeClassPair`), so a pointer that was a class
+/// stays one for the life of the process. Safe code reads through it: the
+/// [`Debug`](std::fmt::Debug) impl calls `class_getName`. Every safe
+/// constructor therefore yields a class or null ([`ClassPtr::NULL`],
+/// [`class`], [`crate::ClassMeta::class`]); the runtime's own returns come out
+/// of `unsafe` sends and lookups, whose callers vouch for them, and
+/// [`ClassPtr::from_ptr`] is `unsafe` (boundaries hunt L4, ruling 2026-10-10,
+/// `docs/AUDIT-boundaries-2026-10-09.md`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClassPtr(*mut c_void);
@@ -184,9 +196,28 @@ impl ClassPtr {
     pub const NULL: Self = Self(std::ptr::null_mut());
 
     /// Wrap a raw class pointer.
+    ///
+    /// `unsafe` because the type's invariant is what lets safe code read
+    /// through it (the [`Debug`](std::fmt::Debug) impl's `class_getName`): a
+    /// safe `from_ptr` handed any other pointer let safe code read arbitrary
+    /// memory. A class named at compile time comes from [`class`], a class
+    /// this crate registered from [`crate::ClassMeta::class`].
+    ///
+    /// Safe code cannot build one from an arbitrary pointer:
+    ///
+    /// ```compile_fail,E0133
+    /// let bogus = std::ptr::without_provenance_mut::<std::ffi::c_void>(0x10);
+    /// let cls = aterm_objc::ClassPtr::from_ptr(bogus);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null or a class object the Objective-C runtime has
+    /// registered (from `objc_getClass`, `object_getClass`,
+    /// `objc_registerClassPair` or an address one of them returned).
     #[inline]
     #[must_use]
-    pub const fn from_ptr(ptr: *mut c_void) -> Self {
+    pub const unsafe fn from_ptr(ptr: *mut c_void) -> Self {
         Self(ptr)
     }
 
@@ -231,8 +262,9 @@ impl ClassPtr {
 impl std::fmt::Debug for ClassPtr {
     /// Prints the class's name via `class_getName`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: `self` is null (reported as `"(nil)"` without a dereference)
-        // or a class object, which is immortal.
+        // SAFETY: the type's invariant: `self` is null (reported as `"(nil)"`
+        // without a dereference) or a registered class object, which is
+        // immortal. No safe constructor admits anything else.
         let name = unsafe { class_name(*self) };
         write!(f, "Class({})", name.to_string_lossy())
     }

@@ -20223,6 +20223,7 @@ impl App {
                             truncated: s.truncated,
                             searched_lines: s.searched_lines,
                             match_capped: s.match_capped,
+                            cut_short: s.cut_short,
                             // The count predates output that landed since (the
                             // search is not re-run per PTY burst), so the bar
                             // marks it stale.

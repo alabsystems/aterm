@@ -208,6 +208,15 @@ pub trait SessionHost {
     /// only times out.
     fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_>;
 
+    /// Whether session `sid` has ended — its program exited or it was closed —
+    /// so a verb parked on it answers `ERR exited` rather than waiting out its
+    /// deadline. The host notifies [`SessionHost::subscribe`]'s handles when it
+    /// happens. Defaults to `false`: a host whose sessions outlive every verb.
+    fn session_ended(&self, sid: u64) -> bool {
+        let _ = sid;
+        false
+    }
+
     /// Place `text` on the system clipboard; `false` if the write failed. Only
     /// called when [`HostCapabilities::clipboard`] is set.
     fn clipboard_set(&self, text: &str) -> bool;

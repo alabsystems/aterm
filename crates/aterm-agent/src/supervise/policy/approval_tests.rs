@@ -1187,8 +1187,8 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         "/etc/hosts",
         "/usr/share/dict/words",
         "/opt/homebrew/etc/x.conf",
-        "~/Developer/aterm-h-b2/README.md",
-        "~/Developer/ay/src/lib.rs",
+        "~/aterm-h-b2/README.md",
+        "~/ay/src/lib.rs",
         "/private/tmp/claude-502/scratch/x.log",
     ] {
         let d = on_screen(&read_box(ok), &ctx());
@@ -1198,8 +1198,6 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     // profile, another user's, a server's key directory.
     for outside in [
         "~/notes/todo.md",
-        // A checkout outside the developer root is under no default trust root.
-        "~/aterm/README.md",
         "~/.zsh_history",
         "/Users/_owner/Library/Application Support/Google/Chrome/Default/Cookies",
         "/Users/_other/aterm/x",
@@ -1213,19 +1211,19 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     assert!(approved(&d).is_none(), "{d:?}");
     // Under an allowed root, a secret is still refused.
     for secret in [
-        "~/Developer/aterm/.env",
-        "~/Developer/aterm/.env.local",
-        "~/Developer/aterm/deploy/server.KEY",
-        "~/Developer/aterm/.ssh/config",
-        "~/Developer/ay/x/.npmrc",
-        "~/Developer/trust-x/.pypirc",
-        "~/Developer/aterm/credentials.json",
+        "~/aterm/.env",
+        "~/aterm/.env.local",
+        "~/aterm/deploy/server.KEY",
+        "~/aterm/.ssh/config",
+        "~/ay/x/.npmrc",
+        "$HOME/trust-x/.pypirc",
+        "~/aterm/credentials.json",
         "/private/tmp/claude-502/a.sock.token",
         "/private/tmp/claude-502/.zsh_history",
         "/etc/ssl/private/server.key",
-        "~/Developer/aterm/id_ed25519",
-        "~/Developer/aterm/.gcloud/gcloud/x",
-        "~/Developer/aterm/.vault-token",
+        "~/aterm/id_ed25519",
+        "~/aterm/.gcloud/gcloud/x",
+        "~/aterm/.vault-token",
     ] {
         let d = on_screen(&read_box(secret), &ctx());
         assert!(reason(&d).contains("secret"), "{secret}: {d:?}");
@@ -1254,7 +1252,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     assert!(approved(&on_screen(&read_box("/etc/hosts"), &none(ctx()))).is_none());
     // The same judgement on 2.1.292's layout, which the reader once took the
     // first dashed rule for the path of: every Read escalated.
-    for ok in ["/etc/hosts", "~/Developer/ay/src/lib.rs"] {
+    for ok in ["/etc/hosts", "~/ay/src/lib.rs"] {
         for rows in [read_call_box(ok), read_call_box_2_1_284(ok)] {
             let d = on_screen(&rows, &ctx());
             assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{ok}: {d:?}");
@@ -1262,7 +1260,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     }
     for (path, why) in [
         ("~/notes/todo.md", "allowed root"),
-        ("~/Developer/aterm/.env", "secret"),
+        ("~/aterm/.env", "secret"),
         ("/etc/ssl/private/server.key", "secret"),
     ] {
         let d = on_screen(&read_call_box(path), &ctx());
@@ -1288,10 +1286,10 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         assert_eq!((rule, subject), (RULE_READ_OUTSIDE_CWD, whole.as_str()));
         assert_eq!(guarded(guard, &rows), [format!(" Read({whole})")], "{view}");
         for secret in [
-            "~/Developer/aterm/.env",
+            "~/aterm/.env",
             "/etc/ssl/cert.pem",
             "/etc/ssl/private/server.key",
-            "~/Developer/ay/x/.npmrc",
+            "~/ay/x/.npmrc",
         ] {
             let d = on_screen(&read_call_box(&format!("{secret}{view}")), &ctx());
             assert!(reason(&d).contains("secret"), "{secret}{view}: {d:?}");
@@ -1316,7 +1314,7 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
     // `~` needs a home to resolve against.
     let mut homeless = ctx();
     homeless.home = None;
-    assert!(approved(&on_screen(&read_box("~/Developer/aterm/x"), &homeless)).is_none());
+    assert!(approved(&on_screen(&read_box("~/aterm/x"), &homeless)).is_none());
 }
 
 // --- the folder-trust dialog -------------------------------------------------
@@ -1388,7 +1386,7 @@ fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     unknown.cwd_known = false;
     assert!(reason(&on_screen(&rows, &unknown)).contains("cwd unknown"));
     let mut rootless = ctx();
-    rootless.set_trust_roots(&["~/Developer/aterm*".to_string()], 502);
+    rootless.set_trust_roots(&["~/aterm*".to_string()], 502);
     assert!(reason(&on_screen(&rows, &rootless)).contains("no trust root"));
     assert!(reason(&on_screen(&rows, &none(ctx()))).contains("approve = \"none\""));
 }
@@ -1415,7 +1413,7 @@ fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
     else {
         panic!("{d:?}");
     };
-    let wait = "Wait here, then continue automatically at Sep 27 at 7pm";
+    let wait = "Wait here, then continue automatically at 12:23pm";
     assert_eq!(*unproven, None, "the rule proves the wait row");
     assert_eq!(*rule_id, RULE_LIMIT_WAIT);
     assert_eq!(
@@ -1429,7 +1427,7 @@ fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
     let m = aterm_observe::row_matcher(guard).expect("compiles");
     assert_eq!(
         rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
-        [" What do you want to do?"]
+        ["  What do you want to do?"]
     );
     for wait in [
         "Wait here, then continue automatically shortly",
@@ -1640,7 +1638,7 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
         .iter()
         .position(|r| r.trim() == "What do you want to do?")
         .expect("the title");
-    other[t] = " You've hit your limit".to_string();
+    other[t] = "  You've hit your limit".to_string();
     for rows in [
         other,
         phase_fixtures::limit_options_dialog(&["Upgrade your plan", CREDITS], 0),
@@ -2328,20 +2326,12 @@ fn the_default_context_has_decision_ones_roots() {
     assert_eq!(
         trust,
         [
-            "/Users/_owner/Developer/aterm*",
-            "/Users/_owner/Developer/ay*",
-            "/Users/_owner/Developer/trust*",
+            "/Users/_owner/aterm*",
+            "/Users/_owner/ay*",
+            "/Users/_owner/trust*",
             "/private/tmp/claude-502"
         ]
     );
-    // A worktree under the developer root is trusted; the same name in the bare
-    // home is not.
-    let held = |p: &str| {
-        let comps = abs_components(p).expect("abs");
-        c.trust_roots.iter().any(|r| r.holds(&comps))
-    };
-    assert!(held("/Users/_owner/Developer/aterm-wt/src"));
-    assert!(!held("/Users/_owner/aterm/src"));
     let read: Vec<&str> = c.read_roots.iter().map(ScratchRoot::label).collect();
     assert_eq!(
         read[4..],
@@ -3896,13 +3886,10 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
         502,
         None,
     );
-    let mut safe = ApprovalCtx {
+    let safe = ApprovalCtx {
         approve: Approve::Safe,
         ..own.clone()
     };
-    // The captured folder sits in the bare home, under no default trust root: name
-    // it, so what refuses the press is the backstop's options, not the root.
-    safe.set_trust_roots(&["~/aterm*".to_string()], 502);
     let d = on_screen(&backstop, &safe);
     assert!(reason(&d).contains("options are not exactly"), "{d:?}");
     let d = on_screen(&backstop, &own);
@@ -4605,13 +4592,7 @@ fn guarded_row(guard: &str, rows: &[String]) -> Option<String> {
 /// The decline [`decline`] builds on the box on `rows` for `text`.
 fn decline_on(rows: &[String], text: &str) -> Result<Decision, String> {
     let p = aterm_phase::parse_prompt_v2(rows).expect("the box");
-    decline(
-        RULE_UNDER_TEST,
-        &p,
-        rows,
-        text.to_string(),
-        "the box".to_string(),
-    )
+    decline(RULE_UNDER_TEST, &p, text.to_string(), "the box".to_string())
 }
 
 /// The decline over the four captured states: each state is declined on
@@ -6395,4 +6376,182 @@ fn the_paused_goals_box_is_answered_only_for_the_upgrades_resume() {
             }
         }
     }
+}
+
+/// A kind's reason takes the article its word does: the 2026-10-09 sweep's
+/// ledger read `a edit box: no rule approves this kind`.
+#[test]
+fn a_kinds_reason_takes_its_article() {
+    assert_eq!(
+        reason(&on_screen(&lines(CAP_EDIT), &ctx())),
+        "an edit box: no rule approves this kind"
+    );
+}
+
+/// Claude Code 2.1.295 MEASURED (tools/real-claude-lab, 2026-10-09): a file box
+/// an ask rule sends to a person draws no reason, the box an unruled call
+/// draws — under `ask: ["Write", "Edit"]` and `ask: ["Read"]` in manual mode,
+/// and under `ask: ["NotebookEdit"]` in accept-edits mode.
+const ASK_WRITE: &str = include_str!("fixtures/claude-2.1.295-box-write-ask-rule.txt");
+const ASK_EDIT: &str = include_str!("fixtures/claude-2.1.295-box-edit-ask-rule.txt");
+const ASK_READ_OUTSIDE: &str =
+    include_str!("fixtures/claude-2.1.295-box-read-outside-ask-rule.txt");
+const ASK_NOTEBOOK: &str =
+    include_str!("fixtures/claude-2.1.295-box-edit-notebook-ask-rule-acceptedits.txt");
+
+/// The sweep's wrong action (2026-10-09, Claude Code 2.1.295): the owner's
+/// BARE-TOOL ask rule for a file box's tool, read from the agent's own
+/// settings ([`ApprovalCtx::owner_asks`]), holds the captured box at every
+/// level, naming the rule and its file; settings that could not be read hold
+/// it too, saying so. Negative controls: with no rule, or a rule for another
+/// tool (each bare rule is its own tool's, as Claude Code applies it), the
+/// box is the levels' as before — full power's one-shot allow, the safe
+/// rules' Read outside the project. The IDE diff (hand-built from the render
+/// code) names no tool, so any edit tool's rule holds it.
+#[test]
+fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
+    let source = "/Users/_owner/.claude/settings.json";
+    let rule = |tool: &str| AskRule {
+        tool: tool.to_string(),
+        rule: tool.to_string(),
+        source: source.to_string(),
+    };
+    let under = |c: ApprovalCtx, asks: Result<Vec<AskRule>, String>| ApprovalCtx {
+        owner_asks: asks,
+        ..c
+    };
+    let ide = phase_fixtures::BOX_EDIT_IDE;
+    for (name, text, tool, other, unruled) in [
+        ("write", ASK_WRITE, "Write", "Edit", RULE_ALLOW_ONCE),
+        ("edit", ASK_EDIT, "Edit", "Write", RULE_ALLOW_ONCE),
+        (
+            "read outside",
+            ASK_READ_OUTSIDE,
+            "Read",
+            "Write",
+            RULE_READ_OUTSIDE_CWD,
+        ),
+        (
+            "notebook",
+            ASK_NOTEBOOK,
+            "NotebookEdit",
+            "Edit",
+            RULE_ALLOW_ONCE,
+        ),
+        ("ide diff", ide, "Write", "Read", RULE_ALLOW_ONCE),
+    ] {
+        let rows = phase_fixtures::screen(text);
+        for c in [full(), ctx(), none(full())] {
+            let held = reason(&on_screen(&rows, &under(c, Ok(vec![rule(tool)])))).to_string();
+            assert_eq!(
+                held,
+                format!(
+                    "the owner's Claude Code settings send this box to a person (an ask rule): \
+                     `{tool}` in {source}"
+                ),
+                "{name}"
+            );
+        }
+        let unread = on_screen(&rows, &under(full(), Err("they were not read".to_string())));
+        assert!(
+            reason(&unread)
+                .ends_with("may send to a person, and they are unknown: they were not read"),
+            "{name}: {unread:?}"
+        );
+        for asks in [vec![], vec![rule(other)]] {
+            let d = on_screen(&rows, &under(full(), Ok(asks)));
+            assert_eq!(approval(&d).0, unruled, "{name}: {d:?}");
+        }
+    }
+}
+
+/// Claude Code 2.1.295 MEASURED (tools/real-claude-lab, 2026-10-09, the review
+/// of the sweep's fix): under `ask: ["Bash"]` in manual mode, a Bash `sed -i`
+/// of an in-project file is drawn as an `Edit file` box with NO reason — row
+/// for row the box the Edit tool draws (its bundle titles the Bash permission
+/// path's `_simulatedSedEdit` preview `Edit file`) — and 2.1.299 the same
+/// (MEASURED 2026-10-14, where the fixed harness held it).
+const ASK_BASH_SED: &str = include_str!("fixtures/claude-2.1.295-box-bash-sed-edit-ask-rule.txt");
+const ASK_BASH_SED_299: &str =
+    include_str!("fixtures/claude-2.1.299-box-bash-sed-edit-ask-rule.txt");
+
+/// A box Claude Code can draw for more than one tool names none of them, so
+/// a bare ask rule for ANY of them holds it at every level (fail-closed): the
+/// captured `Edit file` box of a Bash `sed -i` under `ask: ["Bash"]` (pressed
+/// by full power in the review of 2026-10-09), and the Edit tool's own box
+/// under the same rule, which nothing on it tells apart; the Read box under a
+/// `Glob` or `Grep` rule (Claude Code's file-box builder titles every
+/// read-only file tool's box `Read file`); the IDE diff under `Bash`.
+/// Negative controls: unruled, or under a rule for a tool that never draws the
+/// box, each is the levels' as before.
+#[test]
+fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
+    let source = "/Users/_owner/.claude/settings.json";
+    let rule = |tool: &str| AskRule {
+        tool: tool.to_string(),
+        rule: tool.to_string(),
+        source: source.to_string(),
+    };
+    let under = |c: ApprovalCtx, asks: Vec<AskRule>| ApprovalCtx {
+        owner_asks: Ok(asks),
+        ..c
+    };
+    let ide = phase_fixtures::BOX_EDIT_IDE;
+    for (name, text, tool, other, unruled) in [
+        ("bash sed", ASK_BASH_SED, "Bash", "Write", RULE_ALLOW_ONCE),
+        (
+            "bash sed 2.1.299",
+            ASK_BASH_SED_299,
+            "Bash",
+            "Read",
+            RULE_ALLOW_ONCE,
+        ),
+        ("edit", ASK_EDIT, "Bash", "NotebookEdit", RULE_ALLOW_ONCE),
+        (
+            "read outside",
+            ASK_READ_OUTSIDE,
+            "Grep",
+            "Bash",
+            RULE_READ_OUTSIDE_CWD,
+        ),
+        (
+            "read outside",
+            ASK_READ_OUTSIDE,
+            "Glob",
+            "Edit",
+            RULE_READ_OUTSIDE_CWD,
+        ),
+        ("ide diff", ide, "Bash", "Read", RULE_ALLOW_ONCE),
+    ] {
+        let rows = phase_fixtures::screen(text);
+        for c in [full(), ctx(), none(full())] {
+            assert_eq!(
+                reason(&on_screen(&rows, &under(c, vec![rule(tool)]))),
+                format!(
+                    "the owner's Claude Code settings send this box to a person (an ask rule): \
+                     `{tool}` in {source}"
+                ),
+                "{name} under `{tool}`"
+            );
+        }
+        for asks in [vec![], vec![rule(other)]] {
+            let d = on_screen(&rows, &under(full(), asks));
+            assert_eq!(approval(&d).0, unruled, "{name}: {d:?}");
+        }
+    }
+}
+
+/// A WRAPPED FOOTER (aterm-phase's prompt.rs): an ordinary Bash box in a
+/// 26-column pane (MEASURED on 2.1.295, its footer `Esc to cancel · Tab to`
+/// over `amend`) read `idle`, and nothing was pressed or escalated. Read
+/// whole, it is pressed under full power as at any width, and a decline
+/// still finds its `No` offered `Tab to amend` with no amend input open: the
+/// footer is the box's whole footer, never its last row.
+#[test]
+fn a_box_whose_footer_wraps_is_decided_by_its_whole_footer() {
+    let rows = phase_fixtures::screen(phase_fixtures::BOX_BASH_26_2_1_295);
+    assert_eq!(approved(&on_screen(&rows, &full())), Some(RULE_ALLOW_ONCE));
+    let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect("the box");
+    assert_eq!(refusal_of(&p, "use another name"), Ok(3));
+    assert!(!amend_input_open(&p));
 }

@@ -14,27 +14,22 @@
 //! press, and no verb, config key or automatic trigger starts it. Off the main
 //! thread it re-checks (a fresh census, the copy's identity right before the
 //! move, whether a process runs from it) and moves the copy with
-//! `/usr/bin/trash`, so it stays recoverable.
+//! `/usr/bin/trash` ([`atpkg::copies::trash`], the move `aterm doctor`'s prune
+//! makes too), so it stays recoverable.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use aterm_containment::consent::{self, Claimants, Retired};
 
 /// The trash tool macOS 15 and later ship.
-pub(crate) const TRASH_TOOL: &str = "/usr/bin/trash";
+pub(crate) const TRASH_TOOL: &str = atpkg::copies::TRASH_TOOL;
 
 /// Whether [`TRASH_TOOL`] is on this Mac, read once: it ships with the OS.
 pub(crate) fn trash_tool_present() -> bool {
     static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PRESENT.get_or_init(|| Path::new(TRASH_TOOL).is_file())
 }
-
-/// How long one move may take. Within a volume it is a rename; across
-/// volumes it is a copy.
-const TRASH_CEILING: Duration = Duration::from_secs(120);
 
 /// The worker's reaches, injected so a headless instance and every unit test
 /// get arms that read nothing and move nothing.
@@ -52,7 +47,7 @@ impl RetireArms {
             census: consent::claimants_for,
             unchanged: consent::still_claims,
             in_use: atpkg::gc::runs_from,
-            trash: trash_with_tool,
+            trash: atpkg::copies::trash,
         }
     }
 
@@ -206,64 +201,10 @@ pub(crate) fn summary(moved: usize, of: usize) -> String {
     }
 }
 
-/// Move `path` to the Trash with [`TRASH_TOOL`], bounded by [`TRASH_CEILING`].
-/// The error is the system's own reason when it gave one.
-fn trash_with_tool(path: &Path) -> Result<(), String> {
-    use aterm_uds::spawnfd::Stdio;
-    // Census paths are absolute, so the argument can never read as an option.
-    if !path.is_absolute() {
-        return Err("not an absolute path".to_string());
-    }
-    let mut child = aterm_uds::spawnfd::command(TRASH_TOOL)
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{TRASH_TOOL} could not run: {e}"))?;
-    let deadline = Instant::now() + TRASH_CEILING;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "the move did not finish within {} s",
-                    TRASH_CEILING.as_secs()
-                ));
-            }
-        }
-    };
-    if status.success() {
-        return Ok(());
-    }
-    let mut stderr = String::new();
-    if let Some(pipe) = child.stderr.take() {
-        let _ = pipe.take(8 * 1024).read_to_string(&mut stderr);
-    }
-    Err(
-        trash_refusal(&stderr).unwrap_or_else(|| match status.code() {
-            Some(code) => format!("{TRASH_TOOL} exited {code}"),
-            None => format!("{TRASH_TOOL} was ended by a signal"),
-        }),
-    )
-}
-
-/// The system's reason from the tool's stderr: the first quoted description
-/// after `Code=<n>`, e.g. `The file “x.app” doesn’t exist.`
-fn trash_refusal(stderr: &str) -> Option<String> {
-    let after = &stderr[stderr.find("Code=")?..];
-    let open = after.find('"')? + 1;
-    let len = after[open..].find('"')?;
-    let reason = after[open..open + len].trim();
-    (!reason.is_empty()).then(|| reason.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const DEV_ID: &str = "designated => identifier \"x\" and anchor apple generic and \
                           certificate leaf[subject.OU] = \"T\"";
@@ -399,7 +340,7 @@ mod tests {
         ));
         assert!(std::ptr::fn_addr_eq(
             live.trash,
-            trash_with_tool as fn(&Path) -> Result<(), String>
+            atpkg::copies::trash as fn(&Path) -> Result<(), String>
         ));
     }
 
@@ -416,19 +357,6 @@ mod tests {
             "Moved 1 of 2 copies to the Trash; the other stayed where it was."
         );
         assert_eq!(summary(0, 1), "Nothing was moved.");
-    }
-
-    #[test]
-    fn the_refusal_is_the_systems_own_words() {
-        let stderr = "2026-09-23 22:29:30.491 trash[79297:53920104] # Error attempting to move \
-                      /x/Nope.app to the trash folder, Error Domain=NSCocoaErrorDomain Code=4 \
-                      \"The file “Nope.app” doesn’t exist.\" UserInfo={NSURL=file:///x/Nope.app}";
-        assert_eq!(
-            trash_refusal(stderr).as_deref(),
-            Some("The file “Nope.app” doesn’t exist.")
-        );
-        assert_eq!(trash_refusal("no code here"), None);
-        assert_eq!(trash_refusal("Code=4 \"\""), None);
     }
 
     /// No control module names an entry point that raises a consent surface (the
@@ -489,26 +417,5 @@ mod tests {
         ] {
             assert!(lib.contains(entry), "`{entry}` moved; update ENTRY_POINTS");
         }
-    }
-
-    /// The live tool on a missing path runs, moves nothing, and reports its own
-    /// refusal. A successful move is not exercised: it would touch the real Trash.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_trash_tool_names_why_it_could_not_move_a_copy() {
-        if !Path::new(TRASH_TOOL).is_file() {
-            eprintln!("{TRASH_TOOL} absent (macOS before 15): skipped");
-            return;
-        }
-        let missing = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("aterm-retire-missing-{}.app", std::process::id()));
-        let refused = trash_with_tool(&missing).unwrap_err();
-        // The system's own words, in whatever language this Mac speaks, name
-        // the file — never the generic exit-status fallback.
-        assert!(refused.contains("aterm-retire-missing"), "{refused}");
-        assert!(!refused.contains(TRASH_TOOL), "{refused}");
-        assert!(trash_with_tool(Path::new("relative.app")).is_err());
     }
 }

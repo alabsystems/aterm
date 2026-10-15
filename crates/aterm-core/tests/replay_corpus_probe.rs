@@ -9,6 +9,10 @@
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
+// The corpus records are generated and their layout is their content (xtask's
+// `FMT_SWEEP_EXCLUSIONS`). A trustfmt from Trust `77d28e49f5` on follows a
+// literal `include!` and formats the file it names; the skip keeps it out.
+#[rustfmt::skip]
 include!("support/replay_corpus_data.rs");
 
 const ROWS: u16 = 12;

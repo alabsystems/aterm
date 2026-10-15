@@ -541,14 +541,23 @@ pub const VERBS: &[VerbSpec] = &[
          Developer Tools list (`kTCCServiceDeveloperTool`), which macOS asks before a new \
          program run in aterm first starts. It reads `devtools \
          state=<allowed|denied|unlisted|unknown> subject=<bundle id|-> requests=<n|-> \
-         not_allowed=<n|-> answer_age_ms=<n|-> window_s=600 probe=<label> probe_age_ms=<n|->`. \
+         not_allowed=<n|-> answer_age_ms=<n|-> window_s=600 probe=<label> probe_age_ms=<n|-> \
+         grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe=<label>`. \
+         `grant=` is the verdict, both halves joined: `list=` is aterm's switch on the list \
+         (its row in the system TCC.db, read-only: `on`, `off`, `absent`), and tccd's answer \
+         below decides instead when it is newer than the switch's last change; `unknown` only \
+         when neither was read. `list_probe=` says why `list=` reads as it does (`read`; \
+         `no_full_disk_access` = the database opens only to an app with Full Disk Access; \
+         `sqlite_failed`, `format_unrecognized`, `timed_out`, `spawn_failed`, \
+         `output_unreadable`, `open_failed`; the `refused_*` labels). \
          `state=` is tccd's newest answer for `subject=` in its own log over the last \
          `window_s=` seconds (macOS asks it once per new program aterm starts). tccd answers \
          for the app a new program starts under, and its log names that app by bundle \
          id alone, so `state=` and the counts also take in answers for another copy carrying \
          aterm's id; how tccd answers a copy that does not meet the code requirement it holds \
-         for aterm is unmeasured. A background `log show` reads it; it raises no dialog, needs \
-         no Full Disk Access and never opens TCC.db. `unlisted` is tccd's `Unknown (None)`, its \
+         for aterm is unmeasured. A background `log show` reads it, and one `sqlite3 -readonly` \
+         the switch; neither raises a dialog or writes anything. `unlisted` is tccd's \
+         `Unknown (None)`, its \
          measured answer while aterm is not on the list. `requests=` counts tccd's \
          answers for aterm in the window and `not_allowed=` those that were not `allowed`: new \
          programs macOS checked before letting them start. `answer_age_ms=` is the age of \
@@ -556,11 +565,13 @@ pub const VERBS: &[VerbSpec] = &[
          `unlisted`: see `probe=` (`pending` = not read yet, usually on a first read; \
          `no_recent_request`; `log_unavailable` = not an administrator account; `log_failed`, \
          `timed_out`, `spawn_failed`, `output_unreadable` = aterm could not read the log this \
-         time; `refused_observer_off`; `format_unrecognized`). A change shows only after the \
-         next new program starts. The list has no dialog of its own, and only a human changes \
-         it, in System Settings: `remediate devtools=settings:Privacy_DevTools` names that \
-         place, never a command. `spctl developer-mode` adds only Terminal; `tccutil`, editing \
-         TCC.db and `sudo` are not the fix. Being listed should also skip macOS's first-run \
+         time; `refused_observer_off`; `format_unrecognized`). tccd's answer changes only \
+         after the next new program starts; `list=` the moment the switch moves. The list has \
+         no dialog of its own, and only a human changes it, in System Settings: `remediate \
+         devtools=settings:Privacy_DevTools` names that place, never a command; `aterm doctor` \
+         and the window open it for the owner. `spctl developer-mode enable-terminal` adds \
+         only Terminal (it makes the pane appear on a Mac whose list is empty); `tccutil`, \
+         editing TCC.db and `sudo` are not the fix. Being listed should also skip macOS's first-run \
          malware scan for everything run in aterm, agents and downloaded tools included, so it \
          is the operator's decision. \
          `access_card` says where the Full Disk Access question stands, with no dialog of its \
@@ -776,10 +787,12 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "search <pat> [case] [regex]: find in history; OK <n>[ incomplete…], \"<row> <col> <len>\" each",
-        "(searches the newest search_history_lines lines, default 100000; incomplete alone: \
-         older history was not searched; incomplete capped: the list stopped at 100000 \
-         matches; incomplete rewrapping: a resize holds the history away, only the screen \
-         was searched. A hit straddling a SOFT WRAP is one match whose col+len runs past the \
+        "(searches the newest search_history_lines lines, default 100000; incomplete is \
+         followed by every cause that applies: capped: the list stopped at 100000 matches; \
+         rewrapping: a resize holds the history away, only the screen was searched; \
+         long-line: a regex ran out of scan budget on a very long line, so that line was \
+         not searched to its end; older: older history was not searched either. incomplete \
+         alone: older history was not searched. A hit straddling a SOFT WRAP is one match whose col+len runs past the \
          grid width and continues at column 0 of the next row; regex ^ and $ bind to the reader's \
          LOGICAL line, so a continuation row has no ^ of its own)",
     ),
@@ -2104,8 +2117,12 @@ pub const VERBS: &[VerbSpec] = &[
          or named turn, or another supervisor's claim that lands after the request pauses the \
          SIGKILL until it is lifted, while the stamp stands; one that outlasts the stamp lets the \
          program go. No SIGKILL is sent in the stamp's last 30 s, nor after it, when its exit \
-         would no longer be read as the restart's. `[harness] relaunch = false` does not refuse \
-         it. Refused under a hold like `signal`. POSIX only: Windows \
+         would no longer be read as the restart's, nor once the tab's stamp names another \
+         program (a later restart's), nor before this window's harness has read the agent (a \
+         successor after a seamless update reads it once it leads its tab again). Its end read \
+         while a hold, a lease or a turn stands is still the restart's: relaunched once that is \
+         lifted, unless another supervisor claims the tab first, which takes it. `[harness] \
+         relaunch = false` does not refuse it. Refused under a hold like `signal`. POSIX only: Windows \
          answers `ERR restart unsupported on this platform`",
     ),
     v(
@@ -2697,7 +2714,8 @@ pub const VERBS: &[VerbSpec] = &[
          it ends `ERR exited` when this session exits. An older server answers `ERR \
          usage: await consent [timeout=<ms>]`: read `privacy` once instead, never in a loop. \
          And `await inbox`'s hold-TRANSITION latch answers `OK inbox \
-         hold=0|1`. Every form answers `OK timeout` otherwise, after 30 s by \
+         hold=0|1`. Every form answers `ERR exited` once its session exits or is closed, and \
+         `OK timeout` otherwise, after 30 s by \
          default (`await consent` 300 s; max 600 s), which the client exits 124 on. \
          Each parked wait holds one of the 64 wait slots every tab shares (past them, one of 4 \
          request slots; then `ERR control server busy`), so park at most one per driver.",
@@ -2709,8 +2727,8 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "wait [<ms>]: block until the running command completes (OSC 133)",
         "Answers `OK complete <id> exit=<code|->`; with nothing running it returns the newest \
-         completed block at once. `OK timeout` after 30 s by default (max 600 s); without shell \
-         integration it can only time out.",
+         completed block at once. `ERR exited` once the session exits or is closed; `OK timeout` \
+         after 30 s by default (max 600 s); without shell integration it can only time out or end.",
     ),
     // streaming
     v(
@@ -4580,6 +4598,9 @@ mod tests {
             "kTCCServiceDeveloperTool",
             "settings:Privacy_DevTools",
             "`unknown` is not `unlisted`",
+            "grant=<granted|not_granted|unknown>",
+            "list=<on|off|absent|unknown>",
+            "`no_full_disk_access`",
             "first-run malware scan",
             "agents and downloaded tools included",
             "`log_failed`",

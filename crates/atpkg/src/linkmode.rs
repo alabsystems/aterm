@@ -532,26 +532,6 @@ pub fn linked_bins(layout: &Layout, program: &str) -> Vec<String> {
 }
 
 pub fn refresh(layout: &Layout, program: &str) -> Result<LinkOutcome, LinkError> {
-    relink_from(layout, program, None)
-}
-
-/// Lay `program`'s dev link again from `checkout`, the place its recorded checkout was
-/// moved to (`aterm pkg devroot move`, [`crate::devroot`]): [`link`] with the marker's own
-/// bins, so the shims and the marker both name the new place. DELETION POINT: goes with
-/// the move ([`crate::devroot`]'s module header).
-///
-/// # Errors
-/// Not linked, an unreadable marker, or [`link`]'s.
-pub fn relink(layout: &Layout, program: &str, checkout: &Path) -> Result<LinkOutcome, LinkError> {
-    relink_from(layout, program, Some(checkout))
-}
-
-/// [`refresh`] (`checkout` `None`: the marker's own) and [`relink`].
-fn relink_from(
-    layout: &Layout,
-    program: &str,
-    checkout: Option<&Path>,
-) -> Result<LinkOutcome, LinkError> {
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));
     }
@@ -562,7 +542,7 @@ fn relink_from(
             LinkError::Io(format!("could not read link marker for {program}: {error}"))
         }
     })?;
-    let checkout = checkout.map_or_else(|| PathBuf::from(&marker.checkout), Path::to_path_buf);
+    let checkout = PathBuf::from(&marker.checkout);
     let bins: Vec<PathBuf> = marker.bins.iter().map(PathBuf::from).collect();
     link(layout, program, &checkout, &bins)
 }

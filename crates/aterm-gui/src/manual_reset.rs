@@ -49,6 +49,19 @@
 //! the term lock on the calling thread and records the timeline event only —
 //! there is no stream left to order it against, or no parse stage to carry it.
 //!
+//! So does a reset on a session an update has PARKED (the park closes the
+//! lane): it lands on this process's engine after the park took the carry the
+//! successor will restore. Committing over it would hand the successor the
+//! stuck modes the reply just reported reverted (the lifecycle audit of
+//! 2026-10-14, handoff finding 2). So a direct reset, once applied, moves the
+//! session's carry serial before it is answered
+//! (`fabric::SessionFabric::note_direct_reset`), which the park reads before
+//! its carry and the Commit compares again under its hold fence: a Commit
+//! that reads it moved stands down — a lossless retry — and this engine,
+//! reset, runs on; one that read it first holds the reset's answer back until
+//! its `_exit` (the reset dies unanswered) or its stand-down (answered then).
+//! Past the verb's wait it is refused [`RESET_BUSY`].
+//!
 //! `flush` (the verb only) then drops the tty input queue — the kernel's and
 //! whatever aterm still holds behind it (`SinkWriter::discard_unread_input`,
 //! the `signal term` remedy's discard, labelled `Discard::Flush` so it is
@@ -106,9 +119,21 @@ pub(crate) struct ResetReport {
 }
 
 /// How long the verb waits for the parse stage. A reader that does not answer
-/// in this long is parked (an update handoff) or wedged; the request stays
-/// queued and runs when it resumes, and the reply says so.
+/// in this long is busy or wedged: the request stays on its channel and runs
+/// when the parse stage reaches it, unless the reader stops first (an update's
+/// park or the session's end drops the channel, and the request with it), and
+/// the reply says so. A request the reader drops while the verb still waits
+/// runs directly ([`request`]). A direct reset waits as long again for a
+/// committing update ([`run_direct`]).
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The verb's answer when a seamless update was committing the session for the
+/// whole of its wait ([`run_direct`]): the reset ran on this process's engine,
+/// which the update is about to replace with one that may not have it. `ERR
+/// busy` is the class a driver retries, and the retry reaches whichever process
+/// then owns the session.
+pub(crate) const RESET_BUSY: &str = "ERR busy update-committing (the reset reached this aterm, \
+                                     which an update is replacing; retry)\n";
 
 /// The `modes-restored` payload of a manual reset:
 /// `reason=manual source=<ctl|menu> reverted=<csv|-> bytes=<n>`. An automatic
@@ -154,19 +179,30 @@ pub(crate) fn record(
 }
 
 /// The reset where no parse stage can carry it: under the term lock on this
-/// thread, then the timeline (see the module docs).
+/// thread, then the carry serial and the timeline (see the module docs).
+///
+/// `fence_wait` bounds the wait for a committing update's fence
+/// (`fabric::SessionFabric::note_direct_reset`); past it the answer is
+/// [`RESET_BUSY`]. `None` on the main thread, which never waits: it raises the
+/// fence itself.
 pub(crate) fn run_direct(
     sid: u64,
     term: &std::sync::Mutex<Terminal>,
     ctx: &SessionCtx,
     source: ResetSource,
-) -> ResetReport {
+    fence_wait: Option<Duration>,
+) -> Result<ResetReport, String> {
     let (report, _) = {
         let mut t = crate::term_lock(term);
         apply(&mut t)
     };
+    let noted = ctx.fabric.note_direct_reset(fence_wait);
     record(sid, &ctx.timeline, source, &report);
-    report
+    if noted {
+        Ok(report)
+    } else {
+        Err(RESET_BUSY.to_string())
+    }
 }
 
 /// Ask for a reset and, with `wait`, for its report. The parse stage runs it
@@ -201,7 +237,7 @@ pub(crate) fn request(
                 "ERR busy reset (this session's reader queue is full; retry)\n".to_string(),
             );
         }
-        LaneOffer::Closed => return Ok(Some(run_direct(sid, term, ctx, source))),
+        LaneOffer::Closed => return run_direct(sid, term, ctx, source, wait).map(Some),
     }
     let (Some(rx), Some(timeout)) = (rx, wait) else {
         return Ok(None);
@@ -209,13 +245,13 @@ pub(crate) fn request(
     match rx.recv_timeout(timeout) {
         Ok(report) => Ok(Some(report)),
         Err(RecvTimeoutError::Timeout) => Err(format!(
-            "ERR reset timed out after {} ms (the session's reader is parked or busy; the reset \
-             stays queued and runs if that reader resumes)\n",
+            "ERR reset timed out after {} ms (the session's reader is busy; the reset stays \
+             queued and runs when the reader reaches it, unless the reader stops first)\n",
             timeout.as_millis()
         )),
         // The reader exited with the request unanswered: no stream is left to
         // order against, so run it here.
-        Err(RecvTimeoutError::Disconnected) => Ok(Some(run_direct(sid, term, ctx, source))),
+        Err(RecvTimeoutError::Disconnected) => run_direct(sid, term, ctx, source, wait).map(Some),
     }
 }
 
@@ -326,7 +362,8 @@ impl Drop for LaneGuard {
 /// under canonical mode, which FIONREAD does not report — measured on the
 /// live headless try of 2026-09-26: `junkjunk` typed during `sleep 4` answered
 /// `discarded=0` and never reached zle, where the same run without `flush`
-/// put `junkjunk` on the next command line. A HELD session
+/// put `junkjunk` on the next command line. [`RESET_BUSY`] when a seamless
+/// update was committing the session for the whole of the wait. A HELD session
 /// never gets here: `reset` is in the halt set (`fabric::is_pty_reaching`), so
 /// the dispatch answers `ERR halted …` first — the human's escape hatch under a
 /// hold is the menu row, which no halt gates.

@@ -15,12 +15,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use aterm_core::grid::extra::ImageData;
 use aterm_core::grid::{CellFlags, Grid};
 use aterm_core::search::{
-    DEFAULT_MAX_CACHED_LINES, NarrowedSearch, SearchDirection as EngineSearchDirection,
+    DEFAULT_MAX_CACHED_LINES, LineCells, NarrowedSearch, SearchDirection as EngineSearchDirection,
     SearchMatch, SearchOptionsError, SearchResults, TerminalSearch, max_cached_for_retained,
 };
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
-use aterm_search::MAX_SEARCH_MATCHES;
+use aterm_search::{LineFrame, MAX_SEARCH_MATCHES};
 use aterm_types::text_shaping::AmbiguousWidth;
 use winit::event_loop::EventLoopProxy;
 
@@ -2521,7 +2521,10 @@ pub(crate) fn abs_row_wrapped(t: &Terminal, abs_row: u64) -> bool {
 /// Append the text and soft-wrap flag of absolute rows `first..first + count`
 /// to `text` and `wrapped` — row for row what [`abs_row_text`] and
 /// [`abs_row_wrapped`] answer, an evicted or unreadable row reading as an
-/// empty, unwrapped one.
+/// empty, unwrapped one — and, when `cells` is given, the grid cells each
+/// row's text was read from ([`LineCells`]: a visible row's live cells, a
+/// history row's as it is drawn, `history_line_text_cells`), which the search
+/// index reports matches in.
 ///
 /// The scrollback part is read through ONE dense walk
 /// ([`Grid::history_lines_from`]): one decode per tiered segment, the text and
@@ -2538,6 +2541,7 @@ pub(crate) fn read_abs_rows(
     count: usize,
     text: &mut Vec<String>,
     wrapped: &mut Vec<bool>,
+    mut cells: Option<&mut Vec<LineCells>>,
 ) {
     let grid = t.grid();
     let oldest = grid.oldest_absolute_row();
@@ -2551,6 +2555,9 @@ pub(crate) fn read_abs_rows(
     let evicted = rows_until(oldest, abs);
     text.extend(std::iter::repeat_n(String::new(), evicted));
     wrapped.extend(std::iter::repeat_n(false, evicted));
+    if let Some(cells) = cells.as_deref_mut() {
+        cells.extend(std::iter::repeat_n(LineCells::new(), evicted));
+    }
     abs = abs.saturating_add(evicted as u64);
     // Scrollback, through the dense walk. The oldest retained row is never a
     // continuation (`abs_row_wrapped`'s rule): its run's head is gone.
@@ -2562,11 +2569,23 @@ pub(crate) fn read_abs_rows(
             match lines.next().flatten() {
                 Some(line) => {
                     wrapped.push((start > 0 || k > 0) && line.is_wrapped());
-                    text.push(line.to_string());
+                    let row = line.to_string();
+                    if let Some(cells) = cells.as_deref_mut() {
+                        let idx = usize::try_from(start)
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(k);
+                        cells.push(aterm_core::terminal::history_line_text_cells(
+                            grid, idx, &line, &row,
+                        ));
+                    }
+                    text.push(row);
                 }
                 None => {
                     wrapped.push(false);
                     text.push(String::new());
+                    if let Some(cells) = cells.as_deref_mut() {
+                        cells.push(LineCells::new());
+                    }
                 }
             }
         }
@@ -2575,10 +2594,22 @@ pub(crate) fn read_abs_rows(
     // The visible screen, and anything past its bottom. Counted, not bounded by
     // `end`, so exactly `count` rows are appended whatever saturates.
     for _ in evicted.saturating_add(in_history)..count {
-        text.push(match abs_row_text(t, abs) {
-            AbsRow::Text(s) => s,
-            AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
-        });
+        match cells.as_deref_mut() {
+            // The same row `abs_row_text` reads (its visible arm), with cells.
+            Some(cells) => {
+                let (row, row_cells) = abs
+                    .checked_sub(history_end)
+                    .and_then(|visible| i32::try_from(visible).ok())
+                    .and_then(|visible| t.written_line_cells(visible))
+                    .unwrap_or_default();
+                text.push(row);
+                cells.push(row_cells);
+            }
+            None => text.push(match abs_row_text(t, abs) {
+                AbsRow::Text(s) => s,
+                AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
+            }),
+        }
         wrapped.push(abs_row_wrapped(t, abs));
         abs = abs.saturating_add(1);
     }
@@ -2612,7 +2643,7 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
     None
 }
 
-/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped| rewrapping]]\n`
+/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ older]]\n`
 /// then `<abs_row> <col> <len>` per match.
 ///
 /// SEARCH-1: backed by the engine's real `TerminalSearch`, indexing BOTH the
@@ -2651,11 +2682,16 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
 ///
 /// INCOMPLETE (DL-2): when the list is not exhaustive the header carries a
 /// trailing ` incomplete` token, so a client never trusts a short list silently,
-/// followed by the cause when it is not the depth cap: ` capped` when the list
-/// stopped at [`MAX_SEARCH_MATCHES`], ` rewrapping` when a width change's rewrap
-/// overlapped the search, so history it held away may not have been read. A
-/// bare ` incomplete` means history older than the newest `search_history_lines`
-/// lines was not read.
+/// followed by every cause that applies, in this order (see
+/// [`search_incomplete_marker`]): ` capped` when the list stopped at
+/// [`MAX_SEARCH_MATCHES`], ` rewrapping` when a width change's rewrap overlapped
+/// the search, so history it held away may not have been read, ` long-line`
+/// when a regex scan could not finish some line within the line's budget (a
+/// soft-wrapped run of megabytes), so matches past where it stopped on that line
+/// are missing — the pattern is fine, and the rest of the searched range was
+/// searched — and ` older` when, besides one of those, history older than the
+/// newest `search_history_lines` lines was not read. The depth cap alone is a
+/// bare ` incomplete`, as it has been since DL-2.
 ///
 /// LOCKING (P1.0c): the O(scrollback) index build NEVER runs under the Terminal
 /// mutex — a rebuild while the shell is streaming output would stall the PTY
@@ -2715,13 +2751,13 @@ fn cmd_search_capped(
             // Function-local (like the other `Write` uses in this file) so it can
             // never shadow an `io::Write` elsewhere in the module.
             use std::fmt::Write as _;
-            let capped = search.results.matches.len() >= MAX_SEARCH_MATCHES;
-            let qualifier = match (search.results.incomplete || rewrapping, capped, rewrapping) {
-                (false, _, _) => "",
-                (true, true, _) => " incomplete capped",
-                (true, false, true) => " incomplete rewrapping",
-                (true, false, false) => " incomplete",
-            };
+            let qualifier = search_incomplete_marker(
+                search.results.incomplete || rewrapping,
+                search.results.matches.len() >= MAX_SEARCH_MATCHES,
+                rewrapping,
+                search.results.cut_short_lines > 0,
+                search.searched_lines.is_some(),
+            );
             let mut out = format!("OK {}{qualifier}\n", search.results.matches.len());
             // One buffer, sized once: a match line ("<row> <col> <len>\n") is ~16
             // bytes typical, and the result set is capped at MAX_SEARCH_MATCHES
@@ -2739,6 +2775,49 @@ fn cmd_search_capped(
         }
         Err(e) => format!("ERR search: {e}\n"),
     }
+}
+
+/// The ` incomplete…` marker of a `search` reply header ([`cmd_search`]):
+/// empty for an exhaustive list, else ` incomplete` followed by EVERY cause that
+/// applies, in a fixed order — ` capped`, ` rewrapping`, ` long-line`, then
+/// ` older` for the depth cap (`search_history_lines` left older history
+/// unread). The depth cap alone stays a bare ` incomplete`, its form since DL-2,
+/// so a reader that knows only that form still reads it right; the rule a reader
+/// applies is "older history was not searched when no cause follows
+/// ` incomplete`, or when ` older` does".
+///
+/// Ruling 2026-10-11 (R15 content-2 review): the header named ONE cause, and the
+/// first one won, so a depth cap under a cut-short line (`long-line`), a full
+/// list (`capped`) or a rewrap went unsaid, and an agent reading the verb help
+/// concluded the older history had been searched. Every cause is now named; the
+/// tokens follow the count, which is all the framing reads, so an older client
+/// keeps every match and an older `aterm ctl` still names the first cause.
+fn search_incomplete_marker(
+    incomplete: bool,
+    capped: bool,
+    rewrapping: bool,
+    cut_short: bool,
+    older: bool,
+) -> String {
+    if !incomplete {
+        return String::new();
+    }
+    let mut marker = String::from(" incomplete");
+    let mut named = false;
+    for (applies, token) in [
+        (capped, " capped"),
+        (rewrapping, " rewrapping"),
+        (cut_short, " long-line"),
+    ] {
+        if applies {
+            marker.push_str(token);
+            named = true;
+        }
+    }
+    if older && named {
+        marker.push_str(" older");
+    }
+    marker
 }
 
 /// Full-scrollback search over the LIVE terminal, shared by the `search` control verb
@@ -2864,33 +2943,34 @@ impl WrapFrame {
 }
 
 /// Fold each soft-wrapped run of snapshot rows into the ONE logical line the
-/// reader sees, in place: the run's head takes the whole text and every
-/// continuation becomes empty, so a hit that straddles the boundary is found
-/// exactly once, keyed at the row it starts on.
+/// reader sees, in place: the run's head takes the whole text and the cells it
+/// was read from, and every continuation becomes empty, so a hit that
+/// straddles the boundary is found exactly once, keyed at the row it starts
+/// on.
 ///
 /// Every row a continuation follows is padded back out to the full `cols`
-/// display columns it occupies on the glass, however few of them hold text. Grid
-/// rows are read as WRITTEN, and the cells past a row's written extent (a tail
-/// the program never wrote or erased, the cell a wide glyph left when it
-/// wrapped early) are not read, so without the padding such a row would splice
-/// its neighbour's first column onto its last written one, both inventing
-/// matches that are not on the glass and shifting every column after it. With
-/// it, the joined line has a UNIFORM stride: column `c` of the run is row
-/// `c / cols`, column `c % cols`, which is the arithmetic
-/// [`WrapFrame::to_physical`] inverts. That uniformity is the whole contract,
-/// so the padding is derived from the ROW COUNT and never from the accumulated
-/// column total. Columns are counted under the terminal's `ambiguous_width`
-/// policy, as the grid drew them.
+/// columns it occupies on the glass, however few of them hold text. Grid rows
+/// are read as WRITTEN, and the cells past a row's written extent (a tail the
+/// program never wrote or erased, the cell a wide glyph left when it wrapped
+/// early) are not read, so without the padding such a row would splice its
+/// neighbour's first column onto its last written one, both inventing matches
+/// that are not on the glass and shifting every column after it. With it, the
+/// joined line has a UNIFORM stride: column `c` of the run is row `c / cols`,
+/// column `c % cols`, which is the arithmetic [`WrapFrame::to_physical`]
+/// inverts. That uniformity is the whole contract, so it is built in rather
+/// than counted ([`LineCells::append_wrapped_row`], the join a double-click's
+/// word window takes too): row `k` of the run is drawn from column `k * cols`,
+/// each of its cells at that plus the column the grid drew it in, and the
+/// padding runs from where the row's own cells end. (Ruling 2026-10-11, r15
+/// content-4: counting the columns by re-measuring each row's text broke the
+/// stride wherever the text measured wider than the row is, a VS16 base the
+/// grid left one cell wide in the last column, and moved every later hit on
+/// the run one cell right per such row.)
 ///
 /// Joining also makes the logical line the unit a regex sees, so `^`/`$` bind to
 /// the reader's line rather than to a grid row — the semantics
 /// [`search_full_history_direction`] documents.
-fn join_wrapped_rows(
-    lines: &mut [String],
-    wrapped: &[bool],
-    cols: usize,
-    ambiguous: AmbiguousWidth,
-) {
+fn join_wrapped_rows(lines: &mut [String], cells: &mut [LineCells], wrapped: &[bool], cols: usize) {
     // A zero-column grid lays nothing out; leaving the rows alone keeps every
     // coordinate the caller already has, and there is no boundary to straddle.
     if cols == 0 {
@@ -2905,35 +2985,34 @@ fn join_wrapped_rows(
         let continuations = end.saturating_sub(head).saturating_sub(1);
         if continuations > 0
             && let Some((slot, rest)) = lines.get_mut(head..).and_then(<[String]>::split_first_mut)
+            && let Some((slot_cells, rest_cells)) = cells
+                .get_mut(head..)
+                .and_then(<[LineCells]>::split_first_mut)
         {
             let mut joined = std::mem::take(slot);
-            // Carried, not re-measured: re-counting the accumulated text once
-            // per continuation would make joining a long run quadratic in its
-            // length, and a `cat` of a file with no newlines is exactly a long
-            // run.
-            let mut columns = aterm_search::display_columns_with(&joined, ambiguous);
-            // How many columns the run occupies once the rows joined so far are
-            // laid out: one grid width per ROW, counted here rather than derived
-            // from `columns % cols`. A row whose cells are all blank trims to the
-            // empty string, leaving the running count already a multiple of the
-            // width, so a modulo would pad it by nothing and the joined line
-            // would silently lose that row's entire stride — every later hit on
-            // the run then inverts to one grid row too high, and find paints the
-            // blank row while the real match stays dark. A blank row inside a run
-            // is an ordinary redraw, not a corner case: `CSI 2 K` erases a row
-            // without clearing the NEXT row's continuation flag.
-            let mut occupied = cols;
-            for row in rest.iter_mut().take(continuations) {
-                let pad = occupied.saturating_sub(columns);
-                joined.extend(std::iter::repeat_n(' ', pad));
-                columns = columns.saturating_add(pad);
+            let mut joined_cells = std::mem::take(slot_cells);
+            // Row `k` of the run from column `k * cols`, padded out to it
+            // from where the rows before end: a blank row (`CSI 2 K` erases a
+            // row without clearing the next row's continuation flag) is
+            // padded across its whole width.
+            let mut row_start = 0usize;
+            for (row, row_cells) in rest
+                .iter_mut()
+                .zip(rest_cells.iter_mut())
+                .take(continuations)
+            {
+                row_start = row_start.saturating_add(cols);
                 let continuation = std::mem::take(row);
-                columns = columns
-                    .saturating_add(aterm_search::display_columns_with(&continuation, ambiguous));
-                joined.push_str(&continuation);
-                occupied = occupied.saturating_add(cols);
+                let continuation_cells = std::mem::take(row_cells);
+                joined_cells.append_wrapped_row(
+                    &mut joined,
+                    &continuation,
+                    &continuation_cells,
+                    row_start,
+                );
             }
             *slot = joined;
+            *slot_cells = joined_cells;
         }
         head = end;
     }
@@ -3031,19 +3110,24 @@ fn select_point_match(
             // Past the batch cap the walk addresses the INDEX, whose lines are
             // joined soft-wrap runs — so it takes the anchor in that frame and
             // hands back a match that still has to be re-expressed physically.
-            index
-                .find_direction_opts(
-                    query,
-                    case_sensitive,
-                    is_regex,
-                    aterm_search::DirectedFind {
-                        anchor: wrap.logical_anchor.unwrap_or(anchor),
-                        direction,
-                        inclusive: !strict,
-                        wrap: true,
-                    },
-                )?
-                .map(|found| wrap.to_physical(&found))
+            //
+            // A walk that found nothing but could not finish some line has no
+            // point to offer, and the batch beside it already carries the
+            // matches and counts the line (`cut_short_lines`): keep the batch.
+            match index.find_direction_opts(
+                query,
+                case_sensitive,
+                is_regex,
+                aterm_search::DirectedFind {
+                    anchor: wrap.logical_anchor.unwrap_or(anchor),
+                    direction,
+                    inclusive: !strict,
+                    wrap: true,
+                },
+            ) {
+                Err(SearchOptionsError::ScanCutShort) => None,
+                found => found?.map(|found| wrap.to_physical(&found)),
+            }
         }
     } else {
         None
@@ -3083,8 +3167,10 @@ fn select_point_match(
 /// One typed prefix's occurrence frame.
 struct NarrowFrame {
     query: String,
-    /// Ascending retained lines whose folded text contains the folded query.
-    occurrence_lines: Vec<u32>,
+    /// Ascending retained lines whose folded text contains the folded query —
+    /// absolute rows, held as `u32` offsets from the frame's own base, so a
+    /// frame costs four bytes a line past row `u32::MAX` too.
+    occurrence_lines: LineFrame,
 }
 
 /// A terminal's live narrowing stack, valid for exactly one index generation.
@@ -3106,7 +3192,7 @@ struct NarrowSession {
 /// terminal, newest-kept).
 const NARROW_SESSION_CAPACITY: usize = 4;
 
-/// Retained-entry budget per session (~1.6 MB of `u32` at the bound). The
+/// Retained-entry budget per session (~1.6 MB of `u32` offsets at the bound). The
 /// SHALLOWEST frames (the biggest — short prefixes) are dropped first; a deep
 /// backspace past a dropped frame reseeds from the engine, which is always
 /// correct, merely batch-priced.
@@ -3238,9 +3324,9 @@ fn query_search_index_narrowing(
             .rposition(|frame| query.starts_with(frame.query.as_str()))
     });
     let narrowed = {
-        let prev_lines = session.as_ref().and_then(|session| {
-            frame_index.map(|at| session.frames[at].occurrence_lines.as_slice())
-        });
+        let prev_lines = session
+            .as_ref()
+            .and_then(|session| frame_index.map(|at| &session.frames[at].occurrence_lines));
         // COST GUARD: a frame is a SUBSET property, not a cost guarantee. The
         // keystroke that turns a COMMON prefix into a RARE query inverts the
         // comparison — the engine's trigram intersection visits a handful of
@@ -3635,6 +3721,9 @@ fn search_full_history_direction_capped(
     let snapshot_lines = indexed_end.saturating_sub(snapshot_start);
     let snapshot_start_u64 = u64::try_from(snapshot_start).unwrap_or(u64::MAX);
     let mut lines: Vec<String> = Vec::with_capacity(snapshot_lines);
+    // The grid cells each row's text was read from, which the index reports
+    // matches in.
+    let mut cells: Vec<LineCells> = Vec::with_capacity(snapshot_lines);
     // Which snapshot rows are soft-wrap CONTINUATIONS, read in the same lock
     // holds as the text so the layout and the content can never come from two
     // different frames.
@@ -3662,6 +3751,7 @@ fn search_full_history_direction_capped(
             chunk,
             &mut lines,
             &mut wrapped,
+            Some(&mut cells),
         );
     }
     // The FIRST snapshot row starts a logical line by construction (the walk
@@ -3670,7 +3760,7 @@ fn search_full_history_direction_capped(
     if let Some(first) = wrapped.first_mut() {
         *first = false;
     }
-    join_wrapped_rows(&mut lines, &wrapped, wrap.cols, ambiguous);
+    join_wrapped_rows(&mut lines, &mut cells, &wrapped, wrap.cols);
 
     // Build the index OUTSIDE any lock: line `j` keys at absolute row `oldest + j`, so
     // SearchMatch.line is already an absolute row and the eviction/incomplete semantics
@@ -3678,7 +3768,13 @@ fn search_full_history_direction_capped(
     // newest — always including the visible screen — stay searchable) and the engine
     // flags results incomplete, which the callers surface honestly.
     record_search_snapshot_lines(lines.len());
-    index.index_visible_content(snapshot_start, &lines);
+    index.index_numbered_cells_owned(
+        lines
+            .into_iter()
+            .zip(cells)
+            .enumerate()
+            .map(|(j, (line, cells))| (snapshot_start.saturating_add(j), line, cells)),
+    );
     // The completeness verdict for THIS build, stated in both directions from
     // the window it was actually built over. `skipped_prefix > 0` means the
     // terminal still retains history older than the configured depth cap and
@@ -6657,10 +6753,39 @@ mod tests {
         );
     }
 
+    /// `search` reports a hit in the cells the grid drew it in, read with the
+    /// row (r15 content-5): flag halves drawn right one first stay two cells,
+    /// so `XYZ` is at column 4, not where a walk of the row's text pairing
+    /// them would put it (column 2, what origin/main answered).
+    #[test]
+    fn search_reports_a_hit_where_the_grid_drew_it() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        term.lock()
+            .unwrap()
+            .process("\x1b[1;3H\u{1f1e7}\x1b[1;1H\u{1f1e6}\x1b[1;5HXYZ".as_bytes());
+        assert_eq!(
+            term.lock().unwrap().cell_grapheme(0, 4).as_deref(),
+            Some("X"),
+            "precondition: the grid draws X in column 4"
+        );
+        assert_eq!(
+            cmd_search(&term, "XYZ", &RewrapGauge::default()),
+            "OK 1\n0 4 3\n"
+        );
+    }
+
     /// A live `ambiguous_width` switch moves no content generation, and the find
-    /// cache neither serves nor extends an index measured under the old policy:
+    /// cache neither serves nor extends an index a fresh one would not equal:
     /// the first search after the switch answers as a fresh index over the same
     /// terminal does (one with no cache entry).
+    ///
+    /// A row written before the switch keeps the cells it was drawn in
+    /// (`apply_config` reflows nothing) and find reads those cells, so the
+    /// fresh answer is where the grid paints `foo`: after two one-cell arrows.
+    /// (Ruling 2026-10-11, r15 content-5: until find read the grid's cells it
+    /// re-measured such a row under the new policy and put `foo` two cells
+    /// right of where it is drawn; this test pinned that as its precondition.)
     #[test]
     fn a_live_ambiguous_width_switch_is_not_served_from_the_find_cache() {
         let _serial = super::search_cap_test_guard();
@@ -6678,7 +6803,8 @@ mod tests {
         fresh.lock().unwrap().process("→→foo bar".as_bytes());
         fresh.lock().unwrap().apply_config(&wide);
         let fresh = cmd_search(&fresh, "foo", &RewrapGauge::default());
-        assert_ne!(narrow, fresh, "precondition: the policy moves the match");
+        assert_eq!(fresh, "OK 1\n0 2 3\n", "where the grid paints it");
+        assert_eq!(narrow, fresh, "a row keeps the cells it was drawn in");
         assert_eq!(after_switch, fresh);
     }
 
@@ -7089,6 +7215,100 @@ mod tests {
         assert_eq!(
             home, "OK 0\n",
             "a job that ended before the search is no overlap"
+        );
+    }
+
+    /// R15 content-2: find joins a soft-wrapped run into ONE line, and a `cat`
+    /// of a minified bundle makes that line a megabyte or more. An ordinary
+    /// regex over it was refused for the whole terminal (`ERR search: invalid
+    /// regex: pattern too expensive…`, the find bar's `bad regex`); now the
+    /// run's budget scales with it and every match is listed, complete. A
+    /// pattern that still cannot finish the run is reported for that line —
+    /// `incomplete long-line` — with every other line's matches, never as an
+    /// invalid pattern.
+    #[test]
+    fn a_long_soft_wrapped_run_is_searched_and_one_left_unfinished_is_named() {
+        let _serial = super::search_cap_test_guard();
+        let cap = super::DEFAULT_MAX_CACHED_LINES;
+        let unit = "function a(b){return b+1};var needle_x=[1,2,3];";
+        let len = 1_000_000;
+        let mut bundle = unit.repeat(len / unit.len() + 1);
+        bundle.truncate(len);
+        let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
+        term.lock()
+            .unwrap()
+            .process(format!("$ cat bundle.js\r\n{bundle}\r\n$ echo x=1\r\n").as_bytes());
+        let reply = super::cmd_search_capped(&term, "[a-z]+= regex", cap, RewrapReading::default);
+        let header = reply.lines().next().unwrap_or_default();
+        let count: usize = header
+            .strip_prefix("OK ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("a complete count, not a refusal: {header}"));
+        // One `x=` per unit of the bundle, and the prompt line's.
+        assert!(count > len / unit.len(), "{header}");
+
+        let long = "x".repeat(70_000);
+        let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
+        term.lock()
+            .unwrap()
+            .process(format!("before z\r\n{long}\r\nafter z\r\n").as_bytes());
+        let reply = super::cmd_search_capped(
+            &term,
+            "(?:x?){1020}z case regex",
+            cap,
+            RewrapReading::default,
+        );
+        let mut lines = reply.lines();
+        assert_eq!(lines.next(), Some("OK 2 incomplete long-line"), "{reply}");
+        assert_eq!(
+            lines.map(|line| line.split(' ').nth(1)).collect::<Vec<_>>(),
+            vec![Some("7"), Some("6")],
+            "the short lines around the unfinished run are still searched: {reply}"
+        );
+    }
+
+    /// R15 content-2 review: the header names EVERY cause that applies. A
+    /// depth cap under a line the regex could not finish said only
+    /// `long-line`, and a depth cap under a full list only `capped`, so a
+    /// reader of the verb help concluded the older history had been searched
+    /// when the first row's match was missing. Both now carry ` older`; the
+    /// depth cap alone stays a bare ` incomplete`.
+    #[test]
+    fn the_search_header_names_the_depth_cap_beside_another_cause() {
+        let _serial = super::search_cap_test_guard();
+        let header = |reply: &str| reply.lines().next().unwrap_or_default().to_string();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
+        let mut text = String::from("old z\r\n");
+        for i in 0..400 {
+            text.push_str(&format!("filler {i}\r\n"));
+        }
+        text.push_str(&"x".repeat(70_000));
+        text.push_str("\r\nafter z\r\n");
+        term.lock().unwrap().process(text.as_bytes());
+        let costly = "(?:x?){1020}z case regex";
+        let deep = super::cmd_search_capped(&term, costly, 200, RewrapReading::default);
+        assert_eq!(header(&deep), "OK 1 incomplete long-line older", "{deep}");
+        let whole = super::cmd_search_capped(
+            &term,
+            costly,
+            super::DEFAULT_MAX_CACHED_LINES,
+            RewrapReading::default,
+        );
+        assert_eq!(header(&whole), "OK 2 incomplete long-line", "{whole}");
+        let plain = super::cmd_search_capped(&term, "z case regex", 200, RewrapReading::default);
+        assert_eq!(header(&plain), "OK 1 incomplete", "{plain}");
+
+        // A full list under the depth cap: every row holds 40 hits, so the
+        // newest `cap` rows alone fill the list, and older rows are left out.
+        let row = "a".repeat(40);
+        let rows = super::MAX_SEARCH_MATCHES / 40 + 100;
+        let owned: Vec<&str> = (0..rows).map(|_| row.as_str()).collect();
+        let term = term_with(&owned);
+        let cap = super::MAX_SEARCH_MATCHES / 40 + 10;
+        let full = super::cmd_search_capped(&term, "a", cap, RewrapReading::default);
+        assert_eq!(
+            header(&full),
+            format!("OK {} incomplete capped older", super::MAX_SEARCH_MATCHES)
         );
     }
 
@@ -9606,7 +9826,7 @@ mod dense_history_tests {
 
     fn dense(t: &Terminal, first: u64, count: usize) -> (Vec<String>, Vec<bool>) {
         let (mut text, mut wrapped) = (Vec::new(), Vec::new());
-        read_abs_rows(t, first, count, &mut text, &mut wrapped);
+        read_abs_rows(t, first, count, &mut text, &mut wrapped, None);
         (text, wrapped)
     }
 

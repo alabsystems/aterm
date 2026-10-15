@@ -1,0 +1,38 @@
+# claude-code 2.1.299 · MEASURED 2026-10-14, `aterm ctl text` of a private headless aterm (26x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a five-hour usage limit at 26 columns after Esc on Claude Code's own countdown (`resume_limits = false`, `continue = false`: nothing typed): the cancel's `⏺` row wraps over five rows, `/rate-limit-options` broken mid-word, and the footer's notification is cut (`Automatic continue ca…`); the turn's `⎿` notice wraps after `You've hit your`
+           Claude Code
+           v2.1.299
+ ▐▛███▛█   Sonnet 5.5
+▝▜██████▀  Claude API
+ ▝▝   ▝▝   /…/tmp/at.booV/
+           proj
+
+
+❯ carry on with the task
+  ⎿  You've hit your
+     session limit ·
+     resets 10:50am
+     (America/Los_Angeles)
+     /upgrade to increase
+     your usage limit.
+
+⏺ Usage limit
+  reached ·
+  continuing
+  automatically at
+  10:50am · esc
+  to cancel
+
+✻ Brewed for 0s · done
+  10:40 AM
+
+⏺ Automatic
+  continue
+  cancelled · /rat
+  e-limit-options
+  to re-arm
+
+──────────────────────────
+❯
+──────────────────────────
+  ⏵⏵ auto mode on      ·
+  Automatic continue ca…

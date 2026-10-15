@@ -101,13 +101,10 @@ pub fn conn_main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 }
 
 /// Write `"aterm conn: <msg>\n"` to stderr — the conn-prefixed twin of the
-/// crate's [`super::stderr_line`], so a failure names the verb the user typed.
+/// crate's [`super::stderr_line`], so a failure names the verb the user typed,
+/// rendered for a terminal as it is ([`super::stderr_prefixed`]).
 fn conn_stderr_line(msg: &str) -> io::Result<()> {
-    let stderr = io::stderr();
-    let mut err = stderr.lock();
-    err.write_all(b"aterm conn: ")?;
-    err.write_all(msg.as_bytes())?;
-    err.write_all(b"\n")
+    super::stderr_prefixed("aterm conn: ", msg)
 }
 
 /// A usage error: `InvalidInput` with a hand-shaped message (surfaced by
@@ -167,7 +164,7 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
 /// Print [`CONN_USAGE`] and exit SUCCESS.
 fn print_usage() -> io::Result<ExitCode> {
     let stdout = io::stdout();
-    let mut out = super::StdoutSink(stdout.lock());
+    let mut out = super::StdoutSink::new(stdout.lock());
     out.write_all(CONN_USAGE.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }

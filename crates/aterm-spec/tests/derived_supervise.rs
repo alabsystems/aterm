@@ -2008,6 +2008,353 @@ fn the_usage_wall_ends_and_never_types_before_its_reset() {
         assert!(m.fire("Tick", &mut c), "{c:?}");
     }
     assert!(m.action_enabled("Act", &c), "{c:?}");
+
+    // A NOTICE THAT LEAVES AN IDLE SCREEN (Esc on the vendor's countdown, the
+    // review of 2026-10-14): waited on to the same reset and grace, and acted
+    // on there; read as a turn's end, the continuation went into the standing
+    // limit at once (`LeftReadAsTurnEnd`, caught by `NoBlindAct`).
+    let mut left = m.init_state();
+    for a in ["WallAppears", "NoticeLeaves"] {
+        assert!(m.fire(a, &mut left), "{a} at {left:?}");
+    }
+    assert_eq!(left["wall"], 6, "{left:?}");
+    assert!(!m.action_enabled("Act", &left), "{left:?}");
+    let mut at_once = buggy.init_state();
+    for a in ["WallAppears", "NoticeLeaves", "LeftReadAsTurnEnd"] {
+        assert!(buggy.fire(a, &mut at_once), "{a} at {at_once:?}");
+    }
+    assert!(
+        !buggy.check_invariant("NoBlindAct", &at_once),
+        "{at_once:?}"
+    );
+    for _ in 0..3 {
+        assert!(m.fire("Tick", &mut left), "{left:?}");
+    }
+    assert!(m.action_enabled("Act", &left), "at its reset: {left:?}");
+    // A person's turn the account serves there ends the wait however short
+    // (`PersonTurnServed`); read as no turn, the wait stands over it and the
+    // person's continuation is held to the reset (`PersonTurnUnseen`, caught
+    // by `NoWaitOverAServedTurn`). A loop restart that loses the left wait is
+    // `MemoryLost` again: never acted on.
+    let mut served = m.init_state();
+    for a in ["WallAppears", "NoticeLeaves", "Tick", "Tick"] {
+        assert!(m.fire(a, &mut served), "{a} at {served:?}");
+    }
+    let mut unseen = served.clone();
+    assert!(m.fire("PersonTurnServed", &mut served), "{served:?}");
+    assert_eq!(served["wall"], 0, "{served:?}");
+    assert!(buggy.fire("PersonTurnUnseen", &mut unseen), "{unseen:?}");
+    assert_eq!(unseen["wall"], 6, "the wait stands: {unseen:?}");
+    assert!(
+        !buggy.check_invariant("NoWaitOverAServedTurn", &unseen),
+        "{unseen:?}"
+    );
+    // THE LIMIT LIFTED BEFORE ITS NAMED RESET (`LimitLiftedEarly`: a plan
+    // changed, usage bought; the lab's `mode ok`, the review of 2026-10-14):
+    // a person's turn served then is served before the reset, and ends the
+    // wait at once; read as no turn, the hold spans the whole wait to the
+    // reset and its grace.
+    let mut early = m.init_state();
+    for a in ["WallAppears", "NoticeLeaves", "LimitLiftedEarly"] {
+        assert!(m.fire(a, &mut early), "{a} at {early:?}");
+    }
+    assert_eq!((early["clock"], early["due"]), (0, 0), "{early:?}");
+    let mut held = early.clone();
+    assert!(m.fire("PersonTurnServed", &mut early), "{early:?}");
+    assert_eq!(early["wall"], 0, "{early:?}");
+    assert!(buggy.fire("PersonTurnUnseen", &mut held), "{held:?}");
+    assert!(
+        !buggy.check_invariant("NoWaitOverAServedTurn", &held),
+        "{held:?}"
+    );
+    assert!(!buggy.action_enabled("Act", &held), "held: {held:?}");
+    for _ in 0..3 {
+        assert!(buggy.fire("Tick", &mut held), "{held:?}");
+    }
+    assert!(buggy.action_enabled("Act", &held), "to the reset: {held:?}");
+    // ANOTHER CONVERSATION RESUMED at the left wall (`ConversationResumed`):
+    // its older limit's turns are no turn of this limit's, served or not —
+    // the wait stands to the reset; read as this limit's
+    // (`OtherLimitsTurnRead`), the continuation went into the standing limit
+    // (measured on 2.1.300), caught by `NoBlindAct`.
+    let mut resumed = m.init_state();
+    for a in ["WallAppears", "NoticeLeaves", "ConversationResumed"] {
+        assert!(m.fire(a, &mut resumed), "{a} at {resumed:?}");
+    }
+    let mut misread = resumed.clone();
+    for _ in 0..2 {
+        assert!(m.fire("Tick", &mut resumed), "{resumed:?}");
+    }
+    assert!(
+        !m.action_enabled("PersonTurnServed", &resumed),
+        "no turn of this limit's: {resumed:?}"
+    );
+    assert!(m.fire("Tick", &mut resumed), "{resumed:?}");
+    assert!(
+        m.action_enabled("Act", &resumed),
+        "at its reset: {resumed:?}"
+    );
+    assert!(
+        buggy.fire("OtherLimitsTurnRead", &mut misread),
+        "{misread:?}"
+    );
+    assert!(
+        !buggy.check_invariant("NoBlindAct", &misread),
+        "{misread:?}"
+    );
+    let mut forgot = buggy.init_state();
+    for a in [
+        "WallAppears",
+        "NoticeLeaves",
+        "MemoryLost",
+        "Tick",
+        "Tick",
+        "Tick",
+    ] {
+        assert!(buggy.fire(a, &mut forgot), "{a} at {forgot:?}");
+    }
+    assert!(!buggy.action_enabled("Act", &forgot), "{forgot:?}");
+    // THE OWN ACT'S TAKE WINDOW (round 16; round 15's run on 2.1.300): the
+    // continue policy's act at a turn's end, answered at once by a limit
+    // whose notice leaves inside the window. No act while the window is
+    // open, none before the reset after it, and the limit-resume at the
+    // reset; folded in only at a point, the left limit read as the act's
+    // short turn and the continuation went into the standing limit
+    // (`TakeWindowDropsWall`, caught by `NoBlindAct`).
+    let mut window = m.init_state();
+    for a in ["OwnActTyped", "WallAppears", "NoticeLeaves"] {
+        assert!(m.fire(a, &mut window), "{a} at {window:?}");
+    }
+    assert_eq!((window["wall"], window["held"]), (6, 1), "{window:?}");
+    assert!(!m.action_enabled("Act", &window), "{window:?}");
+    let mut dropped = buggy.init_state();
+    for a in [
+        "OwnActTyped",
+        "WallAppears",
+        "NoticeLeaves",
+        "TakeWindowDropsWall",
+    ] {
+        assert!(buggy.fire(a, &mut dropped), "{a} at {dropped:?}");
+    }
+    assert!(
+        !buggy.check_invariant("NoBlindAct", &dropped),
+        "{dropped:?}"
+    );
+    assert!(m.fire("Tick", &mut window), "{window:?}");
+    assert_eq!(window["held"], 0, "a tick is past the window: {window:?}");
+    assert!(!m.action_enabled("Act", &window), "{window:?}");
+    for _ in 0..2 {
+        assert!(m.fire("Tick", &mut window), "{window:?}");
+    }
+    assert!(m.action_enabled("Act", &window), "at its reset: {window:?}");
+    // THE RETRY'S TAKE WINDOW (round 16's review): the wall's own retry opens
+    // a window too. The limit answers it at once (no turn run, the tokens
+    // late) and its notice leaves inside the window: no act while the window
+    // is open, and the next rung after it — the wall is still the loop's.
+    // Read as the retry taken, the wall is forgotten (`RetryReadAsTaken`,
+    // caught by `WallRemembered`).
+    let mut retry = m.init_state();
+    for a in [
+        "WallAppearsLate",
+        "Tick",
+        "Tick",
+        "Tick",
+        "Act",
+        "MetInWindow",
+        "NoticeLeaves",
+    ] {
+        assert!(m.fire(a, &mut retry), "{a} at {retry:?}");
+    }
+    assert_eq!(
+        (retry["wall"], retry["held"], retry["tries"]),
+        (6, 1, 1),
+        "{retry:?}"
+    );
+    assert!(!m.action_enabled("Act", &retry), "{retry:?}");
+    let mut taken = retry.clone();
+    assert!(buggy.fire("RetryReadAsTaken", &mut taken), "{taken:?}");
+    assert!(
+        !buggy.check_invariant("WallRemembered", &taken),
+        "{taken:?}"
+    );
+    assert!(m.fire("Tick", &mut retry), "{retry:?}");
+    assert_eq!(retry["held"], 0, "{retry:?}");
+    assert!(m.action_enabled("Act", &retry), "its next rung: {retry:?}");
+    // THE NOTICE GONE BEFORE ANY READ (round 16's residual (a), the lab's
+    // `tw16after` on 2.1.300): the limit answers the own act at once and a
+    // person's Esc on the countdown comes before the loop's first read
+    // (`WallAppearsLeft`): no act while the window is open, none before the
+    // reset after it. Read as no limit, the window's end typed into it
+    // (`UnreadLeftDropped`, caught by `NoBlindAct`).
+    let mut unread = m.init_state();
+    for a in ["OwnActTyped", "WallAppearsLeft"] {
+        assert!(m.fire(a, &mut unread), "{a} at {unread:?}");
+    }
+    assert_eq!(
+        (unread["wall"], unread["held"], unread["unread"]),
+        (6, 1, 1),
+        "{unread:?}"
+    );
+    assert!(!m.action_enabled("Act", &unread), "{unread:?}");
+    let mut typed = unread.clone();
+    assert!(buggy.fire("UnreadLeftDropped", &mut typed), "{typed:?}");
+    assert!(!buggy.check_invariant("NoBlindAct", &typed), "{typed:?}");
+    assert!(m.fire("Tick", &mut unread), "{unread:?}");
+    assert_eq!(
+        (unread["held"], unread["unread"]),
+        (0, 0),
+        "the window's end: {unread:?}"
+    );
+    assert!(!m.action_enabled("Act", &unread), "{unread:?}");
+    for _ in 0..2 {
+        assert!(m.fire("Tick", &mut unread), "{unread:?}");
+    }
+    assert!(m.action_enabled("Act", &unread), "at its reset: {unread:?}");
+    // ... and a retry's answer gone before any read (`MetLeftUnread`): the
+    // next rung after its window; read as the retry taken, the wall is
+    // forgotten (`UnreadAnswerReadAsTaken`, caught by `WallRemembered`).
+    let mut answer = m.init_state();
+    for a in [
+        "WallAppearsLate",
+        "Tick",
+        "Tick",
+        "Tick",
+        "Act",
+        "MetLeftUnread",
+    ] {
+        assert!(m.fire(a, &mut answer), "{a} at {answer:?}");
+    }
+    assert_eq!(
+        (
+            answer["wall"],
+            answer["held"],
+            answer["unread"],
+            answer["tries"]
+        ),
+        (6, 1, 1, 1),
+        "{answer:?}"
+    );
+    let mut forgotten = answer.clone();
+    assert!(
+        buggy.fire("UnreadAnswerReadAsTaken", &mut forgotten),
+        "{forgotten:?}"
+    );
+    assert!(
+        !buggy.check_invariant("WallRemembered", &forgotten),
+        "{forgotten:?}"
+    );
+    assert!(m.fire("Tick", &mut answer), "{answer:?}");
+    assert!(
+        m.action_enabled("Act", &answer),
+        "its next rung: {answer:?}"
+    );
+    // A PERSON'S TURN answered the same way (round 17's residual (a)): a
+    // person's prompt at a turn's end, no act of the loop's in flight, met by
+    // the limit and cancelled before any read (`PersonWallLeft`): no act
+    // before the reset. Read as no limit, the continue policy's next act went
+    // into it (`UnreadLeftDropped`, caught by `NoBlindAct`).
+    let mut person = m.init_state();
+    assert!(m.fire("PersonWallLeft", &mut person), "{person:?}");
+    assert_eq!(
+        (person["wall"], person["held"], person["unread"]),
+        (6, 0, 1),
+        "{person:?}"
+    );
+    assert!(!m.action_enabled("Act", &person), "{person:?}");
+    let mut typed = person.clone();
+    assert!(buggy.fire("UnreadLeftDropped", &mut typed), "{typed:?}");
+    assert!(!buggy.check_invariant("NoBlindAct", &typed), "{typed:?}");
+    for _ in 0..3 {
+        assert!(m.fire("Tick", &mut person), "{person:?}");
+    }
+    assert!(m.action_enabled("Act", &person), "at its reset: {person:?}");
+    // AN OLDER CANCELLED LIMIT `/resume`d inside the own act's window
+    // (`OlderLeftResumed`): nothing stands, nothing dates its print, its bare
+    // clock is placed within a session window — passed: the one try at the
+    // window's end, taken. Placed on the act's print, a past clock is
+    // tomorrow's (`OlderLeftPlacedTomorrow`): no act for a day while the
+    // session is free, caught by `NoDayWait`.
+    let mut older = m.init_state();
+    for a in ["OwnActTyped", "OlderLeftResumed"] {
+        assert!(m.fire(a, &mut older), "{a} at {older:?}");
+    }
+    assert_eq!(
+        (
+            older["wall"],
+            older["held"],
+            older["view"],
+            older["sitting"]
+        ),
+        (6, 1, 1, 1),
+        "{older:?}"
+    );
+    assert!(
+        !m.action_enabled("Act", &older),
+        "the window first: {older:?}"
+    );
+    assert!(m.fire("Tick", &mut older), "{older:?}");
+    assert!(
+        m.action_enabled("Act", &older),
+        "at the window's end: {older:?}"
+    );
+    for a in ["Act", "Taken"] {
+        assert!(m.fire(a, &mut older), "{a} at {older:?}");
+    }
+    assert_eq!(older["wall"], 0, "{older:?}");
+    let mut tomorrow = buggy.init_state();
+    for a in ["OwnActTyped", "OlderLeftPlacedTomorrow"] {
+        assert!(buggy.fire(a, &mut tomorrow), "{a} at {tomorrow:?}");
+    }
+    assert!(
+        !buggy.check_invariant("NoDayWait", &tomorrow),
+        "{tomorrow:?}"
+    );
+    for _ in 0..4 {
+        assert!(buggy.fire("Tick", &mut tomorrow), "{tomorrow:?}");
+    }
+    assert!(
+        !buggy.action_enabled("Act", &tomorrow),
+        "a day's wait: {tomorrow:?}"
+    );
+    // Each defect is caught ALONE: the interpreter's audit of the dead
+    // negative controls (the strict-vacuity gate's, `ty` or not).
+    let dead: Vec<&str> = m
+        .actions
+        .iter()
+        .map(|a| a.name)
+        .filter(|a| !aterm_spec::interp::fired_actions(&m).contains(a))
+        .collect();
+    for d in [
+        "LeftReadAsTurnEnd",
+        "PersonTurnUnseen",
+        "OtherLimitsTurnRead",
+        "TakeWindowDropsWall",
+        "RetryReadAsTaken",
+        "UnreadLeftDropped",
+        "UnreadAnswerReadAsTaken",
+        "OlderLeftPlacedTomorrow",
+        "MemoryLost",
+    ] {
+        assert!(dead.contains(&d), "{d} is dead at Buggy = 0: {dead:?}");
+    }
+    assert_eq!(
+        aterm_spec::verify::audit_dead_negative_controls(&m, &dead),
+        Ok(dead.len()),
+        "{dead:?}"
+    );
+    // With the notice's leaving switched off the model has no left wall.
+    let still = aterm_spec::interp::with_consts(&m, &[("Leaves", 0)]);
+    let mut q = still.init_state();
+    assert!(still.fire("WallAppears", &mut q));
+    assert!(!still.action_enabled("NoticeLeaves", &q), "{q:?}");
+    let mut u = still.init_state();
+    assert!(still.fire("OwnActTyped", &mut u));
+    assert!(!still.action_enabled("WallAppearsLeft", &u), "{u:?}");
+    let read = aterm_spec::interp::with_consts(&m, &[("Unread", 0)]);
+    let mut r = read.init_state();
+    assert!(read.fire("OwnActTyped", &mut r));
+    assert!(read.action_enabled("WallAppears", &r), "{r:?}");
+    assert!(!read.action_enabled("WallAppearsLeft", &r), "{r:?}");
 }
 
 /// THE MODEL SWITCH (2026-09-22 to 09-27, 240 relaunches in five days): the

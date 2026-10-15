@@ -649,8 +649,8 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     // #3's review) and this desk leave `LAUNCHD_SOFT_NOFILE - 30 - 3 × 63`
     // = 37 below launchd's 256. The soft limit is set to leave exactly
     // that many here: this binary's own table is smaller than a window's,
-    // and a child of a busy test run inherits whatever descriptors other
-    // tests held open across its spawn, at whatever numbers they had.
+    // and under a std without SP-1 a child of a busy test run inherits what
+    // other tests held open across its spawn, at whatever numbers they had.
     let headroom = LAUNCHD_SOFT_NOFILE - WINDOW_BASE_NOFILE - 3 * SESSIONS;
     let listed: Vec<i32> = std::fs::read_dir("/dev/fd")
         .expect("the descriptor directory")

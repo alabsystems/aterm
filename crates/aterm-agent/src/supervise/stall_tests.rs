@@ -542,7 +542,8 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
 /// the box and the escalation read it, no probe on any step, no hold. (The
 /// one read after each step on the box's row is the wait's own, FIX 3's: the
 /// box is a Read box, and a FILE box replaced under its path row is seen —
-/// `Session::wait_for_next`.)
+/// `Session::wait_for_next`; the `meta` before the badge is the decision's,
+/// for the agent's directory, whose settings may send a file box to a person.)
 #[test]
 fn a_host_that_does_not_measure_input_sees_the_requests_it_always_saw() {
     for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
@@ -568,6 +569,7 @@ fn a_host_that_does_not_measure_input_sees_the_requests_it_always_saw() {
                 "await gone esc.to.interrupt rows 2 7 timeout 20000",
                 "text --json tail=40",
                 "status",
+                "meta",
                 set.as_str(),
                 "status",
                 post.as_str(),

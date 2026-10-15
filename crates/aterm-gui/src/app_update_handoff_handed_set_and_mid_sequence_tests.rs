@@ -189,12 +189,14 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
 }
 
 /// A carry that would only swallow the queued tail is a miss, not a carry: an
-/// OSC over the 4 KiB cap, an unhooked DCS header and a started APC string are
-/// carried only as sequences to ignore, so the successor would dispatch nothing
-/// (no kitty image, no clipboard). Each re-parks on a boundary, on the fork lane
-/// as on the launched one; only a picture is carried once no free re-park is
-/// left. Over a quiet PTY each is still carried; a short OSC over queued output,
-/// which the carry continues exactly, is the control.
+/// OSC over the 4 KiB cap and a started APC string are carried only as
+/// sequences to ignore, so the successor would dispatch nothing (no kitty
+/// image, no clipboard). Each re-parks on a boundary, on the fork lane as on
+/// the launched one; only a picture is carried once no free re-park is left.
+/// Over a quiet PTY each is still carried. The controls are what the carry
+/// continues exactly, carried over queued output: a short OSC, and a DCS
+/// header, carried as itself since 2026-10-10 (round fifteen, R15-PARSER-P1;
+/// it was carried as `DcsIgnore` and missed the park here before).
 #[test]
 fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -237,13 +239,6 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
                 false,
             ),
             (
-                "an unhooked DCS header",
-                &b"\x1bP1;2"[..],
-                &b"q#0;2;0;0;0#0!10~-\x1b\\"[..],
-                "DcsParam",
-                false,
-            ),
-            (
                 "a hooked sixel string",
                 &b"\x1bPq#0;2;0;0;0"[..],
                 &b"#0!10~-\x1b\\"[..],
@@ -271,16 +266,26 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
         }
     }
     app.update_handoff_prelaunch = None;
-    // CONTROL: a short OSC the carry continues exactly is carried over
-    // queued output.
-    crate::term_lock(&term).process(b"\x1b]0;a ti");
-    write_all(slave, b"tle\x07");
-    assert_eq!(
-        capture(&mut app),
-        Ok(vec![0]),
-        "a short OSC over queued output is carried whole"
-    );
-    drain(master);
+    // CONTROLS: what the carry continues exactly is carried over queued
+    // output — a short OSC, and a DCS header.
+    for (at, parked, queued) in [
+        ("a short OSC", &b"\x1b]0;a ti"[..], &b"tle\x07"[..]),
+        (
+            "a DCS header",
+            &b"\x1bP1;2"[..],
+            &b"q#0;2;0;0;0#0!10~-\x1b\\"[..],
+        ),
+    ] {
+        crate::term_lock(&term).process(parked);
+        write_all(slave, queued);
+        assert_eq!(
+            capture(&mut app),
+            Ok(vec![0]),
+            "{at} over queued output is carried whole"
+        );
+        drain(master);
+        crate::term_lock(&term).process(b"\x18");
+    }
 
     set_master(&mut app, 0, -1);
     drop(app);

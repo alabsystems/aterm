@@ -253,6 +253,13 @@ pub mod unsync {
         /// Gets the contents, initialising them with `f` if the cell was empty.
         ///
         /// If `f` fails, the cell stays empty and the error is returned.
+        ///
+        /// # Panics
+        ///
+        /// If `f` panics, the panic propagates and the cell stays empty. It is
+        /// an error to initialise the cell reentrantly from `f`; doing so
+        /// panics with "reentrant init", as upstream does and as
+        /// [`get_or_init`](Self::get_or_init) does.
         pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
         where
             F: FnOnce() -> Result<T, E>,
@@ -261,10 +268,13 @@ pub mod unsync {
                 return Ok(val);
             }
             let val = f()?;
-            // Single-threaded, and the cell was empty one statement ago: `f`
-            // cannot have filled it without a `&self` this function did not
-            // hand out.
-            let _ = self.0.set(val);
+            // `f` CAN have filled the cell: it may capture `&self` on its own
+            // and call `set` or `get_or_init` on it. Upstream asserts here
+            // (once_cell-1.21.4/src/lib.rs:644). Ruling 2026-10-10: assert
+            // too, rather than drop `f`'s value and hand the caller one its
+            // closure never produced. The sync cell needs no such check: a
+            // reentrant writer blocks on its gate before reaching `set`.
+            assert!(self.0.set(val).is_ok(), "reentrant init");
             Ok(self
                 .get()
                 .unwrap_or_else(|| unreachable!("just initialised")))
@@ -553,7 +563,10 @@ pub mod sync {
             }
             let val = f()?;
             // Cannot fail: the gate is held, the cell was empty under it, and
-            // every writer (`set`, `try_insert`) goes through the gate.
+            // every writer (`set`, `try_insert`) goes through the gate. That
+            // includes a reentrant one called from `f`, which blocks on the
+            // gate this thread holds (upstream's sync cell deadlocks the same
+            // way; divergence 2 says so for `race`).
             let _ = self.inner.set(val);
             Ok(self
                 .get()

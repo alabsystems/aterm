@@ -2172,8 +2172,8 @@ mod tests {
         );
     }
 
-    /// Headless fence for the macOS access block (`AGENTS.md`, "never let a headless
-    /// code path reach WindowServer"): a headless instance opens the Security page, the
+    /// Headless fence for the macOS access block (`AGENTS.md`, "A headless
+    /// code path never reaches WindowServer"): a headless instance opens the Security page, the
     /// per-park hop runs, and no posture is published: no probe read, no `NSWorkspace`,
     /// no block to press.
     #[test]

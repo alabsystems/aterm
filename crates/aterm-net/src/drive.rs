@@ -21,9 +21,9 @@
 //! no implicit bind, no default port, no ambient authority.
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_session::EdgeToken;
@@ -82,11 +82,22 @@ fn is_deadline(e: &io::Error) -> bool {
 /// lifted once the capability verifies, before the long-lived relay.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum connections [`serve`] keeps in flight at once (handshaking + relaying).
-/// A flood beyond this is refused rather than allowed to spawn unbounded threads
-/// and file descriptors. Bounds total resource use to `MAX_INFLIGHT × (2 threads
-/// + 2 fds)`.
+/// Maximum connections [`serve`] keeps in flight at once (handshaking + relaying):
+/// the bound on its threads and file descriptors, each connection holding a fixed
+/// handful of each. A connection beyond it is refused unless it may take the slot
+/// of one that has not authenticated ([`serve`]'s rule); an admitted relay's slot
+/// is never taken.
 const MAX_INFLIGHT: usize = 64;
+
+/// How long a connection that has not authenticated keeps its slot against a
+/// newcomer from an address holding no more unauthenticated connections than
+/// its own ([`serve`]'s rule 2). A newcomer from a heavier address never takes
+/// it, at any age. The TLS 1.3 handshake plus the `AUTH` line is two round
+/// trips, which fit in it over most paths, though not every one: a lost
+/// segment costs an initial retransmission timeout of a second, and a
+/// geostationary round trip is about 600 ms. Far below [`HANDSHAKE_TIMEOUT`],
+/// which idle sockets were renewed against.
+const PREAUTH_GRACE: Duration = Duration::from_secs(2);
 
 /// How often [`serve`]'s accept loop wakes to re-check its `running` flag, so the
 /// kill-switch is observed promptly instead of only when the next peer connects.
@@ -183,24 +194,272 @@ fn wait_listener_readable(_listener: &TcpListener, timeout: Duration) -> io::Res
     Ok(false)
 }
 
-/// Decrements the in-flight counter when a connection's handler thread ends
-/// (including on panic), so a refused/finished connection always frees its slot.
-struct InFlightGuard(Arc<AtomicUsize>);
-impl Drop for InFlightGuard {
+/// The address a connection is counted against ([`serve`]'s rule 1): its IPv4
+/// address, or its IPv6 /64 — the block one site is given, inside which a single
+/// host mints addresses at will. An IPv4-mapped peer (a dual-stack listener)
+/// counts as its IPv4 address.
+fn source_of(peer: IpAddr) -> IpAddr {
+    match peer.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 @ IpAddr::V4(_) => v4,
+    }
+}
+
+/// A held slot as [`pick_displaced`] weighs it.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// The address it is counted against ([`source_of`]).
+    source: IpAddr,
+    /// When its connection was given the slot.
+    since: Instant,
+    /// Its connection has neither authenticated nor been cut off.
+    unauthenticated: bool,
+}
+
+/// Which held slot a newcomer from `source` may take at `now`, every slot being
+/// held: `None` refuses the newcomer. Only an unauthenticated connection's
+/// slot is ever named — rule 1, then rule 2, of [`serve`]'s docs — and only
+/// one from an address holding at least as many unauthenticated connections
+/// as the newcomer's.
+fn pick_displaced(held: &[Held], source: IpAddr, now: Instant) -> Option<usize> {
+    let pending = || held.iter().enumerate().filter(|(_, h)| h.unauthenticated);
+    let count = |of: IpAddr| pending().filter(|(_, h)| h.source == of).count();
+    let oldest = |eligible: &dyn Fn(&Held) -> bool| {
+        pending()
+            .filter(|(_, h)| eligible(h))
+            .min_by_key(|(_, h)| h.since)
+            .map(|(i, _)| i)
+    };
+    let mine = count(source);
+    // 1. An address crowding the newcomer's out (two or more ahead of it)
+    // gives up its oldest. Said as a difference, which cannot overflow.
+    let most = pending().map(|(_, h)| count(h.source)).max()?;
+    if most.saturating_sub(mine) >= 2 {
+        return oldest(&|h| count(h.source) == most);
+    }
+    // 2. Otherwise whichever has gone PREAUTH_GRACE without authenticating,
+    // from an address no lighter than the newcomer's: a heavier address's
+    // reconnects never cut a lighter one's slow handshake.
+    oldest(&|h| count(h.source) >= mine && now.saturating_duration_since(h.since) >= PREAUTH_GRACE)
+}
+
+/// One connection [`serve`] holds a slot for, handshaking or relaying.
+struct Slot {
+    /// Which connection: its [`SlotTenure`] frees the slot by this.
+    id: u64,
+    /// The address it is counted against ([`source_of`]).
+    source: IpAddr,
+    /// When it was given the slot.
+    since: Instant,
+    /// Its unauthenticated phase, which a newcomer may end ([`pick_displaced`]).
+    phase: Evictor,
+}
+
+/// [`serve`]'s slots, one per connection in flight: the bound on its threads
+/// and descriptors. Only the accept loop takes a slot or displaces a
+/// connection; each connection's handler thread frees its own as it ends.
+#[derive(Default)]
+struct Slots {
+    held: Mutex<Vec<Slot>>,
+    /// Signalled whenever a slot is freed.
+    freed: Condvar,
+}
+
+impl Slots {
+    fn lock(&self) -> MutexGuard<'_, Vec<Slot>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a newcomer from `source` gets a slot: a free one, or one
+    /// [`pick_displaced`] lets it take. A displaced connection is cut off at
+    /// once, and its threads end before the newcomer's start, so making room
+    /// never exceeds the bound; one that has not let go within [`ACCEPT_POLL`]
+    /// leaves the newcomer refused rather than the loop stalled.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Refuse",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    fn make_room(&self, source: IpAddr) -> bool {
+        let held = self.lock();
+        if held.len() < MAX_INFLIGHT {
+            return true;
+        }
+        let now = Instant::now();
+        loop {
+            let view: Vec<Held> = held
+                .iter()
+                .map(|slot| Held {
+                    source: slot.source,
+                    since: slot.since,
+                    unauthenticated: slot.phase.unauthenticated(),
+                })
+                .collect();
+            let Some(displaced) = pick_displaced(&view, source, now) else {
+                return false;
+            };
+            if held[displaced].phase.evict() {
+                break;
+            }
+            // It authenticated, or met its deadline, since the scan: it is no
+            // longer unauthenticated, so the next scan passes it over.
+        }
+        let (held, _) = self
+            .freed
+            .wait_timeout_while(held, ACCEPT_POLL, |held| held.len() >= MAX_INFLIGHT)
+            .unwrap_or_else(PoisonError::into_inner);
+        held.len() < MAX_INFLIGHT
+    }
+
+    /// Give connection `id`, armed with `phase`, a slot, freed when the
+    /// returned tenure drops.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Accept",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    fn take(self: &Arc<Self>, id: u64, source: IpAddr, phase: Evictor) -> SlotTenure {
+        self.lock().push(Slot {
+            id,
+            source,
+            since: Instant::now(),
+            phase,
+        });
+        SlotTenure {
+            slots: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Free connection `id`'s slot as its handler thread ends: a cut
+    /// connection's (`Release`) or a relay's (`Close`).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Release",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Close",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    fn free(&self, id: u64) {
+        self.lock().retain(|slot| slot.id != id);
+        self.freed.notify_all();
+    }
+}
+
+/// Frees its connection's slot when the connection's handler thread ends
+/// (including on panic), so a refused, displaced or finished connection always
+/// frees its slot.
+struct SlotTenure {
+    slots: Arc<Slots>,
+    id: u64,
+}
+
+impl Drop for SlotTenure {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.slots.free(self.id);
     }
 }
 
 // Unauthenticated-phase watchdog state. A per-syscall `SO_RCVTIMEO` only bounds an
 // IDLE stall — a peer that dribbles one byte just under the timeout keeps resetting
 // it. So a watchdog thread enforces a TOTAL WALL-CLOCK deadline: after it elapses it
-// force-closes the socket unless the handshake+AUTH already finished. The tri-state
-// is claimed by exactly one side (CAS), so the watchdog never shuts a socket the
-// relay is about to use.
+// force-closes the socket unless the handshake+AUTH already finished. The state
+// leaves `WD_RUNNING` exactly once (CAS) — to `WD_AUTHED` by the handshake, to
+// `WD_FIRED` by the deadline, or to `WD_EVICTED` by [`serve`] giving the slot to a
+// newer connection — so neither the watchdog nor the listener ever shuts a socket
+// the relay is about to use. This claim, the slots [`serve`] holds and the
+// newcomer that waits for one are the ty model
+// `aterm_spec::derive::net_slot_displacement_model` (`NetSlotDisplacement`,
+// 2026-10-10), whose actions the `#[refines]` anchors here name.
 const WD_RUNNING: u8 = 0;
 const WD_AUTHED: u8 = 1;
 const WD_FIRED: u8 = 2;
+const WD_EVICTED: u8 = 3;
+
+/// How a connection's unauthenticated phase ended: the claim that won.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claim {
+    /// The handshake finished first: the connection is the caller's.
+    Authed,
+    /// The wall-clock deadline elapsed first; the socket was force-closed.
+    Deadline,
+    /// [`serve`] gave the connection's slot to a newer one; the socket was
+    /// force-closed.
+    Evicted,
+}
+
+/// Why a connection [`serve`] displaced was not admitted (its `Refused` reason).
+const DISPLACED: &str = "a newer connection took its slot before it authenticated";
+
+/// The listener's hold on one connection's unauthenticated phase: it can end
+/// that phase early, through the same exactly-once claim the deadline makes.
+#[derive(Clone)]
+struct Evictor {
+    /// The watchdog's state.
+    state: Arc<AtomicU8>,
+    /// The parked watchdog thread, woken to force-close.
+    watchdog: std::thread::Thread,
+}
+
+impl Evictor {
+    /// Whether the connection has neither authenticated nor been cut off yet.
+    fn unauthenticated(&self) -> bool {
+        self.state.load(Ordering::Acquire) == WD_RUNNING
+    }
+
+    /// Claim [`WD_EVICTED`] iff the phase is still running, and wake the
+    /// watchdog to force-close the socket. `false`: the handshake (or the
+    /// deadline) claimed it first, and the connection is left alone.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Evict",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    fn evict(&self) -> bool {
+        let won = self
+            .state
+            .compare_exchange(WD_RUNNING, WD_EVICTED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            self.watchdog.unpark();
+        }
+        won
+    }
+}
+
+/// The watchdog's claim at its deadline: [`WD_FIRED`] iff the phase is still
+/// running. `false`: the handshake or an eviction claimed it first.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "NetSlotDisplacement",
+        action = "Deadline",
+        project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+    )
+)]
+fn claim_deadline(state: &AtomicU8) -> bool {
+    state
+        .compare_exchange(WD_RUNNING, WD_FIRED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 /// The unauthenticated-phase watchdog: one thread holding a CLONE of the socket,
 /// armed for a total wall-clock `handshake_timeout`, which force-closes that clone
@@ -220,13 +479,16 @@ const WD_FIRED: u8 = 2;
 /// `park_timeout`'s permitted spurious wakeups — re-reads the tri-state and
 /// recomputes the remaining time from the arming instant, so the force-close still
 /// happens at exactly `handshake_timeout` after arming and no wake can shorten,
-/// lengthen or starve it. Exactly one of {authed, fired} wins the CAS, so the
-/// watchdog never shuts a socket the relay is about to use.
+/// lengthen or starve it. Exactly one of {authed, fired, evicted} wins the CAS,
+/// so the watchdog never shuts a socket the relay is about to use.
 struct HandshakeWatchdog {
-    /// The tri-state claimed by exactly one of the handshake and the watchdog.
+    /// The state claimed by exactly one of the handshake, the watchdog and an
+    /// [`Evictor`].
     state: Arc<AtomicU8>,
     /// The parked watchdog thread — its `Thread` handle is the wake channel.
     thread: std::thread::JoinHandle<()>,
+    /// The deadline it was armed with, for the words of a timeout.
+    timeout: Duration,
     /// Set by the thread each time it is about to wait — tests only, so a test
     /// can time `finish` against a thread that is really inside its wait.
     #[cfg(test)]
@@ -238,7 +500,8 @@ impl HandshakeWatchdog {
     /// the caller moves `tcp` into the TLS handshake.
     ///
     /// # Errors
-    /// If the socket cannot be cloned (the caller then never starts the handshake).
+    /// If the socket cannot be cloned or the watchdog thread cannot start (the
+    /// caller then never starts the handshake).
     fn arm(tcp: &TcpStream, handshake_timeout: Duration) -> io::Result<Self> {
         let state = Arc::new(AtomicU8::new(WD_RUNNING));
         let wd_sock = tcp.try_clone()?;
@@ -247,60 +510,101 @@ impl HandshakeWatchdog {
         let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(test)]
         let wd_waiting = Arc::clone(&waiting);
-        let thread = std::thread::spawn(move || {
+        // Fallible spawn: [`serve`] arms on its accept loop, which a refused
+        // thread must not take down.
+        let thread = std::thread::Builder::new().spawn(move || {
             let start = Instant::now();
-            loop {
-                if wd_state.load(Ordering::Acquire) != WD_RUNNING {
-                    return; // finished early — nothing to cut off
+            let cut_off = loop {
+                match wd_state.load(Ordering::Acquire) {
+                    WD_RUNNING => {}
+                    // The listener gave the slot away: force-close now.
+                    WD_EVICTED => break true,
+                    _ => break false, // finished early — nothing to cut off
                 }
                 // Remaining time measured from ARMING, so a spurious wake or an
                 // `unpark` that raced a state store cannot move the deadline.
-                let Some(remaining) = handshake_timeout.checked_sub(start.elapsed()) else {
-                    break; // deadline reached
-                };
+                let remaining = handshake_timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    break;
+                    // Deadline reached: claim FIRED iff still running. A lost
+                    // claim is re-read above: the handshake's leaves the socket
+                    // alone, an eviction's still closes it.
+                    if claim_deadline(&wd_state) {
+                        break true;
+                    }
+                    continue;
                 }
                 #[cfg(test)]
                 wd_waiting.store(true, Ordering::Release);
                 std::thread::park_timeout(remaining);
-            }
-            // Deadline reached: claim FIRED iff still running, then force-close so
-            // the blocked handshake/AUTH read errors out.
-            if wd_state
-                .compare_exchange(WD_RUNNING, WD_FIRED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            };
+            // Force-close so the blocked handshake/AUTH read errors out.
+            if cut_off {
                 let _ = wd_sock.shutdown(std::net::Shutdown::Both);
             }
-        });
+        })?;
         Ok(Self {
             state,
             thread,
+            timeout: handshake_timeout,
             #[cfg(test)]
             waiting,
         })
     }
 
-    /// Claim [`WD_AUTHED`] iff the watchdog has not already fired, wake it, and
-    /// JOIN it — so its socket clone is dropped before the caller touches the
-    /// connection again. Returns whether the unauthenticated phase beat the
-    /// deadline; `false` means the watchdog already claimed `WD_FIRED` and the
-    /// caller must tear the connection down.
+    /// The listener's handle for ending this phase early ([`Evictor::evict`]).
+    fn evictor(&self) -> Evictor {
+        Evictor {
+            state: Arc::clone(&self.state),
+            watchdog: self.thread.thread().clone(),
+        }
+    }
+
+    /// Claim [`WD_AUTHED`] iff no deadline or eviction claimed the phase first,
+    /// wake the watchdog, and JOIN it — so its socket clone is dropped before the
+    /// caller touches the connection again. Returns the claim that won: anything
+    /// but [`Claim::Authed`] means the socket was force-closed and the caller
+    /// must tear the connection down.
     ///
     /// The state is published by the `AcqRel` compare-exchange BEFORE the wake, so
     /// the watchdog's re-check on waking always observes it; and `unpark` issued
     /// before the thread parks leaves a token that makes its next `park_timeout`
     /// return at once, so the wake can never be lost to that race.
-    fn finish(self) -> bool {
-        let authed_in_time = self
-            .state
-            .compare_exchange(WD_RUNNING, WD_AUTHED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "NetSlotDisplacement",
+            action = "Authenticate",
+            project = "drive::tests::serve_slots_conform_to_net_slot_displacement"
+        )
+    )]
+    fn finish(self) -> Claim {
+        let claim = match self.state.compare_exchange(
+            WD_RUNNING,
+            WD_AUTHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Claim::Authed,
+            Err(WD_EVICTED) => Claim::Evicted,
+            Err(_) => Claim::Deadline,
+        };
         self.thread.thread().unpark();
         let _ = self.thread.join();
-        authed_in_time
+        claim
     }
+}
+
+/// Arm both deadlines on an accepted connection's unauthenticated phase: the
+/// per-syscall floor, which bounds a single fully-idle read or write (defense in
+/// depth), and the wall-clock [`HandshakeWatchdog`], which a peer that dribbles
+/// bytes cannot reset.
+fn arm_unauthenticated(
+    tcp: &TcpStream,
+    handshake_timeout: Duration,
+) -> io::Result<HandshakeWatchdog> {
+    tcp.set_read_timeout(Some(handshake_timeout))?;
+    tcp.set_write_timeout(Some(handshake_timeout))?;
+    HandshakeWatchdog::arm(tcp, handshake_timeout)
 }
 
 /// Listener side, ONE connection: complete the TLS handshake on `tcp` with the
@@ -353,14 +657,27 @@ where
     F: FnOnce(&str, &str) -> Option<EdgeToken>,
     G: FnOnce() -> io::Result<CtlStream>,
 {
-    // Per-syscall floor: bounds a single fully-idle read/write (defense in depth).
-    tcp.set_read_timeout(Some(handshake_timeout))?;
-    tcp.set_write_timeout(Some(handshake_timeout))?;
+    let watchdog = arm_unauthenticated(&tcp, handshake_timeout)?;
+    accept_and_relay_armed(tcp, watchdog, config, lookup, connect_local, on_admit)
+}
 
-    // Total wall-clock deadline on the handshake + AUTH read, which a peer that
-    // dribbles bytes cannot reset ([`HandshakeWatchdog`]).
-    let watchdog = HandshakeWatchdog::arm(&tcp, handshake_timeout)?;
-
+/// [`accept_and_relay_inner`] on a connection whose deadlines are already
+/// armed ([`arm_unauthenticated`]) — by [`serve`]'s accept loop, which keeps
+/// the watchdog's [`Evictor`] to give the slot away if the connection has not
+/// authenticated when a newer one needs it.
+fn accept_and_relay_armed<F, G>(
+    tcp: TcpStream,
+    watchdog: HandshakeWatchdog,
+    config: Arc<ServerConfig>,
+    lookup: F,
+    connect_local: G,
+    on_admit: impl FnOnce(&Granted),
+) -> io::Result<Granted>
+where
+    F: FnOnce(&str, &str) -> Option<EdgeToken>,
+    G: FnOnce() -> io::Result<CtlStream>,
+{
+    let handshake_timeout = watchdog.timeout;
     // The unauthenticated phase. Any error here (incl. the watchdog's force-close)
     // tears the connection down.
     let unauth = (|| -> io::Result<(TlsTransport<rustls::ServerConnection>, Granted)> {
@@ -369,14 +686,16 @@ where
         let granted = verify_capability(transport.stream(), &exporter, lookup)?;
         Ok((transport, granted))
     })();
-    let authed_in_time = watchdog.finish();
 
     // A deadline — the watchdog's force-close (which the blocked read sees as an
     // end of stream) or the per-syscall timer — is said as one, never as the
-    // `unexpected end of file` it surfaces as.
-    let (mut transport, granted) = match unauth {
-        Ok(v) if authed_in_time => v,
-        Err(e) if authed_in_time && !is_deadline(&e) => return Err(e),
+    // `unexpected end of file` it surfaces as; so is an eviction.
+    let (mut transport, granted) = match (watchdog.finish(), unauth) {
+        (Claim::Authed, Ok(v)) => v,
+        (Claim::Authed, Err(e)) if !is_deadline(&e) => return Err(e),
+        (Claim::Evicted, _) => {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, DISPLACED));
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -411,13 +730,61 @@ where
 /// reported via `on_event` (audit) and never stops the loop — a hostile peer
 /// cannot take the listener down by failing a handshake.
 ///
-/// **DoS bounds.** At most [`MAX_INFLIGHT`] connections are handled concurrently;
-/// a flood beyond that is refused (logged, dropped) rather than allowed to spawn
-/// unbounded threads/fds. Each accepted connection's unauthenticated phase is
-/// deadline-bounded inside [`accept_and_relay`] ([`HANDSHAKE_TIMEOUT`]), so a
-/// slow-loris cannot pin a handler thread. (An AUTHENTICATED peer that then idles
-/// holds one slot until it closes; the cap bounds the worst case — these are
-/// token-holders the operator already trusts.)
+/// **DoS bounds.** At most [`MAX_INFLIGHT`] connections are in flight at once,
+/// handshaking or relaying, which bounds the listener's threads and descriptors.
+/// Each connection's unauthenticated phase ends within [`HANDSHAKE_TIMEOUT`]
+/// ([`accept_and_relay`]'s two deadlines), so a slow-loris holds one handler
+/// thread for no longer than that. By the rule below its slot can go to a
+/// newcomer sooner: at once to one from an address lighter by two, when the
+/// slow-loris's address holds the most unauthenticated connections; after
+/// [`PREAUTH_GRACE`] to one from an address no heavier than its own.
+///
+/// **Who gets a slot when every slot is held** (ruling 2026-10-10, r13 NET-1;
+/// rule 2's address bound added 2026-10-10 on review). Refusing the newest
+/// connection let one peer's idle sockets — no TLS byte, each renewed as its
+/// deadline cut it — hold every slot and turn away every token holder for as
+/// long as it kept them coming. Now a newcomer takes the slot of a connection
+/// that has NOT authenticated, if one of these allows it, and is refused
+/// otherwise:
+///
+/// 1. the oldest unauthenticated connection from the address holding the most
+///    of them, when that address holds at least two more than the newcomer's
+///    (an IPv4 address or an IPv6 /64, [`source_of`]). However fast one
+///    address reconnects, a dialer from another is let in at once; the margin
+///    of two keeps the address that lost a slot from taking it straight back.
+/// 2. otherwise the oldest that has gone [`PREAUTH_GRACE`] without
+///    authenticating, from an address holding at least as many unauthenticated
+///    connections as the newcomer's. Idle sockets yield to the next dialer from
+///    their own address after `PREAUTH_GRACE`, where they used to be renewed
+///    forever.
+///
+/// Both rules give a connection's slot only to a newcomer from an address
+/// holding no more unauthenticated connections than the connection's own. So
+/// one address never crowds out another, however fast it reconnects, and a
+/// lighter address's handshake is never cut for a heavier address's newcomer,
+/// however long it takes inside [`HANDSHAKE_TIMEOUT`]. Without that bound on
+/// rule 2, a 127.0.0.1 peer's own reconnects cut every handshake from ::1 that
+/// took longer than `PREAUTH_GRACE` (0 of 4 slow dials admitted, measured).
+///
+/// An admitted relay's slot is never taken — the listener's claim on a
+/// connection ([`Evictor`]) succeeds only before the handshake's — so relays
+/// still fill the listener where they did: they are token holders the operator
+/// trusts. The displaced connection's threads end before the newcomer's start,
+/// so making room never exceeds the bound. Those three laws — the bound, the
+/// exactly-once claim, a relay never cut — are the ty-checked
+/// `NetSlotDisplacement` model's invariants, and
+/// `tests::serve_slots_conform_to_net_slot_displacement` holds these slots to
+/// it.
+///
+/// What no rule that sees only addresses can do: tell a dialer from a peer that
+/// shares its address (a NAT, the same host, the same /64) before the
+/// handshake. Such a peer that re-takes each slot the instant it turns
+/// `PREAUTH_GRACE` old can still out-race the dialer, and so can one with more
+/// addresses than there are slots, each holding as few unauthenticated
+/// connections as the dialer's (rule 2 then also cuts a dialer's handshake
+/// once it is `PREAUTH_GRACE` old). Rejected: a separate, smaller pre-auth pool
+/// (one peer fills it the same way) and a hard per-address cap (it refuses a
+/// dialer behind the peer's address outright, where rule 2 lets it in).
 ///
 /// **Shutdown.** The listener is set non-blocking and its readiness wait is
 /// bounded by [`ACCEPT_POLL`], so clearing `running` stops the loop promptly (a
@@ -447,7 +814,8 @@ pub fn serve<F, G, E>(
         )));
         return;
     }
-    let inflight = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(Slots::default());
+    let mut next_id: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
         let (tcp, peer) = match listener.accept() {
@@ -477,39 +845,47 @@ pub fn serve<F, G, E>(
         // its SO_RCVTIMEO handshake deadline to take effect.
         let _ = tcp.set_nonblocking(false);
 
-        // Concurrency cap: reserve a slot; if we are already at the ceiling, roll
-        // back and refuse rather than spawn unbounded work.
-        if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
-            inflight.fetch_sub(1, Ordering::SeqCst);
+        // Concurrency cap: a free slot, or one an unauthenticated connection
+        // gives up (the rule above); otherwise refuse rather than spawn
+        // unbounded work.
+        let source = source_of(peer.ip());
+        if !slots.make_room(source) {
             on_event(NetEvent::Refused {
                 peer,
                 reason: "the listener is at capacity".to_owned(),
             });
             continue; // dropping `tcp` closes the connection
         }
-        let guard = InFlightGuard(Arc::clone(&inflight));
+        // Armed here, not on the handler thread, so the slot holds the
+        // connection's evictor from the moment it is taken.
+        let watchdog = match arm_unauthenticated(&tcp, HANDSHAKE_TIMEOUT) {
+            Ok(watchdog) => watchdog,
+            Err(e) => {
+                on_event(NetEvent::Refused {
+                    peer,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
+        next_id = next_id.wrapping_add(1);
+        let slot = slots.take(next_id, source, watchdog.evictor());
 
         let config = Arc::clone(config);
         let lookup = lookup.clone();
         let connect_local = connect_local.clone();
         let on_event = on_event.clone();
         std::thread::spawn(move || {
-            let _slot = guard; // released (slot freed) when this thread ends
+            let _slot = slot; // released (slot freed) when this thread ends
             let admitted = std::cell::Cell::new(false);
-            let result = accept_and_relay_inner(
-                tcp,
-                config,
-                lookup,
-                connect_local,
-                HANDSHAKE_TIMEOUT,
-                |granted| {
+            let result =
+                accept_and_relay_armed(tcp, watchdog, config, lookup, connect_local, |granted| {
                     admitted.set(true);
                     on_event(NetEvent::Admitted {
                         peer,
                         granted: granted.clone(),
                     });
-                },
-            );
+                });
             let ev = match result {
                 Ok(_) => NetEvent::Closed { peer, error: None },
                 Err(e) if admitted.get() => NetEvent::Closed {
@@ -818,7 +1194,7 @@ fn within_wall_clock<T>(
 ) -> io::Result<T> {
     let watchdog = HandshakeWatchdog::arm(transport.stream().get_ref(), bound)?;
     let result = exchange(transport);
-    if watchdog.finish() {
+    if watchdog.finish() == Claim::Authed {
         result
     } else {
         Err(late())
@@ -891,7 +1267,7 @@ where
         present_capability(transport.stream(), &exporter, src, op, token)?;
         Ok(transport)
     })();
-    let authed_in_time = watchdog.finish();
+    let authed_in_time = watchdog.finish() == Claim::Authed;
 
     // A deadline — the watchdog's force-close (which the blocked read sees as an
     // end of stream) or the per-syscall timer — is said as one, never as the
@@ -978,7 +1354,8 @@ mod tests {
     use crate::tls::{cert_fingerprint, client_config, server_config};
     use aterm_spec::wait::MUST_HAPPEN;
     use std::io::{Read, Write};
-    use std::sync::Mutex;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicUsize;
 
     const TEST_CERT_DER: &[u8] = include_bytes!("testdata/cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("testdata/key.pkcs8.der");
@@ -1692,8 +2069,9 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 let started = Instant::now();
-                assert!(
+                assert_eq!(
                     watchdog.finish(),
+                    Claim::Authed,
                     "an early handshake beats a 60 s deadline"
                 );
                 started.elapsed()
@@ -1789,8 +2167,9 @@ mod tests {
             "a wake must not STARVE the deadline: the deadline is {DEADLINE:?} but the \
              force-close only landed after {closed_after:?} of continuous wakes"
         );
-        assert!(
-            !watchdog.finish(),
+        assert_eq!(
+            watchdog.finish(),
+            Claim::Deadline,
             "the watchdog claimed the deadline, so the handshake must lose the CAS"
         );
     }
@@ -2425,6 +2804,808 @@ mod tests {
         drv_client.shutdown(std::net::Shutdown::Both).ok();
         drop(drv_client);
         driver.join().unwrap().ok();
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// What a [`serve`] under test said, counted as it says it.
+    #[derive(Default)]
+    struct Heard {
+        /// Newcomers turned away with every slot held.
+        at_capacity: AtomicUsize,
+        /// Unauthenticated connections whose slot went to a newcomer.
+        displaced: AtomicUsize,
+        /// Dialers admitted.
+        admitted: AtomicUsize,
+        /// Why each connection from ::1 was turned away, in order: the
+        /// dual-stack tests' token holder dials from there, and nothing else.
+        refused_v6: Mutex<Vec<String>>,
+    }
+
+    /// [`serve`] on `listener` with the test certificate, granting `token` the
+    /// drive op and relaying each admitted dialer to an echo.
+    fn serve_counting(
+        listener: TcpListener,
+        token: EdgeToken,
+        running: &Arc<AtomicBool>,
+    ) -> (Arc<Heard>, std::thread::JoinHandle<()>) {
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let heard = Arc::new(Heard::default());
+        let server = std::thread::spawn({
+            let running = Arc::clone(running);
+            let heard = Arc::clone(&heard);
+            move || {
+                serve(
+                    &listener,
+                    &scfg,
+                    move |_src, op| (op == "drive").then_some(token),
+                    || {
+                        let (a, b) = CtlStream::pair()?;
+                        spawn_echo(b);
+                        Ok(a)
+                    },
+                    &running,
+                    move |ev| match ev {
+                        NetEvent::Refused { peer, reason } => {
+                            if reason == "the listener is at capacity" {
+                                heard.at_capacity.fetch_add(1, Ordering::SeqCst);
+                            } else if reason == DISPLACED {
+                                heard.displaced.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if peer.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST) {
+                                heard.refused_v6.lock().unwrap().push(reason);
+                            }
+                        }
+                        NetEvent::Admitted { .. } => {
+                            heard.admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    },
+                );
+            }
+        });
+        (heard, server)
+    }
+
+    /// A token holder's dial: TCP, the pinned TLS handshake and the
+    /// channel-bound capability, read and write bounded by a minute's hang
+    /// detector. `Ok` is the admitted connection, whose relay lives until it is
+    /// dropped.
+    fn token_holder(
+        addr: SocketAddr,
+        token: &EdgeToken,
+    ) -> io::Result<TlsTransport<rustls::ClientConnection>> {
+        token_holder_after(addr, token, Duration::ZERO)
+    }
+
+    /// [`token_holder`], waiting `late` between its TCP connect and its
+    /// ClientHello: a handshake over a slow or lossy path.
+    fn token_holder_after(
+        addr: SocketAddr,
+        token: &EdgeToken,
+        late: Duration,
+    ) -> io::Result<TlsTransport<rustls::ClientConnection>> {
+        let tcp = TcpStream::connect_timeout(&addr, MUST_HAPPEN)?;
+        tcp.set_read_timeout(Some(MUST_HAPPEN))?;
+        tcp.set_write_timeout(Some(MUST_HAPPEN))?;
+        std::thread::sleep(late);
+        let mut transport = tls::connect(
+            tcp,
+            tls::fixed_server_name(),
+            client_config(cert_fingerprint(TEST_CERT_DER)),
+        )?;
+        let exporter = transport.exporter().to_vec();
+        present_capability(transport.stream(), &exporter, "dial", "drive", token)?;
+        Ok(transport)
+    }
+
+    /// One line through an admitted connection's relay, answered by the echo.
+    fn echoes(conn: &mut TlsTransport<rustls::ClientConnection>) -> bool {
+        let mut back = [0u8; 5];
+        conn.stream().write_all(b"ping\n").is_ok()
+            && conn.stream().flush().is_ok()
+            && conn.stream().read_exact(&mut back).is_ok()
+            && &back == b"ping\n"
+    }
+
+    /// [`MAX_INFLIGHT`] idle sockets to one address, each sending nothing and
+    /// reconnected the moment the listener closes it, until dropped. Stops
+    /// them however the test ends, so a failure does not leave them hammering
+    /// the rest of the binary.
+    struct IdleSockets {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl IdleSockets {
+        fn hold(target: SocketAddr) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let threads = (0..MAX_INFLIGHT)
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::SeqCst) {
+                            let Ok(mut idle) = TcpStream::connect_timeout(&target, MUST_HAPPEN)
+                            else {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            };
+                            let _ = idle.set_read_timeout(Some(Duration::from_millis(50)));
+                            let mut byte = [0u8; 1];
+                            while !stop.load(Ordering::SeqCst) {
+                                match idle.read(&mut byte) {
+                                    Ok(0) => break,
+                                    Err(e) if !is_deadline(&e) => break,
+                                    Ok(_) | Err(_) => {}
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            Self { stop, threads }
+        }
+    }
+
+    impl Drop for IdleSockets {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Once the listener turned a connection from `target` away at capacity,
+    /// idle sockets hold every slot: the attack is in force.
+    fn until_turned_away(heard: &Heard, target: SocketAddr) {
+        let started = Instant::now();
+        while heard.at_capacity.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < MUST_HAPPEN,
+                "the idle sockets never filled the listener"
+            );
+            drop(TcpStream::connect_timeout(&target, MUST_HAPPEN));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A listener on `[::]` that also takes IPv4, and the port it took. It
+    /// sees a 127.0.0.1 peer as `::ffff:127.0.0.1` ([`source_of`]: 127.0.0.1)
+    /// and a ::1 peer as `::/64`: two addresses on loopback with no second
+    /// one configured, which a listener on 127.0.0.1 cannot see (lo0 carries
+    /// no other usable IPv4 address without an alias, which needs root).
+    /// `None`, said, on a host whose loopback has no IPv6 or whose `[::]`
+    /// listener is IPv6-only by default (Windows): the test cannot run there.
+    fn dual_stack_listener(test: &str) -> Option<(TcpListener, u16)> {
+        let not_run = |why: String| {
+            eprintln!("{test}: NOT RUN, no dual-stack loopback here ({why})");
+            None
+        };
+        let listener = match TcpListener::bind("[::]:0") {
+            Ok(listener) => listener,
+            Err(e) => return not_run(format!("binding [::]: {e}")),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let mut sources = Vec::new();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let probe = match TcpStream::connect_timeout(&SocketAddr::new(ip, port), MUST_HAPPEN) {
+                Ok(probe) => probe,
+                Err(e) => return not_run(format!("{ip} cannot reach [::]: {e}")),
+            };
+            // The connect completed, so the backlog holds it: no wait.
+            let (accepted, peer) = listener.accept().unwrap();
+            drop((probe, accepted));
+            sources.push(source_of(peer.ip()));
+        }
+        assert_ne!(
+            sources[0], sources[1],
+            "127.0.0.1 and ::1 are two addresses"
+        );
+        Some((listener, port))
+    }
+
+    /// NET-1 (r13, 2026-10-10): a peer holding every slot with idle TCP
+    /// sockets — no TLS byte, each reconnected the moment the listener closes
+    /// it — must not lock a token holder out. Refusing the NEWEST connection at
+    /// capacity did: every slot stayed with a socket that never authenticated,
+    /// renewed each time its handshake deadline cut it, and the token holder was
+    /// turned away for as long as the sockets kept coming.
+    ///
+    /// The attack is in force before the token holder dials (a connection was
+    /// turned away at capacity), and the dial must then be admitted within a
+    /// minute's hang detector — by taking an idle socket's slot, which the
+    /// listener reports — and relay. All peers share 127.0.0.1, so this is the
+    /// same-address path: rule 2, once an idle socket is [`PREAUTH_GRACE`] old.
+    /// A dialer from another address is the next test's.
+    #[test]
+    fn idle_unauthenticated_sockets_never_lock_a_token_holder_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (heard, server) = serve_counting(listener, token, &running);
+
+        // Control: with no attacker the token holder is admitted and relays.
+        let mut control = token_holder(addr, &token).expect("an unloaded listener admits");
+        assert!(echoes(&mut control), "the control's relay answers");
+        drop(control);
+
+        let idle = IdleSockets::hold(addr);
+        until_turned_away(&heard, addr);
+
+        let started = Instant::now();
+        let mut admitted = loop {
+            match token_holder(addr, &token) {
+                Ok(conn) => break conn,
+                Err(e) => {
+                    assert!(
+                        started.elapsed() < MUST_HAPPEN,
+                        "{MAX_INFLIGHT} idle sockets locked the token holder out for \
+                         {MUST_HAPPEN:?} (last refusal: {e}; {} turned away at capacity, \
+                         {} admitted)",
+                        heard.at_capacity.load(Ordering::SeqCst),
+                        heard.admitted.load(Ordering::SeqCst),
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+        assert!(
+            echoes(&mut admitted),
+            "the admitted token holder's relay answers"
+        );
+        assert!(
+            heard.displaced.load(Ordering::SeqCst) >= 1,
+            "the token holder got in by taking an idle socket's slot, and the \
+             listener said so"
+        );
+
+        drop(idle);
+        drop(admitted);
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// NET-1 across addresses (r13 review, 2026-10-10): idle sockets from one
+    /// address — every slot held, each reconnected the moment the listener
+    /// closes it — never turn away a token holder from another. Rule 1 lets
+    /// it in on its FIRST dial, with no retry and no wait for an idle socket
+    /// to age past [`PREAUTH_GRACE`] (rule 2, which this dial comes too early
+    /// for: the attack is milliseconds old). Refusing the newest connection
+    /// turned it away for as long as the sockets kept coming.
+    #[test]
+    fn idle_sockets_from_one_address_never_turn_away_a_dialer_from_another() {
+        let test = "idle_sockets_from_one_address_never_turn_away_a_dialer_from_another";
+        let Some((listener, port)) = dual_stack_listener(test) else {
+            return;
+        };
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (heard, server) = serve_counting(listener, token, &running);
+        let attacker = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let dialer = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+
+        let idle = IdleSockets::hold(attacker);
+        until_turned_away(&heard, attacker);
+
+        let mut admitted = token_holder(dialer, &token).unwrap_or_else(|e| {
+            panic!(
+                "idle sockets from 127.0.0.1 turned the token holder from ::1 away: {e} \
+                 (the listener said {:?}; {} turned away at capacity, {} displaced)",
+                heard.refused_v6.lock().unwrap(),
+                heard.at_capacity.load(Ordering::SeqCst),
+                heard.displaced.load(Ordering::SeqCst),
+            )
+        });
+        assert!(
+            echoes(&mut admitted),
+            "the admitted token holder's relay answers"
+        );
+        assert!(
+            heard.displaced.load(Ordering::SeqCst) >= 1,
+            "the token holder got in by taking an idle socket's slot, and the \
+             listener said so"
+        );
+
+        drop(idle);
+        drop(admitted);
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// Rule 2's address bound (r13 review, 2026-10-10): a token holder from
+    /// another address whose handshake outlasts [`PREAUTH_GRACE`] — a lossy or
+    /// long path, here a ClientHello sent `PREAUTH_GRACE` + 500 ms after its
+    /// connect — is never cut for the idle sockets' own reconnects. Without
+    /// the bound, the next idle socket from 127.0.0.1 took its slot the moment
+    /// it turned `PREAUTH_GRACE` old, and the handshake met a closed socket.
+    #[test]
+    fn a_slow_handshake_is_never_cut_for_a_heavier_address() {
+        let test = "a_slow_handshake_is_never_cut_for_a_heavier_address";
+        let Some((listener, port)) = dual_stack_listener(test) else {
+            return;
+        };
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (heard, server) = serve_counting(listener, token, &running);
+        let attacker = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let dialer = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+
+        let idle = IdleSockets::hold(attacker);
+        until_turned_away(&heard, attacker);
+
+        let late = PREAUTH_GRACE + Duration::from_millis(500);
+        let mut admitted = token_holder_after(dialer, &token, late).unwrap_or_else(|e| {
+            panic!(
+                "a handshake from ::1 sent {late:?} after its connect was cut while idle \
+                 sockets from 127.0.0.1 held the other slots: {e} (the listener said {:?})",
+                heard.refused_v6.lock().unwrap(),
+            )
+        });
+        assert!(
+            echoes(&mut admitted),
+            "the admitted token holder's relay answers"
+        );
+        assert!(
+            heard.refused_v6.lock().unwrap().is_empty(),
+            "nothing from ::1 was turned away"
+        );
+
+        drop(idle);
+        drop(admitted);
+        running.store(false, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// [`serve`]'s rule, case by case, on synthetic addresses. The real-socket
+    /// tests reach two sources through a dual-stack listener (127.0.0.1 and
+    /// ::1), which is enough for rule 1 and rule 2's address bound end to end;
+    /// the margin of two, ties, relays and ages are pinned here, where any
+    /// number of addresses is free. Slot `i` was taken `i` ms after `t0`, so
+    /// lower is older.
+    #[test]
+    fn a_newcomer_takes_only_an_unauthenticated_slot_by_the_rule() {
+        let t0 = Instant::now();
+        let a: IpAddr = "198.51.100.7".parse().unwrap();
+        let b: IpAddr = "203.0.113.9".parse().unwrap();
+        let c: IpAddr = "192.0.2.1".parse().unwrap();
+        let slots = |of: &[(IpAddr, bool)]| -> Vec<Held> {
+            (0u64..)
+                .zip(of)
+                .map(|(i, &(source, unauthenticated))| Held {
+                    source,
+                    since: t0 + Duration::from_millis(i),
+                    unauthenticated,
+                })
+                .collect()
+        };
+        let fresh = t0 + Duration::from_millis(500);
+        let grown = t0 + PREAUTH_GRACE + Duration::from_millis(500);
+
+        // One address holds every slot, unauthenticated and fresh.
+        let crowded = slots(&[(a, true); MAX_INFLIGHT]);
+        // Rule 1: another address takes the crowding address's oldest, at
+        // any age, however fast that address reconnects.
+        assert_eq!(pick_displaced(&crowded, b, fresh), Some(0));
+        // The crowding address itself waits out PREAUTH_GRACE (rule 2) ...
+        assert_eq!(pick_displaced(&crowded, a, fresh), None);
+        // ... and then takes its own oldest.
+        assert_eq!(pick_displaced(&crowded, a, grown), Some(0));
+
+        // The margin of two: a holds 2, b holds 1, the rest are relays. b
+        // cannot take a's slot (it would only swap who is heavier); c can.
+        let mut mixed = vec![(c, false); MAX_INFLIGHT - 3];
+        mixed.extend([(b, true), (a, true), (a, true)]);
+        let mixed = slots(&mixed);
+        assert_eq!(pick_displaced(&mixed, b, fresh), None);
+        assert_eq!(pick_displaced(&mixed, c, fresh), Some(MAX_INFLIGHT - 2));
+        // Rule 2 takes the oldest unauthenticated one, never an older relay.
+        assert_eq!(pick_displaced(&mixed, b, grown), Some(MAX_INFLIGHT - 3));
+
+        // Two addresses tie for most: the oldest of either.
+        let tied = slots(&[(b, true), (a, true), (a, true), (b, true)]);
+        assert_eq!(pick_displaced(&tied, c, fresh), Some(0));
+
+        // Every slot an admitted relay, however old: nothing to take.
+        let relays = slots(&[(a, false); MAX_INFLIGHT]);
+        for newcomer in [a, b, c] {
+            assert_eq!(pick_displaced(&relays, newcomer, grown), None);
+        }
+
+        // Rule 2's address bound (2026-10-10, on review): b's one handshake
+        // is older than PREAUTH_GRACE, a's are fresh and fill every other
+        // slot. a's own newcomer may not cut b's slow handshake, however old
+        // it is: it waits for one of a's to age, and then takes that one.
+        let mut slow = vec![Held {
+            source: b,
+            since: t0,
+            unauthenticated: true,
+        }];
+        slow.extend((1u64..).take(MAX_INFLIGHT - 1).map(|i| Held {
+            source: a,
+            since: t0 + PREAUTH_GRACE + Duration::from_millis(i),
+            unauthenticated: true,
+        }));
+        let b_aged = t0 + PREAUTH_GRACE + Duration::from_millis(500);
+        assert_eq!(pick_displaced(&slow, a, b_aged), None);
+        let all_aged = t0 + PREAUTH_GRACE * 2 + Duration::from_millis(500);
+        assert_eq!(pick_displaced(&slow, a, all_aged), Some(1));
+        // A newcomer from an address as light as b's may take it, once old.
+        assert_eq!(pick_displaced(&slow, c, b_aged), Some(1), "rule 1 first");
+        let mut even = slow.clone();
+        even.truncate(2);
+        even.push(Held {
+            source: c,
+            since: t0 + PREAUTH_GRACE,
+            unauthenticated: true,
+        });
+        assert_eq!(pick_displaced(&even, c, b_aged), Some(0));
+    }
+
+    #[test]
+    fn an_address_is_an_ipv4_address_or_an_ipv6_slash_64() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        assert_eq!(
+            source_of(ip("2001:db8:1:2::1")),
+            source_of(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")),
+            "one /64 is one address, however many hosts it mints"
+        );
+        assert_ne!(
+            source_of(ip("2001:db8:1:2::1")),
+            source_of(ip("2001:db8:1:3::1"))
+        );
+        assert_eq!(
+            source_of(ip("::ffff:198.51.100.7")),
+            ip("198.51.100.7"),
+            "an IPv4-mapped peer counts as its IPv4 address"
+        );
+        assert_ne!(source_of(ip("198.51.100.7")), source_of(ip("198.51.100.8")));
+    }
+
+    /// The listener's claim on a connection ([`Evictor::evict`]) cuts one that
+    /// has not authenticated — at once, not at its deadline — and never one
+    /// whose handshake claimed it first.
+    #[test]
+    fn an_eviction_cuts_only_a_connection_that_has_not_authenticated() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pair = || {
+            let accepting = {
+                let listener = listener.try_clone().unwrap();
+                std::thread::spawn(move || listener.accept().unwrap().0)
+            };
+            let peer = TcpStream::connect(addr).unwrap();
+            let tcp = accepting.join().unwrap();
+            tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+            (tcp, peer)
+        };
+
+        // Unauthenticated: the eviction wins and the socket is cut at once,
+        // inside a deadline far longer than the hang detector.
+        let (tcp, _peer) = pair();
+        let watchdog = HandshakeWatchdog::arm(&tcp, MUST_HAPPEN * 5).unwrap();
+        let evictor = watchdog.evictor();
+        assert!(evictor.unauthenticated());
+        let started = Instant::now();
+        assert!(evictor.evict());
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!((&tcp).read(&mut byte), Ok(0) | Err(_)),
+            "the evicted socket is force-closed"
+        );
+        assert!(
+            started.elapsed() < MUST_HAPPEN,
+            "cut at once, not at the deadline"
+        );
+        assert!(!evictor.unauthenticated());
+        assert!(!evictor.evict(), "a connection is evicted once");
+        assert_eq!(watchdog.finish(), Claim::Evicted);
+
+        // Authenticated first: the eviction loses and the socket stays open.
+        let (tcp, mut peer) = pair();
+        let watchdog = HandshakeWatchdog::arm(&tcp, MUST_HAPPEN * 5).unwrap();
+        let evictor = watchdog.evictor();
+        assert_eq!(watchdog.finish(), Claim::Authed);
+        assert!(!evictor.unauthenticated());
+        assert!(
+            !evictor.evict(),
+            "an authenticated connection is never evicted"
+        );
+        peer.write_all(b"x").unwrap();
+        assert_eq!(
+            (&tcp).read(&mut byte).unwrap(),
+            1,
+            "and its socket still carries bytes"
+        );
+    }
+
+    /// CONFORMANCE (Tier-1) of the REAL listener slots to
+    /// `aterm_spec::derive::net_slot_displacement_model` (`NetSlotDisplacement`)
+    /// at the production capacity (`Cap` overridden to [`MAX_INFLIGHT`]).
+    ///
+    /// The test plays both halves of [`serve`] over real loopback sockets: its
+    /// accept loop (`Slots::make_room`, [`arm_unauthenticated`]'s watchdog,
+    /// `Slots::take`) and each connection's handler thread (the handshake's
+    /// [`HandshakeWatchdog::finish`], then dropping the slot). After every
+    /// step it projects the real state onto the model — each held slot's
+    /// watchdog claim (`pending`, `authed`, `cut`), whether a newcomer's
+    /// `make_room` is still unresolved (`waiting`), the connections given a
+    /// slot and the claims they show, and whether an authenticated
+    /// connection's socket was closed under it (read at the dialer's end) —
+    /// and validates the transition against the model, then its invariants.
+    /// Steps: fill every slot; authenticate one; evict and refuse (no slot
+    /// freed within `ACCEPT_POLL`); a deadline; evict and admit (the slot
+    /// freed while the newcomer waits); a relay's close.
+    ///
+    /// NEGATIVE CONTROL: the real [`Evictor::evict`] on the authenticated
+    /// connection loses its claim and changes nothing, and the step a store
+    /// would have made there (`authed` to `cut`) is one the committed model
+    /// rejects. Make `evict` store `WD_EVICTED` instead of its
+    /// compare-and-swap and the projection moves: this test fails.
+    #[test]
+    fn serve_slots_conform_to_net_slot_displacement() {
+        use aterm_spec::derive::net_slot_displacement_model;
+        use aterm_spec::interp::with_consts;
+        use aterm_spec::verify::validate_transition_tiered;
+        use std::collections::BTreeMap;
+
+        type State = BTreeMap<&'static str, i64>;
+
+        /// One real connection: the listener's end (kept open, so only the
+        /// watchdog ever closes it), the dialer's end, the watchdog's claim,
+        /// and the slot its handler holds.
+        struct Conn {
+            _tcp: TcpStream,
+            peer: TcpStream,
+            evictor: Evictor,
+            watchdog: Option<HandshakeWatchdog>,
+            slot: Option<SlotTenure>,
+        }
+        impl Conn {
+            fn claim(&self) -> u8 {
+                self.evictor.state.load(Ordering::Acquire)
+            }
+            /// The dialer's end reads the listener's close.
+            fn closed(&self) -> bool {
+                self.peer.set_nonblocking(true).unwrap();
+                let mut byte = [0u8; 1];
+                let closed = match (&self.peer).read(&mut byte) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(e) => !is_deadline(&e),
+                };
+                self.peer.set_nonblocking(false).unwrap();
+                closed
+            }
+        }
+
+        let n = |count: usize| i64::try_from(count).unwrap();
+        let project = |slots: &Slots, conns: &[Conn], waiting: bool| -> State {
+            let held = slots.lock();
+            let holding = |claims: &[u8]| {
+                n(held
+                    .iter()
+                    .filter(|slot| claims.contains(&slot.phase.state.load(Ordering::Acquire)))
+                    .count())
+            };
+            BTreeMap::from([
+                ("pending", holding(&[WD_RUNNING])),
+                ("authed", holding(&[WD_AUTHED])),
+                ("cut", holding(&[WD_FIRED, WD_EVICTED])),
+                ("waiting", i64::from(waiting)),
+                ("arrivals", n(conns.len())),
+                (
+                    "claims",
+                    n(conns.iter().filter(|c| c.claim() != WD_RUNNING).count()),
+                ),
+                (
+                    "authed_cut",
+                    i64::from(conns.iter().any(|c| c.claim() == WD_AUTHED && c.closed())),
+                ),
+            ])
+        };
+
+        let model = net_slot_displacement_model();
+        let cap = n(MAX_INFLIGHT);
+        let overrides = [("Cap", cap), ("Arrivals", 2 * cap)];
+        let at_scale = with_consts(&model, &overrides);
+        let check = |seen: &mut State, action: &str, now: State| {
+            let (ok, why) = validate_transition_tiered(
+                &model,
+                &overrides,
+                seen,
+                &now,
+                Some(action),
+                "NetSlotDisplacement(serve)",
+            );
+            assert!(
+                ok,
+                "the real listener took `{action}` from {seen:?} to {now:?}, which the model \
+                 does not admit — {why}"
+            );
+            for invariant in &at_scale.invariants {
+                assert!(
+                    at_scale.check_invariant(invariant.name, &now),
+                    "{} broken after `{action}`: {now:?}",
+                    invariant.name
+                );
+            }
+            *seen = now;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let a: IpAddr = "198.51.100.7".parse().unwrap();
+        let b: IpAddr = "203.0.113.9".parse().unwrap();
+        let slots = Arc::new(Slots::default());
+        let mut conns: Vec<Conn> = Vec::new();
+        // The accept loop: a slot for a connection from `source`, armed with
+        // `deadline` (the others never reach theirs in this test).
+        let accept = |conns: &mut Vec<Conn>, source: IpAddr, deadline: Duration| {
+            assert!(slots.make_room(source), "a slot is free");
+            let peer = TcpStream::connect(addr).unwrap();
+            let (tcp, _) = listener.accept().unwrap();
+            let watchdog = arm_unauthenticated(&tcp, deadline).unwrap();
+            let evictor = watchdog.evictor();
+            let id = u64::try_from(conns.len()).unwrap();
+            let slot = slots.take(id, source, evictor.clone());
+            conns.push(Conn {
+                _tcp: tcp,
+                peer,
+                evictor,
+                watchdog: Some(watchdog),
+                slot: Some(slot),
+            });
+        };
+        let never = MUST_HAPPEN * 5;
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !done() {
+                assert!(started.elapsed() < MUST_HAPPEN, "{what} never happened");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let mut seen = project(&slots, &conns, false);
+        assert_eq!(seen, model.init_state(), "the listener starts empty");
+
+        // Every slot taken, from one address.
+        for _ in 0..MAX_INFLIGHT {
+            accept(&mut conns, a, never);
+            check(&mut seen, "Accept", project(&slots, &conns, false));
+        }
+
+        // The first connection authenticates: its handshake wins the claim.
+        assert_eq!(conns[0].watchdog.take().unwrap().finish(), Claim::Authed);
+        check(&mut seen, "Authenticate", project(&slots, &conns, false));
+
+        // NEGATIVE CONTROL: the listener's claim on the relay loses and
+        // changes nothing. Had it moved anything, that move must still be a
+        // step of the committed model, and a store over the relay's claim
+        // (`authed` to `cut`) is none.
+        let claimed = conns[0].evictor.evict();
+        let after = project(&slots, &conns, false);
+        if after != seen {
+            let (ok, why) = validate_transition_tiered(&model, &overrides, &seen, &after, None, "");
+            assert!(
+                ok,
+                "the listener's claim on a relay moved {seen:?} to {after:?}, which the \
+                 model does not admit — {why}"
+            );
+        }
+        assert!(!claimed, "an admitted relay is never evicted");
+        assert_eq!(after, seen, "and nothing moved");
+
+        // A newcomer from another address evicts the oldest connection that
+        // has not authenticated; no slot frees within ACCEPT_POLL, so it is
+        // refused; then the evicted connection's handler lets go.
+        let newcomer = std::thread::spawn({
+            let slots = Arc::clone(&slots);
+            move || slots.make_room(b)
+        });
+        until("the eviction", &|| conns[1].claim() == WD_EVICTED);
+        check(&mut seen, "Evict", project(&slots, &conns, true));
+        assert!(!newcomer.join().unwrap(), "no slot freed: refused");
+        check(&mut seen, "Refuse", project(&slots, &conns, false));
+        assert_eq!(conns[1].watchdog.take().unwrap().finish(), Claim::Evicted);
+        until("the eviction's close at the dialer", &|| conns[1].closed());
+        conns[1].slot = None;
+        check(&mut seen, "Release", project(&slots, &conns, false));
+
+        // A connection that never authenticates meets its deadline.
+        let late = conns.len();
+        accept(&mut conns, a, Duration::from_millis(250));
+        let now = project(&slots, &conns, false);
+        if conns[late].claim() == WD_FIRED && now["cut"] > seen["cut"] {
+            // The deadline beat this projection (a stalled host): the
+            // connection was pending when its slot was taken.
+            let mut taken = now.clone();
+            for (var, by) in [("pending", 1), ("cut", -1), ("claims", -1)] {
+                *taken.get_mut(var).unwrap() += by;
+            }
+            check(&mut seen, "Accept", taken);
+        } else {
+            check(&mut seen, "Accept", now);
+            until("the deadline", &|| conns[late].claim() == WD_FIRED);
+        }
+        check(&mut seen, "Deadline", project(&slots, &conns, false));
+        assert_eq!(
+            conns[late].watchdog.take().unwrap().finish(),
+            Claim::Deadline
+        );
+        until("the deadline's close at the dialer", &|| {
+            conns[late].closed()
+        });
+        conns[late].slot = None;
+        check(&mut seen, "Release", project(&slots, &conns, false));
+        accept(&mut conns, a, never);
+        check(&mut seen, "Accept", project(&slots, &conns, false));
+
+        // Evict again, and free the slot while the newcomer waits: it takes
+        // the slot (or, past ACCEPT_POLL, is refused and takes it after).
+        let newcomer = std::thread::spawn({
+            let slots = Arc::clone(&slots);
+            move || slots.make_room(b)
+        });
+        until("the eviction", &|| conns[2].claim() == WD_EVICTED);
+        check(&mut seen, "Evict", project(&slots, &conns, true));
+        assert_eq!(conns[2].watchdog.take().unwrap().finish(), Claim::Evicted);
+        conns[2].slot = None;
+        check(&mut seen, "Release", project(&slots, &conns, true));
+        if !newcomer.join().unwrap() {
+            check(&mut seen, "Refuse", project(&slots, &conns, false));
+        }
+        accept(&mut conns, b, never);
+        check(&mut seen, "Accept", project(&slots, &conns, false));
+
+        // The relay ends.
+        conns[0].slot = None;
+        check(&mut seen, "Close", project(&slots, &conns, false));
+        assert!(!conns[0].closed(), "nothing ever closed the relay's socket");
+
+        // Cut the rest, so no watchdog outlives the test.
+        for conn in &mut conns {
+            if let Some(watchdog) = conn.watchdog.take() {
+                conn.evictor.evict();
+                watchdog.finish();
+            }
+        }
+    }
+
+    /// The control for the rule above: ADMITTED relays still fill the listener
+    /// where they did — [`MAX_INFLIGHT`] token holders hold every slot, a
+    /// newcomer is turned away at capacity even after every relay is older than
+    /// [`PREAUTH_GRACE`], and no relay is displaced to make room for it.
+    #[test]
+    fn admitted_relays_still_fill_the_listener_and_are_never_displaced() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = EdgeToken::generate();
+        let running = Arc::new(AtomicBool::new(true));
+        let (heard, server) = serve_counting(listener, token, &running);
+
+        let mut relays: Vec<_> = (0..MAX_INFLIGHT)
+            .map(|i| token_holder(addr, &token).unwrap_or_else(|e| panic!("relay {i}: {e}")))
+            .collect();
+        // Older than the grace an unauthenticated connection gets, so the age
+        // rule would take a relay's slot if relays were displaceable.
+        std::thread::sleep(PREAUTH_GRACE + Duration::from_millis(500));
+
+        assert!(
+            token_holder(addr, &token).is_err(),
+            "a newcomer is turned away while every slot holds an admitted relay"
+        );
+        assert!(heard.at_capacity.load(Ordering::SeqCst) >= 1);
+        assert_eq!(heard.displaced.load(Ordering::SeqCst), 0);
+        for (i, relay) in relays.iter_mut().enumerate() {
+            assert!(echoes(relay), "relay {i} still answers");
+        }
+
+        drop(relays);
         running.store(false, Ordering::Relaxed);
         server.join().unwrap();
     }

@@ -532,3 +532,120 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
         );
     }
 }
+
+/// A GR BYTE IN A DCS HEADER KEEPS THE STRING (round fifteen, R15-PARSER-P2).
+/// A GR byte (`0xA0..=0xFF`) in `DcsEntry`, `DcsParam` or `DcsIntermediate`
+/// sent the parser to Ground, so the string after it printed and ran as
+/// terminal input: `ESC P 1 é q #0;2;0;0;0#0~~~~ ESC \ after` printed
+/// `\u{fffd}q#0;2;0;0;0#0~~~~after`. The header now ignores it, as vte's does.
+///
+/// The table, entry by entry: every GR byte stays in each header state and
+/// does nothing, and `0x80..=0x9F` keep the C1 entries every other sequence
+/// state has. Then a string with GR bytes in each header state, fed whole,
+/// one byte per read and split in two at every byte, through the byte path
+/// and the fast path, C1 controls off and on: each hooks its string, delivers
+/// the payload and prints only `after`. With C1 controls off a character
+/// holding `0x9C` (本, `E6 9C AC`) in the header keeps the string too: the C1
+/// guard drops its `0x9C`.
+#[test]
+fn a_gr_byte_in_a_dcs_header_keeps_the_string() {
+    for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {
+        for byte in 0x80..=u8::MAX {
+            let entry = TRANSITIONS[state as usize][usize::from(byte)];
+            let expected = if byte >= 0xA0 {
+                (state, crate::table::ActionType::Ignore)
+            } else {
+                let c1 = TRANSITIONS[State::Escape as usize][usize::from(byte)];
+                (c1.next_state, c1.action)
+            };
+            assert_eq!(
+                (entry.next_state, entry.action),
+                expected,
+                "{state:?} byte {byte:#04x}"
+            );
+        }
+    }
+
+    // (stream, the hook, the payload, C1 controls off only)
+    let strings: [(&[u8], (Vec<u16>, Vec<u8>, u8), &[u8], bool); 6] = [
+        (
+            "\x1bP\u{e9}q#0~\x1b\\after".as_bytes(),
+            (vec![], vec![], b'q'),
+            b"#0~",
+            false,
+        ),
+        (
+            "\x1bP1\u{e9}q#0;2;0;0;0#0~~~~\x1b\\after".as_bytes(),
+            (vec![1], vec![], b'q'),
+            b"#0;2;0;0;0#0~~~~",
+            false,
+        ),
+        (
+            "\x1bP$\u{e9}qm\x1b\\after".as_bytes(),
+            (vec![], vec![b'$'], b'q'),
+            b"m",
+            false,
+        ),
+        (
+            b"\x1bP\xa01;\xff2$\xa0\xffqm\x1b\\after",
+            (vec![1, 2], vec![b'$'], b'q'),
+            b"m",
+            false,
+        ),
+        (
+            "\x1bP1\u{672c};2\u{276f}q#0~\x1b\\after".as_bytes(),
+            (vec![1, 2], vec![], b'q'),
+            b"#0~",
+            true,
+        ),
+        (
+            "\x1bP+\u{276f}q544e\x1b\\after".as_bytes(),
+            (vec![], vec![b'+'], b'q'),
+            b"544e",
+            true,
+        ),
+    ];
+    let feeds: [(&str, fn(&mut Parser, &[u8], &mut RecordingSink)); 2] = [
+        ("advance", |p, b, s| p.advance(b, s)),
+        ("advance_fast", |p, b, s| p.advance_fast(b, s)),
+    ];
+    for (stream, hook, payload, c1_off_only) in strings {
+        for c1 in [false, true] {
+            if c1 && c1_off_only {
+                continue;
+            }
+            for (how, feed) in feeds {
+                let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![stream], stream.chunks(1).collect()];
+                chunkings.extend((1..stream.len()).map(|at| {
+                    let (head, tail) = stream.split_at(at);
+                    vec![head, tail]
+                }));
+                for chunks in chunkings {
+                    let mut parser = if c1 {
+                        Parser::with_c1_controls()
+                    } else {
+                        Parser::new()
+                    };
+                    let mut sink = RecordingSink::default();
+                    for chunk in &chunks {
+                        feed(&mut parser, chunk, &mut sink);
+                    }
+                    let what = format!(
+                        "c1={c1} {how} {} reads {:?}",
+                        chunks.len(),
+                        String::from_utf8_lossy(stream)
+                    );
+                    assert_eq!(sink.dcs_hooks, vec![hook.clone()], "{what}");
+                    assert_eq!(sink.dcs_puts, payload, "{what}");
+                    assert_eq!(sink.dcs_unhooks, 1, "{what}");
+                    assert_eq!(sink.prints.iter().collect::<String>(), "after", "{what}");
+                    assert!(
+                        sink.executes.is_empty() && sink.csi_dispatches.is_empty(),
+                        "{what}"
+                    );
+                    assert_eq!(parser.state(), State::Ground, "{what}");
+                }
+            }
+        }
+    }
+}

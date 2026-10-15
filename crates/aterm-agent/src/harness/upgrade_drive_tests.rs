@@ -13,8 +13,9 @@ use super::super::upgrade::Dialect;
 use super::*;
 use crate::supervise::ScratchDir;
 // Every child these tests start is the product's kind: its stdio and nothing
-// else of this process. A `std::process::Command` child under the seal's std
-// holds every descriptor open here without close-on-exec at its spawn, and on
+// else of this process. A `std::process::Command` child under a std without
+// SP-1 (which Trust seals from `62f89f11` on have, and no other std) holds
+// every descriptor open here without close-on-exec at its spawn, and on
 // Darwin that is any other test thread's pipe between its `pipe()` and its
 // `F_SETFD`: a stand-in that lives (a bash in its `read`, a parked agent) held
 // a `ps` child's stdout that way, and `ps()`'s read for its end waited as long
@@ -319,6 +320,9 @@ fn every_phase_survives_the_state_file() {
             // The move's instant, kept through Done for the finished move's
             // record (audit 2026-10-09).
             relaunched_at: 1_790_000_090,
+            // The command block its line was typed into, by which its end
+            // is read (review of 2026-10-09).
+            line_block: Some(12),
             hold_since_s: 1_790_000_060,
             hold_seen_s: 1_790_000_120,
             // What the record keeps of the process it is about and of the
@@ -375,6 +379,7 @@ fn a_state_main_wrote_reads_with_the_owners_fields_at_their_defaults() {
     assert_eq!((st.from.as_str(), st.to.as_str()), ("2.1.281", "2.1.282"));
     assert_eq!(st.notice_pid, 9162);
     assert_eq!(st.prompt, None);
+    assert_eq!(st.line_block, None);
     assert_eq!(st.request, Request::None);
     assert!(st.request_tab.is_empty() && st.wait.is_empty());
     assert_eq!(
@@ -636,6 +641,8 @@ fn host_filters_foreign_groups_before_expensive_process_reads() {
         proc_start: "start".to_string(),
         kind: kind.to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     };
     let files = [
         file(1, "interactive"),
@@ -720,6 +727,8 @@ fn current_claude_skips_process_inspection_but_new_and_in_flight_do_not() {
         proc_start: "start".to_string(),
         kind: "interactive".to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     };
     let target = |version: &str, source| Candidate {
         exe: PathBuf::from("/x/claude"),
@@ -901,7 +910,7 @@ fn the_homes_model_caches_are_not_read_under_several_logins() {
         !one.several_logins,
         "control: the packaged state is one login"
     );
-    let read = model_evidence(&one);
+    let read = model_evidence(&one, &Records::of(&one.home, None));
     assert_eq!(read.denied, ["claude-opus-5"]);
     assert_eq!(read.disabled_options, ["claude-fable-5"]);
     assert_eq!(read.served.as_ref().map(Vec::len), Some(1));
@@ -913,9 +922,10 @@ fn the_homes_model_caches_are_not_read_under_several_logins() {
 
     let several = Opts {
         several_logins: true,
+        instances: Instances::Listed(Vec::new()),
         ..one.clone()
     };
-    let unknown = model_evidence(&several);
+    let unknown = model_evidence(&several, &Records::of(&several.home, None));
     assert_eq!(
         unknown,
         models::Evidence::default(),
@@ -1388,6 +1398,9 @@ fn parked_bare() -> Command {
         // A stand-in names no login of its own, whatever shell runs the
         // tests: a test that wants one adds it to what the visit reads.
         .env_remove(crate::harness::accounts::LOGIN_ENV)
+        // Nor a HOME: an unset Claude home is its process's own `HOME`'s
+        // (`Records::at`), and a stand-in's is the sweep's user home.
+        .env_remove("HOME")
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());
@@ -1417,12 +1430,18 @@ fn register(home: &Path, pid: u32, session: &str) -> SessionFile {
 /// [`register`] in the Claude Code directory `claude_dir` itself — where a
 /// Claude Code started with `CLAUDE_CONFIG_DIR=<claude_dir>` files it.
 fn register_in(claude_dir: &Path, pid: u32, session: &str) -> SessionFile {
+    register_as(claude_dir, pid, session, "1.0.0")
+}
+
+/// [`register_in`], the process running build `version` (`unknown`: one
+/// nobody can compare, which the host looks at as it does a behind one).
+fn register_as(claude_dir: &Path, pid: u32, session: &str, version: &str) -> SessionFile {
     let start = kernel_start(pid).expect("lstart");
     std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
     std::fs::write(
         claude_dir.join(format!("sessions/{pid}.json")),
         format!(
-            r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/","version":"1.0.0","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
+            r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/","version":"{version}","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
         ),
     )
     .expect("session file");
@@ -2251,6 +2270,7 @@ fn drive(dir: &Path) -> Opts {
         // unless the test runs [`quietly`], under the default.
         ask: !QUIET.with(std::cell::Cell::get),
         several_logins: false,
+        instances: Instances::Listed(Vec::new()),
     }
 }
 
@@ -3493,7 +3513,8 @@ impl Default for Answers {
 /// A control socket at `<dir>/t.sock`, its token beside it, standing in for
 /// the aterm instance of [`TAB`] with an idle Claude in it: `sessions` names the
 /// tab, `text --json` is [`idle_screen`] (or what `<dir>/t.screen` says, when a
-/// test writes it: the screen a later look finds), a `cell` is a plain blank,
+/// test writes it: the screen a later look finds), `blocks` is unscripted (or
+/// what `<dir>/t.blocks` says, when a test writes it), a `cell` is a plain blank,
 /// `status` holds nothing (or answers what `<dir>/t.status` says, when a test
 /// writes it), and a `turn` is answered OK — recorded here, typed nowhere.
 /// Returns the socket and every request it read, in order. The accept loop
@@ -3534,6 +3555,7 @@ fn instance_for(
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     let status_file = dir.join("t.status");
     let screen_file = dir.join("t.screen");
+    let blocks_file = dir.join("t.blocks");
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = std::sync::Arc::clone(&asked);
     std::thread::spawn(move || {
@@ -3597,7 +3619,8 @@ fn instance_for(
                         }
                     }
                     "help" => answers.help.to_string(),
-                    "blocks" => answers.blocks.to_string(),
+                    "blocks" => std::fs::read_to_string(&blocks_file)
+                        .map_or_else(|_| answers.blocks.to_string(), |b| b.trim().to_string()),
                     "line" => answers.line.to_string(),
                     "rekey" if line.ends_with(" rekey withdraw") => {
                         "OK rekey withdrawn".to_string()
@@ -3722,6 +3745,7 @@ fn stale_preliminary_roster_cannot_authorize_an_announcement() {
     let mut a = parked_bare().spawn().expect("agent A");
     wait_exec(a.id());
     let sf_a = register(&opts.home, a.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let initial_files = session_files(&opts.home).expect("initial complete roster");
     assert!(unique_live_owner(&initial_files, &sf_a));
 
@@ -3789,6 +3813,7 @@ fn carry_on_rechecks_tab_ownership_at_the_turn() {
     let mut agent = parked().spawn().expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let mut st = St {
         phase: Phase::Relaunched { at_s: now_s() },
         from: "1.0.0".to_string(),
@@ -3848,6 +3873,7 @@ fn carry_on_is_held_for_a_person_at_the_keys() {
     let mut agent = parked().spawn().expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let fresh = || St {
         phase: Phase::Relaunched { at_s: now_s() },
         from: "1.0.0".to_string(),
@@ -3936,6 +3962,7 @@ fn the_continuation_is_typed_under_a_hand_taken_or_passed() {
         let mut agent = parked().spawn().expect("agent");
         wait_exec(agent.id());
         let sf = register(&opts.home, agent.id(), SESSION);
+        file_transcript_in(&opts.home.join(".claude"), "p");
         let mut st = St {
             phase: Phase::Relaunched { at_s: now_s() },
             from: "1.0.0".to_string(),
@@ -4599,6 +4626,8 @@ fn only_the_relaunch_itself_is_adopted_and_told_it_was_upgraded() {
         proc_start: String::new(),
         kind: "interactive".to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     };
     let fresh = "11111111-2222-3333-4444-555555555555";
     let adopted = [
@@ -4714,6 +4743,1508 @@ fn a_relaunch_whose_parent_cannot_be_read_is_waited_for_never_failed() {
     );
     assert_eq!(ledger_lines(&opts), 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A RELAUNCH STOPPED AS NEVER PICKED UP, PICKED UP AFTER ALL, IS CARRIED ON
+/// (the review of the 2026-10-09 sweep fixes): a stop `no-resume` is a
+/// reading of the tab, and the Claude Code the relaunch's line started can
+/// still come up after it — a start slower than the stale bound, a stop read
+/// early. Left stopped, the owner kept the interrupt `agent-down` (for a day)
+/// and the command that starts a second holder of the conversation, while
+/// the relaunched agent ran idle in the tab on the target build. The process
+/// the recorded shell started, holding the conversation, is that relaunch
+/// landed: the host's `due` asks about it whatever its build
+/// ([`needs_upgrade_inspection`]), and the visit reopens the record
+/// (`reopened:relaunch-landed`, ledgered once) and carries it on as any
+/// relaunch that landed. NEGATIVE CONTROLS, each left as it stood and asked
+/// about by nothing: the holder another shell started (resumed by hand
+/// elsewhere), a record stopped for another reason (`stale-exit`: its line
+/// was never typed), and a stop of the live relaunch on exit (its own loop
+/// tries it again).
+#[cfg(unix)]
+#[test]
+fn a_relaunch_stopped_no_resume_whose_agent_came_up_is_carried_on() {
+    let current = Targets {
+        managed: Some(Candidate {
+            exe: PathBuf::from("/nonexistent/claude"),
+            version: Version::parse("1.0.0").expect("version"),
+            source: Source::Managed,
+        }),
+        native: None,
+        unanswered: false,
+    };
+    let me = std::process::id();
+    let case = |name: &str, shell: u32, why: &str, cause: &str| {
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        let mut agent = parked().spawn().expect("agent");
+        wait_exec(agent.id());
+        let sf = register(&opts.home, agent.id(), SESSION);
+        file_transcript_in(&opts.home.join(".claude"), "p");
+        let st = St {
+            phase: Phase::Failed(why.to_string()),
+            pid: dead_pid(),
+            shell,
+            tab: TAB.to_string(),
+            from: "0.9.0".to_string(),
+            to: "1.0.0".to_string(),
+            source: "managed".to_string(),
+            cause: cause.to_string(),
+            quiet: true,
+            exited_at: now_s(),
+            relaunched_at: now_s(),
+            // Stopped as [`St::fail`] stamps a stop: after the holder started.
+            failed_at: now_s(),
+            streak_why: why.to_string(),
+            stop_streak: 1,
+            ..St::default()
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        save(&opts, SESSION, &st);
+        let asks = needs_upgrade_inspection(&sf, &current, Some(&st));
+        let r = visit(&opts, &sf, &table(), &current, &Live);
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let after = load(&opts, SESSION).expect("record");
+        let typed = turns(&asked);
+        let reopened = ledger_details(&opts, "reopened:relaunch-landed").len();
+        let _ = std::fs::remove_dir_all(&dir);
+        (asks, r, after, typed, reopened)
+    };
+    let (asks, r, after, typed, reopened) = case("landed-late", me, "no-resume", "");
+    assert!(asks, "the host's due asks about it");
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    assert_eq!(after.phase, Phase::Done, "{after:?}");
+    assert_eq!(typed, 0, "a quiet move types nothing");
+    assert_eq!(reopened, 1);
+    assert_eq!(
+        (after.stop_streak, after.streak_why.as_str()),
+        (0, ""),
+        "the stop taken back is no stop that repeats"
+    );
+    for (name, shell, why, cause) in [
+        ("landed-elsewhere", 1, "no-resume", ""),
+        ("landed-stale", me, "stale-exit", ""),
+        ("landed-exit", me, "no-resume", CAUSE_EXIT),
+    ] {
+        let (asks, r, after, typed, reopened) = case(name, shell, why, cause);
+        assert!(!asks, "{name}");
+        assert_eq!(r.step, "current", "{name}: {r:?}");
+        assert_eq!(after.phase, Phase::Failed(why.to_string()), "{name}");
+        assert_eq!((typed, reopened), (0, 0), "{name}");
+        assert_eq!(after.stop_streak, 1, "{name}: its stop stands");
+    }
+}
+
+/// A CONVERSATION RESUMED BY HAND AFTER A NO-RESUME STOP IS THE PERSON'S, NOT
+/// A RELAUNCH THAT LANDED LATE (the review of the late-landing reopen): the
+/// stop tells the owner to resume the conversation in that tab (`claude
+/// --resume <id>`), and the process that command starts is a child of the
+/// recorded shell holding the conversation, as the line's own late agent
+/// would be. Read as the line's, the record was reopened (`came up after
+/// all`, false), and a restart in place's continuation (`nobody is here to
+/// answer: decide for yourself`) was owed to the conversation a person had
+/// just taken over, a day after the stop; an upgrade the person resumed on
+/// the OLD build closed `done` as moved onto the target. Only a holder that
+/// started no later than the stop was said, on the build the line ran, can
+/// be the line's agent ([`St::landed_after_stop`]). Each case leaves the stop
+/// standing: nothing asks about it, nothing is owed and nothing is typed.
+#[cfg(unix)]
+#[test]
+fn a_conversation_resumed_by_hand_after_a_no_resume_stop_is_never_reopened() {
+    use super::super::relaunch::CAUSE_MEMORY;
+    const DAY: u64 = 86_400;
+    let me = std::process::id();
+    // (name, cause, the build the line ran, quiet, how long before the
+    // holder started the stop was said); the sweep knows the line's build.
+    let cases = [
+        // A restart in place's stop, the conversation resumed by hand a day
+        // later: its continuation would be typed.
+        ("hand-memory", CAUSE_MEMORY, "1.0.0", false, DAY),
+        // An announced upgrade's stop, resumed by hand on the target a day
+        // later: its continuation would be typed.
+        ("hand-announced", "", "1.0.0", false, DAY),
+        // A quiet upgrade to 9.9.9 whose conversation runs on the OLD build
+        // (1.0.0) in a process of the recorded shell: not the line's agent,
+        // whenever it started.
+        ("hand-old-build", "", "9.9.9", true, 0),
+    ];
+    for (name, cause, to, quiet, before) in cases {
+        let targets = Targets {
+            managed: Some(Candidate {
+                exe: PathBuf::from("/nonexistent/claude"),
+                version: Version::parse(to).expect("version"),
+                source: Source::Managed,
+            }),
+            native: None,
+            unanswered: false,
+        };
+        let dir = scratch(name);
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        let mut agent = parked().spawn().expect("agent");
+        wait_exec(agent.id());
+        let sf = register(&opts.home, agent.id(), SESSION);
+        file_transcript_in(&opts.home.join(".claude"), "p");
+        let stopped = now_s() - before;
+        let st = St {
+            phase: Phase::Failed("no-resume".to_string()),
+            pid: dead_pid(),
+            shell: me,
+            tab: TAB.to_string(),
+            from: "1.0.0".to_string(),
+            to: to.to_string(),
+            source: "managed".to_string(),
+            cause: cause.to_string(),
+            quiet,
+            exited_at: stopped,
+            relaunched_at: stopped,
+            failed_at: stopped,
+            streak_why: "no-resume".to_string(),
+            stop_streak: 1,
+            ..St::default()
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        save(&opts, SESSION, &st);
+        if to == sf.version {
+            assert!(
+                !needs_upgrade_inspection(&sf, &targets, Some(&st)),
+                "{name}: nothing asks about a current agent's standing stop"
+            );
+        }
+        let r = visit(&opts, &sf, &table(), &targets, &Live);
+        let after = load(&opts, SESSION).expect("record");
+        let owes = owed(&opts);
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let typed = turns(&asked);
+        let reopened = ledger_details(&opts, "reopened:relaunch-landed").len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reopened, 0, "{name}: {r:?}");
+        assert_eq!(
+            after.phase,
+            Phase::Failed("no-resume".to_string()),
+            "{name}: {r:?}"
+        );
+        assert!(!owes, "{name}: no continuation is owed");
+        assert_eq!(typed, 0, "{name}: nothing typed");
+    }
+}
+
+/// A BUILD THAT FAILED TO START FOR A CONVERSATION IS NOT TRIED AGAIN FOR ITS
+/// HAND RESUME (the handoff's §4 residual, lab run `urfx1`, 2026-10-14):
+/// after an upgrade's relaunch onto a build that crashes at start stopped
+/// `no-resume`, the person who follows the stop's remedy (`claude --resume
+/// <id>` by hand) gets a NEW process, and the visit minted it a fresh round
+/// ([`St::retarget`]: a stopped round belongs to its process) — no rest, no
+/// streak — so the next quiet moment moved it onto the same broken build
+/// again (34 s later in the lab), stopped again, and undid the remedy every
+/// time. The failure is the conversation's on that build: the round keeps
+/// the stop's rest and streak, bound to the new process, so the target is
+/// not tried for it until the rest the streak defines runs out — after a
+/// restart in place of the hand resume too, whose record carries the stop
+/// ([`St::kept_by_restart`]). CONTROLS: past that rest the round re-arms; a
+/// stop on an OLDER target is no reason to hold back a newer one (a new
+/// pending round, as before).
+#[cfg(unix)]
+#[test]
+fn a_build_that_failed_to_start_is_not_retried_for_the_conversations_hand_resume() {
+    // The stopped round, of the process the upgrade ended (not the one the
+    // person started since), `ago` seconds after its stop, its target `to`.
+    let stopped = |to: &'static str, ago: u64| {
+        move |opts: &Opts| {
+            let at = now_s() - ago;
+            let st = St {
+                phase: Phase::Failed("no-resume".to_string()),
+                pid: dead_pid(),
+                shell: dead_pid(),
+                tab: TAB.to_string(),
+                from: "1.0.0".to_string(),
+                to: to.to_string(),
+                source: "managed".to_string(),
+                proc_start: "Thu Oct 1 00:00:00 2026".to_string(),
+                salt: at - 600,
+                pending_since: at - 600,
+                exited_at: at - 5,
+                relaunched_at: at - 4,
+                failed_at: at,
+                streak_why: "no-resume".to_string(),
+                stop_streak: 1,
+                ..St::default()
+            };
+            std::fs::write(state_path(opts, SESSION), st.to_json()).expect("the stop");
+        }
+    };
+    let shell = dead_pid();
+    let visit = |name: &str, seed: &dyn Fn(&Opts)| {
+        quietly(|| {
+            visit_launched(
+                name,
+                &[
+                    user_row("fix the bug"),
+                    turn_by("claude-haiku-4-5", "Fixed."),
+                ],
+                false,
+                &Script::new(shell, usize::MAX, None),
+                77,
+                None,
+                None,
+                Answers::default(),
+                &[],
+                seed,
+            )
+        })
+    };
+    // 34 s after the stop, the hand resume holds the conversation, idle.
+    let (r, saved, typed) = visit("hand-resume-rests", &stopped("9.9.9", 34));
+    let saved = saved.expect("the record");
+    assert_eq!(r.step, "wait:failed", "{r:?}");
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "nothing typed");
+    assert_eq!(
+        saved.phase,
+        Phase::Failed("no-resume".to_string()),
+        "the round rests: {saved:?}"
+    );
+    assert_eq!(
+        (saved.streak_why.as_str(), saved.stop_streak),
+        ("no-resume", 1),
+        "the streak the next stop of this build lengthens"
+    );
+    assert_ne!(
+        saved.proc_start, "Thu Oct 1 00:00:00 2026",
+        "bound to the process that holds the conversation now"
+    );
+    assert_eq!(
+        saved.exited_at, 0,
+        "no agent of this record is down: the person's runs"
+    );
+    // The hand resume restarted in place on its own program (a memory
+    // banner's restart), landed 10 minutes into the rest: its record over the
+    // stop carries it ([`St::kept_by_restart`]), and the round still rests.
+    let restarted = |opts: &Opts| {
+        use super::super::relaunch::CAUSE_MEMORY;
+        stopped("9.9.9", 600)(opts);
+        let stop = load(opts, SESSION).expect("the stop");
+        let mut restart = St {
+            phase: Phase::Done,
+            from: "1.0.0".to_string(),
+            to: "1.0.0".to_string(),
+            source: SAME_PROGRAM.to_string(),
+            cause: CAUSE_MEMORY.to_string(),
+            tab: TAB.to_string(),
+            salt: now_s() - 60,
+            done_at: now_s() - 30,
+            ..St::default()
+        };
+        stop.kept_by_restart(TAB, &mut restart);
+        std::fs::write(state_path(opts, SESSION), restart.to_json()).expect("the restart");
+    };
+    let (r, saved, typed) = visit("restarted-in-place-rests", &restarted);
+    let saved = saved.expect("the record");
+    assert_eq!(r.step, "wait:failed", "{r:?}");
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "nothing typed");
+    assert_eq!(
+        (
+            saved.phase.clone(),
+            saved.streak_why.as_str(),
+            saved.stop_streak
+        ),
+        (Phase::Failed("no-resume".to_string()), "no-resume", 1),
+        "the round rests after the restart in place: {saved:?}"
+    );
+    // CONTROL: the rest over, the round re-arms onto the same build.
+    let (r, saved, _) = visit(
+        "hand-resume-rested",
+        &stopped("9.9.9", upgrade::RETRY_S + 60),
+    );
+    assert_eq!(r.step, "rearmed:no-resume", "{r:?}");
+    assert_eq!(saved.map(|st| st.phase), Some(Phase::Pending));
+    // CONTROL: a stop on an older target holds no newer build back: a new
+    // round, pending (its screen yet to settle for this record).
+    let (r, saved, _) = visit("hand-resume-newer", &stopped("9.9.8", 34));
+    assert_eq!(r.step, "wait:settling", "{r:?}");
+    assert_eq!(saved.map(|st| st.phase), Some(Phase::Pending));
+}
+
+/// A conversation's relaunch onto `to` (managed) that stopped `no-resume`
+/// `ago` seconds ago, as the relaunch saves it ([`save`], the one writer):
+/// the round of the process the upgrade ended, in another tab.
+#[cfg(unix)]
+fn failed_start_saved(opts: &Opts, session: &str, to: &str, ago: u64) {
+    let at = now_s() - ago;
+    let st = St {
+        phase: Phase::Failed("no-resume".to_string()),
+        pid: dead_pid(),
+        shell: dead_pid(),
+        tab: "s-0th3r0th3r0th3r0th3r".to_string(),
+        from: "1.0.0".to_string(),
+        to: to.to_string(),
+        source: "managed".to_string(),
+        proc_start: "Thu Oct 1 00:00:00 2026".to_string(),
+        salt: at - 600,
+        pending_since: at - 600,
+        exited_at: at - 5,
+        relaunched_at: at - 4,
+        failed_at: at,
+        streak_why: "no-resume".to_string(),
+        stop_streak: 1,
+        ..St::default()
+    };
+    // Saved as a real visit saves it: the dry run's own options write nothing.
+    let writes = Opts {
+        dry_run: false,
+        ..opts.clone()
+    };
+    save(&writes, session, &st);
+}
+
+/// A BUILD THAT FAILED TO START IS THE BUILD'S FACT, NOT ONLY ITS
+/// CONVERSATION'S (the handoff's §4 limits of `St::keep_stop`): after a
+/// relaunch onto 9.9.9 stopped `no-resume` for ONE conversation, an agent of
+/// ANOTHER conversation — a hand resume as another conversation (`claude`
+/// with no `--resume`, a new session id), or any other tab's agent — was
+/// moved onto that very build at its next quiet moment, ended, and left
+/// stopped; and the stopped conversation's own round, its rest run out, was
+/// moved onto it again ("a build that still crashes is tried once per rest
+/// and each try stops again"). Each such move kills a working agent. No
+/// agent is moved onto a build that has failed to start until the build is
+/// proved to start without one: here its probe cannot even run it (the
+/// candidate is `/nonexistent/claude`), so the quiet restart waits
+/// (`wait:build-fails`).
+#[cfg(unix)]
+#[test]
+fn a_build_that_failed_to_start_for_any_conversation_moves_no_agent_onto_it() {
+    const OTHER: &str = "0badf00d-9999-2222-3333-444455556666";
+    let visit = |name: &str, seed: &dyn Fn(&Opts)| {
+        quietly(|| {
+            visit_launched(
+                name,
+                &[
+                    user_row("fix the bug"),
+                    turn_by("claude-haiku-4-5", "Fixed."),
+                ],
+                true,
+                &Script::new(dead_pid(), usize::MAX, None),
+                77,
+                None,
+                None,
+                Answers::default(),
+                &[],
+                seed,
+            )
+        })
+    };
+    // ANOTHER conversation's relaunch onto 9.9.9 stopped 34 s ago; this
+    // agent's own round is pending, quiet, at an idle point.
+    let (r, _, typed) = visit("another-conversations-stop", &|opts| {
+        failed_start_saved(opts, OTHER, "9.9.9", 34);
+    });
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "nothing typed");
+    assert_eq!(r.step, "wait:build-fails", "another conversation: {r:?}");
+    // THIS conversation's own stop, its rest run out and its round re-armed:
+    // the build is no better for the rest.
+    let (r, _, _) = visit("its-own-stop-rested", &|opts| {
+        failed_start_saved(opts, SESSION, "9.9.9", upgrade::RETRY_S + 60);
+        let writes = Opts {
+            dry_run: false,
+            ..opts.clone()
+        };
+        let mut st = load(&writes, SESSION).expect("the stop");
+        st.rearm(now_s());
+        // Re-armed for the process that holds the conversation (the stop
+        // was kept bound to it, `St::keep_stop`), behind since long before.
+        let holder = session_files(&opts.home)
+            .and_then(|files| files.into_iter().find(|sf| sf.session_id == SESSION))
+            .expect("the agent's record");
+        st.proc_start = squash(&holder.proc_start);
+        st.tab = TAB.to_string();
+        st.last_seq = 77;
+        st.seq_since_s = now_s() - 3600;
+        save(&writes, SESSION, &st);
+    });
+    assert_eq!(r.step, "wait:build-fails", "its own rested round: {r:?}");
+    // CONTROL: a stop on an older build holds no newer one back.
+    let (r, _, _) = visit("an-older-builds-stop", &|opts| {
+        failed_start_saved(opts, OTHER, "9.9.8", 34);
+    });
+    assert_eq!(r.step, "would-restart", "{r:?}");
+}
+
+/// THE FAILURE IS NOTED AGAINST THE BUILD ONCE, BY THE ONE WRITER
+/// ([`build_start::note_failure`], from [`save_at`]): a `no-resume` stop of a
+/// relaunch onto 9.9.9 (managed) is the build's failure; the same record
+/// saved again, a new process of the conversation that keeps the stop
+/// ([`St::keep_stop`]) and a restart's record that carries it
+/// ([`St::kept_by_restart`]) are the same failure; another conversation's
+/// stop is another. NEGATIVE CONTROLS, none noted: a stop of another reason,
+/// a relaunch that kept its program, a Codex record, a dry run's save.
+#[cfg(unix)]
+#[test]
+fn a_failed_start_is_noted_against_its_build_once_by_the_one_writer() {
+    const OTHER: &str = "0badf00d-9999-2222-3333-444455556666";
+    let dir = scratch("build-note");
+    let opts = drive(&dir);
+    let failures =
+        |opts: &Opts| build_start::load(opts, "managed", "9.9.9").map_or(0, |note| note.failures);
+    failed_start_saved(&opts, SESSION, "9.9.9", 34);
+    assert_eq!(failures(&opts), 1, "the stop is the build's failure");
+    let stop = load(&opts, SESSION).expect("the stop");
+    save(&opts, SESSION, &stop);
+    assert_eq!(failures(&opts), 1, "saved again: the same failure");
+    let mut kept = St {
+        phase: Phase::Pending,
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    kept.keep_stop(stop.failed_start().expect("a failed start"));
+    kept.source = "managed".to_string();
+    save(&opts, SESSION, &kept);
+    assert_eq!(failures(&opts), 1, "a hand resume that keeps the stop");
+    let mut restart = St {
+        phase: Phase::Done,
+        from: "1.0.0".to_string(),
+        to: "1.0.0".to_string(),
+        source: SAME_PROGRAM.to_string(),
+        ..St::default()
+    };
+    stop.kept_by_restart(TAB, &mut restart);
+    save(&opts, SESSION, &restart);
+    assert_eq!(failures(&opts), 1, "a restart's record that carries it");
+    failed_start_saved(&opts, OTHER, "9.9.9", 10);
+    assert_eq!(failures(&opts), 2, "another conversation's stop");
+    // NEGATIVE CONTROLS.
+    let unnoted = |name: &str, st: St, opts: &Opts| {
+        save(opts, OTHER, &st);
+        assert_eq!(
+            build_start::load(opts, &st.source, &st.to),
+            None,
+            "{name}: no failure to start"
+        );
+    };
+    let failed = |why: &str, source: &str, agent: upgrade::Agent| St {
+        phase: Phase::Failed(why.to_string()),
+        from: "1.0.0".to_string(),
+        to: "9.9.7".to_string(),
+        source: source.to_string(),
+        failed_at: now_s(),
+        agent,
+        ..St::default()
+    };
+    unnoted(
+        "another reason",
+        failed("resumed-elsewhere", "managed", upgrade::Agent::Claude),
+        &opts,
+    );
+    unnoted(
+        "its own program",
+        failed("no-resume", SAME_PROGRAM, upgrade::Agent::Claude),
+        &opts,
+    );
+    unnoted(
+        "a Codex",
+        failed("no-resume", "managed", upgrade::Agent::Codex),
+        &opts,
+    );
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    unnoted(
+        "a dry run",
+        failed("no-resume", "managed", upgrade::Agent::Claude),
+        &dry,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE GATE ([`build_start::starts`]): a build with no failure noted is
+/// taken without a probe; one with a failure is taken only once a probe run
+/// since passes, and a probe that did not pass is not run again within
+/// [`build_start::PROBE_GAP_S`]; a move that fails after a passing probe
+/// leaves the build BLIND — no probe proves it again. Every probe run is one
+/// ledger row (`build-probe:<what>`). A dry run runs no build: what is not
+/// proved is a wait.
+#[cfg(unix)]
+#[test]
+fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
+    use build_start::{BUILD_FAILS, PROBE_GAP_S, Probe, starts_with};
+    let dir = scratch("build-gate");
+    let opts = drive(&dir);
+    let to = Candidate {
+        exe: dir.join("claude"),
+        version: Version::parse("9.9.9").expect("v"),
+        source: Source::Managed,
+    };
+    let r = Report {
+        pid: 1,
+        tab: TAB.to_string(),
+        session: SESSION.to_string(),
+        from: "1.0.0".to_string(),
+        to: "9.9.9(managed)".to_string(),
+        step: String::new(),
+    };
+    let never = |_: &Path| -> Probe { panic!("no probe is run") };
+    let now = now_s();
+    // No failure noted: taken, nothing run.
+    assert_eq!(starts_with(&opts, &r, &to, now, false, never), Ok(()));
+    failed_start_saved(&opts, SESSION, "9.9.9", 34);
+    // A dry run runs nothing and moves nothing.
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    assert_eq!(
+        starts_with(&dry, &r, &to, now, false, never),
+        Err(BUILD_FAILS)
+    );
+    // The probe exits: no move, and not probed again inside the gap.
+    let ran = std::cell::Cell::new(0);
+    let exits = |_: &Path| {
+        ran.set(ran.get() + 1);
+        Probe::Exited
+    };
+    assert_eq!(
+        starts_with(&opts, &r, &to, now, false, exits),
+        Err(BUILD_FAILS)
+    );
+    assert_eq!(ran.get(), 1);
+    assert_eq!(
+        starts_with(&opts, &r, &to, now + PROBE_GAP_S - 1, false, never),
+        Err(BUILD_FAILS),
+        "inside the gap"
+    );
+    assert_eq!(ledger_details(&opts, "build-probe:exited").len(), 1);
+    // Past the gap it is probed again; it starts: moved onto, and taken
+    // without a probe after.
+    assert_eq!(
+        starts_with(&opts, &r, &to, now + PROBE_GAP_S, false, |_| Probe::Starts),
+        Ok(())
+    );
+    assert_eq!(
+        starts_with(&opts, &r, &to, now + PROBE_GAP_S + 1, false, never),
+        Ok(())
+    );
+    assert_eq!(ledger_details(&opts, "build-probe:starts").len(), 1);
+    // A move onto it made after that proof fails to start again: blind.
+    let mut again = St {
+        phase: Phase::Failed("no-resume".to_string()),
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        relaunched_at: now + PROBE_GAP_S + 5,
+        failed_at: now + PROBE_GAP_S + 9,
+        streak_why: "no-resume".to_string(),
+        stop_streak: 1,
+        ..St::default()
+    };
+    save_at(
+        &opts,
+        "0badf00d-7777-2222-3333-444455556666",
+        &again,
+        now + PROBE_GAP_S + 9,
+    );
+    let note = build_start::load(&opts, "managed", "9.9.9").expect("the note");
+    assert!(note.blind, "{note:?}");
+    assert_eq!(ledger_details(&opts, "build-probe:blind").len(), 1);
+    assert_eq!(
+        starts_with(&opts, &r, &to, now + 10 * PROBE_GAP_S, false, never),
+        Err(BUILD_FAILS),
+        "no probe proves a blind build again"
+    );
+    // CONTROL: a move that began before the proof and failed after it is no
+    // verdict on the probe: another build's note, proved, then that failure.
+    let older = Candidate {
+        version: Version::parse("9.9.8").expect("v"),
+        ..to.clone()
+    };
+    failed_start_saved(&opts, SESSION, "9.9.8", 34);
+    assert_eq!(
+        starts_with(&opts, &r, &older, now, false, |_| Probe::Starts),
+        Ok(())
+    );
+    again.to = "9.9.8".to_string();
+    again.relaunched_at = now - 1;
+    save_at(
+        &opts,
+        "0badf00d-8888-2222-3333-444455556666",
+        &again,
+        now + 1,
+    );
+    let note = build_start::load(&opts, "managed", "9.9.8").expect("the note");
+    assert!(!note.blind, "{note:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE START PROBE RUNS THE BUILD AS ITS RELAUNCH WOULD, WITHOUT AN AGENT
+/// ([`build_start::probe`]): `<build> --help` — the lab's crashing twin
+/// (`lab.sh twin --crashing`) names its version to `--version` and exits 1
+/// at any other launch, so `--version` proves nothing — exited 0 starts;
+/// exited 1 does not; one that cannot be run does not; one that never ends
+/// is killed at the bound, its group whole.
+#[cfg(unix)]
+#[test]
+fn the_start_probe_runs_the_build_with_its_help_flag_bounded() {
+    use build_start::{Probe, probe, probe_within};
+    let dir = scratch("build-probe");
+    let crashing = dir.join("crashing");
+    sh_script(
+        &crashing,
+        "case \"$1\" in --version) echo \"2.1.999 (Claude Code)\"; exit 0 ;; esac\nexit 1",
+    );
+    let starts = dir.join("starts");
+    sh_script(
+        &starts,
+        "case \"$1\" in --help) echo usage; exit 0 ;; esac\nexit 1",
+    );
+    let hangs = dir.join("hangs");
+    sh_script(&hangs, "sleep 600");
+    assert_eq!(
+        version_of(&crashing),
+        Probed::Version(Version::parse("2.1.999").expect("v"))
+    );
+    assert_eq!(
+        probe(&crashing),
+        Probe::Exited,
+        "a build that crashes at start"
+    );
+    assert_eq!(probe(&starts), Probe::Starts);
+    assert_eq!(probe(&dir.join("absent")), Probe::NoExec);
+    assert_eq!(
+        probe_within(&hangs, Duration::from_millis(300)),
+        Probe::TimedOut
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE MOVE WAITS ON A BUILD THAT FAILED TO START, AT A REAL VISIT
+/// ([`build_starts`] at the act): the quiet restart of an idle agent, the
+/// build noted failed by another conversation's stop, is a recorded wait
+/// (`wait:build-fails`), its probe one ledger row; the owner's view reads the
+/// record as ONE fault per build (`build-fails`), never a stop. CONTROL: a
+/// build a probe proved since is moved onto (`would-restart`).
+#[cfg(unix)]
+#[test]
+fn a_real_visit_waits_on_a_build_that_failed_to_start_and_says_it_once() {
+    const OTHER: &str = "0badf00d-9999-2222-3333-444455556666";
+    let rows = [
+        user_row("fix the bug"),
+        turn_by("claude-haiku-4-5", "Fixed."),
+    ];
+    let seen = std::cell::RefCell::new(None);
+    let (r, saved, typed) = quietly(|| {
+        visit_launched(
+            "build-fails-visit",
+            &rows,
+            false,
+            &Script::new(dead_pid(), usize::MAX, None),
+            77,
+            None,
+            None,
+            Answers::default(),
+            &[],
+            &|opts| {
+                failed_start_saved(opts, OTHER, "9.9.9", 34);
+                *seen.borrow_mut() = Some(opts.clone());
+            },
+        )
+    });
+    let _ = seen;
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "nothing typed");
+    assert_eq!(r.step, "wait:build-fails", "{r:?}");
+    let saved = saved.expect("the record");
+    assert_eq!(saved.phase, Phase::Pending);
+    assert_eq!(saved.wait, BUILD_FAILS);
+    // CONTROL: proved since its failure, the build is moved onto.
+    let (r, _, _) = quietly(|| {
+        visit_launched(
+            "build-proved-visit",
+            &rows,
+            true,
+            &Script::new(dead_pid(), usize::MAX, None),
+            77,
+            None,
+            None,
+            Answers::default(),
+            &[],
+            &|opts| {
+                failed_start_saved(opts, OTHER, "9.9.9", 34);
+                let writes = Opts {
+                    dry_run: false,
+                    ..opts.clone()
+                };
+                let to = newer().managed.expect("managed");
+                let r = blank(&record("1.0.0"));
+                assert_eq!(
+                    build_start::starts_with(&writes, &r, &to, now_s(), false, |_| {
+                        build_start::Probe::Starts
+                    }),
+                    Ok(())
+                );
+            },
+        )
+    });
+    assert_eq!(r.step, "would-restart", "{r:?}");
+}
+
+/// A READY GIVEN FOR A MOVE ONTO A BUILD THAT FAILS TO START STOPS THE ROUND
+/// AND RELEASES THE AGENT (the ask flow, `upgrade_ask = true`): the agent
+/// answered the notice and stopped for a restart onto 9.9.9, which another
+/// conversation's relaunch found failing to start. No restart comes, so the
+/// round is stopped at once (`failed:build-fails`, [`upgrade::build_hold`]):
+/// its markers forgotten, so the answer can restart nothing later, and the
+/// agent told to carry on in the same visit, ONCE — never left waiting on a
+/// restart the build's hold keeps from coming. Its ledger row says why, once.
+/// A dry read says what it would do (`would-fail:build-fails`) and writes
+/// nothing.
+#[cfg(unix)]
+#[test]
+fn a_ready_for_a_build_that_failed_to_start_stops_the_round_and_releases_its_agent() {
+    let rig = |name: &str| {
+        let h = Parked::new(name, Answers::default(), settled(), 3600);
+        asked_then_answered(&h, ASKED_MARKER, &format!("Saved.\\n{ASKED_MARKER}"));
+        let st = St {
+            markers: vec![ASKED_MARKER.to_string()],
+            last_seq: 77,
+            seq_since_s: now_s() - 3600,
+            ..announced_to(&h, ASKED_MARKER)
+        };
+        std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("state");
+        h
+    };
+    let mut dry = rig("ready-build-fails-dry");
+    dry.opts.dry_run = true;
+    failed_start_saved(&dry.opts, ANOTHER_CONVERSATION, "9.9.9", 34);
+    assert_eq!(dry.visit().step, "would-fail:build-fails");
+    assert!(dry.typed().is_empty() && dry.details("failed:build-fails").is_empty());
+    drop(dry);
+    let h = rig("ready-build-fails");
+    let (steps, releases, after) = onto_a_failing_build(&h);
+    assert_eq!(steps[0], "released:build-fails", "{steps:?}");
+    assert_eq!(releases, 1, "{steps:?}");
+    assert_eq!(after.phase, Phase::Failed(BUILD_FAILS.to_string()));
+    assert_eq!(
+        after.round_markers().count(),
+        0,
+        "the answer void: {after:?}"
+    );
+    assert!(after.release.is_empty(), "{after:?}");
+    let why = h.details("failed:build-fails");
+    assert_eq!(why.len(), 1, "said once: {why:?}");
+    assert!(
+        why[0].contains("failed to start") && why[0].contains("owed its release"),
+        "{why:?}"
+    );
+}
+
+/// The conversation whose relaunch onto a build found it failing to start,
+/// in another tab ([`failed_start_saved`]).
+#[cfg(unix)]
+const ANOTHER_CONVERSATION: &str = "0badf00d-9999-2222-3333-444455556666";
+
+/// The READY marker of the round the tests below asked.
+#[cfg(unix)]
+const ASKED_MARKER: &str = "ATERM-UPGRADE-READY-0badf00d";
+
+/// `h`'s agent, its round as the test left it, visited three times after
+/// [`ANOTHER_CONVERSATION`]'s relaunch onto 9.9.9 failed to start (34 s
+/// ago; no probe can run `/nonexistent/claude`): each visit's step, how
+/// many release lines were typed into the tab, and the record after.
+#[cfg(unix)]
+fn onto_a_failing_build(h: &Parked) -> (Vec<String>, usize, St) {
+    failed_start_saved(&h.opts, ANOTHER_CONVERSATION, "9.9.9", 34);
+    let steps = (0..3).map(|_| h.visit().step).collect();
+    let releases = h
+        .typed()
+        .iter()
+        .filter(|t| t.contains(upgrade::RELEASE_HEAD.trim_end()))
+        .count();
+    (steps, releases, load(&h.opts, SESSION).expect("the record"))
+}
+
+/// A GIVEN-UP ROUND'S LATE READY ONTO A BUILD THAT FAILS TO START IS
+/// RELEASED (the review of round eighteen's upgradebuild lane, major 1): the
+/// round asked to its bound and gave up, its release owed, and the agent
+/// then wound down and answered READY. The restart it would take is onto
+/// 9.9.9, which another conversation's relaunch found failing to start. The
+/// build's gate held that restart as a wait (`wait:build-fails`), the READY
+/// held the release behind it (`upgrade::gate_release`), and no re-arm is
+/// due while a READY stands (`upgrade::retry_due`): the agent, stopped for a
+/// restart that cannot come, was never restarted, voided nor released. It is
+/// released, ONCE, its answer void. CONTROL: with no failure noted, the
+/// READY restarts it.
+#[cfg(unix)]
+#[test]
+fn a_late_ready_onto_a_build_that_fails_to_start_is_released() {
+    let rig = |name: &str| {
+        let h = Parked::new(name, Answers::default(), settled(), 3600);
+        asked_then_answered(&h, ASKED_MARKER, &format!("Done.\\n{ASKED_MARKER}"));
+        let mut st = St {
+            markers: vec![ASKED_MARKER.to_string()],
+            last_seq: 77,
+            seq_since_s: now_s() - 3600,
+            ..announced_to(&h, ASKED_MARKER)
+        };
+        st.give_up(now_s() - 600);
+        assert_eq!(st.release, "gave-up");
+        std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("state");
+        h
+    };
+    let mut control = rig("late-ready-onto-a-build");
+    control.opts.dry_run = true;
+    assert_eq!(control.visit().step, "would-restart");
+    drop(control);
+    let h = rig("late-ready-onto-a-failing-build");
+    let (steps, releases, after) = onto_a_failing_build(&h);
+    assert_eq!(releases, 1, "released once: {steps:?}");
+    assert!(after.release.is_empty(), "nothing owed: {after:?}");
+    assert_eq!(
+        after.round_markers().count(),
+        0,
+        "its READY void: {after:?}"
+    );
+}
+
+/// A PENDING ROUND THAT OWES ITS AGENT A RELEASE TYPES IT WHILE ITS BUILD
+/// FAILS TO START (the review's major 2): a notice for another build was
+/// abandoned by a retarget (`retargeted`), and the agent it reached may have
+/// answered READY and stopped. Under the ask flow the round's next notice
+/// superseded that release, under the quiet flow its restart carried the
+/// agent on; the build's gate holds both (`wait:build-fails`), and that wait
+/// was no point the release is the next act at (`upgrade::release_is_next`),
+/// so the agent was never told the upgrade is off. It is, ONCE, in both
+/// flows. CONTROL: with no failure noted, the notice (ask flow) or the
+/// restart (quiet flow) goes.
+#[cfg(unix)]
+#[test]
+fn a_pending_round_owing_a_release_types_it_while_its_build_fails_to_start() {
+    for quiet in [false, true] {
+        let rig = |name: &str| {
+            let park = || Parked::new(name, Answers::default(), settled(), 3600);
+            let h = if quiet { quietly(park) } else { park() };
+            asked_then_answered(&h, ASKED_MARKER, &format!("Done.\\n{ASKED_MARKER}"));
+            let st = St {
+                phase: Phase::Pending,
+                release: "retargeted".to_string(),
+                asked: vec![ASKED_MARKER.to_string()],
+                notice_pid: h.sf.pid,
+                notice_start: squash(&h.sf.proc_start),
+                pending_since: now_s() - 3 * 3600,
+                ..settled()
+            };
+            std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("state");
+            h
+        };
+        let mut control = rig(&format!("owed-onto-a-build-{quiet}"));
+        control.opts.dry_run = true;
+        let would = if quiet {
+            "would-restart"
+        } else {
+            "would-announce"
+        };
+        assert_eq!(control.visit().step, would, "quiet={quiet}");
+        drop(control);
+        let h = rig(&format!("owed-onto-a-failing-build-{quiet}"));
+        let (steps, releases, after) = onto_a_failing_build(&h);
+        assert_eq!(releases, 1, "quiet={quiet}: released once: {steps:?}");
+        assert!(after.release.is_empty(), "quiet={quiet}: {after:?}");
+        assert_eq!(after.phase, Phase::Pending, "quiet={quiet}");
+        assert_eq!(after.wait, BUILD_FAILS, "quiet={quiet}");
+    }
+}
+
+/// AN ANNOUNCED ROUND WHOSE BUILD FAILS TO START RELEASES ITS AGENT (found
+/// beside the review's majors, of their class): the agent was asked to wind
+/// down — save its work, stop its watches, start no new long-running work —
+/// and answered "not yet". Past the window, the re-ask is a notice the
+/// build's gate holds (`wait:build-fails`): the round never asked again,
+/// never gave up and never owed a release, and the agent stayed wound down
+/// for a restart that could not come, for as long as the build failed. It is
+/// released, ONCE. CONTROL: with no failure noted, the re-ask goes.
+#[cfg(unix)]
+#[test]
+fn an_announced_round_whose_build_fails_to_start_releases_its_agent() {
+    let rig = |name: &str| {
+        let h = Parked::new(name, Answers::default(), settled(), 3600);
+        asked_then_answered(&h, ASKED_MARKER, "Not yet: the suite is still running.");
+        let st = St {
+            phase: Phase::Announced {
+                at_s: now_s() - upgrade::REASK_S - 60,
+                asks: 1,
+            },
+            markers: vec![ASKED_MARKER.to_string()],
+            last_seq: 77,
+            seq_since_s: now_s() - 3600,
+            ..announced_to(&h, ASKED_MARKER)
+        };
+        std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("state");
+        h
+    };
+    let mut control = rig("announced-onto-a-build");
+    control.opts.dry_run = true;
+    assert_eq!(control.visit().step, "would-announce");
+    drop(control);
+    let h = rig("announced-onto-a-failing-build");
+    let (steps, releases, after) = onto_a_failing_build(&h);
+    assert_eq!(releases, 1, "released once: {steps:?}");
+    assert!(after.release.is_empty(), "nothing owed: {after:?}");
+    assert_eq!(after.round_markers().count(), 0, "{after:?}");
+}
+
+/// A FAILURE WHOSE RELAUNCH CAME UP AFTER ALL IS NO FAILURE OF ITS BUILD
+/// (the review's minor 4): a relaunch stopped `no-resume` — its start slower
+/// than the stale bound — is noted against its build, and after a passing
+/// probe it makes the build BLIND. When the agent its line started comes up
+/// after all, the visit takes the stop back (`reopened:relaunch-landed`,
+/// [`St::reopen_landed`]), but the note kept it: no agent was moved onto a
+/// build that starts, until a newer one shipped. The stop taken back is
+/// taken back from its build too: the other conversation's failure alone
+/// stands, which the probe proved since.
+#[cfg(unix)]
+#[test]
+fn a_failure_whose_relaunch_came_up_after_all_is_taken_back_from_its_build() {
+    let current = Targets {
+        managed: Some(Candidate {
+            exe: PathBuf::from("/nonexistent/claude"),
+            version: Version::parse("1.0.0").expect("version"),
+            source: Source::Managed,
+        }),
+        native: None,
+        unanswered: false,
+    };
+    let to = current.managed.clone().expect("the build");
+    let dir = scratch("landed-late-taken-back");
+    let (sock, _asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut agent = parked().spawn().expect("agent");
+    wait_exec(agent.id());
+    let sf = register(&opts.home, agent.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    // Another conversation's relaunch onto 1.0.0 failed to start; a probe
+    // passed a minute ago.
+    failed_start_saved(&opts, ANOTHER_CONVERSATION, "1.0.0", 600);
+    let r = blank(&sf);
+    let probed = now_s() - 60;
+    assert_eq!(
+        build_start::starts_with(&opts, &r, &to, probed, false, |_| {
+            build_start::Probe::Starts
+        }),
+        Ok(())
+    );
+    // This conversation's relaunch, moved since, stopped `no-resume`: blind.
+    let st = St {
+        phase: Phase::Failed("no-resume".to_string()),
+        pid: dead_pid(),
+        shell: std::process::id(),
+        tab: TAB.to_string(),
+        from: "0.9.0".to_string(),
+        to: "1.0.0".to_string(),
+        source: "managed".to_string(),
+        quiet: true,
+        exited_at: now_s(),
+        relaunched_at: now_s(),
+        failed_at: now_s(),
+        streak_why: "no-resume".to_string(),
+        stop_streak: 1,
+        ..St::default()
+    };
+    save(&opts, SESSION, &st);
+    let blind = build_start::load(&opts, "managed", "1.0.0").expect("the note");
+    assert!(blind.blind, "{blind:?}");
+    let r = visit(&opts, &sf, &table(), &current, &Live);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    let note = build_start::load(&opts, "managed", "1.0.0").expect("the note");
+    let moves = build_start::starts_with(&opts, &r, &to, now_s(), false, |_| {
+        panic!("proved since the failure that stands: no probe")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!note.blind, "{note:?}");
+    assert_eq!(note.failures, 1, "the other conversation's alone: {note:?}");
+    assert_eq!(moves, Ok(()));
+}
+
+/// THE OWNER'S `--now` PROBES A BLIND BUILD AGAIN (the review's minor 4): a
+/// build a move failed on after a passing probe is BLIND — no probe proves
+/// it again — and the owner's own word to move the agent now moved nothing,
+/// said nothing and ran nothing, until a newer build shipped. The owner's
+/// `--now` runs the probe once more: a build that starts is moved onto (its
+/// note proved again), one that does not still waits. CONTROL: without the
+/// owner's word the blind build is not probed.
+#[cfg(unix)]
+#[test]
+fn the_owners_now_probes_a_blind_build_again() {
+    let rig = |name: &str, now_word: bool| {
+        // Behind for hours: the owner has been told ([`upgrade::Facts::unnoticed`]).
+        let behind = St {
+            pending_since: now_s() - 3 * 3600,
+            ..settled()
+        };
+        let h = quietly(|| Parked::new(name, Answers::default(), behind, 3600));
+        // A build whose `--help` runs and exits 0.
+        let exe = h.dir.join("claude-9.9.9");
+        sh_script(&exe, "case \"$1\" in --help) exit 0 ;; esac\nexit 1");
+        let targets = Targets {
+            managed: Some(Candidate {
+                exe,
+                version: Version::parse("9.9.9").expect("version"),
+                source: Source::Managed,
+            }),
+            native: None,
+            unanswered: false,
+        };
+        // Failed, proved by a probe, failed again after the proof: blind.
+        failed_start_saved(&h.opts, ANOTHER_CONVERSATION, "9.9.9", 600);
+        let to = targets.managed.clone().expect("the build");
+        let r = blank(&h.sf);
+        assert_eq!(
+            build_start::starts_with(&h.opts, &r, &to, now_s() - 300, false, |_| {
+                build_start::Probe::Starts
+            }),
+            Ok(())
+        );
+        failed_start_saved(&h.opts, "0badf00d-7777-2222-3333-444455556666", "9.9.9", 30);
+        assert!(build_start::load(&h.opts, "managed", "9.9.9").is_some_and(|n| n.blind));
+        if now_word {
+            let mut st = load(&h.opts, SESSION).expect("the round");
+            st.request = Request::Now;
+            st.request_tab = TAB.to_string();
+            st.request_at = now_s();
+            save(&h.opts, SESSION, &st);
+        }
+        // The probes run before the visit (the proof above).
+        let before = h.details("build-probe:starts").len();
+        let r = visit(
+            &h.opts,
+            &h.sf,
+            &[(dead_pid(), 1, "zsh".to_string())],
+            &targets,
+            &Script::new(dead_pid(), usize::MAX, None),
+        );
+        let probed = h.details("build-probe:starts").len() - before;
+        (h, r, probed)
+    };
+    let (h, r, probed) = rig("blind-build-unasked", false);
+    assert_eq!(r.step, "wait:build-fails", "{r:?}");
+    assert_eq!(probed, 0, "not probed");
+    drop(h);
+    let (_h, r, probed) = rig("blind-build-owners-now", true);
+    assert_eq!(probed, 1, "probed: {r:?}");
+    assert_ne!(r.step, "wait:build-fails", "moved: {r:?}");
+}
+
+/// THE SETTINGS CHAIN IS READ FOR THE RECORD'S OWN PROCESS, NEVER A PID
+/// REUSED SINCE (the review's minor 7): the model rule reads the `--settings`
+/// an agent was launched with off its process's argv, and read it off
+/// `sf.pid` whatever process held that pid now — a recycled pid's
+/// `--settings` was the dead agent's allowlist. Read only where the process
+/// is the record's (its kernel start, Claude's `procStart`). CONTROL: the
+/// record's own process's `--settings` is read.
+#[cfg(unix)]
+#[test]
+fn the_settings_chain_reads_no_recycled_pids_settings_flag() {
+    let dir = scratch("model-settings-recycled-pid");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    let user = opts.home.join(".claude");
+    let catalog = user.join("cache/model-catalog");
+    std::fs::create_dir_all(&catalog).expect("the catalog cache");
+    std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&opts, &targets);
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    let proj = user.join("projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let at = i64::try_from(now_s()).expect("now") - 7_200;
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+    // A process launched with `--settings` allowing Fable 5.1 alone.
+    let flag = dir.join("team.json");
+    std::fs::write(&flag, r#"{"availableModels":["claude-fable-5-1"]}"#).expect("team");
+    let mut holder = aterm_uds::spawnfd::command("/bin/sh")
+        .arg("-c")
+        .arg("sleep 600; :")
+        .arg("--settings")
+        .arg(&flag)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the process");
+    // Until it runs `/bin/sh` with its flag (a fork not yet exec'd reads as
+    // this test): a hang detector, never a budget.
+    for _ in 0..3_000 {
+        if atpkg::caller_shell::process_args(holder.id())
+            .is_some_and(|a| a.argv.iter().any(|arg| arg == "--settings"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let its_start = kernel_start(holder.id()).expect("its start");
+    let verdict = |proc_start: &str| {
+        let sf = SessionFile {
+            pid: holder.id(),
+            proc_start: proc_start.to_string(),
+            claude_dir: Some(user.clone()),
+            cwd: work.to_string_lossy().into_owned(),
+            ..record("2.1.296")
+        };
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        model_read_for(&opts, &sf, None, &mctx, false, None).verdict
+    };
+    let own = verdict(&its_start);
+    let recycled = verdict("Thu Oct  1 00:00:00 2026");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(own, ModelVerdict::Keep("model-current"), "its own flag");
+    assert_eq!(
+        recycled,
+        ModelVerdict::Due {
+            from: "claude-fable-5-1".to_string(),
+            to: "claude-opus-5-5".to_string(),
+        },
+        "a recycled pid's flag is not the record's"
+    );
+}
+
+/// THE STOP A NEW PROCESS OF THE CONVERSATION KEEPS ([`St::keep_stop`]), at
+/// [`St::retarget`]: a Claude Code relaunch onto the target that never
+/// registered the conversation (`no-resume`) is that build's failure for the
+/// conversation, so another process of it keeps the stop, its rest's
+/// instant and its streak — bound to itself (its start, its build, its age
+/// from now), nothing of the ended agent's (no exit seen, no process brought
+/// up) — and the next such stop rests longer. Said once on the ledger
+/// (`kept-stopped:no-resume`). NEGATIVE CONTROLS, each a fresh pending round
+/// as before: the same process keeps its record as it was; another reason
+/// (the process's or its line's); another install of the build (native); a
+/// relaunch that kept its program; a Codex record; a newer build.
+#[test]
+fn a_hand_resume_keeps_the_stop_of_the_build_that_failed_to_start_for_it() {
+    let running = Version::parse("2.1.296").expect("v");
+    let target = |version: &str, source: Source| Candidate {
+        exe: PathBuf::from("/pkg/agents/claude"),
+        version: Version::parse(version).expect("v"),
+        source,
+    };
+    let to = target("2.1.999", Source::Managed);
+    let stopped = |why: &str| St {
+        phase: Phase::Failed(why.to_string()),
+        from: "2.1.296".to_string(),
+        to: "2.1.999".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        pid: 41,
+        shell: 40,
+        salt: 100,
+        pending_since: 100,
+        proc_start: "A".to_string(),
+        exited_at: 990,
+        relaunched_at: 991,
+        relaunched_pid: 42,
+        failed_at: 995,
+        streak_why: why.to_string(),
+        stop_streak: 1,
+        notices: 2,
+        ..St::default()
+    };
+    let (st, how) = St::retarget(
+        Some(stopped("no-resume")),
+        &running,
+        &to,
+        None,
+        proc("B"),
+        1_029,
+    );
+    assert_eq!(how, Retarget::Rested);
+    assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
+    assert_eq!(
+        (st.failed_at, st.streak_why.as_str(), st.stop_streak),
+        (995, "no-resume", 1),
+        "the stop, its rest and its streak"
+    );
+    assert_eq!(
+        (
+            st.proc_start.as_str(),
+            st.from.as_str(),
+            st.to.as_str(),
+            st.behind_since(),
+            st.tab.as_str()
+        ),
+        ("B", "2.1.296", "2.1.999", 1_029, TAB),
+        "bound to the process that holds the conversation now"
+    );
+    assert_eq!(
+        (st.exited_at, st.relaunched_pid, st.pid, st.notices),
+        (0, 0, 0, 0),
+        "nothing of the ended agent's: its exit, what its relaunch brought up, its asks"
+    );
+    assert_eq!(
+        retarget_how(how, &st),
+        "kept stopped: that build failed to start for this conversation"
+    );
+    // The rest runs: the same process keeps the record as it is now.
+    let (again, how) = St::retarget(Some(st.clone()), &running, &to, None, proc("B"), 1_100);
+    assert_eq!(
+        (how, again.phase.clone()),
+        (Retarget::Kept, st.phase.clone())
+    );
+    // Past it, a new round; that build failing to start again rests longer.
+    let mut next = again;
+    next.rearm(995 + upgrade::RETRY_S + 1);
+    assert_eq!(next.phase, Phase::Pending);
+    let at = 995 + upgrade::RETRY_S + 600;
+    next.stop("no-resume", at);
+    assert_eq!(next.stop_streak, 2, "a stop that repeats");
+    assert_eq!(next.failed_at, at + upgrade::rest_extension(2));
+    // Said once.
+    let dir = scratch("kept-stopped");
+    let opts = drive(&dir);
+    let r = Report {
+        pid: 7,
+        tab: TAB.to_string(),
+        session: SESSION.to_string(),
+        from: "2.1.296".to_string(),
+        to: "2.1.999(managed)".to_string(),
+        step: String::new(),
+    };
+    rested_said(&opts, &r, &st, 1_029);
+    let said = ledger_details(&opts, "kept-stopped:no-resume");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("2.1.999 failed to start"), "{}", said[0]);
+    assert!(
+        said[0].contains("rest ends in 1h59m"),
+        "counted from the stop: {}",
+        said[0]
+    );
+    assert_eq!(
+        load(&opts, SESSION).map(|st| st.phase),
+        Some(st.phase.clone()),
+        "saved"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROLS.
+    let fresh = |prior: St, to: &Candidate| {
+        let (st, how) = St::retarget(Some(prior), &running, to, None, proc("B"), 1_029);
+        (st.phase, how)
+    };
+    let pending = (Phase::Pending, Retarget::Anew);
+    let (kept, how) = St::retarget(
+        Some(stopped("no-resume")),
+        &running,
+        &to,
+        None,
+        proc("A"),
+        1_029,
+    );
+    assert_eq!(
+        (kept.phase, how),
+        (Phase::Failed("no-resume".to_string()), Retarget::Kept),
+        "its own process: as it was"
+    );
+    assert_eq!(
+        fresh(stopped("relaunch-refused"), &to),
+        pending,
+        "the line's"
+    );
+    assert_eq!(
+        fresh(stopped("resumed-elsewhere"), &to),
+        pending,
+        "the process's"
+    );
+    assert_eq!(
+        fresh(stopped("no-resume"), &target("2.1.999", Source::Native)),
+        pending,
+        "another install of the build"
+    );
+    let same_program = St {
+        source: SAME_PROGRAM.to_string(),
+        ..stopped("no-resume")
+    };
+    assert_eq!(
+        fresh(same_program, &to),
+        pending,
+        "a relaunch that kept its program"
+    );
+    let codex = St {
+        agent: upgrade::Agent::Codex,
+        ..stopped("no-resume")
+    };
+    assert_eq!(fresh(codex, &to).0, Phase::Pending, "a Codex record");
+    assert_eq!(
+        fresh(stopped("no-resume"), &target("2.1.1000", Source::Managed)),
+        pending,
+        "a newer build"
+    );
+}
+
+/// A RESTART ON ITS OWN PROGRAM KEEPS THE STOP OF A BUILD THAT FAILED TO
+/// START FOR THE CONVERSATION (the review of `fix/upgrade-homes`,
+/// 2026-10-14): the stop lived on the conversation's record alone, and a
+/// restart in place (a memory banner, a bucket's fallback, an account move)
+/// or a relaunch on exit kept on its program wrote its own record over it,
+/// keeping only the owner's hold and the move clock
+/// ([`St::kept_by_restart`]). Once that restart landed, the next visit's
+/// retarget minted a fresh pending round for the very build — no rest, no
+/// streak — and the quiet flow moved the hand-resumed agent onto it inside
+/// the rest: the `urfx1` harm by another road. Now the restart's record
+/// carries the stop ([`St::failed_start`]), through a second restart too,
+/// and the retarget off it rests as the stopped arm does
+/// ([`Retarget::Rested`]): the stop, its rest's instant and its streak, a
+/// repeat resting longer. The record reads back as written. NEGATIVE
+/// CONTROLS: a newer build is a new round at once, and a restart over a
+/// record with no such stop carries none.
+#[test]
+fn a_restart_on_its_own_program_keeps_the_stop_of_a_build_that_failed_to_start() {
+    use super::super::relaunch::{CAUSE_EXIT, CAUSE_MEMORY};
+    let running = Version::parse("2.1.296").expect("v");
+    let target = |version: &str| Candidate {
+        exe: PathBuf::from("/pkg/agents/claude"),
+        version: Version::parse(version).expect("v"),
+        source: Source::Managed,
+    };
+    let to = target("2.1.999");
+    // The upgrade's relaunch onto 2.1.999 stopped `no-resume` at 995; the
+    // person resumed the conversation by hand (process B), which keeps it.
+    let stopped = St {
+        phase: Phase::Failed("no-resume".to_string()),
+        from: "2.1.296".to_string(),
+        to: "2.1.999".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        pid: 41,
+        salt: 100,
+        pending_since: 100,
+        proc_start: "A".to_string(),
+        failed_at: 995,
+        streak_why: "no-resume".to_string(),
+        stop_streak: 1,
+        ..St::default()
+    };
+    let (rested, how) = St::retarget(Some(stopped), &running, &to, None, proc("B"), 1_029);
+    assert_eq!(how, Retarget::Rested, "precondition: the hand resume rests");
+    // A restart of B on its own program, `cause`, its record over the stop.
+    let restarted = |prior: &St, cause: &str, phase: Phase| {
+        let mut st = St {
+            phase,
+            from: "2.1.296".to_string(),
+            to: "2.1.296".to_string(),
+            source: SAME_PROGRAM.to_string(),
+            cause: cause.to_string(),
+            tab: TAB.to_string(),
+            salt: 1_500,
+            ..St::default()
+        };
+        prior.kept_by_restart(TAB, &mut st);
+        St::from_json(&st.to_json()).expect("the record reads back")
+    };
+    let landed = restarted(&rested, CAUSE_MEMORY, Phase::Done);
+    // Inside the rest, the round after it rests for process C as it was.
+    let (next, how) = St::retarget(Some(landed.clone()), &running, &to, None, proc("C"), 1_700);
+    assert_eq!(how, Retarget::Rested, "{next:?}");
+    assert_eq!(next.phase, Phase::Failed("no-resume".to_string()));
+    assert_eq!(
+        (next.failed_at, next.streak_why.as_str(), next.stop_streak),
+        (995, "no-resume", 1),
+        "the stop, its rest and its streak"
+    );
+    assert_eq!(
+        (next.proc_start.as_str(), next.to.as_str()),
+        ("C", "2.1.999"),
+        "bound to the process that holds the conversation now"
+    );
+    // Through a second restart (a crash relaunched on its program), and one
+    // that itself stopped.
+    let twice = restarted(&landed, CAUSE_EXIT, Phase::Done);
+    let (next, how) = St::retarget(Some(twice), &running, &to, None, proc("D"), 1_800);
+    assert_eq!((how, next.failed_at), (Retarget::Rested, 995), "twice");
+    let mut refused = restarted(&rested, CAUSE_MEMORY, Phase::Exiting { at_s: 1_500 });
+    refused.stop("relaunch-refused", 1_510);
+    let (next, how) = St::retarget(Some(refused), &running, &to, None, proc("B"), 1_600);
+    assert_eq!(
+        (how, next.phase, next.failed_at),
+        (
+            Retarget::Rested,
+            Phase::Failed("no-resume".to_string()),
+            995
+        ),
+        "a restart that stopped"
+    );
+    // Past the rest the round re-arms and a repeat of the stop rests longer.
+    let (mut late, _) = St::retarget(
+        Some(landed.clone()),
+        &running,
+        &to,
+        None,
+        proc("C"),
+        995 + upgrade::RETRY_S + 1,
+    );
+    late.rearm(995 + upgrade::RETRY_S + 1);
+    late.stop("no-resume", 995 + upgrade::RETRY_S + 600);
+    assert_eq!(late.stop_streak, 2, "a stop that repeats");
+    // NEGATIVE CONTROLS.
+    let (newer, how) = St::retarget(
+        Some(landed),
+        &running,
+        &target("2.1.1000"),
+        None,
+        proc("C"),
+        1_700,
+    );
+    assert_eq!(
+        (how, newer.phase),
+        (Retarget::Anew, Phase::Pending),
+        "a newer build"
+    );
+    let plain = St {
+        phase: Phase::Pending,
+        from: "2.1.296".to_string(),
+        to: "2.1.999".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        ..St::default()
+    };
+    let (next, how) = St::retarget(
+        Some(restarted(&plain, CAUSE_MEMORY, Phase::Done)),
+        &running,
+        &to,
+        None,
+        proc("C"),
+        1_700,
+    );
+    assert_eq!(
+        (how, next.phase),
+        (Retarget::Anew, Phase::Pending),
+        "no stop"
+    );
 }
 
 /// A restart left in flight acts on its tab only while it is fresh and its
@@ -5144,8 +6675,55 @@ fn a_relaunch_that_never_carries_on_is_noted_once_past_its_bound() {
 #[cfg(unix)]
 #[test]
 fn a_restart_whose_agent_the_relaunch_sees_gone_says_when() {
+    let st = relaunched_over("seen-gone-relaunch", dead_pid());
+    assert_ne!(st.exited_at, 0, "seen gone");
+}
+
+/// ...AND SO FOR AN AGENT ITS SHELL HAS NOT REAPED YET (the live re-check of
+/// 2026-10-09): the SIGTERMed Claude Code a zombie as the relaunch looks.
+/// `wait_exit` reads its exit (the kernel watches no zombie), but the stamp
+/// asked `kill(pid, 0)`, which a zombie still answers: the record stood with
+/// no exit on it, and a relaunch stopped at once read as an upgrade still
+/// owed, hidden from the owner, its old agent's exit taken for a graceful
+/// one of its own. (Where the kernel can say a process is a zombie: macOS's
+/// exit watch, Linux's `/proc/<pid>/stat`.)
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
+    let mut zombie = Command::new("/bin/sleep")
+        .arg("60")
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the agent");
+    let pid = zombie.id();
+    let gone = libc::pid_t::try_from(pid).expect("pid");
+    // SAFETY: the test's own child; reaped below, after the look.
+    unsafe { libc::kill(gone, libc::SIGKILL) };
+    assert!(
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(5),
+            || super::super::upgrade_wake::wait_exit(pid, Duration::ZERO).then_some(())
+        )
+        .is_some(),
+        "the agent ended"
+    );
+    assert!(
+        alive(pid),
+        "a zombie, not reaped: kill(pid, 0) still finds it"
+    );
+    let st = relaunched_over("unreaped-relaunch", pid);
+    let _ = zombie.wait();
+    assert_ne!(st.exited_at, 0, "its exit seen");
+}
+
+/// One [`relaunch`] of a restart whose signalled agent is `pid`, at a shell
+/// that never takes its terminal back: `wait:shell-prompt`, still in flight,
+/// nothing typed; the record after it.
+#[cfg(unix)]
+fn relaunched_over(name: &str, pid: u32) -> St {
     let _quick = QuickWaits::new();
-    let dir = scratch("seen-gone-relaunch");
+    let dir = scratch(name);
     let (sock, asked) = instance(&dir);
     let opts = Opts {
         sock: Some(sock),
@@ -5160,7 +6738,7 @@ fn a_restart_whose_agent_the_relaunch_sees_gone_says_when() {
         .expect("stand-in shell");
     let mut st = St {
         phase: Phase::Exiting { at_s: now_s() },
-        pid: dead_pid(),
+        pid,
         shell: shell.id(),
         tab: TAB.to_string(),
         to: "2.1.283".to_string(),
@@ -5188,9 +6766,9 @@ fn a_restart_whose_agent_the_relaunch_sees_gone_says_when() {
     let _ = shell.wait();
     assert_eq!(r.step, "wait:shell-prompt");
     assert!(matches!(st.phase, Phase::Exiting { .. }), "still in flight");
-    assert_ne!(st.exited_at, 0, "seen gone");
     assert_eq!(turns(&asked), 0, "nothing typed");
     let _ = std::fs::remove_dir_all(&dir);
+    st
 }
 
 /// Every step word is taught, and an untaught one is no last word: the last
@@ -6068,6 +7646,8 @@ fn record(version: &str) -> SessionFile {
         proc_start: "start".to_string(),
         kind: "interactive".to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     }
 }
 
@@ -6705,12 +8285,17 @@ fn stand_in_shell() -> aterm_uds::spawnfd::Child {
 /// never read the owner's word on the tab, so an agent that crashed came
 /// back on the very build its owner had skipped (or deferred). Now a build
 /// the conversation's upgrade record holds the session off for this tab is
-/// no relaunch target: it comes back on the program it ran. NEGATIVE
-/// CONTROLS: no word, a deferral run out, a word on another tab and `--now`
-/// move it as before; a build NEWER than the skipped one is moved to.
+/// no relaunch target: it comes back on the program it ran. So is A BUILD
+/// THAT FAILED TO START FOR THE CONVERSATION while its stop's rest stands
+/// ([`St::holds_off`]), whatever ended the agent: a crash, the stall
+/// remedy, `aterm ctl restart`, aterm's own end. NEGATIVE CONTROLS: no
+/// word, a deferral run out, a word on another tab and `--now` move it as
+/// before; a build NEWER than the skipped one is moved to; so is the failed
+/// build once the rest has run out (a stop there again then repeats), and a
+/// build a stop of another reason, or of an older build, names.
 #[cfg(unix)]
 #[test]
-fn the_owners_hold_keeps_a_crashs_relaunch_off_the_build_it_names() {
+fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     // Canonical: the native link is read through `canonicalize`, which a
     // temp dir's `/var` → `/private/var` would otherwise move out from under
     // the install's root.
@@ -6731,6 +8316,7 @@ fn the_owners_hold_keeps_a_crashs_relaunch_off_the_build_it_names() {
     std::os::unix::fs::symlink(versions.join("99.9.9"), opts.home.join(".local/bin/claude"))
         .expect("the native link");
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("sessions");
+    file_transcript_in(&opts.home.join(".claude"), "p");
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     let mut shell = stand_in_shell();
     let dead = dead_pid();
@@ -6761,6 +8347,7 @@ fn the_owners_hold_keeps_a_crashs_relaunch_off_the_build_it_names() {
         dialect: Some(Dialect::Zsh),
         login: None,
         home: None,
+        claude_dir: None,
     };
     let now = now_s();
     let relaunched_to = |request: Request, request_tab: &str| {
@@ -6812,6 +8399,113 @@ fn the_owners_hold_keeps_a_crashs_relaunch_off_the_build_it_names() {
         moved,
         "a build newer than the skipped one"
     );
+    // A BUILD THAT FAILED TO START FOR THE CONVERSATION holds its relaunch
+    // the same way while the stop's rest stands ([`St::holds_off`]; the
+    // review of `fix/upgrade-homes`, 2026-10-14): the conversation's record
+    // is the kept stop of an upgrade onto 99.9.9 that stopped `no-resume`,
+    // its hand resume crashed (or was ended by the stall remedy, by `aterm
+    // ctl restart`, or with aterm itself), and the relaunch on exit moved it
+    // straight onto the build that had just failed to start for it.
+    use super::super::restart_stamp::Cause;
+    let stopped = |why: &str, to: &str, ago: u64| St {
+        phase: Phase::Failed(why.to_string()),
+        from: "2.1.281".to_string(),
+        to: to.to_string(),
+        source: "native".to_string(),
+        tab: TAB.to_string(),
+        proc_start: "B".to_string(),
+        pending_since: now - 7_200,
+        salt: now - 7_200,
+        failed_at: now - ago,
+        streak_why: why.to_string(),
+        stop_streak: 1,
+        ..St::default()
+    };
+    let relaunched_over = |st: &St, how: &str| {
+        std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("the record");
+        let r = match how {
+            "crash" => after_exit(&opts, &snap, &ExitRecord::Unread, true, None),
+            "stall" => after_exit(&opts, &snap, &ExitRecord::Unread, true, Some(Cause::Stall)),
+            "asked" => after_exit(&opts, &snap, &ExitRecord::Unread, true, Some(Cause::Asked)),
+            _ => after_host_ended(&opts, &snap, true),
+        };
+        assert_eq!(r.step, "would-relaunch", "{how}: {r:?}");
+        r.to
+    };
+    for how in ["crash", "stall", "asked", "host-ended"] {
+        assert_eq!(
+            relaunched_over(&stopped("no-resume", "99.9.9", 600), how),
+            held,
+            "{how}: inside the stop's rest"
+        );
+        // NEGATIVE CONTROLS: the rest run out; another reason, the process's
+        // or its line's; a stop of an older build.
+        assert_eq!(
+            relaunched_over(&stopped("no-resume", "99.9.9", upgrade::RETRY_S + 60), how),
+            moved,
+            "{how}: the rest run out"
+        );
+        assert_eq!(
+            relaunched_over(&stopped("resumed-elsewhere", "99.9.9", 600), how),
+            moved,
+            "{how}: another reason"
+        );
+        assert_eq!(
+            relaunched_over(&stopped("no-resume", "99.9.8", 600), how),
+            moved,
+            "{how}: a stop of an older build"
+        );
+    }
+    // Past the rest, the relaunch onto that build tries it again: its record
+    // keeps the stop in a row, so a stop there again repeats and rests longer
+    // ([`St::retried_by`]); onto another build, it is a first stop.
+    let stopped_on = |prior: &St, to: &str| {
+        let mut st = St {
+            from: "2.1.281".to_string(),
+            to: to.to_string(),
+            source: "native".to_string(),
+            cause: CAUSE_EXIT.to_string(),
+            ..St::default()
+        };
+        prior.retried_by(&mut st);
+        st.stop("no-resume", now);
+        st.stop_streak
+    };
+    let rested = stopped("no-resume", "99.9.9", upgrade::RETRY_S + 60);
+    assert_eq!(stopped_on(&rested, "99.9.9"), 2, "a stop that repeats");
+    assert_eq!(stopped_on(&rested, "99.9.10"), 1, "another build");
+    // A BUILD THAT FAILED TO START FOR ANOTHER CONVERSATION, not proved to
+    // start since ([`build_starts`], round eighteen): this conversation's
+    // record holds nothing, and its crash comes back on the program it ran.
+    // CONTROL: proved to start since, it is moved onto.
+    let _ = std::fs::remove_file(state_path(&opts, SESSION));
+    let writes = Opts {
+        dry_run: false,
+        ..opts.clone()
+    };
+    let elsewhere = St {
+        agent: upgrade::Agent::Claude,
+        source: "native".to_string(),
+        relaunched_at: now - 40,
+        ..stopped("no-resume", "99.9.9", 34)
+    };
+    save(&writes, "0badf00d-9999-2222-3333-444455556666", &elsewhere);
+    let crash = || after_exit(&opts, &snap, &ExitRecord::Unread, true, None);
+    let r = crash();
+    assert_eq!((r.step.as_str(), r.to.as_str()), ("would-relaunch", held));
+    let native = Candidate {
+        exe: versions.join("99.9.9"),
+        version: Version::parse("99.9.9").expect("v"),
+        source: Source::Native,
+    };
+    assert_eq!(
+        build_start::starts_with(&writes, &r, &native, now, false, |_| {
+            build_start::Probe::Starts
+        }),
+        Ok(())
+    );
+    let r = crash();
+    assert_eq!((r.step.as_str(), r.to.as_str()), ("would-relaunch", moved));
     let _ = shell.kill();
     let _ = shell.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -7325,6 +9019,16 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     };
     seed_builds(&opts);
     std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("home");
+    // The conversations a crash leaves have messages: their transcripts.
+    let project = opts.home.join(".claude/projects/-w");
+    let later = "0badf00d-9999-2222-3333-444455556666";
+    let transcripts = || {
+        std::fs::create_dir_all(&project).expect("projects");
+        for s in [SESSION, later] {
+            std::fs::write(project.join(format!("{s}.jsonl")), "{}\n").expect("transcript");
+        }
+    };
+    transcripts();
     let mut shell = stand_in_shell();
     let shell_pid = shell.id();
     let snap = |pid: u32, start: &str, session: Option<&str>| Snapshot {
@@ -7344,6 +9048,7 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
         dialect: Some(Dialect::Zsh),
         login: None,
         home: None,
+        claude_dir: None,
     };
     // Each step reads Claude's record at the attempt: an exit nothing could
     // read as it was seen ([`ExitRecord::Unread`]; the look at the exit is the
@@ -7402,19 +9107,24 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
         ("would-relaunch", SESSION)
     );
     // A conversation Claude filed no transcript for (no message yet) cannot
-    // be resumed: the agent is started afresh. One whose transcripts cannot
-    // be read at all is resumed (Negative control above: no projects dir).
-    let project = opts.home.join(".claude/projects/-w");
-    std::fs::create_dir_all(&project).expect("projects");
+    // be resumed: the agent is started afresh — and so in a Claude home with
+    // no projects at all (Claude makes them with the home's first message).
+    // NEGATIVE CONTROL: projects that exist and cannot be listed say nothing,
+    // and the conversation is resumed (Claude says if it cannot).
+    let projects = opts.home.join(".claude/projects");
+    std::fs::remove_file(project.join(format!("{SESSION}.jsonl"))).expect("rm");
     let r = at_attempt(&snap(dead, start, Some(SESSION)), false);
     assert_eq!(r.step, "would-relaunch:fresh");
-    std::fs::write(project.join(format!("{SESSION}.jsonl")), "{}\n").expect("transcript");
+    std::fs::remove_dir_all(&projects).expect("rm");
     let r = at_attempt(&snap(dead, start, Some(SESSION)), false);
-    assert_eq!(r.step, "would-relaunch");
-    std::fs::remove_dir_all(opts.home.join(".claude/projects")).expect("rm");
+    assert_eq!(r.step, "would-relaunch:fresh", "no projects yet");
+    std::fs::write(&projects, "").expect("not a directory");
+    let r = at_attempt(&snap(dead, start, Some(SESSION)), false);
+    assert_eq!(r.step, "would-relaunch", "unreadable projects");
+    std::fs::remove_file(&projects).expect("rm");
+    transcripts();
     // ...and the crash's surviving record wins over the snapshot: it names
     // the conversation as the agent last held it.
-    let later = "0badf00d-9999-2222-3333-444455556666";
     crash_record(dead, later);
     let r = at_attempt(&snap(dead, start, Some(SESSION)), false);
     assert_eq!(
@@ -7502,6 +9212,7 @@ impl DeadAgent {
         seed_builds(&opts);
         let sessions = opts.home.join(".claude/sessions");
         std::fs::create_dir_all(&sessions).expect("home");
+        file_transcript_in(&opts.home.join(".claude"), "p");
         let shell = stand_in_shell();
         let dead = dead_pid();
         let snap = Snapshot {
@@ -7518,6 +9229,7 @@ impl DeadAgent {
             dialect: Some(Dialect::Zsh),
             login: None,
             home: None,
+            claude_dir: None,
         };
         let record = sessions.join(format!("{dead}.json"));
         DeadAgent {
@@ -7695,8 +9407,9 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
 /// removes its own record ([`ExitRecord::Removed`]). A restart its step left in
 /// flight past [`STALE_S`] (the relaunch lane's back-off can pass the bound)
 /// is stopped with the moment its agent was seen gone (the status view shows
-/// it) and said, `refused:<why>` (the one case a person is asked about), for
-/// the upgrade's causes and the restart in place's alike, and again for a
+/// it) and said — `told:<why>` for the upgrade's causes, whose own row asks
+/// the owner, `refused:<why>` for the restart in place's (the one case the
+/// host asks a person about) — and again for a
 /// restart already stopped after its exit; it never falls through to
 /// `ended:graceful-exit` unsaid. A relaunched one that never registered is
 /// never relaunched afresh: its line was typed once. Negative controls: a
@@ -7727,19 +9440,21 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         ..St::default()
     };
     let attempt = || after_exit(&opts, &a.snap, &ExitRecord::Removed, true, None).step;
-    for cause in [
-        "",
-        CAUSE_UPGRADE_FRESH,
-        CAUSE_MEMORY,
-        "model:claude-fable-5-1",
-        "model-back:",
+    // An upgrade's record, which the owner's view lists, is said by its own
+    // row (`told:`); a restart in place's by the host (`refused:`).
+    for (cause, said) in [
+        ("", "told:stale-exit"),
+        (CAUSE_UPGRADE_FRESH, "told:stale-exit"),
+        (CAUSE_MEMORY, "refused:stale-exit"),
+        ("model:claude-fable-5-1", "refused:stale-exit"),
+        ("model-back:", "refused:stale-exit"),
     ] {
         save(
             &opts,
             SESSION,
             &record(Phase::Exiting { at_s: old }, cause, a.snap.pid),
         );
-        assert_eq!(attempt(), "refused:stale-exit", "{cause:?}");
+        assert_eq!(attempt(), said, "{cause:?}");
         let st = load(&opts, SESSION).expect("kept");
         assert_eq!(
             st.phase,
@@ -7748,7 +9463,7 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         );
         assert_ne!(st.exited_at, 0, "{cause:?}: its agent was seen gone");
         // Stopped after its exit: the next attempt says so again.
-        assert_eq!(attempt(), "refused:stale-exit", "{cause:?}");
+        assert_eq!(attempt(), said, "{cause:?}");
     }
     // Relaunched and never registered: said, never typed a second time.
     save(
@@ -7756,7 +9471,7 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
         SESSION,
         &record(Phase::Relaunched { at_s: old }, "", a.snap.pid),
     );
-    assert_eq!(attempt(), "refused:no-resume");
+    assert_eq!(attempt(), "told:no-resume");
     // Negative controls. A relaunch on exit's record: its agent crashed, and
     // its graceful end is read as before; the record too old to act on is
     // closed as a stop ([`St::stop`]), with the moment its agent was seen gone.
@@ -7881,13 +9596,74 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
     );
 }
 
+/// THE UPGRADE'S OWN ROW ASKS FOR A MOVE STOPPED AFTER ITS EXIT, NOT THE
+/// HOST'S CARRY (the review of the 2026-10-09 sweep fixes). A record the
+/// owner's view lists — an upgrade's, quiet or fresh — that stopped after its
+/// agent was seen gone raises `agent-down` there, with the one remedy
+/// (`upgrade_status::Row::agent_down`: the conversation's resume, or a plain
+/// `claude` for a restart that started its agent afresh). The carry of that
+/// agent's exit answered `refused:<why>`, which the host says as an agent it
+/// cannot bring back: a second report, its reason `aterm refused it` (false:
+/// the new agent ended at once), its tab mark telling `claude --resume <the
+/// old conversation>` — which for a fresh restart is the conversation with no
+/// transcript that Claude refuses. Such a carry answers `told:<why>`,
+/// whatever the stop (`no-resume`, `stale-exit`), and the host reads it as
+/// said (`outcome`: `Cannot`, its word the row's). NEGATIVE CONTROL: a
+/// restart in place's record (a model move: listed nowhere) is still
+/// `refused:<why>`, the host's to say.
+#[test]
+fn the_carry_of_an_upgrade_stopped_after_its_exit_leaves_the_ask_to_its_row() {
+    use super::super::relaunch::{CAUSE_UPGRADE_FRESH, Outcome, carry_restart, outcome, restarted};
+    let a = DeadAgent::new("carry-told");
+    let opts = Opts {
+        dry_run: false,
+        ..a.opts.clone()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let pid = a.snap.pid;
+    for (cause, why, want) in [
+        ("", "no-resume", "told:no-resume"),
+        (CAUSE_UPGRADE_FRESH, "no-resume", "told:no-resume"),
+        ("", "stale-exit", "told:stale-exit"),
+        ("model:claude-sonnet-5-5", "no-resume", "refused:no-resume"),
+    ] {
+        save(
+            &opts,
+            SESSION,
+            &St {
+                phase: Phase::Failed(why.to_string()),
+                pid,
+                shell: a.snap.shell,
+                tab: TAB.to_string(),
+                from: "2.1.281".to_string(),
+                to: "2.1.283".to_string(),
+                source: "managed".to_string(),
+                cause: cause.to_string(),
+                exited_at: now_s(),
+                ..St::default()
+            },
+        );
+        assert!(restarted(&opts, false, Some(pid)), "{cause:?}");
+        assert_eq!(
+            carry_restart(&opts, false, Some(pid)).step,
+            want,
+            "{cause:?} {why}"
+        );
+    }
+    assert_eq!(
+        outcome("told:no-resume"),
+        Outcome::Cannot("no-resume".to_string())
+    );
+}
+
 /// The host finds the restart that ended the agent that left ([`restarted`]),
 /// before whose exit it was — ONE rule for both lanes: the record of a restart
 /// that ended its agent itself, filed for the process that left (a Claude
 /// Code's SIGTERM, a Codex TUI's `/exit`) in its tab — and carries it
 /// ([`carry_restart`]): on to the tab while it may act ([`STALE_S`] from the
-/// exit the carry saw, never from the signal), `refused:<why>` once it cannot
-/// (said again while it is still that restart's), never typed afresh.
+/// exit the carry saw, never from the signal), `told:<why>` once it cannot
+/// (its own row asks the owner; said again while it is still that
+/// restart's), never typed afresh.
 /// Negative controls: another process, no snapshot, another tab and the other
 /// agent's lane find nothing; a stop long past its exit is no longer this
 /// exit's; and in the Codex lane, whose records are filed per tab, a Codex a
@@ -7960,9 +9736,10 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
         &claude(Phase::Exiting { at_s: signal }, now - STALE_S - 1),
     );
     let r = carry_restart(&opts, false, Some(pid));
+    // The upgrade's own row asks the owner about it (`told:`).
     assert_eq!(
         (r.step.as_str(), r.session.as_str()),
-        ("refused:stale-exit", SESSION)
+        ("told:stale-exit", SESSION)
     );
     let st = load(&opts, SESSION).expect("kept");
     assert_eq!(st.phase, Phase::Failed("stale-exit".to_string()));
@@ -7970,7 +9747,7 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     assert!(restarted(&opts, false, Some(pid)));
     assert_eq!(
         carry_restart(&opts, false, Some(pid)).step,
-        "refused:stale-exit"
+        "told:stale-exit"
     );
     // Long past its exit: a pid the kernel may have handed on.
     save(
@@ -8019,7 +9796,7 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     let r = carry_restart(&opts, true, Some(tui));
     assert_eq!(
         (r.step.as_str(), r.session.as_str()),
-        ("refused:stale-exit", codex.as_str())
+        ("told:stale-exit", codex.as_str())
     );
     assert!(
         !restarted(&opts, true, Some(tui)),
@@ -8147,15 +9924,22 @@ fn the_host_finds_and_carries_the_restart_that_ended_the_agent_that_left() {
     // relaunched TUI was adopted, then stopped, is re-armed on the same record
     // once it has rested, and its next restart's relaunch is that restart's
     // again; otherwise the old adoption would read the new restart's exit as
-    // the adopted TUI's own.
+    // the adopted TUI's own. Nor the block its old line was typed into
+    // ([`St::line_block`]): no line of the new round was typed there.
     let mut again = St {
         phase: Phase::Failed("no-resume".to_string()),
+        line_block: Some(7),
         ..relaunched(4_000_002, 4_000_002)
     };
     let _ = again.rearm(now);
     assert_eq!(
-        (again.resumed_pid, again.relaunched_pid, again.exited_at),
-        (0, 0, 0)
+        (
+            again.resumed_pid,
+            again.relaunched_pid,
+            again.exited_at,
+            again.line_block
+        ),
+        (0, 0, 0, None)
     );
     again.phase = Phase::Relaunched { at_s: now };
     save(&opts, &codex, &again);
@@ -8606,6 +10390,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         dialect: Some(Dialect::Zsh),
         login: None,
         home: None,
+        claude_dir: None,
     };
     let claude = ["/opt/claude/bin/claude", "--verbose"];
     // Not read: a wait, nothing else.
@@ -8713,6 +10498,29 @@ fn answer_at(model: &str, at: &str) -> String {
     )
 }
 
+/// The relaunch snapshot of an agent under the user's own Claude home
+/// holding conversation `session`: what the window host hands the readers of
+/// its limit and its wall ([`named_standing_wall`]).
+#[cfg(unix)]
+fn users_agent(session: &str) -> Snapshot {
+    Snapshot {
+        tab: TAB.to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: vec!["/opt/claude/bin/claude".to_string()],
+        session: Some(session.to_string()),
+        cwd: "/".to_string(),
+        version: None,
+        codex: None,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+    }
+}
+
 /// The conversation `SESSION`'s transcript under `home`: `rows`, one a line.
 #[cfg(unix)]
 fn write_transcript(home: &Path, rows: &[String]) {
@@ -8772,6 +10580,7 @@ fn a_memory_restart_carries_a_model_chosen_by_hand_not_the_launchs() {
         dialect: None,
         login: None,
         home: None,
+        claude_dir: None,
     };
     register(&opts.home, agent.id(), SESSION);
     let sonnet = ["/opt/claude/bin/claude", "--model", "claude-sonnet-5-5"];
@@ -9351,6 +11160,7 @@ fn restart_saved_as(
         dialect: None,
         login: login.map(str::to_string),
         home: None,
+        claude_dir: None,
     };
     let r = crate::harness::relaunch::restart_as(
         &opts,
@@ -9643,6 +11453,7 @@ fn an_exit_relaunch_types_back_the_login_the_agent_ran_under() {
         if home {
             a.snap.home = Some(lab_home.to_string_lossy().into_owned());
             a.write_record_in(&lab_home, SESSION);
+            file_transcript_in(&lab_home, "p");
         } else {
             a.write_record();
         }
@@ -9686,7 +11497,12 @@ fn an_exit_relaunch_types_back_the_login_the_agent_ran_under() {
 }
 
 /// A transcript of [`SESSION`] with one prompt in it, filed in the Claude
-/// Code directory `claude_dir` itself, project `project`.
+/// Code directory `claude_dir` itself, project `project`: a conversation
+/// someone asked something, as Claude Code files one with its first message.
+/// A registered session with no transcript is one nobody has asked anything
+/// ([`transcript_exists_in`]): an upgrade restarts it afresh and announces
+/// nothing to it, and a relaunch starts it afresh, so the sessions the tests
+/// move or relaunch as ones with work have this.
 #[cfg(unix)]
 fn file_transcript_in(claude_dir: &Path, project: &str) {
     let dir = claude_dir.join("projects").join(project);
@@ -9697,6 +11513,66 @@ fn file_transcript_in(claude_dir: &Path, project: &str) {
             + "\n",
     )
     .expect("transcript");
+}
+
+/// THE TURN END'S TASK READ IS THE AGENT'S OWN RECORDS
+/// ([`Tasked::of_snapshot`]; the review of the 2026-10-09 sweep fixes): an
+/// agent under another Claude home (an identity's `CLAUDE_CONFIG_DIR`)
+/// keeps its transcripts there, and a conversation a person asked something
+/// there is tasked, though the user's `~/.claude` exists with no projects —
+/// which, read instead, says no task (a Claude home with no projects holds
+/// no message), and the turn-end policy typed nothing into that tasked
+/// conversation. A RELATIVE home is read where it resolves from the
+/// directory the agent runs in (fix/r16-homes; it named nothing before).
+/// CONTROLS: with no home of its own, the user's `~/.claude` is read; a
+/// relative home whose directory nobody knows names nothing that can be
+/// read: nobody can say.
+#[cfg(unix)]
+#[test]
+fn the_turn_ends_task_read_is_the_agents_own_records() {
+    let dir = scratch("tasked-own-home");
+    let user_home = dir.join("home");
+    std::fs::create_dir_all(user_home.join(".claude")).expect("the user's home, no projects");
+    let work = dir.join("work/.claude");
+    file_transcript_in(&work, "p");
+    let own = Snapshot {
+        home: Some(work.to_string_lossy().into_owned()),
+        claude_dir: Some(work.clone()),
+        ..users_agent(SESSION)
+    };
+    assert_eq!(
+        Tasked::default().of_snapshot(&user_home, &own, &[]),
+        Some(true),
+        "its own transcript: a person's prompt"
+    );
+    assert_eq!(
+        Tasked::default().of(&user_home, SESSION, &[]),
+        Some(false),
+        "the user's ~/.claude says nothing of it"
+    );
+    assert_eq!(
+        Tasked::default().of_snapshot(&user_home, &users_agent(SESSION), &[]),
+        Some(false)
+    );
+    let relative = Snapshot {
+        home: Some("work/.claude".to_string()),
+        cwd: dir.to_string_lossy().into_owned(),
+        ..users_agent(SESSION)
+    };
+    assert_eq!(
+        Tasked::default().of_snapshot(&user_home, &relative, &[]),
+        Some(true),
+        "a relative home, where it resolves"
+    );
+    let unknown = Snapshot {
+        cwd: String::new(),
+        ..relative
+    };
+    assert_eq!(
+        Tasked::default().of_snapshot(&user_home, &unknown, &[]),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// AN AGENT STARTED UNDER ANOTHER CLAUDE HOME IS RELAUNCHED OFF ITS OWN
@@ -9842,6 +11718,1037 @@ fn the_hosts_looks_read_the_record_under_the_agents_own_claude_home() {
     let mut snap = a.snap.clone();
     assert!(follow(&a.opts.home, &mut snap), "followed");
     assert_eq!(snap.session.as_deref(), Some(CLEARED));
+}
+
+/// Claude's record of `pid` (started `start`, idle) holding [`SESSION`],
+/// running in `cwd`, filed in the Claude Code directory `claude_dir`: where a
+/// Claude Code whose home resolves there files it.
+fn register_running_in(claude_dir: &Path, pid: u32, start: &str, cwd: &Path) {
+    std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
+    std::fs::write(
+        claude_dir.join(format!("sessions/{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{SESSION}","cwd":"{}","version":"1.0.0","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#,
+            cwd.display()
+        ),
+    )
+    .expect("the record");
+}
+
+/// A RELATIVE CLAUDE HOME IS FOLLOWED BY THE RELAUNCH ON EXIT AND THE
+/// RESTART IN PLACE (the upgrade-homes lane's stated limit, handoff §4): a
+/// Claude Code started with `CLAUDE_CONFIG_DIR=work home/.claude` files its
+/// records under the directory it runs in, where the live upgrade's sweep
+/// resolves it ([`Homes`]), and every read of a relaunch's agent read
+/// nothing for it ("no record is read, so nothing is relaunched"):
+///
+/// * the host's look at its crash found no record, so the crash read as a
+///   graceful exit and nothing was relaunched;
+/// * the relaunch after aterm itself ended kept the raw relative home as the
+///   home its relaunched process files under ([`St::home`]), which names no
+///   directory, so the new process was never found;
+/// * the restart in place found no record of the process
+///   (`wait:no-session-record`), and never restarted it;
+///
+/// where the line's `cd` puts the home: its own record's directory.
+/// CONTROL: a record whose directory would move the home (the line `cd`s
+/// elsewhere than where the agent ran) is refused, as the sweep refuses it
+/// (`refused:home`), never typed.
+#[cfg(unix)]
+#[test]
+fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place() {
+    const RELATIVE: &str = "work home/.claude";
+    let record = register_running_in;
+    // THE LOOK AT A CRASH, and the relaunch after aterm itself ended.
+    let _quick = QuickWaits::new();
+    let mut a = DeadAgent::new("relative-home-relaunch");
+    let (sock, _) = instance_with(&a.dir, Answers::default());
+    a.opts = Opts {
+        sock: Some(sock),
+        dry_run: false,
+        ..a.opts.clone()
+    };
+    let work = a.dir.to_path_buf();
+    let claude_dir = work.join(RELATIVE);
+    a.snap.cwd = work.to_string_lossy().into_owned();
+    a.snap.home = Some(RELATIVE.to_string());
+    record(&claude_dir, a.snap.pid, &a.snap.start, &work);
+    file_transcript_in(&claude_dir, "-work");
+    assert!(
+        look_at_exit(&a.opts.home, &a.snap).record.is_some(),
+        "its crash's record is read where its home resolves"
+    );
+    std::fs::create_dir_all(state_dir(&a.opts)).expect("state");
+    let r = after_host_ended(&a.opts, &a.snap, true);
+    let saved = load(&a.opts, SESSION).unwrap_or_else(|| panic!("nothing relaunched: {r:?}"));
+    assert!(
+        saved.line.contains(&format!("'--resume' '{SESSION}'")),
+        "resumed: {}",
+        saved.line
+    );
+    assert!(
+        saved
+            .line
+            .contains(&format!("CLAUDE_CONFIG_DIR='{RELATIVE}' ")),
+        "the line carries the home as the agent had it: {}",
+        saved.line
+    );
+    assert_eq!(
+        saved.home.as_deref().map(Path::new),
+        Some(claude_dir.as_path()),
+        "the relaunched process is looked for where it files its record"
+    );
+
+    // THE RESTART IN PLACE of a live agent registered under it.
+    let dir = scratch("relative-home-restart");
+    let opts = Opts {
+        dry_run: true,
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    seed_builds(&opts);
+    std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
+    let mut shell = stand_in_shell();
+    let mut agent = parked().spawn().expect("agent");
+    wait_exec(agent.id());
+    let start = kernel_start(agent.id()).expect("lstart");
+    let work = dir.join("work");
+    let claude_dir = work.join(RELATIVE);
+    let snap = Snapshot {
+        tab: TAB.to_string(),
+        pid: agent.id(),
+        start: start.clone(),
+        shell: shell.id(),
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: vec!["/opt/claude/bin/claude".to_string()],
+        session: Some(SESSION.to_string()),
+        cwd: work.to_string_lossy().into_owned(),
+        version: Some("1.0.0".to_string()),
+        codex: None,
+        dialect: Some(Dialect::Zsh),
+        login: None,
+        home: Some(RELATIVE.to_string()),
+        claude_dir: None,
+    };
+    record(&claude_dir, agent.id(), &start, &work);
+    let restarted = restart_from(&opts, &Restart::Memory, Ok(snap.clone())).step;
+    // CONTROL: its record says it runs elsewhere, where the line would `cd`
+    // and so move its home.
+    record(&claude_dir, agent.id(), &start, &dir.join("elsewhere"));
+    let moved = restart_from(&opts, &Restart::Memory, Ok(snap)).step;
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(restarted, "would-restart", "restarted on its record");
+    assert_eq!(
+        moved, "would-refuse:home",
+        "a line that would move its home"
+    );
+}
+
+/// THE RESTART IN PLACE RECORDS THE DIRECTORY ITS RELAUNCHED AGENT FILES
+/// UNDER, for a RELATIVE Claude home (the homes lane's review, 2026-10-14:
+/// this hunk passed every test reverted alone). The upgrade's record keeps
+/// the home its relaunched process files its record under ([`St::home`]),
+/// and every later look for that process — its adoption, its carry, the
+/// view's holders, the CLI's sweep — reads there ([`St::agent_records`]).
+/// Kept as the raw value (`work home/.claude`), a relative home names no
+/// directory ([`Records::of`]): the relaunched process could never be found
+/// or adopted. So the record keeps the DIRECTORY ([`Records::home_word`]).
+/// Driven for real past its signal ([`super::super::relaunch::restart_as`],
+/// its job and terminal scripted), the record it saved read back, and the
+/// relaunched process looked for through it.
+#[cfg(unix)]
+#[test]
+fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under() {
+    const RELATIVE: &str = "work home/.claude";
+    let dir = scratch("restart-relative-home-record");
+    let (sock, _) = instance_with(&dir, Answers::default());
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    seed_builds(&opts);
+    std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let work = dir.join("work");
+    let claude_dir = work.join(RELATIVE);
+    let mut shell = stand_in_shell();
+    let mut agent = parked_bare().spawn().expect("agent");
+    wait_exec(agent.id());
+    let start = kernel_start(agent.id()).expect("lstart");
+    register_running_in(&claude_dir, agent.id(), &start, &work);
+    file_transcript_in(&claude_dir, "-work");
+    let snap = Snapshot {
+        tab: TAB.to_string(),
+        pid: agent.id(),
+        start,
+        shell: shell.id(),
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: vec!["/opt/claude/bin/claude".to_string()],
+        session: Some(SESSION.to_string()),
+        cwd: work.to_string_lossy().into_owned(),
+        version: Some("1.0.0".to_string()),
+        codex: None,
+        dialect: None,
+        login: None,
+        home: Some(RELATIVE.to_string()),
+        claude_dir: None,
+    };
+    let r = crate::harness::relaunch::restart_as(
+        &opts,
+        &Restart::Memory,
+        &crate::harness::accounts::Roster::default(),
+        Ok(snap),
+        &Script::new(shell.id(), usize::MAX, None),
+    );
+    let saved = load(&opts, SESSION);
+    // The relaunched process files its record under the same home.
+    let mut relaunched = parked_bare().spawn().expect("the relaunched agent");
+    wait_exec(relaunched.id());
+    let again = kernel_start(relaunched.id()).expect("lstart");
+    register_running_in(&claude_dir, relaunched.id(), &again, &work);
+    let found = saved
+        .as_ref()
+        .and_then(|st| st.agent_records(&opts.home).session_file(relaunched.id()));
+    let _ = relaunched.kill();
+    let _ = relaunched.wait();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let saved = saved.unwrap_or_else(|| panic!("nothing restarted: {r:?}"));
+    assert!(
+        saved
+            .line
+            .contains(&format!("CLAUDE_CONFIG_DIR='{RELATIVE}' ")),
+        "the line carries the home as the agent had it: {}",
+        saved.line
+    );
+    assert_eq!(
+        saved.home.as_deref().map(Path::new),
+        Some(claude_dir.as_path()),
+        "the record names the directory, not the raw value"
+    );
+    assert!(
+        found.is_some(),
+        "the relaunched process is found where it files its record"
+    );
+}
+
+/// THE RELAUNCH ON EXIT REFUSES A LINE THAT WOULD MOVE A RELATIVE HOME (the
+/// homes lane's review, 2026-10-14: no test drove it into `refused:home`).
+/// An agent started with `CLAUDE_CONFIG_DIR=work home/.claude` in `work`
+/// filed its records under `work/work home/.claude`, where its snapshot read
+/// them ([`Snapshot::claude_dir`]); its crash's record says it ran in
+/// another directory, and the relaunch line `cd`s there, where the same
+/// relative home names another directory: the relaunched Claude Code would
+/// look for its conversation, and file its record, where nothing reads it.
+/// Refused ([`home_carried`], `refused:home`), as the restart in place and
+/// the upgrade refuse it, never typed. CONTROL: the same crash whose record
+/// names the directory the home resolves from is relaunched.
+#[cfg(unix)]
+#[test]
+fn the_relaunch_on_exit_refuses_a_line_that_would_move_a_relative_home() {
+    const RELATIVE: &str = "work home/.claude";
+    let case = |name: &str, ran_in: &str| {
+        let mut a = DeadAgent::new(name);
+        let work = a.dir.join("work");
+        let claude_dir = work.join(RELATIVE);
+        a.snap.cwd = work.to_string_lossy().into_owned();
+        a.snap.home = Some(RELATIVE.to_string());
+        a.snap.claude_dir = Some(claude_dir.clone());
+        register_running_in(&claude_dir, a.snap.pid, &a.snap.start, &work.join(ran_in));
+        file_transcript_in(&claude_dir, "-work");
+        after_exit(&a.opts, &a.snap, &ExitRecord::Unread, false, None).step
+    };
+    assert_eq!(
+        case("exit-relative-home-moved", "elsewhere"),
+        "would-refuse:home",
+        "a line that would move its home"
+    );
+    assert_eq!(
+        case("exit-relative-home-kept", ""),
+        "would-relaunch",
+        "CONTROL: its record names where its home resolves"
+    );
+}
+
+/// THE RELAUNCH SNAPSHOT READS A RELATIVE OR EMPTY CLAUDE HOME WHERE ITS
+/// AGENT RUNS ([`super::super::relaunch::snapshot`] itself, which every
+/// other test of such a home stands in for with a hand-built snapshot, its
+/// `claude_dir` none: the review of the homes lane, 2026-10-14). The tab's
+/// foreground leader's exec `CLAUDE_CONFIG_DIR`, resolved by the one
+/// resolver of a running agent's record ([`Records::of_process`]: against
+/// the leader's working directory, or the one it was started in), names
+/// the directory its record is read from — the conversation and the build
+/// the snapshot names — and the snapshot keeps it
+/// ([`Snapshot::claude_dir`]), where every later read of the agent is made.
+/// Read as the raw value, a relative home named nothing: no record, so no
+/// conversation, and the stand-in not even a Claude Code (`not-claude`).
+/// CONTROL: an absolute home and the user's own (unset).
+#[cfg(unix)]
+#[test]
+fn the_relaunch_snapshot_reads_a_relative_or_empty_home_where_its_agent_runs() {
+    /// The agent's `CLAUDE_CONFIG_DIR`.
+    #[derive(Clone, Copy)]
+    enum Home {
+        /// Unset: the user's own `~/.claude`.
+        Users,
+        /// `<scratch>/abs/.claude`.
+        Absolute,
+        /// `work home/.claude`, under the directory the agent runs in.
+        Relative,
+        /// Set and empty: the directory the agent runs in itself.
+        Empty,
+    }
+    let case = |name: &str, home: Home| {
+        let dir = scratch(name);
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).expect("its working directory");
+        let absolute = dir.join("abs/.claude");
+        // Where the kernel says it runs: a relative home resolves there.
+        let runs_in = std::fs::canonicalize(&work).expect("its working directory");
+        let (raw, claude_dir) = match home {
+            Home::Users => (None, dir.join("home/.claude")),
+            Home::Absolute => (
+                Some(absolute.to_string_lossy().into_owned()),
+                absolute.clone(),
+            ),
+            Home::Relative => (
+                Some("work home/.claude".to_string()),
+                runs_in.join("work home/.claude"),
+            ),
+            Home::Empty => (Some(String::new()), runs_in.clone()),
+        };
+        let env: Vec<(&str, &Path)> = raw
+            .as_deref()
+            .map(|h| (crate::harness::accounts::HOME_ENV, Path::new(h)))
+            .into_iter()
+            .collect();
+        let mut agent = tty_agent(&env, Some(&work));
+        let pid = agent.id();
+        let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+        let (sock, _asked) = instance_with(
+            &dir,
+            Answers {
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        let start = kernel_start(pid).expect("lstart");
+        register_running_in(&claude_dir, pid, &start, &work);
+        let snap = crate::harness::relaunch::snapshot_with(
+            &opts,
+            &Script::new(std::process::id(), usize::MAX, None),
+        );
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let snap = snap.unwrap_or_else(|why| panic!("{name}: no snapshot: {why}"));
+        assert_eq!(
+            (snap.session.as_deref(), snap.home.as_deref()),
+            (Some(SESSION), raw.as_deref()),
+            "{name}: its conversation, and its home as it had it"
+        );
+        assert_eq!(
+            snap.claude_dir.as_deref(),
+            Some(claude_dir.as_path()),
+            "{name}: where its records are"
+        );
+    };
+    case("snapshot-relative-home", Home::Relative);
+    case("snapshot-empty-home", Home::Empty);
+    case("snapshot-absolute-home", Home::Absolute);
+    case("snapshot-users-home", Home::Users);
+}
+
+/// AN UNSET `CLAUDE_CONFIG_DIR` IS THE AGENT'S OWN HOME'S `.claude`, NOT THE
+/// WINDOW'S (the homes lane's stated limit, handoff §4): Claude Code keeps
+/// its records under `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`, and
+/// `homedir()` is the agent's own `HOME` (READ in the 2.1.300 bundle). An
+/// agent launched with `HOME=<other>` and no `CLAUDE_CONFIG_DIR` files its
+/// session record in `<other>/.claude`; every reader resolved an unset home
+/// to the window's own `~/.claude`, so the relaunch snapshot named no
+/// conversation (the agent not even a Claude Code: `not-claude`), and the
+/// live upgrade's sweep never listed that home. And the footer's own reader
+/// (`footer::claude_dir_of`: the footer, netprobe and the disk census) read
+/// an EMPTY `CLAUDE_CONFIG_DIR` as unset — the user's `~/.claude`, where
+/// Claude Code's `??` keeps the empty value and files under the directory it
+/// runs in — and a relative one as none.
+#[cfg(unix)]
+#[test]
+fn an_unset_claude_home_is_the_agents_own_homes_not_the_windows() {
+    let dir = scratch("agent-home-unset");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("its working directory");
+    // The agent's own HOME, which is not the window's (`dir/home`).
+    let other = dir.join("other");
+    let claude_dir = other.join(".claude");
+    let mut agent = tty_agent(&[("HOME", other.as_path())], Some(&work));
+    let pid = agent.id();
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+    let (sock, _asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    let start = kernel_start(pid).expect("lstart");
+    register_running_in(&claude_dir, pid, &start, &work);
+    let snap = crate::harness::relaunch::snapshot_with(
+        &opts,
+        &Script::new(std::process::id(), usize::MAX, None),
+    );
+    // The sweep's homes, read off the tab's leader.
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(pid)),
+    }];
+    let homes = Homes::read(
+        &opts,
+        Some(&tabs),
+        atpkg::caller_shell::process_args,
+        aterm_sysprobe::process_cwd,
+    );
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let snap = snap.unwrap_or_else(|why| panic!("no snapshot: {why}"));
+    assert_eq!(
+        (snap.session.as_deref(), snap.claude_dir.as_deref()),
+        (Some(SESSION), Some(claude_dir.as_path())),
+        "the snapshot reads its record where its own HOME keeps it"
+    );
+    assert_eq!(
+        homes.dirs(),
+        vec![claude_dir.clone()],
+        "the sweep lists its home"
+    );
+    // The footer's reader, the one resolver: an empty `CLAUDE_CONFIG_DIR` is
+    // the directory the process runs in, a relative one under it.
+    use crate::harness::footer::claude_dir_of;
+    let home = "/Users//someone";
+    let runs_in = || Some(PathBuf::from("/work"));
+    assert_eq!(
+        claude_dir_of(Some(""), Some(home), runs_in),
+        Some(PathBuf::from("/work")),
+        "an empty CLAUDE_CONFIG_DIR read as unset"
+    );
+    assert_eq!(
+        claude_dir_of(Some("rel/.claude"), Some(home), runs_in),
+        Some(PathBuf::from("/work/rel/.claude")),
+        "a relative CLAUDE_CONFIG_DIR read as none"
+    );
+    assert_eq!(
+        claude_dir_of(None, Some(home), runs_in),
+        Some(PathBuf::from("/Users//someone/.claude"))
+    );
+}
+
+/// THE ONE RESOLVER'S PROFILE FOR AN AGENT'S OWN `HOME` ([`Records::at`],
+/// [`profile_apart`]): Claude Code keeps the profile at
+/// `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, `homedir()` the
+/// agent's own `HOME` — beside `<HOME>/.claude` for an unset home, in that
+/// `HOME` for an empty one — never the window's. A record of such an agent
+/// keeps both ([`St::keep_home`]). CONTROL: an agent whose `HOME` is the
+/// user's is the user's own home, recorded as none.
+#[test]
+fn an_agents_own_home_keeps_its_records_and_its_profile() {
+    let user = Path::new("/Users//someone");
+    let other = "/Users//someone/other";
+    let records = Records::at(
+        user,
+        HomeVars {
+            config: None,
+            home: Some(other),
+        },
+        || None,
+    );
+    assert_eq!(
+        records.dir(),
+        Some(Path::new("/Users//someone/other/.claude"))
+    );
+    assert_eq!(
+        records.profile(user),
+        Some(PathBuf::from("/Users//someone/other/.claude.json"))
+    );
+    let mut st = St::default();
+    assert!(st.keep_home(&records, user));
+    assert_eq!(st.home.as_deref(), Some("/Users//someone/other/.claude"));
+    assert_eq!(
+        st.home_profile.as_deref(),
+        Some("/Users//someone/other/.claude.json")
+    );
+    assert_eq!(st.agent_records(user), records, "read back whole");
+    // An empty one: its records where it runs, its profile in its own HOME.
+    let empty = Records::at(
+        user,
+        HomeVars {
+            config: Some(""),
+            home: Some(other),
+        },
+        || Some(PathBuf::from("/work")),
+    );
+    assert_eq!(empty.dir(), Some(Path::new("/work")));
+    assert_eq!(
+        empty.profile(user),
+        Some(PathBuf::from("/Users//someone/other/.claude.json"))
+    );
+    // CONTROL: its HOME is the user's, or not known.
+    for home in [Some("/Users//someone"), None] {
+        let own = Records::at(user, HomeVars { config: None, home }, || None);
+        assert_eq!(own.dir(), Some(Path::new("/Users//someone/.claude")));
+        assert_eq!(own.home_word(user), None, "{home:?}");
+        assert_eq!(
+            own.profile(user),
+            Some(PathBuf::from("/Users//someone/.claude.json"))
+        );
+    }
+}
+
+/// EVERY READER FINDS A RELATIVE HOME'S RECORDS WHERE ITS AGENT FILED THEM,
+/// after the agent changed directory (the homes lane's stated limit,
+/// handoff §4). Claude Code keeps `CLAUDE_CONFIG_DIR` RAW — `ve()` is a
+/// memoize keyed by the variable's value, holding `CLAUDE_CONFIG_DIR ??
+/// join(homedir(), ".claude")` unresolved (READ in the 2.1.300 bundle) —
+/// and opens every path under it from the directory it runs in at that
+/// moment; its session record, written once at its start, stays where it was
+/// filed. 2.1.300's worktree enter `process.chdir`s: MEASURED in the
+/// real-Claude lab (`other/.claude`, then `EnterWorktree`), the record stayed
+/// in `<start>/other/.claude/sessions`, the transcript went on under
+/// `<worktree>/other/.claude`. The window's relaunch snapshot and the
+/// sweep's homes each resolved the home against the LIVE working directory,
+/// which holds no record of the agent: the snapshot named no conversation
+/// (the stand-in not even a Claude Code), the sweep never found the agent.
+/// Driven over a stand-in started (`PWD`) in `work` and running in
+/// `work/wt`, its record filed under `work`'s home. CONTROL: a stand-in that
+/// never moved. (The wall confirmation's tail reads the transcript where the
+/// agent writes NOW, not where it filed its record:
+/// [`the_walls_tail_is_the_transcript_its_agent_writes_now`].)
+#[cfg(unix)]
+#[test]
+fn every_reader_finds_a_relative_homes_records_where_its_agent_filed_them() {
+    const RELATIVE: &str = "work home/.claude";
+    let case = |name: &str, moved: bool| {
+        let dir = scratch(name);
+        let work = dir.join("work");
+        let wt = work.join("wt");
+        std::fs::create_dir_all(&wt).expect("its directories");
+        let started = std::fs::canonicalize(&work).expect("where it started");
+        let claude_dir = started.join(RELATIVE);
+        let runs_in = if moved { &wt } else { &work };
+        let mut agent = tty_agent(
+            &[
+                (crate::harness::accounts::HOME_ENV, Path::new(RELATIVE)),
+                ("PWD", started.as_path()),
+            ],
+            Some(runs_in),
+        );
+        let pid = agent.id();
+        let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+        let (sock, _asked) = instance_with(
+            &dir,
+            Answers {
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        seed_builds(&opts);
+        std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
+        // Filed where it started, a build nobody can compare.
+        register_as(&claude_dir, pid, SESSION, "unknown");
+        file_transcript_in(&claude_dir, "-work");
+        // The window's relaunch snapshot and the sweep's look, each read on
+        // its own.
+        let snap = crate::harness::relaunch::snapshot_with(
+            &opts,
+            &Script::new(std::process::id(), usize::MAX, None),
+        );
+        let due_now = due(&opts);
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let named = snap
+            .as_ref()
+            .map(|snap| (snap.session.clone(), snap.claude_dir.clone()));
+        assert_eq!(
+            (named, due_now),
+            (Ok((Some(SESSION.to_string()), Some(claude_dir))), Due::Yes),
+            "{name}: the snapshot names its conversation where it filed it, the sweep finds it"
+        );
+    };
+    case("records-where-filed-unmoved", false);
+    case("records-where-filed-moved", true);
+}
+
+/// THE LIVE UPGRADE FINDS AN AGENT UNDER ANOTHER CLAUDE HOME (the handoff's
+/// §4 residual, 2026-10-14): a Claude Code started with
+/// `CLAUDE_CONFIG_DIR=<dir>` — an account roster's move, an owner's wrapper,
+/// the real-Claude lab — files `sessions/<pid>.json` in `<dir>`, and every
+/// reader of the sweep looked in `~/.claude` alone, so the agent leading the
+/// tab was never due ([`due`]: no record, then `No` past its launch) and the
+/// tab's step never visited it: relaunched on exit and restarted in place
+/// under its home, but never moved to a newer build. Driven through the
+/// host's own reads (the instance's `who` roster naming the agent's group,
+/// the agent's exec environment read off the kernel): due, and the step's
+/// pass visits it — under an absolute home, a relative one, and on a
+/// machine whose user home keeps no Claude records at all (no
+/// `~/.claude/sessions`, which the pass read as records it could not read).
+/// CONTROL: the same agent under the user's home, found as ever.
+#[cfg(unix)]
+#[test]
+fn the_live_upgrade_finds_an_agent_under_another_claude_home() {
+    /// The agent's Claude home.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Home {
+        /// The user's own (no `CLAUDE_CONFIG_DIR`).
+        Users,
+        /// `CLAUDE_CONFIG_DIR=<dir>`.
+        Absolute,
+        /// `CLAUDE_CONFIG_DIR=work home/.claude`, the agent running in the
+        /// scratch directory: resolved against it, as Claude Code does.
+        Relative,
+    }
+    // `users_records`: the user's own home keeps Claude records (its
+    // `sessions/`); a machine whose agents all run under other homes has none.
+    let case = |name: &str, home: Home, users_records: bool| {
+        let dir = scratch(name);
+        let claude_dir = dir.join("work home/.claude");
+        let relative = Path::new("work home/.claude");
+        let env: Vec<(&str, &Path)> = match home {
+            Home::Users => Vec::new(),
+            Home::Absolute => vec![(crate::harness::accounts::HOME_ENV, claude_dir.as_path())],
+            Home::Relative => vec![(crate::harness::accounts::HOME_ENV, relative)],
+        };
+        let mut agent = tty_agent(&env, Some(&dir));
+        let pid = agent.id();
+        let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+        let (sock, _asked) = instance_with(
+            &dir,
+            Answers {
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        seed_builds(&opts);
+        // The user's own home keeps records too, none of this agent's — or,
+        // on a machine whose agents all run under other homes, none at all.
+        let users = opts.home.join(".claude");
+        if users_records {
+            std::fs::create_dir_all(users.join("sessions")).expect("the user's sessions");
+        }
+        // Its record, where its Claude Code files it. A build nobody can
+        // compare is looked at as a behind one is, whatever this machine
+        // has installed.
+        register_as(
+            if home == Home::Users {
+                &users
+            } else {
+                &claude_dir
+            },
+            pid,
+            SESSION,
+            "unknown",
+        );
+        let due_now = due(&opts);
+        let r = step(&Opts {
+            dry_run: true,
+            ..opts.clone()
+        });
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(due_now, Due::Yes, "{name}: the tab's agent is due");
+        assert_eq!(
+            (r.tab.as_str(), r.session.as_str(), r.pid),
+            (TAB, SESSION, pid),
+            "{name}: the step's pass visits it: {r:?}"
+        );
+    };
+    case("sweep-users-home", Home::Users, true);
+    case("sweep-own-home", Home::Absolute, true);
+    case("sweep-relative-home", Home::Relative, true);
+    case("sweep-own-home-only", Home::Absolute, false);
+}
+
+/// AN AGENT UNDER AN EMPTY CLAUDE HOME IS READ WHERE CLAUDE CODE FILES IT
+/// (the upgrade-homes lane's stated limit, handoff §4): `CLAUDE_CONFIG_DIR`
+/// set and EMPTY was read as unset by every reader here, where Claude Code's
+/// `??` keeps the empty string and files `sessions/<pid>.json` and
+/// `projects/` in the directory it runs in (MEASURED in the real-Claude lab,
+/// 2026-10-14, 2.1.299). So such an agent was looked for in the user's
+/// `~/.claude`, which holds nothing of it: the live upgrade never found it
+/// (never due, never visited), and the host's look at its crash found no
+/// record (read as a graceful exit, never relaunched).
+#[cfg(unix)]
+#[test]
+fn an_agent_under_an_empty_claude_home_is_read_where_claude_code_files_it() {
+    // THE LIVE UPGRADE: the agent leading the tab, under `CLAUDE_CONFIG_DIR=`
+    // in `work`, its record where its Claude Code files it.
+    let dir = scratch("sweep-empty-home");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).expect("its working directory");
+    let mut agent = tty_agent(
+        &[(crate::harness::accounts::HOME_ENV, Path::new(""))],
+        Some(&work),
+    );
+    let pid = agent.id();
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+    let (sock, _asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    seed_builds(&opts);
+    std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
+    register_as(&work, pid, SESSION, "unknown");
+    let due_now = due(&opts);
+    let r = step(&Opts {
+        dry_run: true,
+        ..opts.clone()
+    });
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    // THE HOST'S LOOK AT ITS CRASH.
+    let mut a = DeadAgent::new("look-empty-home");
+    a.snap.cwd = a.dir.to_string_lossy().into_owned();
+    a.snap.home = Some(String::new());
+    a.write_record_in(&a.dir, SESSION);
+    let looked = look_at_exit(&a.opts.home, &a.snap).record.is_some();
+    assert_eq!(due_now, Due::Yes, "the tab's agent is due");
+    assert_eq!(
+        (r.tab.as_str(), r.session.as_str(), r.pid),
+        (TAB, SESSION, pid),
+        "the step's pass visits it: {r:?}"
+    );
+    assert!(looked, "its crash's record is read where it filed it");
+}
+
+/// THE UPGRADE VIEW COUNTS AN AGENT UNDER ANOTHER CLAUDE HOME: an upgrade
+/// record shows only while a live process holds its conversation
+/// ([`Row::standing`]), and the holders were read in `~/.claude` alone, so a
+/// pending upgrade of an agent under another home was never shown or
+/// counted. The record names the home its agent keeps its records under
+/// ([`St::home`]); the holder is read there. CONTROL: the same record with
+/// no home, its agent under the user's, as ever.
+#[cfg(unix)]
+#[test]
+fn the_upgrade_view_counts_an_agent_under_another_claude_home() {
+    let case = |name: &str, own_home: bool| {
+        let dir = scratch(name);
+        let opts = drive(&dir);
+        let users = opts.home.join(".claude");
+        let claude_dir = if own_home {
+            dir.join("work home/.claude")
+        } else {
+            users.clone()
+        };
+        std::fs::create_dir_all(users.join("sessions")).expect("the user's sessions");
+        let mut agent = parked();
+        if own_home {
+            agent.env(crate::harness::accounts::HOME_ENV, &claude_dir);
+        }
+        let mut agent = agent.spawn().expect("agent");
+        wait_exec(agent.id());
+        let sf = register_in(&claude_dir, agent.id(), SESSION);
+        let now = now_s();
+        let st = St {
+            phase: Phase::Pending,
+            from: "1.0.0".to_string(),
+            to: "9.9.9".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            salt: now,
+            pending_since: now,
+            proc_start: squash(&sf.proc_start),
+            home: own_home.then(|| claude_dir.to_string_lossy().into_owned()),
+            ..St::default()
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        save(&opts, SESSION, &st);
+        let (rows, whole) = status_rows(&opts, false);
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(whole, "{name}: the holders read whole");
+        assert!(
+            rows.iter()
+                .any(|row| row.session == SESSION && row.tab == TAB),
+            "{name}: shown and counted: {rows:?}"
+        );
+    };
+    case("view-users-home", false);
+    case("view-own-home", true);
+}
+
+/// [`Homes`]: what one pass reads past the user's own Claude home, off each
+/// tab leader's exec environment (injected here). A home is learned from a
+/// leader whose `CLAUDE_CONFIG_DIR` is set: an absolute one as it is, a
+/// RELATIVE one — set and EMPTY included, which Claude Code's `??` keeps —
+/// against the leader's working directory, as Claude Code resolves it (the
+/// one resolver, [`home_dir_at`]). Only the tab the pass is scoped to
+/// ([`Opts::only_sid`]). Each directory once, and the user's own never — by
+/// a link to it too: read twice, every record there would read as a second
+/// owner of its own conversation. A leader whose home cannot be named (its
+/// exec record unread; a relative home whose working directory is unread) is
+/// said, never read as one under the user's home. With no roster (the
+/// CLI's sweep), the homes the conversations' records name.
+#[cfg(unix)]
+#[test]
+fn a_pass_reads_every_claude_home_its_tabs_agents_run_under() {
+    let dir = scratch("homes");
+    let opts = drive(&dir);
+    let users = opts.home.join(".claude");
+    std::fs::create_dir_all(&users).expect("the user's home");
+    let link = dir.join("users-link");
+    std::os::unix::fs::symlink(&users, &link).expect("a link to the user's home");
+    let link = link.to_string_lossy().into_owned();
+    let tab = |sid: &str, group: Option<i64>| LiveTab {
+        sid: sid.to_string(),
+        fgpgid: group,
+    };
+    // Two live leaders whose home cannot be named (this process and its
+    // parent), and one gone.
+    let me = std::process::id();
+    // SAFETY: getppid takes nothing and cannot fail.
+    let parent = u32::try_from(unsafe { libc::getppid() }).expect("a parent");
+    let gone = dead_pid();
+    let tabs = [
+        tab("s-a", Some(1)),
+        tab("s-b", Some(2)),
+        tab("s-c", Some(3)),
+        tab("s-d", Some(4)),
+        tab("s-e", Some(i64::from(me))),
+        tab("s-f", Some(i64::from(parent))),
+        tab("s-g", Some(7)),
+        tab("s-h", None),
+        tab("s-i", Some(1)),
+        tab("s-j", Some(i64::from(gone))),
+    ];
+    let env = |home: Option<&str>| {
+        Some(atpkg::caller_shell::ProcArgs {
+            env: home
+                .map(|h| vec![format!("CLAUDE_CONFIG_DIR={h}")])
+                .unwrap_or_default(),
+            ..atpkg::caller_shell::ProcArgs::default()
+        })
+    };
+    let read_args = |pid: u32| match pid {
+        1 => env(Some("/work/a/.claude")),
+        // Against its working directory, `/work/b`.
+        2 => env(Some("rel/../rel/.claude")),
+        // The user's own.
+        3 => env(None),
+        // Set and empty: its working directory itself, `/work/d`.
+        4 => env(Some("")),
+        // Relative, its working directory unread.
+        p if p == parent => env(Some("rel/.claude")),
+        // The user's own, by a link.
+        7 => env(Some(&link)),
+        // Its exec record unread (`me`; `gone`, which leads nothing now).
+        _ => None,
+    };
+    let read_cwd = |pid: u32| match pid {
+        2 => Some(PathBuf::from("/work/b")),
+        4 => Some(PathBuf::from("/work/d")),
+        _ => None,
+    };
+    let homes = Homes::read(&opts, Some(&tabs), read_args, read_cwd);
+    assert_eq!(
+        homes.dirs(),
+        [
+            PathBuf::from("/work/a/.claude"),
+            PathBuf::from("/work/b/rel/.claude"),
+            PathBuf::from("/work/d"),
+        ]
+    );
+    assert_eq!(homes.unnamed, ["s-e", "s-f"]);
+    assert!(homes.unnamed("s-f") && !homes.unnamed("s-a"));
+    // The window's step: its own tab alone.
+    let scoped = |sid: &str| Opts {
+        only_sid: Some(sid.to_string()),
+        ..opts.clone()
+    };
+    let homes = Homes::read(&scoped("s-b"), Some(&tabs), read_args, read_cwd);
+    assert_eq!(homes.dirs(), [PathBuf::from("/work/b/rel/.claude")]);
+    assert!(homes.unnamed.is_empty());
+    let homes = Homes::read(&scoped("s-c"), Some(&tabs), read_args, read_cwd);
+    assert_eq!(homes, Homes::default(), "the user's own is read anyway");
+    // No roster: the records' homes, each once.
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    for (session, home) in [
+        (
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            Some("/work/a/.claude"),
+        ),
+        (
+            "aaaaaaaa-0000-0000-0000-000000000002",
+            Some("/work/a/.claude"),
+        ),
+        ("aaaaaaaa-0000-0000-0000-000000000003", None),
+    ] {
+        let st = St {
+            home: home.map(str::to_string),
+            ..St::default()
+        };
+        save(&opts, session, &st);
+    }
+    let homes = Homes::read(
+        &opts,
+        None,
+        |_| panic!("no process is read without a roster"),
+        |_| panic!("no process is read without a roster"),
+    );
+    assert_eq!(homes.dirs(), [PathBuf::from("/work/a/.claude")]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [`Homes::roster`]: every home's records, each stamped with where it was
+/// read ([`SessionFile::claude_dir`], what every later read of the agent
+/// follows). A home with no `sessions/` yet keeps none; one whose records
+/// cannot be read whole (a file where `sessions/` should be) leaves the whole
+/// roster unread, as the user's own does.
+#[test]
+fn a_roster_reads_every_home_whole_or_not_at_all() {
+    let dir = scratch("roster");
+    let me = std::process::id();
+    let a = dir.join("a/.claude");
+    register_as(&a, me, SESSION, "1.0.0");
+    let fresh = dir.join("fresh/.claude");
+    std::fs::create_dir_all(&fresh).expect("a home with no records yet");
+    let broken = dir.join("broken/.claude");
+    std::fs::create_dir_all(&broken).expect("a home");
+    std::fs::write(broken.join("sessions"), "").expect("records that cannot be listed");
+    let homes = |dirs: &[&PathBuf]| Homes {
+        dirs: dirs
+            .iter()
+            .map(|d| Records::of(&dir.join("home"), d.to_str()))
+            .collect(),
+        unnamed: Vec::new(),
+    };
+    let got = homes(&[&a, &fresh])
+        .roster(Some(Vec::new()))
+        .expect("read whole");
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].pid, got[0].claude_dir.as_deref()),
+        (me, Some(a.as_path()))
+    );
+    assert_eq!(homes(&[&a, &broken]).roster(Some(Vec::new())), None);
+    assert_eq!(homes(&[&a]).roster(None), None, "the user's own unread");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A RELATIVE CLAUDE HOME IS CARRIED ONLY WHERE THE LINE KEEPS IT
+/// ([`home_carried`]): Claude Code resolves `CLAUDE_CONFIG_DIR` against the
+/// directory it runs in, and the relaunch line starts it in the directory its
+/// record names (`cd`). Where that resolves elsewhere than where its records
+/// are, the relaunched agent would look for its conversation under another
+/// home: refused (`refused:home`, a line a resume cannot repeat). An absolute
+/// home, none, and a line that starts it where it runs now are carried.
+#[test]
+fn a_relative_claude_home_the_line_would_move_is_refused() {
+    let user = Path::new("/home");
+    let records = Records::of(user, Some("/work/b/rel/.claude"));
+    let refused = |r: Result<(), NoPlan>| matches!(r, Err(NoPlan::Refused { why, what, .. }) if why == "line:home" && what == "home");
+    assert!(home_carried(user, None, "/work/c", &Records::of(user, None)).is_ok());
+    assert!(home_carried(user, Some("/elsewhere/.claude"), "/work/c", &records).is_ok());
+    assert!(home_carried(user, Some("rel/.claude"), "/work/b", &records).is_ok());
+    assert!(home_carried(user, Some("rel/.claude"), "", &records).is_ok());
+    assert!(refused(home_carried(
+        user,
+        Some("rel/.claude"),
+        "/work/c",
+        &records
+    )));
+    // AN UNSET HOME UNDER ANOTHER `HOME` (round eighteen): its records are
+    // `<HOME>/.claude`, and the line, carrying no HOME, would start it under
+    // its shell's.
+    let other = Records::at(
+        user,
+        HomeVars {
+            config: None,
+            home: Some("/other"),
+        },
+        || None,
+    );
+    assert!(refused(home_carried(user, None, "/work/c", &other)));
+}
+
+/// THE UPGRADE'S RECORD NAMES THE CLAUDE HOME ITS AGENT RUNS UNDER
+/// ([`St::home`]), from the visit that finds it: where the restart's relaunch
+/// finds the new process ([`St::agent_records`]), the owner's view its
+/// holder, a pass with no roster the agent. Driven (not dry): an agent under
+/// another home, which the visit stops (not its shell's job) — its record
+/// names the home, written and read back. CONTROL: an agent under the
+/// user's own home: none written, the record as it always was.
+#[cfg(unix)]
+#[test]
+fn an_upgrades_record_names_the_claude_home_its_agent_runs_under() {
+    for (name, own) in [("bind-own", true), ("bind-users", false)] {
+        let dir = scratch(name);
+        let opts = drive(&dir);
+        let claude_dir = if own {
+            dir.join("work home/.claude")
+        } else {
+            opts.home.join(".claude")
+        };
+        let mut agent = parked().spawn().expect("agent");
+        wait_exec(agent.id());
+        let sf = register_in(&claude_dir, agent.id(), SESSION);
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let r = visit(&opts, &sf, &table(), &newer(), &Live);
+        let saved = load(&opts, SESSION).expect("the record");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r.session, SESSION, "{name}: visited: {r:?}");
+        assert_eq!(
+            saved.home,
+            own.then(|| claude_dir.to_string_lossy().into_owned()),
+            "{name}: {r:?}"
+        );
+        assert_eq!(saved.to_json().contains("\"home\""), own, "{name}");
+        assert_eq!(
+            saved.agent_records(&opts.home).dir(),
+            Some(claude_dir.as_path()),
+            "{name}: read back where its agent keeps its records"
+        );
+    }
 }
 
 /// AN EXIT'S RELAUNCH SAVES THE FALLBACK ORIGIN IT DECIDES, driven (not
@@ -10633,9 +13540,23 @@ impl Drop for QuickWaits {
 }
 
 /// A [`Kernel`] whose one scripted answer is whether the relaunch's shell has
-/// its terminal back; nothing else about any process can be read.
+/// its terminal back, look by look (the last answer repeating); nothing else
+/// about any process can be read.
 #[cfg(unix)]
-struct ShellHolds(Option<bool>);
+struct ShellHolds {
+    looks: &'static [Option<bool>],
+    next: std::cell::Cell<usize>,
+}
+
+#[cfg(unix)]
+impl ShellHolds {
+    fn new(looks: &'static [Option<bool>]) -> Self {
+        Self {
+            looks,
+            next: std::cell::Cell::new(0),
+        }
+    }
+}
 
 #[cfg(unix)]
 impl Kernel for ShellHolds {
@@ -10652,16 +13573,68 @@ impl Kernel for ShellHolds {
     }
 
     fn shell_holds_tab(&self, _: u32) -> Option<bool> {
-        self.0
+        let at = self.next.get();
+        self.next.set(at + 1);
+        self.looks
+            .get(at)
+            .or_else(|| self.looks.last())
+            .copied()
+            .flatten()
     }
 }
 
+/// The shell held its terminal at every look: what it does before the line's
+/// command starts (its hooks), or a command that came and went between looks.
+#[cfg(unix)]
+const HELD: &[Option<bool>] = &[Some(true)];
+
+/// The line's command held the terminal at the first look (the agent ran),
+/// and the shell has it back at every look since.
+#[cfg(unix)]
+const RAN: &[Option<bool>] = &[Some(false), Some(true)];
+
+/// What the looks of one [`held_step`] read: the shell's hold on its terminal
+/// look by look ([`ShellHolds`]), and, where its integration marks command
+/// blocks, the block the line was typed into ([`St::line_block`]) with the
+/// tab's `blocks 1 --json` reply.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct Looks {
+    holds: &'static [Option<bool>],
+    block: Option<(u64, &'static str)>,
+}
+
+#[cfg(unix)]
+impl Looks {
+    /// Only the kernel's witness: no block was read.
+    const fn holds(holds: &'static [Option<bool>]) -> Self {
+        Self { holds, block: None }
+    }
+}
+
+/// The line was typed into block 3, which is still the prompt it was typed
+/// at: the shell has not run the line's command yet (its hooks).
+#[cfg(unix)]
+const BLOCK_NOT_RUN: &str = r#"OK {"blocks":[{"id":3,"state":"entering","exit":null,"prompt":10,"cmd":10,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
+
+/// Block 3 is still running its command.
+#[cfg(unix)]
+const BLOCK_RUNS: &str = r#"OK {"blocks":[{"id":3,"state":"executing","exit":null,"prompt":10,"cmd":10,"cmdcol":5,"out":11,"end":null,"cwd":"","cmdline":"claude --resume x"}]}"#;
+
+/// Block 3's command ended (its `133;D`).
+#[cfg(unix)]
+const BLOCK_ENDED: &str = r#"OK {"blocks":[{"id":3,"state":"complete","exit":1,"prompt":10,"cmd":10,"cmdcol":5,"out":11,"end":null,"cwd":"","cmdline":"claude --resume x"}]}"#;
+
+/// The shell drew its next prompt: block 4 began after block 3.
+#[cfg(unix)]
+const BLOCK_NEXT: &str = r#"OK {"blocks":[{"id":4,"state":"entering","exit":null,"prompt":12,"cmd":12,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
+
 /// A relaunched agent that ended as it started (Claude's `No conversation
-/// found`, a crash at start) leaves its shell holding the tab again at once,
-/// and is said at once: `failed:no-resume`, stopped, one ledger line, in
-/// seconds, not after a long wait with the harness's hand on the tab.
-/// (Negative controls, where no 90 s wait is paid:
-/// `relaunch::tests::a_shell_that_has_the_tab_back_reads_as_ended_only_after_a_while`.)
+/// found`, a crash at start) — the agent took the terminal, and its shell has
+/// it back at once — is said at once: `failed:no-resume`, stopped, one
+/// ledger line, in seconds, not after a long wait with the harness's hand on
+/// the tab. (Negative controls, where no 90 s wait is paid:
+/// `relaunch::tests::a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran`.)
 #[cfg(unix)]
 #[test]
 fn a_relaunch_that_ended_as_it_started_is_said_at_once() {
@@ -10696,7 +13669,7 @@ fn a_relaunch_that_ended_as_it_started_is_said_at_once() {
         step: String::new(),
     };
     let started = Instant::now();
-    let r = await_new(&opts, r, &mut st, &mut c, SESSION, &ShellHolds(Some(true)));
+    let r = await_new(&opts, r, &mut st, &mut c, SESSION, &ShellHolds::new(RAN));
     let took = started.elapsed();
     assert_eq!(r.step, "failed:no-resume", "{r:?}");
     assert!(
@@ -10709,13 +13682,29 @@ fn a_relaunch_that_ended_as_it_started_is_said_at_once() {
 }
 
 /// One [`await_new`] step over a relaunch of `cause` in flight since just
-/// now, its shell's hold on the tab read as `holds` ([`ShellHolds`]), and
-/// the wait for the relaunched process cut to `wait` (a step that must not
-/// end early is waited out): the step, the record after it, its ledger rows.
+/// now, its looks reading `looks` ([`Looks`]), and the wait for the
+/// relaunched process cut to `wait` (a step that must not end early is
+/// waited out): the step, the record after it, its ledger rows.
 #[cfg(unix)]
-fn held_step(name: &str, cause: &str, holds: Option<bool>, wait: Duration) -> (Report, St, usize) {
+fn held_step(name: &str, cause: &str, looks: Looks, wait: Duration) -> (Report, St, usize) {
+    let (r, st, rows, _) = held_step_shown(name, cause, looks, wait);
+    (r, st, rows)
+}
+
+/// [`held_step`], and the owner's rows of the records after it ([`rows`]),
+/// the step's record saved as its callers save it.
+#[cfg(unix)]
+fn held_step_shown(
+    name: &str,
+    cause: &str,
+    looks: Looks,
+    wait: Duration,
+) -> (Report, St, usize, Vec<Row>) {
     let dir = scratch(name);
     let (sock, _asked) = instance(&dir);
+    if let Some((_, blocks)) = looks.block {
+        std::fs::write(dir.join("t.blocks"), blocks).expect("blocks");
+    }
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -10731,6 +13720,9 @@ fn held_step(name: &str, cause: &str, holds: Option<bool>, wait: Duration) -> (R
         to: "9.9.9".to_string(),
         source: "same".to_string(),
         cause: cause.to_string(),
+        // Its agent seen gone before the line, as `relaunch` stamps it.
+        exited_at: now_s(),
+        line_block: looks.block.map(|(block, _)| block),
         ..St::default()
     };
     save(&opts, SESSION, &st);
@@ -10745,11 +13737,21 @@ fn held_step(name: &str, cause: &str, holds: Option<bool>, wait: Duration) -> (R
     };
     let _quick = QuickWaits::new();
     HELD_WAIT_IN_TEST.with(|w| w.set(Some(wait)));
-    let r = await_new(&opts, r, &mut st, &mut c, SESSION, &ShellHolds(holds));
+    let r = await_new(
+        &opts,
+        r,
+        &mut st,
+        &mut c,
+        SESSION,
+        &ShellHolds::new(looks.holds),
+    );
     HELD_WAIT_IN_TEST.with(|w| w.set(None));
     let rows = ledger_lines(&opts);
+    // Saved as every caller of the step saves it, then read as the owner's.
+    save(&opts, SESSION, &st);
+    let shown = super::rows(&opts);
     let _ = std::fs::remove_dir_all(&dir);
-    (r, st, rows)
+    (r, st, rows, shown)
 }
 
 /// A wait long enough that a shell read as holding the tab throughout would
@@ -10773,40 +13775,337 @@ const HANG_DETECTOR: Duration = Duration::from_secs(60);
 fn a_restored_relaunch_still_starting_or_unread_is_waited_on_not_failed() {
     // Each case waits PAST_ENDED out on a step of its own: side by side.
     side_by_side(
-        [(Some(false), "held-starting"), (None, "held-unread")]
-            .into_iter()
-            .map(|(holds, name)| -> Box<dyn FnOnce() + Send> {
-                Box::new(move || {
-                    let (r, st, rows) = held_step(name, CAUSE_HOST, holds, PAST_ENDED);
-                    assert_eq!(r.step, "wait:resume", "{holds:?}: {r:?}");
-                    assert!(
-                        matches!(st.phase, Phase::Relaunched { .. }),
-                        "{holds:?}: {st:?}"
-                    );
-                    assert_eq!(rows, 0, "{holds:?}");
-                })
+        [
+            (&[Some(false)] as &'static [Option<bool>], "held-starting"),
+            (&[None], "held-unread"),
+        ]
+        .into_iter()
+        .map(|(holds, name)| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || {
+                let (r, st, rows) = held_step(name, CAUSE_HOST, Looks::holds(holds), PAST_ENDED);
+                assert_eq!(r.step, "wait:resume", "{holds:?}: {r:?}");
+                assert!(
+                    matches!(st.phase, Phase::Relaunched { .. }),
+                    "{holds:?}: {st:?}"
+                );
+                assert_eq!(rows, 0, "{holds:?}");
             })
-            .collect(),
+        })
+        .collect(),
     );
 }
 
-/// The early verdict is a restored tab's relaunch's alone. The live relaunch
-/// on exit ([`CAUSE_EXIT`]) keeps its wait even with its shell holding the tab
-/// throughout: its loop retries `failed:no-resume` after its back-off by typing
-/// the relaunch line afresh, so an early verdict there would retype a refusing
-/// agent within seconds. Negative control: the same step as a restored tab's
-/// is said as ended.
+/// The early verdict is never the live relaunch on exit's. It
+/// ([`CAUSE_EXIT`]) keeps its wait even with its agent seen to run and its
+/// shell holding the tab since: its loop retries `failed:no-resume` after
+/// its back-off by typing the relaunch line afresh, so an early verdict
+/// there would retype a refusing agent within seconds. Negative control: the
+/// same step as a restored tab's is said as ended (and so is an upgrade's,
+/// `an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once`).
 #[cfg(unix)]
 #[test]
 fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
-    let (r, st, rows) = held_step("held-live", CAUSE_EXIT, Some(true), PAST_ENDED);
+    let (r, st, rows) = held_step("held-live", CAUSE_EXIT, Looks::holds(RAN), PAST_ENDED);
     assert_eq!(r.step, "wait:resume", "{r:?}");
     assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
     assert_eq!(rows, 0);
-    let (r, st, rows) = held_step("held-restored", CAUSE_HOST, Some(true), HANG_DETECTOR);
+    let (r, st, rows) = held_step(
+        "held-restored",
+        CAUSE_HOST,
+        Looks::holds(RAN),
+        HANG_DETECTOR,
+    );
     assert_eq!(r.step, "failed:no-resume", "{r:?}");
     assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
     assert_eq!(rows, 1);
+}
+
+/// A SHELL THAT HOLDS ITS TAB IS NO PROOF THE AGENT ENDED (the review of the
+/// 2026-10-09 sweep fixes): a shell does its own work between reading the
+/// relaunch line and starting what it names — a `preexec` built on `$(…)`, a
+/// direnv on the line's `cd` — and holds its terminal all the while. Read as
+/// ended after `relaunch::ENDED_AT_ONCE` of that, an upgrade's relaunch was
+/// stopped `failed:no-resume`, and the owner was told to resume by hand,
+/// while the Claude Code the line started came up seconds later holding the
+/// very conversation (lab: `preexec() { : $(sleep 8) }`). Nothing showed
+/// that the line's command had run: the shell never handed its terminal to
+/// it, and the block it was typed into was still its prompt. The step waits
+/// (`wait:resume`), the record in flight and nothing ledgered, for the
+/// upgrade's move and for an account move alike (whose stop strikes the
+/// account it moved to), by either witness.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_whose_shell_has_not_run_its_line_yet_is_waited_on() {
+    side_by_side(
+        [
+            ("hook-upgrade", "", Looks::holds(HELD)),
+            ("hook-account", "account:work-2", Looks::holds(HELD)),
+            (
+                "hook-marked",
+                "",
+                Looks {
+                    holds: HELD,
+                    block: Some((3, BLOCK_NOT_RUN)),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, cause, looks)| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || {
+                let (r, st, rows) = held_step(name, cause, looks, PAST_ENDED);
+                assert_eq!(r.step, "wait:resume", "{name}: {r:?}");
+                assert!(
+                    matches!(st.phase, Phase::Relaunched { .. }),
+                    "{name}: {st:?}"
+                );
+                assert_eq!(rows, 0, "{name}");
+            })
+        })
+        .collect(),
+    );
+}
+
+/// THE SHELL'S OWN WORD DECIDES WHETHER THE LINE RAN where its integration
+/// marks the block the line was typed into ([`St::line_block`]): that block
+/// over — its `133;D`, or the next prompt's block begun — is the line's
+/// command ended, though no look caught the agent holding the terminal (a
+/// crash faster than a look): `failed:no-resume`. NEGATIVE CONTROL: the
+/// block still running its command is no end, though the kernel saw the
+/// agent take the terminal and give it back (the kernel's witness does not
+/// count where the shell's can be read): the step waits.
+#[cfg(unix)]
+#[test]
+fn the_shells_own_block_says_whether_the_line_ran() {
+    side_by_side(
+        [
+            ("marked-ended", BLOCK_ENDED, HELD, true),
+            ("marked-next", BLOCK_NEXT, HELD, true),
+            ("marked-runs", BLOCK_RUNS, RAN, false),
+        ]
+        .into_iter()
+        .map(|(name, blocks, holds, ended)| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || {
+                let looks = Looks {
+                    holds,
+                    block: Some((3, blocks)),
+                };
+                let wait = if ended { HANG_DETECTOR } else { PAST_ENDED };
+                let (r, st, rows) = held_step(name, "", looks, wait);
+                if ended {
+                    assert_eq!(r.step, "failed:no-resume", "{name}: {r:?}");
+                    assert_eq!(st.phase, Phase::Failed("no-resume".to_string()), "{name}");
+                    assert_eq!(rows, 1, "{name}");
+                } else {
+                    assert_eq!(r.step, "wait:resume", "{name}: {r:?}");
+                    assert!(
+                        matches!(st.phase, Phase::Relaunched { .. }),
+                        "{name}: {st:?}"
+                    );
+                    assert_eq!(rows, 0, "{name}");
+                }
+            })
+        })
+        .collect(),
+    );
+}
+
+/// The tab's newest block is the prompt the shell waits at (block 3), its
+/// input start not marked yet (`133;B`): what a relaunch line is typed into.
+#[cfg(unix)]
+const BLOCK_AT_PROMPT: &str = r#"OK {"blocks":[{"id":3,"state":"prompt","exit":null,"prompt":10,"cmd":null,"cmdcol":null,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
+
+/// THE BLOCK A RESTART'S LINE IS TYPED INTO IS READ BEFORE IT IS, AND ITS END
+/// IS THE LINE'S (the review of the block witness: every test of it set
+/// [`St::line_block`] by hand, so nothing pinned that a relaunch stamps it).
+/// A restart in place at a zsh that holds its terminal throughout — no look
+/// sees the line's job, as with a Claude Code that crashes faster than a
+/// look — in a tab whose newest block is the prompt (block 3) as the line is
+/// typed: the record names block 3, and the next prompt's block begun after
+/// the line says the line's command ended: `failed:no-resume`, at once.
+/// NEGATIVE CONTROL: block 3 still the newest, the step waits
+/// (`wait:resume`). Without the stamp the kernel alone would judge, and it
+/// never saw the line run: both wait.
+#[cfg(unix)]
+#[test]
+fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
+    let case = |name: &str, next_prompt: bool| {
+        let _quick = QuickWaits::new();
+        let dir = scratch(name);
+        let mut shell = tty_zsh();
+        let who = format!(
+            "OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={}",
+            shell.id()
+        );
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                blocks: BLOCK_AT_PROMPT,
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        seed_builds(&opts);
+        let mut agent = parked_bare().spawn().expect("agent");
+        let pid = agent.id();
+        wait_exec(pid);
+        register(&opts.home, pid, SESSION);
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        write_transcript(
+            &opts.home,
+            &[answer_at("claude-opus-5", "2099-01-01T00:00:00Z")],
+        );
+        let snap = Snapshot {
+            tab: TAB.to_string(),
+            pid,
+            start: kernel_start(pid).expect("lstart"),
+            shell: shell.id(),
+            program: PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".to_string()],
+            session: Some(SESSION.to_string()),
+            cwd: "/".to_string(),
+            version: Some("1.0.0".to_string()),
+            codex: None,
+            dialect: None,
+            login: None,
+            home: None,
+            claude_dir: None,
+        };
+        // Reaped as the stand-in's signal ends it.
+        let (tx, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(agent.wait());
+        });
+        // The shell's next prompt, drawn once the line is typed.
+        let next = next_prompt.then(|| {
+            let (asked, blocks) = (asked.clone(), dir.join("t.blocks"));
+            std::thread::spawn(move || {
+                let typed = aterm_spec::wait::within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    Duration::from_millis(5),
+                    || {
+                        asked
+                            .lock()
+                            .ok()?
+                            .iter()
+                            .any(|l| l.contains(" turn "))
+                            .then_some(())
+                    },
+                );
+                if typed.is_some() {
+                    std::fs::write(blocks, BLOCK_NEXT).expect("the next prompt's block");
+                }
+            })
+        });
+        let wait = if next_prompt {
+            HANG_DETECTOR
+        } else {
+            PAST_ENDED
+        };
+        HELD_WAIT_IN_TEST.with(|w| w.set(Some(wait)));
+        let restart = || {
+            crate::harness::relaunch::restart_with(
+                &opts,
+                &Restart::Memory,
+                Ok(snap.clone()),
+                &Script::new(shell.id(), usize::MAX, None),
+            )
+        };
+        let mut r = restart();
+        // The stand-in's agent is this test's child, alive to `kill(0)`
+        // until reaped: the relaunch is carried on, as the host's next idle
+        // point carries it, once it surely is.
+        assert!(
+            ended.recv_timeout(HANG_DETECTOR).is_ok(),
+            "{name}: the agent ended"
+        );
+        if turns(&asked) == 0 {
+            r = restart();
+        }
+        HELD_WAIT_IN_TEST.with(|w| w.set(None));
+        let st = load(&opts, SESSION).expect("the restart's record");
+        let typed = turns(&asked);
+        if let Some(next) = next {
+            let _ = next.join();
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        (r, st, typed)
+    };
+    let case = &case;
+    side_by_side(vec![
+        Box::new(move || {
+            let (r, st, typed) = case("block-next-prompt", true);
+            assert_eq!(typed, 1, "{r:?}");
+            assert_eq!(st.line_block, Some(3), "{st:?}");
+            assert_eq!(r.step, "failed:no-resume", "{r:?}");
+            assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
+        }),
+        Box::new(move || {
+            let (r, st, typed) = case("block-still-prompt", false);
+            assert_eq!(typed, 1, "{r:?}");
+            assert_eq!(st.line_block, Some(3), "{st:?}");
+            assert_eq!(r.step, "wait:resume", "{r:?}");
+            assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+        }),
+    ]);
+}
+
+/// AN UPGRADE'S RELAUNCH THAT ENDED AS IT STARTED IS SAID AT ONCE, AND READS
+/// AS AN AGENT THAT IS DOWN (the real-Claude sweep of 2026-10-09: the new
+/// Claude Code refused its relaunch line and exited at once; the record stood
+/// `relaunched` with nothing left to look at the tab, and read for half an
+/// hour as a start-up screen waiting on a person — "came back after the
+/// upgrade and has not reached a prompt" — never as `agent-down`). The
+/// harness's own restarts type their relaunch line once and never again, so
+/// the early read a restored tab's relaunch takes is theirs too: the quiet
+/// move's (no cause) and a fresh one's. The stopped record is the owner's one
+/// interrupt, `agent-down`, whose remedy is the conversation's resume — or,
+/// for a restart that started the agent afresh, a fresh `claude`: nothing of
+/// that conversation is there to resume. NEGATIVE CONTROL: the live relaunch
+/// on exit keeps its wait
+/// (`a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab`).
+#[cfg(unix)]
+#[test]
+fn an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once() {
+    use super::super::relaunch::CAUSE_UPGRADE_FRESH;
+    side_by_side(
+        [
+            ("upgrade-ended", "", format!("claude --resume {SESSION}")),
+            ("fresh-ended", CAUSE_UPGRADE_FRESH, "claude".to_string()),
+        ]
+        .into_iter()
+        .map(|(name, cause, command)| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || {
+                let (r, st, rows, shown) =
+                    held_step_shown(name, cause, Looks::holds(RAN), HANG_DETECTOR);
+                assert_eq!(r.step, "failed:no-resume", "{cause:?}: {r:?}");
+                assert_eq!(
+                    st.phase,
+                    Phase::Failed("no-resume".to_string()),
+                    "{cause:?}"
+                );
+                assert_eq!(rows, 1, "{cause:?}");
+                let row = shown
+                    .iter()
+                    .find(|row| row.session == SESSION)
+                    .expect("its row");
+                match row.attention(now_s()) {
+                    Attention::Interrupt(need) => {
+                        assert_eq!(need.kind, "agent-down", "{cause:?}");
+                        assert_eq!(need.command.as_deref(), Some(command.as_str()), "{cause:?}");
+                    }
+                    other => panic!("{cause:?}: {other:?}"),
+                }
+            })
+        })
+        .collect(),
+    );
 }
 
 /// The kernel's own answer ([`Kernel::shell_holds_tab`]'s default, which
@@ -11178,6 +14477,7 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     // Precondition, so the pass below is about THIS path: the move is due,
@@ -11262,6 +14562,7 @@ fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     let salt = now - 500;
@@ -11386,6 +14687,7 @@ fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
             "claude-fable-5-1".to_string(),
         ],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     save(&opts, SESSION, &announced("9.9.9"));
@@ -11621,6 +14923,7 @@ fn a_due_model_rides_a_restart_made_for_another_reason() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     assert_eq!(
@@ -11660,6 +14963,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     std::fs::write(&path, &answered).expect("transcript");
@@ -11746,6 +15050,7 @@ fn an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: None,
     };
     let asked = |applied: bool| {
@@ -11814,6 +15119,7 @@ fn a_native_session_is_judged_by_the_native_builds_own_offer() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: Some((None, vec!["claude-fable-5-1".to_string()])),
     };
     let due_to =
@@ -11853,6 +15159,7 @@ fn the_pre_filter_never_restarts_a_native_sessions_warm_wait() {
         baked: None,
         offered: vec!["claude-opus-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: Some((None, vec!["claude-opus-5-5".to_string()])),
     };
     let first = model_read_for(&opts, &sf, None, &mctx, true, None);
@@ -11921,6 +15228,7 @@ fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
         baked: None,
         offered: vec!["claude-opus-5".to_string()],
         default_model: None,
+        versions: Default::default(),
         native: Some((None, vec!["claude-opus-5-5".to_string()])),
     };
     let native = native_root(&opts.home).join("2.1.283");
@@ -11933,6 +15241,612 @@ fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
     let managed = vec!["/opt/aterm/pkg/agents/claude".to_string()];
     assert_eq!(riding_model_in(&opts, &sf, &managed, &mctx), None);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN AGENT UNDER ANOTHER CLAUDE HOME IS JUDGED BY THAT HOME'S MODEL FILES
+/// (the review of `fix/upgrade-homes`, 2026-10-14): the sweep now finds an
+/// agent started with `CLAUDE_CONFIG_DIR=<dir>` and the model rule reads its
+/// transcript there, but judged it by the pass's one model half, read from
+/// the user's `~/.claude/settings.json`, `~/.claude/cache/model-catalog` and
+/// `~/.claude.json` — so a person's saved default and allowlist in `<dir>`,
+/// and a model `<dir>`'s login is denied, were never seen, the move was due
+/// across families, and the agent was restarted with a `--model` its own
+/// home chose against. Now each is read where the agent runs
+/// ([`ModelCtx::at`]): `<dir>/settings.json`, `<dir>/cache/model-catalog`
+/// and `<dir>/.claude.json`, where Claude Code under that home keeps them.
+/// CONTROLS: the same home with nothing chosen and nothing denied is due as
+/// before (the judge is not switched off), and an agent in the user's own
+/// home is judged by the user's files whatever the other home says; under
+/// several logins the other home's caches are not read either.
+#[test]
+fn an_agent_under_another_claude_home_is_judged_by_its_homes_model_files() {
+    let dir = scratch("model-home");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    // Both models served, neither chosen nor denied, in the user's home.
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    let served_in = |claude_dir: &Path| {
+        let catalog = claude_dir.join("cache/model-catalog");
+        std::fs::create_dir_all(&catalog).expect("the catalog cache");
+        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    };
+    served_in(&opts.home.join(".claude"));
+    // No build: the offer is the list as the served catalog admits it.
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&opts, &targets);
+    // The agent under the other home answered on Fable 5.1 two hours ago.
+    let other = dir.join("work/.claude");
+    served_in(&other);
+    let answered = |claude_dir: &Path| {
+        let proj = claude_dir.join("projects/-work");
+        std::fs::create_dir_all(&proj).expect("projects");
+        let at = i64::try_from(now_s()).expect("now") - 7_200;
+        std::fs::write(
+            proj.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+                crate::harness::usage::rfc3339_utc(at)
+            ),
+        )
+        .expect("transcript");
+    };
+    answered(&other);
+    let sf = SessionFile {
+        claude_dir: Some(other.clone()),
+        ..record("2.1.296")
+    };
+    let verdict = |opts: &Opts, sf: &SessionFile| {
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        model_read_for(opts, sf, None, &mctx, false, None).verdict
+    };
+    let due = ModelVerdict::Due {
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-5-5".to_string(),
+    };
+    // CONTROL: nothing chosen or denied in its home either: due, as before.
+    assert_eq!(verdict(&opts, &sf), due, "the judge is not switched off");
+    assert!(model_wants_a_look(&opts, &sf, &mctx));
+    // Each of its home's files, alone, keeps it.
+    let settings = other.join("settings.json");
+    let profile = other.join(".claude.json");
+    for (name, file, text, kept) in [
+        (
+            "its saved default",
+            &settings,
+            r#"{"model":"claude-fable-5-1"}"#,
+            "model-chosen-by-hand",
+        ),
+        (
+            "its allowlist",
+            &settings,
+            r#"{"availableModels":["claude-fable-5-1"]}"#,
+            "model-current",
+        ),
+        (
+            "its login's denial",
+            &profile,
+            r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#,
+            "model-current",
+        ),
+    ] {
+        std::fs::write(file, text).expect("the home's file");
+        assert_eq!(
+            verdict(&opts, &sf),
+            ModelVerdict::Keep(kept),
+            "{name}: judged by the user's home"
+        );
+        assert!(!model_wants_a_look(&opts, &sf, &mctx), "{name}");
+        let argv = vec!["claude".to_string()];
+        assert_eq!(riding_model_in(&opts, &sf, &argv, &mctx), None, "{name}");
+        // CONTROL: the same conversation in the user's own home is judged by
+        // the user's files, which choose and deny nothing.
+        answered(&opts.home.join(".claude"));
+        let own = SessionFile {
+            claude_dir: Some(opts.home.join(".claude")),
+            ..sf.clone()
+        };
+        assert_eq!(verdict(&opts, &own), due, "{name}: the user's own home");
+        let _ = std::fs::remove_file(file);
+    }
+    // Under several logins the other home's caches are the unknown too, as
+    // the user's are ([`Opts::several_logins`]): its served catalog is not
+    // read, and with no build's own catalog nothing is offered.
+    let several = Opts {
+        several_logins: true,
+        instances: Instances::Listed(Vec::new()),
+        ..opts.clone()
+    };
+    assert_eq!(
+        verdict(&several, &sf),
+        ModelVerdict::Keep("no-model-available")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE MODEL RULE READS AN AGENT'S SETTINGS THROUGH THE ONE CHAIN
+/// (`claude_settings::sources_under`, handoff §4: "The upgrade's model half
+/// reads a Claude home's `settings.json` ALONE, not the chain"): Claude Code
+/// takes `model` and `availableModels` from the highest source that sets
+/// each — managed, `--settings`, the project's local and shared files, then
+/// the user's (READ in the 2.1.300 bundle: the restriction allowlists, among
+/// them `availableModels`, are owned whole by the highest source that sets
+/// one). A project's `.claude/settings.json` that allows only Fable 5.1 was
+/// never read: the agent standing in it was judged due onto Opus 5.5 and
+/// restarted with a `--model` its own settings disallow; a project's saved
+/// `model` the same.
+#[test]
+fn the_model_rule_reads_the_agents_settings_chain_not_its_homes_file_alone() {
+    let dir = scratch("model-settings-chain");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    let user = opts.home.join(".claude");
+    let catalog = user.join("cache/model-catalog");
+    std::fs::create_dir_all(&catalog).expect("the catalog cache");
+    std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&opts, &targets);
+    // The agent, in the user's own home, answered on Fable 5.1 two hours ago
+    // in the project `work`.
+    let work = dir.join("work");
+    let proj = user.join("projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let at = i64::try_from(now_s()).expect("now") - 7_200;
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+    let sf = SessionFile {
+        claude_dir: Some(user.clone()),
+        cwd: work.to_string_lossy().into_owned(),
+        ..record("2.1.296")
+    };
+    let verdict = || {
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        model_read_for(&opts, &sf, None, &mctx, false, None).verdict
+    };
+    // CONTROL: nothing chosen or allowed anywhere: due.
+    let due = ModelVerdict::Due {
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-5-5".to_string(),
+    };
+    assert_eq!(verdict(), due, "the judge is not switched off");
+    let shared = work.join(".claude/settings.json");
+    std::fs::create_dir_all(shared.parent().expect("dir")).expect("the project's .claude");
+    for (name, text, kept) in [
+        (
+            "the project's allowlist",
+            r#"{"availableModels":["claude-fable-5-1"]}"#,
+            "model-current",
+        ),
+        (
+            "the project's saved model",
+            r#"{"model":"claude-fable-5-1"}"#,
+            "model-chosen-by-hand",
+        ),
+    ] {
+        std::fs::write(&shared, text).expect("the project's settings");
+        assert_eq!(verdict(), ModelVerdict::Keep(kept), "{name}");
+        let argv = vec!["claude".to_string()];
+        assert_eq!(riding_model_in(&opts, &sf, &argv, &mctx), None, "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE CHAIN'S ORDER ([`agent_settings`]): each of `model` and
+/// `availableModels` is the HIGHEST document's that sets it — the managed
+/// tier over the project's over the user's, a higher list replacing a lower
+/// one whole, the managed drop-ins over the managed file — as Claude Code
+/// merges them (READ in the 2.1.300 bundle). FAIL-CLOSED: a document there
+/// that does not parse makes the chain unknown and nothing is moved; an
+/// `availableModels` that is no list is an empty allowlist, as Claude Code
+/// enforces one.
+#[test]
+fn the_model_rule_takes_each_key_from_the_highest_document_that_sets_it() {
+    let dir = scratch("model-settings-order");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    let user = opts.home.join(".claude");
+    let catalog = user.join("cache/model-catalog");
+    std::fs::create_dir_all(&catalog).expect("the catalog cache");
+    std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&opts, &targets);
+    let work = dir.join("work");
+    let proj = user.join("projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let at = i64::try_from(now_s()).expect("now") - 7_200;
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+    let sf = SessionFile {
+        claude_dir: Some(user.clone()),
+        cwd: work.to_string_lossy().into_owned(),
+        ..record("2.1.296")
+    };
+    let managed = dir.join("managed");
+    std::fs::create_dir_all(managed.join("managed-settings.d")).expect("the managed tier");
+    std::fs::create_dir_all(work.join(".claude")).expect("the project's .claude");
+    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = Some(managed.clone()));
+    let due = ModelVerdict::Due {
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-5-5".to_string(),
+    };
+    let only_fable = r#"{"availableModels":["claude-fable-5-1"]}"#;
+    let both_allowed = r#"{"availableModels":["claude-opus-5-5","claude-fable-5-1"]}"#;
+    let files = [
+        ("managed", managed.join("managed-settings.json")),
+        ("drop-in", managed.join("managed-settings.d/10-models.json")),
+        ("project", work.join(".claude/settings.json")),
+        ("local", work.join(".claude/settings.local.json")),
+        ("user", user.join("settings.json")),
+    ];
+    let case = |name: &str, docs: &[(&str, &str)]| {
+        for (_, path) in &files {
+            let _ = std::fs::remove_file(path);
+        }
+        for (which, text) in docs {
+            let path = &files
+                .iter()
+                .find(|(w, _)| w == which)
+                .expect("a document")
+                .1;
+            std::fs::write(path, text).expect("the document");
+        }
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        let verdict = model_read_for(&opts, &sf, None, &mctx, false, None).verdict;
+        let _ = name;
+        verdict
+    };
+    assert_eq!(
+        case("nothing set", &[]),
+        due,
+        "the judge is not switched off"
+    );
+    assert_eq!(
+        case(
+            "managed over project",
+            &[("managed", only_fable), ("project", both_allowed)]
+        ),
+        ModelVerdict::Keep("model-current")
+    );
+    assert_eq!(
+        case(
+            "a drop-in over the managed file",
+            &[("managed", both_allowed), ("drop-in", only_fable)]
+        ),
+        ModelVerdict::Keep("model-current")
+    );
+    assert_eq!(
+        case(
+            "the local file over the user's",
+            &[("local", only_fable), ("user", both_allowed)]
+        ),
+        ModelVerdict::Keep("model-current")
+    );
+    assert_eq!(
+        case(
+            "a higher list replaces a lower one whole",
+            &[("project", both_allowed), ("user", only_fable)]
+        ),
+        due
+    );
+    assert_eq!(
+        case(
+            "the managed model",
+            &[("managed", r#"{"model":"claude-fable-5-1"}"#)]
+        ),
+        ModelVerdict::Keep("model-chosen-by-hand")
+    );
+    assert_ne!(
+        case("a document that does not parse", &[("project", "{")]),
+        due,
+        "unknown: nothing is moved"
+    );
+    assert_ne!(
+        case(
+            "an allowlist that is no list",
+            &[("project", r#"{"availableModels":"opus"}"#)]
+        ),
+        due,
+        "an empty allowlist"
+    );
+    MANAGED_SETTINGS.with(|m| *m.borrow_mut() = None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN AGENT UNDER AN EMPTY CLAUDE HOME IS JUDGED BY THE PROFILE CLAUDE CODE
+/// KEEPS FOR IT (the homes lane's stated limit, handoff §4): Claude Code
+/// keeps its records and its `settings.json` under `CLAUDE_CONFIG_DIR ??
+/// join(homedir(), ".claude")` — for one set and EMPTY, the directory it
+/// runs in — but its global config, the profile holding the login's model
+/// caches, at `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`, whose
+/// `||` reads the empty value as unset: `$HOME/.claude.json` (READ in the
+/// 2.1.300 bundle; MEASURED in the real-Claude lab). The model rule read
+/// `<cwd>/.claude.json` for it (`claude_profile` had the directory alone,
+/// which an empty home shares with a relative `.`), so its login's denials
+/// were the unknown: a model its login is denied was offered, the agent
+/// judged due onto it and restarted with that `--model`. Driven through the
+/// sweep's own reader of the tab's leader ([`Homes::read`], [`Homes::roster`]).
+/// CONTROL: a relative `.` names the same directory and keeps its profile
+/// inside it, as Claude Code does.
+#[test]
+fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keeps_for_it() {
+    let dir = scratch("model-empty-home-profile");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let work = dir.join("work");
+    // Both models served, in the user's home and in the working directory,
+    // which an empty home's Claude Code reads as its own.
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    for claude_dir in [opts.home.join(".claude"), work.clone()] {
+        let catalog = claude_dir.join("cache/model-catalog");
+        std::fs::create_dir_all(&catalog).expect("the catalog cache");
+        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    }
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&opts, &targets);
+    // The agent leading the tab, filed where its Claude Code files it, its
+    // last answer on Fable 5.1 two hours ago.
+    const LEADER: u32 = 4_242;
+    std::fs::create_dir_all(work.join("sessions")).expect("sessions");
+    std::fs::write(
+        work.join(format!("sessions/{LEADER}.json")),
+        format!(
+            r#"{{"pid":{LEADER},"sessionId":"{SESSION}","cwd":"{}","version":"2.1.296","status":"idle","statusUpdatedAt":1,"procStart":"start","kind":"interactive","entrypoint":"cli"}}"#,
+            work.display()
+        ),
+    )
+    .expect("the record");
+    let proj = work.join("projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let at = i64::try_from(now_s()).expect("now") - 7_200;
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(LEADER)),
+    }];
+    // The record as the sweep reads it, its leader's exec home `home`.
+    let read = |home: &str| {
+        let args = |_: u32| {
+            Some(atpkg::caller_shell::ProcArgs {
+                env: vec![format!("CLAUDE_CONFIG_DIR={home}")],
+                ..atpkg::caller_shell::ProcArgs::default()
+            })
+        };
+        Homes::read(&opts, Some(&tabs), args, |_| Some(work.clone()))
+            .roster(Some(Vec::new()))
+            .and_then(|files| files.into_iter().find(|sf| sf.pid == LEADER))
+            .expect("the record is read where its Claude Code files it")
+    };
+    let verdict = |sf: &SessionFile| {
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        model_read_for(&opts, sf, None, &mctx, false, None).verdict
+    };
+    let denial = r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#;
+    let due = ModelVerdict::Due {
+        from: "claude-fable-5-1".to_string(),
+        to: "claude-opus-5-5".to_string(),
+    };
+    let empty = read("");
+    // CONTROL: nothing denied anywhere: due.
+    assert_eq!(verdict(&empty), due, "the judge is not switched off");
+    // Its login's denial, in `$HOME/.claude.json`: kept.
+    let home_profile = opts.home.join(".claude.json");
+    std::fs::write(&home_profile, denial).expect("the profile");
+    assert_eq!(
+        verdict(&empty),
+        ModelVerdict::Keep("model-current"),
+        "an empty home's login is read in $HOME/.claude.json"
+    );
+    std::fs::remove_file(&home_profile).expect("rm");
+    // A `.claude.json` in its working directory is nobody's profile here.
+    let cwd_profile = work.join(".claude.json");
+    std::fs::write(&cwd_profile, denial).expect("a stray file");
+    assert_eq!(
+        verdict(&empty),
+        due,
+        "an empty home's working directory holds no profile of its"
+    );
+    // CONTROL: `CLAUDE_CONFIG_DIR=.` names the same directory, and keeps its
+    // profile inside it (`"." || homedir()` is `.`).
+    let dot = read(".");
+    assert_eq!(dot.claude_dir.as_deref(), Some(work.as_path()));
+    assert_eq!(
+        verdict(&dot),
+        ModelVerdict::Keep("model-current"),
+        "a relative home's profile is inside it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE PRIORITY LIST GROWS FROM THE RECOMMENDATIONS OF THE HOME AN AGENT
+/// RUNS UNDER (the homes lane's stated limit, handoff §4: "the priority list
+/// is still grown from the user's home's recommendations alone"). Claude Code
+/// announces a launched model to a login (`tengu_startup_announcements`'
+/// `requiresModel`, in the home's profile), and the list admits it — a model
+/// the installed build knows, of a family on the list, newer than its best —
+/// even where the build does not yet name it its family's latest
+/// ([`models::recommendations`], [`models::ingest`]). Read only in the user's
+/// home, the announcement made to an agent under ANOTHER home grew nothing:
+/// the model was never on offer to it ([`models::offered`]) and the agent
+/// was never moved to it, while the same agent under the user's home was.
+/// CONTROL: the same announcement in the user's home moves the user's agent.
+#[test]
+fn an_agent_under_another_claude_home_moves_to_the_model_its_home_announces() {
+    let dir = scratch("model-home-announces");
+    let opts = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    // The managed build: it knows Opus 5.6 and still names Opus 5.5 its
+    // family's latest.
+    let bin = dir.join("build/claude");
+    std::fs::create_dir_all(bin.parent().expect("dir")).expect("the build");
+    std::fs::write(
+        &bin,
+        concat!(
+            r#"VERSION:"2.1.300",models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5"},"#,
+            r#"{id:"claude-opus-5-5",family:"opus",display_name:"Opus 5.5"},"#,
+            r#"{id:"claude-opus-5-6",family:"opus",display_name:"Opus 5.6"},"#,
+            r#"{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"}],"#,
+            r#"latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5"},alias_migration:{}};"#,
+        ),
+    )
+    .expect("the build's catalog");
+    let twin = dir.join("agents/claude");
+    std::fs::create_dir_all(twin.parent().expect("dir")).expect("the twin");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", bin.display()),
+    )
+    .expect("the twin");
+    let targets = Targets {
+        managed: Some(Candidate {
+            exe: twin,
+            version: Version::parse("2.1.300").expect("version"),
+            source: Source::Managed,
+        }),
+        native: None,
+        unanswered: false,
+    };
+    // Its conversation answered on Opus 5.5 two hours ago, in `claude_dir`.
+    let answered = |claude_dir: &Path| {
+        let proj = claude_dir.join("projects/-work");
+        std::fs::create_dir_all(&proj).expect("projects");
+        let at = i64::try_from(now_s()).expect("now") - 7_200;
+        std::fs::write(
+            proj.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n",
+                crate::harness::usage::rfc3339_utc(at)
+            ),
+        )
+        .expect("transcript");
+    };
+    let announced = r#"{"cachedGrowthBookFeatures":{"tengu_startup_announcements":[{"id":"opus-5-6-launch","text":"t","requiresModel":"claude-opus-5-6"}]}}"#;
+    let users = opts.home.join(".claude");
+    std::fs::create_dir_all(&users).expect("the user's home");
+    let due = ModelVerdict::Due {
+        from: "claude-opus-5-5".to_string(),
+        to: "claude-opus-5-6".to_string(),
+    };
+    let verdict = |sf: &SessionFile| {
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        let mctx = ModelCtx::read(&opts, &targets);
+        model_read_for(&opts, sf, None, &mctx, false, None).verdict
+    };
+    // An agent under another home, announced to there.
+    let other = dir.join("work/.claude");
+    std::fs::create_dir_all(&other).expect("its home");
+    std::fs::write(other.join(".claude.json"), announced).expect("its profile");
+    answered(&other);
+    let theirs = SessionFile {
+        claude_dir: Some(other.clone()),
+        ..record("2.1.300")
+    };
+    assert_eq!(
+        verdict(&theirs),
+        due,
+        "moved to the model its own home's login was announced"
+    );
+    // CONTROL: the user's agent, the same announcement in the user's home.
+    std::fs::write(opts.home.join(".claude.json"), announced).expect("the user's profile");
+    answered(&users);
+    let own = SessionFile {
+        claude_dir: Some(users.clone()),
+        ..record("2.1.300")
+    };
+    assert_eq!(verdict(&own), due, "the user's own agent");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE CLI'S SWEEP FINDS AN AGENT UNDER ANOTHER CLAUDE HOME NO VISIT HAS
+/// RECORDED (the homes lane's stated limit, handoff §4): `aterm harness
+/// upgrade` (no roster: [`sweep`]) read the user's `~/.claude` and the homes
+/// the upgrade records name ([`St::home`], written by a window's visit) —
+/// so an agent under another home that no window visit had recorded yet (a
+/// build that just landed, a window whose host is off) was never listed,
+/// never moved, by a hand-run sweep, though its record stood in its own home
+/// and its tab was live. The window's pass finds its home from the tab's
+/// foreground leader's exec environment ([`Homes::read`]); a pass with no
+/// roster of its own reads the instances' tabs the same way.
+#[cfg(unix)]
+#[test]
+fn the_clis_sweep_finds_an_agent_under_another_claude_home_no_visit_recorded() {
+    let dir = scratch("cli-sweep-other-home");
+    let claude_dir = dir.join("work home/.claude");
+    let mut agent = tty_agent(
+        &[(crate::harness::accounts::HOME_ENV, claude_dir.as_path())],
+        Some(&dir),
+    );
+    let pid = agent.id();
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+    let (sock, _asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    // The CLI's unscoped pass: no tab of its own, a dry run.
+    let opts = Opts {
+        sock: Some(sock),
+        dry_run: true,
+        ..drive(&dir)
+    };
+    seed_builds(&opts);
+    std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("the user's sessions");
+    register_as(&claude_dir, pid, SESSION, "unknown");
+    let reports = sweep(&opts);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        reports.iter().any(|r| r.session == SESSION && r.pid == pid),
+        "the sweep visits it: {reports:?}"
+    );
 }
 
 // ---------------------------------------------------------------- a parked agent
@@ -11986,6 +15900,7 @@ impl Parked {
         let agent = parked_bare().spawn().expect("agent");
         wait_exec(agent.id());
         let sf = register_idle_since(&opts.home, agent.id(), SESSION, ago_s);
+        file_transcript_in(&opts.home.join(".claude"), "p");
         std::fs::create_dir_all(state_dir(&opts)).expect("state");
         std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
         Parked {
@@ -12125,6 +16040,74 @@ fn tty_zsh() -> std::process::Child {
     let _ = child.kill();
     let _ = child.wait();
     panic!("zsh never held its terminal");
+}
+
+/// A STAND-IN AGENT ([`parked`]) THAT LEADS A TERMINAL OF ITS OWN, as a
+/// Claude Code leads its aterm tab: a new session on a pty, that pty its
+/// controlling terminal, so its group is the terminal's foreground (`ids`:
+/// `pgid == tpgid == pid`) and a roster naming that group (`who …
+/// fgpgid=<pid>`) claims it ([`host_candidates`]). It names [`TAB`] and no
+/// login or Claude home of the test's; `env` adds to that. It runs in `cwd`
+/// (`None`: the test's own). Killed and reaped by the caller.
+#[cfg(unix)]
+fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: both descriptors were just opened above and are owned here
+    // alone; the master lives as long as the test process (leaked below) so
+    // the terminal never hangs up under the agent.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
+    // `std`'s, for the hook below, with the strip installed first ([`tty_zsh`]).
+    let mut agent = std::process::Command::new(std::env::current_exe().expect("exe"));
+    agent
+        .inherit_nothing()
+        .args(PARK)
+        .env(PARK_ENV, "1")
+        .env("ATERM_PARENT_SESSION_ID", TAB)
+        .env_remove(crate::harness::accounts::LOGIN_ENV)
+        .env_remove(crate::harness::accounts::HOME_ENV)
+        // An unset Claude home is the process's own `HOME`'s: a stand-in's is
+        // the sweep's user home unless a test names one.
+        .env_remove("HOME")
+        .stdin(tty(&slave))
+        .stdout(tty(&slave))
+        .stderr(tty(&slave));
+    for (key, value) in env {
+        agent.env(key, value);
+    }
+    if let Some(cwd) = cwd {
+        agent.current_dir(cwd);
+    }
+    // SAFETY: async-signal-safe calls only, between fork and exec: a new
+    // session, and the terminal on stdin made its controlling terminal.
+    unsafe {
+        agent.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = agent.spawn().expect("agent");
+    std::mem::forget(master);
+    drop(slave);
+    let me = std::env::current_exe().expect("exe");
+    for _ in 0..6_000 {
+        if ids(child.id())
+            .is_some_and(|(_, pgid, tpgid)| i64::from(child.id()) == pgid && pgid == tpgid)
+            && atpkg::caller_shell::process_args(child.id())
+                .is_some_and(|a| Path::new(&a.exec_path).file_name() == me.file_name())
+        {
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the stand-in agent never held its terminal");
 }
 
 /// A pending state for [`SESSION`] whose screen ([`idle_screen`], seq 77) has
@@ -15166,6 +19149,7 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let behind = now_s() - 600;
     let st = St {
         phase: Phase::Pending,
@@ -15267,6 +19251,7 @@ fn the_real_look_climbs_the_ladder_on_claude_code() {
         let mut agent = parked_bare().spawn().expect("agent");
         wait_exec(agent.id());
         let sf = register(&opts.home, agent.id(), SESSION);
+        file_transcript_in(&opts.home.join(".claude"), "p");
         let now = now_s();
         let st = St {
             phase: Phase::Pending,
@@ -15379,6 +19364,7 @@ fn the_owners_word_waives_nothing_in_a_tab_it_did_not_name() {
     let mut agent = parked_bare().spawn().expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let settling = |named: &str| St {
         phase: Phase::Pending,
         from: "1.0.0".to_string(),
@@ -17183,6 +21169,8 @@ fn the_owners_now_restarts_a_quiet_session_whose_status_only_lags() {
         proc_start: "Wed Sep 30 12:00:00 2026".into(),
         kind: "interactive".into(),
         entrypoint: "cli".into(),
+        claude_dir: None,
+        profile: None,
     };
     let idle = SessionFile {
         status: "idle".into(),
@@ -17633,8 +21621,9 @@ fn harness_row(text: &str) -> String {
     user_row(&format!("[aterm harness] {text}"))
 }
 
-/// Whether a conversation has a task, read on: nobody can say without readable
-/// projects; with them, no transcript is no message and no task; the harness's
+/// Whether a conversation has a task, read on: nobody can say without a Claude
+/// home or with projects that cannot be listed; a home with no projects yet,
+/// and readable projects with no transcript, hold no message and no task; the harness's
 /// own turns, answered, are no task; a line caught half-written is read once
 /// whole; someone else's prompt is a task the moment it is whole (before its
 /// answer), and for good, and the next ask of the same conversation reads only
@@ -17648,8 +21637,15 @@ fn whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended()
     assert_eq!(
         tasked(&home, SESSION, &[]),
         None,
-        "no projects: nobody can say"
+        "no Claude home: nobody can say"
     );
+    // A Claude home with no projects yet: no message, so no task.
+    std::fs::create_dir_all(home.join(".claude")).expect("home");
+    assert_eq!(tasked(&home, SESSION, &[]), Some(false), "no projects yet");
+    // Projects that cannot be listed: nobody can say.
+    std::fs::write(home.join(".claude/projects"), "").expect("not a directory");
+    assert_eq!(tasked(&home, SESSION, &[]), None, "unreadable projects");
+    std::fs::remove_file(home.join(".claude/projects")).expect("rm");
     let project = home.join(".claude/projects/p");
     std::fs::create_dir_all(&project).expect("projects");
     assert_eq!(tasked(&home, SESSION, &[]), Some(false), "no message yet");
@@ -17938,6 +21934,156 @@ fn an_upgrade_restarts_a_conversation_with_no_task_afresh_and_announces_to_one_w
         assert_eq!(r.step, want, "{name}: {r:?}");
         assert_eq!(typed, 0, "{name}: a dry run types nothing");
     }
+}
+
+/// A CLAUDE HOME WITH NO `projects/` HOLDS NO TRANSCRIPT (the real-Claude
+/// sweep of 2026-10-09, Claude Code 2.1.294 -> 2.1.295): Claude Code makes
+/// the directory with a home's first message, so an idle session nobody has
+/// asked anything in a fresh home — a new machine's first run, a new
+/// `CLAUDE_CONFIG_DIR` — has none. Read as "nobody can say", the quiet
+/// upgrade restarted it `--resume <id>`, Claude answered `No conversation
+/// found with session ID` and exited, and the tab was left without its
+/// agent; the ask flow typed its notice into the empty session. Both start
+/// it afresh. NEGATIVE CONTROL: projects that exist and cannot be read (a
+/// file in the directory's place) still say nothing, and the quiet move
+/// resumes, as before.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_in_a_claude_home_with_no_projects_restarts_the_session_afresh() {
+    let shell = dead_pid();
+    let kernel = || Script::new(shell, usize::MAX, None);
+    let projects_as = |file: bool| {
+        move |opts: &Opts| {
+            let projects = opts.home.join(".claude/projects");
+            std::fs::remove_dir_all(&projects).expect("no projects yet");
+            if file {
+                std::fs::write(&projects, "").expect("projects that cannot be listed");
+            }
+        }
+    };
+    let visit = |name: &str, file: bool| {
+        visit_launched(
+            name,
+            &[],
+            true,
+            &kernel(),
+            77,
+            None,
+            None,
+            Answers::default(),
+            &[],
+            &projects_as(file),
+        )
+    };
+    let (r, _, typed) = quietly(|| visit("no-projects-quiet", false));
+    assert_eq!(r.step, "would-restart:fresh", "quiet: {r:?}");
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "{typed:?}");
+    let (r, _, typed) = visit("no-projects-ask", false);
+    assert_eq!(r.step, "would-restart:fresh", "ask: {r:?}");
+    assert!(typed.iter().all(|l| !l.contains(" turn ")), "{typed:?}");
+    // NEGATIVE CONTROL: unreadable projects say nothing of a task.
+    let (r, _, _) = quietly(|| visit("unreadable-projects-quiet", true));
+    assert_eq!(r.step, "would-restart", "{r:?}");
+}
+
+/// A [`Script`] that, at its `at`-th job read, runs `then`: what changes
+/// between a visit's step (its reads before) and its restart (the reads
+/// after).
+#[cfg(unix)]
+struct Racing<'a> {
+    script: Script,
+    at: usize,
+    then: Box<dyn Fn() + 'a>,
+}
+
+#[cfg(unix)]
+impl Kernel for Racing<'_> {
+    fn job(&self, agent: u32) -> Option<(Job, u32)> {
+        if self.script.reads.get() == self.at {
+            (self.then)();
+        }
+        self.script.job(agent)
+    }
+
+    fn parent(&self, pid: u32) -> Option<u32> {
+        self.script.parent(pid)
+    }
+
+    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+        self.script.terminal(pid)
+    }
+}
+
+/// NO RESTART RESUMES A CONVERSATION WITH NO TRANSCRIPT, whatever its step
+/// read (`restart`'s guard; the review of the 2026-10-09 sweep fixes, which
+/// found it untested). The step reads the conversation tasked and takes the
+/// quiet restart, and the transcript is gone before the restart looks (a
+/// race: removed between the step's reads and the restart's). Typed
+/// `--resume`, Claude refuses that conversation and exits, and the tab is
+/// left with no agent. The restart starts it afresh instead: its line has no
+/// `--resume`, its record says so (`CAUSE_UPGRADE_FRESH`: the relaunch adopts
+/// the new process and carries nothing on), and its ledger row says
+/// `restarted afresh`. NEGATIVE CONTROL: the transcript still there, the same
+/// quiet restart resumes the conversation as it was.
+#[cfg(unix)]
+#[test]
+fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step() {
+    use super::super::relaunch::CAUSE_UPGRADE_FRESH;
+    use std::os::unix::process::ExitStatusExt as _;
+    let run = |name: &str, gone: bool| {
+        let pending = St {
+            phase: Phase::Pending,
+            from: "1.0.0".to_string(),
+            to: "9.9.9".to_string(),
+            source: "managed".to_string(),
+            last_seq: 77,
+            seq_since_s: now_s() - 3_600,
+            ..St::default()
+        };
+        let mut h = quietly(|| Parked::new(name, Answers::default(), pending, 3_600));
+        let transcript = h
+            .opts
+            .home
+            .join(format!(".claude/projects/p/{SESSION}.jsonl"));
+        let ended = h.reaped();
+        let mut shell = tty_zsh();
+        let table = vec![(shell.id(), 1, "zsh".to_string())];
+        // The visit's first job read is the step's; the second, after it.
+        let kernel = Racing {
+            script: Script::new(shell.id(), usize::MAX, None),
+            at: 1,
+            then: Box::new(|| {
+                if gone {
+                    let _ = std::fs::remove_file(&transcript);
+                }
+            }),
+        };
+        let _quick = QuickWaits::new();
+        HELD_WAIT_IN_TEST.with(|w| w.set(Some(Duration::from_millis(100))));
+        let r = visit(&h.opts, &h.sf, &table, &newer(), &kernel);
+        HELD_WAIT_IN_TEST.with(|w| w.set(None));
+        let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {r:?}");
+        let st = load(&h.opts, SESSION).expect("record");
+        (st, h.details("terminated"))
+    };
+    let (st, terminated) = run("resume-gone", true);
+    assert!(!st.line.contains("--resume"), "{}", st.line);
+    assert_eq!(st.cause, CAUSE_UPGRADE_FRESH);
+    assert_eq!(
+        terminated,
+        ["SIGTERM (no task: restarted afresh, nothing typed or resumed)"]
+    );
+    // NEGATIVE CONTROL: its transcript there, resumed as it was.
+    let (st, terminated) = run("resume-kept", false);
+    assert!(st.line.contains("'--resume'"), "{}", st.line);
+    assert_eq!(st.cause, "");
+    assert_eq!(
+        terminated,
+        ["SIGTERM (idle: nothing asked or typed; resumed as it was)"]
+    );
 }
 
 /// The quiet upgrade at the driver (the default): a tasked conversation at a
@@ -18921,6 +23067,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             dialect: None,
             login: None,
             home: None,
+            claude_dir: None,
         };
         // Reaped as the stand-in's signal ends it; a signal refused leaves it
         // parked, ended below.
@@ -20233,24 +24380,30 @@ fn the_standing_wall_is_read_from_the_named_transcripts_bounded_tail() {
     let mut rows = vec![filler.clone(); 256];
     rows.push(wall.clone());
     write_transcript(&home, &rows);
-    assert_eq!(named_standing_wall(&home, SESSION), Some(read));
     assert_eq!(
-        named_limit_reset(&home, SESSION),
+        named_standing_wall(&home, &users_agent(SESSION)),
+        Some(read)
+    );
+    assert_eq!(
+        named_limit_reset(&home, &users_agent(SESSION)),
         Some(1_790_870_400),
         "the same row"
     );
     // NEGATIVE CONTROLS.
     assert_eq!(
-        named_standing_wall(&home, "00000000-0000-4000-8000-000000000000"),
+        named_standing_wall(&home, &users_agent("00000000-0000-4000-8000-000000000000")),
         None
     );
-    assert_eq!(named_standing_wall(&dir.join("nowhere"), SESSION), None);
+    assert_eq!(
+        named_standing_wall(&dir.join("nowhere"), &users_agent(SESSION)),
+        None
+    );
     // THE BOUND: more than a tail of rows after it, and it is not read.
     let mut rows = vec![wall];
     rows.extend(vec![filler; 80]);
     assert!(rows[1..].iter().map(String::len).sum::<usize>() as u64 > TAIL_BYTES);
     write_transcript(&home, &rows);
-    assert_eq!(named_standing_wall(&home, SESSION), None);
+    assert_eq!(named_standing_wall(&home, &users_agent(SESSION)), None);
 }
 
 /// THE LINE A CONVERSATION'S USAGE-LIMIT DIALOG ENDED WITH, READ FROM ITS
@@ -20284,19 +24437,146 @@ fn the_reset_line_is_read_from_the_named_transcripts_bounded_tail() {
     )));
     write_transcript(&home, &rows);
     assert_eq!(
-        named_reset_line(&home, SESSION, claimed).as_deref(),
+        named_reset_line(&home, &users_agent(SESSION), claimed).as_deref(),
         Some(said)
     );
     // NEGATIVE CONTROLS.
-    assert_eq!(named_reset_line(&home, SESSION, claimed + 60), None);
     assert_eq!(
-        named_reset_line(&home, "00000000-0000-4000-8000-000000000000", claimed),
+        named_reset_line(&home, &users_agent(SESSION), claimed + 60),
         None
     );
     assert_eq!(
-        named_reset_line(&dir.join("nowhere"), SESSION, claimed),
+        named_reset_line(
+            &home,
+            &users_agent("00000000-0000-4000-8000-000000000000"),
+            claimed
+        ),
         None
     );
+    assert_eq!(
+        named_reset_line(&dir.join("nowhere"), &users_agent(SESSION), claimed),
+        None
+    );
+}
+
+/// THE WINDOW HOST'S LIMIT AND WALL READERS READ THE AGENT'S OWN CLAUDE HOME
+/// (the upgrade-homes lane's stated limit, handoff §4): the reset a standing
+/// usage limit names ([`named_limit_reset`], the loop's
+/// `IdleHost::limit_until`), the quota wall that stands
+/// ([`named_standing_wall`], the accounts recorder's and the limit reset's)
+/// and the line the usage-limit dialog ended with ([`named_reset_line`], the
+/// reset's outcome) are read from the conversation's transcript, which a
+/// Claude Code started with `CLAUDE_CONFIG_DIR=<dir>` files under `<dir>`.
+/// The window host asked each of them under the user's home: for such an
+/// agent no reset was ever named (a notice left on the screen past its reset
+/// withheld every point until something was typed, and a bare clock time
+/// read on a later day than its notice was placed a day late), and no wall
+/// or reset line was read. Each now takes the agent's relaunch snapshot and
+/// reads its own records ([`Records::of_snapshot`]): its absolute home, a
+/// relative one and a set-and-empty one where they resolve.
+#[cfg(unix)]
+#[test]
+fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
+    let dir = scratch("named-own-home");
+    let user_home = dir.join("home");
+    // The user's own home keeps projects too, none of them this conversation's.
+    std::fs::create_dir_all(user_home.join(".claude/projects/p")).expect("the user's projects");
+    // 2026-09-30T19:02:11Z.
+    let claimed = 1_790_794_931;
+    let said = "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
+    let wall = r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-09-30T19:02:11.123Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 1 at 9am (America/Los_Angeles)"}]},"quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"error":"rate_limit","isApiErrorMessage":true}"#;
+    let row = |content: &str| {
+        format!(
+            r#"{{"isSidechain":false,"type":"user","timestamp":"2026-09-30T19:02:40.500Z","message":{{"role":"user","content":"{content}"}}}}"#
+        )
+    };
+    let rows = [
+        wall.to_string(),
+        row("<command-name>/rate-limit-options</command-name>"),
+        row(&format!(
+            "<local-command-stdout>{said}</local-command-stdout>"
+        )),
+    ];
+    let file = |claude_dir: &Path| {
+        let project = claude_dir.join("projects/p");
+        std::fs::create_dir_all(&project).expect("its project");
+        std::fs::write(
+            project.join(format!("{SESSION}.jsonl")),
+            rows.join("\n") + "\n",
+        )
+        .expect("its transcript");
+    };
+    // The agent as the window host keeps it: its relaunch snapshot.
+    let work = dir.join("work");
+    let snap = |home: Option<&str>, claude_dir: Option<PathBuf>| Snapshot {
+        tab: TAB.to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: vec!["/opt/claude/bin/claude".to_string()],
+        session: Some(SESSION.to_string()),
+        cwd: work.to_string_lossy().into_owned(),
+        version: None,
+        codex: None,
+        dialect: None,
+        login: None,
+        home: home.map(str::to_string),
+        claude_dir,
+    };
+    let read = |snap: &Snapshot| {
+        (
+            named_limit_reset(&user_home, snap),
+            named_standing_wall(&user_home, snap).map(|w| w.until),
+            named_reset_line(&user_home, snap, claimed),
+        )
+    };
+    let named = (
+        Some(1_790_870_400),
+        Some(Some(1_790_870_400)),
+        Some(said.to_string()),
+    );
+    // Under its own home: absolute, where its snapshot read its record.
+    let own = dir.join("work home/.claude");
+    file(&own);
+    let absolute = own.to_string_lossy().into_owned();
+    assert_eq!(
+        read(&snap(Some(&absolute), Some(own.clone()))),
+        named,
+        "its own absolute home"
+    );
+    // Relative, and set and empty: under the directory it runs in — here a
+    // snapshot a reopened layout gave back, which names no directory of its
+    // records and is read where its line starts it.
+    let relative = work.join("rel/.claude");
+    file(&relative);
+    assert_eq!(
+        read(&snap(Some("rel/.claude"), None)),
+        named,
+        "a relative home"
+    );
+    file(&work);
+    assert_eq!(read(&snap(Some(""), None)), named, "set and empty");
+    // CONTROLS: an agent under the user's home is read there, as ever; a
+    // relative home whose directory nobody knows names nothing; no
+    // conversation, nothing.
+    assert_eq!(
+        read(&snap(None, None)),
+        (None, None, None),
+        "not the user's"
+    );
+    file(&user_home.join(".claude"));
+    assert_eq!(read(&snap(None, None)), named, "the user's own");
+    let unknown = Snapshot {
+        cwd: String::new(),
+        ..snap(Some("nowhere/.claude"), None)
+    };
+    assert_eq!(read(&unknown), (None, None, None), "no directory known");
+    let unnamed = Snapshot {
+        session: None,
+        ..snap(Some(&absolute), Some(own))
+    };
+    assert_eq!(read(&unnamed), (None, None, None), "no conversation");
 }
 
 /// THE ACCOUNT MOVE WHOSE RESTART SIGNALLED AN AGENT IS NAMED BY ITS LABEL
@@ -20473,7 +24753,7 @@ fn the_transcript_that_confirms_a_wall_is_found_from_the_process() {
         "{\"the\":\"home tail\"}\n",
     );
     let tail = |config: Option<&Path>, at: &str| {
-        process_transcript_tail(config.and_then(Path::to_str), home.to_str(), 4242, at)
+        process_transcript_tail(config.and_then(Path::to_str), home.to_str(), None, 4242, at)
     };
     assert_eq!(
         tail(Some(&alt), start).as_deref(),
@@ -20534,7 +24814,10 @@ fn the_transcript_that_confirms_a_wall_is_found_from_the_process() {
 /// `HOME` another, each keeping a record of its pid that names a different
 /// conversation — the tail is the config directory's, read from the
 /// process's environment, never the home's `.claude`. The same stand-in
-/// launched with no `CLAUDE_CONFIG_DIR` reads its home's.
+/// launched with no `CLAUDE_CONFIG_DIR` reads its home's. A RELATIVE one,
+/// and one set and EMPTY, are read where they resolve from the directory the
+/// process runs in, by the one resolver ([`home_dir_at`]; fix/r16-homes:
+/// before, a relative one read nothing and an empty one its home's).
 #[cfg(unix)]
 #[test]
 fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
@@ -20557,9 +24840,12 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
         std::fs::create_dir_all(&at).expect("project");
         std::fs::write(at.join(format!("{id}.jsonl")), text).expect("transcript");
     };
-    let tail_of = |config: Option<&Path>| {
+    let tail_of = |config: Option<&Path>, runs_in: Option<&Path>| {
         let mut c = parked();
         c.env("HOME", &home);
+        if let Some(dir) = runs_in {
+            c.current_dir(dir);
+        }
         match config {
             Some(dir) => c.env("CLAUDE_CONFIG_DIR", dir),
             None => c.env_remove("CLAUDE_CONFIG_DIR"),
@@ -20593,6 +24879,7 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
             dialect: None,
             login: None,
             home: None,
+            claude_dir: None,
         };
         let tail = snapshot_transcript_tail(&snap);
         let _ = agent.kill();
@@ -20600,13 +24887,591 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
         tail
     };
     assert_eq!(
-        tail_of(Some(&alt)).as_deref(),
+        tail_of(Some(&alt), None).as_deref(),
         Some("{\"the\":\"alt tail\"}\n"),
         "the process's own CLAUDE_CONFIG_DIR"
     );
     assert_eq!(
-        tail_of(None).as_deref(),
+        tail_of(None, None).as_deref(),
         Some("{\"the\":\"home tail\"}\n"),
         "none: its HOME's .claude"
     );
+    assert_eq!(
+        tail_of(Some(Path::new("claude-alt")), Some(&root)).as_deref(),
+        Some("{\"the\":\"alt tail\"}\n"),
+        "a relative one, under the directory it runs in"
+    );
+    assert_eq!(
+        tail_of(Some(Path::new("")), Some(&alt)).as_deref(),
+        Some("{\"the\":\"alt tail\"}\n"),
+        "set and empty: the directory it runs in"
+    );
+}
+
+// ------------------------------------------------- the review of fix/r17-homes2
+
+/// THE CLI'S SWEEP JUDGES AN EMPTY HOME'S AGENT BY ITS LOGIN AFTER A WINDOW
+/// RECORDED IT (the review of `fix/r17-homes2`, 2026-10-14). Claude Code keeps
+/// an EMPTY `CLAUDE_CONFIG_DIR`'s records in the directory it runs in and its
+/// profile — the login's model caches — in `$HOME/.claude.json`
+/// ([`profile_apart`]). A record a window's visit or note writes keeps the
+/// home as its directory alone ([`St::home`]), which `aterm harness upgrade`
+/// (no roster) reads back ([`recorded_homes`], [`St::agent_records`]) with no
+/// profile apart, and [`Homes`] kept the first reading of a directory — so
+/// once a window had noted the agent, the CLI's pass judged it by
+/// `<cwd>/.claude.json` again: a model its login is denied was offered, the
+/// agent due onto it. Driven through the pass's own reads ([`Homes::read`]
+/// with no roster) over an instance that lists the agent's tab and over one
+/// that answers nothing (the records' homes alone), before and after the
+/// window's note ([`mint_behind`]) of the record it read. The record now
+/// keeps the profile with the home ([`St::home_profile`], [`St::keep_home`])
+/// and a home read off a live leader comes before a record's word
+/// ([`Homes::read`]), which an older build's record (its directory alone)
+/// shows.
+#[cfg(unix)]
+#[test]
+fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
+    const LEADER: u32 = 4_242;
+    let dir = scratch("cli-empty-home-recorded");
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={LEADER}");
+    let (sock, _asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    // The CLI's unscoped pass, its instance listing the agent's tab, and one
+    // whose instance answers nothing (`drive`'s socket does not exist).
+    let listed = Opts {
+        sock: Some(sock),
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let unlisted = Opts {
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let work = dir.join("work");
+    let both = r#"{"catalog":{"config":{"models":[{"id":"claude-opus-5-5","section":"current"},{"id":"claude-fable-5-1","section":"current"}]}}}"#;
+    for claude_dir in [listed.home.join(".claude"), work.clone()] {
+        let catalog = claude_dir.join("cache/model-catalog");
+        std::fs::create_dir_all(&catalog).expect("the catalog cache");
+        std::fs::write(catalog.join("0000-cc.json"), both).expect("served");
+    }
+    let targets = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let mctx = ModelCtx::read(&listed, &targets);
+    std::fs::create_dir_all(work.join("sessions")).expect("sessions");
+    std::fs::write(
+        work.join(format!("sessions/{LEADER}.json")),
+        format!(
+            r#"{{"pid":{LEADER},"sessionId":"{SESSION}","cwd":"{}","version":"2.1.296","status":"idle","statusUpdatedAt":1,"procStart":"start","kind":"interactive","entrypoint":"cli"}}"#,
+            work.display()
+        ),
+    )
+    .expect("the record");
+    let proj = work.join("projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let at = i64::try_from(now_s()).expect("now") - 7_200;
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+    // Its login is denied Opus 5.5, in the profile Claude Code keeps for it.
+    std::fs::write(
+        listed.home.join(".claude.json"),
+        r#"{"modelAccessCache":[{"apiName":"claude-opus-5-5","entitled":false}]}"#,
+    )
+    .expect("the login's profile");
+    let args = |_: u32| {
+        Some(atpkg::caller_shell::ProcArgs {
+            env: vec!["CLAUDE_CONFIG_DIR=".to_string()],
+            ..atpkg::caller_shell::ProcArgs::default()
+        })
+    };
+    let record = |opts: &Opts, tabs: Option<&[LiveTab]>| {
+        Homes::read(opts, tabs, args, |_| Some(work.clone()))
+            .roster(Some(Vec::new()))
+            .and_then(|files| files.into_iter().find(|sf| sf.pid == LEADER))
+    };
+    let verdict = |opts: &Opts| {
+        record(opts, None).map(|sf| {
+            let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+            model_read_for(opts, &sf, None, &mctx, false, None).verdict
+        })
+    };
+    let keep = Some(ModelVerdict::Keep("model-current"));
+    // CONTROL: no record of a visit. The listed tab's leader names the home;
+    // with no tab listed, nothing names it.
+    assert_eq!(verdict(&listed), keep, "CONTROL: read from its tab");
+    assert_eq!(verdict(&unlisted), None, "CONTROL: nothing names its home");
+    // A record an older build wrote names the home's directory alone: the
+    // listed tab's leader, read first, still names its profile.
+    std::fs::create_dir_all(state_dir(&listed)).expect("state");
+    let older = St {
+        home: Records::at(&listed.home, HomeVars::config(Some("")), || {
+            Some(work.clone())
+        })
+        .home_word(&listed.home),
+        ..St::default()
+    };
+    std::fs::write(state_path(&listed, SESSION), older.to_json()).expect("the older record");
+    assert_eq!(
+        verdict(&listed),
+        keep,
+        "a home read off its live leader comes before a record's word"
+    );
+    std::fs::remove_file(state_path(&listed, SESSION)).expect("rm");
+    // The window notes it behind, from the record its own pass read.
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(LEADER)),
+    }];
+    let sf = record(&listed, Some(&tabs)).expect("the window reads its record");
+    assert!(
+        mint_behind(
+            &Opts {
+                dry_run: false,
+                ..listed.clone()
+            },
+            &sf,
+            TAB,
+            &newer(),
+            false,
+            now_s(),
+        ),
+        "noted behind"
+    );
+    let (after_listed, after_unlisted) = (verdict(&listed), verdict(&unlisted));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        (after_listed, after_unlisted),
+        (keep.clone(), keep),
+        "judged by its login's denial, from its tab and from the window's record alike"
+    );
+}
+
+/// THE WALL'S TAIL IS THE TRANSCRIPT ITS AGENT WRITES NOW (the review of
+/// `fix/r17-homes2`): under a relative home, a Claude Code that changed
+/// directory (2.1.300's worktree enter) keeps its record where it filed it at
+/// start and writes its conversation under the home its NEW directory names
+/// (MEASURED in the real-Claude lab, `h2wtobs1`: the start home's transcript
+/// frozen at 244191 bytes, the worktree's growing 83849 → 88660). The tail a
+/// supervisor confirms a wall on its screen by ([`process_transcript_tail`])
+/// was read where the record is, a transcript that ends before the move, so
+/// every real wall the agent hit in the worktree read unconfirmed. Driven
+/// over a stand-in started (`PWD`) in `work` with its record and transcript
+/// filed there: in `work/wt` writing a notice under `wt`'s own home, the
+/// tail is that notice's; in `work/wt` with nothing written there yet, no
+/// tail (the screen decides, as before the homes lane); CONTROL: in `work`,
+/// its transcript's.
+#[cfg(unix)]
+#[test]
+fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
+    const RELATIVE: &str = "work home/.claude";
+    let case = |name: &str, moved: bool, written_now: Option<&str>| {
+        let dir = scratch(name);
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("wt")).expect("its directories");
+        let started = std::fs::canonicalize(&work).expect("where it started");
+        let runs_in = if moved {
+            started.join("wt")
+        } else {
+            started.clone()
+        };
+        let claude_dir = started.join(RELATIVE);
+        let mut agent = tty_agent(
+            &[
+                (crate::harness::accounts::HOME_ENV, Path::new(RELATIVE)),
+                ("PWD", started.as_path()),
+            ],
+            Some(&runs_in),
+        );
+        let pid = agent.id();
+        let start = kernel_start(pid).expect("lstart");
+        register_running_in(&claude_dir, pid, &start, &started);
+        // The conversation as it stood when it filed its record.
+        file_transcript_in(&claude_dir, &crate::harness::footer::project_slug(&started));
+        // What it writes now, under the home its directory now names.
+        if let Some(text) = written_now {
+            let now_dir = runs_in
+                .join(RELATIVE)
+                .join("projects")
+                .join(crate::harness::footer::project_slug(&runs_in));
+            std::fs::create_dir_all(&now_dir).expect("projects");
+            std::fs::write(
+                now_dir.join(format!("{SESSION}.jsonl")),
+                format!(
+                    "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+                ),
+            )
+            .expect("transcript");
+        }
+        let tail = snapshot_transcript_tail(&Snapshot {
+            tab: TAB.to_string(),
+            pid,
+            start,
+            shell: 1,
+            program: PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["claude".to_string()],
+            session: None,
+            cwd: "/".to_string(),
+            version: None,
+            codex: None,
+            dialect: None,
+            login: None,
+            home: Some(RELATIVE.to_string()),
+            claude_dir: None,
+        });
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        tail
+    };
+    let unmoved = case("wall-tail-unmoved", false, None);
+    let moved = case("wall-tail-moved", true, Some("WRITTEN-NOW limit notice"));
+    let unwritten = case("wall-tail-moved-unwritten", true, None);
+    assert!(
+        unmoved
+            .as_deref()
+            .is_some_and(|t| t.contains("port the parser")),
+        "CONTROL: an agent that never moved, its transcript's: {unmoved:?}"
+    );
+    assert!(
+        moved
+            .as_deref()
+            .is_some_and(|t| t.contains("WRITTEN-NOW") && !t.contains("port the parser")),
+        "the transcript it writes now: {moved:?}"
+    );
+    assert_eq!(
+        unwritten, None,
+        "nothing written where it writes now: no tail, never the one it left"
+    );
+}
+
+/// THE CLI'S SWEEP LEARNS HOMES FROM THE INSTANCES' TABS AND WAITS ON NONE OF
+/// THEM (the review of `fix/r17-homes2`): with no roster of its own,
+/// `aterm harness upgrade` reads every instance's tabs to learn the Claude
+/// homes their leaders run under ([`instance_tabs`]), and every live tab
+/// whose leader's exec record could not be read (a `sudo` shell, another
+/// user's process: none of them Claude) was named unread ([`Homes::unnamed`])
+/// and reported `wait:no-process`, rows the CLI's sweep never printed
+/// before. The window's own roster names its tabs' waits (CONTROL); a tab the
+/// CLI only learned homes from is not its to wait on.
+#[cfg(unix)]
+#[test]
+fn the_clis_sweep_waits_on_no_tab_it_only_learned_homes_from() {
+    let dir = scratch("cli-sweep-unread-leader");
+    // A live leader whose exec record is not read.
+    let leader = std::process::id();
+    let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={leader}");
+    let (sock, _asked) = instance_with(
+        &dir,
+        Answers {
+            who: Some(who),
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        dry_run: true,
+        ..drive(&dir)
+    };
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(leader)),
+    }];
+    let window = Homes::read(&opts, Some(&tabs), |_| None, |_| None).unnamed(TAB);
+    let cli = Homes::read(&opts, None, |_| None, |_| None).unnamed(TAB);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(window, "CONTROL: the window's own tab waits on its leader");
+    assert!(
+        !cli,
+        "the CLI's sweep reports no wait for a tab it only learned homes from"
+    );
+}
+
+/// ANOTHER HOME'S ANNOUNCEMENT GROWS THE LIST ITS OWN AGENTS ARE JUDGED BY,
+/// AND NO OTHER (the review of `fix/r17-homes2`): an agent under another
+/// Claude home is judged by a list grown from that home's announcements
+/// ([`ModelCtx::at`]), which was written to the pass's shared `models.json`
+/// and journaled `models-changed` once per such agent — so the user's own
+/// agents, whose login was announced nothing, were judged by it on the next
+/// pass (moved onto a model their login was never offered), and two homes'
+/// growths overwrote each other's. Two agents under one other home in one
+/// real pass: each moved to the model its home announces; the file and the
+/// journal as the pass's own read left them; CONTROL: the user's agent, on
+/// the next pass, not moved.
+#[test]
+fn another_homes_announcement_grows_only_its_own_agents_list() {
+    let dir = scratch("model-home-grows-alone");
+    let opts = Opts {
+        dry_run: false,
+        ..drive(&dir)
+    };
+    let bin = dir.join("build/claude");
+    std::fs::create_dir_all(bin.parent().expect("dir")).expect("the build");
+    std::fs::write(
+        &bin,
+        concat!(
+            r#"VERSION:"2.1.300",models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5"},"#,
+            r#"{id:"claude-opus-5-5",family:"opus",display_name:"Opus 5.5"},"#,
+            r#"{id:"claude-opus-5-6",family:"opus",display_name:"Opus 5.6"},"#,
+            r#"{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"}],"#,
+            r#"latest_per_family:{fable:"claude-fable-5-1",opus:"claude-opus-5-5"},alias_migration:{}};"#,
+        ),
+    )
+    .expect("the build's catalog");
+    let twin = dir.join("agents/claude");
+    std::fs::create_dir_all(twin.parent().expect("dir")).expect("the twin");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", bin.display()),
+    )
+    .expect("the twin");
+    let targets = Targets {
+        managed: Some(Candidate {
+            exe: twin,
+            version: Version::parse("2.1.300").expect("version"),
+            source: Source::Managed,
+        }),
+        native: None,
+        unanswered: false,
+    };
+    let answered = |claude_dir: &Path| {
+        let proj = claude_dir.join("projects/-work");
+        std::fs::create_dir_all(&proj).expect("projects");
+        let at = i64::try_from(now_s()).expect("now") - 7_200;
+        std::fs::write(
+            proj.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-opus-5-5\"}}}}\n",
+                crate::harness::usage::rfc3339_utc(at)
+            ),
+        )
+        .expect("transcript");
+    };
+    let other = dir.join("work/.claude");
+    std::fs::create_dir_all(&other).expect("its home");
+    std::fs::write(
+        other.join(".claude.json"),
+        r#"{"cachedGrowthBookFeatures":{"tengu_startup_announcements":[{"id":"opus-5-6-launch","text":"t","requiresModel":"claude-opus-5-6"}]}}"#,
+    )
+    .expect("its profile");
+    answered(&other);
+    let users = opts.home.join(".claude");
+    answered(&users);
+    let verdict = |sf: &SessionFile, mctx: &ModelCtx| {
+        let _ = std::fs::remove_dir_all(opts.state.join("upgrade/models"));
+        model_read_for(&opts, sf, None, mctx, false, None).verdict
+    };
+    // The pass's own read, as it leaves the file and the journal.
+    let mctx = ModelCtx::read(&opts, &targets);
+    let path = state_dir(&opts).join("models.json");
+    let list = std::fs::read_to_string(&path).expect("the list");
+    let changed = ledger_details(&opts, "models-changed");
+    let theirs = SessionFile {
+        claude_dir: Some(other.clone()),
+        ..record("2.1.300")
+    };
+    let second = SessionFile {
+        pid: 102,
+        ..theirs.clone()
+    };
+    let moved = ModelVerdict::Due {
+        from: "claude-opus-5-5".to_string(),
+        to: "claude-opus-5-6".to_string(),
+    };
+    let judged = [verdict(&theirs, &mctx), verdict(&second, &mctx)];
+    let (list_after, changed_after) = (
+        std::fs::read_to_string(&path).expect("the list"),
+        ledger_details(&opts, "models-changed"),
+    );
+    let own = SessionFile {
+        claude_dir: Some(users.clone()),
+        ..record("2.1.300")
+    };
+    let next = verdict(&own, &ModelCtx::read(&opts, &targets));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        judged,
+        [moved.clone(), moved],
+        "each moved to the model its home announces"
+    );
+    assert_eq!(
+        (list_after, changed_after),
+        (list, changed),
+        "the shared list and its journal as the pass's own read left them"
+    );
+    assert!(
+        !matches!(next, ModelVerdict::Due { .. }),
+        "CONTROL: the user's agent, announced nothing, is not moved: {next:?}"
+    );
+}
+
+/// AN AGENT WHOSE RECORDS A WORKTREE SPLIT WAITS, ASKED NOTHING (the review
+/// of `fix/r17-homes2`): under a relative home, a Claude Code that changed
+/// directory keeps its record where it filed it, its status frozen at what it
+/// was as it moved (`busy`: its updates under the new directory fail,
+/// MEASURED in the real-Claude lab), while it writes its conversation under
+/// the home its new directory names. Found there by the sweep since the homes
+/// lane, its look went on to the upgrade's gates, which read that frozen
+/// status as lagging the idle screen: under the ask flow the notice and its
+/// re-asks were typed, then a release, for a restart that waits on a status
+/// that cannot move. Its look now waits by name (`wait:home-moved`) until it
+/// is back where its record is. CONTROL: the same agent, never moved, goes
+/// on to the gates.
+#[cfg(unix)]
+#[test]
+fn an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing() {
+    const RELATIVE: &str = "work home/.claude";
+    let case = |name: &str, moved: bool| {
+        let dir = scratch(name);
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("wt")).expect("its directories");
+        let started = std::fs::canonicalize(&work).expect("where it started");
+        let runs_in = if moved {
+            started.join("wt")
+        } else {
+            started.clone()
+        };
+        let claude_dir = started.join(RELATIVE);
+        let mut agent = tty_agent(
+            &[
+                (crate::harness::accounts::HOME_ENV, Path::new(RELATIVE)),
+                ("PWD", started.as_path()),
+            ],
+            Some(&runs_in),
+        );
+        let pid = agent.id();
+        let who = format!("OK 1\n0 {TAB} driving=- watchers=0 turns=0 alive fgpgid={pid}");
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        // The ask flow, its window's step for the tab.
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            ..drive(&dir)
+        };
+        assert!(opts.ask, "the ask flow");
+        let sf = register_as(&claude_dir, pid, SESSION, "1.0.0");
+        file_transcript_in(&claude_dir, "-work");
+        let shell = dead_pid();
+        let r = visit(
+            &opts,
+            &sf,
+            &[(shell, 1, "zsh".to_string())],
+            &newer(),
+            &Script::new(shell, usize::MAX, None),
+        );
+        let typed: Vec<String> = asked
+            .lock()
+            .map(|a| a.iter().filter(|l| l.contains(" turn ")).cloned().collect())
+            .unwrap_or_default();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        (r.step, typed)
+    };
+    let (moved, typed) = case("split-records-moved", true);
+    let (unmoved, _) = case("split-records-unmoved", false);
+    assert_eq!(
+        (moved.as_str(), typed),
+        ("wait:home-moved", Vec::<String>::new()),
+        "its look waits by name, typing nothing"
+    );
+    assert_ne!(unmoved, "wait:home-moved", "CONTROL: never moved");
+}
+
+/// THE CLI'S SWEEP READS THE TABS OF EVERY INSTANCE IT IS GIVEN (the review
+/// of `fix/r17-homes2`): with no roster of its own, a pass learns the Claude
+/// homes from the `who` roster of every instance [`Opts::instances`] names
+/// ([`instance_tabs`]) — the product's, every instance `aterm ctl ls` lists.
+/// That arm had no test (its only one dialled a `--sock`), and a `cfg(test)`
+/// escape kept the machine's instances from this crate's tests alone; the
+/// instances are now a field ([`Instances`]), and a test names its own. Two
+/// stand-in instances, each with one tab whose leader runs under a Claude
+/// home of its own: both homes' agents are read. CONTROL: given one of them,
+/// the other's agent is not; given none, neither.
+#[cfg(unix)]
+#[test]
+fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
+    const OTHER_TAB: &str = "s-0123456789abcdef0123";
+    let dir = scratch("cli-sweep-two-instances");
+    // Two instances, one tab each, each tab led by an agent under its own home.
+    let mut socks = Vec::new();
+    for (name, tab, leader) in [("a", TAB, 4_242_u32), ("b", OTHER_TAB, 4_343)] {
+        let at = dir.join(name);
+        std::fs::create_dir_all(&at).expect("the instance's directory");
+        let who = format!("OK 1\n0 {tab} driving=- watchers=0 turns=0 alive fgpgid={leader}");
+        let (sock, _asked) = instance_for(
+            &at,
+            tab,
+            Answers {
+                who: Some(who),
+                ..Answers::default()
+            },
+        );
+        socks.push(sock);
+        let home = dir.join(format!("{name}/.claude"));
+        std::fs::create_dir_all(home.join("sessions")).expect("sessions");
+        std::fs::write(
+            home.join(format!("sessions/{leader}.json")),
+            format!(
+                r#"{{"pid":{leader},"sessionId":"{SESSION}","cwd":"/","version":"2.1.296","status":"idle","statusUpdatedAt":1,"procStart":"start","kind":"interactive","entrypoint":"cli"}}"#
+            ),
+        )
+        .expect("the record");
+    }
+    let args = |pid: u32| {
+        let name = if pid == 4_242 { "a" } else { "b" };
+        Some(atpkg::caller_shell::ProcArgs {
+            env: vec![format!(
+                "CLAUDE_CONFIG_DIR={}",
+                dir.join(format!("{name}/.claude")).display()
+            )],
+            ..atpkg::caller_shell::ProcArgs::default()
+        })
+    };
+    // The CLI's unscoped pass: no `--sock`, the instances it is given.
+    let read = |instances: Vec<String>| {
+        let opts = Opts {
+            sock: None,
+            dry_run: true,
+            instances: Instances::Listed(instances),
+            ..drive(&dir)
+        };
+        let mut pids: Vec<u32> = Homes::read(&opts, None, args, |_| None)
+            .roster(Some(Vec::new()))
+            .expect("the records")
+            .iter()
+            .map(|sf| sf.pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    };
+    let both = read(socks.clone());
+    let one = read(socks[..1].to_vec());
+    let none = read(Vec::new());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        both,
+        [4_242, 4_343],
+        "every instance's tabs teach their homes"
+    );
+    assert_eq!(one, [4_242], "CONTROL: the instance not given is not read");
+    assert_eq!(none, Vec::<u32>::new(), "CONTROL: none given, none read");
 }

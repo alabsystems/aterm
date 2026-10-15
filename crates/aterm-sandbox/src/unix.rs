@@ -19,7 +19,7 @@ pub(crate) fn apply_limits(limits: &Limits) -> io::Result<()> {
         (libc::RLIMIT_FSIZE, limits.file_size),
         (libc::RLIMIT_NOFILE, limits.open_files),
     ] {
-        if let Err(e) = set_limit(resource, value) {
+        if let Err(e) = set_limit(resource, value, limits.binding) {
             first_err.get_or_insert(e);
         }
     }
@@ -37,15 +37,21 @@ pub(crate) type RlimitResource = libc::__rlimit_resource_t;
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub(crate) type RlimitResource = libc::c_int;
 
-/// Set the SOFT `resource` limit to `value` while PRESERVING the inherited hard
-/// ceiling (no-op when `value` is `None`).
-///
-/// The hard limit is never lowered: the `$SHELL` must stay able to raise its
-/// soft limit from its rc (a `.zshrc` `ulimit -n 65536`), which a lowered hard
-/// limit turns into `ulimit: value exceeds hard limit` at startup. The soft
-/// value is clamped to the hard ceiling so `setrlimit` cannot `EINVAL` on
+/// Set the `resource` limit to `value` (no-op when `value` is `None`), clamped
+/// to the inherited hard ceiling so `setrlimit` cannot `EINVAL` on
 /// `rlim_cur > rlim_max`.
-pub(crate) fn set_limit(resource: RlimitResource, value: Option<u64>) -> io::Result<()> {
+///
+/// Without `binding` only the SOFT limit is set and the inherited hard ceiling
+/// is kept, so the `$SHELL` can raise its soft limit from its rc (a `.zshrc`
+/// `ulimit -n 65536`), which a lowered hard limit turns into `ulimit: value
+/// exceeds hard limit` at startup. With `binding` the hard limit is lowered to
+/// the same value, so the program cannot raise it back
+/// ([`crate::Limits::contained`]).
+pub(crate) fn set_limit(
+    resource: RlimitResource,
+    value: Option<u64>,
+    binding: bool,
+) -> io::Result<()> {
     let Some(v) = value else {
         return Ok(());
     };
@@ -61,9 +67,10 @@ pub(crate) fn set_limit(resource: RlimitResource, value: Option<u64>) -> io::Res
     } else {
         v as libc::rlim_t
     };
+    let soft = core::cmp::min(v as libc::rlim_t, hard);
     let lim = libc::rlimit {
-        rlim_cur: core::cmp::min(v as libc::rlim_t, hard),
-        rlim_max: hard,
+        rlim_cur: soft,
+        rlim_max: if binding { soft } else { hard },
     };
     // SAFETY: `resource` is a valid RLIMIT_* constant and `&lim` is a valid,
     // fully-initialized `rlimit` for the duration of the call.

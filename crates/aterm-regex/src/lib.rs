@@ -344,12 +344,32 @@ impl Regex {
     /// reading a truncated list.
     #[must_use]
     pub fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
+        self.find_iter_with_limit(text, self.step_limit)
+    }
+
+    /// [`find_iter`](Self::find_iter), held to `step_limit` units instead of
+    /// the pattern's own [`RegexBuilder::step_limit`].
+    ///
+    /// For a caller whose fair budget depends on the haystack. `aterm-search`
+    /// matches a soft-wrapped run as ONE line, of any length, and a budget
+    /// sized for one grid row runs out on a long run for any pattern at all,
+    /// so it scales the budget with the line under a ceiling of its own. The
+    /// iteration still shares one budget across the search it runs per match,
+    /// and still fails closed: [`Matches::step_limit_exceeded`] says whether
+    /// it reached the end, and an exhausted search is recorded on the pattern
+    /// as [`step_limit_exceeded`](Self::step_limit_exceeded) too.
+    #[must_use]
+    pub fn find_iter_with_limit<'r, 't>(
+        &'r self,
+        text: &'t str,
+        step_limit: u64,
+    ) -> Matches<'r, 't> {
         Matches {
             re: self,
             text,
             last_end: 0,
             last_match: None,
-            budget: self.step_limit,
+            budget: step_limit,
             cut_short: false,
         }
     }
@@ -484,8 +504,12 @@ impl Matches<'_, '_> {
     /// `false` means the iterator ran to the end of the haystack and the
     /// matches it yielded are every match there is. `true` means it gave up
     /// part-way: what it yielded is a prefix of the truth, not the truth.
+    ///
+    /// Unlike [`Regex::step_limit_exceeded`], which is sticky across every
+    /// search on the pattern, this is about one haystack: a caller scanning
+    /// many lines with one pattern reads it per line to say WHICH lines it
+    /// could not finish.
     #[must_use]
-    #[cfg(test)]
     pub fn step_limit_exceeded(&self) -> bool {
         self.cut_short
     }
@@ -1187,5 +1211,36 @@ mod step_budget_tests {
             clone.step_limit_exceeded(),
             "the clone sees what the original learned"
         );
+    }
+
+    /// `find_iter_with_limit` is held to the budget it is handed, not the
+    /// pattern's own, in both directions, and its iterator says per haystack
+    /// whether it finished — a caller scanning many lines needs to know which
+    /// one it could not, which the pattern's sticky flag cannot tell it.
+    #[test]
+    fn find_iter_with_limit_spends_the_budget_it_is_handed() {
+        let text = format!("{} needle", "x".repeat(10_000));
+        let needed = budget_needed("needle", &text);
+        let tight = RegexBuilder::new("needle")
+            .step_limit(needed / 2)
+            .build()
+            .expect("compiles");
+        let mut it = tight.find_iter_with_limit(&text, needed);
+        assert_eq!(it.next().map(|m| m.range()), Some(10_001..10_007));
+        assert_eq!(it.next(), None);
+        assert!(!it.step_limit_exceeded(), "the larger budget finishes");
+
+        let roomy = Regex::new("needle").expect("compiles");
+        let mut it = roomy.find_iter_with_limit(&text, needed / 2);
+        assert_eq!(it.next(), None);
+        assert!(it.step_limit_exceeded(), "the smaller budget does not");
+        assert!(roomy.step_limit_exceeded(), "and the pattern records it");
+
+        // Per haystack: the next one starts from its own budget and its own
+        // verdict, whatever the pattern learned before.
+        let mut it = roomy.find_iter_with_limit("a needle", needed / 2);
+        assert_eq!(it.next().map(|m| m.range()), Some(2..8));
+        assert_eq!(it.next(), None);
+        assert!(!it.step_limit_exceeded());
     }
 }

@@ -33,8 +33,7 @@ use std::path::PathBuf;
 use super::upgrade::{self, Candidate, Phase, Source, Step, Version};
 use super::{
     AT_POINT, Opts, Proc, Report, St, TAIL_BYTES, at_second, due_by, ledger, load, now_s, rearm,
-    rounds_step, save_at, session_files, state_dir, step, sweep_lock, tail_to_end, transcript,
-    watch_at,
+    rounds_step, save_at, state_dir, step, sweep_lock, tail_to_end, watch_at,
 };
 
 /// Who looks and why (the window's host, [`watch`]): the aterm build that looks
@@ -235,6 +234,15 @@ fn look_at(
     if owed.is_empty() {
         return Watched::skipped("no-record");
     }
+    // Where its agent keeps its records: the Claude home its record names
+    // ([`St::home`]), else the user's own.
+    let records = session
+        .as_deref()
+        .and_then(|s| owed.iter().find(|(name, _)| name == s))
+        .map_or_else(
+            || super::Records::of(&opts.home, None),
+            |(_, st)| st.agent_records(&opts.home),
+        );
     // The conversation's transcript, read once: until when its usage limit
     // holds (the reset it names, else a re-ask's wait after a row naming none),
     // which holds the round's clocks ([`sanctioned`]), and the reset it names,
@@ -242,7 +250,7 @@ fn look_at(
     // it could not be read, and the record keeps what it had.
     let tail = session
         .as_deref()
-        .and_then(|s| transcript(&opts.home, s))
+        .and_then(|s| records.transcript(s))
         .map(|p| tail_to_end(&p, TAIL_BYTES).0);
     let limit_until = tail.as_deref().and_then(upgrade::transcript_limit_until);
     let limit_reset = tail.as_deref().and_then(upgrade::transcript_limit_reset);
@@ -269,7 +277,7 @@ fn look_at(
     let claude = owed.iter().any(|(name, st)| {
         session.as_deref() == Some(name.as_str()) && st.agent == upgrade::Agent::Claude
     });
-    let wait = look_word(&r.step, claude, || status_of(opts, session.as_deref()));
+    let wait = look_word(&r.step, claude, || status_of(&records, session.as_deref()));
     let mut out = Watched {
         step: r.step.clone(),
         wait,
@@ -439,13 +447,15 @@ fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
     out
 }
 
-/// Claude's own status of `session` (its session file), which a `not-idle`
-/// wait word carries ([`upgrade::wait_word`]); empty where none is read.
-fn status_of(opts: &Opts, session: Option<&str>) -> String {
+/// Claude's own status of `session` (its session file, among `records`: the
+/// Claude home its agent keeps them under), which a `not-idle` wait word
+/// carries ([`upgrade::wait_word`]); empty where none is read.
+fn status_of(records: &super::Records, session: Option<&str>) -> String {
     let Some(session) = session else {
         return String::new();
     };
-    session_files(&opts.home)
+    records
+        .session_files()
         .and_then(|files| files.into_iter().find(|sf| sf.session_id == session))
         .map(|sf| sf.status)
         .unwrap_or_default()

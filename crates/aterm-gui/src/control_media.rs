@@ -1488,13 +1488,7 @@ fn valid_recording_name(name: &str) -> bool {
 }
 
 fn valid_frame_file_name(file: &str) -> bool {
-    let path = std::path::Path::new(file);
-    if path.components().count() != 1
-        || !matches!(
-            path.components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
+    if !crate::pinned_dir::is_one_component(std::ffi::OsStr::new(file)) {
         return false;
     }
     let Some(number) = file

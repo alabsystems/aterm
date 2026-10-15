@@ -6,12 +6,12 @@
 //! Endpoint, proxy, CA and managed-attestation policy is applied by the
 //! connectors here, on the exact stream that will carry terminal context.
 
-use super::description::{is_generic_description, normalize_description};
+use super::description::{bounded_text, is_generic_description, normalize_description};
 #[cfg(target_os = "macos")]
 use super::managed_ollama::attest_managed_server_stream;
 use super::managed_ollama::{ManagedOllama, ManagedOllamaController, ManagedProcessIdentity};
 use super::max_response_bytes;
-use super::redaction::{contains_sensitive_text, redact_context_line};
+use super::redaction::{REDACTED_LINE, contains_sensitive_text, redact_context_line};
 use super::{
     ActivityState, EffectiveTransport, EndpointOrigin, Job, ProviderSettings, Snapshot,
     TitleSummaryLocality, WorkerMessage, WorkerResult, cancelled_error,
@@ -31,8 +31,10 @@ const WORKER_REAP_INTERVAL: Duration = Duration::from_millis(250);
 /// Maximum age of a cached operating-system trust snapshot.
 pub(super) const PLATFORM_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// Whether the locality policy calls `endpoint` loopback: exactly when it has
+/// a [`loopback_peer`], the addresses every transport then dials it at.
 pub(super) fn endpoint_is_loopback(endpoint: &str) -> bool {
-    endpoint_authority(endpoint).is_some_and(|(_, host, _)| host_is_loopback(host))
+    loopback_peer(endpoint).is_some()
 }
 
 pub(super) fn effective_transport(
@@ -76,23 +78,33 @@ fn effective_settings_transport(
 }
 
 /// Everything that affects an unmanaged HTTP client's reusable transport
-/// configuration. Endpoint, bearer token, request guard, and proxy environment
-/// are deliberately absent: there is no connection pool, tokens/guards belong
-/// to one request, and `aterm-http` resolves environment proxies on every send.
+/// configuration. Bearer token, request guard, and proxy environment are
+/// deliberately absent: there is no connection pool, tokens/guards belong to
+/// one request, and `aterm-http` resolves environment proxies on every send.
+/// Of the endpoint only its [`LoopbackPeer`] is present, the one thing about it
+/// the connector depends on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UnmanagedClientIdentity {
     trust: Arc<aterm_http::Trust>,
     proxy_mode: aterm_http::ProxyMode,
     timeout: Duration,
+    loopback: Option<LoopbackPeer>,
 }
 
 impl UnmanagedClientIdentity {
-    fn client(&self) -> aterm_http::Client {
+    /// The client for this identity: a loopback-classified endpoint is dialed
+    /// at its pinned [`LoopbackPeer`], any other name through `resolver`.
+    fn client(&self, resolver: &Arc<dyn aterm_http::Connect>) -> aterm_http::Client {
+        let connector: Arc<dyn aterm_http::Connect> = match &self.loopback {
+            Some(peer) => Arc::new(peer.clone()),
+            None => Arc::clone(resolver),
+        };
         aterm_http::Client::with_shared_trust(
             Arc::clone(&self.trust),
             self.proxy_mode,
             self.timeout,
         )
+        .with_connector(connector)
     }
 
     fn uses_platform_trust(&self) -> bool {
@@ -121,6 +133,7 @@ fn unmanaged_client_identity(
         trust,
         proxy_mode,
         timeout: settings.timeout,
+        loopback: loopback_peer(effective_endpoint),
     })
 }
 
@@ -136,13 +149,29 @@ struct CachedUnmanagedClient {
 /// cannot retain an older platform-trust snapshot across the authority change.
 /// Platform trust is also refreshed on a monotonic deadline so a long-lived
 /// worker adopts system-root changes; explicit DER roots remain identity-cached.
-#[derive(Default)]
 pub(super) struct WorkerClientCache {
     unmanaged: Option<CachedUnmanagedClient>,
+    /// The connector an unmanaged client dials a name the locality policy did
+    /// not classify as loopback through: `aterm_http`'s system-resolver
+    /// [`aterm_http::TcpConnector`]. Only a test stands another resolver in.
+    resolver: Arc<dyn aterm_http::Connect>,
     #[cfg(test)]
     unmanaged_builds: usize,
     #[cfg(test)]
     managed_builds: usize,
+}
+
+impl Default for WorkerClientCache {
+    fn default() -> Self {
+        Self {
+            unmanaged: None,
+            resolver: Arc::new(aterm_http::TcpConnector),
+            #[cfg(test)]
+            unmanaged_builds: 0,
+            #[cfg(test)]
+            managed_builds: 0,
+        }
+    }
 }
 
 pub(super) enum WorkerClient<'a> {
@@ -162,6 +191,15 @@ impl std::ops::Deref for WorkerClient<'_> {
 }
 
 impl WorkerClientCache {
+    /// A cache whose unmanaged clients resolve names through `resolver`.
+    #[cfg(test)]
+    pub(super) fn with_resolver(resolver: Arc<dyn aterm_http::Connect>) -> Self {
+        Self {
+            resolver,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn for_request(
         &mut self,
         settings: &ProviderSettings,
@@ -214,7 +252,7 @@ impl WorkerClientCache {
                     && now.saturating_duration_since(cached.built_at)
                         >= PLATFORM_TRUST_REFRESH_INTERVAL)
         }) {
-            let client = identity.client();
+            let client = identity.client(&self.resolver);
             self.unmanaged = Some(CachedUnmanagedClient {
                 identity,
                 client,
@@ -307,7 +345,8 @@ pub(super) fn build_client(
     managed_process: Option<ManagedProcessIdentity>,
     write_authority: RequestWriteAuthority,
 ) -> Result<aterm_http::Client, String> {
-    let client = unmanaged_client_identity(settings, effective_endpoint)?.client();
+    let resolver: Arc<dyn aterm_http::Connect> = Arc::new(aterm_http::TcpConnector);
+    let client = unmanaged_client_identity(settings, effective_endpoint)?.client(&resolver);
     let _ = write_authority;
     if let Some(process) = managed_process {
         #[cfg(target_os = "macos")]
@@ -679,13 +718,16 @@ pub(super) fn request_summary(
     if !job_is_authorized(job, authority_epoch) {
         return Err(cancelled_error());
     }
-    let value: aterm_json::Value = match aterm_json::from_slice(response.body()) {
+    let value = match provider_answer(&response) {
         Ok(value) => value,
         Err(error) => {
+            // A refused answer or one that is not JSON: the daemon this
+            // authority owns is not serving the model, so drop it exactly as a
+            // transport failure does.
             if owned_managed {
                 ollama.invalidate_owned(&effective_endpoint, job.authority_epoch);
             }
-            return Err(format!("invalid JSON response: {error}"));
+            return Err(error);
         }
     };
     if !job_is_authorized(job, authority_epoch) {
@@ -714,6 +756,69 @@ pub(super) fn request_summary(
         effective_endpoint,
         managed_install_present,
     })
+}
+
+/// The most of a provider's own error message a status error carries.
+const PROVIDER_ERROR_EXCERPT_CHARS: usize = 160;
+
+/// A provider's answer read as the JSON it carries: the one reading both HTTP
+/// consumers share, the summary request and the managed warm-up
+/// (`send_warm_up`).
+///
+/// `aterm_http` returns every final status as `Ok` and leaves the status to its
+/// caller. A non-2xx answer is therefore an error here, naming its status and,
+/// when the body is the provider's JSON, an excerpt of its own `error` field
+/// (Ollama's `{"error": "…"}`, the OpenAI shape's `{"error": {"message": "…"}}`)
+/// — never a value: a 503 whose body happens to hold a well-formed completion
+/// is not a summary, and Ollama's 500 for a model that failed to load is not a
+/// warm-up.
+///
+/// Ruling 2026-10-10 (NET-2): the excerpt is the control- and bidi-stripped
+/// line [`bounded_text`] makes, cut to 160 characters, and it passes the same
+/// privacy check terminal context passes ([`contains_sensitive_text`]). It
+/// reaches the log and Settings, and a provider that echoes the bearer token
+/// back, or names an API key, has its message withheld whole: the status
+/// still names the refusal, and withholding fails closed.
+///
+/// Ruling 2026-10-10 (review of NET-2): the check reads the WHOLE message,
+/// before the cut, in both forms the excerpt comes from: as the provider wrote
+/// it, and as the one stripped line. A cut made first left a token straddling
+/// the 160th character too short to look like a credential, so its head
+/// showed; stripping first glued a key on a line of its own to the word
+/// before it (`id\nAKIA…` became `idAKIA…`), so it no longer looked like one.
+/// The cut then only shortens a line the check passed whole. A message past
+/// the check's scan bound is withheld, as that bound already rules.
+pub(super) fn provider_answer(
+    response: &aterm_http::Response,
+) -> Result<aterm_json::Value, String> {
+    if !response.is_success() {
+        let status = response.status();
+        return Err(match provider_error_excerpt(response.body()) {
+            Some(excerpt) => format!("provider answered HTTP {status}: {excerpt}"),
+            None => format!("provider answered HTTP {status}"),
+        });
+    }
+    aterm_json::from_slice(response.body())
+        .map_err(|error| format!("invalid JSON response: {error}"))
+}
+
+fn provider_error_excerpt(body: &[u8]) -> Option<String> {
+    let value: aterm_json::Value = aterm_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .as_str()
+        .or_else(|| error.get("message").and_then(aterm_json::Value::as_str))?;
+    let line = bounded_text(message, usize::MAX);
+    if line.is_empty() {
+        return None;
+    }
+    Some(
+        if contains_sensitive_text(message) || contains_sensitive_text(&line) {
+            REDACTED_LINE.to_string()
+        } else {
+            bounded_text(&line, PROVIDER_ERROR_EXCERPT_CHARS)
+        },
+    )
 }
 
 /// Parse just enough URL authority for the security/locality policy. Host
@@ -810,6 +915,78 @@ fn canonical_loopback_ip(host: &str) -> Option<std::net::IpAddr> {
 
 fn host_is_loopback(host: &str) -> bool {
     canonical_loopback_ip(host).is_some()
+}
+
+/// The addresses a loopback-classified endpoint is dialed at: the socket half
+/// of the locality policy.
+///
+/// The policy calls an endpoint loopback by its host AS WRITTEN — a loopback
+/// literal, `localhost`, `*.localhost` ([`canonical_loopback_ip`]) — and that
+/// call drops the HTTPS requirement and the proxy. A connector that then
+/// resolved the name would let the system resolver, not the policy, pick the
+/// peer: where a network resolver answers `*.localhost`, terminal context and
+/// the bearer token would leave in plaintext. So every transport dials a
+/// loopback-classified endpoint here and never resolves its name, as the
+/// managed connector always did through [`loopback_socket`].
+///
+/// Ruling 2026-10-10 (NET-3): a loopback literal is dialed at itself. A NAME
+/// is dialed at 127.0.0.1, then `::1` — the two addresses RFC 6761 §6.3 gives
+/// it — so a local server that listens on `::1` alone still answers, as it did
+/// through the resolver. A `*.localhost` name mapped to any other address
+/// (another 127/8 address in a hosts file) is not followed: write that address
+/// as the endpoint. The port is the endpoint's, else its scheme's default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoopbackPeer {
+    addresses: Vec<std::net::SocketAddr>,
+}
+
+fn loopback_peer(endpoint: &str) -> Option<LoopbackPeer> {
+    let (scheme, host, port) = endpoint_authority(endpoint)?;
+    let ip = canonical_loopback_ip(host)?;
+    let port = port.unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let mut addresses = vec![std::net::SocketAddr::new(ip, port)];
+    let literal = host
+        .strip_suffix('.')
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok();
+    if !literal {
+        addresses.push(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            port,
+        ));
+    }
+    Some(LoopbackPeer { addresses })
+}
+
+impl aterm_http::Connect for LoopbackPeer {
+    fn connect(
+        &self,
+        _host: &str,
+        _port: u16,
+        deadline: aterm_http::Deadline,
+    ) -> std::io::Result<std::net::TcpStream> {
+        // The name in the URL never selects the peer: the policy already did.
+        let mut last = None;
+        for address in &self.addresses {
+            // The REMAINING budget, re-derived per address, as `TcpConnector`
+            // does: one global deadline for the whole request.
+            let budget = deadline.remaining_or_timeout()?;
+            match std::net::TcpStream::connect_timeout(address, budget) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Ok(stream);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no loopback address to dial",
+            )
+        }))
+    }
 }
 
 pub(super) fn loopback_socket(endpoint: &str) -> Option<std::net::SocketAddr> {

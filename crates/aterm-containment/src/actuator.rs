@@ -15,8 +15,8 @@
 //! | Mode | Enforced |
 //! |---|---|
 //! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
-//! | Safety | Hardened resource limits (`aterm-sandbox`: rlimits on Unix, the Job Object on Windows). No OS sandbox. |
-//! | Containment | The hardened limits plus the OS sandbox below; on a platform without one, no shell. |
+//! | Safety | Resource limits (`aterm-sandbox`): soft rlimits on Unix, a guardrail the shell's rc or its program can raise; the Job Object on Windows. No OS sandbox. |
+//! | Containment | Safety's limits as hard rlimits, which the program cannot raise (`Limits::contained`), plus the OS sandbox below; on a platform without one, no shell. |
 //!
 //! The Containment OS sandbox (macOS Seatbelt) wraps the spawn with
 //! `/usr/bin/sandbox-exec -p <SBPL>`, the profile from
@@ -49,6 +49,16 @@
 //! against the live kernel by the enforcement tests here.
 //! [`SpawnDecision::Permit::sbpl`] carries the per-user profile; the PTY seam
 //! refuses to spawn if the wrapper binary is missing.
+//!
+//! aterm itself runs outside the sandbox, so what it does at a contained
+//! program's request is refused where aterm does it: the window brokers
+//! nothing for a Containment tab, so its OSC 52 neither sets nor reads the
+//! pasteboard, a Kitty file or shared-memory image is not read, and an OSC
+//! 9/99/777 posts no desktop notification, whatever the config allows
+//! (`aterm-gui`'s `host_reach`, ruling 2026-10-10). What the person does (a
+//! link click, a paste) is theirs and is not refused. The transparent session
+//! (`aterm --sandbox` at a TTY) parses nothing, so the terminal around it
+//! decides the program's escape sequences by its own policy.
 //!
 //! Fail closed: `Containment` never degrades. Where [`os_sandbox_actuated`] is
 //! false (every non-macOS target), [`decide`] returns [`SpawnDecision::Deny`]
@@ -196,8 +206,8 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
         );
     } else {
         // Explicit record that no OS sandbox is in force (the policy permits
-        // network). Safety's hardened limits apply as rlimits on Unix and via
-        // the Job Object on Windows (`aterm_sandbox::Limits::shell_default`);
+        // network). Safety's limits apply as soft rlimits on Unix and via the
+        // Job Object on Windows (`aterm_sandbox::Limits::shell_default`);
         // Master and User keep aterm's own (`Limits::inherit`), so their record
         // claims no limits.
         log_posture(
@@ -910,8 +920,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn scratch_home_outside_writable_roots(tag: &str) -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
-        // `…/target/debug/deps/<test>` → `…/target/debug` (never `deps/`, which
-        // is kept small).
+        // `<profile>/deps/<test>` → `<profile>` (never `deps/`, which is kept
+        // small).
         let dir = std::fs::canonicalize(exe.parent()?.parent()?).ok()?;
         if crate::sbpl::WRITABLE_ROOTS
             .iter()

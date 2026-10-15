@@ -41,6 +41,18 @@
 //! deferred was not drawn. Unknown is not evidence (a protected cell the
 //! world sees still is), a refused ghost hands its presence to its arriver,
 //! every ghost on glass is carried, and a ghost's held tile is its own.
+//!
+//! The residual after those (2026-10-14): a still ghost was drawn at unit
+//! scale with no lift, so a cat caught mid-breath or mid-stretch changed
+//! size by a pixel or three at the boundary, and one caught mid-hop fell to
+//! the ground line. A ghost is now drawn at the stance its body's last frame
+//! drew, and an arriver that adopts it eases from there.
+//!
+//! The residual after that (2026-10-14): a ghost was baked in the arriver's
+//! palette, sampled on the new surface, so at an alternate-screen enter onto
+//! another ground its outline changed on the boundary frame. A ghost now
+//! carries the palette its body was drawn in, and an arriver that adopts it
+//! goes on in it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -125,6 +137,21 @@ struct Shot {
     own: [Option<(i32, u8)>; 4],
     /// The focused pane's cell `(0, 0)` in window pixels.
     pane_at: (i32, i32),
+    /// Every pet-sized body drawn this frame, either channel, in window
+    /// pixels: the ghosts and the live body, with the atlas tile each wears.
+    pets: [Option<Drawn>; 8],
+}
+
+/// One pet-sized sprite as drawn: its window rect `(x0, y0, x1, y1)`, the
+/// atlas tile it wears — the bake of its pose, look AND palette — its
+/// opacity, and whether it is the frame's live body (the last sprite the
+/// live lane pushed, at `body_win`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Drawn {
+    rect: (i32, i32, i32, i32),
+    tile: (u16, u16),
+    alpha: u8,
+    body: bool,
 }
 
 impl Shot {
@@ -298,6 +325,34 @@ impl Host {
             .flatten()
             .filter(|d| !d.own_glass)
             .count();
+        let body_win = frame
+            .body_px
+            .map(|(x0, x1, y0, y1)| (x0 + pane.0, y0 + pane.1, x1 + pane.0, y1 + pane.1));
+        let mut pets = [None; 8];
+        let pet_sized = |s: &&aterm_core::render::FreeSprite| s.ah > self.cell.1;
+        let last = free.len().checked_sub(1);
+        let drawn = free
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| pet_sized(s))
+            .map(|(i, s)| {
+                let rect = win(s, pane);
+                (rect, s, Some(i) == last && Some(rect) == body_win)
+            })
+            .chain(
+                window
+                    .iter()
+                    .filter(pet_sized)
+                    .map(|s| (win(s, (0, 0)), s, false)),
+            );
+        for (slot, (rect, s, body)) in pets.iter_mut().zip(drawn) {
+            *slot = Some(Drawn {
+                rect,
+                tile: (s.ax, s.ay),
+                alpha: s.alpha,
+                body,
+            });
+        }
         let ghost_sprite = window.first().map(|s| (win(s, (0, 0)), s)).or_else(|| {
             (lane_ghosts > 0)
                 .then(|| free.first().map(|s| (win(s, pane), s)))
@@ -314,15 +369,14 @@ impl Host {
                 .chain(&window)
                 .filter(|s| s.z == FreeZ::UnderText)
                 .count(),
-            body_win: frame
-                .body_px
-                .map(|(x0, x1, y0, y1)| (x0 + pane.0, y0 + pane.1, x1 + pane.0, y1 + pane.1)),
+            body_win,
             ghost_win: ghost_sprite.map(|(rect, _)| rect),
             ghost_alpha: ghost_sprite.map_or(0, |(_, s)| s.alpha),
             ghost_under: ghost_sprite.is_some_and(|(_, s)| s.z == FreeZ::UnderText),
             glass_sprites: window.len(),
             own: core::array::from_fn(|i| window.get(i).map(|s| (s.x, s.alpha))),
             pane_at: pane,
+            pets,
         }
     }
 
@@ -531,11 +585,9 @@ fn project(
             let g = ghost(s);
             post.insert("ghost", i64::from(g.is_some()));
             // The old body stood at `before`'s cell, in `before`'s frame: a
-            // ghost anywhere else ON GLASS — window pixels, a pixel of
-            // rounding allowed — stands where the old body never was.
-            let near = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| {
-                (a.0 - b.0).abs() <= 1 && (a.3 - b.3).abs() <= 1 && (a.2 - b.2).abs() <= 1
-            };
+            // ghost anywhere else ON GLASS — window pixels, every edge — or
+            // drawn at another size stands where the old body never was.
+            let near = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| a == b;
             post.insert(
                 "ghost_moved",
                 i64::from(g.is_some_and(|g| {
@@ -1373,9 +1425,9 @@ fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
 fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
     let model = pet_surface_seam_model();
     for (case, keys, wait, input) in [
-        // Past the stretch's lead, so the live body is drawn at the unit
-        // scale a still ghost is drawn at (`ghost_moved` reads its pixels).
-        ("mid-stretch", 1usize, 12usize, None),
+        // Inside the stretch's lead: the body drawn stretched, and its
+        // ghost at that stretch (`ghost_moved` reads its pixels).
+        ("mid-stretch", 1usize, 4usize, None),
         ("standing", 3, 30, None),
         ("face-on", 6, 120, None),
         ("asleep", 0, 0, None),
@@ -2285,4 +2337,571 @@ fn a_carried_ghost_keeps_its_own_tile() {
             "frame {k}: every body on the lane is drawn: {shot:?}"
         );
     }
+}
+
+/// A drawn rect `(x0, y0, x1, y1)` as `(w, h, x0, y0)`, for the prints.
+fn dims(r: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (r.2 - r.0, r.3 - r.1, r.0, r.1)
+}
+
+/// Drive a settled host until its body is drawn `caught` — mid-breath (the
+/// fixture's cat is asleep and breathing: a fresh pet sleeps, and the
+/// settled three seconds are inside its breath window), mid-stretch (a key
+/// wakes it), or mid-hop (awake and standing, Enter sends it to the next
+/// row) — and return that frame, the last one before the boundary.
+fn caught(h: &mut Host, caught: &str) -> Shot {
+    let drawn = |s: &Shot| s.frame.on_glass && s.frame.pet.alpha == 255;
+    let (want, frames): (fn(&PetFrame) -> bool, usize) = match caught {
+        "mid-breath" => (
+            |p: &PetFrame| p.action == PetAction::Sleep && (p.scale_y - 1.0).abs() > 0.025,
+            200,
+        ),
+        "mid-stretch" => {
+            h.term.process(b"l");
+            (
+                |p: &PetFrame| p.pose == PetGlyphId::PetStretch && p.scale_x > 1.05,
+                40,
+            )
+        }
+        _ => {
+            for _ in 0..3 {
+                h.term.process(b"l");
+                h.present();
+                h.present();
+            }
+            h.run(Duration::from_millis(500));
+            h.term.process(b"\r\n$ ");
+            (|p: &PetFrame| p.lift > 0.3, 60)
+        }
+    };
+    for _ in 0..frames {
+        let shot = h.present();
+        if drawn(&shot) && want(&shot.frame.pet) {
+            return shot;
+        }
+    }
+    panic!("fixture: the cat {caught} on glass");
+}
+
+/// A GHOST IS DRAWN AS THE BODY THE USER LAST SAW (2026-10-14). At a
+/// coordinate-space boundary — a split-pane focus switch, an alternate-screen
+/// enter — the body on glass becomes a still ghost: the same cell, pose and
+/// facing, and the same squash, stretch and lift the last frame drew it at
+/// (`Departure::stance0`). Its drawn rectangle is the body's to the pixel on
+/// every frame of its fade, for a cat caught mid-breath, mid-stretch and
+/// mid-hop. An arriver that adopts that ghost on a quick return (the focus
+/// back a frame later) is drawn at the ghost's rectangle on the adoption
+/// frame and eases from there to its own, never more than a pixel an edge
+/// per frame while it wears the look it adopted.
+///
+/// Before this fix, measured here (window pixels, `(w, h, x0, y0)`): a still
+/// ghost was drawn at unit scale with no lift, so on the frame after the
+/// boundary the cat changed size or fell — a sleeper mid-breath (44, 28,
+/// 432, 148) became (45, 27, 432, 149); a stretch (47, 27, 431, 149) became
+/// (45, 27, 432, 149); a cat mid-hop, lifted 0.36 rows, (48, 26, 451, 148)
+/// became (45, 27, 453, 153), its feet 6 px lower. With the ghost fixed and
+/// the adopted look still drawn at unit scale (its rule until then), the
+/// arriver snapped on the adoption frame instead: the stretch's ghost (47,
+/// 27, 431, 149) to (45, 27, 432, 149).
+#[test]
+fn a_ghost_is_drawn_as_the_body_the_user_last_saw() {
+    let mut wrong = Vec::new();
+    for case in ["mid-breath", "mid-stretch", "mid-hop"] {
+        for glass in ["split", "screen"] {
+            let label = format!("{case}, {glass}");
+            let mut h = match glass {
+                "split" => Host::split_settled(),
+                _ => Host::settled(),
+            };
+            let before = caught(&mut h, case);
+            let body = before.body_win.expect("fixture: the body on glass");
+            match glass {
+                "split" => h.focus_other(),
+                _ => {
+                    h.term.process(&tui_bytes());
+                    h.owner.resight_owner();
+                }
+            }
+            let after = h.shots(Duration::from_millis(300));
+            let ghosts: Vec<(i32, i32, i32, i32)> = after
+                .iter()
+                .filter(|s| s.ghost_alpha > 0)
+                .filter_map(|s| s.ghost_win)
+                .collect();
+            let p = before.frame.pet;
+            eprintln!(
+                "{label}: the body {:?} at scale ({:.3}, {:.3}) lift {:.3}, as {:?}; its ghost \
+                 per frame {:?}",
+                dims(body),
+                p.scale_x,
+                p.scale_y,
+                p.lift,
+                p.pose,
+                ghosts.iter().map(|&g| dims(g)).collect::<Vec<_>>()
+            );
+            assert!(
+                ghosts.len() >= 8,
+                "{label}: fixture: the ghost fades on glass: {after:?}"
+            );
+            if !ghosts.iter().all(|&g| g == body) {
+                wrong.push(format!("{label}: the ghost is not the body the user saw"));
+            }
+        }
+    }
+
+    // THE ADOPTED ARRIVER: a quick return to the ghost's seat.
+    for case in ["mid-breath", "mid-stretch"] {
+        for glass in ["split", "screen"] {
+            let label = format!("{case}, {glass}, back");
+            let (mut h, own) = match glass {
+                "split" => (Host::split_settled(), true),
+                _ => (Host::settled(), false),
+            };
+            caught(&mut h, case);
+            match glass {
+                "split" => h.focus_other(),
+                _ => {
+                    h.term.process(&tui_bytes());
+                    h.owner.resight_owner();
+                }
+            }
+            let seen = *h.shots(Duration::from_millis(16)).last().expect("frames");
+            let old = if own { own_ghost(&seen) } else { ghost(&seen) }
+                .expect("fixture: the body the focus left fades as a ghost");
+            let ghost_px = seen.ghost_win.expect("fixture: the ghost drawn");
+            match glass {
+                "split" => h.focus_other(),
+                _ => {
+                    h.term.process(b"\x1b[?1049l");
+                    h.owner.resight_owner();
+                }
+            }
+            let after = h.shots(Duration::from_millis(400));
+            let a0 = after[0].frame.pet;
+            assert!(
+                at_seat(a0.col, a0.row, (old.col, old.row)),
+                "{label}: fixture: the arriver adopts the ghost at its seat: {:?}",
+                after[0]
+            );
+            let worn: Vec<(i32, i32, i32, i32)> = after
+                .iter()
+                .take_while(|s| {
+                    (s.frame.pet.pose, s.frame.pet.facing_left) == (old.pose, old.facing_left)
+                })
+                .filter_map(|s| s.body_win)
+                .collect();
+            eprintln!(
+                "{label}: the ghost {:?}; the adopted arriver per frame while it wears the \
+                 ghost's look {:?}",
+                dims(ghost_px),
+                worn.iter().map(|&b| dims(b)).collect::<Vec<_>>()
+            );
+            assert!(!worn.is_empty(), "{label}: fixture: the look is worn");
+            if worn[0] != ghost_px {
+                wrong.push(format!(
+                    "{label}: the arriver is not drawn as the ghost it adopted"
+                ));
+            }
+            let step = worn
+                .windows(2)
+                .map(|w| {
+                    (w[1].0 - w[0].0)
+                        .abs()
+                        .max((w[1].1 - w[0].1).abs())
+                        .max((w[1].2 - w[0].2).abs())
+                        .max((w[1].3 - w[0].3).abs())
+                })
+                .max()
+                .unwrap_or(0);
+            if step > 1 {
+                wrong.push(format!(
+                    "{label}: the adopted arriver snapped {step} px in one frame"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A screen on a light ground: every row painted in a light background
+/// (SGR, so it does not lean on erase-in-colour), the caret at
+/// `(caret_row, 5)`. `alt` enters the alternate screen first, as a
+/// full-screen program does.
+fn light_screen(rows: u16, cols: u16, caret_row: u16, alt: bool) -> Vec<u8> {
+    let mut b = if alt {
+        b"\x1b[?1049h\x1b[2J".to_vec()
+    } else {
+        Vec::new()
+    };
+    b.extend_from_slice(b"\x1b[48;2;236;236;236m\x1b[38;2;40;40;40m");
+    for row in 1..=rows {
+        b.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+        b.extend(std::iter::repeat_n(b' ', usize::from(cols)));
+    }
+    b.extend_from_slice(format!("\x1b[{caret_row};5H").as_bytes());
+    b
+}
+
+/// Every ghost drawn on `after` that stands where a body of the cat stood on
+/// `before` — the same window rectangle — wearing another atlas tile than
+/// every body there did: `(rect, the tile before, the tile now)`. The tile
+/// is the bake of pose, look and palette, so a still ghost of that body in
+/// another tile is that body repainted.
+type Repaint = ((i32, i32, i32, i32), (u16, u16), (u16, u16));
+
+fn repainted(before: &Shot, after: &Shot) -> Vec<Repaint> {
+    after
+        .pets
+        .iter()
+        .flatten()
+        .filter(|d| !d.body && d.alpha > 0)
+        .filter_map(|d| {
+            let was: Vec<&Drawn> = before
+                .pets
+                .iter()
+                .flatten()
+                .filter(|b| b.rect == d.rect)
+                .collect();
+            (!was.is_empty() && was.iter().all(|b| b.tile != d.tile))
+                .then(|| (d.rect, was[0].tile, d.tile))
+        })
+        .collect()
+}
+
+/// The ghosts on `after` standing where a body of the cat stood on `before`.
+fn ghosts_in_place(before: &Shot, after: &Shot) -> usize {
+    after
+        .pets
+        .iter()
+        .flatten()
+        .filter(|d| !d.body && d.alpha > 0)
+        .filter(|d| before.pets.iter().flatten().any(|b| b.rect == d.rect))
+        .count()
+}
+
+/// A GHOST WEARS THE PALETTE ITS BODY WAS DRAWN IN (2026-10-14). The pet's
+/// contrast palette (`CatColorKey`: the accent family and the background
+/// band that picks its outline) is frozen per appearance, sampled under the
+/// body's footprint. At a coordinate-space boundary the body on glass
+/// becomes a ghost and an arriver comes up on the new surface, which samples
+/// ITS palette. The ghost is the body the user last saw, colours included:
+/// on every frame of its fade it wears the very atlas tile — pose, look and
+/// palette — that body wore on the last frame before the boundary, at every
+/// boundary kind: an alternate-screen enter and leave, a tab switch, a
+/// split-pane focus switch, a tall screen, the breed handoff's leaver
+/// carried across one, and a quick return (where the arriver that adopts its
+/// ghost goes on in that ghost's tile too, even where the ground under the
+/// seat changed since that body's palette was frozen — on the surface the
+/// ghost was drawn on: [`an_arriver_resumes_a_ghosts_palette_only_on_the_surface_it_was_drawn_on`]).
+/// The arriver wears the palette right for its own surface.
+///
+/// Before this fix, measured here: the ghost was baked in the frame's
+/// palette — the arriver's, sampled on the new surface — on every frame of
+/// its fade. An alternate-screen enter onto a light screen took the body's
+/// {accent 5, background 0} tile (0, 32) to the light ground's {accent 5,
+/// background 3} tile (0, 192) on all 16 ghost frames; its leave, a tab
+/// switch, a tall screen and a quick return the same, and the breed
+/// handoff's leaver and body carried across an enter both (32 frames). Only
+/// the split switch kept its palette, through the owner's own-glass side
+/// table this fix retires. An adopting arriver that re-sampled ground that
+/// had turned light under its seat was repainted from (0, 32) to (0, 192)
+/// on the adoption frame.
+///
+/// NEGATIVE CONTROL: a theme change at the boundary
+/// (`CompanionOwner::invalidate_colors`) retires every frozen palette, the
+/// ghosts' included; its ghost is repainted, and the check sees it.
+#[test]
+fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
+    use aterm_effects::companion::CompanionRung;
+    use aterm_effects::kitty_pet::PetArrival;
+    use aterm_effects::kitty_registry::coat_distance;
+    let mut wrong = Vec::new();
+    for case in [
+        "alt enter",
+        "alt leave",
+        "tab switch",
+        "split switch",
+        "tall",
+        "breed leaver",
+        "quick return, screen",
+        "quick return, split",
+        "quick return, repainted ground",
+        "theme change (negative control)",
+    ] {
+        let mut h = match case {
+            "tall" => Host::new(90, 100),
+            "split switch" | "quick return, split" => Host::split_settled(),
+            _ => Host::settled(),
+        };
+        if let Some(other) = h.other.as_mut() {
+            // The other pane on a light ground, its prompt where it was.
+            other.term.process(&light_screen(30, 50, 21, false));
+            other.term.process(b"$ ");
+        }
+        if case == "alt leave" {
+            h.term.process(&light_screen(30, 100, 25, true));
+            h.owner.resight_owner();
+        }
+        let mut before = h.run(Duration::from_secs(3));
+        if case == "quick return, repainted ground" {
+            // The ground under the settled cat turns light while it stays:
+            // its appearance keeps the palette it was first drawn in, and a
+            // fresh sample at its seat would pick another.
+            let mut paint = b"\x1b7\x1b[48;2;236;236;236m".to_vec();
+            for row in 9..=10 {
+                paint.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+                paint.extend(std::iter::repeat_n(b' ', 100));
+            }
+            paint.extend_from_slice(b"\x1b[11;3H");
+            paint.extend(std::iter::repeat_n(b' ', 98));
+            paint.extend_from_slice(b"\x1b[0m\x1b8");
+            h.term.process(&paint);
+            before = h.run(Duration::from_secs(1));
+        }
+        if case == "breed leaver" {
+            let old = h.owner.brain().worn_pair().expect("dressed");
+            let coat = (0..16u8)
+                .find(|&c| coat_distance(old.0, c) >= 40.0)
+                .expect("a far coat");
+            h.owner
+                .set_look((coat, old.1), PetArrival::Ceremony, CompanionRung::Program);
+            let mut fired = false;
+            for k in 0..400 {
+                if k % 60 == 0 {
+                    h.term.process(b"l");
+                }
+                if coat_presence(&h.present(), old.0) > 0 {
+                    fired = true;
+                    break;
+                }
+            }
+            assert!(fired, "{case}: fixture: the handoff fired");
+            before = *h.shots(Duration::from_millis(160)).last().expect("frames");
+            assert!(
+                coat_presence(&before, old.0) > 192,
+                "{case}: fixture: the leaver on glass: {before:?}"
+            );
+        }
+        assert!(
+            before.frame.on_glass && before.frame.pet.alpha > 0,
+            "{case}: fixture: the cat on glass: {before:?}"
+        );
+        let mut was = h.owner.brain().appearance_colors();
+        let boundary = |h: &mut Host| match case {
+            "alt enter"
+            | "breed leaver"
+            | "quick return, screen"
+            | "quick return, repainted ground" => {
+                h.term.process(&light_screen(30, 100, 25, true));
+                h.owner.resight_owner();
+            }
+            "theme change (negative control)" => {
+                h.term.process(&light_screen(30, 100, 25, true));
+                h.owner.resight_owner();
+                h.owner.invalidate_colors();
+            }
+            "alt leave" => {
+                h.term.process(b"\x1b[?1049l");
+                h.owner.resight_owner();
+            }
+            "tab switch" => {
+                let mut tab = Terminal::new(30, 100);
+                tab.process(&light_screen(30, 100, 21, false));
+                tab.process(b"$ ");
+                std::mem::swap(&mut h.term, &mut tab);
+                h.session = 9;
+                h.owner.resight_owner();
+            }
+            "tall" => {
+                h.term.process(&light_screen(90, 100, 90, true));
+                h.owner.resight_owner();
+            }
+            _ => h.focus_other(),
+        };
+        boundary(&mut h);
+        let born = h.shots(Duration::from_millis(16));
+        if !case.contains("negative control") && !case.starts_with("quick return") {
+            // Every ghost the boundary made carries the palette its body was
+            // drawn in.
+            let carried: Vec<_> = born[0]
+                .frame
+                .pet
+                .departures
+                .iter()
+                .flatten()
+                .map(|d| d.colors)
+                .collect();
+            if carried.is_empty() || carried.iter().any(|c| c.is_none()) {
+                wrong.push(format!("{case}: a ghost without its palette: {carried:?}"));
+            }
+        }
+        if case.starts_with("quick return") {
+            // Two frames into the first crossfade, the focus comes back.
+            before = *born.last().expect("frames");
+            was = h.owner.brain().appearance_colors();
+            match case {
+                "quick return, split" => h.focus_other(),
+                _ => {
+                    h.term.process(b"\x1b[?1049l");
+                    h.owner.resight_owner();
+                }
+            }
+        }
+        let after = if case.starts_with("quick return") {
+            h.shots(Duration::from_millis(300))
+        } else {
+            let mut after = born;
+            after.extend(h.shots(Duration::from_millis(270)));
+            after
+        };
+        let now = h.owner.brain().appearance_colors();
+        let ghost_tiles: Vec<Vec<(u16, u16)>> = after
+            .iter()
+            .take(3)
+            .map(|s| {
+                s.pets
+                    .iter()
+                    .flatten()
+                    .filter(|d| !d.body && d.alpha > 0)
+                    .map(|d| d.tile)
+                    .collect()
+            })
+            .collect();
+        let body_tiles: Vec<(u16, u16)> = before
+            .pets
+            .iter()
+            .flatten()
+            .filter(|d| d.alpha > 0)
+            .map(|d| d.tile)
+            .collect();
+        let bad: Vec<Repaint> = after.iter().flat_map(|s| repainted(&before, s)).collect();
+        eprintln!(
+            "{case}: the palette before {was:?}, the arriver's after {now:?}; the bodies' tiles \
+             before {body_tiles:?}, the ghosts' on the first frames {ghost_tiles:?}; {} \
+             repainted ghost frames",
+            bad.len()
+        );
+        assert!(
+            ghosts_in_place(&before, &after[0]) >= 1,
+            "{case}: fixture: a ghost stands where the body was drawn: {:?}",
+            after[0]
+        );
+        if case.contains("negative control") {
+            assert!(!bad.is_empty(), "{case}: the check sees a repainted ghost");
+            continue;
+        }
+        if !bad.is_empty() {
+            wrong.push(format!(
+                "{case}: a ghost repainted on {} frames, first {:?}",
+                bad.len(),
+                bad[0]
+            ));
+        }
+        if case.starts_with("quick return") {
+            // The arriver adopts its ghost at its seat: on that frame it IS
+            // that body, in the tile the user saw.
+            let body = after[0]
+                .pets
+                .iter()
+                .flatten()
+                .find(|d| d.body)
+                .expect("the arriver drawn");
+            let seen: Vec<(u16, u16)> = before
+                .pets
+                .iter()
+                .flatten()
+                .filter(|b| b.rect == body.rect)
+                .map(|b| b.tile)
+                .collect();
+            assert!(
+                !seen.is_empty(),
+                "{case}: fixture: the arriver adopts the ghost at its seat"
+            );
+            if !seen.contains(&body.tile) {
+                wrong.push(format!(
+                    "{case}: the adopted arriver is repainted: {seen:?} -> {:?}",
+                    body.tile
+                ));
+            }
+        } else if now == was {
+            wrong.push(format!(
+                "{case}: fixture or law: the arriver did not pick its own surface's palette"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// AN ARRIVER RESUMES A GHOST'S PALETTE ONLY ON THE SURFACE IT WAS DRAWN ON
+/// (2026-10-14). An arriver that adopts a carried ghost at its seat goes on
+/// in that ghost's palette ([`a_ghost_wears_the_palette_its_body_was_drawn_in`]'s
+/// quick returns) — but a ghost carried across TWO boundaries within the
+/// ramp was sampled on another ground than the one the arriver stands on. A
+/// quick tab cycle A (dark) → B (dark) → C (light), with C's caret on A's
+/// cell: C's arriver adopts A's ghost there, and must wear the palette right
+/// for C's ground — the one a cat arriving on C straight from A picks — for
+/// its whole appearance, not A's dark-ground palette, whose pale outline all
+/// but vanishes on C's light ground.
+///
+/// Measured before the fix (review of 51ddf5d51): with 1, 2, 4 or 8 frames
+/// on B, C's adopting arriver wore A's {accent 5, background 0} after the
+/// fade and still 1, 3 and 6 s later, settled at its seat; a cat that comes
+/// to C straight from A wears {accent 5, background 3}.
+#[test]
+fn an_arriver_resumes_a_ghosts_palette_only_on_the_surface_it_was_drawn_on() {
+    let tab = |rows, cols, light: bool| {
+        let mut t = Terminal::new(rows, cols);
+        if light {
+            // A light ground, `$ ` on row 11: the caret on A's cell.
+            t.process(&light_screen(rows, cols, 11, false));
+            t.process(b"\x1b[11;1H$ ");
+        } else {
+            t.process(b"\x1b]11;#000000\x07\x1b[21;1H$ ");
+        }
+        t
+    };
+    let switch = |h: &mut Host, to: Terminal, session: u64| {
+        h.term = to;
+        h.session = session;
+        h.owner.resight_owner();
+    };
+    // The palette a cat coming to C straight from A picks.
+    let direct = {
+        let mut h = Host::settled();
+        switch(&mut h, tab(30, 100, true), 11);
+        h.run(Duration::from_secs(1));
+        h.owner.brain().appearance_colors()
+    };
+    let mut wrong = Vec::new();
+    for frames_on_b in [1, 2, 4, 8] {
+        let mut h = Host::settled();
+        let seen = h.run(Duration::from_millis(16));
+        let on_a = h.owner.brain().appearance_colors();
+        assert!(
+            on_a.is_some() && on_a != direct,
+            "fixture: A's ground and C's pick different palettes: {on_a:?} {direct:?}"
+        );
+        switch(&mut h, tab(30, 100, false), 9);
+        for _ in 0..frames_on_b {
+            h.present();
+        }
+        switch(&mut h, tab(30, 100, true), 11);
+        let arrived = h.present();
+        assert_eq!(
+            arrived.body_win, seen.body_win,
+            "{frames_on_b}: fixture: C's arriver adopts A's ghost at its seat"
+        );
+        let mut palettes = Vec::new();
+        for span in [300, 1000, 3000, 6000] {
+            h.run(Duration::from_millis(span));
+            palettes.push(h.owner.brain().appearance_colors());
+        }
+        eprintln!("{frames_on_b} frames on B: C's arriver wears {palettes:?}, direct {direct:?}");
+        if palettes.iter().any(|p| *p != direct) {
+            wrong.push(format!(
+                "{frames_on_b} frames on B: C's arriver wears {palettes:?}, not C's {direct:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

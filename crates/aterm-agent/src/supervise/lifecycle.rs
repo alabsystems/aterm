@@ -12,6 +12,8 @@
 //! * `ERR busy …` and `ERR rate` back the loop off ([`Session::back_off`]):
 //!   it waits for the refused point to leave the screen, bounded by a pause
 //!   that doubles from 250 ms to 8 s.
+//! * Either is journaled when it is news ([`Session::refusal_news`]): a
+//!   refusal that persists is retried, and said once, again when it changes.
 //! * At the start ([`Session::take_claim`]) the claim is taken, and
 //!   ([`Session::reconcile`]) a keyed attention entry a previous supervisor
 //!   left is adopted when the screen still shows its point, else unset. A loop
@@ -21,6 +23,26 @@
 
 use super::escalate::{point_label, status_field};
 use super::*;
+
+/// What makes two refusals THE SAME for the journal ([`Session::refusal_news`]):
+/// the words, with every field that MEASURES dropped — a `<name>=<number>`
+/// whose name counts time or bytes (`ERR busy person human_ms=<n>`, how long
+/// ago a person typed; `ERR busy input-unread bytes=<n>`; a `…_ms=` wait):
+/// the server says it anew at every retry. Who holds the session
+/// (`lease=s-9`, `turn=17`, `supervisor=…`, `reason=… origin=…`) is kept: a
+/// new holder is news.
+pub(super) fn refusal_key(said: &str) -> String {
+    said.split_whitespace()
+        .filter(|word| {
+            !word.split_once('=').is_some_and(|(name, value)| {
+                (name.ends_with("_ms") || name.ends_with("bytes"))
+                    && !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 impl<C: Ctl> Session<'_, C> {
     /// The hosted loop's stop flag is set.
@@ -70,20 +92,43 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// Whether the refusal `said` (`REFUSED <why>`, `HALTED <why>`), met at
+    /// `now`, is NEWS for the journal: not the one it last said
+    /// ([`refusal_key`]: its measures dropped), or that one met again after
+    /// [`REFUSAL_QUIET`] unmet. A refusal that persists — another driver's
+    /// lease, a person typing, a hold on a host whose `status` names none —
+    /// meets every retry of the act it refused (decided again a moment
+    /// later, `turn_end_loop.rs`'s `write_refused`), and is said when it
+    /// first appears and when it changes, never at every retry. The episode
+    /// also ends at the first write the server does not refuse
+    /// ([`Self::call`]) and at a hold seen lifted.
+    pub(super) fn refusal_news(&mut self, said: &str, now: Instant) -> bool {
+        let key = refusal_key(said);
+        let news = !self.refusal_said.as_ref().is_some_and(|(last, met)| {
+            *last == key && now.saturating_duration_since(*met) < REFUSAL_QUIET
+        });
+        self.refusal_said = Some((key, now));
+        news
+    }
+
     /// `ERR halted`: wait for the hold to lift. `status hold=1` is waited
     /// out with `await inbox since=0 kinds=hold` (the hold's transition
     /// latches it), a step at most, then read again; `hold=0` returns. A
     /// host whose `status` names no hold, or that refuses the wait, gets one
     /// step (`await seq`) and the loop looks again — the next press says
-    /// whether the halt stands. Journaled `HALTED seq=<n> <why>` and
-    /// `UNHALTED seq=<n> after <ms> ms`.
+    /// whether the halt stands. Journaled `HALTED seq=<n> <why>` when the
+    /// refusal is news ([`Self::refusal_news`]) and `UNHALTED seq=<n> after
+    /// <ms> ms`.
     pub(super) fn park_on_hold(
         &mut self,
         why: &str,
         seq: u64,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        review.note(&format!("HALTED seq={seq} {}", clip(&one_line(why))));
+        let why = clip(&one_line(why));
+        if self.refusal_news(&format!("HALTED {why}"), Instant::now()) {
+            review.note(&format!("HALTED seq={seq} {why}"));
+        }
         let since = Instant::now();
         loop {
             if self.stopped() {
@@ -104,6 +149,7 @@ impl<C: Ctl> Session<'_, C> {
                         "UNHALTED seq={seq} after {} ms",
                         since.elapsed().as_millis()
                     ));
+                    self.refusal_said = None;
                     return Ok(());
                 }
                 Some("1") => {
@@ -134,7 +180,8 @@ impl<C: Ctl> Session<'_, C> {
     /// `ERR busy …` / `ERR rate`: wait [`Session::refusal_pause`] (doubling
     /// to [`REFUSAL_PAUSE_MAX`]) or until `anchor` leaves the screen, as the
     /// server's own wait — never a sleep here — then the loop looks again.
-    /// Journaled `REFUSED seq=<n> backoff=<ms> <why>`.
+    /// Journaled `REFUSED seq=<n> backoff=<ms> <why>` when the refusal is
+    /// news ([`Self::refusal_news`]).
     pub(super) fn back_off(
         &mut self,
         why: &str,
@@ -150,11 +197,13 @@ impl<C: Ctl> Session<'_, C> {
         if why.contains("ERR busy input-unread") {
             self.stall_suspect = true;
         }
-        review.note(&format!(
-            "REFUSED seq={seq} backoff={} {}",
-            pause.as_millis(),
-            clip(&one_line(why))
-        ));
+        let said = clip(&one_line(why));
+        if self.refusal_news(&format!("REFUSED {said}"), Instant::now()) {
+            review.note(&format!(
+                "REFUSED seq={seq} backoff={} {said}",
+                pause.as_millis()
+            ));
+        }
         let ms = pause.as_millis().to_string();
         match anchor {
             Some(a) => self.wait(&["gone", a], pause)?,

@@ -15,6 +15,8 @@
 //!   ([`QuestionPriority`]) by the worker from a fixed policy text
 //!   ([`LONG_TERM_TEXT`], [`SHORT_TERM_TEXT`]); what a person began, or what
 //!   aterm-phase did not read whole, is escalated.
+//! * [`claude_settings`]: where a Claude Code agent's own settings live, and
+//!   the bare-tool ask rules in them that send a file box to a person.
 //! * [`git_config`]: what a git read would load that can run a program.
 //! * [`rm_breaker`]: where every `rm` operand on a line points, for the rm
 //!   circuit breaker's approval rule.
@@ -30,6 +32,7 @@
 //!   model, compact, log in, or escalate).
 
 pub mod approval;
+pub mod claude_settings;
 pub mod exception;
 pub mod git_config;
 pub mod guard;
@@ -50,6 +53,7 @@ pub use approval::{
     RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decline, decline_step,
     decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
 };
+pub use claude_settings::AskRule;
 pub use git_config::{GitView, WorkerEnv};
 pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
 pub use question::{
@@ -61,3 +65,17 @@ pub use reset::{
     Verdict, confirm_verdict,
 };
 pub use shell_startup::ShellStartup;
+
+/// `word` after its indefinite article (`a write`, `an edit`, `an auth`), for
+/// a reason that names a kind by its CLI word: `an` before `a`, `e`, `i` and
+/// `o`; `a` before anything else, `u` included, which those words all sound
+/// as "you" (`a usage-limit`).
+#[must_use]
+pub fn a_or_an(word: &str) -> String {
+    let article = if word.starts_with(['a', 'e', 'i', 'o']) {
+        "an"
+    } else {
+        "a"
+    };
+    format!("{article} {word}")
+}

@@ -29,14 +29,77 @@ pub(crate) const MAX_INSERT_BYTES: usize = 32 * 1024 * 1024;
 /// Restart-stable identity embedded in a private draft stream.
 ///
 /// `DocumentId` is process-local and therefore cannot identify a journal after
-/// relaunch. This key is derived from the canonical URI with a stable encoding;
-/// the URI itself is never written into the draft directory.
+/// relaunch. This key is a MAC of the canonical URI under the install's
+/// journal secret ([`JournalSecret`]); the URI itself is never written into the
+/// draft directory.
+///
+/// KEYED, NOT A PUBLIC HASH (hashclock-2, ruling 2026-10-10). The key is a
+/// journal's whole identity: it names the file and every record carries it, and
+/// recovery accepts any record whose key matches. It used to be the unkeyed
+/// FNV-1a/64 of the URI ([`Self::legacy_unkeyed`]), so whoever names the files a
+/// person opens could make two documents share one journal — a rho search found
+/// two names under one known directory with equal keys in 45 s — and opening the
+/// second showed the first's unsaved draft as its content, which Save then wrote
+/// to the second's path. HMAC-SHA256 under a per-install random secret kept in
+/// the private draft directory leaves nobody without that secret able to compute
+/// a key, let alone search for two equal ones. The first 64 bits of the tag are
+/// the key, so the record format (and the decoder that still reads the legacy
+/// journals) is unchanged; a chance collision of two keyed identities is 2^-64
+/// per pair, and nobody can aim one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct JournalDocumentKey(pub(crate) u64);
 
+/// What the MAC of a document key covers ahead of the URI: a fixed,
+/// NUL-terminated label, so the tag of one purpose is never the tag of another
+/// under the same secret.
+const JOURNAL_KEY_DOMAIN: &[u8] = b"aterm draft journal document key v1\0";
+
 impl JournalDocumentKey {
-    pub(crate) fn for_canonical_uri(uri: &str) -> Self {
+    /// The identity of `uri`'s draft journal under `secret`.
+    pub(crate) fn keyed(secret: &JournalSecret, uri: &str) -> Self {
+        let mut mac = aterm_digest::HmacSha256::new_from_slice(&secret.0)
+            .expect("HMAC-SHA256 accepts a key of any length");
+        mac.update(JOURNAL_KEY_DOMAIN);
+        mac.update(uri.as_bytes());
+        let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = mac.finalize();
+        Self(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]).max(1))
+    }
+
+    /// The unkeyed identity every journal written before 2026-10-10 carries
+    /// (FNV-1a/64 of the URI, length-mixed). Read only to migrate those
+    /// journals (`native_document_journal`'s `LegacyJournal`), never to name or
+    /// write a new one.
+    pub(crate) fn legacy_unkeyed(uri: &str) -> Self {
         Self(ContentFingerprint::of(uri.as_bytes()).0.max(1))
+    }
+}
+
+/// Length of the per-install journal secret.
+pub(crate) const JOURNAL_SECRET_LEN: usize = 32;
+
+/// The per-install secret every [`JournalDocumentKey`] is a MAC under. 32
+/// bytes from the OS CSPRNG, minted once into the private draft directory and
+/// read back from there by every aterm of this user (an update's successor
+/// included), so the same URI keys the same journal across processes.
+#[derive(Clone)]
+pub(crate) struct JournalSecret([u8; JOURNAL_SECRET_LEN]);
+
+impl JournalSecret {
+    /// `None` for all zeros: the CSPRNG never draws that (2^-256), so such a
+    /// file is a hole a crash left, not a secret.
+    pub(crate) fn from_bytes(bytes: [u8; JOURNAL_SECRET_LEN]) -> Option<Self> {
+        (bytes != [0; JOURNAL_SECRET_LEN]).then_some(Self(bytes))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; JOURNAL_SECRET_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for JournalSecret {
+    /// Opaque on purpose: anyone holding the secret can aim key collisions.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JournalSecret(..)")
     }
 }
 
@@ -814,6 +877,9 @@ pub(crate) struct JournalAppendPlan {
     /// Exact durable journal image observed by the host that scheduled this
     /// plan. `None` is a pure reducer plan and must be bound before filesystem I/O.
     pub(crate) expected_image: Option<ContentFingerprint>,
+    /// A legacy journal the host must retire before this append publishes
+    /// (`native_document_journal::LegacyJournal`); bound with `expected_image`.
+    pub(crate) retire_legacy: Option<crate::native_document_journal::LegacyJournal>,
     pub(crate) bytes: Arc<[u8]>,
     pub(crate) encoded_fingerprint: ContentFingerprint,
 }
@@ -1014,6 +1080,7 @@ impl DraftJournalReducer {
             base_durable,
             target_seq,
             expected_image: None,
+            retire_legacy: None,
             encoded_fingerprint: ContentFingerprint::of(&bytes),
             bytes,
         };

@@ -568,7 +568,7 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     // drawn the same by any program's menu — a shell script's `❯ 1. dev`
     // under a rule and a title — so it names Claude Code only where the
     // program's name already did.
-    let names_claude = |p: PromptV2| p.kind != PromptKind::Other || crate::prompt::footed(rows, &p);
+    let names_claude = |p: PromptV2| p.kind != PromptKind::Other || p.footer.is_some();
     if has_composer_frame(rows) || parse_prompt_v2(rows).is_some_and(names_claude) {
         &ClaudeReader
     } else if codex::codex_box(rows).is_some() || codex::is_codex_screen(rows) {

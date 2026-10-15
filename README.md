@@ -211,10 +211,10 @@ context file of every coding agent it finds — Claude Code, Codex CLI, Gemini C
 OpenCode (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …). Claude Code also gets four
 bundled skills — `drive-aterm`, `supervise-agent`, `rust-in-aterm` and `aterm-fabric` —
 and the other agents get `aterm-fabric` as a command. The brief activates only inside
-aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`; its Rust and peer-messaging notes gate on
-the toolchain and the fabric), where `aterm help` prints the agent brief with the
-caller's session ID filled in. Rules of your own go outside its markers. `aterm agents`
-shows status, `aterm agents remove` uninstalls, `agents_auto_prime = false` stops it.
+aterm (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1`; its Rust note gates on the toolchain),
+where `aterm help` prints the agent brief with the caller's session ID filled in. Rules
+of your own go outside its markers. `aterm agents` shows status, `aterm agents remove`
+uninstalls, `agents_auto_prime = false` stops it.
 
 - **Env hygiene is unconditional.** Every spawned shell has `CLAUDE*`, `ANTHROPIC_*`,
   `COPILOT_*`, `CODEX_*`, `CURSOR_*`, `AI_*` and `_DEVTOOL_*` stripped, and a window's
@@ -406,11 +406,20 @@ directories, no debugger attach (no task port but a process's own), and no
 mach service lookup but the user and group queries (so `open`, `osascript`,
 `pbcopy` and the keychain do nothing from inside; launchd, which needs no
 lookup, answers a contained caller by its own policy), failing closed if the
-wrapper is missing. The working directory
+wrapper is missing. The window brokers nothing for a contained tab either,
+whatever `allow_osc52_query`, `allow_kitty_file_transfer` and
+`allow_notifications` say: its OSC 52 neither sets nor reads the pasteboard,
+aterm reads no file or shared memory its Kitty images name, and its OSC
+9/99/777 post no desktop notification. A plain `aterm --sandbox` session
+inside another terminal parses nothing, so that terminal receives the
+program's escape sequences and decides them by its own policy (an aterm window
+in `user` mode writes the pasteboard from its OSC 52). The working directory
 and `$HOME` are read-only there, so a contained tool that builds a project
 builds a copy under `$TMPDIR`. Linux and Windows have no OS sandbox, so there `--sandbox`
 refuses to start and names the gap rather than run a shell unconfined. `safety`
-is hardened resource limits with no OS sandbox, on every platform.
+is resource limits with no OS sandbox, on every platform; on macOS and Linux
+they are soft, a guardrail the shell's rc or its program can raise, and
+`--sandbox` sets the same limits as hard ones, which the program cannot.
 
 Temporal recording is off by default, and pixel video starts only when requested.
 Each session retains a bounded in-memory asciicast output history. Granting
@@ -492,12 +501,11 @@ On macOS aterm also turns Universal Control off for this Mac by default. In
 `aterm.toml`, `[machine]` `universal_control = "leave"` stops it (Settings ▸
 Security); `aterm pkg machine` prints the line that turns it back on.
 
-Code goes in `~/Developer`: `aterm doctor` names the git checkouts under your home
-that are not there, `aterm pkg devroot move --all` moves them a repository at a time
-(refusing any with uncommitted work or a program running in it), and its `spotlight:`
-row measures whether Spotlight skips `~/Developer` — add the folder once in System
-Settings ▸ Spotlight ▸ Search Privacy, the one way Apple documents to keep a folder out
-of the index.
+On macOS, builds and tests can stall while macOS checks each new program aterm starts
+before its first run. `aterm doctor`'s `devtools:` row says whether it does, and where
+the fix is: adding aterm under System Settings ▸ Privacy & Security ▸ Developer Tools
+should end those checks. That is your call to make, since it also skips macOS's first-run
+malware scan for everything run in aterm.
 
 ## Community and license
 

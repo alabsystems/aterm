@@ -116,6 +116,10 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         upgrading: false,
         taskless: false,
         login_back: false,
+        auto_continue: None,
+        since_limit: None,
+        served_in_transcript: false,
+        reset_clock: None,
         person: None,
         reach: match st["verdict"] {
             1 => Reach::Down { since: at },

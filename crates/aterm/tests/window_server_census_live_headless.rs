@@ -9,7 +9,7 @@
 //! of that binary ON WINDOWSERVER'S MAIN THREAD, and tccd `readdir`s the
 //! binary's directory to identify it. From a binary in a huge build directory
 //! that outran WindowServer's watchdog and killed every window on the machine,
-//! twice (AGENTS.md rule 5). Until 2026-09-26 every `aterm --headless` launch on
+//! twice (AGENTS.md). Until 2026-09-26 every `aterm --headless` launch on
 //! macOS did it: the event loop was AppKit's, and `-[NSApplication init]` opens
 //! the connection. An idle `aterm --headless --cpu` drew one preflight within
 //! two seconds; the live-headless suites in this directory drew 50 in one run.
@@ -432,7 +432,7 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
     assert!(
         !pids.contains(&pid),
         "aterm --headless (pid {pid}) made WindowServer preflight it: a headless process opened \
-         a WindowServer connection (AGENTS.md rule 5). Find the door with the instance's own log \
+         a WindowServer connection (AGENTS.md). Find the door with the instance's own log \
          (`log show --predicate 'processID == {pid}'`: the SkyLight `New connection` line and \
          what precedes it). Instance log tail:\n{tail_before_exit}"
     );

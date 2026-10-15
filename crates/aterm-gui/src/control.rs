@@ -42,7 +42,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::control_auth::{self, AuthOutcome};
 use crate::input::{
-    Delivery, Egress, EgressMode, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source,
+    Delivery, Egress, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source,
 };
 use crate::session_store::Store;
 use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
@@ -5494,6 +5494,30 @@ const MIN_ARTIFACT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 struct QuarantinedArtifactReply {
     until: std::time::Instant,
     _retention: ReplyRetention,
+    /// Which quarantine this is, so a test ends ITS OWN entry's grace
+    /// (`control_tests::end_quarantine`) and leaves every other test's alone:
+    /// the quarantine is process-global, and the lib tests share the process.
+    #[cfg(test)]
+    ticket: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The ticket of the guard the calling thread put in quarantine last
+    /// ([`QuarantinedArtifactReply::ticket`]): the thread that ran the failed
+    /// handoff is the one that knows which entry is its own.
+    static LAST_QUARANTINE_TICKET: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A fresh quarantine ticket, noted as this thread's last
+/// ([`LAST_QUARANTINE_TICKET`]).
+#[cfg(test)]
+fn next_quarantine_ticket() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+    LAST_QUARANTINE_TICKET.with(|last| last.set(Some(ticket)));
+    ticket
 }
 
 struct ArtifactReplyQuarantine {
@@ -5647,6 +5671,8 @@ fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::
     entries.push(QuarantinedArtifactReply {
         until,
         _retention: retention,
+        #[cfg(test)]
+        ticket: next_quarantine_ticket(),
     });
     quarantine.changed.notify_one();
 }
@@ -6295,6 +6321,18 @@ fn is_wait_request(line: &str, scope: Scope, store: &Store) -> bool {
         // `cast drift` settles 60 ms, then replays the recording through fresh
         // engines: seconds of lane time on a long recording.
         "cast" => rest.split_whitespace().next() == Some("drift"),
+        // A paste into a session not on screen waits, bounded, for its bytes to
+        // reach the program (`background_input`); a request lane must never wait
+        // on a program. A `paste` waits so only into another session: a flagless
+        // one goes to the App (`front_routed_input`, `cmd_paste`). A `paste-bin`
+        // takes the hidden arm whenever its target is not on screen, flagless too
+        // (a scoped caller's own background tab, a tab switch that raced it). Its
+        // target may be the tab on screen, whose paste answers at once; a wait
+        // lane serves that as well.
+        "paste" => selector
+            .as_ref()
+            .is_some_and(|s| !matches!(s, Selector::SelfTok)),
+        "paste-bin" => true,
         _ => false,
     }
 }
@@ -7561,7 +7599,7 @@ fn run_feed_bin<W: Write>(
             &ctx.sink,
             &ctx.output_echo,
             &event,
-            EgressMode::Backpressured,
+            crate::input::EgressMode::Backpressured,
         );
         Ok(InputOutcome::Ok)
     };
@@ -7968,21 +8006,14 @@ where
         } else {
             InputEvent::KeySequence(payload)
         };
-        let receipt = crate::app_input::tracked_egress(
-            &term,
-            &ctx.modes,
-            &ctx.sink,
-            &ctx.output_echo,
-            &event,
-            EgressMode::Backpressured,
-        );
         // The hidden arm answers from the same receipt as the front arm: a short
         // or failed write is `ERR write failed`, never a false `OK` (which under
-        // `id=` would make a retry a `dup=1`). A paste also waits for its bytes
-        // to leave the spill (see `background_reply_outcome`).
-        match background_reply_outcome(&ctx.sink, receipt, paste) {
-            InputOutcome::Ok => format!("OK {n} bytes\n"),
-            outcome => control_input::input_reply_to_str(Ok(outcome)),
+        // `id=` would make a retry a `dup=1`). It never parks this lane on the
+        // program, and a paste also waits, bounded, for its bytes to leave the
+        // spill (see `background_input`).
+        match background_input(&term, &ctx, &event, PASTE_RECEIPT_WAIT) {
+            Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
+            outcome => control_input::input_reply_to_str(outcome),
         }
     });
     let response = crate::input_stall::with_warning(response, warning.as_deref());
@@ -8856,10 +8887,10 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
 /// focus reporting off), byte-identical to the active-tab seam for the same event.
 /// `None` (a malformed line) maps to `err`.
 ///
-/// The reply is the write's receipt, like the front-session arms and
-/// [`cross_mouse_apply`]: a short or failed write (dead peer) is `ERR write failed`. A
-/// paste's `OK` also means every byte left the process-local spill for the kernel
-/// (see [`background_reply_outcome`]).
+/// The reply is [`background_input`]'s: the write's receipt, like the front-session
+/// arms and [`cross_mouse_apply`] (a short or failed write, a dead peer, is `ERR write
+/// failed`), and a paste's `OK` also means every byte left the process-local spill for
+/// the kernel.
 fn cross_input(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -8868,26 +8899,11 @@ fn cross_input(
 ) -> String {
     match ev {
         Some(ev) => {
-            // Cross-session verbs run on the expendable control thread and block under
-            // SPILL_CAP, so a machine-rate driver into a wedged target feels backpressure
-            // here instead of growing the target's spill.
-            //
             // This bypasses the App input seam, so an in-flight `video ... keys`
             // recording cannot log it; count the attempts so the recording can say so.
             // `focus` is not an attempt and contributes nothing.
             crate::note_unseamed_control_input(&ev);
-            let paste = matches!(&ev, InputEvent::Paste(..));
-            let receipt = crate::app_input::tracked_egress(
-                term,
-                &ctx.modes,
-                &ctx.sink,
-                &ctx.output_echo,
-                &ev,
-                EgressMode::Backpressured,
-            );
-            control_input::input_reply_to_str(Ok(background_reply_outcome(
-                &ctx.sink, receipt, paste,
-            )))
+            control_input::input_reply_to_str(background_input(term, ctx, &ev, PASTE_RECEIPT_WAIT))
         }
         None => err.to_string(),
     }
@@ -8895,42 +8911,124 @@ fn cross_input(
 
 /// Raw `send`/`feed` bytes are terminal input: keep their unlogged-input/latency
 /// accounting while routing the frame through the per-session echo receipt. Returns
-/// the write's verdict so the reply can say `ERR write failed`.
-fn cross_raw_input(term: &Arc<Mutex<Terminal>>, ctx: &SessionCtx, bytes: Vec<u8>) -> InputOutcome {
+/// [`background_input`]'s verdict, so the reply can say `ERR write failed`.
+fn cross_raw_input(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    bytes: Vec<u8>,
+) -> Result<InputOutcome, String> {
     crate::metrics::note_input();
     crate::note_unseamed_control_bytes(&bytes);
-    let event = InputEvent::KeySequence(bytes);
-    let receipt = crate::app_input::tracked_egress(
+    background_input(
         term,
-        &ctx.modes,
-        &ctx.sink,
-        &ctx.output_echo,
-        &event,
-        EgressMode::Backpressured,
-    );
-    crate::app_input::egress_to_outcome(receipt.egress)
+        ctx,
+        &InputEvent::KeySequence(bytes),
+        PASTE_RECEIPT_WAIT,
+    )
 }
 
-/// The reply verdict for one background (control-thread) write: the seam's receipt
-/// through [`crate::app_input::egress_to_outcome`], so a short or failed write is
-/// `WriteFailed`. With `kernel_receipt` (a `paste` / `paste-bin`, whose `OK` is a
-/// delivered-turn receipt), the process-local spill must also drain to the kernel: a
-/// frame spilled behind a wedged foreground reports `Delivery::Full`, and if the peer
-/// dies first the drainer discards it; the sink's completion fence keeps that as a
-/// sticky failure, answered `ERR write failed`.
+/// How long a background paste's reply waits for its bytes to reach the program
+/// before answering [`PASTE_UNREAD`]: the wait family's default
+/// (`aterm_control::wire::WAIT_DEFAULT_MS`).
+const PASTE_RECEIPT_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(aterm_control::wire::WAIT_DEFAULT_MS);
+
+/// A background write refused at the session's input cap (the sink's spill, or its
+/// ordered writer's queue): nothing was written. `ERR busy`, so a driver's back-off
+/// retries it and an `id=` mark is given back (`pty_idem`).
+const INPUT_QUEUE_FULL: &str =
+    "ERR busy input-queue-full: nothing written (the program has not read its queued input)\n";
+
+/// A background paste whose bytes are still queued for a program that has not read
+/// them when its reply's wait ends: in doubt, never `ERR busy` (a retry would type it
+/// twice). The program gets them when it reads; `signal` drops them.
+const PASTE_UNREAD: &str =
+    "ERR in-doubt paste-unread: queued, the program has not read it yet (signal drops it)\n";
+
+/// One control-lane write into a session that is not on screen, and its reply's
+/// outcome (`Err` is the reply line itself).
 ///
-/// The wait parks only this expendable control thread, never the UI loop.
-/// Keystroke-shaped input keeps the accepted-for-delivery contract.
-fn background_reply_outcome(
+/// The write takes the App's hidden-session route
+/// ([`crate::app_input::paste_order::unparked`]), so it never parks the lane on the
+/// program. These arms used the blocking egress until 2026-10-14, and a lane that
+/// wrote into a program that had stopped reading waited for it with no bound: eight
+/// `@<sid> paste`s into one stuck background tab took every request lane, and every
+/// other client — `@<sid> signal`, the remedy, included — was answered busy for as
+/// long as the program did not read. Refused at the session's input cap:
+/// [`INPUT_QUEUE_FULL`], nothing written.
+///
+/// A paste's `OK` stays a kernel receipt (see [`background_reply`]); a paste handed
+/// to the session's ordered writer (behind input queued there, or on Windows)
+/// answers on acceptance, as the front tab's paste does.
+fn background_input(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: &InputEvent,
+    limit: std::time::Duration,
+) -> Result<InputOutcome, String> {
+    let discards = ctx.sink.discards();
+    let receipt =
+        crate::app_input::paste_order::unparked(term, &ctx.modes, &ctx.sink, &ctx.output_echo, ev);
+    background_reply(
+        &ctx.sink,
+        receipt,
+        matches!(ev, InputEvent::Paste(..)).then_some(discards),
+        limit,
+    )
+}
+
+/// Whether a background write was refused at the session's input cap with
+/// nothing written: [`INPUT_QUEUE_FULL`]. A wheel writes a report per notch,
+/// and one cut short at the cap after its first notches went is a failed
+/// write, never "nothing written" (a retry would scroll those notches twice).
+const fn refused_unwritten(receipt: crate::input::EgressReceipt) -> bool {
+    receipt.input_queue_full() && receipt.accepted_order().is_none()
+}
+
+/// The reply verdict for one background (control-lane) write: the seam's receipt
+/// through [`crate::app_input::egress_to_outcome`], so a short or failed write is
+/// `WriteFailed`, and a refusal at the input cap with nothing written is
+/// [`INPUT_QUEUE_FULL`]. With `kernel_receipt` (a `paste` / `paste-bin`, whose `OK`
+/// is a delivered-turn receipt: the sink's discard count before the write), the
+/// process-local spill must also drain to the kernel: a frame spilled behind a
+/// wedged foreground reports `Delivery::Full`, and if the peer dies first the drainer
+/// discards it; the sink's completion fence keeps that as a sticky failure, answered
+/// `ERR write failed`. So is a spill `signal` (or `reset flush`) dropped meanwhile:
+/// the discard count moved, so some of the paste may never reach the program, and
+/// the fence, which reads an emptied spill as drained, cannot tell. Keystroke-shaped
+/// input keeps the accepted-for-delivery contract.
+///
+/// That wait is the request's own, on a wait lane (`is_wait_request` classes a paste
+/// into another session as one), and bounded: it ends when its caller hangs up
+/// ([`HUNG_UP_REPLY`]) and after `limit` ([`PASTE_UNREAD`], the bytes still queued).
+fn background_reply(
     sink: &aterm_session::sink::SinkWriter,
     receipt: crate::input::EgressReceipt,
-    kernel_receipt: bool,
-) -> InputOutcome {
-    let outcome = crate::app_input::egress_to_outcome(receipt.egress);
-    if kernel_receipt && outcome == InputOutcome::Ok && !sink.wait_egress_drained_to_kernel() {
-        return InputOutcome::WriteFailed;
+    kernel_receipt: Option<u64>,
+    limit: std::time::Duration,
+) -> Result<InputOutcome, String> {
+    if refused_unwritten(receipt) {
+        return Err(INPUT_QUEUE_FULL.to_string());
     }
-    outcome
+    let outcome = crate::app_input::egress_to_outcome(receipt.egress);
+    let Some(discards) = kernel_receipt else {
+        return Ok(outcome);
+    };
+    if outcome != InputOutcome::Ok || receipt.is_queued() {
+        return Ok(outcome);
+    }
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(limit).unwrap_or(now);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match sink.wait_egress_drained_to_kernel_for(hangup_park(left)) {
+            Some(true) if sink.discards() == discards => return Ok(InputOutcome::Ok),
+            Some(_) => return Ok(InputOutcome::WriteFailed),
+            None if caller_hung_up() => return Err(HUNG_UP_REPLY.to_string()),
+            None if left.is_zero() => return Err(PASTE_UNREAD.to_string()),
+            None => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9271,16 +9369,14 @@ fn cross_mouse_apply(
     rest: &str,
 ) -> Result<bool, String> {
     let ev = parse_mouse(rest)?;
-    match crate::app_input::tracked_egress(
-        term,
-        &ctx.modes,
-        &ctx.sink,
-        &ctx.output_echo,
-        &ev,
-        EgressMode::Backpressured,
-    )
-    .egress
-    {
+    // The App's report route, which never parks this lane on the program
+    // ([`background_input`] has why).
+    let receipt =
+        crate::app_input::paste_order::report_ordered_or_inline(term, &ctx.modes, &ctx.sink, &ev);
+    if refused_unwritten(receipt) {
+        return Err(INPUT_QUEUE_FULL.to_string());
+    }
+    match receipt.egress {
         // Tracking ON but the PTY write failed: honest error, not a false OK.
         Egress::Reported(crate::input::Delivery::Failed) => Err("ERR write failed\n".to_string()),
         // Tracking ON: the seam already wrote the report to the target sink.
@@ -10145,11 +10241,11 @@ fn handle(
             Some(InputEvent::KeySequence(control_input::send_bytes(rest))),
             "ERR\n",
         ),
-        "send" => control_input::input_reply_to_str(Ok(cross_raw_input(
+        "send" => control_input::input_reply_to_str(cross_raw_input(
             term,
             ctx,
             control_input::send_bytes(rest),
-        ))),
+        )),
         // The self (active-tab) path sends `key`/`ctrl`/`mouse`/`paste`/`focus`/`resize`/
         // `scroll` through the source-blind `App::input` seam on the event loop
         // (`Wake::Input` / a reply-bearing resize), so bytes match human input and the
@@ -10215,8 +10311,8 @@ fn handle(
             Ok(bytes) => {
                 let n = bytes.len();
                 match cross_raw_input(term, ctx, bytes) {
-                    InputOutcome::Ok => format!("OK {n} bytes\n"),
-                    outcome => control_input::input_reply_to_str(Ok(outcome)),
+                    Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
+                    outcome => control_input::input_reply_to_str(outcome),
                 }
             }
             Err(error) => error.to_string(),

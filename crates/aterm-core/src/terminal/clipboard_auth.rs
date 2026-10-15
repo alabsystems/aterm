@@ -24,9 +24,12 @@
 //! demand one. Fresh terminals start with both capabilities revoked.
 //!
 //! That is the engine's posture, not aterm's shipped one: the native GUI
-//! (`aterm-gui`'s `configure_clipboard`) authorizes write for every tab, so a
-//! program's OSC 52 set reaches the system clipboard with no prompt (as in kitty
-//! and WezTerm), and authorizes query only when the user sets `allow_osc52_query`.
+//! (`aterm-gui`'s `configure_clipboard`) authorizes write for every tab not
+//! spawned under Containment, so a program's OSC 52 set reaches the system
+//! clipboard with no prompt (as in kitty and WezTerm), and authorizes query only
+//! when the user sets `allow_osc52_query`. A Containment tab gets neither, and
+//! no clipboard callback at all (`host_reach`, ruling 2026-10-10, P3 of the r13
+//! policy hunt).
 //! The standard policy's `OSC 52 set` rule requires `User` origin, so PTY bytes
 //! fall to `BridgeDecision::Fallback` and the host's bit decides.
 

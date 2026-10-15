@@ -25,6 +25,8 @@
 //!   [`lazy_does_not_run_its_initialiser_until_forced`].
 //! * `race::OnceBox::get_or_init` as check-compute-set ->
 //!   [`once_box_runs_its_initialiser_once_under_contention`].
+//! * `unsync::OnceCell::get_or_try_init` ignoring a failed `set` (origin/main
+//!   before 2026-10-10) -> [`unsync_get_or_try_init_refuses_a_reentrant_initialisation`].
 
 use once_cell::{race, sync, unsync};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -411,6 +413,49 @@ fn unsync_once_cell_matches_its_sync_sibling() {
     let mut cell = cell;
     assert_eq!(cell.take(), Some(8));
     assert_eq!(cell.into_inner(), None);
+}
+
+/// The panic message of `f`, which must panic.
+fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(f).expect_err("accepted without a panic");
+    match payload.downcast::<&'static str>() {
+        Ok(s) => (*s).to_owned(),
+        Err(payload) => *payload.downcast::<String>().expect("a string payload"),
+    }
+}
+
+#[test]
+fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
+    // Upstream asserts `self.set(val).is_ok()` with "reentrant init"
+    // (once_cell-1.21.4/src/lib.rs:644) and `get_or_init` panics the same
+    // way through core's cell: a closure that fills the cell it is
+    // initialising is a caller bug, and its value must not be dropped quietly
+    // while the caller is handed one its closure never produced.
+    let by_set = panic_message(|| {
+        let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
+        let _ = cell.get_or_try_init(|| {
+            assert_eq!(cell.set(1), Ok(()));
+            Ok::<u32, ()>(2)
+        });
+    });
+    assert!(by_set.contains("reentrant init"), "got {by_set:?}");
+    let by_get_or_init = panic_message(|| {
+        let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
+        let _ = cell.get_or_try_init(|| Ok::<u32, ()>(*cell.get_or_init(|| 10) + 1));
+    });
+    assert!(
+        by_get_or_init.contains("reentrant init"),
+        "got {by_get_or_init:?}"
+    );
+    // The control: `get_or_init` has always refused it.
+    let control = panic_message(|| {
+        let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
+        let _ = cell.get_or_init(|| {
+            let _ = cell.set(1);
+            2
+        });
+    });
+    assert!(control.contains("reentrant init"), "got {control:?}");
 }
 
 // ---------------------------------------------------------------------------

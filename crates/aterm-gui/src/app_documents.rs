@@ -1821,6 +1821,16 @@ impl App {
         self.native_documents.journal_unavailable = None;
     }
 
+    /// The journal identity this App's store gives `document`'s URI.
+    #[cfg(test)]
+    pub(crate) fn document_journal_key_for_test(
+        &self,
+        document: DocumentId,
+    ) -> Option<crate::native_document_io::JournalDocumentKey> {
+        let uri = self.document_store.canonical_uri(document)?;
+        Some(self.native_documents.journals.as_ref()?.key_for(uri))
+    }
+
     #[cfg(test)]
     pub(crate) fn document_journal_path_for_test(
         &self,
@@ -2965,14 +2975,11 @@ impl App {
     }
 
     fn prepare_quit_document_shutdown_inner(&mut self, start_saves: bool) -> Result<bool, String> {
-        if self.native_documents.pending_quit.is_none() {
-            self.native_documents.pending_quit = Some(self.document_close_plan_for_quit());
-        }
-        let plan = self
-            .native_documents
-            .pending_quit
-            .clone()
-            .expect("quit close plan was just installed");
+        // Re-derived on EVERY gesture, as the window barrier is: the app stays
+        // interactive while a Quit's saves run, so a repeated Quit can find a
+        // document opened since the first one, which a reused plan would skip.
+        let plan = self.document_close_plan_for_quit();
+        self.native_documents.pending_quit = Some(plan.clone());
         let ready = self.drive_document_close_plan(&plan, start_saves)?;
         if ready {
             self.native_documents.pending_quit = None;
@@ -2994,6 +3001,19 @@ impl App {
                 // reducer-owned readiness at the irreversible exit boundary.
                 if !self.prepare_quit_native_shutdown()? {
                     return Ok((false, Vec::new()));
+                }
+                // `plan` froze when the barrier armed, and a document opened and
+                // edited while its saves ran is absent from it; the editor
+                // reducer answers `Ready` unconditionally, so the native preflight
+                // above cannot see that document's edits either. Re-plan against
+                // the store's CURRENT documents, exactly as the window arm below
+                // does, and exit only once that plan is ready too.
+                let fresh = self.document_close_plan_for_quit();
+                if fresh != plan {
+                    self.native_documents.pending_quit = Some(fresh.clone());
+                    if !self.drive_document_close_plan(&fresh, true)? {
+                        return Ok((false, Vec::new()));
+                    }
                 }
                 self.native_documents.pending_quit = None;
                 return Ok((true, Vec::new()));
@@ -4607,8 +4627,12 @@ mod tests {
             &fs::canonicalize(&config).expect("canonical config path"),
         )
         .unwrap();
-        let key = crate::native_document_io::JournalDocumentKey::for_canonical_uri(&canonical);
-        let journal = journal_root.join(format!("{:016x}.atdj", key.0));
+        let journal = app
+            .native_documents
+            .journals
+            .as_ref()
+            .unwrap()
+            .path_for_uri(&canonical);
         let journal_c =
             std::ffi::CString::new(journal.as_os_str().as_bytes()).expect("journal FIFO path");
         // SAFETY: `journal_c` is a live NUL-terminated pathname and `mkfifo`
@@ -4641,8 +4665,12 @@ mod tests {
             &fs::canonicalize(&config).expect("canonical config path"),
         )
         .unwrap();
-        let key = crate::native_document_io::JournalDocumentKey::for_canonical_uri(&canonical);
-        let journal = journal_root.join(format!("{:016x}.atdj", key.0));
+        let journal = app
+            .native_documents
+            .journals
+            .as_ref()
+            .unwrap()
+            .path_for_uri(&canonical);
         let lock_path = journal_root.join(format!(
             ".{}.lock",
             journal.file_name().unwrap().to_string_lossy()
@@ -7177,6 +7205,214 @@ mod tests {
             // late document keeps a live view the user can still reach and save.
             assert!(app.view_store.contains(late_view));
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The Quit twin of `window_close_plan_frozen_before_a_later_document_cannot_orphan_its_dirty_view`.
+    /// The Quit barrier arms on a dirty document and the app stays interactive
+    /// while its save runs, so a SECOND document is opened and edited
+    /// meanwhile. When the planned save landed, the plan frozen at arming
+    /// granted the exit with the late document unsaved on disk — and, its
+    /// journal append still queued behind that save on the one document
+    /// worker, in neither the file nor the draft journal once the process
+    /// exited. The grant re-plans against the store's current documents: it
+    /// is withheld until the late document is saved too.
+    #[test]
+    fn quit_plan_frozen_before_a_later_document_cannot_exit_over_its_edits() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-quit-late-document-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("planned.md");
+        let late = dir.join("late.md");
+        fs::write(&planned, "planned\n").unwrap();
+        fs::write(&late, "late\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&planned))
+            .unwrap();
+        let (planned_instance, planned_view) = app.active_native_view(wid).unwrap();
+        let planned_document = app.native_runtime.document_id(planned_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("planned edit ".into())),
+        )
+        .unwrap();
+
+        // Quit: the one dirty document arms the barrier.
+        assert!(!app.prepare_quit_document_shutdown_inner(false).unwrap());
+
+        // The still-interactive app opens a SECOND document and dirties it.
+        app.open_document_tab(AppKind::Editor, &file_uri(&late))
+            .unwrap();
+        let (late_instance, late_view) = app.active_native_view(wid).unwrap();
+        let late_document = app.native_runtime.document_id(late_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("late edit ".into())),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.dirty(late_document), Some(true));
+
+        // The planned document becomes durable.
+        app.save_document_checkpoint(planned_document, planned_view)
+            .unwrap();
+        let mut verdict = app.take_ready_document_shutdowns().unwrap();
+        if verdict.0 {
+            // Granted at once only if the re-plan's save of the late document
+            // landed within it.
+            assert_eq!(
+                app.document_store.dirty(late_document),
+                Some(false),
+                "the Quit was granted over a document opened and edited after it armed"
+            );
+        } else {
+            assert_eq!(verdict, (false, Vec::new()));
+            // The late document's save lands; now the Quit may go.
+            app.save_document_checkpoint(late_document, late_view)
+                .unwrap();
+            verdict = app.take_ready_document_shutdowns().unwrap();
+        }
+        assert_eq!(
+            verdict,
+            (true, Vec::new()),
+            "the Quit goes once both are saved"
+        );
+        assert_eq!(app.document_store.dirty(late_document), Some(false));
+        assert_eq!(fs::read_to_string(&late).unwrap(), "late edit late\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The same late document, reached through the Quit GESTURE repeated while
+    /// the first save runs — what a person does when the app does not quit. A
+    /// gesture that reused the plan frozen at arming checkpointed only the
+    /// planned document and answered ready, an exit over the late one's edits.
+    #[test]
+    fn repeated_quit_gesture_cannot_exit_over_a_later_document() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-quit-repeat-gesture-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("planned.md");
+        let late = dir.join("late.md");
+        fs::write(&planned, "planned\n").unwrap();
+        fs::write(&late, "late\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&planned))
+            .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("planned edit ".into())),
+        )
+        .unwrap();
+        assert!(!app.prepare_quit_document_shutdown_inner(false).unwrap());
+
+        app.open_document_tab(AppKind::Editor, &file_uri(&late))
+            .unwrap();
+        let (late_instance, late_view) = app.active_native_view(wid).unwrap();
+        let late_document = app.native_runtime.document_id(late_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("late edit ".into())),
+        )
+        .unwrap();
+
+        // The second Quit, authorized to save.
+        if app.prepare_quit_document_shutdown_inner(true).unwrap() {
+            assert_eq!(
+                app.document_store.dirty(late_document),
+                Some(false),
+                "a repeated Quit was granted over a document opened after it armed"
+            );
+        } else {
+            // The honest alternative: the app stays, the late document reachable.
+            assert!(app.view_store.contains(late_view));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The same late document, reached through a Quit that was READY when it
+    /// deferred behind an update handoff (`DeferredHandoffTeardown::CleanQuitReady`):
+    /// the app stays interactive while the handoff rolls back, and the replay
+    /// asked only the native barrier, which the editor answers `Ready` whatever
+    /// its document holds, so it exited over the late document's edits. The
+    /// replay asks the document barrier too: the Quit stays pending, saving,
+    /// and goes once the late document is saved.
+    #[cfg(unix)]
+    #[test]
+    fn a_quit_ready_behind_an_update_cannot_exit_over_a_document_edited_meanwhile() {
+        let _serial = crate::menu::terminate_test_serial();
+        let dir =
+            std::env::temp_dir().join(format!("aterm-quit-replay-late-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("planned.md");
+        let late = dir.join("late.md");
+        fs::write(&planned, "planned\n").unwrap();
+        fs::write(&late, "late\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&planned))
+            .unwrap();
+        let (planned_instance, planned_view) = app.active_native_view(wid).unwrap();
+        let planned_document = app.native_runtime.document_id(planned_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("planned edit ".into())),
+        )
+        .unwrap();
+        // AppKit's `terminate:`, admitted; the Quit arms on the dirty document,
+        // and its save lands: ready, so the escalation defers it behind the
+        // handoff as `CleanQuitReady`.
+        let crate::menu::NativeTerminateDecision::Dispatch(generation) =
+            crate::menu::admit_native_terminate(false)
+        else {
+            panic!("a first request dispatches");
+        };
+        assert!(!app.prepare_quit_document_shutdown_inner(false).unwrap());
+        app.save_document_checkpoint(planned_document, planned_view)
+            .unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (true, Vec::new())
+        );
+
+        // While the handoff rolls back, a second document is opened and edited.
+        app.open_document_tab(AppKind::Editor, &file_uri(&late))
+            .unwrap();
+        let (late_instance, late_view) = app.active_native_view(wid).unwrap();
+        let late_document = app.native_runtime.document_id(late_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("late edit ".into())),
+        )
+        .unwrap();
+
+        if app.replay_clean_quit_ready() {
+            // Exit at once only if the late document's save landed within it.
+            assert_eq!(
+                app.document_store.dirty(late_document),
+                Some(false),
+                "the replayed Quit exited over a document edited while it was deferred"
+            );
+        } else {
+            assert!(
+                crate::menu::native_termination_is_current(generation),
+                "a Quit left saving stays pending, neither completed nor cancelled"
+            );
+            app.save_document_checkpoint(late_document, late_view)
+                .unwrap();
+            assert_eq!(
+                app.take_ready_document_shutdowns().unwrap(),
+                (true, Vec::new()),
+                "the Quit goes once the late document is saved"
+            );
+        }
+        assert_eq!(fs::read_to_string(&late).unwrap(), "late edit late\n");
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -688,7 +688,10 @@ fn concurrent_installs_into_one_site_never_build_a_chain_that_calls_itself() {
         for _ in 0..THREADS {
             let gate = std::sync::Arc::clone(&gate);
             threads.push(std::thread::spawn(move || {
-                let cls = ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(addr));
+                // SAFETY: `addr` is the class `register_probe_class` registered
+                // above; classes are never disposed.
+                let cls =
+                    unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(addr)) };
                 gate.wait();
                 // SAFETY: the prototype matches the registered row — which the
                 // install re-checks — and cannot unwind.

@@ -63,19 +63,19 @@ aterm-messages = { workspace = true }
 # where a bare console child opened a visible one (measured 2026-09-30; B28). A
 # dependency-free leaf the one binary links already.
 aterm-uds = { workspace = true }
+# aterm.toml, read through the parser the window loads the file with: on Windows
+# for `shell` (`aterm doctor` / `show-config` report the shell the WINDOW will
+# spawn), and for `[privacy] observer`, which `aterm doctor`'s `devtools:` row
+# honours as the window's Developer Tools row does (debugger design §9.1 O11).
+# First-party, and already in this binary's graph (aterm-containment and
+# aterm-update link it), so it adds no package; a hand-rolled line scan would be
+# the second parser of one file.
+aterm-toml = { workspace = true }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-# `aterm doctor` / `show-config` on Windows report the shell the WINDOW will
-# spawn, which starts from aterm.toml's `shell` key — read through the parser
-# the window loads the file with. First-party, and already in this binary's
-# graph (aterm-containment and aterm-update link it), so it adds no package;
-# a hand-rolled line scan would be the second parser of one file.
-[target.'cfg(windows)'.dependencies]
-aterm-toml = { workspace = true }
 
 [lints]
 workspace = true

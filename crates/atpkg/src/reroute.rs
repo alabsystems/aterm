@@ -2076,10 +2076,26 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             if let Some(say) = say {
                 eprintln!("{say}");
             }
+            let args = if upstream == "cargo" && !machine.passthrough {
+                upstream_cargo_args(
+                    &target,
+                    args,
+                    &machine,
+                    &crate::build_cache::with_build_dir_here,
+                )
+            } else {
+                args
+            };
             exec_upstream(&target, &args)
         }
         Plan::Branded { say, copy, args } => {
             eprintln!("{say}");
+            let args = if upstream == "cargo" {
+                crate::build_cache::with_build_dir_here(&args, crate::build_cache::Tool::Targo)
+                    .unwrap_or(args)
+            } else {
+                args
+            };
             exec_branded(layout, &copy, &args)
         }
         Plan::Shim { shim, args } => {
@@ -2090,6 +2106,40 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
             };
             exec_branded(layout, &copy, &args)
         }
+    }
+}
+
+/// [`crate::build_cache::with_build_dir_here`]'s shape, injected into
+/// [`upstream_cargo_args`].
+type Decide<'a> = dyn Fn(&[String], crate::build_cache::Tool) -> Option<Vec<String>> + 'a;
+
+/// An upstream `cargo`'s `args`, with the build cache's `--config` ([`crate::build_cache`])
+/// when `decide` adds it and the cargo that runs reads `build.build-dir` (its `-vV`
+/// release, resolved and cached as a signpost resolves it). Trust's own `cargo` is
+/// `targo`, so it follows `targo`'s rule: its verified lane is left alone. Anything
+/// unknown keeps the line as typed.
+fn upstream_cargo_args(
+    target: &Path,
+    args: Vec<String>,
+    machine: &Machine<'_>,
+    decide: &Decide<'_>,
+) -> Vec<String> {
+    use crate::build_cache::Tool;
+    if decide(&args, Tool::Cargo).is_none() {
+        return args;
+    }
+    match (machine.resolve)(target, explicit_toolchain(&args)).identity {
+        crate::upstream_identity::Identity::Known(vv)
+            if crate::build_cache::release_reads_build_dir(&vv.release) =>
+        {
+            let tool = if vv.trust.is_some() {
+                Tool::Targo
+            } else {
+                Tool::Cargo
+            };
+            decide(&args, tool).unwrap_or(args)
+        }
+        _ => args,
     }
 }
 

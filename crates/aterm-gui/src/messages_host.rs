@@ -83,9 +83,7 @@ use aterm_messages::{
     PROGRESS_GRACE, Restatement, Severity, WallStamp, drive, wire,
 };
 
-use crate::message_reporters::{
-    PANE_FULL_DISK_ACCESS, PANE_SPOTLIGHT_SEARCH_PRIVACY, log_did_not_open,
-};
+use crate::message_reporters::{PANE_DEVELOPER_TOOLS, PANE_FULL_DISK_ACCESS, log_did_not_open};
 use crate::native_app::MessageActOutcome;
 use crate::native_settings::SettingsRoute;
 use crate::toolchain_words::{self, HookDialect, SnapshotWords};
@@ -340,7 +338,7 @@ fn route_words(opened: bool, route: &str) -> Restatement {
 fn privacy_pane(pane: &str) -> Option<crate::menu::PrivacyPane> {
     match pane {
         PANE_FULL_DISK_ACCESS => Some(crate::menu::PrivacyPane::FullDiskAccess),
-        PANE_SPOTLIGHT_SEARCH_PRIVACY => Some(crate::menu::PrivacyPane::SpotlightSearchPrivacy),
+        PANE_DEVELOPER_TOOLS => Some(crate::menu::PrivacyPane::DeveloperTools),
         _ => None,
     }
 }
@@ -1263,10 +1261,7 @@ impl App {
                     .opened();
                 let route = crate::menu::privacy_settings_path_words(pane);
                 self.restate_message(id, route_words(opened, route));
-                // The access card's marker is Full Disk Access's alone.
-                if pane == crate::menu::PrivacyPane::FullDiskAccess {
-                    self.note_macos_access_settings_opened(now);
-                }
+                self.note_macos_access_settings_opened(now);
                 opened
             }
             Intent::ApplyUpdate { build } => {

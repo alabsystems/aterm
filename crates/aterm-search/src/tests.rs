@@ -2126,10 +2126,10 @@ fn max_cached_for_retained_protects_the_newest_lines() {
         };
         index.index_line(i, &text);
     }
-    let hits: Vec<u32> = index.search("OLDESTKEPT").collect();
+    let hits: Vec<usize> = index.search("OLDESTKEPT").collect();
     assert_eq!(
         hits,
-        vec![u32::try_from(total - 8).unwrap()],
+        vec![total - 8],
         "the oldest of the newest-8 lines survives eviction and stays searchable"
     );
 }
@@ -2187,7 +2187,7 @@ fn batch_forward(index: &SearchIndex, query: &str, case_sensitive: bool) -> Sear
 /// step's occurrence frame, asserting batch equality at EVERY step. Returns
 /// how many steps actually ran off a frame (the reach signal).
 fn type_and_check(index: &SearchIndex, query: &str, case_sensitive: bool) -> usize {
-    let mut frame: Option<Vec<u32>> = None;
+    let mut frame: Option<LineFrame> = None;
     let mut narrowed_steps = 0usize;
     let mut prefix = String::new();
     for c in query.chars() {
@@ -2195,7 +2195,7 @@ fn type_and_check(index: &SearchIndex, query: &str, case_sensitive: bool) -> usi
         if frame.is_some() {
             narrowed_steps += 1;
         }
-        let step = index.search_literal_narrowed(&prefix, case_sensitive, frame.as_deref());
+        let step = index.search_literal_narrowed(&prefix, case_sensitive, frame.as_ref());
         let batch = batch_forward(index, &prefix, case_sensitive);
         assert_eq!(
             step.results,
@@ -2280,7 +2280,7 @@ fn occurrence_frame_keeps_zero_width_only_lines_narrable() {
             .occurrence_lines
             .expect("uncapped walk must produce a frame");
         assert!(
-            frame.contains(&0),
+            frame.contains(0),
             "the occurrence frame must retain {text:?} despite zero reported matches"
         );
 

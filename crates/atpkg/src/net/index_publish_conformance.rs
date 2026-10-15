@@ -167,7 +167,7 @@ const FOREIGN_VALID_UNTIL: &str = "2098-01-02T00:00:00Z";
 /// more lanes win the test a larger share of it. Measured on a 14-core machine, 16 and 32
 /// lanes were within noise of each other and 55 gained nothing more, so the cap is the
 /// lower figure: fewer processes in flight, and fewer bare `Command` spawns racing each
-/// other's pipe fds (AGENTS.md, "A child process is built by `aterm_uds::spawnfd::command`").
+/// other's pipe fds (AGENTS.md, Code).
 fn lane_count() -> usize {
     std::thread::available_parallelism()
         .map_or(8, |n| 4 * n.get())
@@ -312,9 +312,9 @@ impl Rig {
         let tmp = self.dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp);
         // `spawnfd::command`, not a bare `Command`: sixteen of these run at once beside the
-        // other tests of this binary, and a std child inherits any descriptor another
-        // thread has open at its spawn (AGENTS.md, "A child process is built by
-        // `aterm_uds::spawnfd::command`").
+        // other tests of this binary, and on a std without the SP-1 strip a std child inherits
+        // any descriptor another thread has open unflagged at its spawn (AGENTS.md,
+        // Code).
         let mut cmd = aterm_uds::spawnfd::command("bash");
         cmd.env_clear()
             .arg(root.join("tools/atpkg-index.sh"))

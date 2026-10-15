@@ -3788,19 +3788,36 @@ fn a_reused_pid_is_refused_by_its_start_time() {
     );
 }
 
+/// The one resolver (`upgrade_drive::claude_home_dir`), as Claude Code
+/// resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`: an EMPTY
+/// override is set (`??` keeps it) and names the directory the process runs
+/// in; a relative one is under it; neither is read without that directory.
 #[test]
 fn the_claude_dir_is_the_processs_own() {
+    let runs_in = || Some(PathBuf::from("/work"));
     assert_eq!(
-        claude_dir_of(Some("/cfg/claude"), Some("/Users//ana")),
+        claude_dir_of(Some("/cfg/claude"), Some("/Users//ana"), runs_in),
         Some(PathBuf::from("/cfg/claude"))
     );
     assert_eq!(
-        claude_dir_of(Some(""), Some("/Users//ana")),
-        Some(PathBuf::from("/Users//ana/.claude")),
-        "an empty override is no override"
+        claude_dir_of(Some(""), Some("/Users//ana"), runs_in),
+        Some(PathBuf::from("/work")),
+        "an empty override is the directory it runs in"
     );
-    assert_eq!(claude_dir_of(Some("rel/dir"), Some("/Users//ana")), None);
-    assert_eq!(claude_dir_of(None, None), None);
+    assert_eq!(
+        claude_dir_of(Some("rel/dir"), Some("/Users//ana"), runs_in),
+        Some(PathBuf::from("/work/rel/dir"))
+    );
+    assert_eq!(
+        claude_dir_of(Some("rel/dir"), Some("/Users//ana"), || None),
+        None,
+        "its directory not read"
+    );
+    assert_eq!(
+        claude_dir_of(None, Some("/Users//ana"), || None),
+        Some(PathBuf::from("/Users//ana/.claude"))
+    );
+    assert_eq!(claude_dir_of(None, None, || None), None);
 }
 
 /// A FIFO where `HEAD` should be must not park the reader thread.
@@ -4102,6 +4119,129 @@ fn the_upgrade_note_leads_and_gives_way_as_a_reason_does() {
     }
 }
 
+/// The line [`set_facts`] made, read back from where its glyphs are drawn:
+/// a space for each pitch of room between two glyphs, at the line's own
+/// pitch (its cells over its pitches, `pitches`).
+fn read_set(set: &SetFacts, pitches: f32) -> String {
+    let pitch = set.cells as f32 / pitches;
+    let at = |g: &SetGlyph| {
+        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
+    };
+    let mut out = String::new();
+    for (i, g) in set.glyphs.iter().enumerate() {
+        if let Some(before) = i.checked_sub(1).map(|b| &set.glyphs[b]) {
+            let room = (at(g) - at(before)) / pitch - (before.cols + g.cols) as f32 / 2.0;
+            out.extend(std::iter::repeat_n(' ', room.round() as usize));
+        }
+        out.push(g.ch);
+    }
+    out
+}
+
+/// THE FACTS ARE SET AS A LINE OF TYPE (owner, 2026-10-14, of the facts'
+/// spacing; 2026-10-08: "the kerning is too wide"): letters and words
+/// [`FACT_PITCH`] apart, every two facts [`GAP`] pitches apart whatever
+/// their lengths, the line a whole number of cells a hair looser than that
+/// (or, where its glyphs need more cells than that line has, exactly as
+/// loose as they need), its first and last glyphs half a pitch in from its
+/// ends, and every glyph in a cell of its own, in order, within a nudge's
+/// reach. A word too long
+/// for that reach at [`FACT_PITCH`] (eighty letters and more) is set looser,
+/// every letter alike. CONTROL: one cell a character, the layout before,
+/// took more cells than the line does.
+#[test]
+fn the_facts_are_set_as_a_line_of_type() {
+    let step = 1.0 / f32::from(NUDGES_PER_CELL);
+    let at = |g: &SetGlyph| {
+        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
+    };
+    let check = |facts: &FooterFacts, reading: &str| {
+        let segments = segments(facts);
+        let set = set_facts(&segments);
+        let pitches = reading
+            .chars()
+            .map(aterm_grapheme::char_width)
+            .sum::<usize>() as f32;
+        assert_eq!(read_set(&set, pitches), reading);
+        let pitch = set.cells as f32 / pitches;
+        let ink = set.glyphs.iter().map(|g| g.cols).sum::<usize>() as f32;
+        let tight = FACT_PITCH.max(ink / pitches);
+        assert!(
+            (tight..tight + 1.0 / pitches).contains(&pitch),
+            "{reading}: {pitch}"
+        );
+        let (first, last) = (set.glyphs[0], set.glyphs[set.glyphs.len() - 1]);
+        assert!((at(&first) - first.cols as f32 * pitch / 2.0).abs() <= step);
+        assert!((set.cells as f32 - at(&last) - last.cols as f32 * pitch / 2.0).abs() <= step);
+        for pair in set.glyphs.windows(2) {
+            assert!(pair[1].cell >= pair[0].cell + pair[0].cols, "{pair:?}");
+        }
+        assert!(last.cell + last.cols <= set.cells);
+        assert!(
+            set.cells < reading.chars().count(),
+            "CONTROL: {} cells, {} characters",
+            set.cells,
+            reading.chars().count()
+        );
+        set
+    };
+    let facts = FooterFacts {
+        model: Some("Opus 5.5".into()),
+        effort: Some("xhigh".into()),
+        path: Some("~/aterm".into()),
+        branch: Some("main".into()),
+        ..FooterFacts::default()
+    };
+    check(
+        &facts,
+        "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main",
+    );
+    // A long path and branch, with few spaces among their glyphs: the line
+    // is as loose as one cell a glyph needs, the facts as far apart.
+    let long = FooterFacts {
+        path: Some("~/Developer/aterm-typo-20261014/crates/aterm-gui".into()),
+        branch: Some("ui/footer-spacing-iosevka-20261014".into()),
+        ..facts.clone()
+    };
+    check(
+        &long,
+        "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/Developer/aterm-typo-20261014/crates/aterm-gui   \u{2387} ui/footer-spacing-iosevka-20261014",
+    );
+    // Wide characters take two cells each, and stay in order.
+    let wide = FooterFacts {
+        branch: Some("\u{6F22}\u{5B57}".into()),
+        ..facts.clone()
+    };
+    let set = check(
+        &wide,
+        "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} \u{6F22}\u{5B57}",
+    );
+    assert_eq!(set.glyphs.iter().filter(|g| g.cols == 2).count(), 2);
+    // A path no nudge reaches at FACT_PITCH: set looser, evenly.
+    let deep = FooterFacts {
+        path: Some(format!("~/{}", "deep/".repeat(30))),
+        ..facts
+    };
+    let set = set_facts(&segments(&deep));
+    let d = set
+        .glyphs
+        .iter()
+        .position(|g| g.ch == 'd')
+        .expect("the path");
+    let pitches: Vec<f32> = set.glyphs[d..d + 40]
+        .windows(2)
+        .map(|p| at(&p[1]) - at(&p[0]))
+        .collect();
+    let (lo, hi) = pitches
+        .iter()
+        .fold((f32::MAX, 0.0f32), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+    assert!(
+        lo > FACT_PITCH && hi - lo <= 2.0 * step,
+        "looser, evenly: {lo}..{hi}"
+    );
+    assert!(set_facts(&[]).glyphs.is_empty());
+}
+
 /// THE ORDER OF GIVING WAY ([`fit_rule`]; the owner fixed only that the
 /// facts go into the rule and fit at any width, not this order): a light's transient
 /// title first (whole, then short, then none), then the path is cut to
@@ -4137,7 +4277,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         }
         seen
     };
-    assert_eq!(segments_width(&segments(&facts)) + 2, 54);
+    assert_eq!(segments_width(&segments(&facts)) + 2, 44);
     assert_eq!(
         walk(&facts),
         [
@@ -4288,6 +4428,7 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             (owned(&[model_effort, cut, branch]), TitleFit::Short, true),
             (owned(&[model_effort, cut]), TitleFit::Short, true),
             (owned(&[model_effort]), TitleFit::Short, true),
+            (owned(&[model_effort, path, branch]), TitleFit::None, true),
             (owned(&[model_effort, cut, branch]), TitleFit::None, true),
             (owned(&[model_effort, cut]), TitleFit::None, true),
             (owned(&[model_effort]), TitleFit::None, true),
@@ -4375,7 +4516,7 @@ fn walk_down(facts: &FooterFacts) -> Vec<Vec<String>> {
 }
 
 /// The facts `a_narrow_rule_gives_way_title_first_and_the_model_last`
-/// walks: 54 cells whole.
+/// walks: 44 cells whole.
 fn narrow_rule_facts() -> FooterFacts {
     FooterFacts {
         model: Some("Opus 5.5".into()),
@@ -4463,12 +4604,10 @@ fn the_account_costs_only_the_tokens() {
             &[wall, model, account, path, branch, total],
             &[wall, model, account, path, branch, runtime],
             &[wall, model, account, path, branch],
-            &[wall, model, path, branch, runtime],
             &[wall, model, path, branch],
             &[wall, model, account, short, branch],
             &[wall, model, short, branch],
             &[wall, model, short],
-            &[wall, model, account],
             &[wall, model],
             &[wall, "\u{25C6} Opus 5.5"],
             &[wall],
@@ -4484,18 +4623,38 @@ fn the_account_costs_only_the_tokens() {
         .expect("a narrower rung");
     assert_eq!(fewer.as_slice(), &walk[0][..5], "{fewer:?}");
 
-    // With no tokens the account's own widths: 65 cells whole, gone one
-    // cell short with the path whole down to its own 54; the path is cut
-    // at the width it is cut at with no account, and the account is back
-    // beside the cut path.
+    // With no tokens the account's own widths: shown at the whole facts'
+    // width, gone one cell short with the path whole down to the path's
+    // own width; the path is cut at the width it is cut at with no
+    // account, and the account is back beside the cut path.
     let bare = narrow_rule_facts();
     let at = |room: usize| rung_texts(&fit_rule(&named("work-2", &bare), room, None));
-    assert_eq!(at(65), [model, account, path, branch]);
-    assert_eq!(at(64), [model, path, branch], "one cell short: it goes");
-    assert_eq!(at(54), [model, path, branch]);
-    assert_eq!(at(53), [model, account, short, branch]);
-    assert_eq!(at(50), [model, account, short, branch]);
-    assert_eq!(at(49), [model, short, branch]);
+    let width = |rung: &[&str]| -> usize {
+        let segments: Vec<Segment> = rung
+            .iter()
+            .map(|shown| {
+                let (mark, text) = shown.split_once(' ').expect("<mark> <text>");
+                Segment {
+                    mark: mark.chars().next().expect("a mark"),
+                    text: text.to_owned(),
+                }
+            })
+            .collect();
+        segments_width(&segments) + 2
+    };
+    let whole = width(&[model, account, path, branch]);
+    assert_eq!(at(whole), [model, account, path, branch]);
+    assert_eq!(
+        at(whole - 1),
+        [model, path, branch],
+        "one cell short: it goes"
+    );
+    let path_whole = width(&[model, path, branch]);
+    assert_eq!(at(path_whole), [model, path, branch]);
+    assert_eq!(at(path_whole - 1), [model, account, short, branch]);
+    let cut = width(&[model, account, short, branch]);
+    assert_eq!(at(cut), [model, account, short, branch]);
+    assert_eq!(at(cut - 1), [model, short, branch]);
 
     // The law, at every width, for a short label, one of a runtime's
     // width and one wider than the rule's whole room at 80 columns.
@@ -4567,7 +4726,14 @@ fn the_account_costs_only_the_tokens() {
             &[wall, model, path, branch],
         ])
     );
-    assert_eq!(unnamed_of(&walk), pinned[1..]);
+    // Rounded to whole cells, a rung of the account's and the next one
+    // without it can take the same width, and the earlier one shows: the
+    // named walk, its account's rungs left out, is the pinned walk with at
+    // most such rungs missing, in its order.
+    let mut rest = pinned[1..].iter();
+    for rung in unnamed_of(&walk) {
+        assert!(rest.any(|r| *r == rung), "{rung:?} out of order: {walk:?}");
+    }
     assert_eq!(
         unnamed_of(&walk_down(&named("work-2", &bare))),
         walk_down(&bare)

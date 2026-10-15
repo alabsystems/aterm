@@ -1861,19 +1861,38 @@ fn a_zsh_probe_killed_by_its_alarm_is_a_timeout() {
     // must kill it too, or the wait lasts its five minutes, not the
     // window's 1 s. The bound is a minute's hang detector (AGENTS.md),
     // which only that wait reaches.
-    let started = std::time::Instant::now();
-    let Some(cut) = zsh_probe(dir, "print partial; sleep 300", 1) else {
-        return;
-    };
-    let waited = started.elapsed();
-    let why = cut.expect_err("a hung probe is no measurement");
-    let hung = "zsh probe hung: it printed nothing for 1 s (killed by its hang detector) \
-                having printed 1 lines, the last \"partial\"";
-    assert!(why.contains(hung), "{why}");
-    assert!(
-        waited < aterm_spec::wait::MUST_HAPPEN,
-        "the detector bounds the wait, grandchildren included: {waited:?}"
-    );
+    //
+    // The window is the thing measured, not zsh's start: a zsh that took
+    // longer than the 1 s window to print its first line (a loaded machine,
+    // 2026-10-10: "having printed 0 lines, the last \"\"") is asked again
+    // under a longer window, the same probe, so the line it reports is
+    // the one the probe printed. Every other answer fails at once.
+    let mut saw_the_line = false;
+    for window in [1, 4, 16] {
+        let started = std::time::Instant::now();
+        let Some(cut) = zsh_probe(dir, "print partial; sleep 300", window) else {
+            return;
+        };
+        let waited = started.elapsed();
+        let why = cut.expect_err("a hung probe is no measurement");
+        assert!(
+            waited < aterm_spec::wait::MUST_HAPPEN,
+            "the detector bounds the wait, grandchildren included: {waited:?}"
+        );
+        let hung = format!(
+            "zsh probe hung: it printed nothing for {window} s (killed by its hang \
+             detector) having printed 1 lines, the last \"partial\""
+        );
+        if why.contains(&hung) {
+            saw_the_line = true;
+            break;
+        }
+        assert!(
+            why.contains("having printed 0 lines, the last \"\""),
+            "{why}"
+        );
+    }
+    assert!(saw_the_line, "zsh printed nothing even in a 16 s window");
     // The probes that run to their end get a minute's window: a hang
     // detector (AGENTS.md), never a latency budget.
     let early = zsh_probe(dir, "print partial; exit 0", 60).expect("zsh");

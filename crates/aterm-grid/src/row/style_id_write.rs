@@ -34,22 +34,14 @@ impl Row {
 
         // Wide character fixup (rare path) - check if either WIDE or WIDE_CONTINUATION is set
         let wide_mask = CellFlags::WIDE.union(CellFlags::WIDE_CONTINUATION);
-        if (current_flags.bits() & wide_mask.bits()) != 0 {
-            self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
-        }
+        let end_half_blanked = (current_flags.bits() & wide_mask.bits()) != 0
+            && self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
 
         // SAFETY: col_usize < cells_len verified above
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) = Cell::with_style_id(c, style_id, cell_flags);
         }
-        if col >= self.len {
-            self.len = col.saturating_add(1);
-        } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // An interior write over a tail WIDE head cleared its continuation;
-            // recompute len (never over-shrinks). Ungated, matching this
-            // variant's ungated fixup.
-            self.recalculate_len_up_to(old_len);
-        }
+        self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_STYLE_ID;
         true
     }
@@ -83,11 +75,9 @@ impl Row {
         let second_flags = unsafe { self.cells.get_unchecked(col_usize + 1) }.flags();
 
         // Wide character fixup (rare path)
-        if first_flags.contains(CellFlags::WIDE_CONTINUATION)
-            || second_flags.contains(CellFlags::WIDE)
-        {
-            self.fixup_wide_char_write(col_usize, second_flags, cells_len);
-        }
+        let end_half_blanked = (first_flags.contains(CellFlags::WIDE_CONTINUATION)
+            || second_flags.contains(CellFlags::WIDE))
+            && self.fixup_wide_char_write(col_usize, second_flags, cells_len);
 
         // SAFETY: bounds already verified
         unsafe {
@@ -100,13 +90,7 @@ impl Row {
                 Cell::with_style_id(' ', style_id, cell_flags.wide_continuation_of());
         }
 
-        if col + 1 >= self.len {
-            self.len = col.saturating_add(2);
-        } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // An orphaned continuation at col+2 may have been the last content;
-            // recompute len (never over-shrinks).
-            self.recalculate_len_up_to(old_len);
-        }
+        self.settle_len_after_write(old_len, col_usize + 2, end_half_blanked);
         // HAS_WIDE_CHARS gates the row's wide fixups, so every wide write sets it.
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_STYLE_ID | RowFlags::HAS_WIDE_CHARS;
         true

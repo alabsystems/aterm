@@ -15,7 +15,7 @@
 //! built an `NSApplication`, whose initialisation checks the process in with
 //! LaunchServices and opens its WindowServer connection — which makes
 //! WindowServer run a synchronous TCC preflight of the binary on its main
-//! thread (AGENTS.md rule 5). Since 2026-09-26 headless builds winit's
+//! thread (AGENTS.md). Since 2026-09-26 headless builds winit's
 //! display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`), which
 //! never creates the application object, so LaunchServices holds NO record for
 //! the pid: `policy=none`. That is what this pins now; the `Prohibited` value it
@@ -371,8 +371,8 @@ fn a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front() {
             Some(p) => panic!(
                 "sample {sample}: aterm --headless (pid {pid}) is an app LaunchServices knows \
                  (activationPolicy {p}): it built an NSApplication, whose initialisation opens \
-                 the WindowServer connection a headless process must never open (AGENTS.md rule \
-                 5) — the display-free loop was not selected, or a verb (`chrome` above) created \
+                 the WindowServer connection a headless process must never open (AGENTS.md) \
+                 — the display-free loop was not selected, or a verb (`chrome` above) created \
                  the application object; posture={got:?}"
             ),
             None => {}

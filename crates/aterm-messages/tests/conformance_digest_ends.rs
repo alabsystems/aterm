@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1: the shipping `MessageCenter` follows the derived
-//! `ExceptionsDigestEnds` model in lock step (AGENTS.md, derived models, step
+//! `ExceptionsDigestEnds` model in lock step (aterm-spec `derive`, step
 //! 3), and so the liveness `AnUnnamedEntryEnds` proven on the model is a
 //! property of the code. After every real step the projection `(open, missed,
 //! age)` of the center equals the model's, where `missed` is "the center names

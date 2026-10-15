@@ -33,28 +33,68 @@ pub(crate) fn sanitize(s: &str, cap: usize) -> String {
     out
 }
 
-/// A control character, or one of the invisible format characters that
-/// re-orders or hides what follows it.
-pub(crate) fn is_stripped(c: char) -> bool {
+/// A character no chrome surface prints: a control (C0 and C1, so every
+/// ASCII line break and tab — escape-sequence injection), or an invisible
+/// format character that re-orders or hides the text around it: the bidi
+/// marks, embeddings, overrides and isolates (U+061C, U+200E/F,
+/// U+202A–202E, U+2066–2069), the zero-width space and the word joiner with
+/// its invisible operators (U+200B, U+2060–2064), the BOM, the soft hyphen,
+/// the combining grapheme joiner, the Hangul fillers, the Khmer inherent
+/// vowels, the Mongolian selectors and separator, the line and paragraph
+/// separators, the specials and interlinear anchors (U+FFF0–FFFB), the
+/// Egyptian, shorthand and musical format controls, the TAG block (U+E0000–
+/// E007F: invisible ASCII an agent reading the text still reads — the "ASCII
+/// smuggling" channel) and the noncharacters.
+///
+/// THE ONE TABLE (ruling 2026-10-11, round fifteen content-7): the band's
+/// strip (`is_stripped`), the presence row's tokens
+/// ([`crate::presence::sanitize_token`]) and the host's user-metadata gate
+/// (`aterm-gui`'s `is_forbidden_metadata_char`) all read it. Before, three
+/// lists had drifted apart — the row's passed tag characters, ZWSP, WJ, the
+/// BOM, U+061C, the soft hyphen and U+180E; the band's lacked the Hangul
+/// fillers, CGJ and the Mongolian selectors; the metadata gate's lacked the
+/// noncharacters and U+FFF9–FFFB — so each surface now strips the union.
+/// ZWJ, ZWNJ and the variation selectors are NOT here: an emoji sequence, a
+/// joining script and an ideographic variant need them, and user metadata
+/// keeps them; a surface that drops the joiners too says so
+/// (`is_stripped`).
+#[must_use]
+pub fn is_hidden_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206f}'
-                | '\u{fdd0}'..='\u{fdef}'
-                | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-                | '\u{2028}'
-                | '\u{2029}'
+            '\u{00ad}' // SOFT HYPHEN
+                | '\u{034f}' // COMBINING GRAPHEME JOINER
+                | '\u{061c}' // ARABIC LETTER MARK
+                | '\u{115f}'..='\u{1160}' // Hangul fillers
+                | '\u{17b4}'..='\u{17b5}' // Khmer inherent-vowel controls
+                | '\u{180b}'..='\u{180f}' // Mongolian selectors / vowel separator
+                | '\u{200b}' // ZERO WIDTH SPACE
+                | '\u{200e}'..='\u{200f}' // directional marks
+                | '\u{2028}'..='\u{202e}' // line/paragraph separators, bidi embedding/override
+                | '\u{2060}'..='\u{206f}' // word joiner, invisible operators, bidi isolates
+                | '\u{3164}' // HANGUL FILLER
+                | '\u{fdd0}'..='\u{fdef}' // noncharacters
+                | '\u{feff}' // BOM / ZERO WIDTH NO-BREAK SPACE
+                | '\u{ffa0}' // HALFWIDTH HANGUL FILLER
+                | '\u{fff0}'..='\u{fffb}' // specials, interlinear annotation anchors
+                | '\u{13430}'..='\u{1343f}' // Egyptian hieroglyph format controls
+                | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+                | '\u{1d173}'..='\u{1d17a}' // musical symbol format controls
+                | '\u{e0000}'..='\u{e007f}' // the tag block
         )
+        // The noncharacters at the end of every plane (U+xFFFE, U+xFFFF).
         || u32::from(c) & 0xfffe == 0xfffe
+}
+
+/// A character the band and the presence row strip: [`is_hidden_char`], and
+/// the two joiners (ZWNJ, ZWJ) as well. The band prints paths and commands
+/// that a joiner could hide inside (and the log page copies them to a
+/// clipboard), and the row paints one character per cell, so a joiner would
+/// only fold the glyph after it out of sight: without it, each glyph keeps
+/// its own cell.
+pub(crate) fn is_stripped(c: char) -> bool {
+    is_hidden_char(c) || matches!(c, '\u{200c}' | '\u{200d}')
 }
 
 /// `s` in at most `max` chars, the last one `…` when it was cut. `max == 0`
@@ -726,6 +766,18 @@ mod tests {
             ),
             "abcdefgh",
             "bidi overrides, zero-width characters and line separators are stripped"
+        );
+        // The one table (round fifteen content-7): what the host's metadata
+        // gate had and the band's list lacked — a combining grapheme joiner,
+        // the Hangul fillers, a Mongolian selector, Khmer's inherent vowels,
+        // a shorthand and a musical format control — goes too.
+        assert_eq!(
+            sanitize(
+                "a\u{034f}b\u{115f}c\u{3164}d\u{ffa0}e\u{180b}f\u{17b4}g\u{1bca0}h\u{1d173}i\u{e0000}j",
+                100
+            ),
+            "abcdefghij",
+            "every invisible character the metadata gate strips"
         );
         assert_eq!(
             sanitize("h\u{e9}llo \u{6f22}", 100),

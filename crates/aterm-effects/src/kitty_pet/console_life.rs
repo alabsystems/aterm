@@ -701,6 +701,7 @@ impl PetBrain {
     fn console_body(&self, sense: PetSense) -> PetRect {
         still_body_rect(
             (self.col, self.row),
+            Stance::NEUTRAL,
             (sense.cell_w, sense.cell_h),
             (sense.cols, sense.rows),
         )
@@ -710,30 +711,38 @@ impl PetBrain {
     /// boundary ([`PetBrain::resight_coordinate_space`]) — before the retire
     /// drops the old surface's map, so the map is the observation the body
     /// was drawn against on the frame the user saw. The ghost is the body
-    /// standing still at its seat (no lift, no squash), at the last tick's
+    /// standing still at its seat in the stance that frame drew it at
+    /// (`PetBrain::last_stance`: a ghost is drawn at it), at the last tick's
     /// cell metrics and grid; it is admitted only where that map certifies
     /// nothing protected under it — no selection, image, overlay or unseen
     /// cell — exactly the live body's own verdict
     /// (`under_text_clearance_past_caret`). An incoherent map, or none,
     /// admits nothing.
     pub(super) fn console_still_body_clear(&self) -> bool {
-        self.console_still_rect_verdict(self.col, self.row) == Some(true)
+        self.console_still_rect_verdict(self.col, self.row, self.last_stance) == Some(true)
     }
 
     /// [`Self::console_still_body_clear`]'s verdict for a still body standing
-    /// at `(col, row)` of the same map — a ghost still on glass there at the
-    /// boundary (`Departure::own_clear`) — three-valued over what the map
+    /// at `(col, row)` of the same map in `stance` — a ghost still on glass
+    /// there at the boundary (`Departure::own_clear`), at the stance it is
+    /// drawn at (`Departure::stance0`) — three-valued over what the map
     /// sees of it (`PetWorld::seen_under_text_clearance_past_caret`): `None`
     /// where the part of it this map covers is clear and the rest is outside
     /// the coverage window (unseen, which is not evidence of anything), and
     /// `Some(false)` over a protected cell the map sees, or with no certified
     /// map at all, which admits nothing.
-    pub(super) fn console_still_rect_verdict(&self, col: f32, row: f32) -> Option<bool> {
+    pub(super) fn console_still_rect_verdict(
+        &self,
+        col: f32,
+        row: f32,
+        stance: Stance,
+    ) -> Option<bool> {
         let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
             return Some(false);
         };
         let rect = still_body_rect(
             (col, row),
+            stance,
             (self.last_cell_w, self.last_cell_h),
             self.last_grid,
         );
@@ -2152,9 +2161,11 @@ impl PetBrain {
             ghost.alpha = d.alpha;
             ghost.col = d.col;
             ghost.row = d.row;
-            ghost.lift = 0.0;
-            ghost.scale_x = 1.0;
-            ghost.scale_y = 1.0;
+            // Judged where it is drawn: at its own stance
+            // (`Departure::stance0`), not the body's.
+            ghost.lift = d.lift;
+            ghost.scale_x = d.scale_x;
+            ghost.scale_y = d.scale_y;
             let keep = match body_rect(&ghost, sense) {
                 None => false,
                 Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
@@ -2299,21 +2310,27 @@ impl PetBrain {
     }
 }
 
-/// A body standing still at `(col, row)` — no lift, no squash — in
-/// fractional grid cells: the neutral-scale `PetFrame::body_px` projection,
-/// including the origin, the feet and the grid clamp. Fractional flight
-/// landings can straddle a protected cell before rounding even though the
-/// actual displayed body clears it.
-fn still_body_rect(seat: (f32, f32), cell: (u16, u16), grid: (u16, u16)) -> PetRect {
-    let cw = f32::from(cell.0.max(1));
-    let ch = f32::from(cell.1.max(1));
-    let h = (ART_ROWS * ch).round().clamp(1.0, f32::from(u16::MAX));
-    let w = (h * ART_ASPECT).round().clamp(1.0, f32::from(u16::MAX));
-    let x = (seat.0 * cw)
-        .round()
-        .clamp(0.0, (f32::from(grid.0) * cw - w).max(0.0));
-    let y = (((seat.1 + 1.0) * ch).round() - h).clamp(0.0, (f32::from(grid.1) * ch - h).max(0.0));
-    PetRect::new(y / ch, x / cw, h / ch, w / cw)
+/// A body standing still at `(col, row)` in `stance` — [`Stance::NEUTRAL`]
+/// for the natural body, no lift, no squash — in fractional grid cells: the
+/// `PetFrame::body_px` projection itself (`drawn_body_px`), including the
+/// origin, the feet and the grid clamp. Fractional flight landings can
+/// straddle a protected cell before rounding even though the actual
+/// displayed body clears it.
+fn still_body_rect(
+    seat: (f32, f32),
+    stance: Stance,
+    cell: (u16, u16),
+    grid: (u16, u16),
+) -> PetRect {
+    let (cw, ch) = (cell.0.max(1), cell.1.max(1));
+    let (x0, x1, y0, y1) = drawn_body_px(seat, stance, (cw, ch), grid);
+    let (cw, ch) = (f32::from(cw), f32::from(ch));
+    PetRect::new(
+        y0 as f32 / ch,
+        x0 as f32 / cw,
+        (y1 - y0) as f32 / ch,
+        (x1 - x0) as f32 / cw,
+    )
 }
 
 /// The frame's body in cell units: [`PetFrame::body_px`]'s pixel box divided
@@ -2966,10 +2983,13 @@ mod tests {
             facing_left: false,
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
+            stance0: Stance::NEUTRAL,
             resight: false,
             own_glass: None,
             own_clear: false,
             peak: 1.0,
+            colors: None,
+            surface: None,
         };
         s.pet.departures[0] = Some(ghost(&s));
         let f = s.frame(0.016);
@@ -3098,10 +3118,13 @@ mod tests {
                 facing_left: false,
                 stride0: 0.0,
                 pose0: PetGlyphId::PetSit,
+                stance0: Stance::NEUTRAL,
                 resight: false,
                 own_glass: None,
                 own_clear: false,
                 peak: 1.0,
+                colors: None,
+                surface: None,
             });
             s.pet.last_drawn = [0.0; PET_DEPARTURES_MAX];
             s.pet.last_drawn[1] = drawn;
@@ -3232,10 +3255,13 @@ mod tests {
             facing_left: false,
             stride0: 0.0,
             pose0: PetGlyphId::PetSit,
+            stance0: Stance::NEUTRAL,
             resight: false,
             own_glass: None,
             own_clear: false,
             peak: 1.0,
+            colors: None,
+            surface: None,
         };
         s.pet.departures[0] = Some(ghost);
         let f = s.frame(0.016);

@@ -573,7 +573,8 @@ pub(crate) fn main() -> ExitCode {
     //
     //  -  THE HOST SETTINGS (`pkg machine apply`) are not the package manager's to
     //     gate: no store lock, no index, no network. They write two `defaults
-    //     -currentHost` keys and walk nothing; they run ONCE A DAY on the slot a
+    //     -currentHost` keys and remove unused Rust build cache folders
+    //     (`atpkg::build_cache::reclaim`); they run ONCE A DAY on the slot a
     //     window's launch claims too
     //     (`atpkg::machine::launch_apply_due`), never under a private state root
     //     (ruling 409; the claim logs why it stood aside).

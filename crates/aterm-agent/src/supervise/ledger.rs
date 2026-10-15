@@ -1379,16 +1379,15 @@ pub fn render_md(l: &Ledger) -> String {
     out
 }
 
-/// A string for a JSON document embedded in HTML: [`json_str`], and `<`,
-/// `>`, `&`, U+2028 and U+2029 as `\u` escapes, so no `</script>` and no
-/// line terminator a script would choke on survives.
+/// A string for a JSON document embedded in HTML: [`json_str`] (which already
+/// spells U+2028 and U+2029, the line terminators a script would choke on, as
+/// `\u` escapes), and `<`, `>` and `&` as `\u` escapes, so no `</script>`
+/// survives.
 pub(super) fn html_json_str(s: &str) -> String {
     json_str(s)
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
 }
 
 /// Text for HTML: `&`, `<`, `>`, `"` and `'` escaped.

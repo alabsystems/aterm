@@ -491,7 +491,7 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
             .spawn()
             .expect("start a stand-in launcher")
     };
-    // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+    // A stand-in that must die dies by SIGKILL (AGENTS.md).
     let stop = |child: &mut Child| {
         child.kill().unwrap();
         child.wait().unwrap();
@@ -902,7 +902,7 @@ fn concurrent_live_candidates_of_one_trial_never_revert() {
     };
     let launcher = |child: &Child| TrialLauncher::of(child.id()).expect("a running child");
     let stop = |child: &mut Child| {
-        // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+        // A stand-in that must die dies by SIGKILL (AGENTS.md).
         child.kill().unwrap();
         child.wait().unwrap();
     };
@@ -989,7 +989,7 @@ fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
     };
     let launcher = |child: &Child| TrialLauncher::of(child.id()).expect("a running child");
     let stop = |child: &mut Child| {
-        // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+        // A stand-in that must die dies by SIGKILL (AGENTS.md).
         child.kill().unwrap();
         child.wait().unwrap();
     };
@@ -1067,7 +1067,7 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
             .spawn()
             .expect("start a stand-in launch")
     };
-    // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+    // A stand-in that must die dies by SIGKILL (AGENTS.md).
     let stop = |child: &mut Child| {
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1499,7 +1499,7 @@ fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
             .spawn()
             .expect("start a stand-in launch")
     };
-    // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+    // A stand-in that must die dies by SIGKILL (AGENTS.md).
     let stop = |child: &mut Child| {
         child.kill().unwrap();
         child.wait().unwrap();

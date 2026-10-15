@@ -177,13 +177,7 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
         }
         let retained = net() - base;
         assert!(search.is_complete());
-        assert!(
-            search
-                .results()
-                .expect("an affordable query is never refused")
-                .matches
-                .is_empty()
-        );
+        assert!(search.results().matches.is_empty());
         assert!(
             retained < SCRATCH_ALLOWANCE,
             "completed scan retained {retained} bytes beyond matcher scratch: \

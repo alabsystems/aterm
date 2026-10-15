@@ -22,7 +22,7 @@ mod utf8_errors;
 mod utf8_parity;
 
 /// Test sink that records all actions for verification.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct RecordingSink {
     prints: Vec<char>,
     executes: Vec<u8>,

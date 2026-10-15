@@ -107,35 +107,16 @@ pub(crate) fn normalize_questions_value(value: &str) -> Option<&'static str> {
 }
 
 /// True for characters that must never reach native/window chrome from user
-/// metadata. `char::is_control` covers C0/C1 (every ASCII line break and tab);
-/// the explicit format characters cover Unicode line separators, bidi
-/// overrides/isolation, tags/fillers and spoof-relevant default-ignorables.
-/// ZWJ/ZWNJ and the variation-selector blocks U+FE00..FE0F and
-/// U+E0100..E01EF are allowed so emoji, joining scripts and ideographic
-/// variants survive.
+/// metadata: the engine's one table of them
+/// ([`aterm_messages::text::is_hidden_char`] — controls, so every ASCII line
+/// break and tab; Unicode line separators, bidi overrides/isolation,
+/// tags/fillers, noncharacters and spoof-relevant default-ignorables), which
+/// the message band and the presence row strip too (ruling 2026-10-11, round
+/// fifteen content-7: the three lists had drifted apart). ZWJ/ZWNJ and the
+/// variation-selector blocks U+FE00..FE0F and U+E0100..E01EF are allowed so
+/// emoji, joining scripts and ideographic variants survive.
 pub(crate) fn is_forbidden_metadata_char(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{00ad}' // SOFT HYPHEN
-                | '\u{034f}' // COMBINING GRAPHEME JOINER
-                | '\u{061c}' // ARABIC LETTER MARK
-                | '\u{115f}'..='\u{1160}' // Hangul fillers
-                | '\u{17b4}'..='\u{17b5}' // Khmer inherent-vowel controls
-                | '\u{180b}'..='\u{180f}' // Mongolian selectors / vowel separator
-                | '\u{200b}' // ZERO WIDTH SPACE
-                | '\u{200e}'..='\u{200f}' // directional marks
-                | '\u{2028}'..='\u{202e}' // line/paragraph separators + bidi embedding/override
-                | '\u{2060}'..='\u{206f}' // invisible operators + bidi isolates/deprecated controls
-                | '\u{3164}' // HANGUL FILLER
-                | '\u{feff}' // BOM / ZERO WIDTH NO-BREAK SPACE
-                | '\u{ffa0}' // HALFWIDTH HANGUL FILLER
-                | '\u{fff0}'..='\u{fff8}' // reserved specials
-                | '\u{13430}'..='\u{1343f}' // Egyptian hieroglyph format controls
-                | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
-                | '\u{1d173}'..='\u{1d17a}' // musical symbol controls
-                | '\u{e0000}'..='\u{e007f}' // language/tag characters
-        )
+    aterm_messages::text::is_hidden_char(ch)
 }
 
 #[must_use]
@@ -2238,6 +2219,14 @@ mod tests {
             '\u{1bca0}',
             '\u{1d173}',
             '\u{e0001}',
+            // The engine's one table (round fifteen content-7): the
+            // noncharacters and the interlinear annotation anchors the
+            // message band always stripped.
+            '\u{fdd0}',
+            '\u{fffe}',
+            '\u{1ffff}',
+            '\u{fff9}',
+            '\u{fffb}',
         ] {
             assert!(
                 metadata_has_forbidden_formatting(&format!("a{invisible}b")),

@@ -1439,8 +1439,10 @@ fn bold_italic_gpu_match_cpu() {
 /// A SUBSCRIPT cell (`Script::Sub`, chrome-only: the Claude footer's facts)
 /// draws its glyph smaller and lower — no glyph's ink, a parenthesis taller
 /// than the letters included, above `SUB_CEILING` — the rule glyph beside it
-/// full size; a nudged one draws the same glyph moved sideways by its nudge;
-/// and the GPU, which takes the CPU's raster and placement, matches it.
+/// full size; a nudged one draws the same glyph moved sideways by exactly its
+/// nudge, a fraction of a pixel included (its ink's centre, weighted by
+/// coverage); and the GPU, which takes the CPU's raster and placement,
+/// matches it.
 #[test]
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;
@@ -1482,14 +1484,20 @@ fn sub_script_gpu_matches_cpu() {
             px.iter().filter(|p| inked(p)).count(),
         )
     };
-    // The leftmost inked frame column of `row` within its first `span` cells.
-    let ink_left = |f: &Frame, row: usize, span: usize| {
+    // The coverage-weighted centre column of `row`'s ink within its first
+    // `span` cells: where a glyph stands, to a fraction of a pixel.
+    let ink_centre = |f: &Frame, row: usize, span: usize| {
         let ground = f.pixels[row * ch * f.width];
-        (0..span * cw)
-            .find(|&x| {
-                (row * ch..row * ch + ch).any(|y| dist(f.pixels[y * f.width + x], ground) > 24)
-            })
-            .expect("the row has ink")
+        let (mut sum, mut weight) = (0.0f64, 0.0f64);
+        for x in 0..span * cw {
+            for y in row * ch..row * ch + ch {
+                let w = f64::from(dist(f.pixels[y * f.width + x], ground));
+                sum += w * (x as f64 + 0.5);
+                weight += w;
+            }
+        }
+        assert!(weight > 0.0, "the row has ink");
+        sum / weight
     };
     for f in [&cf, &gf] {
         let (sub_top, _, sub_ink) = ink_rows(f, 0, 0);
@@ -1511,11 +1519,11 @@ fn sub_script_gpu_matches_cpu() {
                 "col {col}: ink from row {top}, ceiling {ceiling}"
             );
         }
-        let moved = (cw as f32 / 2.0).round() as usize;
-        assert_eq!(
-            ink_left(f, 2, 2),
-            ink_left(f, 0, 1) + cw - moved,
-            "the nudged sub H stands half a cell left of its cell"
+        let (nudged, home) = (ink_centre(f, 2, 2), ink_centre(f, 0, 1));
+        assert!(
+            (nudged - (home + cw as f64 / 2.0)).abs() <= 0.25,
+            "the nudged sub H stands half a cell left of its cell: {nudged} vs {home} + {}",
+            cw as f64 / 2.0
         );
     }
 }

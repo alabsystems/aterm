@@ -239,3 +239,56 @@ fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_s
     }
     assert!(!overlap.released(), "PRECONDITION: no Commit in this test");
 }
+
+/// A QUIT ENDS EVERY TAB'S SHELL AS CLOSING THE TAB DOES. The final exit forgets
+/// the App, so no session is dropped; `hang_up_at_exit` runs each one's hang-up
+/// and reap instead. This shell ignores SIGHUP, so only the reap's SIGKILL ends
+/// it: before, the quit left it to the master's close, which SIGHUPs the
+/// session leader alone, and it outlived aterm. CONTROL: a shell the
+/// predecessor still owns (an adoption before Commit) is left alive, as its
+/// close leaves it.
+#[cfg(unix)]
+#[test]
+fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
+    let mut holdout = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "trap '' HUP; exec /bin/sleep 600"])
+        .setsid(true)
+        .spawn()
+        .expect("the HUP-ignoring shell must spawn");
+    let mut handed = setsid_sleep();
+    let mut pool = SessionPool::default();
+    let mut tab = stub_session(1);
+    tab.pid = i32::try_from(holdout.id()).expect("pid fits i32");
+    tab.shell_identity = aterm_pty::record_spawned_shell(tab.pid);
+    pool.insert(tab);
+    let mut adopted = stub_session(2);
+    adopted.pid = i32::try_from(handed.id()).expect("pid fits i32");
+    adopted.shell_identity = aterm_pty::record_spawned_shell(adopted.pid);
+    adopted.handoff_local_id = Some(7);
+    adopted.handoff_commit = Some(Arc::new(crate::shell_rekey::Deferred::holding()));
+    pool.insert(adopted);
+
+    pool.hang_up_at_exit();
+    let settled = aterm_pty::wait_for_reaps(Duration::from_secs(60));
+    // A hang detector: the reap's SIGKILL is the event.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while running(&mut holdout) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = !running(&mut holdout);
+    let kept = running(&mut handed);
+    for child in [&mut holdout, &mut handed] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(pool);
+    assert!(settled, "the reaps never settled");
+    assert!(
+        ended,
+        "the final exit left a HUP-ignoring shell running that closing its tab ends"
+    );
+    assert!(
+        kept,
+        "the final exit hung up a shell the predecessor still owns"
+    );
+}

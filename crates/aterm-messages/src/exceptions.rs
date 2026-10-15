@@ -63,10 +63,6 @@ pub enum Family {
     Toolchain,
     /// The disk reclaim pass.
     Disk,
-    /// The developer root (`devroot.<kind>`, `atpkg::devroot`): a measurement that
-    /// Spotlight indexes `~/Developer`. Raised and cleared by the host's look, by
-    /// event: an unmeasured look changes nothing.
-    DevRoot,
     /// The render stream's repair that gave up (`render.<tab>.unrepaired`): a
     /// tab the repaint could not put right, so its screen may be drawn a row
     /// off. Raised at the give-up and cleared when the epoch heals, by event.
@@ -88,7 +84,6 @@ impl Family {
             Self::Accounts => "harness.accounts",
             Self::Toolchain => "toolchain",
             Self::Disk => "disk",
-            Self::DevRoot => "devroot",
             Self::Render => "render",
         }
     }
@@ -116,13 +111,12 @@ impl Family {
             | Self::Accounts
             | Self::Toolchain
             | Self::Disk
-            | Self::DevRoot
             | Self::Render => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -132,7 +126,6 @@ impl Family {
         Self::Accounts,
         Self::Toolchain,
         Self::Disk,
-        Self::DevRoot,
         Self::Render,
     ];
 
@@ -148,7 +141,7 @@ impl Family {
             | Self::Supervisor
             | Self::Accounts => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
-            Self::Disk | Self::DevRoot => tags::SYSTEM,
+            Self::Disk => tags::SYSTEM,
             Self::Render => tags::RENDER,
         }
     }

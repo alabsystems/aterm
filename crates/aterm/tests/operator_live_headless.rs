@@ -57,6 +57,12 @@ const CLIENT_DEADLINE: Duration = Duration::from_secs(90);
 /// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// The server's TRANSIENT refusal of `operator manage` (`operator_host`'s
+/// `command_manage`): the baseline is read from the terminal by `try_lock` (a
+/// control worker never waits on the PTY reader), so a manage that meets the
+/// lock held answers this and asks for a retry.
+const MANAGE_BUSY: &str = "its terminal is busy; retry manage";
+
 /// The control server's worker pool (`control.rs` `CONTROL_WORKERS`): the crash
 /// cycles run past it, so a waiter a dead client leaked would starve the server.
 const CONTROL_WORKERS: usize = 8;
@@ -154,6 +160,31 @@ fn op_ok(inst: &Instance, args: &[&str]) -> String {
     let (stdout, stderr) = text(&out);
     assert!(out.status.success(), "operator {args:?}: {stdout} {stderr}");
     stdout
+}
+
+/// `aterm ctl operator manage <sid>`, retried as its refusal asks while the
+/// terminal is busy ([`MANAGE_BUSY`]), and otherwise required to succeed. A
+/// busy terminal is a moment of the PTY reader's, which a loaded machine
+/// stretches: every red of this suite measured under load (2026-09-27, load
+/// 145-170: 4 of 20 runs of `crash_cycles_leave_no_waiter_no_event_and_no_fault`)
+/// was a helper taking that refusal as final. The retries end at [`HANG`]; a
+/// manage that never succeeds still fails, naming the last answer.
+fn op_manage(inst: &Instance, sid: &str) -> String {
+    let mut last = String::new();
+    aterm_spec::wait::within(HANG, Duration::from_millis(50), || {
+        let out = ctl(inst, &["operator", "manage", sid]);
+        let (stdout, stderr) = text(&out);
+        if out.status.success() {
+            return Some(stdout);
+        }
+        assert!(
+            stderr.contains(MANAGE_BUSY),
+            "operator manage {sid}: {stdout} {stderr}"
+        );
+        last = stderr;
+        None
+    })
+    .unwrap_or_else(|| panic!("operator manage {sid}: still busy after {HANG:?}: {last}"))
 }
 
 /// Poll `ready` (bounded) until it holds.
@@ -281,10 +312,7 @@ fn ack(inst: &Instance, event: &Event, resolution: &str) -> String {
 
 /// Manage `sid` and resolve the baseline its admission raises.
 fn manage(inst: &Instance, sid: &str) {
-    assert_eq!(
-        op_ok(inst, &["manage", sid]).trim(),
-        "OK managed=true changed=1"
-    );
+    assert_eq!(op_manage(inst, sid).trim(), "OK managed=true changed=1");
     let baseline = next_for(inst, sid, "changed", HANG);
     assert_eq!(ack(inst, &baseline, "no-action").trim(), "OK resolved");
 }
@@ -341,6 +369,63 @@ fn propose(inst: &Instance, json: &str) -> (bool, String) {
     (out.status.success(), format!("{body}{err}"))
 }
 
+/// A `next` parked by a client of its own and HOLDING the waiter slot, shown
+/// by this client's `next timeout=0` being refused `already waiting` while the
+/// parked client runs. The parked client has to spawn, connect and register
+/// first — a moment alone, seconds on a loaded gate, where a fixed 300-500 ms
+/// sleep read a slot not yet taken as the refusal missing (or killed a client
+/// that had never parked, and the crash cycle tested nothing) — so a probe
+/// that finds the slot FREE (served `OK timeout`) is asked again while the
+/// parked client lives. A parked client that ended is started again for
+/// exactly two endings, both read from its own output: turned away `already
+/// waiting` (it arrived while a probe held the slot past the server's 1 s
+/// handover grace, `operator_host`'s `NEXT_HANDOVER_GRACE`), or `OK timeout`
+/// (its own 30 s ran out while the probes went on). Any other ending — an
+/// event served to it, an error, a crash — fails at once with that output, as
+/// main's control did. A waiter that never keeps its slot is never refused
+/// against: that fails at the hang detector. Returns the parked client.
+fn parked_next(inst: &Instance) -> std::process::Child {
+    let spawn = || {
+        client(inst, &["operator", "next", "timeout=30000"])
+            .spawn()
+            .expect("spawn the parked next")
+    };
+    let mut parked = spawn();
+    let parked_by = Instant::now() + HANG;
+    loop {
+        let probe = ctl(inst, &["operator", "next", "timeout=0"]);
+        let (body, err) = text(&probe);
+        if err.contains("already waiting") {
+            assert!(
+                parked.try_wait().expect("poll").is_none(),
+                "refused as if a next were parked, yet the parked next had ended"
+            );
+            return parked;
+        }
+        assert!(
+            probe.status.code() == Some(124) && body.trim() == "OK timeout",
+            "a probe of the free slot is served, and nothing is queued: {body} {err}"
+        );
+        assert!(
+            Instant::now() < parked_by,
+            "a live waiter keeps the slot: no probe was refused within {HANG:?}"
+        );
+        if parked.try_wait().expect("poll").is_some() {
+            let ended = parked.wait_with_output().expect("read the ended next");
+            let (out, why) = text(&ended);
+            assert!(
+                why.contains("already waiting")
+                    || (ended.status.code() == Some(124) && out.trim() == "OK timeout"),
+                "the parked next ended other than turned away by a probe or at its own \
+                 timeout ({}): {out} {why}",
+                ended.status
+            );
+            parked = spawn();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// §9.1. Before the peer probe, the restarted client's `next` was refused
 /// `another operator next call is already waiting` for up to 30 s.
 #[test]
@@ -359,57 +444,18 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
     );
 
     // The CONTROL: a waiter whose client is alive keeps the slot, and a
-    // second `next` is refused (after the handover grace). The parked client
-    // has to spawn, connect and register first — a moment alone, seconds on a
-    // loaded gate, where a fixed 500 ms read a slot not yet taken as the
-    // refusal missing — so a probe that finds the slot FREE (served `OK
-    // timeout`) is asked again while the parked client lives. A waiter that
-    // does not keep its slot is never refused against: that fails at the hang
-    // detector, and a parked client that ends first fails at once.
-    let mut live = client(&inst, &["operator", "next", "timeout=30000"])
-        .spawn()
-        .expect("spawn the parked next");
-    let parked_by = Instant::now() + HANG;
-    loop {
-        let probe = ctl(&inst, &["operator", "next", "timeout=0"]);
-        let (body, err) = text(&probe);
-        if err.contains("already waiting") {
-            break;
-        }
-        assert!(
-            probe.status.code() == Some(124) && body.trim() == "OK timeout",
-            "a probe of the free slot is served, and nothing is queued: {body} {err}"
-        );
-        assert!(
-            live.try_wait().expect("poll").is_none(),
-            "the parked next ended before a probe was refused against it"
-        );
-        assert!(
-            Instant::now() < parked_by,
-            "a live waiter keeps the slot: no probe was refused within {HANG:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        live.try_wait().expect("poll").is_none(),
-        "the refusal was the live waiter's: it is still parked"
-    );
+    // second `next` is refused (after the handover grace): `parked_next`.
+    let mut live = parked_next(&inst);
     live.kill().expect("kill");
     live.wait().expect("reap");
 
-    // Crash cycles past the worker pool: each client dies parked, and the next
-    // one is served, not refused: without the peer probe the dead predecessor
-    // keeps the slot and the successor is refused once the handover grace runs
-    // out, which `next` fails on at once.
+    // Crash cycles past the worker pool: each client dies PARKED — holding
+    // the slot, shown as the control shows it — and the next one is served,
+    // not refused: without the peer probe the dead predecessor keeps the slot
+    // and the successor is refused once the handover grace runs out, which
+    // `next` fails on at once.
     for cycle in 0..CONTROL_WORKERS + 2 {
-        let mut parked = client(&inst, &["operator", "next", "timeout=30000"])
-            .spawn()
-            .expect("spawn the parked next");
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            parked.try_wait().expect("poll").is_none(),
-            "cycle {cycle}: the next ended before it was killed"
-        );
+        let mut parked = parked_next(&inst);
         parked.kill().expect("kill");
         parked.wait().expect("reap");
         assert!(next(&inst, 0).is_none(), "cycle {cycle}: nothing is queued");
@@ -469,10 +515,7 @@ fn a_cold_restart_redelivers_the_unresolved_event_under_a_new_token() {
         return;
     };
     let sid = first_sid(&first);
-    assert_eq!(
-        op_ok(&first, &["manage", &sid]).trim(),
-        "OK managed=true changed=1"
-    );
+    assert_eq!(op_manage(&first, &sid).trim(), "OK managed=true changed=1");
     let delivered = next_for(&first, &sid, "changed", HANG);
     assert_eq!(delivered.redelivery, 0);
     // Mid-run: delivered, unresolved — and the process dies.

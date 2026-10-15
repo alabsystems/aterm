@@ -273,22 +273,16 @@ impl JournalRecord {
     }
 }
 
-/// `s` as a JSON string: `"` and `\` escaped, control characters as `\n`,
-/// `\t`, `\r` or `\u00XX`; everything else verbatim (UTF-8).
+/// `s` as a JSON string, quoted: the control path's one escape
+/// ([`aterm_codec::json::escape_into`]) — `"`, `\` and C0 escaped as RFC 8259
+/// asks, and every other character a terminal acts on (DEL, C1, the bidi
+/// controls, U+2028/9) as `\uXXXX`, since a journal line carries a screen's
+/// rows (`DIALOG`) and a person may read the file raw; everything else
+/// verbatim (UTF-8).
 pub fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
-            c => out.push(c),
-        }
-    }
+    aterm_codec::json::escape_into(&mut out, s);
     out.push('"');
     out
 }

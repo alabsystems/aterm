@@ -83,26 +83,37 @@ const ATLAS_GROW_HEADROOM: u32 = 256;
 /// `unsafe impl` the [`aterm_bits`] `Pod`/`Zeroable` pair for a `#[repr(C)]`
 /// struct, with compile-time checks standing in for a derive:
 ///
+/// * the list names every field exactly once: it is spelled as an exhaustive
+///   struct pattern (`let $t { $($f: _),+ } = v`), so a repeated field (E0025)
+///   and an omitted one (inside a macro rustc words it "pattern requires `..`")
+///   are compile errors;
 /// * every field type is `Pod` (the `is_pod` bound);
 /// * each listed field's declared type is its real type (`let f: $ft = v.$f`),
 ///   so the list cannot describe a struct other than the real one;
-/// * `size_of::<T>()` equals the sum of the field sizes, so there is no padding
-///   and every field is listed.
+/// * `size_of::<T>()` equals the sum of the field sizes, so there is no padding.
+///
+/// The sum alone cannot prove the list exact: on origin/main before 2026-10-10
+/// `Padded { a: u32, a: u32 }` for `struct Padded { a: u32, b: u16, flag: bool }`
+/// summed to its 8 bytes and made a padded struct holding a `bool` `Pod`
+/// (miri: uninitialized read through `bytes_of`). Ruling 2026-10-10: the
+/// pattern proves the list, the sum proves the padding; `$t` is an `ident`
+/// because a pattern needs a path, and every row names a local struct.
 ///
 /// `#[repr(C)]` is the caller's responsibility; the WGSL/MSL layouts depend on it.
 macro_rules! impl_pod_zeroable {
-    ($t:ty { $($f:ident : $ft:ty),+ $(,)? }) => {
+    ($t:ident { $($f:ident : $ft:ty),+ $(,)? }) => {
         const _: () = assert!(
             ::core::mem::size_of::<$t>() == 0usize $(+ ::core::mem::size_of::<$ft>())+,
             concat!(
                 stringify!($t),
                 ": size_of is not the sum of its field sizes, so it has padding bytes. \
-                 `Pod` forbids them (give the hole an explicit `_pad` field), and the \
-                 field list in this `impl_pod_zeroable!` must name every field.",
+                 `Pod` forbids them (give the hole an explicit `_pad` field).",
             ),
         );
         const _: fn($t) = |v: $t| {
             fn is_pod<T: ::aterm_bits::Pod>(_: &T) {}
+            // Exhaustive, so the list names each field of `$t` exactly once.
+            let $t { $($f: _),+ } = v;
             // Reads the real field and binds it at the declared type, so the
             // two must match; the `Pod` bound then checks what was read.
             $({ let f: $ft = v.$f; is_pod(&f); })+

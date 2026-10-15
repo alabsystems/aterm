@@ -72,7 +72,7 @@ USAGE
                            the cut's signing profile (default
                            ~/.aterm/release-credentials.toml)
         --engine DIRECTORY the publication engine (default
-                           $PUBLICATION_ENGINE, else ~/Developer/publication, or ~/publication until it moves there)
+                           $PUBLICATION_ENGINE, else ~/publication)
         --dry-run          the plan, the ETA, and every refusal a real run would
                            meet; nothing changes
         --verbose          stream every step's output, not only into its log

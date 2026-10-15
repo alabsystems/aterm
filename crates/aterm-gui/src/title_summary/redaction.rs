@@ -12,9 +12,12 @@ pub(super) const MAX_SENSITIVE_SCAN_BYTES: usize = MAX_CONTEXT_BYTES;
 pub(super) const MAX_SENSITIVE_FIELDS: usize = 64;
 const MAX_SENSITIVE_LABEL_BYTES: usize = 128;
 
+/// What stands in for a line the privacy boundary withholds.
+pub(super) const REDACTED_LINE: &str = "[redacted potentially sensitive line]";
+
 pub(super) fn redact_context_line(line: &str) -> String {
     if contains_sensitive_text(line) {
-        "[redacted potentially sensitive line]".to_string()
+        REDACTED_LINE.to_string()
     } else {
         line.to_string()
     }

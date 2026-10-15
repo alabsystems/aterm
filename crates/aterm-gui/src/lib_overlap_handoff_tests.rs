@@ -171,8 +171,6 @@ fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<()> {
     app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id: 7,
         nonce: None,
         live: live.clone(),

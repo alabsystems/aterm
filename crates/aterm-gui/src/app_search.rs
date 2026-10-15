@@ -309,8 +309,9 @@ pub(crate) const HISTORY_AWAY_NONE: &str = "none yet, history rewrapping";
 /// What a find count rests on. The find bar, the window title and the spoken
 /// status word their qualifiers from this one value, so the three name the same
 /// cause: the depth cap (`newest 100,000 lines`), the match limit (`match
-/// limit`), a rewrap holding the history away (`rewrapping`), or output since
-/// the count (`stale`).
+/// limit`), a regex that could not finish a long line (`long line partly
+/// searched`), a rewrap holding the history away (`rewrapping`), or output
+/// since the count (`stale`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CountFacts {
     /// The count is a floor: some of the history was not searched, or the list
@@ -324,6 +325,11 @@ pub(crate) struct CountFacts {
     pub(crate) searched_lines: Option<usize>,
     /// The list stopped at [`aterm_search::MAX_SEARCH_MATCHES`].
     pub(crate) match_capped: bool,
+    /// A regex scan could not finish some line within the line's budget
+    /// ([`aterm_search::SearchResults::cut_short_lines`]): a soft-wrapped run
+    /// of megabytes, say. Its matches up to where the scan stopped are counted;
+    /// the rest of that line was not searched.
+    pub(crate) cut_short: bool,
 }
 
 impl CountFacts {
@@ -350,8 +356,9 @@ impl CountFacts {
     }
 
     /// Why a floor is a floor, when the code knows; `partial history` when it
-    /// does not. `None` for a whole census, and while the history is away
-    /// (`rewrapping` says it).
+    /// does not. `None` for a whole census, while the history is away
+    /// (`rewrapping` says it), and when a cut-short line is the whole reason
+    /// (its own word says it).
     fn cause(&self, hits: bool, short: bool) -> Option<String> {
         if self.history_away {
             None
@@ -360,14 +367,30 @@ impl CountFacts {
         } else if let Some(depth) = self.depth(short) {
             Some(depth)
         } else {
-            self.truncated.then(|| "partial history".to_string())
+            (self.truncated && !self.cut_short).then(|| "partial history".to_string())
         }
     }
 
-    /// The qualifiers of a count of hits, widest first: the cause, then
-    /// `rewrapping`, then `stale`.
+    /// `long line partly searched` (`short`: `line cut short`, which fits the
+    /// bar's status zone) when a regex scan could not finish some line. A word
+    /// of its own beside the cause, because it says what the depth cap and the
+    /// match limit do not: matches are missing INSIDE the history that was
+    /// searched.
+    pub(crate) fn cut_short_word(&self, short: bool) -> Option<String> {
+        self.cut_short.then(|| {
+            if short {
+                "line cut short".to_string()
+            } else {
+                "long line partly searched".to_string()
+            }
+        })
+    }
+
+    /// The qualifiers of a count of hits, widest first: the cause, then a
+    /// cut-short line, then `rewrapping`, then `stale`.
     pub(crate) fn hit_words(&self, short: bool) -> Vec<String> {
         let mut words: Vec<String> = self.cause(true, short).into_iter().collect();
+        words.extend(self.cut_short_word(short));
         if self.history_away {
             words.push("rewrapping".to_string());
         }
@@ -393,6 +416,7 @@ impl CountFacts {
         } else {
             self.cause(false, false).into_iter().collect()
         };
+        words.extend(self.cut_short_word(false));
         if self.stale {
             words.push("stale".to_string());
         }
@@ -515,6 +539,10 @@ pub(crate) struct SearchState {
     /// The batch stopped at [`aterm_search::MAX_SEARCH_MATCHES`]: there are
     /// more hits than the list holds. Implies [`Self::truncated`].
     pub(crate) match_capped: bool,
+    /// A regex scan could not finish some line within its budget, so the rest
+    /// of that line went unsearched ([`CountFacts::cut_short`]). Implies
+    /// [`Self::truncated`].
+    pub(crate) cut_short: bool,
     /// The search ran while a width change's rewrap held the session's history
     /// detached: the text may be there, the history is simply away. Implies
     /// [`Self::truncated`]; a zero-match here is `none yet`, never `no matches`,
@@ -551,6 +579,7 @@ impl SearchState {
             history_away: self.history_away,
             searched_lines: self.searched_lines,
             match_capped: self.match_capped,
+            cut_short: self.cut_short,
         }
     }
 
@@ -742,6 +771,7 @@ impl SearchState {
             self.regex_error,
             self.truncated,
             self.match_capped,
+            self.cut_short,
             self.history_away,
             self.results_dirty,
         ] {
@@ -1181,6 +1211,7 @@ impl App {
             truncated,
             searched_lines,
             match_capped,
+            cut_short,
             base_y,
             absolute_row_revision,
             history_renumber_epoch,
@@ -1201,6 +1232,7 @@ impl App {
                 false,
                 false,
                 None,
+                false,
                 false,
                 base_y,
                 row_rev,
@@ -1241,6 +1273,7 @@ impl App {
                     search.results.incomplete,
                     search.searched_lines,
                     search.results.matches.len() >= aterm_search::MAX_SEARCH_MATCHES,
+                    search.results.cut_short_lines > 0,
                     search.base_y,
                     search.absolute_row_revision,
                     search.history_renumber_epoch,
@@ -1248,8 +1281,10 @@ impl App {
                     search.cols,
                     search.consistent,
                 ),
-                // The only error is an invalid regex (literal search never errors) → no
-                // hits, and the bar flags "bad regex" instead of a misleading "no matches".
+                // The only error is a pattern the engine will not compile (literal
+                // search never errors, and a regex line its scan cannot finish is
+                // `cut_short_lines` in an `Ok`) → no hits, and the bar flags "bad
+                // regex" instead of a misleading "no matches".
                 Err(_) => {
                     let terminal = term_lock(&term);
                     (
@@ -1258,6 +1293,7 @@ impl App {
                         true,
                         false,
                         None,
+                        false,
                         false,
                         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
                         terminal.absolute_row_revision(),
@@ -1300,6 +1336,7 @@ impl App {
             s.truncated = truncated || (rewrapping && !query.is_empty());
             s.searched_lines = searched_lines;
             s.match_capped = match_capped;
+            s.cut_short = cut_short;
             s.history_away = rewrapping && !query.is_empty();
             if let Some(point) = point_match {
                 s.install_point_match(point);
@@ -2451,6 +2488,46 @@ mod tests {
         );
         search.query.clear();
         assert_eq!(search.spoken_status(), None);
+    }
+
+    /// R15 content-2: a regex that could not finish a long line is a floor
+    /// with its own name, in the title and the spoken status as on the bar —
+    /// never `bad regex`, which is what a long soft-wrapped run used to make
+    /// every regex find say, and never a vague `partial history`. Beside the
+    /// depth cap it is a second word, because it names matches missing INSIDE
+    /// the history that was searched.
+    #[test]
+    fn a_long_line_the_regex_could_not_finish_is_named() {
+        let cut = SearchState {
+            is_regex: true,
+            truncated: true,
+            cut_short: true,
+            ..seeded()
+        };
+        assert_eq!(
+            cut.window_title(),
+            "aterm — find: foo (1/3+, long line partly searched)"
+        );
+        assert_eq!(
+            cut.spoken_status().as_deref(),
+            Some("match 1 of 3 (long line partly searched)")
+        );
+        let none = SearchState {
+            matches: Vec::new(),
+            ..cut
+        };
+        assert_eq!(
+            none.window_title(),
+            "aterm — find: foo (no matches, long line partly searched)"
+        );
+        let deep = SearchState {
+            searched_lines: Some(100_000),
+            ..none
+        };
+        assert_eq!(
+            deep.spoken_status().as_deref(),
+            Some("no matches in newest 100,000 lines (long line partly searched)")
+        );
     }
 
     /// A floor names its cause, and the title, the spoken status and the bar

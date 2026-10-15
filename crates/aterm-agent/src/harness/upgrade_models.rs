@@ -1027,25 +1027,41 @@ pub struct UserModelSettings {
     pub allowed: Option<Vec<String>>,
 }
 
-/// Read [`UserModelSettings`] out of a settings file's text; anything
-/// malformed reads as absent.
+/// Read [`UserModelSettings`] out of a settings file's text, parsed as Claude
+/// Code parses a settings document (the settings chain's one parse,
+/// `claude_settings::parse`: an empty or blank text is `{}`, a leading
+/// byte-order mark is dropped); anything malformed reads as absent.
 #[must_use]
 pub fn parse_user_settings(text: &str) -> UserModelSettings {
-    let Ok(v) = aterm_json::from_str::<Value>(text) else {
-        return UserModelSettings::default();
-    };
+    crate::supervise::policy::claude_settings::parse(text)
+        .map(|v| model_settings_of(&v))
+        .unwrap_or_default()
+}
+
+/// [`UserModelSettings`] out of one parsed settings document `v` — or out
+/// of the values the settings chain's sources give each key, the highest
+/// that sets it (`upgrade_drive`'s `agent_settings`). An `availableModels`
+/// that is there and no list is an EMPTY allowlist, as Claude Code enforces
+/// one ("present but invalid; enforcing an empty allowlist", READ in the
+/// 2.1.300 bundle), never every model allowed.
+#[must_use]
+pub fn model_settings_of(v: &Value) -> UserModelSettings {
     UserModelSettings {
         default: v
             .get("model")
             .and_then(Value::as_str)
             .filter(|m| is_model_id(m))
             .map(str::to_string),
-        allowed: v.get("availableModels").and_then(Value::as_array).map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .filter(|m| is_model_id(m))
-                .map(str::to_string)
-                .collect()
+        allowed: v.get("availableModels").map(|a| {
+            a.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .filter(|m| is_model_id(m))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
         }),
     }
 }
@@ -1065,7 +1081,7 @@ pub fn list_target<'a>(list: &'a Priority, offered: &[String]) -> Option<&'a str
 
 /// Whether the person's `availableModels` (`None`: they set none) admits
 /// `id`, as itself or in its `[1m]` form.
-fn allowed_by(allowed: Option<&[String]>, id: &str) -> bool {
+pub(crate) fn allowed_by(allowed: Option<&[String]>, id: &str) -> bool {
     allowed.is_none_or(|ok| {
         ok.iter()
             .any(|x| x == id || x.strip_suffix("[1m]") == Some(id))
@@ -3380,6 +3396,28 @@ mod tests {
                     &fresh
                 ),
                 ModelVerdict::Keep("model-chosen-by-hand")
+            );
+        }
+    }
+
+    /// The person's `settings.json` is parsed as Claude Code parses a settings
+    /// document (the chain's one parse, `claude_settings::parse`): a leading
+    /// byte-order mark is dropped, so a marked file's allowlist and saved
+    /// default count; an empty or blank one sets nothing. The review of
+    /// 2026-10-14 found a marked file read as no allowlist at all, which
+    /// leaves every model allowed.
+    #[test]
+    fn a_marked_settings_file_keeps_its_allowlist_and_default() {
+        let u = parse_user_settings(
+            "\u{feff}{\"model\":\"opus\",\"availableModels\":[\"claude-opus-5-5\"]}",
+        );
+        assert_eq!(u.default.as_deref(), Some("opus"));
+        assert_eq!(u.allowed, Some(vec!["claude-opus-5-5".to_string()]));
+        for blank in ["", " \n\t", "\u{feff}"] {
+            assert_eq!(
+                parse_user_settings(blank),
+                UserModelSettings::default(),
+                "{blank:?}"
             );
         }
     }

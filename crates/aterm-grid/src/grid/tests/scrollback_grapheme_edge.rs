@@ -7,6 +7,12 @@
 use super::super::*;
 
 /// Unit test for `advance_grapheme_unit` with orphan ZWJ mid-text.
+///
+/// Ruling 2026-10-11 (r15 search-columns review): printable ASCII after a ZWJ
+/// opens a unit of its own, as the live grid draws `A` ZWJ `B` in two cells
+/// (`print_ascii_bulk` never folds); a non-ASCII char after it still folds,
+/// as the grid folds it. This test pinned the old three-char unit since the
+/// 2026-06-07 bootstrap.
 #[test]
 fn advance_grapheme_unit_orphan_zwj_mid_text() {
     use crate::grid::scroll_materialize::advance_grapheme_unit;
@@ -15,9 +21,64 @@ fn advance_grapheme_unit_orphan_zwj_mid_text() {
 
     let mut byte_idx = 0;
     let chars_consumed = advance_grapheme_unit(text, &mut byte_idx);
-    assert_eq!(chars_consumed, 3, "orphan ZWJ should consume A + ZWJ + B");
-    assert_eq!(byte_idx, text.len(), "should consume entire string");
-    assert_eq!(&text[..byte_idx], "A\u{200D}B");
+    assert_eq!(chars_consumed, 2, "the ZWJ joins A, and ASCII B does not");
+    assert_eq!(&text[..byte_idx], "A\u{200D}");
+    assert_eq!(advance_grapheme_unit(text, &mut byte_idx), 1);
+    assert_eq!(byte_idx, text.len(), "B is a unit of its own");
+
+    let text = "A\u{200D}\u{e9}";
+    let mut byte_idx = 0;
+    assert_eq!(
+        advance_grapheme_unit(text, &mut byte_idx),
+        3,
+        "a non-ASCII char after the ZWJ folds into the unit"
+    );
+    assert_eq!(byte_idx, text.len());
+}
+
+/// A regional indicator folds onto a unit whose base is a lone one, past a
+/// mark between them, as the live grid folds it (`try_combine_regional_indicator`
+/// reads the cell's base and counts the indicators it holds) and as
+/// `aterm_grapheme::GridColumns` lays a line out; a flag's third indicator
+/// starts a unit, and so does one after an indicator a ZWJ joined to another
+/// base. Ruling 2026-10-11 (r16 selection-stride review): the scan tested the
+/// scalar absorbed last, so on origin/main `🇺́🇸` was two units, drawn on a
+/// history row as two cells where the screen drew one flag.
+#[test]
+fn advance_grapheme_unit_folds_a_flag_half_onto_its_base_past_a_mark() {
+    use crate::grid::scroll_materialize::advance_grapheme_unit;
+
+    let units = |text: &'static str| {
+        let mut byte_idx = 0;
+        let mut out = Vec::new();
+        while byte_idx < text.len() {
+            let start = byte_idx;
+            advance_grapheme_unit(text, &mut byte_idx);
+            out.push(&text[start..byte_idx]);
+        }
+        out
+    };
+    for (text, want) in [
+        ("\u{1F1FA}\u{1F1F8}", vec!["\u{1F1FA}\u{1F1F8}"]),
+        (
+            "\u{1F1FA}\u{301}\u{1F1F8}",
+            vec!["\u{1F1FA}\u{301}\u{1F1F8}"],
+        ),
+        (
+            "\u{1F1FA}\u{1F1F8}\u{1F1EB}",
+            vec!["\u{1F1FA}\u{1F1F8}", "\u{1F1EB}"],
+        ),
+        (
+            "\u{1F1FA}\u{301}\u{1F1F8}\u{1F1EB}",
+            vec!["\u{1F1FA}\u{301}\u{1F1F8}", "\u{1F1EB}"],
+        ),
+        (
+            "\u{e9}\u{200D}\u{1F1FA}\u{1F1F8}",
+            vec!["\u{e9}\u{200D}\u{1F1FA}", "\u{1F1F8}"],
+        ),
+    ] {
+        assert_eq!(units(text), want, "{text:?}");
+    }
 }
 
 /// Unit test for consecutive combining marks.
@@ -261,7 +322,9 @@ fn materialize_stops_when_wide_char_cannot_fit_at_last_column() {
     );
 }
 
-/// Materialize round-trip for orphan ZWJ between visible chars.
+/// Materialize round-trip for orphan ZWJ between visible chars: the ZWJ stays
+/// in `A`'s cell and `B` has a cell of its own, as the live grid drew them
+/// (ruling 2026-10-11, see `advance_grapheme_unit_orphan_zwj_mid_text`).
 #[test]
 fn materialize_orphan_zwj_between_visible_chars() {
     use crate::grid::scroll_materialize::materialize_from_line;
@@ -280,9 +343,10 @@ fn materialize_orphan_zwj_between_visible_chars() {
     );
     assert_eq!(
         extra.unwrap().complex_char().map(|s| &**s),
-        Some("A\u{200D}B"),
-        "ZWJ-joined unit should be preserved as complex_char"
+        Some("A\u{200D}"),
+        "the ZWJ stays in A's cell"
     );
 
-    assert_eq!(row.cells[1].char(), 'X', "col 1 should be 'X'");
+    assert_eq!(row.cells[1].char(), 'B', "col 1 should be 'B'");
+    assert_eq!(row.cells[2].char(), 'X', "col 2 should be 'X'");
 }

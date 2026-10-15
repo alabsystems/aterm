@@ -19,6 +19,7 @@ impl Grid {
         {
             self.assert_cursor_in_bounds();
             self.assert_wide_char_consistent();
+            self.assert_extras_claimed();
             self.assert_scroll_region_valid();
             self.assert_ring_buffer_valid();
             self.assert_keys_cover_retained_rows();
@@ -135,6 +136,42 @@ impl Grid {
         }
     }
 
+    /// ExtrasClaimed: every extras-map entry keyed to a visible cell is claimed
+    /// by that cell's HAS_EXTRAS bit, or holds only truecolor fg/bg bytes (which
+    /// a BCE blank owns through its RGB marker, without the bit).
+    ///
+    /// An entry its cell does not claim is invisible to the readers that gate
+    /// on the bit, but a later write there with an extras style adopts it, and
+    /// `cell_extra`, `hyperlink_at` and checkpoint serialization read it
+    /// directly: an old combining mark, skin tone or link resurfaces on new
+    /// text. Every operation that blanks or replaces cells drops the entries
+    /// its cells no longer claim ([`Self::drop_unclaimed_extras`]). The no-panic
+    /// fuzzers (aterm-core `fuzz_process_never_panics`) run this after every
+    /// step, so an operation that forgets is found there. O(entries).
+    ///
+    /// # Panics
+    ///
+    /// Panics on a visible entry whose cell lacks HAS_EXTRAS.
+    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    pub fn assert_extras_claimed(&self) {
+        let (rows, cols) = (self.storage.visible_rows, self.storage.cols);
+        for (coord, extra) in self.storage.extras.iter() {
+            if coord.row >= rows || coord.col >= cols {
+                continue;
+            }
+            assert!(
+                !extra.has_claimable_data()
+                    || self
+                        .cell(coord.row, coord.col)
+                        .is_some_and(crate::Cell::has_extras),
+                "ExtrasClaimed violated: an extras entry at ({}, {}) whose cell does not \
+                 claim it: {extra:?}",
+                coord.row,
+                coord.col
+            );
+        }
+    }
+
     /// ScrollRegionValid + DisplayOffsetValid.
     #[cfg(any(debug_assertions, test, feature = "testing"))]
     fn assert_scroll_region_valid(&self) {
@@ -188,7 +225,11 @@ impl Grid {
             self.storage.visible_rows
         );
         // ring_head advances only when scroll_up reuses rows at capacity;
-        // reflow and erase_scrollback reset it. So ring_head > 0 implies full.
+        // reflow and erase_scrollback reset it. So ring_head > 0 implies every
+        // allocated row is retained. It does NOT imply the ring is at its cap:
+        // a rows-only grow's reveal or a ring-only limit raise lifts the cap
+        // under a wrapped ring, which is why every ring append linearizes first
+        // (`GridStorage::linearize_ring`).
         assert!(
             self.storage.ring_head == 0 || self.storage.total_lines == self.storage.rows.len(),
             "RingHeadCapacity violated: ring_head={} but total_lines ({}) != rows.len() ({})",

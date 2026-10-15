@@ -959,6 +959,11 @@ pub struct InkedCell {
     pub bold: bool,
     /// Text presentation (the glyph cell).
     pub text_presentation: bool,
+    /// The right half of a wide glyph: no glyph of its own (`ch` is a
+    /// space), the cell before it draws across it — the renderer's
+    /// `RenderCell::wide`. Only the presence row paints one (a CJK or emoji
+    /// role, `presence::paint_row`); the band's words are one cell each.
+    pub continuation: bool,
 }
 
 /// One resolved row: its cells, whether it has a surface (its gutters then
@@ -1226,6 +1231,7 @@ pub(crate) fn resolve(rp: &RowPaint<'_>, c: &BandInks) -> Resolved {
                 bg,
                 bold: cell.bold,
                 text_presentation: cell.text_presentation,
+                continuation: false,
             }
         })
         .collect();

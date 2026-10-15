@@ -2810,6 +2810,7 @@ pub(crate) mod fixtures {
                 questions: None,
                 identity: None,
                 agent: None,
+                supervised: None,
                 held: false,
             },
         ))
@@ -3135,6 +3136,7 @@ pub(crate) mod tests {
                 home: None,
                 login: None,
                 codex: None,
+                cause: None,
             }));
         }
         assert_eq!(
@@ -3237,6 +3239,7 @@ pub(crate) mod tests {
             home: None,
             login: None,
             codex: None,
+            cause: None,
         };
         let agent_in = |tab: u32| super::LeafProgram {
             window: 0,
@@ -3585,6 +3588,7 @@ pub(crate) mod tests {
             home: None,
             login: None,
             codex: None,
+            cause: None,
         };
         let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
         manifest.fill_agents(&|id| (id == 1).then(|| claude.clone()));
@@ -4654,6 +4658,7 @@ pub(crate) mod tests {
             home: None,
             login: None,
             codex: None,
+            cause: None,
         };
         let successor = || {
             let dir = scratch("cj-dir");

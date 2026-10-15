@@ -13,7 +13,7 @@
 //! A headless instance opens no window, and it is no WindowServer client. Until
 //! 2026-09-26 it was one on macOS: `--headless` built the real AppKit event
 //! loop, and an idle instance drew a WindowServer preflight within three
-//! seconds (AGENTS.md rule 5) — so for that while a login with NO GUI session
+//! seconds (AGENTS.md) — so for that while a login with NO GUI session
 //! (an ssh shell, a CI box) made AppKit log its refusal to connect, and a child
 //! that exited with that in its log was a `SKIP`. Headless now runs winit's
 //! display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`: no
@@ -193,7 +193,7 @@ fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
         !window_server_refused(&whole),
         "aterm --headless asked for a WindowServer connection (CoreGraphics logged its refusal: \
          this login has no GUI session). A headless process never opens one — on macOS it runs \
-         winit's display-free loop, with no NSApplication (AGENTS.md rule 5) — so a code path \
+         winit's display-free loop, with no NSApplication (AGENTS.md) — so a code path \
          reached AppKit or CoreGraphics: a door, not the environment. Log tail:\n{tail}"
     );
 }

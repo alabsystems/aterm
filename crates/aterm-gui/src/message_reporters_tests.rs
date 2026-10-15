@@ -3453,6 +3453,7 @@ fn reopened_with_agent(
         home: None,
         login: None,
         codex: None,
+        cause: None,
     };
     reopened
         .manifest

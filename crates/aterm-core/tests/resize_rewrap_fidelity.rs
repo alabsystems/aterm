@@ -455,3 +455,217 @@ fn a_restored_engine_rewraps_as_the_live_one() {
         }
     }
 }
+
+/// A history row rebuilt at a new width keeps an OSC 8 link or SGR 58
+/// underline colour only on the cells the rebuild put a glyph back in.
+///
+/// One column cannot hold a wide glyph: the rewrap gives it a line of its own,
+/// which rebuilds as an empty ring row (`fill_row_into` places nothing), as
+/// the screen's own rewrap blanks it (`copy_cells_to_row`). Its link and
+/// underline colour came back anyway, keyed to the empty cell, and a rows grow
+/// re-seated them there: an extras entry no cell claimed (which a later
+/// extras-styled write adopts), or, where the reveal claims what it re-seats,
+/// a click target on an empty cell. Found 2026-10-11 (r16) checking every
+/// path that shrinks a wide glyph out of existence, after the alternate
+/// screen's width cut; the synchronous ring path and the window's offloaded
+/// tiered path both rebuild ring rows this way.
+#[test]
+fn a_wide_glyph_one_column_cannot_hold_leaves_no_link_in_history() {
+    let link_on = "\x1b]8;;https://example.com/\x1b\\";
+    let link_off = "\x1b]8;;\x1b\\";
+    for glyph in ["\u{1F680}", "\u{4E2D}"] {
+        let line = format!("\x1b[4:3m\x1b[58;5;1m{link_on}{glyph}{link_off}\x1b[m\r\n");
+        for offload in [false, true] {
+            let mut term = if offload {
+                tiered(3, 4, 2)
+            } else {
+                let mut term = Terminal::new(3, 4);
+                term.set_scrollback_line_limit(Some(100));
+                term
+            };
+            for _ in 0..6 {
+                term.process(line.as_bytes());
+            }
+            let what = format!("{glyph:?} offload={offload}");
+            assert!(term.hyperlink_at(0, 0).is_some(), "{what}: linked before");
+            let history = term.grid().scrollback_lines();
+            for (rows, cols) in [(3, 1), (12, 1)] {
+                if offload {
+                    offloaded_resize(&mut term, rows, cols);
+                } else {
+                    term.resize(rows, cols);
+                }
+            }
+            assert!(
+                term.grid().scrollback_lines() < history,
+                "{what}: the rows grow reveals history"
+            );
+            for row in 0..term.rows() {
+                assert_eq!(
+                    term.hyperlink_at(row, 0),
+                    None,
+                    "{what}: row {row} holds no glyph, so it links nothing"
+                );
+            }
+            let (rows, cols) = (term.rows(), term.cols());
+            for (at, extra) in term.grid().extras().iter() {
+                assert!(
+                    at.row >= rows
+                        || at.col >= cols
+                        || (extra.hyperlink().is_none() && extra.underline_color_index().is_none()),
+                    "{what}: ({}, {}) keeps the dropped glyph's {extra:?}",
+                    at.row,
+                    at.col
+                );
+            }
+        }
+    }
+}
+
+/// Every cell of the view, at every display offset, whose link or SGR 58
+/// underline colour disagrees with `styled` (whether the cell holds part of
+/// the glyph the program styled, read from the cell's own char and, for a
+/// wide continuation, its lead's). The view is read as a person scrolls it:
+/// the screen, then each history row through its tier's materialization.
+fn view_style_strays(
+    term: &mut Terminal,
+    styled: impl Fn(char) -> bool,
+    what: &str,
+) -> Vec<String> {
+    let (rows, cols) = (term.rows(), term.cols());
+    let history = term.grid().scrollback_lines();
+    let mut strays = Vec::new();
+    term.scroll_to_bottom();
+    for offset in 0..=history {
+        if offset > 0 {
+            term.scroll_display(1);
+        }
+        for r in 0..rows {
+            let view = term.grid().visible_row_view(r);
+            for c in 0..cols {
+                let ch = view.col_char(c);
+                let lead = if ch == '\0' && c > 0 {
+                    view.col_char(c - 1)
+                } else {
+                    ch
+                };
+                let want = styled(lead);
+                let link = term.hyperlink_at_visible(r, c).is_some();
+                let underline = view.cell(c).is_some_and(|cell| {
+                    view.cell_data(c, cell)
+                        .cell_extra()
+                        .is_some_and(|extra| extra.underline_color_u32().is_some())
+                });
+                if link != want || underline != want {
+                    strays.push(format!(
+                        "{what}: offset {offset} ({r}, {c}) {lead:?} link={link} underline={underline}"
+                    ));
+                }
+            }
+        }
+    }
+    term.scroll_to_bottom();
+    strays
+}
+
+/// Scrolled back, a history row rebuilt where a wide glyph cannot fit shows
+/// no link or underline colour on its empty cell.
+///
+/// The fills that rebuild ring rows already restore a line's spans only on
+/// the cells they filled (`filled_span_cols`). The scrolled-back view of a
+/// tiered line goes through its own walk (`materialize_from_line`), which
+/// restored them up to the row's width: on one-column history every empty
+/// row of a dropped glyph answered its link. Found 2026-10-11 by the r16
+/// alt-extras review (48 linked blanks over 16 tiered one-column cases).
+#[test]
+fn a_one_column_history_row_scrolled_back_styles_no_blank() {
+    let link_on = "\x1b]8;;https://example.com/\x1b\\";
+    let link_off = "\x1b]8;;\x1b\\";
+    for glyph in ["\u{1F680}", "\u{4E2D}"] {
+        let line = format!("\x1b[4:3m\x1b[58;5;1m{link_on}{glyph}{link_off}\x1b[m\r\n");
+        for offload in [false, true] {
+            let mut term = if offload {
+                tiered(3, 4, 2)
+            } else {
+                let mut term = Terminal::new(3, 4);
+                term.set_scrollback_line_limit(Some(100));
+                term
+            };
+            for _ in 0..6 {
+                term.process(line.as_bytes());
+            }
+            if offload {
+                offloaded_resize(&mut term, 3, 1);
+            } else {
+                term.resize(3, 1);
+            }
+            let what = format!("{glyph:?} offload={offload}");
+            assert!(
+                term.grid().scrollback_lines() >= 3,
+                "{what}: history to scroll back through"
+            );
+            // One column holds none of the glyph, so nothing is styled.
+            let strays = view_style_strays(&mut term, |_| false, &what);
+            assert!(strays.is_empty(), "{strays:#?}");
+        }
+    }
+}
+
+/// A VS16 glyph the live grid kept narrow in mid row keeps the columns after
+/// it, in scrollback and through a history rewrap, so the link and underline
+/// colour of the glyph after it stay on that glyph.
+///
+/// The live writer cannot widen `❤️` at the last column (no room for the
+/// spacer), and the screen's own rewrap keeps that narrow cell narrow when a
+/// width change moves it into mid row. The line it scrolls into history
+/// records it narrow and keys the spans after it to those columns. Every
+/// reader re-widened it from its text: the scrolled-back row drew it two
+/// columns wide, a blank took the link of the 🚀 after it and the 🚀's
+/// right half lost it, and the history rewrap did the same to the line it
+/// built. Found 2026-10-11 by the r16 alt-extras review (3x4, widen to 3x8,
+/// scroll, 12x9).
+#[test]
+fn a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place() {
+    let text = "abc\u{2764}\u{FE0F} \x1b[4:3m\x1b[58;5;1m\x1b]8;;https://e.x/\x1b\\\u{1F680}\x1b]8;;\x1b\\\x1b[m";
+    let rocket = |ch: char| ch == '\u{1F680}';
+    for offload in [false, true] {
+        let mut term = if offload {
+            tiered(3, 4, 2)
+        } else {
+            let mut term = Terminal::new(3, 4);
+            term.set_scrollback_line_limit(Some(100));
+            term
+        };
+        let resize = |term: &mut Terminal, rows: u16, cols: u16| {
+            if offload {
+                offloaded_resize(term, rows, cols);
+            } else {
+                term.resize(rows, cols);
+            }
+        };
+        term.process(text.as_bytes());
+        resize(&mut term, 3, 8);
+        let what = format!("offload={offload}");
+        let row = term.grid().visible_row_view(0);
+        let cells: String = (0..8).map(|c| row.col_char(c)).collect();
+        assert_eq!(
+            cells, "abc\u{2764} \u{1F680}\0 ",
+            "{what}: the screen keeps the heart narrow in mid row"
+        );
+        let strays = view_style_strays(&mut term, rocket, &format!("{what} on screen"));
+        assert!(strays.is_empty(), "{strays:#?}");
+        // Into the ring, then on into the tiered store.
+        term.process(b"\r\n\r\n\r\n\r\n");
+        let strays = view_style_strays(&mut term, rocket, &format!("{what} in history"));
+        assert!(strays.is_empty(), "{strays:#?}");
+        for _ in 0..8 {
+            term.process(b"x\r\n");
+        }
+        let strays = view_style_strays(&mut term, rocket, &format!("{what} deeper"));
+        assert!(strays.is_empty(), "{strays:#?}");
+        // The history rewrap builds its line from the same columns.
+        resize(&mut term, 12, 9);
+        let strays = view_style_strays(&mut term, rocket, &format!("{what} rewrapped"));
+        assert!(strays.is_empty(), "{strays:#?}");
+    }
+}

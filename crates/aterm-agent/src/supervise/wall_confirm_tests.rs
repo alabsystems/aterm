@@ -7,7 +7,7 @@
 
 use aterm_phase::{ApiCause, WallKind, classify_wall};
 
-use super::{Entry, TranscriptEnd, confirms, transcript_ends_on};
+use super::{Entry, confirms, transcript_ends_on};
 
 /// A measured transcript fixture: its header line, then the rows.
 fn fixture(name: &str) -> &'static str {
@@ -233,14 +233,7 @@ fn a_tools_output_confirms_no_wall() {
         "mcp-long-wall-phrase",
     ] {
         let end = transcript_ends_on(fixture(name));
-        assert_eq!(
-            end,
-            TranscriptEnd {
-                last: Entry::Reply,
-                closed: true
-            },
-            "{name}"
-        );
+        assert_eq!((&end.last, end.closed), (&Entry::Reply, true), "{name}");
         for kind in every_kind() {
             assert!(!confirms(kind, &end), "{name}: {kind:?}");
         }
@@ -303,13 +296,7 @@ fn a_transcript_cut_before_its_notice_is_lagging() {
         rows("context").last().expect("its turn_duration")
     );
     let closed = transcript_ends_on(&closed);
-    assert_eq!(
-        closed,
-        TranscriptEnd {
-            last: Entry::Input,
-            closed: true
-        }
-    );
+    assert_eq!((&closed.last, closed.closed), (&Entry::Input, true));
     assert!(!closed.lagging());
 }
 

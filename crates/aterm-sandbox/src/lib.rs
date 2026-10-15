@@ -33,10 +33,9 @@ mod imp;
 pub enum Sandbox {}
 
 /// Resource limits to apply; `None` leaves a limit unchanged. On POSIX each
-/// value is installed as the soft limit and the inherited hard ceiling is kept,
-/// so the `$SHELL` can still raise its soft limit from its rc (`set_limit` in
-/// the unix actuator). On Windows `apply` installs nothing;
-/// `Limits::apply_to_job` is the Windows lane.
+/// value is installed as the soft limit, and as the hard limit too when
+/// [`Limits::binding`] is set (`set_limit` in the unix actuator). On Windows
+/// `apply` installs nothing; `Limits::apply_to_job` is the Windows lane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     /// CPU seconds (`RLIMIT_CPU`).
@@ -56,13 +55,31 @@ pub struct Limits {
     /// hostile child cannot act through the shared window station. `false`
     /// (the daily-driver default) leaves UI access unrestricted.
     pub restrict_ui: bool,
+    /// POSIX: whether each value also becomes the HARD limit, so the program
+    /// cannot raise it back (an unprivileged process can lower its hard limit
+    /// but never raise it). `false` keeps the inherited hard ceiling, so a soft
+    /// limit stays a guardrail the `$SHELL`'s rc can raise (`ulimit -n 65536`).
+    /// Windows ignores it: a Job Object limit binds the child already.
+    pub binding: bool,
 }
 
 impl Limits {
-    /// The hardened default for an interactive shell: caps fds, address space
+    /// The Safety-mode set for an interactive shell: caps fds, address space
     /// (not on macOS) and, on Windows, active processes and UI access; CPU and
     /// file size stay unbounded (a shell legitimately runs long and writes large
     /// files).
+    ///
+    /// On POSIX these are SOFT limits under the inherited hard ceiling: a
+    /// guardrail against a runaway program, which the program, or the person's
+    /// rc, can raise. Decided 2026-10-10 (P1 of the r13 policy hunt): Safety's
+    /// program is not hostile, and a common rc line raises the descriptor limit
+    /// past 8192 (`ulimit -n 10240` or `65536`). Measured on macOS 26.6 under a
+    /// hard ceiling of 8192: zsh prints `ulimit: value exceeds hard limit`,
+    /// bash and sh `cannot modify limit: Operation not permitted`, at every
+    /// shell start, and the shell stays at 8192; under the kept ceiling all
+    /// three raise it. A per-process ceiling would not bound a program that
+    /// forks anyway (POSIX has no process cap here). The hostile mode's set is
+    /// [`Self::contained`]. On Windows the Job Object binds them.
     #[must_use]
     // #[inline] so the MIR crosses the crate boundary and callers' Trust gates
     // (aterm-pty) verify this body instead of assuming an absent callee.
@@ -88,6 +105,28 @@ impl Limits {
             // Hardened modes confine an untrusted shell: lock its window-station
             // access.
             restrict_ui: true,
+            binding: false,
+        }
+    }
+
+    /// The Containment-mode set: [`Self::shell_default`]'s values, installed
+    /// as hard limits too, so the contained program cannot raise them back.
+    ///
+    /// RULING 2026-10-10 (P1 of the r13 policy hunt): Containment holds a
+    /// hostile program, so its limits bind. Until this ruling they went in
+    /// soft under the inherited hard ceiling (unlimited for `RLIMIT_NOFILE` on
+    /// macOS), and one `ulimit -n` by the contained program lifted them. The
+    /// cost, accepted: a contained shell whose rc raises the descriptor limit
+    /// past 8192 prints the shell's refusal at every start and keeps 8192
+    /// (measured, see [`Self::shell_default`]). What binds is per process:
+    /// POSIX sets no process cap here, so a program that forks holds 8192
+    /// descriptors in each child.
+    #[must_use]
+    #[inline]
+    pub fn contained() -> Self {
+        Limits {
+            binding: true,
+            ..Self::shell_default()
         }
     }
 
@@ -361,10 +400,86 @@ mod tests {
 
         // The shell rc raising its soft limit above the applied default.
         let raise = core::cmp::min(applied * 4, hard_before);
-        set_limit(libc::RLIMIT_NOFILE, Some(raise)).expect("raising the soft limit must succeed");
+        set_limit(libc::RLIMIT_NOFILE, Some(raise), false)
+            .expect("raising the soft limit must succeed");
         assert!(
             current(libc::RLIMIT_NOFILE) >= applied,
             "soft limit must be raisable above the applied sandbox default"
+        );
+    }
+
+    /// Run `probe` in a forked child, as the spawn seam's child runs
+    /// [`Limits::apply`] after `fork` and before `exec`, and return its exit
+    /// code. A hard limit, once lowered, stays lowered for the process, so only
+    /// a child may lower one. `probe` must be async-signal-safe: rlimit
+    /// syscalls only.
+    #[cfg(unix)]
+    fn in_forked_child(probe: impl FnOnce() -> i32) -> i32 {
+        // SAFETY: the child runs only `probe` (getrlimit/setrlimit, no
+        // allocation) and `_exit`, all async-signal-safe after `fork`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            let code = probe();
+            // SAFETY: ends the child without running the parent's destructors.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: reaping our own child into a valid out-param.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "the probe child did not exit");
+        libc::WEXITSTATUS(status)
+    }
+
+    /// RULING 2026-10-10 (P1 of the r13 policy hunt): a child that installed
+    /// [`Limits::contained`] cannot raise its descriptor limit back, as
+    /// `ulimit -n` would (soft and hard to one more than the cap); one that
+    /// installed [`Limits::shell_default`] can, which is what makes the first
+    /// refusal mean something.
+    #[cfg(unix)]
+    #[test]
+    fn a_contained_limit_cannot_be_raised_back() {
+        const RAISED: i32 = 0;
+        const REFUSED: i32 = 1;
+        const NOT_INSTALLED: i32 = 2;
+        let _serialized = nofile_guard();
+        let auth = unsafe { Authority::root_authority() };
+        let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
+        let open_files = Limits::contained()
+            .open_files
+            .expect("the set caps open files");
+        let hard = current_hard(libc::RLIMIT_NOFILE);
+        assert!(
+            hard > open_files,
+            "test precondition: inherited hard NOFILE ({hard}) must exceed the cap"
+        );
+        let raise_after = |limits: Limits| {
+            in_forked_child(move || {
+                if limits.apply(&cap).is_err() {
+                    return NOT_INSTALLED;
+                }
+                let above = (open_files + 1) as libc::rlim_t;
+                let lim = libc::rlimit {
+                    rlim_cur: above,
+                    rlim_max: above,
+                };
+                // SAFETY: a valid resource id and a fully initialized rlimit.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+                    RAISED
+                } else {
+                    REFUSED
+                }
+            })
+        };
+        assert_eq!(
+            raise_after(Limits::contained()),
+            REFUSED,
+            "a contained program raised its descriptor limit back"
+        );
+        assert_eq!(
+            raise_after(Limits::shell_default()),
+            RAISED,
+            "Safety's soft limit must stay raisable"
         );
     }
 }

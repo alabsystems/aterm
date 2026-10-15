@@ -681,7 +681,15 @@ fn ring_only_limit_grow_extends_retention_lazily() {
         "raising the limit allocates nothing up front"
     );
 
-    feed_numbered_lines(&mut grid, 100, 200);
+    // The raise left the ring wrapped (`ring_head != 0`) below its new cap, so
+    // the rows the next scrolls append must land at the ring's logical end,
+    // not the Vec's (R15-CHUNK-RING-SCROLL, 2026-10-11): every line feed
+    // scrolls, and history stays the write order.
+    feed_numbered_lines(&mut grid, 100, 30);
+    let want: Vec<String> = (48..128).map(|i| format!("L{i}")).collect();
+    assert_eq!(crate::grid::test_support::history_trimmed(&grid), want);
+    assert_eq!(grid.row(1).unwrap().to_string().trim_end(), "L129");
+    feed_numbered_lines(&mut grid, 130, 170);
     assert_eq!(
         grid.scrollback_lines(),
         120,

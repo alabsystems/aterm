@@ -185,6 +185,16 @@ impl TerminalHandler<'_> {
         // marks and ZWJ are not "preceding graphic characters", ECMA-48
         // §8.3.103). Track the raw received char: xterm re-translates it through
         // the current GL charset at REP time.
+        //
+        // Ruling 2026-10-10 (r15 C3): REP repeats the last graphic character
+        // received, even one the grid folds into the cell before it (a skin-tone
+        // modifier, a flag's second regional indicator, a glyph after a ZWJ):
+        // ECMA-48 names "the preceding character in the data stream", and xterm
+        // repeats `lastchar`, the last printable it was handed. The repeat then
+        // lays out as that character would (a modifier joins its toned emoji,
+        // UAX #29 GB9: no break before Extend). `write_unicode_bulk` records it
+        // the same way, so what REP repeats does not depend on whether the
+        // emoji arrived in one read, across two, or under an extras pen.
         self.transient.last_graphic_char = Some(c);
 
         // Emoji skin tone modifiers (U+1F3FB-U+1F3FF) should combine with the
@@ -203,7 +213,20 @@ impl TerminalHandler<'_> {
 
         // ZWJ sequence continuation: combine with previous cell for emoji sequences.
         // Fast-path: skip the expensive grid lookup unless the last combining char was ZWJ.
-        if self.transient.last_combining_was_zwj && self.should_combine_with_previous_zwj() {
+        //
+        // Never printable ASCII (ruling 2026-10-10, r15 C5): UAX #29 GB11 joins a
+        // ZWJ only to Extended_Pictographic, and no ASCII character is one, so
+        // `a`ZWJ`x` is two clusters; `aterm_grapheme::GridColumns` (find, copy and
+        // selection's column measurer) opens a cell for it, and so does the
+        // ASCII run writer. Without this, the run writer and this per-character
+        // path (IRM, DECAWM off, a national charset that leaves the byte ASCII,
+        // the rest of a VT52 address run) laid the same bytes out a column
+        // apart. A translated glyph (DEC graphics `x` is `│`) is not ASCII and
+        // folds as any other non-ASCII glyph after a ZWJ does.
+        if self.transient.last_combining_was_zwj
+            && !translated.is_ascii()
+            && self.should_combine_with_previous_zwj()
+        {
             self.add_combining_to_previous_cell(translated);
             return;
         }
@@ -345,24 +368,29 @@ impl TerminalHandler<'_> {
                     continue;
                 }
                 if width == 2 {
+                    // A folded glyph is still the last graphic character REP
+                    // repeats, as `write_char` records it before folding.
                     // ZWJ continuation: combine with previous cell for emoji sequences.
                     if self.transient.last_combining_was_zwj
                         && self.should_combine_with_previous_zwj()
                     {
                         self.add_combining_to_previous_cell(c);
                         self.transient.last_combining_was_zwj = false;
+                        last_graphic = Some(c);
                         i += 1;
                         continue;
                     }
                     // Skin tone modifiers combine with previous emoji base.
                     if is_emoji_skin_tone_modifier(c) && self.try_combine_skin_tone_modifier(c) {
                         self.transient.last_combining_was_zwj = false;
+                        last_graphic = Some(c);
                         i += 1;
                         continue;
                     }
                     // Regional-indicator pairs form one flag glyph (see write_char).
                     if is_regional_indicator(c) && self.try_combine_regional_indicator(c) {
                         self.transient.last_combining_was_zwj = false;
+                        last_graphic = Some(c);
                         i += 1;
                         continue;
                     }
@@ -738,6 +766,13 @@ impl TerminalHandler<'_> {
     fn add_combining_to_previous_cell(&mut self, combining: char) {
         let (row, col) = self.combining_target_cell();
         self.grid.cell_extra_mut(row, col).add_combining(combining);
+        // A mark attached to a cell writes it (`Row::len`'s one rule, ruling
+        // 2026-10-10, r15 C4): a mark on a printed blank, or on the cell under
+        // the cursor with nothing before it, is part of the line, so the render
+        // frame, copy and search reach it.
+        if let Some(r) = self.grid.row_mut(row) {
+            r.update_len(col.saturating_add(1));
+        }
         // Combining marks, variation selectors, and joined emoji change the
         // grapheme even when no base cell is rewritten or cursor advanced.
         self.grid.mark_content_cell(row, col);
@@ -817,9 +852,12 @@ impl TerminalHandler<'_> {
             crate::grid::Cell::from_raw_parts(char_data, colors, base_flags.union(CellFlags::WIDE));
         // The spacer inherits the base cell's rendition, as in
         // `Row::write_wide_char_packed`, so an inverse-video ⌚️ keeps its right half.
+        // It claims no extras entry of its own yet: the base's rendition values
+        // are mirrored onto a fresh one below, and the cell it replaces keeps
+        // none (a combining mark on it would otherwise reappear on the spacer).
         let cont_cell = crate::grid::Cell::from_raw_parts(
             ' ' as u16,
-            colors,
+            colors.without_extras_flag(),
             base_flags.wide_continuation_of(),
         );
         // If the continuation column holds the first half of another wide
@@ -852,6 +890,10 @@ impl TerminalHandler<'_> {
             row_data.set(col, wide_base);
             row_data.set(cont_col, cont_cell);
         }
+        // The cell the spacer replaced and a pair's half the widening orphaned
+        // drop the extras they carried (`Grid::drop_unclaimed_extras`).
+        self.grid
+            .drop_unclaimed_extras(row, cont_col..cont_col.saturating_add(2));
 
         // The spacer also inherits the base's rendition values (truecolor fg/bg,
         // SGR 58 underline colour): the base was written narrow, so its extras
@@ -885,9 +927,20 @@ impl TerminalHandler<'_> {
     /// in the spacer's `PackedColors`, copied from the base.
     fn mirror_vs16_spacer_extras(&mut self, row: u16, lead: u16, spacer: u16) {
         // Ring-aware: the RGB hot path stores into a dense ring, the rest into
-        // the map, and these accessors read both in that order.
-        let fg = self.grid.fg_rgb_at(row, lead);
-        let bg = self.grid.bg_rgb_at(row, lead);
+        // the map, and these accessors read both in that order. Only the
+        // channels the lead's colours mark truecolor: the ring keeps a cell's
+        // bytes after a later SGR made it indexed, and which writer left them
+        // there depends on the read boundaries, so carrying them gave the spacer
+        // an entry (and its HAS_EXTRAS claim) by chunking.
+        let lead_cell = self.grid.cell(row, lead).copied();
+        let fg = lead_cell
+            .is_some_and(|c| c.fg_needs_overflow())
+            .then(|| self.grid.fg_rgb_at(row, lead))
+            .flatten();
+        let bg = lead_cell
+            .is_some_and(|c| c.bg_needs_overflow())
+            .then(|| self.grid.bg_rgb_at(row, lead))
+            .flatten();
         let underline = self
             .grid
             .cell_extra(row, lead)
@@ -947,6 +1000,9 @@ impl TerminalHandler<'_> {
             row_data.set(col, narrow_base);
             row_data.set(cont_col, crate::grid::Cell::EMPTY);
         }
+        // The emptied spacer drops what it carried (a link, a mirrored colour).
+        self.grid
+            .drop_unclaimed_extras(row, cont_col..cont_col.saturating_add(1));
 
         // Mark affected cells as damaged.
         self.grid.damage_mut().mark_cell(row, col);

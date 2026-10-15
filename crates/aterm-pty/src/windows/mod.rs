@@ -1227,6 +1227,14 @@ pub fn reap_shell(identity: crate::ShellIdentity) {
     reap(identity.pid);
 }
 
+/// The Unix `reap_shell_in_background` twin: [`reap_shell`] on a thread of its
+/// own, so the caller never waits.
+pub fn reap_shell_in_background(identity: crate::ShellIdentity) {
+    if identity.pid > 1 {
+        std::thread::spawn(move || reap_shell(identity));
+    }
+}
+
 /// Platform-neutral twin of the Unix collector: the recorded exit code, if the
 /// waiter thread has already observed the child end.
 ///
@@ -1338,6 +1346,9 @@ pub enum ReadOutcome {
     /// Never produced on Windows (a plain blocking read has no poll-timeout / stop-flag
     /// path); present to mirror the Unix enum for the shared loop.
     Idle,
+    /// Never produced on Windows (the waiter thread closes the pseudoconsole when the
+    /// child exits, which EOFs the reader); present to mirror the Unix enum.
+    Exited,
 }
 
 /// Windows has no orphaned-different-pgroup reader-pin problem (ConPTY teardown flows
@@ -1349,8 +1360,9 @@ pub fn make_wake_pipe() -> Option<(i32, i32)> {
 }
 
 /// With no wake pipe on Windows (`wake_rd` is always the `-1` sentinel), this is a
-/// plain blocking read reported as [`ReadOutcome`].
-pub fn read_or_wake(master: i32, buf: &mut [u8], _wake_rd: i32) -> ReadOutcome {
+/// plain blocking read reported as [`ReadOutcome`]. No exit watch either: the
+/// child's exit already ends the read.
+pub fn read_or_wake(master: i32, buf: &mut [u8], _wake_rd: i32, _exit_rd: i32) -> ReadOutcome {
     let n = read(master, buf);
     if n > 0 {
         ReadOutcome::Data(n as usize)

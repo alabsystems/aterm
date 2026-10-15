@@ -250,6 +250,12 @@ impl SessionHost for GuiHost<'_> {
         Some(ok)
     }
 
+    /// Ended once the session's fabric endpoint is closed: its program exited
+    /// or its tab closed (`SessionFabric::close`, then a subscriber notify).
+    fn session_ended(&self, sid: u64) -> bool {
+        self.serves(sid) && self.ctx.is_some_and(|ctx| ctx.fabric.endpoint_closed())
+    }
+
     fn request_redraw(&self, sid: u64) {
         if !self.serves(sid) {
             return;
@@ -698,5 +704,136 @@ mod tests {
         let scoped = GuiHost::new(0, &term, None, &reg);
         assert!(!scoped.capabilities().input_sink);
         assert_eq!(scoped.write_input(0, b"echo hi\r"), Some(false));
+    }
+
+    /// A CLOSED TAB ENDS WHAT IS PARKED ON IT. A driver parks `await inbox` and
+    /// `wait` on a tab, and the tab is closed. Both answer `ERR exited` at the
+    /// close; before, they slept to their deadline (up to ten minutes) and then
+    /// answered `OK timeout`, and all that time each lane's `SessionCtx` clone,
+    /// whose sink owns the master, held the closed tab's PTY open. Once they
+    /// answer, the lanes hold nothing of the session.
+    #[test]
+    fn closing_a_tab_ends_its_parked_waits_with_err_exited() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let id = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(id));
+        let (term, ctx) = {
+            let session = app.pool.get(id).expect("the tab's session");
+            (session.term.clone(), session.ctx.clone())
+        };
+        let (answered, answers) = std::sync::mpsc::channel();
+        let inbox = {
+            let (ctx, answered) = (ctx.clone(), answered.clone());
+            std::thread::spawn(move || {
+                let reply = crate::fabric::cmd_await_inbox(&ctx, &["since=0"], 600_000);
+                answered.send(("await inbox", reply)).unwrap();
+            })
+        };
+        let wait = {
+            let (term, ctx) = (term.clone(), ctx.clone());
+            let (store, subscribers) = (app.store.clone(), app.subscribers.clone());
+            std::thread::spawn(move || {
+                let host = GuiHost::with_fleet(id, &term, None, &subscribers, &store, &ctx);
+                let reply = aterm_control::selection::cmd_wait(&host, id, "600000");
+                answered.send(("wait", reply)).unwrap();
+            })
+        };
+        // `wait` is parked once its subscriber is registered: the close wakes it,
+        // where an entry check would have answered it anyway.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "`wait` parks on the tab",
+            || (app.subscribers.lock().unwrap().watchers(id) == 1).then_some(()),
+        );
+        app.close_session_by_id(id).expect("the tab closes");
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            // A hang detector, not a latency budget: the close is the event.
+            replies.push(
+                answers
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("a wait parked on the closed tab never answered"),
+            );
+        }
+        replies.sort_unstable();
+        assert_eq!(
+            replies,
+            [
+                ("await inbox", "ERR exited\n".to_string()),
+                ("wait", "ERR exited\n".to_string())
+            ]
+        );
+        inbox.join().unwrap();
+        wait.join().unwrap();
+        assert_eq!(
+            Arc::strong_count(&ctx),
+            1,
+            "something still holds the closed tab's context, and with it its master"
+        );
+    }
+
+    /// The exit half: a shell that exits under `--hold` keeps its pane, so no
+    /// close ever comes, and the exit edge (`exit_session_logical`, the
+    /// logical core of `Wake::Exit` and of a deferred exit's replay) must end
+    /// what is parked on it by itself: `await inbox` from the fabric it closes,
+    /// `wait` from the subscriber wake it sends.
+    #[test]
+    fn a_held_shells_exit_ends_its_parked_waits_with_err_exited() {
+        let mut app = crate::App::headless_for_test();
+        app.hold = true;
+        let wid = crate::WindowId(0);
+        let id = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(id));
+        let (term, ctx) = {
+            let session = app.pool.get(id).expect("the tab's session");
+            (session.term.clone(), session.ctx.clone())
+        };
+        let (answered, answers) = std::sync::mpsc::channel();
+        let inbox = {
+            let (ctx, answered) = (ctx.clone(), answered.clone());
+            std::thread::spawn(move || {
+                let reply = crate::fabric::cmd_await_inbox(&ctx, &["since=0"], 600_000);
+                answered.send(("await inbox", reply)).unwrap();
+            })
+        };
+        let wait = {
+            let (term, ctx) = (term.clone(), ctx.clone());
+            let (store, subscribers) = (app.store.clone(), app.subscribers.clone());
+            std::thread::spawn(move || {
+                let host = GuiHost::with_fleet(id, &term, None, &subscribers, &store, &ctx);
+                let reply = aterm_control::selection::cmd_wait(&host, id, "600000");
+                answered.send(("wait", reply)).unwrap();
+            })
+        };
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "`wait` parks on the tab",
+            || (app.subscribers.lock().unwrap().watchers(id) == 1).then_some(()),
+        );
+        assert!(
+            app.exit_session_logical(id).is_empty(),
+            "`--hold` keeps the pane"
+        );
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            // A hang detector, not a latency budget: the exit is the event.
+            replies.push(
+                answers
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("a wait parked on the exited shell never answered"),
+            );
+        }
+        replies.sort_unstable();
+        assert_eq!(
+            replies,
+            [
+                ("await inbox", "ERR exited\n".to_string()),
+                ("wait", "ERR exited\n".to_string())
+            ]
+        );
+        inbox.join().unwrap();
+        wait.join().unwrap();
+        assert!(app.pool.get(id).is_some(), "the held pane stays");
     }
 }

@@ -261,6 +261,8 @@ fn stand_in() -> Command {
     c.arg(PARK[0])
         .env(PARK_ENV, "1")
         .env("ATERM_PARENT_SESSION_ID", TAB)
+        // An unset Claude home is its process's own HOME's: the sweep's.
+        .env_remove("HOME")
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());

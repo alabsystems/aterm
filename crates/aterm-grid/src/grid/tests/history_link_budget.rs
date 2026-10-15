@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use aterm_scrollback::Scrollback;
 
+use crate::Grid;
 use crate::grid::ScrolledRowExtras;
-use crate::{CellCoord, Grid};
 
 /// Columns per row: every cell of a linked row carries its own link.
 const COLS: u16 = 80;
@@ -58,9 +58,7 @@ fn write_row(
     }
     let at = grid.cursor().row;
     for col in cols {
-        grid.extras_mut()
-            .get_or_create(CellCoord::new(at, col))
-            .set_hyperlink(Some(link(col)));
+        grid.cell_extra_mut(at, col).set_hyperlink(Some(link(col)));
     }
     grid.carriage_return();
     grid.line_feed();

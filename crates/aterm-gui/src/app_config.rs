@@ -629,7 +629,8 @@ pub(crate) struct Config {
     pub(crate) allow_window_ops: Option<bool>,
     /// Allow desktop notifications (OSC 9 / 99 / 777). Default off. Delivery runs
     /// under aterm's identity (`terminal-notifier` or `osascript`; see
-    /// `notify.rs`), hence the opt-in.
+    /// `notify.rs`), hence the opt-in. Never for a Containment tab
+    /// (`spawn::host_reach`).
     pub(crate) allow_notifications: Option<bool>,
     /// Security opt-in: allow apps to set indexed colors (OSC 4 / numeric OSC 21).
     /// Default OFF. Maps to `allow_palette_reconfigure`.
@@ -637,7 +638,8 @@ pub(crate) struct Config {
     /// Allow Kitty graphics non-direct mediums (`t=f` file, `t=t` temp file,
     /// `t=s` POSIX shm) to read host files. Default off (an exfiltration
     /// surface). When on, a size-capped resolver is installed
-    /// (`spawn::configure_kitty_file_transfer`).
+    /// (`spawn::configure_kitty_file_transfer`), never for a Containment tab
+    /// (`spawn::host_reach`).
     pub(crate) allow_kitty_file_transfer: Option<bool>,
     /// Run the per-session temporal recorder read by the `temporal` control verb.
     /// Default off (no writer thread, no retention). When on, each tab seeds a t0

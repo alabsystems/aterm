@@ -22,7 +22,7 @@
 //! value. A completed search is consistent because every slice saw the same key.
 
 use super::Terminal;
-use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
+use super::search_rows::history_row_for_search;
 use crate::search::{BudgetedSearch, SearchOptionsError, SearchResults};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -157,12 +157,15 @@ impl Terminal {
     /// makes delivery progress. Drive to `complete` by passing each step's
     /// cursor back and appending the returned result deltas.
     ///
+    /// A row whose regex scan runs out of its budget is not an error: it is
+    /// counted in the results' `cut_short_lines`, which marks them incomplete,
+    /// as the one-shot search counts it.
+    ///
     /// # Errors
     /// Propagates pattern errors from the engine (invalid/oversized regex,
-    /// regex feature disabled, or a regex that exhausted its per-line scan
-    /// budget on a row this call fed — the one-shot search's refusal, never a
-    /// truncated list), and fails closed if the process-wide non-repeating
-    /// cursor space is exhausted. No state is retained after an error.
+    /// regex feature disabled), and fails closed if the process-wide
+    /// non-repeating cursor space is exhausted. No state is retained after an
+    /// error.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -353,20 +356,20 @@ impl Terminal {
         // `hist_end <= end <= total_rows`), so every row left here is visible.
         while state.engine.rows_fed() < end {
             let i = state.engine.rows_fed();
-            let text = i
+            let (text, cells) = i
                 .checked_sub(state.scrollback)
                 .and_then(|visible_row| u16::try_from(visible_row).ok())
-                .and_then(|r| self.written_line_text(i32::from(r)))
+                .and_then(|r| self.written_line_cells(i32::from(r)))
                 .unwrap_or_default();
-            state.engine.feed_row_owned(text);
+            state.engine.feed_row_cells(text, &cells);
         }
 
-        // A regex that exhausted its scan budget on a row fed above is refused
-        // here, as the one-shot search refuses it. `state` was taken out of
-        // `self`, so the error leaves no search behind.
+        // A row whose regex scan ran out of budget is counted in the
+        // results' `cut_short_lines` (and marks them incomplete), as the
+        // one-shot search counts it.
         let results = state
             .engine
-            .results_range(state.emitted_matches, MAX_MATCHES_PER_STEP)?;
+            .results_range(state.emitted_matches, MAX_MATCHES_PER_STEP);
         state.emitted_matches = state.emitted_matches.saturating_add(results.matches.len());
         let complete =
             state.engine.is_complete() && state.emitted_matches >= state.engine.result_count();
@@ -409,13 +412,10 @@ impl Terminal {
             .history_lines_from(hist_start)
             .chain(std::iter::repeat_with(|| None))
             .take(hist_end - hist_start);
-        for line in lines {
-            let text = line
-                .map(|l| {
-                    line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
-                })
-                .unwrap_or_default();
-            state.engine.feed_row_owned(text);
+        for (k, line) in lines.enumerate() {
+            let (text, cells) =
+                history_row_for_search(&self.grid, hist_start.saturating_add(k), line);
+            state.engine.feed_row_cells(text, &cells);
         }
     }
 
@@ -476,7 +476,7 @@ impl Terminal {
                 && state.ambiguous_width == self.ambiguous_width()
             {
                 // The completed scan already verified these matches; reuse them.
-                return state.engine.results();
+                return Ok(state.engine.results());
             }
         }
         self.indexed_search()
@@ -486,8 +486,8 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetedSearchError, MAX_MATCHES_PER_STEP, Terminal, allocate_cursor};
-    use crate::search::{SearchOptionsError, SearchResults};
+    use super::{MAX_MATCHES_PER_STEP, Terminal, allocate_cursor};
+    use crate::search::SearchResults;
     use std::sync::atomic::AtomicU64;
 
     fn one_shot(
@@ -526,6 +526,7 @@ mod tests {
             );
             let incomplete = step.results.incomplete;
             let lowest_retained_line = step.results.lowest_retained_line;
+            let cut_short_lines = step.results.cut_short_lines;
             if let Some(existing) = search_id {
                 assert!(!step.reset, "a valid resume must not reset the stream");
                 assert_eq!(step.search_id, existing, "search identity is stable");
@@ -537,7 +538,8 @@ mod tests {
             if step.complete {
                 assert_eq!(step.cursor, None, "a complete step carries no cursor");
                 return (
-                    SearchResults::new(matches, incomplete, lowest_retained_line),
+                    SearchResults::new(matches, incomplete, lowest_retained_line)
+                        .with_cut_short_lines(cut_short_lines),
                     steps,
                 );
             }
@@ -733,54 +735,34 @@ mod tests {
         assert_eq!(got, one_shot(&mut t, "NEEDLE", true, false));
     }
 
-    /// A regex the per-line scan budget cannot afford is refused by the
-    /// budgeted search exactly as the one-shot search refuses it, and leaves no
-    /// state behind. It is never `Ok` with what the scan found before it gave
-    /// up: that list reads as every match there is. Both shapes of
-    /// "unaffordable": one search over budget, and a `find_iter` whose searches
-    /// each fit but together re-walk the row quadratically.
+    /// A row the per-line regex scan budget cannot afford is reported by the
+    /// budgeted search exactly as the one-shot search reports it: the row
+    /// counted in `cut_short_lines`, the results incomplete, and the rows
+    /// around it still searched. It is never `incomplete == false` over a row
+    /// whose tail was not read. Both shapes of "unaffordable": one search over
+    /// budget, and a `find_iter` whose searches each fit but together re-walk
+    /// the row quadratically.
     #[test]
-    fn an_unaffordable_regex_is_refused_not_truncated() {
+    fn an_unaffordable_regex_row_is_reported_not_passed_off() {
         for (pattern, row) in [
             ("(?:x?){1020}z", format!("{}z", "x".repeat(4095))),
             (r"\w+=|\w", "a".repeat(4096)),
         ] {
             for budget in [1, usize::MAX] {
                 let mut t = Terminal::new(3, 4096);
-                t.process(format!("before\r\n{row}\r\nafter").as_bytes());
+                t.process(format!("before z\r\n{row}\r\nafter z").as_bytes());
                 let oracle = t
                     .indexed_search()
                     .search_results_opts(pattern, true, true)
-                    .map_err(BudgetedSearchError::SearchOptions);
-                let mut cursor = None;
-                let mut matches = Vec::new();
-                let got = loop {
-                    match t.search_budgeted(pattern, true, true, cursor, budget) {
-                        Err(e) => break Err(e),
-                        Ok(step) => {
-                            matches.extend(step.results.matches);
-                            if step.complete {
-                                break Ok(SearchResults::new(
-                                    matches,
-                                    step.results.incomplete,
-                                    step.results.lowest_retained_line,
-                                ));
-                            }
-                            cursor = step.cursor;
-                        }
-                    }
-                };
-                assert_eq!(got, oracle, "{pattern:?} budget={budget}");
+                    .expect("a row out of budget is reported, not refused");
+                assert_eq!(oracle.cut_short_lines, 1, "{pattern:?}: {oracle:?}");
+                assert!(oracle.incomplete, "{pattern:?}");
                 assert!(
-                    matches!(
-                        &got,
-                        Err(BudgetedSearchError::SearchOptions(
-                            SearchOptionsError::InvalidRegex(m)
-                        )) if m.contains("too expensive")
-                    ),
-                    "{pattern:?} must exhaust the scan budget: {got:?}"
+                    oracle.matches.iter().any(|m| m.start_col == 6),
+                    "{pattern:?}: the row after the long one is searched: {oracle:?}"
                 );
-                assert!(t.budgeted_search.is_none(), "a refusal retains no state");
+                let (got, _) = drive(&mut t, pattern, true, true, budget);
+                assert_eq!(got, oracle, "{pattern:?} budget={budget}");
             }
         }
     }

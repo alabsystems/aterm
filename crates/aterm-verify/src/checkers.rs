@@ -53,13 +53,23 @@ use crate::identity::FileStamp;
 /// The three programs, in the order the ladder names them.
 pub const NAMES: [&str; 3] = ["ty", "trust-ir", "ay"];
 
-/// How long one `--version` may take: `aterm-spec`'s own bound. A checker that
-/// does not answer in time is recorded without a version, never waited for.
-/// Every run asks under it, the gate's own fixtures too: a checker they have
-/// just written is run once before the run, so its first exec — which waits
-/// on macOS's assessment of the new file — is paid outside this bound
-/// (`tests/common`'s `run_once`, the review of 2026-09-28).
-pub const VERSION_DEADLINE: Duration = Duration::from_secs(5);
+/// How long one `--version` may take before the checker is called wedged: a
+/// HANG DETECTOR, not a latency budget, and `aterm-spec`'s own bound (its
+/// `PROBE_HANG`). A checker that does not answer in time is recorded without
+/// a version, never waited for longer. Every run asks under it, the gate's own
+/// fixtures too: a checker they have just written is run once before the run,
+/// so its first exec — which waits on macOS's assessment of the new file — is
+/// paid outside this bound (`tests/common`'s `run_once`, the review of
+/// 2026-09-28).
+///
+/// It was 5 s, a copy of `aterm-spec`'s bound from before that bound became a
+/// hang detector (4632b9d9b). Ruling 2026-10-10: a run's answer is part of the
+/// receipt's checker identity, so a bound a loaded machine can exceed turned
+/// one slow answer into a different identity, and a base receipt that could
+/// not serve. Measured: round fourteen's merge-contract run at load 30-70 read
+/// `no --version answer` from a stand-in run once beforehand, and
+/// `a_red_main_already_has_is_inherited_and_a_new_one_blocks` failed on it.
+pub const VERSION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The size bound on a shim this will read — atpkg's `MAX_SHIM_BYTES`, as
 /// `aterm-spec` mirrors it.
@@ -529,6 +539,32 @@ mod tests {
         );
         assert!(c.each[0].found.is_some(), "{}", c.summary());
         assert_eq!(c.each[0].version, None, "{}", c.summary());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A SLOW ANSWER IS STILL AN ANSWER. A checker that takes longer than the
+    /// old 5 s bound, as a loaded machine's do, is recorded with its version
+    /// under the bound every run asks under. Run once first, as the fixtures
+    /// do, so only its own sleep is timed; that first run leaves the mark
+    /// that makes every later one slow.
+    #[cfg(unix)]
+    #[test]
+    fn a_checker_slower_than_a_busy_machine_allows_is_still_answered() {
+        let tmp = crate::mktemp_dir("atv-checkers-slow").expect("mktemp");
+        let on_path = tmp.join("path");
+        let ty = on_path.join("ty");
+        script(
+            &ty,
+            "if [ -e \"$0.ran\" ]; then /bin/sleep 6; fi; : >\"$0.ran\"; echo 'ty slow'",
+        );
+        run_once(&ty);
+        let c = Checkers::capture(&tmp.join("home"), on_path.as_os_str());
+        assert_eq!(
+            c.each[0].version.as_deref(),
+            Some("ty slow"),
+            "{}",
+            c.summary()
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 

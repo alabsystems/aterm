@@ -2471,12 +2471,22 @@ const DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// The bound covers the whole call. git reaches a remote through a child of its
 /// own (`git-remote-https`, `ssh`) that inherits its pipes, so git runs in its
 /// own process group and an overrun kills the group
-/// ([`crate::exec::group::kill`]). The drains are waited on for [`DRAIN_GRACE`]
-/// at most: a helper that left the group and still holds a pipe costs a
-/// detached thread, never the gate's time. The group is on the interrupt list
-/// while it runs ([`crate::exec::group::Live`]), since its own group no longer
-/// hears the terminal's Ctrl-C; a background `ssh` asking for a passphrase is
-/// stopped (`SIGTTIN`) and ends at the bound.
+/// ([`crate::exec::group::Live::kill`]). The drains are waited on for
+/// [`DRAIN_GRACE`] at most: a helper that left the group and still holds a pipe
+/// costs a detached thread, never the gate's time. The group is on the
+/// interrupt list while it runs ([`crate::exec::group::Live`]), since its own
+/// group no longer hears the terminal's Ctrl-C; its spawn is not counted in
+/// flight, so an interrupt that lands inside it misses this git
+/// ([`crate::exec::group::Spawning`] says why a count would not help here). A
+/// background `ssh` asking for a passphrase is stopped (`SIGTTIN`) and ends at
+/// the bound.
+///
+/// git is reaped LAST, after whatever is sent its group: the group's id is
+/// git's pid, which is the gate's only while git is its child, running or
+/// unreaped ([`crate::exec::group::Live`] has the rule). So git's exit is seen
+/// without reaping it, the group is killed if it still holds a process, and
+/// only then is git reaped, through the one door. Where the kernel will not say
+/// whether git has exited, nothing is sent to it and the call fails.
 fn git_bounded(root: &Path, args: &[&str], bound: Duration) -> Result<String, String> {
     let mut cmd = git(root, args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -2487,7 +2497,7 @@ fn git_bounded(root: &Path, args: &[&str], bound: Duration) -> Result<String, St
     }
     let mut child = cmd.spawn().map_err(|e| format!("cannot run git: {e}"))?;
     #[cfg(unix)]
-    let _live = crate::exec::group::Live::enter(child.id(), false);
+    let mut live = crate::exec::group::Live::enter(child.id(), false);
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2511,30 +2521,79 @@ fn git_bounded(root: &Path, args: &[&str], bound: Duration) -> Result<String, St
             .take()
             .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
     );
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < bound => std::thread::sleep(Duration::from_millis(20)),
-            _ => break None,
-        }
-    };
-    // Whatever git started dies with it, on an overrun and on an exit that left
-    // a helper holding a pipe. A group already empty answers an error: nothing
-    // to do.
-    #[cfg(unix)]
-    let _ = crate::exec::group::kill(child.id());
-    if status.is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
     let what = args
         .iter()
         .find(|a| !a.starts_with('-') && !a.contains('='))
         .copied()
         .unwrap_or_default();
     let overran = || format!("git {what} did not finish within {} s", bound.as_secs());
-    let Some(status) = status else {
+    let started = Instant::now();
+    // Has git exited inside the bound? Asked without reaping it
+    // (`Live::exited`), so its group's id is still the gate's for the kill
+    // below.
+    #[cfg(unix)]
+    let exited = loop {
+        match live.exited(false) {
+            Ok(true) => break true,
+            Ok(false) if started.elapsed() < bound => std::thread::sleep(Duration::from_millis(20)),
+            Ok(false) => break false,
+            // The kernel would not say whether git is still this process's
+            // child (`ECHILD` once something else has reaped it), and `Live`
+            // has let go of its group (`Live::exited`). git's pid is then no
+            // longer known to be the gate's, so nothing is sent to git or its
+            // group and nothing is waited for: the call fails saying so, not
+            // as an overrun, and the drains end when the pipes close.
+            Err(e) => {
+                return Err(format!(
+                    "git {what}: cannot tell whether it has exited: {e}"
+                ));
+            }
+        }
+    };
+    // Whatever git started dies with it, on an overrun and on an exit that left
+    // a helper holding a pipe, and is killed until its group has stayed empty a
+    // while (`Live::kill`). A group already empty is sent nothing, and nothing
+    // is waited for.
+    //
+    // Held: git is not reaped yet, on an overrun or after an exit, so the id
+    // is the gate's for the question and for every kill. (`Live` sends
+    // nothing once it is, which is what it comes to on a Unix where asking
+    // after the exit reaped it.)
+    #[cfg(unix)]
+    if !exited || live.alive() {
+        let _ = live.kill();
+    }
+    #[cfg(unix)]
+    if !exited {
+        // By pid, on a real overrun only: the kernel has just answered that
+        // git has not exited, so it is unreaped and its pid is the gate's.
+        let _ = child.kill();
+    }
+    // Reaped last, through the one door (`Live::reap`).
+    #[cfg(unix)]
+    let status = match live.reap(true) {
+        Ok(reaped) => reaped.map(|(status, _)| status),
+        Err(e) if exited => return Err(format!("git {what}: {e}")),
+        Err(_) => None,
+    };
+    #[cfg(not(unix))]
+    let (exited, status) = {
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if started.elapsed() < bound => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => break None,
+            }
+        };
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        (status.is_some(), status)
+    };
+    let Some(status) = status.filter(|_| exited) else {
         return Err(overran());
     };
     let deadline = Instant::now() + DRAIN_GRACE;
@@ -3868,6 +3927,75 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!alive(), "the helper outlived the bound");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A git that exits and leaves a helper in its group has the helper
+    /// killed BEFORE git is reaped. The group's id is git's pid, which is the
+    /// gate's only while git is its child, running or unreaped: once git is
+    /// reaped the number can be another process's, and a kill sent to "git's
+    /// group" lands there (`exec::group::Live` has the measurement). Until
+    /// 2026-10-13 this call reaped first and killed after.
+    ///
+    /// The git here runs a shell alias that backgrounds a `sleep` and ends,
+    /// so git exits at once with that `sleep` in its group. The call
+    /// answers git's (empty) output, and the `sleep` is gone. That it went
+    /// while git was still held is checked where the kill is sent: in a
+    /// test build every group signal asks first whether this process still
+    /// holds the group's leader, and panics if not (`exec`'s `signalling`).
+    /// Measured 2026-10-13 with git reaped before the kill: red, on that
+    /// panic or, where the reap went through the door that then refuses the
+    /// kill, on the `sleep` left running.
+    ///
+    /// The helper is ended by pid however the test ends, a panic inside the
+    /// call included: that check panics before the kill goes out, with the
+    /// helper still running (two such red runs of the second reading each
+    /// left one `sleep` behind, for the rest of its 307 s).
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_git_call_kills_the_helper_git_left_before_it_reaps_git() {
+        const GONE_WITHIN: Duration = Duration::from_secs(60);
+        /// The pids of the helpers running `sleep <marker>`.
+        fn helpers(marker: &str) -> String {
+            Command::new("pgrep")
+                .args(["-f", &format!("sleep {marker}")])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        }
+        /// Ends, by pid, every helper still running when it is dropped,
+        /// on an unwind too.
+        struct EndHelpers<'a>(&'a str);
+        impl Drop for EndHelpers<'_> {
+            fn drop(&mut self) {
+                for pid in helpers(self.0).split_whitespace() {
+                    let _ = Command::new("/bin/kill").args(["-KILL", pid]).status();
+                }
+            }
+        }
+        // A duration nothing else here sleeps, so the helper can be found.
+        let marker = format!("307.{}", std::process::id());
+        let root = crate::mktemp_dir("atv-bounded-left").expect("mktemp");
+        let end_helpers = EndHelpers(&marker);
+        let alias = format!("alias.leave=!sleep {marker} >/dev/null 2>&1 &");
+        let got = git_bounded(&root, &["-c", &alias, "leave"], HANG_DETECTOR);
+        let gone_by = Instant::now() + GONE_WITHIN;
+        while !helpers(&marker).is_empty() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A helper that outlived the call is ended here, by pid, whatever is
+        // asserted next.
+        let left = helpers(&marker);
+        drop(end_helpers);
+        assert_eq!(
+            got,
+            Ok(String::new()),
+            "git ran its alias and exited: nothing printed, nothing failed"
+        );
+        assert!(
+            left.is_empty(),
+            "the helper git left in its group outlived the call: {left}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

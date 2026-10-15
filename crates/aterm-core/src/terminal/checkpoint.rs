@@ -553,13 +553,13 @@ impl Terminal {
     /// `checkpoint_carry(max_history)`).
     ///
     /// Almost every partial sequence is carried in
-    /// [`TerminalCheckpoint::parser`] (a split CSI, an OSC title, a UTF-8
-    /// head; an unhooked DCS, SOS/PM/APC or oversize OSC, and a hooked DCS
-    /// string whose handler keeps nothing or holds a picture, ride as a string
-    /// to swallow). What is left out is a hooked DCS QUERY (`DcsPassthrough`
-    /// under DECRQSS or XTGETTCAP), whose reply lives in its handler. A parser
-    /// can sit there indefinitely (a stalled ssh session, an unterminated
-    /// string), and the update must not refuse for it.
+    /// [`TerminalCheckpoint::parser`] (a split CSI or DCS header, an OSC title,
+    /// a UTF-8 head; an ignored DCS, SOS/PM/APC or oversize OSC, and a hooked
+    /// DCS string whose handler keeps nothing or holds a picture, ride as a
+    /// string to swallow). What is left out is a hooked DCS QUERY
+    /// (`DcsPassthrough` under DECRQSS or XTGETTCAP), whose reply lives in its
+    /// handler. A parser can sit there indefinitely (a stalled ssh session, an
+    /// unterminated string), and the update must not refuse for it.
     ///
     /// The semantics are CAN (0x18) applied to the copy: the checkpoint
     /// describes the engine as if the partial sequence had been cancelled, so
@@ -690,8 +690,7 @@ impl Terminal {
     /// The parser state a partial sequence is in when the carry would hold it
     /// only as one to swallow to its terminator, where this engine would still
     /// have delivered it (an OSC over the carry's cap such as OSC 52 or 1337,
-    /// an unhooked DCS header, an APC string whose consumer started, a hooked
-    /// sixel string), or `None`
+    /// an APC string whose consumer started, a hooked sixel string), or `None`
     /// ([`aterm_parser::Parser::carry_swallows_sequence`]; a hooked string
     /// whose handler keeps nothing loses nothing, so it is not named). Over queued
     /// output the seamless capture treats this as a timing miss and re-parks
@@ -2432,22 +2431,25 @@ mod tests {
         }
     }
 
-    /// Every non-Ground state the parser can be parked in is carried — whole,
-    /// or (a DCS before its hook, an SOS/PM/APC string) as a string to ignore
-    /// to its terminator, a hooked DCS string whose handler keeps nothing or
-    /// holds a picture among them — except a hooked DCS query, which is
-    /// abandoned and named. None of them trips `checkpoint_bounded`'s Ground `debug_assert`
-    /// (these tests run with debug assertions on, so a path through it would
-    /// panic here), and each restored carry re-projects to itself.
+    /// Every non-Ground state the parser can be parked in is carried — whole
+    /// (a DCS header among them, since 2026-10-10), or (an SOS/PM/APC string)
+    /// as a string to ignore to its terminator, a hooked DCS string whose
+    /// handler keeps nothing or holds a picture among them — except a hooked
+    /// DCS query, which is abandoned and named. None of them trips
+    /// `checkpoint_bounded`'s Ground `debug_assert` (these tests run with debug
+    /// assertions on, so a path through it would panic here), and each
+    /// restored carry re-projects to itself.
     #[test]
     fn every_partial_parser_state_is_carried_and_named() {
-        let partials: [(&[u8], &str, Option<&str>); 11] = [
+        let partials: [(&[u8], &str, Option<&str>); 13] = [
             (b"\x1b", "Escape", Some("Escape")),
             (b"\x1b(", "EscapeIntermediate", Some("EscapeIntermediate")),
             (b"\x1b[", "CsiEntry", Some("CsiEntry")),
             (b"\x1b[1;", "CsiParam", Some("CsiParam")),
             (b"\x1b[?1$", "CsiIntermediate", Some("CsiIntermediate")),
-            (b"\x1bP", "DcsEntry", Some("DcsIgnore")),
+            (b"\x1bP", "DcsEntry", Some("DcsEntry")),
+            (b"\x1bP1;2", "DcsParam", Some("DcsParam")),
+            (b"\x1bP1$", "DcsIntermediate", Some("DcsIntermediate")),
             (
                 b"\x1bPq#0;2;0;0;0",
                 "DcsPassthrough",

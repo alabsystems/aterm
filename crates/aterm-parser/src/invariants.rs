@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! TLA+ invariant assertions for the parser state machine.
+//! TypeInvariant assertions for the parser state machine.
 
 use crate::Parser;
 #[cfg(test)]
@@ -10,12 +10,14 @@ use crate::state::State;
 use crate::{MAX_INTERMEDIATES, MAX_PARAMS};
 
 impl Parser {
-    /// Assert that all TLA+ TypeInvariant properties hold.
+    /// Assert that every TypeInvariant property holds.
     ///
-    /// This function verifies the parser state matches the formal specification
-    /// in `tla/Parser.tla`. Only runs in debug builds.
+    /// The invariant is written below in TLA+ notation; no TLA+ spec is
+    /// checked. The exhaustive tests in `src/tests/` hold representative
+    /// states at every bound to it through every two-byte tail
+    /// (`tests::invariants::every_state_every_byte_keeps_the_type_invariant`).
     ///
-    /// # TLA+ TypeInvariant
+    /// # TypeInvariant
     ///
     /// ```tla
     /// TypeInvariant ==

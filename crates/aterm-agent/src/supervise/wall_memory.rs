@@ -14,7 +14,8 @@
 //! standing wait is dropped: at the reset nothing is typed, or ever (measured
 //! before the wall was remembered: `WAITING until=00:09:01`, the wall's rows leave, 652 s
 //! later no turn, a timeout). A shell-less tab reads `Idle` in the same state
-//! and is continued at once by the policy's "the screen left a limit" rule;
+//! and is the policy's "the screen left a limit" rule's, which keeps the reset
+//! the notice named (`turn_end::still_shown`);
 //! only a tab with background work — the owner's dominant one — was blind. An
 //! update at that moment lost the wait for good: the successor had nothing to
 //! remember.
@@ -27,18 +28,28 @@
 //! spinner, no `esc to interrupt`, no message just submitted), the memory
 //! stands for the wall the screen no longer shows; the standing `WaitUntil`
 //! then fires at the reset and its grace as it would have with the rows
-//! showing. A live turn (the worker worked: the owner typed, the vendor's own
-//! resume), an idle screen with no wall (the policy's own rule takes over), a
-//! question and another wall end it — the ledger row for the end
-//! ([`approvals::RULE_WALL_WAIT_END`]) says so to the next loop; so does any
-//! act the policy typed since ([`approvals::open_wall`]).
+//! showing — unless the screen draws a turn served under that wall's own
+//! notice ([`served_under`]: a person's short turn, which no read saw busy,
+//! is work since the wall). A live turn (the worker worked: the
+//! owner typed, the vendor's own resume), a question or an idle screen with
+//! no wall, and another wall end it
+//! — the ledger row for the end ([`approvals::RULE_WALL_WAIT_END`]) says so to
+//! the next loop; so does any act the policy typed since
+//! ([`approvals::open_wall`]). NOT an idle screen while the policy still waits
+//! on the reset the notice named ([`TurnEndState::waits_on_named_reset`]): Esc
+//! on the vendor's countdown leaves one, and the wait it leaves standing can
+//! last days. The wall stays open, and a loop that follows takes that reset up
+//! ([`Session::seed_wall_memory`]): with the wall's end written, a successor
+//! typed `keep going` into the standing limit (the review of 2026-10-14).
 //!
 //! Nothing is typed by this module: it decides what a screen READS as. The
 //! act, its grace, a person's hold, the draft and the fenced write are the
 //! policy's and the loop's, as at any wall.
 
 use super::super::policy::outlook::ExceptionKind;
+use super::super::policy::turn_end::served_under;
 use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END};
+use super::turn_end_loop::resume_jitter;
 use super::*;
 
 /// How long past its reset a wall stays remembered when nothing has ended it:
@@ -83,15 +94,24 @@ fn is_kept(wall: &aterm_phase::Wall) -> bool {
 impl<C: Ctl> Session<'_, C> {
     /// The remembered wall, when `rows` show nothing but the agent's own
     /// background work — Claude Code's screen, its composer frame drawn, no
-    /// live turn and no message just submitted.
+    /// live turn and no message just submitted — and no turn served under
+    /// that wall's own notice ([`served_under`]: a person's short turn under
+    /// it, which no read saw busy, is work since the wall; one under another
+    /// limit's notice is not).
     pub(super) fn remembered_wall(
         &self,
         reader: &dyn ScreenReader,
         rows: &[String],
     ) -> Option<aterm_phase::Wall> {
         let memory = self.wall_memory.as_ref()?;
-        (reader.program() == aterm_phase::Program::Claude && aterm_phase::background_only(rows))
-            .then(|| memory.wall.clone())
+        (reader.program() == aterm_phase::Program::Claude
+            && aterm_phase::background_only(rows)
+            && !served_under(
+                aterm_phase::since_limit(rows).as_ref(),
+                memory.wall.kind,
+                limit::ResetClock::of(memory.wall.reset.as_deref()),
+            ))
+        .then(|| memory.wall.clone())
     }
 
     /// `rows` read `Busy`: a LIVE turn on a screen with a composer (a spinner,
@@ -114,8 +134,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The reading of a POINT, folded into the memory (called from
     /// [`Self::turn_end_reading`]): a wall that resets is remembered; another
-    /// wall, an idle screen with no wall and a question end it; a busy screen
-    /// with only background work is read as the remembered wall.
+    /// wall ends it; a busy screen with only background work is read as the
+    /// remembered wall. An idle screen with no wall and a question are the
+    /// policy's to judge first ([`Self::observe_point`]).
     pub(super) fn wall_memory_step(
         &mut self,
         reader: &dyn ScreenReader,
@@ -138,9 +159,27 @@ impl<C: Ctl> Session<'_, C> {
                         self.end_memory_on_live_turn(reader, rows, seq);
                     }
                 }
-                aterm_phase::Phase::Idle | aterm_phase::Phase::Question => self.forget_wall(seq),
-                aterm_phase::Phase::Prompt | aterm_phase::Phase::Limited { .. } => {}
+                aterm_phase::Phase::Idle
+                | aterm_phase::Phase::Question
+                | aterm_phase::Phase::Prompt
+                | aterm_phase::Phase::Limited { .. } => {}
             },
+        }
+    }
+
+    /// A POINT FOLDED INTO THE POLICY ([`TurnEndState::observe`]), and then
+    /// into the memory: an idle screen or a question ends the memory, unless
+    /// the policy, having folded the point in, still waits on the reset a
+    /// limit's notice named ([`TurnEndState::waits_on_named_reset`]: the
+    /// notice left the screen with no work since). The policy's track decides,
+    /// so the memory ends at the very point the wait does — the worker's work,
+    /// the vendor's own continuation, a retry taken.
+    pub(super) fn observe_point(&mut self, reading: &TurnEndReading, now: Instant, seq: u64) {
+        self.turn_end.observe(reading, now);
+        if matches!(reading.phase, Phase::Idle | Phase::Question)
+            && !self.turn_end.waits_on_named_reset()
+        {
+            self.forget_wall(seq);
         }
     }
 
@@ -195,8 +234,10 @@ impl<C: Ctl> Session<'_, C> {
     /// A loop that follows another on the session goes on waiting for the wall
     /// its predecessor waited on ([`approvals::open_wall`]) when the screen
     /// shows none of its rows — the update that applied while the owner's
-    /// scroll hid it. Kept for [`MEMORY_TTL`] past its reset (a wall with no
-    /// placed reset, past its row).
+    /// scroll hid it, or Esc on the vendor's countdown: the policy is handed
+    /// the reset the notice named ([`TurnEndState::seed_named_reset`]). Kept
+    /// for [`MEMORY_TTL`] past its reset (a wall with no placed reset, past its
+    /// row).
     pub(super) fn seed_wall_memory(&mut self, open: Option<approvals::OpenWall>) {
         if self.wall_memory.is_some() {
             return;
@@ -216,6 +257,23 @@ impl<C: Ctl> Session<'_, C> {
         };
         let key = format!("{}|{}", kind.name(), open.reset.as_deref().unwrap_or("-"));
         self.wall_reset = Some((key, open.reset_unix));
+        if let Some(unix) = open.reset_unix {
+            // This session's share of the herd, as a reading of the wall
+            // gives it ([`Self::turn_end_reading`]).
+            let jitter = self.sid.as_deref().map_or(Duration::ZERO, |sid| {
+                resume_jitter(sid, unix, self.turn_end.timing.reset_jitter)
+            });
+            let ago = u64::try_from(self.now_unix_ms().saturating_sub(open.at_ms))
+                .map_or(Duration::ZERO, Duration::from_millis);
+            self.turn_end.seed_named_reset(
+                kind,
+                self.instant_of(unix),
+                jitter,
+                limit::resumes_by_itself(&open.message),
+                limit::ResetClock::of(open.reset.as_deref()),
+                Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
+            );
+        }
         self.wall_memory = Some(WallMemory {
             wall: aterm_phase::Wall {
                 kind,

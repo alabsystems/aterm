@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::{RenderCell, Terminal};
-use aterm_hash::{FNV64_OFFSET, FxHashMap, fnv_mix_u64, fnv1a_64};
+use aterm_hash::{FNV64_OFFSET, FxHashMap, KeyedHashMap, fnv_mix_u64, fnv1a_64};
 use aterm_lexicon::{Class, FormId, LangSet, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
 use aterm_scene::vector::FIXED_ONE;
@@ -365,7 +365,10 @@ impl CompanionFootprint {
 #[derive(Clone, Copy, Debug)]
 pub struct PetCursorFrame {
     pub geom: EffectGeom,
-    /// Quantized local foreground/background context (drives the contrast ink).
+    /// Quantized local foreground/background context (drives the contrast
+    /// ink): the live body's. A ghost wears the palette its own body was
+    /// drawn in (`PetDepartureSprite::colors`), this one only when it has
+    /// none.
     pub colors: CatColorKey,
     /// `COAT_RAMP` / `EYE_RAMP` indices latched for this appearance
     /// ([`crate::kitty_pet::PetBrain::sync_look`]), so a mid-walk companion
@@ -1338,9 +1341,17 @@ struct DoneMarkMutation {
 
 /// Deterministic bounded LRU for completed one-shot identities.
 struct DoneMarkLru {
-    /// Fx, not SipHash: keys are already avalanche-mixed idents. Eviction order
-    /// comes from the intrusive `nodes` list, never map iteration.
-    index: FxHashMap<u64, u32>,
+    /// KEYED HASH (hashclock-1 review, ruling 2026-10-10). The keys are
+    /// `ident ^ ctx_fp`, and `ctx_fp` is a SimHash of the words a pane's
+    /// program prints around the match. Both are mixed without a secret, so
+    /// avalanche mixing does not stop precomputation: a program can search
+    /// offline for contexts whose keys share one bucket and control tag under
+    /// Fx on every aterm, and the map holds up to [`DONE_MARKS_CAP`] of them
+    /// for the session. A [`KeyedHashMap`] keeps that chain short. It is
+    /// probed only at episode births and departures, so its price is not
+    /// measurable. Eviction order comes from the intrusive `nodes` list,
+    /// never map iteration.
+    index: KeyedHashMap<u64, u32>,
     nodes: Vec<DoneMarkNode>,
     free: Vec<u32>,
     oldest: u32,
@@ -1350,7 +1361,7 @@ struct DoneMarkLru {
 impl Default for DoneMarkLru {
     fn default() -> Self {
         Self {
-            index: FxHashMap::default(),
+            index: KeyedHashMap::default(),
             nodes: Vec::new(),
             free: Vec::new(),
             oldest: DONE_MARK_NONE,
@@ -1621,10 +1632,21 @@ pub enum KittySpriteSource {
 /// Retired generations' heap buffers are kept (`spare`) and refilled, so an
 /// all-miss frame (a full-screen TUI repaint) does not malloc/free per row on
 /// the render thread.
+///
+/// KEYED HASH (hashclock-1, ruling 2026-10-10): both generations are
+/// [`KeyedHashMap`]s because the keys are row text a pane's program prints.
+/// The cap bounds how many rows are resident, not how many share a bucket.
+/// Under the unkeyed Fx, rows precomputed to collide make each probe compare
+/// up to both generations, `4 * rows` keys, so a rescan's cost grows with the
+/// square of the viewport's rows. The hunt called that negligible at ordinary
+/// sizes. The memo follows the renderer's text memos anyway: the rule then
+/// needs no size argument that a later cap change could break, and the price
+/// is small. A 50x200 rescan of ordinary prose measured 402-424 us before and
+/// 389-401 us after.
 #[derive(Default)]
 struct ScanMemo {
-    hot: FxHashMap<String, Vec<Match>>,
-    cold: FxHashMap<String, Vec<Match>>,
+    hot: KeyedHashMap<String, Vec<Match>>,
+    cold: KeyedHashMap<String, Vec<Match>>,
     /// Emptied entry buffers from the generation `install` discarded, waiting
     /// to be refilled. Bounded by `gen_cap` (footprint ≈ 3 generations), making
     /// the all-miss steady state allocation-free.
@@ -1678,7 +1700,7 @@ impl ScanMemo {
     /// rest, and leave `gone` empty but allocated.
     fn recycle(
         spare: &mut Vec<(String, Vec<Match>)>,
-        gone: &mut FxHashMap<String, Vec<Match>>,
+        gone: &mut KeyedHashMap<String, Vec<Match>>,
         keep: usize,
     ) {
         let room = keep.saturating_sub(spare.len());
@@ -1880,13 +1902,44 @@ pub struct WordDecorations {
     /// §3.6 identity persistence: `ident → Episode`, cap [`PERSIST_CAP`],
     /// oldest-`last_seen` eviction, [`GRACE_TTL`] sweep at rescan end.
     ///
-    /// Fx, not SipHash: `tick` probes it several times per live occurrence per
-    /// frame and keys are already-mixed idents. Both iteration sites are
-    /// order-independent (`align_pending` sorts; `rescan_end` mutates entries
-    /// independently).
+    /// Fx, NOT KEYED, by ruling (hashclock-1 review, 2026-10-10), as is
+    /// `seed_ordinals` below. A pane's program steers these keys: an ident
+    /// mixes `(column, class, lexicon form, ordinal)` without a secret, so
+    /// being "already mixed" is no defense. The bound is the domain, which
+    /// aterm sets: the columns of this grid, the shipped or configured
+    /// lexicon forms, and ordinals. A program picks keys from it and cannot
+    /// add to it. Enumerating every builtin form with its possessive variants
+    /// (4,068 form hashes) at every column, the most idents that share one
+    /// bucket and control tag of this map's 1,024-bucket table are 13 at 80
+    /// columns, 23 at 200 and 36 at 500. With ordinals up to 3 the figure at
+    /// 200 columns is 52. A higher ordinal costs one more occurrence of the
+    /// same word in the same column in one rescan, and those fillers take
+    /// persist slots too. Each compare in such a chain is an integer compare,
+    /// and [`PERSIST_CAP`] caps the chain in any case.
+    ///
+    /// Keying is not free here, as it is for the done marks. `tick` probes
+    /// this map several times per live occurrence per frame. On a 50x200
+    /// screen at the 128-occurrence cap (release, ten interleaved runs), the
+    /// keyed map raised a static tick's median from 9.6-13.1 us to 15.4-18.4
+    /// us and a busy tick's from 14.3-19.8 us to 20.5-24.8 us, while keying
+    /// the done marks alone stayed within run-to-run noise. That cost would
+    /// be paid on every frame to cap a chain the domain already holds to a
+    /// few dozen compares. A key derived from free text, such as a row or a context
+    /// SimHash, has no such bound and is keyed: see [`ScanMemo`] and
+    /// [`DoneMarkLru::index`].
+    ///
+    /// Both iteration sites are order-independent (`align_pending` sorts;
+    /// `rescan_end` mutates entries independently).
     persist: FxHashMap<u64, Episode>,
     /// Per-rescan row-major count of same-seed occurrences — the §3.6 ordinal
     /// source. Resident so the rescan allocates nothing after warmup.
+    ///
+    /// Fx under the ruling on `persist` above: a seed mixes `(column, class,
+    /// lexicon form)` from the same finite domain. The map holds at most the
+    /// rescan's 128 occurrences, and the largest set of reachable seeds that
+    /// shares one bucket and tag of its 256-bucket table is 49 at 200 columns
+    /// and 98 at 500. A rescan's worst case is then about 128 probes of up to
+    /// 98 integer compares each, a few microseconds.
     seed_ordinals: FxHashMap<u64, u64>,
     /// §3.2 SimHash vote accumulator (resident scratch; zero allocation).
     votes: VoteScratch,
@@ -3478,8 +3531,9 @@ impl WordDecorations {
     /// (the shared bake budget may be spent; the pose lands next frame).
     ///
     /// Also draws the breed handoff's departing bodies
-    /// ([`crate::kitty_pet::PetFrame::departures`]) in the old `(coat, iris)`,
-    /// each with its own held tile.
+    /// ([`crate::kitty_pet::PetFrame::departures`]) in the old `(coat, iris)`
+    /// and the palette each one's body was drawn in, each with its own held
+    /// tile.
     pub fn pet_cursor(&mut self, frame: PetCursorFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let PetCursorFrame {
             geom,
@@ -3639,7 +3693,8 @@ impl WordDecorations {
         // ── the departing bodies (the breed handoff's outgoing kitties) ────
         // Each ghost draws like the live body (its own
         // [`crate::pet_baker::PetBakeKey`] and `host_id`, the same feet-anchored
-        // `body_px` via a synthetic [`PetFrame`]) in its old `(coat, iris)`.
+        // `body_px` via a synthetic [`PetFrame`], at its own stance) in its old
+        // `(coat, iris)` and its own palette.
         // Held tiles (`pet_depart_tiles`, one per ghost) absorb bake misses
         // without strobing. Ghosts push first, so they run off behind the
         // live pet.
@@ -3711,7 +3766,8 @@ impl WordDecorations {
 
     /// ONE DEPARTING BODY'S SPRITE at `geom`, in that grid's own pixels: the
     /// live lane's ghost law, shared by [`Self::pet_cursor`] and
-    /// [`Self::pet_own_glass`]. The ghost's id keys its held tile
+    /// [`Self::pet_own_glass`]. Baked in the ghost's own palette, else
+    /// `colors` (the frame's). The ghost's id keys its held tile
     /// (`pet_depart_tiles`).
     fn pet_departure_sprite(
         &mut self,
@@ -3742,7 +3798,9 @@ impl WordDecorations {
             pose: d.pose,
             coat: d.coat,
             iris: d.iris,
-            colors,
+            // The palette its body was drawn in: a ghost is that body,
+            // colours included (`PetDepartureSprite::colors`).
+            colors: d.colors.unwrap_or(colors),
             w: nat_w,
             h: nat_h,
         };
@@ -3766,10 +3824,13 @@ impl WordDecorations {
             pose: d.pose,
             col: d.col,
             row: d.row,
-            lift: 0.0,
+            // A still ghost at the stance the body was last drawn at, so it
+            // is that body to the pixel; one running off at the authored
+            // size on the ground (`PetDepartureSprite::scale_x`).
+            lift: d.lift,
             facing_left: d.facing_left,
-            scale_x: 1.0,
-            scale_y: 1.0,
+            scale_x: d.scale_x,
+            scale_y: d.scale_y,
             purr: 0.0,
             contented: false,
             // The ghost stands where the body stood; it wears the body's
@@ -11018,6 +11079,122 @@ mod tests {
         assert!(
             profane(&wd),
             "restoring the language must restore the decoration"
+        );
+    }
+
+    /// hashclock-1: the probe class of hash `h` in a 256-bucket hashbrown
+    /// table, its starting bucket and its 7-bit control tag. Keys that share
+    /// one are a chain: every probe among them compares each of them.
+    fn probe_class(h: u64) -> (u64, u64) {
+        (h & 0xff, h >> 57)
+    }
+
+    /// The most `keys` that any one probe class holds under `hash`.
+    fn largest_probe_class<K>(keys: &[K], hash: impl Fn(&K) -> u64) -> usize {
+        let mut classes: FxHashMap<(u64, u64), usize> = FxHashMap::default();
+        keys.iter()
+            .map(|k| {
+                let n = classes.entry(probe_class(hash(k))).or_default();
+                *n += 1;
+                *n
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 128 of `candidate`'s keys that share probe class `(0, 0)` under the
+    /// unkeyed Fx, found by plain search, as a program precomputes them
+    /// offline once for every aterm. Asserts the set is one full chain under
+    /// Fx, so a test built on it is not vacuous.
+    ///
+    /// Under a keyed hasher the same keys must spread like any others: with a
+    /// random key, 9 or more of 128 landing in one of 2^15 classes has
+    /// probability below 2^-70, so a bound of 8 is no flake. The property is
+    /// structural, not a timing.
+    fn fx_flood<K: std::hash::Hash>(candidate: impl Fn(u32) -> K) -> Vec<K> {
+        use std::hash::BuildHasher;
+        let fx = |k: &K| aterm_hash::FxBuildHasher.hash_one(k);
+        let mut flood = Vec::with_capacity(128);
+        let mut i = 0u32;
+        while flood.len() < 128 {
+            let k = candidate(i);
+            if probe_class(fx(&k)) == (0, 0) {
+                flood.push(k);
+            }
+            i += 1;
+        }
+        assert_eq!(largest_probe_class(&flood, fx), flood.len());
+        flood
+    }
+
+    /// hashclock-1 (ruling 2026-10-10): the memo is keyed by row text a pane's
+    /// program prints, so it hashes under a per-process secret. Under Fx the
+    /// precomputed rows ([`fx_flood`]) shared one bucket of a 256-bucket
+    /// generation and one control tag, so each probe compared every row.
+    /// Under the memo's own hashers they must spread like ordinary text.
+    #[test]
+    fn scan_memo_spreads_rows_precomputed_to_collide() {
+        use std::hash::BuildHasher;
+        let flood = fx_flood(|mut i| {
+            let mut s = String::from("row ");
+            for _ in 0..6 {
+                s.extend(char::from_u32(u32::from(b'a') + i % 26));
+                i /= 26;
+            }
+            s
+        });
+
+        let mut memo = ScanMemo::default();
+        memo.fit(64, 0);
+        for r in &flood {
+            assert!(!memo.touch(r));
+            memo.remember(r, &[]);
+        }
+        for r in &flood {
+            assert!(memo.touch(r), "a remembered row is resident");
+        }
+        for (generation, map) in [("hot", &memo.hot), ("cold", &memo.cold)] {
+            let n = largest_probe_class(&flood, |r| map.hasher().hash_one(r.as_str()));
+            assert!(
+                n <= 8,
+                "{generation}: {n} of {} precomputed rows share one bucket and tag, \
+                 so a probe among them compares that many rows",
+                flood.len()
+            );
+        }
+    }
+
+    /// hashclock-1 review (ruling 2026-10-10): a done mark is keyed
+    /// `ident ^ ctx_fp`, and `ctx_fp` is a SimHash of the words a pane's
+    /// program prints around the match, so a program can search offline for
+    /// contexts whose marks collide. Avalanche mixing is no defense: the keys
+    /// here are a real ident XORed with mixed values standing in for those
+    /// SimHashes, and under Fx 128 of them ([`fx_flood`]) share one bucket
+    /// and tag, so each birth's probe compared every mark. Under the LRU
+    /// index's own hasher they must spread.
+    #[test]
+    fn done_marks_spread_keys_precomputed_to_collide() {
+        use std::hash::BuildHasher;
+        let ident = mix(seed_of(
+            10,
+            Class::Feline,
+            aterm_lexicon::form_hash("kitty"),
+        ));
+        let flood = fx_flood(|i| ident ^ mix(u64::from(i)));
+
+        let mut marks = DoneMarkLru::default();
+        for &key in &flood {
+            assert_eq!(marks.insert(key).evicted, None);
+        }
+        for key in &flood {
+            assert!(marks.contains_key(key), "a written mark is resident");
+        }
+        let n = largest_probe_class(&flood, |k| marks.index.hasher().hash_one(k));
+        assert!(
+            n <= 8,
+            "{n} of {} precomputed done marks share one bucket and tag, \
+             so a birth's probe among them compares that many marks",
+            flood.len()
         );
     }
 

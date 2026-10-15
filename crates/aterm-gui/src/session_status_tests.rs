@@ -1522,6 +1522,16 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     // OSC 7 is a separate question this fixture cannot ask.
     #[cfg(unix)]
     {
+        // HOME is process-global: the seamless tests point it at a scratch
+        // dir under ENV_LOCK, and this block reads it twice (the roots here,
+        // and the record's own consent check). Without the lock the two reads
+        // can see different homes and the token goes missing (seen
+        // 2026-10-11 in the round-fifteen land's gate: the cwd was under a
+        // seamless test's `conncarry` home, the record judged it against the
+        // real one).
+        let _env = crate::seamless::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The protected roots are RESOLVED DATA from the consent module —
         // this file writes no protected-folder literal of its own (rule B13).
         let roots = aterm_containment::consent::protected_roots(&[]);

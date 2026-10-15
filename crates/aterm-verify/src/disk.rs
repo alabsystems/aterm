@@ -677,7 +677,9 @@ pub fn header_line(reading: &Reading, plan: &Plan, root: &Path) -> String {
 }
 
 /// The caller tree's incremental caches, newest-first by size: `target*/…/incremental`
-/// directories OUTSIDE this run's root.
+/// directories OUTSIDE this run's root — and the caller's folder in the Rust build cache
+/// aterm's `targo` keeps a checkout's intermediates in on macOS
+/// (`~/Library/Caches/aterm/cargo-build.noindex<caller>/.cargo-build`, `atpkg::build_cache`).
 ///
 /// They are the cheapest bytes on the volume to give back, and the reason is
 /// structural rather than a guess: every child of this gate compiles with
@@ -690,20 +692,36 @@ pub fn header_line(reading: &Reading, plan: &Plan, root: &Path) -> String {
 /// asymmetry is why [`remedy`] names these first.
 #[must_use]
 pub fn caller_incremental_dirs(caller: &Path) -> Vec<(PathBuf, u64)> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    caller_incremental_dirs_in(caller, home.as_deref().map(Path::new))
+}
+
+/// [`caller_incremental_dirs`] with `$HOME` given.
+fn caller_incremental_dirs_in(caller: &Path, home: Option<&Path>) -> Vec<(PathBuf, u64)> {
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(caller) else {
-        return out;
-    };
-    for target in entries.flatten() {
-        if !target.file_name().to_string_lossy().starts_with("target") {
+    let mut builds: Vec<PathBuf> = std::fs::read_dir(caller)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("target"))
+        .map(|e| e.path())
+        .collect();
+    if let Some(home) = home {
+        // Cargo names the folder by the workspace's real path.
+        let real = std::fs::canonicalize(caller).unwrap_or_else(|_| caller.to_path_buf());
+        let mut cache = home
+            .join("Library/Caches/aterm/cargo-build.noindex")
+            .into_os_string();
+        cache.push(real.as_os_str());
+        builds.push(PathBuf::from(cache).join(".cargo-build"));
+    }
+    for target in builds {
+        if !target.symlink_metadata().is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        if !target.path().symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
-        // `target*/<profile>/incremental`, one level down: debug, release, and
+        // `<build>/<profile>/incremental`, one level down: debug, release, and
         // any custom profile. Deeper is not a cargo layout.
-        let Ok(profiles) = std::fs::read_dir(target.path()) else {
+        let Ok(profiles) = std::fs::read_dir(&target) else {
             continue;
         };
         for profile in profiles.flatten() {
@@ -1589,6 +1607,26 @@ mod tests {
         let alone = remedy(&root, &p, &lanes, &free, None);
         assert!(!alone.contains("incremental caches"), "{alone}");
         assert!(alone.contains("regenerable"), "{alone}");
+
+        // The caller's folder in the Rust build cache under `$HOME` counts too, found by
+        // the caller's real path (Cargo's name for it) when it is reached by a link.
+        let home = crate::mktemp_dir("atv-disk-home").expect("mktemp");
+        let mut mirror = home
+            .join("Library/Caches/aterm/cargo-build.noindex")
+            .into_os_string();
+        mirror.push(std::fs::canonicalize(&caller).expect("real").as_os_str());
+        let cached = PathBuf::from(mirror).join(".cargo-build/debug/incremental");
+        std::fs::create_dir_all(&cached).expect("mk");
+        std::fs::write(cached.join("blob"), vec![0u8; 8192]).expect("write");
+        let link = home.join("caller-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&caller, &link).expect("link");
+        #[cfg(not(unix))]
+        let link = caller.clone();
+        let found = caller_incremental_dirs_in(&link, Some(&home));
+        assert_eq!(found.first().map(|f| &f.0), Some(&cached), "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
+        std::fs::remove_dir_all(&home).ok();
 
         // A caller with no incremental caches says nothing about them either.
         let bare = crate::mktemp_dir("atv-disk-bare").expect("mktemp");

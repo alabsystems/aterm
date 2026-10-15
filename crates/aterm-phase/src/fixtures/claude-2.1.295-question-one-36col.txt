@@ -1,0 +1,24 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (36x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the same standing question after `ctl resize 50 36`: the question wraps onto a second row, and the footer wraps after its second separator, `Esc to cancel` alone on the row under it (by itself a footer, the wrong one)
+           Claude Code v2.1.295
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/tmp/at.swEU/proj
+
+
+❯ toolstart
+────────────────────────────────────
+ ☐ Runner
+
+Which test runner should the repo
+use?
+
+❯ 1. nextest (Recommended)
+     Parallel
+  2. libtest
+     Built in
+  3. Type something.
+────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel

@@ -62,10 +62,11 @@ mod imp;
 #[path = "control_auth_win.rs"]
 mod imp;
 
-// The socket's own peer check reads it inside `imp`; out here only the tests do
-// (the snapshot override that also named it was deleted, 2026-09-24).
-#[cfg(all(unix, test))]
-use imp::our_uid;
+// The socket's own peer check reads it inside `imp`; out here the draft
+// journal's key reader does (`native_document_journal`: the key must be ours),
+// and the tests.
+#[cfg(unix)]
+pub(crate) use imp::our_uid;
 pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision_token};
 // Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
 // sweep of a dead sender's `seamless-<pid>-…` leftovers (`crate::seamless`).
@@ -1743,7 +1744,7 @@ fn valid_instance_component(instance: &str) -> bool {
         && instance
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && Path::new(instance).components().count() == 1
+        && crate::pinned_dir::is_one_component(std::ffi::OsStr::new(instance))
 }
 
 fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
@@ -1763,8 +1764,14 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 
 /// Create/validate one real directory immediately below a canonical parent.
 /// Existing links/reparse redirections are rejected before hardening or use.
+///
+/// `name` is judged raw ([`crate::pinned_dir::is_one_component`], ruling
+/// 2026-10-10): `Path::components()` counted `"x/"` as one component, and
+/// `parent.join("x/")` then resolved a link `x` at the `symlink_metadata` and
+/// the create below — through a dangling one, a directory made outside before
+/// the canonical re-check refused it.
 fn ensure_canonical_direct_child(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
-    if Path::new(name).components().count() != 1 {
+    if !crate::pinned_dir::is_one_component(std::ffi::OsStr::new(name)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "child name is not one path component",
@@ -1862,7 +1869,8 @@ fn open_private_namespace_lock(
     create: bool,
 ) -> std::io::Result<std::fs::File> {
     let namespace = std::fs::canonicalize(namespace)?;
-    if Path::new(file_name).components().count() != 1 {
+    // Judged raw, as `ensure_canonical_direct_child` judges its name.
+    if !crate::pinned_dir::is_one_component(file_name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "namespace lock name must be one component",
@@ -3698,10 +3706,12 @@ pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStrea
     }
     // Flagged close-on-exec AT CREATION where the platform can: this runs on the
     // control worker while the successor's other threads spawn helpers, and a
-    // spawned child inherits every descriptor not yet flagged when it execs — a
-    // dial left unflagged for that window rides into the helper for its whole
-    // life (the product fd-hygiene sweep of 2026-09-27). Darwin has no
-    // `SOCK_CLOEXEC`, so there the `fcntl` pair below is the best available.
+    // child spawned by a path that does not strip what it inherits (a std
+    // `Command` on a std without SP-1, among others) holds every descriptor not
+    // yet flagged when it execs — a dial left unflagged for that window rides
+    // into the helper for its whole life (the product fd-hygiene sweep of
+    // 2026-09-27). Darwin has no `SOCK_CLOEXEC`, so there the `fcntl` pair below
+    // is the best available.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -4048,7 +4058,7 @@ fn resolve_confined_image_target(
     // dir could be symlink-swapped between this check and the open.
     let file_name = lexical.file_name()?;
     // A filename with a path separator or `..`/`.` is not a single component.
-    if Path::new(file_name).components().count() != 1 {
+    if !crate::pinned_dir::is_one_component(file_name) {
         return None;
     }
     if file_name == std::ffi::OsStr::new(AUTO_IMAGES_DIR)
@@ -4114,7 +4124,7 @@ pub(crate) fn confine_proxy_sock(sock_dir: &Path, requested: &str) -> Option<Str
     // parent is EXACTLY our socket dir — never a nested or redirected directory.
     let lexical = lexically_normalize(req)?;
     let file_name = lexical.file_name()?;
-    if Path::new(file_name).components().count() != 1 {
+    if !crate::pinned_dir::is_one_component(file_name) {
         return None;
     }
     let canon_parent = std::fs::canonicalize(lexical.parent()?).ok()?;
@@ -6262,6 +6272,34 @@ mod tests {
         let _ = std::fs::remove_file(instance_path);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(replacement);
+    }
+
+    /// REGRESSION (FS-1, 2026-10-10): a child name is judged raw. `"x/"` once
+    /// counted as one component, so `parent.join("x/")` reached through the
+    /// dangling link `x` and made (and chmodded) a directory outside `parent`
+    /// before the canonical re-check refused it.
+    #[test]
+    #[cfg(unix)]
+    fn a_direct_child_name_with_a_trailing_slash_makes_nothing_outside() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("aterm-direct-child-slash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let parent = root.join("parent");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(outside.join("absent"), parent.join("dangle")).unwrap();
+
+        for name in ["dangle/", "dangle/.", "dangle//"] {
+            let result = ensure_canonical_direct_child(&parent, name);
+            assert!(result.is_err(), "{name:?} was accepted: {result:?}");
+            assert!(
+                !outside.join("absent").exists(),
+                "{name:?} made a directory outside its parent"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

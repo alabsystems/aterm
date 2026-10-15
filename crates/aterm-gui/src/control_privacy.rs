@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 
 use aterm_containment::consent::{
     self, Attribution, Claimants, ConsentKey, ConsentPosture, DebuggerMode, DebuggerProbe,
-    DebuggerProbeLabel, DevToolProbe, DevToolProbeLabel, DrClass, FdaProbe, FdaState, Folder,
-    FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError, SelfHardening,
-    SpikeEvidence, TrashOffer, plist_string, read_plist_text,
+    DebuggerProbeLabel, DevToolList, DevToolListLabel, DevToolProbe, DevToolProbeLabel, DrClass,
+    FdaProbe, FdaState, Folder, FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible,
+    ResponsibleError, SelfHardening, SpikeEvidence, TrashOffer, plist_string, read_plist_text,
 };
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 use winit::event_loop::EventLoopProxy;
@@ -149,6 +149,11 @@ pub(crate) struct ConsentProbes {
     /// bundle id given. Spawns a process, so it is fenced; the inert arm
     /// spawns nothing.
     devtools: fn(ProbeGate, &str) -> DevToolProbe,
+    /// The same list's SWITCH (debugger design §9.1, O18): the subject's row in
+    /// the system TCC.db, one `open` and one bounded `/usr/bin/sqlite3
+    /// -readonly`. Spawns a process, so it is fenced; the inert arm opens and
+    /// spawns nothing.
+    devtools_list: fn(ProbeGate, &str) -> DevToolList,
     /// The bundle id the Developer Tools row asks about: the running bundle's
     /// `CFBundleIdentifier` once the identity is warm, never a literal. Not an
     /// OS question; injected so a test can name a subject without warming the
@@ -190,6 +195,11 @@ fn inert_devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
     DevToolProbe::refused(DevToolProbeLabel::RefusedDisabled)
 }
 
+/// The inert list arm: the system TCC.db was deliberately not read.
+fn inert_devtools_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
+    DevToolList::refused(DevToolListLabel::RefusedDisabled)
+}
+
 impl ConsentProbes {
     /// The windowed instance's arms.
     pub(crate) const fn live() -> Self {
@@ -200,6 +210,7 @@ impl ConsentProbes {
             debugger: consent::probe_debugger,
             hardening: consent::self_hardening,
             devtools: consent::probe_devtool,
+            devtools_list: consent::probe_devtool_list,
             subject: running_bundle_id_if_warm,
             warm_subject: running_bundle_id,
             live: true,
@@ -215,6 +226,7 @@ impl ConsentProbes {
             debugger: inert_debugger,
             hardening: inert_hardening,
             devtools: inert_devtools,
+            devtools_list: inert_devtools_list,
             subject: running_bundle_id_if_warm,
             warm_subject: running_bundle_id_if_warm,
             live: false,
@@ -237,6 +249,7 @@ impl ConsentProbes {
                 debugger: unsupported_debugger_probe,
                 hardening: inert_hardening,
                 devtools: unsupported_devtools_probe,
+                devtools_list: unsupported_devtools_list,
                 subject: running_bundle_id_if_warm,
                 warm_subject: running_bundle_id_if_warm,
                 live: false,
@@ -281,6 +294,16 @@ fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
         DevToolProbeLabel::UnsupportedPlatform
     } else {
         DevToolProbeLabel::RefusedDisabled
+    })
+}
+
+/// There is no Developer Tools list off macOS: the list arm's twin of
+/// [`unsupported_devtools_probe`].
+fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolList {
+    DevToolList::refused(if gate.permits() {
+        DevToolListLabel::UnsupportedPlatform
+    } else {
+        DevToolListLabel::RefusedDisabled
     })
 }
 
@@ -458,6 +481,7 @@ const DEVTOOLS_TTL: Duration = Duration::from_secs(120);
 #[derive(Clone, Copy, Debug)]
 struct DevToolsEntry {
     probe: DevToolProbe,
+    list: DevToolList,
     subject: Option<&'static str>,
 }
 
@@ -467,6 +491,8 @@ struct DevToolsEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DevToolsRow {
     probe: DevToolProbe,
+    /// The switch's row in the system TCC.db (`list=`, `list_probe=`).
+    list: DevToolList,
     /// The bundle id the row is about (`subject=`), when there is one.
     subject: Option<&'static str>,
     probe_age_ms: Option<u128>,
@@ -478,6 +504,15 @@ impl DevToolsRow {
     const fn refused(label: DevToolProbeLabel, subject: Option<&'static str>) -> Self {
         Self {
             probe: DevToolProbe::refused(label),
+            list: DevToolList::refused(match label {
+                DevToolProbeLabel::Pending => DevToolListLabel::Pending,
+                DevToolProbeLabel::RefusedObserverOff => DevToolListLabel::RefusedObserverOff,
+                DevToolProbeLabel::RefusedNoSubject => DevToolListLabel::RefusedNoSubject,
+                DevToolProbeLabel::RefusedOutOfBundle => DevToolListLabel::RefusedOutOfBundle,
+                DevToolProbeLabel::RefusedNoExe => DevToolListLabel::RefusedNoExe,
+                DevToolProbeLabel::UnsupportedPlatform => DevToolListLabel::UnsupportedPlatform,
+                _ => DevToolListLabel::RefusedDisabled,
+            }),
             subject,
             probe_age_ms: None,
             answer_age_ms: None,
@@ -489,6 +524,7 @@ impl DevToolsRow {
     /// timestamp (a stamp in the future is age 0).
     fn from_probe(
         probe: DevToolProbe,
+        list: DevToolList,
         subject: Option<&'static str>,
         age: Duration,
         now_ms: i64,
@@ -496,6 +532,7 @@ impl DevToolsRow {
         let completed = !probe.label.refused() && probe.label != DevToolProbeLabel::Pending;
         Self {
             probe,
+            list,
             subject,
             probe_age_ms: completed.then_some(age.as_millis()),
             answer_age_ms: probe
@@ -512,6 +549,21 @@ impl DevToolsRow {
     /// The probe this row reports.
     pub(crate) const fn probe(&self) -> DevToolProbe {
         self.probe
+    }
+
+    /// The switch's row this row reports.
+    pub(crate) const fn list(&self) -> DevToolList {
+        self.list
+    }
+
+    /// The bundle id this row is about, when there is one.
+    pub(crate) const fn subject(&self) -> Option<&'static str> {
+        self.subject
+    }
+
+    /// The joined verdict (`grant=`, [`consent::devtool_grant`]).
+    pub(crate) fn grant(&self) -> aterm_containment::DevToolGrant {
+        consent::devtool_grant(&self.list, &self.probe)
     }
 
     /// How old tccd's newest answer was when this row was read.
@@ -895,6 +947,7 @@ impl ConsentState {
         if !self.probes.live {
             return DevToolsRow::from_probe(
                 (self.probes.devtools)(gate, known.unwrap_or_default()),
+                (self.probes.devtools_list)(gate, known.unwrap_or_default()),
                 known,
                 Duration::ZERO,
                 unix_now_ms(),
@@ -915,17 +968,28 @@ impl ConsentState {
             if let Some(generation) = generation {
                 let shared = Arc::clone(&self.shared);
                 let probe = self.probes.devtools;
+                let read_list = self.probes.devtools_list;
                 let warm_subject = self.probes.warm_subject;
                 spawn_slot_worker(&self.shared.devtools, "aterm-devtools-probe", move || {
                     let subject = known.or_else(warm_subject);
-                    let read = match subject.filter(|id| consent::devtool_subject_is_usable(id)) {
-                        Some(id) => probe(gate, id),
-                        None => DevToolProbe::refused(DevToolProbeLabel::RefusedNoSubject),
-                    };
+                    let (read, list) =
+                        match subject.filter(|id| consent::devtool_subject_is_usable(id)) {
+                            // The switch first: ten milliseconds, against tccd's
+                            // log's second.
+                            Some(id) => {
+                                let list = read_list(gate, id);
+                                (probe(gate, id), list)
+                            }
+                            None => (
+                                DevToolProbe::refused(DevToolProbeLabel::RefusedNoSubject),
+                                DevToolList::refused(DevToolListLabel::RefusedNoSubject),
+                            ),
+                        };
                     shared.complete_devtools(
                         generation,
                         DevToolsEntry {
                             probe: read,
+                            list,
                             subject,
                         },
                         Instant::now(),
@@ -938,7 +1002,9 @@ impl ConsentState {
         };
         answer.map_or(
             DevToolsRow::refused(DevToolProbeLabel::Pending, known),
-            |(entry, age)| DevToolsRow::from_probe(entry.probe, entry.subject, age, unix_now_ms()),
+            |(entry, age)| {
+                DevToolsRow::from_probe(entry.probe, entry.list, entry.subject, age, unix_now_ms())
+            },
         )
     }
 
@@ -1772,7 +1838,7 @@ impl PrivacySnapshot {
         let devtools = self.devtools.probe;
         out.push(format!(
             "devtools state={} subject={} requests={} not_allowed={} answer_age_ms={} \
-             window_s={} probe={} probe_age_ms={}",
+             window_s={} probe={} probe_age_ms={} grant={} list={} list_probe={}",
             devtools.state.as_str(),
             opt(self.devtools.subject),
             num(devtools.requests.map(u64::from)),
@@ -1783,6 +1849,9 @@ impl PrivacySnapshot {
             self.devtools
                 .probe_age_ms
                 .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
+            self.devtools.grant().as_str(),
+            self.devtools.list.listing.as_str(),
+            self.devtools.list.label.as_str(),
         ));
         out.push(format!(
             "observer fda={} responsible={} log={} taskport={TASKPORT_WATCH}",
@@ -2108,7 +2177,7 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     let _ = write!(
         body,
         "\"devtools\":{{{},\"subject\":{},\"requests\":{},\"not_allowed\":{},\
-         \"answer_age_ms\":{},\"window_s\":{},{},\"probe_age_ms\":{}}},",
+         \"answer_age_ms\":{},\"window_s\":{},{},\"probe_age_ms\":{},{},{},{}}},",
         json_str_field("state", devtools.state.as_str()),
         json_opt(snapshot.devtools.subject),
         num(devtools.requests.map(u64::from)),
@@ -2120,6 +2189,9 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
             .devtools
             .probe_age_ms
             .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
+        json_str_field("grant", snapshot.devtools.grant().as_str()),
+        json_str_field("list", snapshot.devtools.list.listing.as_str()),
+        json_str_field("list_probe", snapshot.devtools.list.label.as_str()),
     );
     let _ = write!(body, "\"access_card\":{},", snapshot.access_card.json());
     let _ = write!(
@@ -3169,6 +3241,12 @@ mod tests {
             not_allowed: Some(233),
             answered_at_ms: Some(1_791_381_501_820),
         },
+        list: DevToolList {
+            listing: aterm_containment::DevToolListing::Absent,
+            label: DevToolListLabel::Read,
+            modified_at_s: None,
+            rows: Some(1),
+        },
         subject: Some("com.aterm.aterm"),
         probe_age_ms: Some(812),
         answer_age_ms: Some(4100),
@@ -3177,7 +3255,7 @@ mod tests {
     /// The exact `devtools` line [`FIXTURE_DEVTOOLS`] renders.
     const FIXTURE_DEVTOOLS_LINE: &str = "devtools state=unlisted subject=com.aterm.aterm \
          requests=233 not_allowed=233 answer_age_ms=4100 window_s=600 probe=observed \
-         probe_age_ms=812";
+         probe_age_ms=812 grant=not_granted list=absent list_probe=read";
 
     /// A snapshot with no OS in it, so the wire format is a total function of
     /// data a test can name.
@@ -3314,8 +3392,9 @@ mod tests {
         assert_eq!(
             devtools,
             "devtools state=unknown subject=- requests=- not_allowed=- answer_age_ms=- \
-             window_s=600 probe=refused_disabled probe_age_ms=-",
-            "the INERT devtools arm must be the wired one"
+             window_s=600 probe=refused_disabled probe_age_ms=- grant=unknown list=unknown \
+             list_probe=refused_disabled",
+            "the INERT devtools arms must be the wired ones"
         );
         assert!(!app.read_privacy(PrivacyForm::Lines, Scope::Owner).pending);
     }
@@ -4571,13 +4650,15 @@ mod tests {
         let refused = |label: &str| {
             format!(
                 "devtools state=unknown subject=com.example.subject requests=- not_allowed=- \
-                 answer_age_ms=- window_s=600 probe={label} probe_age_ms=-"
+                 answer_age_ms=- window_s=600 probe={label} probe_age_ms=- grant=unknown \
+                 list=unknown list_probe={label}"
             )
         };
         let warm = |app: &crate::App| {
             app.consent.shared.devtools.lock_or_recover().entry = Some((
                 DevToolsEntry {
                     probe: fake_devtools(&AtomicUsize::new(0), 0),
+                    list: DevToolList::pending(),
                     subject: fake_subject(),
                 },
                 Instant::now(),
@@ -4619,7 +4700,10 @@ mod tests {
             .lines
             .concat();
         assert!(
-            json.contains("\"probe\":\"refused_observer_off\",\"probe_age_ms\":null}"),
+            json.contains(
+                "\"probe\":\"refused_observer_off\",\"probe_age_ms\":null,\"grant\":\"unknown\",\
+                 \"list\":\"unknown\",\"list_probe\":\"refused_observer_off\"}"
+            ),
             "{json}"
         );
         app.config.privacy = None;
@@ -5260,7 +5344,8 @@ mod tests {
             json.contains(
                 "\"devtools\":{\"state\":\"unlisted\",\"subject\":\"com.aterm.aterm\",\
                  \"requests\":233,\"not_allowed\":233,\"answer_age_ms\":4100,\"window_s\":600,\
-                 \"probe\":\"observed\",\"probe_age_ms\":812},"
+                 \"probe\":\"observed\",\"probe_age_ms\":812,\"grant\":\"not_granted\",\
+                 \"list\":\"absent\",\"list_probe\":\"read\"},"
             ),
             "{json}"
         );
@@ -5305,7 +5390,8 @@ mod tests {
             pending.contains(
                 "\"devtools\":{\"state\":\"unknown\",\"subject\":null,\"requests\":null,\
                  \"not_allowed\":null,\"answer_age_ms\":null,\"window_s\":600,\
-                 \"probe\":\"pending\",\"probe_age_ms\":null},"
+                 \"probe\":\"pending\",\"probe_age_ms\":null,\"grant\":\"unknown\",\
+                 \"list\":\"unknown\",\"list_probe\":\"pending\"},"
             ),
             "{pending}"
         );

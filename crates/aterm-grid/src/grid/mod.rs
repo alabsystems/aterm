@@ -79,7 +79,7 @@ pub use history_carry::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
 pub(crate) use scroll_convert::ScrolledRowExtras;
-pub use scroll_materialize::{MaterializedRow, materialize_from_line};
+pub use scroll_materialize::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use scrollback_access::HistoryLines;
 pub use scrollback_offload::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 pub use visible_row_view::{CellDataView, VisibleRowView};

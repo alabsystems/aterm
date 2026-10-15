@@ -2508,10 +2508,9 @@ pub(crate) fn sanitize_checkpoint_for_wire(
                         cursor.margin_left = 0;
                         cursor.margin_right = cols.saturating_sub(1);
                     }
-                    // The engine's own default stops (`GridCursorState::
-                    // default_tab_stops`): one every eight columns.
+                    // The engine's own default stops: one every eight columns.
                     "tab_stops.len()" => {
-                        cursor.tab_stops = (0..cols).map(|col| col > 0 && col % 8 == 0).collect();
+                        cursor.tab_stops = default_tab_stops(usize::from(cols));
                         cursor.tab_defaults_suppressed = false;
                     }
                     _ => return Err(unsanitizable()),
@@ -5050,13 +5049,13 @@ impl ProcessBirth {
 ///
 /// * no such process (the parent already exited AND was reaped);
 /// * a ZOMBIE. Treating it as dead keeps this probe's edge NEAR the predicate
-///   it replaces, not exactly on it: XNU's `proc_exit()` reparents children to
-///   initproc BEFORE setting `p_stat = SZOMB`, so `getppid()` flips first and
-///   this probe goes false strictly later — same event, a few instructions
-///   apart. The gap is on the safe side (the successor keeps running slightly
-///   longer than the old predicate would have allowed, and the commit pipe
-///   still bounds it); claiming the two edges coincide would be wrong. libproc
-///   may already refuse zombies outright, in which case this arm never runs;
+///   it replaces (`getppid() == pid`), not on it, and which of the two moves
+///   first is no caller's to lean on. MEASURED on Darwin 25.6.0, 2026-10-13
+///   (figures at `tests::commit_parent_death_helper`): this probe goes false
+///   FIRST, and a child's `getppid()` names the exiting parent for about a
+///   millisecond more. The protocol needs neither order: liveness reads one
+///   witness, and the watch's last poll lets a written Commit win. There
+///   libproc refused the exiting parent outright, so this arm did not run;
 /// * a process owned by another uid. Every other authority in the overlap
 ///   protocol is uid-bounded (the 0700 control dir, `control_auth::peer_check`),
 ///   and a cross-uid "parent" is not a shape this lane has;
@@ -5229,16 +5228,18 @@ fn attest_handoff_parent_from(
             ParentWitness::Birth(live)
         }
         (None, None) if creator == pid => {
-            // On macOS a live same-uid process with no readable birth record is
-            // a real anomaly (libproc answers for other processes here — the
-            // managed-Ollama attestation depends on it), so say so: it is the
-            // only signal that this machine's handoffs are running on the
-            // weaker witness. Off macOS the parent link IS the documented
-            // witness, so there is nothing to report.
+            // On macOS libproc answers for a live same-uid process (the managed-
+            // Ollama attestation depends on it), so no record is an anomaly, said
+            // below as the one signal that this machine's handoffs run on the
+            // weaker witness — or the parent is already EXITING: its birth read
+            // fails about a millisecond before this link moves (the order measured
+            // at `read_process_birth`), so the line names both causes. Off macOS
+            // the link IS the documented witness.
             #[cfg(target_os = "macos")]
             crate::logging::stderr_line!(
-                "aterm-gui: seamless handoff: no kernel birth record for parent {pid}; \
-                 falling back to the process link for parent-death detection"
+                "aterm-gui: seamless handoff: no kernel birth record for parent {pid} \
+                 (libproc declined it, or the parent is exiting); falling back to the \
+                 process link for parent-death detection"
             );
             ParentWitness::ForkLink
         }
@@ -6304,10 +6305,114 @@ impl ReadySignal {
     }
 }
 
+/// WHY A SUCCESSOR HAS NO COMMIT IT CAN TAKE: each way its Commit watch
+/// ([`CommitReceiver::start_watch`]), or the event loop reading the watch's
+/// answer ([`CommitReceiver::receive_commit`]), ends short of this attempt's
+/// exact Commit. The fail-stop names it before it leaves
+/// ([`fail_stop_without_commit`]). Until 2026-10-14 it named nothing: every
+/// red run of the parent-death fixture on 2026-10-13 left an empty stderr, and
+/// which ending a watch took had to be found by instrumenting a copy of it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoCommit {
+    /// The parent's liveness witness ([`AttestedParent::still_alive`]) no
+    /// longer names it, and a last look found nothing in the pipe.
+    ParentGone,
+    /// `poll` answered these `revents` (`POLLHUP`, `POLLERR`, `POLLNVAL`) and
+    /// nothing to read.
+    PipeEnded { revents: libc::c_short },
+    /// `poll` failed with this `errno`.
+    PollFailed { errno: i32 },
+    /// The read found end of file: every writer closed the pipe and none
+    /// wrote a Commit.
+    EndOfFile,
+    /// The read returned `len` bytes. A Commit is one write of
+    /// [`READY_WIRE_LEN`] bytes, so this is a malformed Commit, not a prefix.
+    ShortCommit { len: usize },
+    /// The read failed with this `errno`.
+    ReadFailed { errno: i32 },
+    /// A whole Commit arrived, and the event loop no longer holds the
+    /// receiver it goes to.
+    ReceiverGone,
+    /// A whole Commit arrived that does not match this attempt's adoption
+    /// proof.
+    Mismatched,
+    /// The watch ended without handing the event loop an answer.
+    NoAnswer,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for NoCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let os = |errno: i32| std::io::Error::from_raw_os_error(errno);
+        match *self {
+            Self::ParentGone => f.write_str(
+                "the parent is gone (its liveness witness no longer names it: it exited, or is \
+                 exiting) and the pipe held no Commit",
+            ),
+            Self::PipeEnded { revents } => {
+                f.write_str("the pipe answered")?;
+                for (bit, name) in [
+                    (libc::POLLHUP, " POLLHUP (hang-up)"),
+                    (libc::POLLERR, " POLLERR (error)"),
+                    (libc::POLLNVAL, " POLLNVAL (invalid descriptor)"),
+                ] {
+                    if revents & bit != 0 {
+                        f.write_str(name)?;
+                    }
+                }
+                f.write_str(" with nothing to read")
+            }
+            Self::PollFailed { errno } => write!(f, "poll failed: {}", os(errno)),
+            Self::EndOfFile => f.write_str(
+                "end of file: every writer closed the pipe without a Commit (the parent closed \
+                 it, or exited)",
+            ),
+            Self::ShortCommit { len } => {
+                write!(f, "a malformed Commit: {len} bytes of {READY_WIRE_LEN}")
+            }
+            Self::ReadFailed { errno } => write!(f, "the read failed: {}", os(errno)),
+            Self::ReceiverGone => f.write_str(
+                "a Commit arrived and the event loop no longer holds the receiver it goes to",
+            ),
+            Self::Mismatched => {
+                f.write_str("a Commit that does not match this attempt's adoption proof")
+            }
+            Self::NoAnswer => f.write_str("the watch ended without an answer"),
+        }
+    }
+}
+
+/// THE FAIL-STOP: a successor that can no longer take a Commit leaves with 74,
+/// through `_exit`, so no App or Session destructor runs and the adopted PTYs
+/// stay the parent's. It says why first (`end`), in the durable log and on
+/// stderr, as the lifeline's exit does.
+///
+/// The Commit pipe's read end is already closed when this is called: the watch
+/// closes it the moment its loop ends, before anything that can say why. So a
+/// Commit the parent writes while this line is written fails (`EPIPE`; the
+/// window ignores `SIGPIPE`, as Rust's runtime leaves it) and the parent takes
+/// its `commit_write_failed` rejection, keeping its sessions, instead of a
+/// write that lands in a pipe nobody will read and an `_exit(0)` beside this
+/// one. The line costs no Commit, so it may take what a log write takes.
+#[cfg(unix)]
+fn fail_stop_without_commit(parent: AttestedParent, end: NoCommit) -> ! {
+    aterm_log::error!(
+        "seamless handoff: no Commit from parent {}: {end}; this successor fail-stops with 74",
+        parent.pid
+    );
+    crate::logging::stderr_line!(
+        "aterm-gui: seamless handoff: no Commit from parent {}: {end}; this successor \
+         fail-stops with 74",
+        parent.pid
+    );
+    crate::crash_signal::clean_exit_now(74)
+}
+
 #[cfg(unix)]
 pub(crate) struct CommitReceiver {
     fd: Option<std::os::fd::OwnedFd>,
-    wire: Option<std::sync::mpsc::Receiver<Option<[u8; READY_WIRE_LEN]>>>,
+    wire: Option<std::sync::mpsc::Receiver<Result<[u8; READY_WIRE_LEN], NoCommit>>>,
     fail_stop: bool,
     parent: AttestedParent,
 }
@@ -6358,13 +6463,18 @@ impl CommitReceiver {
                         if pollfd.revents & libc::POLLIN != 0 {
                             break read_atomic_wire(&fd);
                         }
-                        if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                            break None;
+                        let ended =
+                            pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL);
+                        if ended != 0 {
+                            break Err(NoCommit::PipeEnded { revents: ended });
                         }
-                    } else if polled < 0
-                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                    {
-                        break None;
+                    } else if polled < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            break Err(NoCommit::PollFailed {
+                                errno: error.raw_os_error().unwrap_or(0),
+                            });
+                        }
                     }
                     // The fail-stop's liveness witness. It no longer ASSUMES the
                     // process tree can answer: a successor launchd owns has ppid
@@ -6383,19 +6493,30 @@ impl CommitReceiver {
                         if final_poll > 0 && pollfd.revents & libc::POLLIN != 0 {
                             break read_atomic_wire(&fd);
                         }
-                        break None;
+                        break Err(NoCommit::ParentGone);
                     }
                 };
-                if received.is_none() && fail_stop {
-                    // Parent EOF before exact Commit means this candidate can
-                    // never become authoritative. Exit without App/Session
-                    // destructors so adopted PTYs remain owned by the parent.
-                    crate::crash_signal::clean_exit_now(74)
+                // THE WATCH IS OVER, SO THE READ END CLOSES NOW, before either
+                // fail-stop below says why. Nothing more is read from this pipe
+                // whatever the ending, and a read end left open would accept a
+                // Commit the parent writes from here on: the parent would
+                // `_exit(0)` on it while this process leaves too, and both
+                // would be gone. Closed, that write fails, and the parent
+                // keeps its sessions ([`fail_stop_without_commit`]). A write
+                // between the watch's last look and this close still lands;
+                // nothing runs between them.
+                drop(fd);
+                if let Err(end) = received
+                    && fail_stop
+                {
+                    // No exact Commit can arrive now, so this candidate can
+                    // never become authoritative.
+                    fail_stop_without_commit(parent, end)
                 }
                 if send.send(received).is_err() && fail_stop {
                     // The event-loop authority disappeared while the parent was
                     // deciding. Remaining alive readerless is never terminal.
-                    crate::crash_signal::clean_exit_now(74)
+                    fail_stop_without_commit(parent, NoCommit::ReceiverGone)
                 }
             })
             .ok()?;
@@ -6421,41 +6542,53 @@ impl CommitReceiver {
     }
 
     /// Wait for the exact attempt-bound Commit. No PTY reader may be attached
-    /// before this succeeds.
-    pub(crate) fn receive_commit(&self, expected: AdoptionProof) -> bool {
-        self.wire
+    /// before this succeeds; `Err` says why it did not.
+    pub(crate) fn receive_commit(&self, expected: AdoptionProof) -> Result<(), NoCommit> {
+        match self
+            .wire
             .as_ref()
             .expect("commit watch must start before event-loop ownership")
             .recv()
-            .ok()
-            .flatten()
-            .is_some_and(|wire| expected.commit_wire_matches(&wire))
+        {
+            Ok(Ok(wire)) if expected.commit_wire_matches(&wire) => Ok(()),
+            Ok(Ok(_)) => Err(NoCommit::Mismatched),
+            Ok(Err(end)) => Err(end),
+            Err(std::sync::mpsc::RecvError) => Err(NoCommit::NoAnswer),
+        }
     }
 
     /// A full but mismatched Commit is as terminal as EOF. Production children
-    /// fail-stop destructor-free; unit fixtures can observe the false result.
-    pub(crate) fn fail_stop_if_required(&self) {
+    /// fail-stop destructor-free, saying `end`; unit fixtures can observe the
+    /// `Err` instead.
+    pub(crate) fn fail_stop_if_required(&self, end: NoCommit) {
         if self.fail_stop {
-            crate::crash_signal::clean_exit_now(74)
+            fail_stop_without_commit(self.parent, end)
         }
     }
 }
 
 #[cfg(unix)]
-fn read_atomic_wire(fd: &std::os::fd::OwnedFd) -> Option<[u8; READY_WIRE_LEN]> {
+fn read_atomic_wire(fd: &std::os::fd::OwnedFd) -> Result<[u8; READY_WIRE_LEN], NoCommit> {
     use std::os::fd::AsRawFd as _;
     let mut wire = [0u8; READY_WIRE_LEN];
     loop {
         // Commit is emitted by one fixed <=PIPE_BUF write. A short positive read
         // is therefore malformed authority, not a prefix to wait on indefinitely.
         let read = unsafe { libc::read(fd.as_raw_fd(), wire.as_mut_ptr().cast(), wire.len()) };
-        if read == isize::try_from(wire.len()).ok()? {
-            return Some(wire);
+        match usize::try_from(read) {
+            Ok(len) if len == wire.len() => return Ok(wire),
+            Ok(0) => return Err(NoCommit::EndOfFile),
+            Ok(len) => return Err(NoCommit::ShortCommit { len }),
+            Err(_) => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(NoCommit::ReadFailed {
+                    errno: error.raw_os_error().unwrap_or(0),
+                });
+            }
         }
-        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return None;
     }
 }
 
@@ -6714,6 +6847,141 @@ pub(crate) fn admit_master_descriptor(fd: i32) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// THE KEEPER META'S TAB STOPS, PACKED (round seventeen, R17-HANDOFF-1, ruled
+/// 2026-10-11). The handoff's meta carries each cursor's stops as a JSON bool
+/// per column, about six bytes a column; the alternate screen adds a second
+/// cursor, and a grid never shrinks the vector. So from 119 alternate-screen
+/// columns (330 on the main screen, or any pane once that wide) even the bare
+/// scalars passed the keeper's 4 KiB, and no META was sent at all: a crash
+/// recovery restored the modes from before the program started. A keeper META
+/// the old form does not fit writes each cursor's `tab_stops` as an empty list
+/// and carries the stops under [`PACKED_TAB_STOPS_KEY`]: the vector's length,
+/// and — only when they are not the every-8 defaults a fresh grid seeds
+/// ([`aterm_core::grid::is_default_tab_stop`]) — a bitmap, four columns a
+/// lower-case hex digit (column `4i + j` is bit `j` of digit `i`), trailing
+/// zero digits left off. Default stops cost about thirty bytes at any width,
+/// and any others at most a quarter of a byte a column more.
+///
+/// VERSION SKEW (ruled 2026-10-11, and corrected the same day on review). The
+/// keeper never decodes a META (the AKP1 wire's `PROTO` versions its frames,
+/// not this body) and the body carries no version of its own: its one reader
+/// is whichever window recovers. FORWARD: a newer window reads an older one's
+/// META (bool lists, no packed key) exactly as before. BACKWARD (a rollback,
+/// or an older build launched after a newer one crashed): [`keeper_meta_of`]
+/// writes the old form, byte for byte, whenever the WHOLE carry fits in it, so
+/// an older window reads every META a window before round seventeen sent whole
+/// exactly as before. Where the whole carry did not fit, that window shed the
+/// directory and colours, then the title and mark state, and sent the old form
+/// if one of those fit, else nothing; this one sends the packed form. A packed
+/// META an older window reads as the handoff's meta: it ignores the key it
+/// does not know and reads each cursor's empty list, and its Repaint rung
+/// resets that cursor to a blank one at the same position
+/// (`repaint_checkpoint`'s sanitize). So it keeps every mode and loses the
+/// scroll region, margins and custom stops, which a full-screen program sets
+/// again as it repaints after the size pulse. Where not even a shed old form
+/// fit, it used to recover the modes from before the program started, or
+/// none, so there this is all gain. In the BAND where only a shed old form
+/// fit (the review measured about 105-118 alternate-screen columns with an
+/// ordinary directory and title, or 80 with a pushed colour table) the older
+/// window trades instead: it now keeps the directory, colours and title it
+/// used to lose, and loses the region, margins and custom stops it used to
+/// keep (`where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole`).
+///
+/// Ruled 2026-10-11 for the band, against trying the old form's two shed
+/// rungs before packing. A keeper recovery is nearly always the same build
+/// relaunched after its window crashed, and that reader gets the whole state
+/// here: the directory and a pushed colour table, which no repaint sends
+/// again, as well as the region. Shedding first would cost it those for the
+/// rare older reader. The older reader is safe either way, keeps every mode,
+/// and trades one partial loss for another. No version field: an older reader
+/// would not read one. The handoff's wire keeps the bool form: its successors
+/// read it, and its 64 KiB budget sheds the stops past the width instead
+/// (`shed_metas_to_budget`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PackedTabStops {
+    /// The stop vector's length: at least the width, and more for a pane once
+    /// wider, whose stops past the width a later widen finds again.
+    len: u16,
+    /// The stops as the bitmap; absent when they are the every-8 defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
+}
+
+/// The member of a keeper META's cursor that carries its [`PackedTabStops`].
+const PACKED_TAB_STOPS_KEY: &str = "tab_stops_packed";
+
+/// The stops a fresh grid `cols` wide holds, one every eighth column
+/// ([`aterm_core::grid::is_default_tab_stop`]): what a carried cursor's stops
+/// become wherever this module replaces them.
+pub(crate) fn default_tab_stops(cols: usize) -> Vec<bool> {
+    (0..cols)
+        .map(aterm_core::grid::is_default_tab_stop)
+        .collect()
+}
+
+impl PackedTabStops {
+    /// `stops` packed; `None` for a vector longer than a `u16` counts, which
+    /// no grid holds.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn pack(stops: &[bool]) -> Option<Self> {
+        let len = u16::try_from(stops.len()).ok()?;
+        let defaults = stops
+            .iter()
+            .enumerate()
+            .all(|(col, &stop)| stop == aterm_core::grid::is_default_tab_stop(col));
+        let hex = (!defaults).then(|| {
+            let mut hex = stops
+                .chunks(4)
+                .map(|nibble| {
+                    let bits = nibble
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, stop)| **stop)
+                        .fold(0_u32, |bits, (bit, _)| bits | (1 << bit));
+                    char::from_digit(bits, 16).unwrap_or('0')
+                })
+                .collect::<String>();
+            hex.truncate(hex.trim_end_matches('0').len());
+            hex
+        });
+        Some(Self { len, hex })
+    }
+
+    /// The stop vector, or `None` for a packing no window writes — an empty
+    /// or over-wide vector, a bitmap longer than its length or with a digit
+    /// that is not hex, or a stop past the length. The caller then keeps the
+    /// META's own `tab_stops`, which the Repaint rung judges as it judges any.
+    fn unpack(&self) -> Option<Vec<bool>> {
+        let len = usize::from(self.len);
+        if len == 0 || len > usize::from(aterm_core::grid::MAX_GRID_COLS) {
+            return None;
+        }
+        let Some(hex) = &self.hex else {
+            return Some(default_tab_stops(len));
+        };
+        if hex.len() > len.div_ceil(4) {
+            return None;
+        }
+        let mut stops = vec![false; len];
+        for (digit, ch) in hex.chars().enumerate() {
+            let bits = ch.to_digit(16)?;
+            for bit in 0..4 {
+                if bits & (1 << bit) != 0 {
+                    *stops.get_mut(digit * 4 + bit)? = true;
+                }
+            }
+        }
+        Some(stops)
+    }
+}
+
+/// [`keeper_meta_of`] of a terminal's meta carry, for tests: the pump takes
+/// the carry under the terminal's lock and builds the META after releasing it.
+#[cfg(all(unix, test))]
+pub(crate) fn keeper_meta(term: &aterm_core::terminal::Terminal) -> Option<Vec<u8>> {
+    keeper_meta_of(term.carry_meta_abandoning_partial())
+}
+
 /// THE KEEPER'S META (PTY keeper P3, design §5.3 step 2): the Repaint rung's
 /// scalar state of a live terminal — modes, keyboard protocols, charsets, the
 /// pen, the cursor, the directory and title — as the JSON the handoff's screen
@@ -6726,37 +6994,113 @@ pub(crate) fn admit_master_descriptor(fd: i32) -> Result<(), &'static str> {
 /// be hours old: a link open then and closed since would link everything the
 /// program prints after the recovery, and a link's URI (up to 8 KiB) alone
 /// could push the META past its cap (round eight of the update audit, finding
-/// 502's review). At most [`aterm_keeper::wire::MAX_META`] bytes: the
-/// directory, colours, title and mark state are dropped, in that order, until
-/// it fits; `None` when even the bare scalars do not.
+/// 502's review).
+///
+/// At most [`aterm_keeper::wire::MAX_META`] bytes, for every live session
+/// (round seventeen, R17-HANDOFF-1, ruled 2026-10-11). The whole carry goes as
+/// every window before that round wrote it when it fits whole, which an older
+/// reader reads exactly as before ([`PackedTabStops`]' VERSION SKEW, which also
+/// records what that reader trades where it does not); else the tab stops travel
+/// packed, so the size no longer grows with the width, and what still does
+/// not fit is shed one rung at a time, least important first: the tab stops
+/// past the width (custom stops only a later widen would find); the directory
+/// and colours; the title and the mark state; and last the custom tab stops
+/// themselves, the every-8 defaults standing in. What is left — the modes,
+/// keyboard protocols, charsets, pen and both cursors with their regions — is
+/// a fixed set of scalars. Measured 2026-10-11 on a 50-row session: packed,
+/// a META is about 2,205 bytes on the main screen and 2,781 on the alternate
+/// one at any width (the old form: 2,642 and 3,656 at 80 columns, 26,240 and
+/// 50,850 at 4,096). The fullest session `a_meta_is_built_for_every_session`
+/// builds (4,096 columns, a stop at every one on both screens, a long
+/// directory and title, a pushed colour table, marks, full kitty stacks, both
+/// DECSC slots and counters at their maximum) sheds to 3,268 bytes. With every
+/// other scalar at its widest as well (each mode `false`, each number the
+/// widest its field takes, each enum its longest name, the longest character
+/// sets in every slot) it sheds to 3,675, 421 under the cap; that test builds
+/// both and holds each under the cap. So `None` means only that those scalars
+/// outgrew the cap.
 #[cfg(unix)]
-pub(crate) fn keeper_meta(term: &aterm_core::terminal::Terminal) -> Option<Vec<u8>> {
-    let mut meta = term.carry_meta_abandoning_partial();
+pub(crate) fn keeper_meta_of(mut meta: CheckpointMeta) -> Option<Vec<u8>> {
+    fn cursors(
+        meta: &mut CheckpointMeta,
+    ) -> impl Iterator<Item = &mut aterm_core::terminal::GridCursorRepr> {
+        std::iter::once(&mut meta.cursor).chain(&mut meta.alt_cursor)
+    }
+    let under_cap = |bytes: Vec<u8>| (bytes.len() <= aterm_keeper::wire::MAX_META).then_some(bytes);
     meta.shell_integration_nonce = None;
     meta.parser = None;
     meta.output_state = aterm_core::terminal::OutputStateRepr::default();
-    let fits = |meta: &CheckpointMeta| {
-        aterm_json::to_string(meta)
-            .ok()
-            .map(String::into_bytes)
-            .filter(|bytes| bytes.len() <= aterm_keeper::wire::MAX_META)
-    };
-    if let Some(bytes) = fits(&meta) {
+    if let Some(bytes) = aterm_json::to_string(&meta)
+        .ok()
+        .map(String::into_bytes)
+        .and_then(under_cap)
+    {
         return Some(bytes);
     }
-    meta.current_working_directory = None;
-    meta.color = aterm_core::terminal::ColorRepr::default();
-    if let Some(bytes) = fits(&meta) {
-        return Some(bytes);
+    let shed: [fn(&mut CheckpointMeta); 4] = [
+        |meta| {
+            let cols = usize::from(meta.cols);
+            for cursor in cursors(meta) {
+                cursor.tab_stops.truncate(cols);
+            }
+        },
+        |meta| {
+            meta.current_working_directory = None;
+            meta.color = aterm_core::terminal::ColorRepr::default();
+        },
+        |meta| {
+            meta.title = None;
+            meta.shell = aterm_core::terminal::ShellRepr::default();
+        },
+        |meta| {
+            let cols = usize::from(meta.cols);
+            for cursor in cursors(meta) {
+                cursor.tab_stops = default_tab_stops(cols);
+                cursor.tab_defaults_suppressed = false;
+            }
+        },
+    ];
+    for rung in shed {
+        if let Some(bytes) = keeper_meta_json(meta.clone()).and_then(under_cap) {
+            return Some(bytes);
+        }
+        rung(&mut meta);
     }
-    meta.title = None;
-    meta.shell = aterm_core::terminal::ShellRepr::default();
-    fits(&meta)
+    keeper_meta_json(meta).and_then(under_cap)
+}
+
+/// `meta` as the keeper's META: the handoff's meta JSON with each cursor's
+/// stops packed ([`PackedTabStops`]) beside an empty `tab_stops`.
+#[cfg(unix)]
+fn keeper_meta_json(mut meta: CheckpointMeta) -> Option<Vec<u8>> {
+    let packed = [
+        PackedTabStops::pack(&std::mem::take(&mut meta.cursor.tab_stops)),
+        meta.alt_cursor
+            .as_mut()
+            .and_then(|alt| PackedTabStops::pack(&std::mem::take(&mut alt.tab_stops))),
+    ];
+    let mut value = aterm_json::to_value(&meta).ok()?;
+    let object = value.as_object_mut()?;
+    for (slot, packed) in ["cursor", "alt_cursor"].into_iter().zip(packed) {
+        let (Some(packed), Some(cursor)) = (
+            packed,
+            object
+                .get_mut(slot)
+                .and_then(aterm_json::Value::as_object_mut),
+        ) else {
+            continue;
+        };
+        cursor.insert(
+            PACKED_TAB_STOPS_KEY.to_owned(),
+            aterm_json::to_value(&packed).ok()?,
+        );
+    }
+    aterm_json::to_vec(&value).ok()
 }
 
 /// THE KEEPER'S REPAINT RUNG (PTY keeper P3, design §5.3 step 7): the
 /// checkpoint a keeper-recovered session is adopted onto — a blank canonical
-/// screen carrying the META the dead window last sent ([`keeper_meta`]), built
+/// screen carrying the META the dead window last sent ([`keeper_meta_of`]), built
 /// by the same degrade a refused handoff screen takes
 /// ([`repaint_checkpoint`]), priced against `used_cells` across the recovery.
 /// `None` for a META that is empty or does not read as the handoff's meta (the
@@ -6777,7 +7121,22 @@ pub(crate) fn recovered_checkpoint(
     {
         return None;
     }
+    // A newer META's packed tab stops ([`PackedTabStops`]); an older one has
+    // none and its bool lists read as they always did.
+    let packed = |slot: &str| {
+        let packed = object.get(slot)?.get(PACKED_TAB_STOPS_KEY)?.clone();
+        aterm_json::from_value::<PackedTabStops>(packed)
+            .ok()?
+            .unpack()
+    };
+    let (main_stops, alt_stops) = (packed("cursor"), packed("alt_cursor"));
     let mut meta: CheckpointMeta = aterm_json::from_value(value).ok()?;
+    if let Some(stops) = main_stops {
+        meta.cursor.tab_stops = stops;
+    }
+    if let (Some(stops), Some(alt)) = (alt_stops, meta.alt_cursor.as_mut()) {
+        alt.tab_stops = stops;
+    }
     meta.shell_integration_nonce = None;
     meta.parser = None;
     meta.output_state = aterm_core::terminal::OutputStateRepr::default();

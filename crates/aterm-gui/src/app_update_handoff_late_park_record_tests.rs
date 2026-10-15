@@ -54,8 +54,6 @@ fn parked_record(attempt_id: u64, mode: ApplyMode) -> crate::PendingUpdateHandof
     crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id,
         nonce: None,
         live: Vec::new(),

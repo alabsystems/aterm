@@ -19,6 +19,7 @@ impl Row {
     pub fn write_char(&mut self, col: u16, c: char) -> bool {
         let col_usize = col as usize;
         let old_len = self.len as usize;
+        let mut end_half_blanked = false;
 
         // Wide character fixup: only check when row has wide chars
         if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
@@ -38,6 +39,7 @@ impl Row {
                 && let Some(next_cell) = self.cells.get_mut(col_usize + 1)
             {
                 *next_cell = Cell::EMPTY;
+                end_half_blanked = true;
             }
         }
 
@@ -46,22 +48,42 @@ impl Row {
         }
         self.cells[col_usize].set_char(c);
         self.note_write_through(col_usize + 1);
-        if col >= self.len {
-            self.len = col.saturating_add(1);
-        } else if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && old_len > 0
-            && self.cells[old_len - 1].is_empty()
-        {
-            // A single-width write over a WIDE head at the tail: the fixup above
-            // cleared its continuation at col+1, and if that pair was the row's
-            // last content (old_len == col+2) len would stay stale-high (a
-            // phantom trailing space in row_text/search/scrollback).
-            // recalculate_len_up_to never over-shrinks, and this path is off the
-            // ASCII (no-wide) hot path.
-            self.recalculate_len_up_to(old_len);
-        }
+        self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
         self.flags |= RowFlags::DIRTY;
         true
+    }
+
+    /// `len` after a write over `[.., end)`: the one rule every writer keeps
+    /// (ruling 2026-10-10, r15 C4).
+    ///
+    /// `len` is one past the last cell output has written: a printed glyph, a
+    /// printed blank included, or a mark attached to a cell. That is what its
+    /// readers take it for: the render frame stops at it, copy and search keep
+    /// a soft-wrapped row's text through it (`TrailingBlanks::Written`), a
+    /// history line stores that many cells, and a rewrap keeps the printed
+    /// blanks it covers so a cursor after a printed space keeps its column. A
+    /// printed blank therefore counts whichever writer printed it, one glyph at
+    /// a time or as a run, and whatever the read boundaries were.
+    ///
+    /// The written span always counts. A wide half the write's fixup blanked
+    /// was not written: when it was the row's last cell (`end` is its column
+    /// and `end + 1 == old_len`), `len` ends at the write rather than leave a
+    /// phantom trailing space. Erasing is not writing: the erase paths shrink
+    /// `len` to the last cell that still holds content.
+    #[inline]
+    pub(super) fn settle_len_after_write(
+        &mut self,
+        old_len: usize,
+        end: usize,
+        end_half_blanked: bool,
+    ) {
+        let end = end.min(self.cells.len());
+        let len = if end_half_blanked && end + 1 == old_len {
+            end
+        } else {
+            old_len.max(end)
+        };
+        self.len = u16_from_usize(len);
     }
 
     /// Write a styled character at the given column.
@@ -102,12 +124,14 @@ impl Row {
         // Wide character fixup (rare path): only check cell flags when the
         // row actually contains wide characters. Skips the flag read entirely
         // for ASCII-only rows (common case).
+        let mut end_half_blanked = false;
         if self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
             // SAFETY: col_usize < cells_len verified above
             let current_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
             let wide_mask = CellFlags::WIDE.union(CellFlags::WIDE_CONTINUATION);
             if (current_flags.bits() & wide_mask.bits()) != 0 {
-                self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
+                end_half_blanked =
+                    self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
             }
         }
 
@@ -125,24 +149,14 @@ impl Row {
                 Cell::from_raw_parts(char_data, colors, flags);
         }
         self.note_write_through(col_usize + 1);
-        if col >= self.len {
-            self.len = col.saturating_add(1);
-        } else if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && old_len > 0
-            && self.cells[old_len - 1].is_empty()
-        {
-            // Interior single-width write over a WIDE head at the tail:
-            // fixup_wide_char_overwrite cleared the continuation at col+1, the
-            // row's last content when old_len == col+2, so len must be
-            // recalculated. The HAS_WIDE_CHARS gate keeps ASCII branch-free.
-            self.recalculate_len_up_to(old_len);
-        }
+        self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
         self.flags |= RowFlags::DIRTY;
         true
     }
 
     /// Handle wide character cleanup when overwriting part of a wide char.
-    /// Marked cold since wide characters are relatively rare.
+    /// Marked cold since wide characters are relatively rare. Returns whether
+    /// it blanked the continuation after `col_usize` (the write's end half).
     #[cold]
     #[inline(never)]
     pub(crate) fn fixup_wide_char_overwrite(
@@ -150,7 +164,7 @@ impl Row {
         col_usize: usize,
         current_flags: CellFlags,
         cells_len: usize,
-    ) {
+    ) -> bool {
         // Overwriting a genuine wide continuation: clear the orphaned head.
         // Context-aware check (bit 10 aliases PROTECTED); the cell at col_usize
         // is written only after this fixup, so the check reads the pre-write
@@ -162,7 +176,9 @@ impl Row {
         // is unaliased, so the raw check is correct here.
         if current_flags.contains(CellFlags::WIDE) && col_usize + 1 < cells_len {
             self.cells[col_usize + 1] = Cell::EMPTY;
+            return true;
         }
+        false
     }
 
     /// Fill `count` consecutive cells starting at `col` with a template cell.
@@ -188,10 +204,10 @@ impl Row {
         }
         let old_len = self.len as usize;
 
-        // Wide character fixup before overwriting the range.
-        if self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
-            self.fixup_wide_chars_in_range(col, count);
-        }
+        // Wide character fixup before overwriting the range (gated inline so the
+        // REP/padding path stays free of the cold call).
+        let end_half_blanked = self.flags.contains(RowFlags::HAS_WIDE_CHARS)
+            && self.fixup_wide_chars_in_range(col, count);
 
         let end = start.saturating_add(usize::from(count)).min(cells_len);
         let actual = end - start;
@@ -199,21 +215,10 @@ impl Row {
         self.cells[start..end].fill(template);
         self.note_write_through(end);
 
-        // Update len and flags.
-        let end_col = u16_from_usize(end);
-        if end_col > self.len && !template.is_empty() {
-            self.len = end_col;
-        } else if self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && old_len > 0
-            && self.cells[old_len - 1].is_empty()
-        {
-            // fixup_wide_chars_in_range cleared the continuation at `end` (one
-            // past the fill) when the last filled cell is a WIDE head; if that was
-            // the row's last content (old_len == end+1) the grow above never
-            // fires and len stays stale-high. This is the REP/padding path, so the
-            // HAS_WIDE_CHARS gate keeps ASCII runs branch-free.
-            self.recalculate_len_up_to(old_len);
-        }
+        // The filled cells are written, a default blank as much as a glyph
+        // (the splat of a run of spaces, REP of a space), as every writer counts
+        // them.
+        self.settle_len_after_write(old_len, end, end_half_blanked);
         self.flags |= RowFlags::DIRTY;
 
         u16_from_usize(actual)
@@ -227,43 +232,54 @@ impl Row {
     /// - If any cell in range has WIDE flag, clears the cell after it (orphaned continuation)
     ///
     /// This is the bulk equivalent of `fixup_wide_char_overwrite` for single cells.
+    /// Returns whether it blanked the continuation at the span's end (the end
+    /// half [`Self::settle_len_after_write`] takes).
     #[cold]
     #[inline(never)]
-    pub(crate) fn fixup_wide_chars_in_range(&mut self, start_col: u16, count: u16) {
+    pub(crate) fn fixup_wide_chars_in_range(&mut self, start_col: u16, count: u16) -> bool {
         // Fast path: skip entire scan when row has no wide characters.
         // This is the common case for ASCII-only output (compiler, ls, etc.).
         if !self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
-            return;
+            return false;
         }
-        let start = start_col as usize;
+        // The cells inside the span are overwritten by the caller; only the
+        // halves outside it need clearing. Each is cleared after both are read:
+        // they lie on opposite sides of a non-empty span.
+        let halves = self.orphaned_wide_halves(start_col, start_col.saturating_add(count));
+        for col in halves.into_iter().flatten() {
+            self.cells[usize::from(col)] = Cell::EMPTY;
+        }
+        halves[1].is_some()
+    }
+
+    /// The wide halves outside `[start, end)` that writing the span orphans:
+    /// the head at `start - 1` when `start` is its continuation, and the
+    /// continuation at `end` when `end - 1` is its head (`end` clipped to the
+    /// row). These are the cells the write fixups blank:
+    /// [`Self::fixup_wide_chars_in_range`], and, for a one- or two-cell span,
+    /// [`Self::fixup_wide_char_overwrite`] and [`Self::fixup_wide_char_write`].
+    /// The grid's writers probe them before a write so the extras entry of a
+    /// blanked half goes with it (`grid::write::orphan_halves_with_extras`).
+    ///
+    /// The continuation test is context-aware (bit 10 aliases PROTECTED);
+    /// the head test reads WIDE (bit 9), which is unaliased.
+    #[must_use]
+    #[inline]
+    pub(crate) fn orphaned_wide_halves(&self, start: u16, end: u16) -> [Option<u16>; 2] {
         let cells_len = self.cells.len();
-
-        if start >= cells_len || count == 0 {
-            return;
+        let end = usize::from(end).min(cells_len);
+        if usize::from(start) >= end {
+            return [None, None];
         }
-
-        let end = usize::from(start_col.saturating_add(count));
-        let actual_end = end.min(cells_len);
-
-        // A genuine wide continuation at the start: clear the orphaned head.
-        // Context-aware check (bit 10 aliases PROTECTED); false for start==0, so
-        // start-1 cannot underflow. The cell at `start` is filled only after
-        // this.
-        if self.is_cell_wide_continuation(start_col) {
-            self.cells[start - 1] = Cell::EMPTY;
-        }
-
-        // Check each cell being overwritten - if it's a WIDE char, clear its continuation
-        for col in start..actual_end {
-            let flags = self.cells[col].flags();
-            if flags.contains(CellFlags::WIDE) && col + 1 < cells_len {
-                // If the continuation is outside our write range, clear it
-                // If it's inside, it will be overwritten anyway
-                if col + 1 >= actual_end {
-                    self.cells[col + 1] = Cell::EMPTY;
-                }
-            }
-        }
+        // `is_cell_wide_continuation` is false at column 0, so `start - 1`
+        // cannot underflow.
+        let head = self
+            .is_cell_wide_continuation(start)
+            .then(|| start.saturating_sub(1));
+        let continuation = (end < cells_len
+            && self.cells[end - 1].flags().contains(CellFlags::WIDE))
+        .then(|| u16_from_usize(end));
+        [head, continuation]
     }
 
     /// Write a wide (double-width) character at the given column.
@@ -309,11 +325,9 @@ impl Row {
         let second_flags = unsafe { self.cells.get_unchecked(col_usize + 1) }.flags();
 
         // Wide character fixup (rare path)
-        if first_flags.contains(CellFlags::WIDE_CONTINUATION)
-            || second_flags.contains(CellFlags::WIDE)
-        {
-            self.fixup_wide_char_write(col_usize, second_flags, cells_len);
-        }
+        let end_half_blanked = (first_flags.contains(CellFlags::WIDE_CONTINUATION)
+            || second_flags.contains(CellFlags::WIDE))
+            && self.fixup_wide_char_write(col_usize, second_flags, cells_len);
 
         // Build cells directly with pre-computed colors
         let cp = c as u32;
@@ -337,16 +351,7 @@ impl Row {
         }
 
         self.note_write_through(col_usize + 2);
-        if col + 1 >= self.len {
-            self.len = col.saturating_add(2);
-        } else if old_len > 0 && self.cells[old_len - 1].is_empty() {
-            // An interior wide write orphaned an existing wide char's
-            // continuation at col+2 (cleared by fixup_wide_char_write); if that
-            // was the row's last content (old_len == col+3), len would stay
-            // stale-high. recalculate_len_up_to never over-shrinks; the orphan
-            // can only exist when HAS_WIDE_CHARS was set.
-            self.recalculate_len_up_to(old_len);
-        }
+        self.settle_len_after_write(old_len, col_usize + 2, end_half_blanked);
         self.flags |= RowFlags::DIRTY | RowFlags::HAS_WIDE_CHARS;
         true
     }
@@ -407,7 +412,8 @@ impl Row {
     }
 
     /// Handle wide character cleanup when writing a wide char.
-    /// Marked cold since these conflicts are relatively rare.
+    /// Marked cold since these conflicts are relatively rare. Returns whether
+    /// it blanked the continuation after the written pair (its end half).
     #[cold]
     #[inline(never)]
     pub(crate) fn fixup_wide_char_write(
@@ -415,7 +421,7 @@ impl Row {
         col_usize: usize,
         second_flags: CellFlags,
         cells_len: usize,
-    ) {
+    ) -> bool {
         // If the first position overwrites a genuine wide continuation, clear
         // the orphaned head. Context-aware check (bit 10 aliases PROTECTED);
         // false for col==0. Cells are written only after this fixup.
@@ -426,7 +432,9 @@ impl Row {
         // WIDE (bit 9) is unaliased, so the raw check is correct here.
         if second_flags.contains(CellFlags::WIDE) && col_usize + 2 < cells_len {
             self.cells[col_usize + 2] = Cell::EMPTY;
+            return true;
         }
+        false
     }
 }
 
@@ -750,17 +758,25 @@ mod tests {
         assert_eq!(row.get(6).unwrap().char(), ' ');
     }
 
+    /// A run of printed default blanks is written text (ruling 2026-10-10,
+    /// r15 C4): `len` covers it as it covers the same blanks written one at a
+    /// time, so a splatted or REP'd run of spaces is part of the line.
     #[test]
-    fn fill_cell_run_empty_template_does_not_extend_len() {
+    fn fill_cell_run_counts_written_blanks() {
         let (_pages, mut row) = make_row(10);
         row.write_char(0, 'A');
         assert_eq!(row.len(), 1);
 
-        // Fill with EMPTY cells beyond current len
         let written = row.fill_cell_run(5, 3, Cell::EMPTY);
         assert_eq!(written, 3);
-        // len should stay at 1 since EMPTY cells don't extend
-        assert_eq!(row.len(), 1);
+        assert_eq!(row.len(), 8, "the filled blanks are written");
+
+        let (_pages, mut per_glyph) = make_row(10);
+        per_glyph.write_char(0, 'A');
+        for col in 5..8 {
+            per_glyph.write_char(col, ' ');
+        }
+        assert_eq!(row.len(), per_glyph.len(), "the same as one at a time");
     }
 
     // ── fixup_wide_char_overwrite ───────────────────────────────────

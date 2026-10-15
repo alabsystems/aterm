@@ -1168,6 +1168,51 @@ mod tests {
         assert!(after.contains("\"cmdcol\":9,\"out\":null"), "{after}");
     }
 
+    /// `blocks --json` carries a cwd (OSC 7) and a command line (OSC 633 E)
+    /// that a program chose, and a person may read the reply raw on a
+    /// terminal: no character a terminal acts on or reorders text around
+    /// (C0, DEL, C1, bidi, U+2028/9) reaches the reply's bytes — each is a
+    /// `\uXXXX` escape — and a JSON reader still decodes both fields to exactly
+    /// what the program sent (round fifteen, OUT-2).
+    #[test]
+    fn blocks_json_escapes_what_a_terminal_acts_on_and_decodes_back() {
+        let host = MemoryHost::new(0);
+        host.feed(
+            b"\x1b]7;file://evilhost/tmp/CWD%1B]52;c;Q1dE%07%1B[2K%0DFAKE%C2%9B31m%E2%80%AEdcba\
+              %E2%80%A8%7F\x07",
+        );
+        host.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        host.feed("\x1b]633;E;CMD\u{9b}2J\u{9d}0 pwned\u{9c}\u{202e}txt.exe\x07".as_bytes());
+        host.feed(b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        let reply = selection::cmd_blocks_json(&host, 0, "");
+        let body = reply.strip_prefix("OK 1\n").expect("one JSON row");
+        let body = body.strip_suffix('\n').expect("one JSON row");
+        // The class, stated here on its own (`aterm_codec::tty::is_active`).
+        let active: Vec<String> = body
+            .chars()
+            .filter(|&c| {
+                matches!(c as u32, 0..=0x1f | 0x7f..=0x9f | 0x61c | 0x200e | 0x200f)
+                    || matches!(c as u32, 0x2028..=0x202e | 0x2066..=0x2069)
+            })
+            .map(|c| format!("U+{:04X}", c as u32))
+            .collect();
+        assert!(active.is_empty(), "raw {active:?} in {body:?}");
+        assert!(
+            body.contains("FAKE\\u009b31m\\u202edcba\\u2028\\u007f"),
+            "{body}"
+        );
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid JSON");
+        let block = &value["blocks"][0];
+        assert_eq!(
+            block["cwd"].as_str(),
+            Some("/tmp/CWD\u{1b}]52;c;Q1dE\u{7}\u{1b}[2K\rFAKE\u{9b}31m\u{202e}dcba\u{2028}\u{7f}")
+        );
+        assert_eq!(
+            block["cmdline"].as_str(),
+            Some("CMD\u{9b}2J\u{9d}0 pwned\u{9c}\u{202e}txt.exe")
+        );
+    }
+
     /// The seam itself refuses the foreign sid: a `resolve` on one host
     /// followed by a `write_input` on another must not land keystrokes in the
     /// session this host holds.

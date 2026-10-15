@@ -30,3 +30,4 @@ mod stale_extras_overwrite;
 mod style_perf;
 mod style_perf_complexity;
 mod tab_stops;
+mod zero_store_share;

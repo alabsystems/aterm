@@ -1198,6 +1198,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         cancel: cancel_of(&rows[footer]),
         question: None,
         span: (title_row, footer),
+        footer: Some(crate::text::trim(&rows[footer]).to_string()),
         head_off_screen,
         question_dialog: None,
         reason_rows: Vec::new(),

@@ -533,6 +533,19 @@ enum Spilled {
     NoDrainer,
 }
 
+/// [`SinkWriter::try_fence_egress`]'s hold: no frame reaches the sink's PTY
+/// while it lives.
+#[must_use = "the fence lifts when dropped"]
+pub struct EgressFence<'a> {
+    _frames: std::sync::MutexGuard<'a, ()>,
+}
+
+impl std::fmt::Debug for EgressFence<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressFence").finish_non_exhaustive()
+    }
+}
+
 /// The byte budget of one sink's reply queue: terminal query replies (DA / DSR
 /// / CPR / kitty and colour queries) on their way from the parser to the reply
 /// writer ([`SinkWriter::reply_budget`]). A program that floods queries while
@@ -1378,9 +1391,10 @@ impl SinkWriter {
     /// kernel: no spill bytes wait in this process's memory for the drainer.
     /// True when nothing ever spilled and once a drainer has emptied the buffer.
     ///
-    /// The seamless handoff checks this before it `_exit`s at Commit: spilled
-    /// bytes would die with the process, while kernel-queued bytes are the
-    /// child's to read.
+    /// Spilled bytes would die with the process at the seamless handoff's
+    /// `_exit`, while kernel-queued bytes are the child's to read; the
+    /// handoff reads this through [`Self::try_fence_egress`], which also sees
+    /// a frame still being written.
     ///
     /// This answers "does this process still hold bytes", not "did they land":
     /// after the drainer discards a spill over a dead peer it reads `true`, so
@@ -1392,6 +1406,31 @@ impl SinkWriter {
         self.shared.spill_is_empty()
     }
 
+    /// Stop this sink's egress at a frame boundary, without waiting: `Some`
+    /// when no frame is part-way into the kernel and the spill holds nothing
+    /// ([`Self::egress_drained_to_kernel`]), `None` otherwise. A blocking
+    /// frame parked on a full tty is part-way in with the spill empty: it
+    /// holds the fd lock, which this takes with `try_lock`.
+    ///
+    /// While the fence is held no frame can begin: a blocking writer waits
+    /// for it before its first byte, a non-parking one queues whole behind
+    /// it in the spill, and the drainer waits too. Dropping it lets them go
+    /// on in order. The seamless handoff reads it before it `_exit`s at
+    /// Commit and holds it through the `_exit`: a frame cut there (a
+    /// bracketed paste left open) would have the program read every later
+    /// key as pasted text, and spilled bytes would die with the process.
+    #[must_use]
+    pub fn try_fence_egress(&self) -> Option<EgressFence<'_>> {
+        let frames = match self.shared.lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        self.shared
+            .spill_is_empty()
+            .then_some(EgressFence { _frames: frames })
+    }
+
     /// How many bytes the process-local spill holds right now. For tests,
     /// here and downstream (the `testing` feature): a frame queued behind a
     /// wedged tty is a FACT a test waits for, not a moment it sleeps toward.
@@ -1400,6 +1439,11 @@ impl SinkWriter {
     pub fn spilled_bytes(&self) -> usize {
         self.shared.spill_len()
     }
+
+    /// The spill's cap: a non-parking frame is refused once the spill holds
+    /// this much. For tests, as [`Self::spilled_bytes`].
+    #[cfg(all(unix, any(test, feature = "testing")))]
+    pub const SPILL_CAP: usize = Shared::SPILL_CAP;
 
     /// Block an EXPENDABLE producer until every process-local spill byte has
     /// either reached the kernel or the spill drainer has observed a dead
@@ -1426,6 +1470,35 @@ impl SinkWriter {
                 .unwrap_or_else(|poison| poison.into_inner());
         }
         spill.buf.is_empty() && !spill.failed
+    }
+
+    /// [`Self::wait_egress_drained_to_kernel`] for at most `limit`: `None` when
+    /// bytes are still process-local when it runs out (a program that is not
+    /// reading), otherwise the same answer. For a caller that must not wait on
+    /// the program for ever: the control socket's reply to a background paste
+    /// (aterm-gui's `background_input`), which checks its caller and its own
+    /// deadline between slices.
+    #[must_use]
+    pub fn wait_egress_drained_to_kernel_for(&self, limit: Duration) -> Option<bool> {
+        let deadline = Instant::now().checked_add(limit);
+        let mut spill = self
+            .shared
+            .spill
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while spill.draining && !spill.buf.is_empty() {
+            let left = deadline.map_or(limit, |at| at.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                return None;
+            }
+            spill = self
+                .shared
+                .drained
+                .wait_timeout(spill, left)
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+        Some(spill.buf.is_empty() && !spill.failed)
     }
 
     /// Non-parking observation of [`Self::egress_drained_to_kernel`]:
@@ -1880,12 +1953,14 @@ impl SinkWriter {
     }
 
     /// Write a whole frame while HOLDING the fd lock. Callers are expendable
-    /// threads (the per-session ordered egress writer, the reply writer, the
-    /// cross-session control thread); [`Self::write_frame_nonparking`] also
-    /// delegates here for an oversized frame or a spill already at capacity,
-    /// and it is an expendable-thread API for exactly that reason. The UI
-    /// thread's egress ([`Self::write_frame_interactive_with_receipt`]) never
-    /// reaches this body.
+    /// threads (the per-session ordered egress writer, the reply writer);
+    /// [`Self::write_frame_nonparking`] also delegates here for an oversized
+    /// frame or a spill already at capacity, and it is an expendable-thread API
+    /// for exactly that reason. The UI thread's egress
+    /// ([`Self::write_frame_interactive_with_receipt`]) never reaches this
+    /// body, nor does a control socket lane's (aterm-gui writes a control
+    /// verb's input through that egress too: a lane parked here on a program
+    /// that stopped reading was a lane the socket's other clients lost).
     ///
     /// DELIBERATELY PARKING — contract 1
     /// (docs/AUDIT-performance-quality-2026-08-29.md P0). A multi-MiB paste is
@@ -4120,6 +4195,30 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
         );
         drop(held);
         assert_eq!(read_exactly(&mut reader, 2), b"ab");
+    }
+
+    /// The egress fence stops egress at a frame boundary: refused while a
+    /// frame is part-way in (the fd lock held, the spill empty); held, it
+    /// keeps every frame out of the kernel (a non-parking one queues whole in
+    /// the spill); dropped, the frame goes on.
+    #[test]
+    fn the_egress_fence_keeps_every_frame_out_of_the_kernel_until_it_lifts() {
+        let (sink, mut reader) = sink_and_reader();
+        let mid_frame = sink.shared.lock.lock().unwrap();
+        assert!(sink.try_fence_egress().is_none(), "a frame part-way in");
+        drop(mid_frame);
+        let fence = sink.try_fence_egress().expect("nothing in flight");
+        assert_eq!(sink.write_frame_nonparking(b"after").expect("accepted"), 5);
+        assert_eq!(sink.spilled_bytes(), 5, "queued whole behind the fence");
+        reader.set_nonblocking(true).expect("nonblocking");
+        assert_eq!(
+            reader.read(&mut [0u8; 8]).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "no byte reached the kernel"
+        );
+        reader.set_nonblocking(false).expect("blocking");
+        drop(fence);
+        assert_eq!(read_exactly(&mut reader, 5), b"after");
     }
 
     #[test]

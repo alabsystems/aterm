@@ -466,6 +466,11 @@ aterm-agent = { workspace = true, features = ["spec-anchors"] }
 # `keeper_link`) carries no anchors; this test build re-declares it with
 # `spec-anchors` ON so the closure gate sees the three machines bound.
 aterm-keeper = { workspace = true, features = ["spec-anchors"] }
+# aterm-net supplies the `NetSlotDisplacement` anchors (the network drive's
+# listener slots and its handshake watchdog's claim, every action bound;
+# Tier-1 in its drive.rs), re-declared here with `spec-anchors` ON so this
+# gate's test binary collects them.
+aterm-net = { workspace = true, features = ["spec-anchors"] }
 
 [target.'cfg(windows)'.dependencies]
 # HDR-on-Windows (M3 phase B): query the display's panel MaxLuminance via DXGI

@@ -299,6 +299,29 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     }
 }
 
+/// A descriptor that `poll(2)` reports readable once `pid` has exited — the
+/// one an [`ExitMoment`]'s thread waits on (Darwin: an [`ExitWatch`] kqueue;
+/// Linux: a `pidfd`), for a loop that waits on it beside its own descriptors.
+/// Nothing is read from it and nothing is reaped. `None`: see [`ExitMoment`].
+///
+/// The watch is on the pid as it stands at the call. A caller whose pid may
+/// have been reissued proves it still names its process AFTER this returns:
+/// a process that ended before cannot come back under the same pid with the
+/// same start time.
+#[cfg(unix)]
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn exit_fd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    #[cfg(target_vendor = "apple")]
+    {
+        exit_readable(pid).map(|watch| watch.kq)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        exit_readable(pid)
+    }
+}
+
 /// What an [`ExitMoment`]'s thread holds open and waits on until the exit.
 #[cfg(target_vendor = "apple")]
 type ExitReadable = ExitWatch;

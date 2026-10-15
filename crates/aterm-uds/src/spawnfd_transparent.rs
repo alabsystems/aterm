@@ -13,11 +13,11 @@
 //! and nothing else (`tools/grep_guard.sh` B27).
 //!
 //! WHY IT IS NOT `std`'s `Command`: Trust's std (SP-1, trust 6eb03c9a18) hands
-//! a `Command` child fds 0-2 plus what `CommandExt::inherit_fd` names, and the
-//! installed seal's std has neither `inherit_fd` nor `inherit_all_fds`, so no
-//! `std` spelling passes the table through on both. This one owes nothing to
-//! the std it links: on Darwin one `posix_spawn` without
-//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, elsewhere a fork with no strip.
+//! a `Command` child fds 0-2 plus what `CommandExt::inherit_fd` names, and a
+//! std without SP-1 has neither `inherit_fd` nor `inherit_all_fds` (unstable
+//! where they exist), so no `std` spelling passes the table through on both.
+//! This one owes nothing to the std it links: on Darwin one `posix_spawn`
+//! without `POSIX_SPAWN_CLOEXEC_DEFAULT`, elsewhere a fork with no strip.
 //!
 //! What the child gets is what `Command::new(program).args(args)` gave it
 //! through upstream std's `spawn` and `status`, and nothing a caller here sets:

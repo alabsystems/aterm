@@ -89,7 +89,7 @@ fn read_or_wake_unblocks_on_wake_even_when_master_never_eofs() {
     let h = std::thread::spawn(move || {
         let mut buf = [0u8; 16];
         reader_entered.store(true, std::sync::atomic::Ordering::SeqCst);
-        let out = read_or_wake(master_rd, &mut buf, wake_rd);
+        let out = read_or_wake(master_rd, &mut buf, wake_rd, -1);
         tx.send(matches!(out, ReadOutcome::Wake)).unwrap();
         close_fd(wake_rd);
     });
@@ -120,6 +120,83 @@ fn read_or_wake_unblocks_on_wake_even_when_master_never_eofs() {
         libc::close(master_rd);
         libc::close(master_wr);
     }
+}
+
+/// THE SESSION ENDS WITH ITS SHELL (P3's ruling, applied to the reader). A job
+/// the shell left behind holds the slave, so the master never reads data or
+/// EOF; Linux never hangs it up at the shell's exit. The shell's exit watch
+/// answers `Exited` once the shell exits, with or without a wake pipe; while it
+/// lives the reader stays parked; a wake still wins.
+#[test]
+fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::mpsc;
+    // The master a job holds open: never data, never EOF.
+    let mut m = [0i32; 2];
+    // SAFETY: valid 2-int out-array for pipe(2).
+    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+    let (master_rd, master_wr) = (m[0], m[1]);
+    // The shell: it exits when its stdin closes.
+    let mut shell = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "read _"])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("spawn the shell");
+    let exit = aterm_uds::exitwatch::exit_fd(shell.id()).expect("a live child is watchable");
+    let mut buf = [0u8; 16];
+
+    // Alive: the wakeless poll times out, and a wake wins over the watch.
+    assert!(matches!(
+        read_or_wake(master_rd, &mut buf, -1, exit.as_raw_fd()),
+        ReadOutcome::Idle
+    ));
+    let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
+    wake(wake_wr);
+    assert!(matches!(
+        read_or_wake(master_rd, &mut buf, wake_rd, exit.as_raw_fd()),
+        ReadOutcome::Wake
+    ));
+    close_fd(wake_wr);
+    close_fd(wake_rd);
+
+    let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
+    let (tx, rx) = mpsc::channel();
+    let watch = exit.as_raw_fd();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        let parked = matches!(
+            read_or_wake(master_rd, &mut buf, wake_rd, watch),
+            ReadOutcome::Exited
+        );
+        let wakeless = matches!(
+            read_or_wake(master_rd, &mut buf, -1, watch),
+            ReadOutcome::Exited
+        );
+        tx.send((parked, wakeless)).unwrap();
+    });
+    drop(shell.stdin.take());
+    // A hang detector: the shell's exit is the event.
+    let answered = rx.recv_timeout(HANG_DETECTOR);
+    if answered.is_err() {
+        // Free the parked reader so the test can end.
+        wake(wake_wr);
+    }
+    reader.join().unwrap();
+    let _ = shell.wait();
+    close_fd(wake_wr);
+    close_fd(wake_rd);
+    // SAFETY: closing the two pipe fds this test owns.
+    unsafe {
+        libc::close(master_rd);
+        libc::close(master_wr);
+    }
+    assert_eq!(
+        answered.ok(),
+        Some((true, true)),
+        "the shell exited while its slave was held: the reader must say so"
+    );
 }
 
 /// Direct-read drain (O_NONBLOCK gather): an interactive-sized burst (< one
@@ -1045,7 +1122,7 @@ fn read_or_wake_wakeless_fallback_times_out_instead_of_parking() {
 
     let mut buf = [0u8; 16];
     let t0 = Instant::now();
-    let out = read_or_wake(master_rd, &mut buf, -1);
+    let out = read_or_wake(master_rd, &mut buf, -1, -1);
     let elapsed = t0.elapsed();
 
     assert!(

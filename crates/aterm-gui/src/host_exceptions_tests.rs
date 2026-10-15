@@ -113,8 +113,7 @@ fn roster() -> Vec<Entry> {
         &std::iter::repeat_n(note, 5).collect::<Vec<_>>(),
     ));
     all.push(mr::upgrade_cannot_run_entry("busy:state-unwritable", None));
-    // The developer root's one: the measured Spotlight line.
-    all.push(mr::devroot_indexed_entry());
+    all.push(mr::devtools_entry());
     // The accounts': one signed out, three, the most a roster lists at the
     // longest a label can be, the longest label the action names and the first
     // it does not, and the roster that is refused.
@@ -273,7 +272,6 @@ fn the_host_families_speak_by_event() {
         Family::Supervisor,
         Family::Accounts,
         Family::Disk,
-        Family::DevRoot,
         Family::UpgradeHost,
         Family::Render,
     ] {
@@ -676,13 +674,14 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
     app.note_harness_host(HostNote::DiskPlenty);
 }
 
-/// THE DEVELOPER ROOT'S ONE LINE (`atpkg::devroot`) is decided by the MEASUREMENT
-/// alone: the probe found raises at most one classified entry, whose one press opens
-/// Search Privacy; a probe that stayed out ends it; an unmeasured look leaves it as it
-/// was. Checkouts outside the root raise nothing here (the doctors' `devroot:` row says
-/// them). It never marks a tab, seats a band row or re-grids a window.
+/// THE DEVELOPER TOOLS LIST (owner ruling 2026-10-14) is one line however often a
+/// reading says `not_granted`, whose one press opens the Developer Tools pane; a reading
+/// that finds aterm on the list ends it; `unknown` leaves it as it was. Never a band row
+/// or a re-grid. (The hand-over that opens the pane by itself is the wake handler's, on a
+/// windowed instance only: `apply_devtools_step` reports it and opens nothing.)
 #[test]
-fn the_developer_root_is_one_line_and_the_measurement_decides_it() {
+fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
+    use crate::devtools_watch::Step;
     let mut app = App::headless_for_test();
     let regrids = message_regrids();
     let keys = |app: &App| -> Vec<String> {
@@ -693,36 +692,31 @@ fn the_developer_root_is_one_line_and_the_measurement_decides_it() {
             .map(|e| e.key.clone())
             .collect()
     };
-    for _ in 0..2 {
-        app.note_harness_host(HostNote::DevRoot {
-            indexed: Some(true),
-        });
-    }
+    assert!(app.apply_devtools_step(Step::Raise { hand_over: true }));
+    assert!(!app.apply_devtools_step(Step::Raise { hand_over: false }));
     assert_eq!(
         keys(&app),
-        [mr::DEVROOT_INDEXED_KEY],
+        [mr::DEVTOOLS_KEY],
         "one line, however often it is told"
     );
-    let indexed = app.messages.digest().entries[0].clone();
+    let line = app.messages.digest().entries[0].clone();
     assert!(
-        indexed.actions.iter().any(|a| matches!(
+        line.actions.iter().any(|a| matches!(
             a,
-            aterm_messages::Intent::OpenSystemPane { pane }
-                if pane == mr::PANE_SPOTLIGHT_SEARCH_PRIVACY
+            aterm_messages::Intent::OpenSystemPane { pane } if pane == mr::PANE_DEVELOPER_TOOLS
         )),
-        "the one press opens Search Privacy: {:?}",
-        indexed.actions
+        "the one press opens Developer Tools: {:?}",
+        line.actions
     );
-    // Unmeasured: the line stands as the last measurement left it.
-    app.note_harness_host(HostNote::DevRoot { indexed: None });
-    assert_eq!(keys(&app), [mr::DEVROOT_INDEXED_KEY]);
-    // Measured skipped: it ends.
-    app.note_harness_host(HostNote::DevRoot {
-        indexed: Some(false),
-    });
-    assert!(app.messages.digest().is_empty());
+    assert!(!app.apply_devtools_step(Step::Nothing));
+    assert_eq!(keys(&app), [mr::DEVTOOLS_KEY], "unknown leaves it");
+    assert!(!app.apply_devtools_step(Step::Clear));
+    assert!(app.messages.digest().is_empty(), "on the list: it ends");
     assert_eq!(app.message_band_rows, 0, "never a band row");
     assert_eq!(message_regrids(), regrids, "no re-grid");
+    // A headless instance never acts on a reading, whatever its slot holds.
+    app.on_devtools_probe_ready();
+    assert!(app.messages.digest().is_empty());
 }
 
 /// A `[disk]` SETTING ATERM CANNOT READ, WHICH TURNED ITS CLEANUP OFF, IS ONE

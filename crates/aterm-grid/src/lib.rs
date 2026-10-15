@@ -47,7 +47,7 @@ pub use grid::{CellDataView, HistoryLines, VisibleRowView};
 pub use grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
-pub use grid::{MaterializedRow, materialize_from_line};
+pub use grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 
 // Re-export primary types at crate root for convenience.
@@ -99,3 +99,14 @@ pub const MAX_GRID_ROWS: u16 = 4096;
 
 /// Maximum columns a [`Grid`] will hold; see [`MAX_GRID_ROWS`].
 pub const MAX_GRID_COLS: u16 = 4096;
+
+/// Whether column `col` holds a tab stop in a fresh grid: every eighth column
+/// from 8, the VT100's power-on stops. The one statement of the default, read
+/// where a grid is built, where a widen seeds the columns it adds, and by a
+/// host that carries a grid's stops as their difference from it (`aterm-gui`'s
+/// keeper META).
+#[must_use]
+#[inline]
+pub const fn is_default_tab_stop(col: usize) -> bool {
+    col > 0 && col.is_multiple_of(8)
+}

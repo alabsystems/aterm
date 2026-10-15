@@ -153,10 +153,20 @@ impl Grid {
                     bce = row.clear_range_with_orphan(cursor_col, right_bound, fill, fill);
                 }
             }
-            if !selective {
+            if selective {
+                // DECSEL resets the unprotected cells it clears (and the halves of
+                // their pairs); their extras go with them, a protected cell keeps
+                // its claim.
+                self.drop_unclaimed_extras(
+                    cursor_row,
+                    cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
+                );
+            } else {
+                // `bce` reaches the orphaned head left of the span, so its extras
+                // go too.
                 self.storage
                     .extras
-                    .clear_range(cursor_row, cursor_col, right_bound);
+                    .clear_range(cursor_row, bce.start, bce.end);
                 // A truecolor BCE cell holds only an RGB marker; the bytes live in
                 // the dense ring, so the ring must also cover the orphan column.
                 self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
@@ -227,8 +237,14 @@ impl Grid {
                     bce = row.clear_range_with_orphan(0, end, fill, fill);
                 }
             }
-            if !selective {
-                self.storage.extras.clear_range(cursor_row, 0, end);
+            if selective {
+                // As in `erase_to_end_of_line_core`.
+                self.drop_unclaimed_extras(cursor_row, 0..end.saturating_add(1));
+            } else {
+                // `bce` reaches the orphaned continuation right of the span.
+                self.storage
+                    .extras
+                    .clear_range(cursor_row, bce.start, bce.end);
                 self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
             self.storage.mark_content_row(cursor_row);
@@ -261,7 +277,10 @@ impl Grid {
                 row.erase_with(fill);
             }
         }
-        if !selective {
+        if selective {
+            // As in `erase_to_end_of_line_core`.
+            self.drop_unclaimed_extras(cursor_row, 0..self.storage.cols);
+        } else {
             self.storage.extras.clear_row(cursor_row);
             self.fill_bce_rgb_range(cursor_row, 0, self.storage.cols);
         }
@@ -298,7 +317,12 @@ impl Grid {
                 }
             }
         }
-        if !selective {
+        if selective {
+            // As in `erase_to_end_of_line_core`.
+            for row in range.clone() {
+                self.drop_unclaimed_extras(row, 0..self.storage.cols);
+            }
+        } else {
             self.storage.extras.clear_rows(range.clone());
             self.fill_bce_rgb_rows(range);
             // ED 0 and ED 1 leave the cursor row's attribute alone (a partial
@@ -876,6 +900,11 @@ impl Grid {
         self.storage
             .extras
             .clear_rect(top..bottom.saturating_add(1), left..end_col);
+        // The halves of pairs the rectangle's edges bisected, blanked by
+        // `clear_range_with`.
+        for row_idx in top..=bottom {
+            self.drop_unclaimed_extras(row_idx, left.saturating_sub(1)..end_col.saturating_add(1));
+        }
 
         // The cell carries only RGB markers and clear_rect wiped the ring, so
         // repopulate it. set_rgb_ring_range ignores a None axis.
@@ -1282,7 +1311,7 @@ impl Grid {
             let actual_width = row_cells.len().min((max_col - dst_left + 1) as usize);
             if let Some(row) = self.row_mut(dst_row) {
                 if actual_width > 0 {
-                    row.fixup_wide_chars_in_range(dst_left, actual_width as u16);
+                    let _ = row.fixup_wide_chars_in_range(dst_left, actual_width as u16);
                 }
                 for (&cell, col_offset) in row_cells.iter().zip(0u16..) {
                     let dst_col = dst_left.saturating_add(col_offset);
@@ -1359,6 +1388,16 @@ impl Grid {
                     );
                 }
             }
+        }
+
+        // A source half the copy blanked (its pair cut by the source edges)
+        // brought its entry along, and the destination fixup blanked the halves
+        // of pairs its edges bisected: those cells claim nothing now.
+        for dst_row in dst_top..=dst_bottom_eff {
+            self.drop_unclaimed_extras(
+                dst_row,
+                dst_left.saturating_sub(1)..dst_right_eff.saturating_add(2),
+            );
         }
     }
 }

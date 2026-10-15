@@ -205,6 +205,23 @@ pub(crate) struct TerminalLeafRestore {
     /// Boxed: the other leaf kinds are a fraction of its size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<Box<AgentRestore>>,
+    /// THE AGENT THE OUTGOING INSTANCE'S HOST SUPERVISED HERE (round
+    /// eighteen; additive, absent tolerated): ON A SEAMLESS UPDATE'S HANDOFF
+    /// LAYOUT ONLY, and only where no relaunch is owed (`agent`), the agent
+    /// the host last published for the tab
+    /// (`harness_host::published_snapshot`), for the successor to watch from
+    /// its Commit (`HostHandle::watch_handed`): an exit the outgoing
+    /// instance will not act on — a crash during its Commit's hold, read
+    /// there by a process about to exit, or one that comes before the
+    /// successor's first pass names the agent — is the successor's to read
+    /// and relaunch, once. The Commit compares the process it names
+    /// (`app_update_handoff::commit_agent_carry`): one that changed between
+    /// the two captures was decided by the outgoing instance, and the Commit
+    /// is refused as activity. An older successor ignores it; an older
+    /// producer never writes it. Never on a durable layout, whose `agent`
+    /// names what runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervised: Option<Box<AgentRestore>>,
     /// HELD BY A PROGRAM (audit #8; additive, absent tolerated, written only
     /// when true): at capture a program other than the pane's shell held its
     /// PTY (ssh, a container's shell, vim — the quit confirm's `tcgetpgrp`
@@ -268,6 +285,20 @@ pub(crate) struct AgentRestore {
     /// Code — and a Codex whose run is lost is relaunched by no lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexRestore>,
+    /// THE EXPLICIT RESTART ENDED IT (round eighteen; additive, absent
+    /// tolerated, written only when set): the act's cause — `asked` or
+    /// `stall` (`restart_stamp::Cause::word`) — on a relaunch OWED for it
+    /// (`harness_host::OwedRelaunch::asked`), so the relaunch that takes it
+    /// up is the act's: carried through a hand it waits on rather than
+    /// counted, and made on its cause
+    /// (`harness_host::RestoredAgent::asked`; ruling 20's (iv)). ON A
+    /// SEAMLESS UPDATE'S HANDOFF LAYOUT ONLY, whose successor adopts the
+    /// very tab (`App::pending_restored_agent`): never on a durable layout,
+    /// whose agent a cold restore relaunches in a reopened tab as aterm's own
+    /// end (the review of round eighteen's first cut). An older successor
+    /// ignores it and relaunches it as aterm's own end, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 /// A Codex TUI's run as its leaf's restore carries it
@@ -290,6 +321,26 @@ impl AgentRestore {
         (self.pid, &self.start)
     }
 
+    /// A relaunch owed on `snap`, its act's `asked` cause with it
+    /// ([`Self::cause`]).
+    pub(crate) fn owed(
+        snap: aterm_agent::harness::relaunch::Snapshot,
+        asked: Option<aterm_agent::harness::restart_stamp::Cause>,
+    ) -> Self {
+        Self {
+            cause: asked.map(|cause| cause.word().to_string()),
+            ..Self::of(snap)
+        }
+    }
+
+    /// The explicit restart's cause it carries ([`Self::cause`]); a word
+    /// this build does not know is none.
+    pub(crate) fn asked(&self) -> Option<aterm_agent::harness::restart_stamp::Cause> {
+        self.cause
+            .as_deref()
+            .and_then(aterm_agent::harness::restart_stamp::Cause::parse)
+    }
+
     /// The durable half of the relaunch snapshot `snap`.
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         Self {
@@ -307,6 +358,7 @@ impl AgentRestore {
                 embedded: run.embedded,
                 started_ms: run.started_ms,
             }),
+            cause: None,
         }
     }
 
@@ -341,6 +393,10 @@ impl AgentRestore {
             // reads the shell's dialect itself when it runs; and not read here,
             // on the event loop, from a shell that just started.
             dialect: None,
+            // Where its records are: not carried, so read from its home and
+            // its `cwd`, where its relaunch starts it
+            // (`upgrade_drive::Records::of_snapshot`).
+            claude_dir: None,
             // The login and the Claude home the agent ran under, as the
             // layout carried them off the host's snapshot (nothing is read
             // here, on the event loop): its relaunch line carries both, as a
@@ -1656,6 +1712,7 @@ impl RestoredTab {
                         questions: None,
                         identity: None,
                         agent: None,
+                        supervised: None,
                         held: false,
                     }))
                 }
@@ -3723,6 +3780,7 @@ mod tests {
             questions: None,
             identity: None,
             agent: None,
+            supervised: None,
             held: false,
         }))
     }
@@ -5212,6 +5270,7 @@ metadata = "opaque=copy-me"
                     questions: None,
                     identity: None,
                     agent: None,
+                    supervised: None,
                     held: false,
                 },
             ))),
@@ -5239,6 +5298,7 @@ metadata = "opaque=copy-me"
             questions: None,
             identity: None,
             agent: None,
+            supervised: None,
             held: false,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
@@ -5260,6 +5320,7 @@ metadata = "opaque=copy-me"
                         questions: None,
                         identity: None,
                         agent: None,
+                        supervised: None,
                         held: false,
                     },
                 ))),
@@ -5321,6 +5382,7 @@ metadata = "opaque=copy-me"
                     identity: None,
                     questions: None,
                     agent: None,
+                    supervised: None,
                     held: false,
                 })),
                 focused_path: Vec::new(),
@@ -5463,6 +5525,7 @@ metadata = "opaque=copy-me"
                 home: None,
                 login: None,
                 codex: None,
+                cause: None,
             }));
         }
         assert_eq!(
@@ -5951,6 +6014,7 @@ metadata = "opaque=copy-me"
             home: None,
             login: None,
             codex: None,
+            cause: None,
         };
         let mut m = sample();
         let mut next = 0;
@@ -5998,6 +6062,7 @@ metadata = "opaque=copy-me"
             dialect: None,
             login: None,
             home: None,
+            claude_dir: None,
         };
         let mut m = sample();
         let mut next = 0;
@@ -6158,6 +6223,7 @@ metadata = "opaque=copy-me"
             dialect: Some(Dialect::Zsh),
             login: login.map(str::to_string),
             home: home.map(str::to_string),
+            claude_dir: None,
         };
         // The reopened tab's snapshot, read back from each on-disk format,
         // in a zsh as the relaunch's plan reads the reopened shell's dialect.

@@ -2,17 +2,87 @@
 // Copyright 2026 Andrew Yates
 
 //! The POSIX console driver for the `aterm` passthrough binary: termios raw
-//! mode, a `poll(2)` I/O loop over stdin + the PTY master, SIGWINCH resize
-//! forwarding, and the `waitpid`/`WIFEXITED` exit-status epilogue.
+//! mode, a `poll(2)` I/O loop over stdin, the PTY master and the wake pipe its
+//! signal handlers write, SIGWINCH resize forwarding, and the shell's reap on
+//! SIGCHLD (`waitpid`/`WIFEXITED`), which ends the session with its status.
 //! `driver_windows.rs` is its ConPTY twin behind the same surface.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Set by the SIGWINCH handler; drained in the main loop.
 static GOT_WINCH: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGCHLD handler: a child of this process exited, so the loop
+/// asks whether it was the shell.
+static GOT_CHLD: AtomicBool = AtomicBool::new(false);
+/// The write end of the loop's wake pipe ([`wake_pipe`]); -1 until it exists.
+static WAKE_WR: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn on_winch(_sig: libc::c_int) {
-    GOT_WINCH.store(true, Ordering::Relaxed);
+/// The handler of both signals the loop waits on. A flag alone is a lost
+/// wakeup: one raised between the loop's check and its `poll(2)` (or on
+/// another thread, where `poll` sees no `EINTR`) waits for the next I/O, a
+/// resize applied late and a shell's exit not seen while a job holds the
+/// slave. So it raises the flag and then writes a byte into the wake pipe the
+/// loop polls — both async-signal-safe — and puts back the `errno` of the code
+/// it interrupted, which may be about to read it.
+extern "C" fn on_signal(sig: libc::c_int) {
+    let errno = errno_slot();
+    // SAFETY: the calling thread's own errno slot, valid for its lifetime.
+    let saved = unsafe { *errno };
+    match sig {
+        libc::SIGWINCH => GOT_WINCH.store(true, Ordering::Release),
+        libc::SIGCHLD => GOT_CHLD.store(true, Ordering::Release),
+        _ => {}
+    }
+    let wr = WAKE_WR.load(Ordering::Acquire);
+    if wr >= 0 {
+        let byte = 1u8;
+        // SAFETY: a one-byte write(2) from a local; the pipe is non-blocking
+        // and never closed ([`wake_pipe`]), so a full one answers `EAGAIN`,
+        // and the bytes already in it wake the loop just the same.
+        unsafe { libc::write(wr, (&raw const byte).cast(), 1) };
+    }
+    // SAFETY: as above.
+    unsafe { *errno = saved };
+}
+
+/// The calling thread's `errno`.
+fn errno_slot() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno address; takes no arguments.
+    #[cfg(target_os = "macos")]
+    let slot = unsafe { libc::__error() };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "macos"))]
+    let slot = unsafe { libc::__errno_location() };
+    slot
+}
+
+/// The read end of the loop's wake pipe, made once per process (non-blocking
+/// and close-on-exec, [`aterm_pty::make_wake_pipe`]) and never closed, so a
+/// handler running on any thread at any moment writes into this pipe and never
+/// into a descriptor that later took its number. `None` if it cannot be made.
+fn wake_pipe() -> Option<libc::c_int> {
+    static PIPE: std::sync::OnceLock<Option<(libc::c_int, libc::c_int)>> =
+        std::sync::OnceLock::new();
+    let (rd, wr) = (*PIPE.get_or_init(aterm_pty::make_wake_pipe))?;
+    WAKE_WR.store(wr, Ordering::Release);
+    Some(rd)
+}
+
+/// Route `sig` to [`on_signal`]. `SA_RESTART` keeps this process's other
+/// threads' blocking calls running through it; the loop's `poll(2)` is never
+/// restarted, and the wake pipe holds the byte by then anyway.
+fn catch(sig: libc::c_int, flags: libc::c_int) {
+    // SAFETY: an all-zero `sigaction` is a valid value; filled in below.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    // Cast through a function pointer to satisfy `fn_to_numeric_cast` while
+    // yielding the `sighandler_t` address.
+    sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: `sa.sa_mask` is a valid out-parameter owned by this frame.
+    unsafe { libc::sigemptyset(&raw mut sa.sa_mask) };
+    sa.sa_flags = libc::SA_RESTART | flags;
+    // SAFETY: installs `on_signal`, which is async-signal-safe; `sa` is fully
+    // initialized and the old action is not asked for.
+    unsafe { libc::sigaction(sig, &raw const sa, std::ptr::null_mut()) };
 }
 
 /// Ask the controlling terminal for its size; fall back to 24x80.
@@ -139,9 +209,114 @@ const fn poll_must_read(revents: libc::c_short) -> bool {
     revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
+/// Reap the shell if it has exited, never waiting: `None` while it runs,
+/// `Some(status)` once it is gone — `Some(None)` when its status is not this
+/// process's to read any more (`ECHILD`: a child can only stop being one by
+/// being reaped, so it has exited).
+fn reap_if_exited(pid: libc::pid_t) -> Option<Option<libc::c_int>> {
+    let mut status = 0;
+    loop {
+        // SAFETY: a non-blocking wait on this process's own child, by its
+        // pid; `status` is a valid out-parameter.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            return Some(Some(status));
+        }
+        if r == 0 {
+            return None;
+        }
+        if !eintr() {
+            return Some(None);
+        }
+    }
+}
+
+/// Wait for the shell's exit and return its status (`None` when the wait
+/// fails). By its pid, never `waitpid(-1)`: this process may have other
+/// children (a detached `aterm pkg update`, the update checker's
+/// codesign/curl) whose status would be mistaken for the shell's. The pid is
+/// the session leader whether or not it execs the sandbox-exec wrapper.
+fn wait_for(pid: libc::pid_t) -> Option<libc::c_int> {
+    let mut status = 0;
+    loop {
+        // SAFETY: a blocking wait on this process's own child, by its pid;
+        // `status` is a valid out-parameter.
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r < 0 && eintr() {
+            continue;
+        }
+        return (r == pid).then_some(status);
+    }
+}
+
+/// The session's exit code for the shell's wait status: its own code when it
+/// exited, 1 when a signal ended it or no status was to be had.
+fn exit_code(status: Option<libc::c_int>) -> i32 {
+    match status {
+        Some(status) if libc::WIFEXITED(status) => libc::WEXITSTATUS(status),
+        _ => 1,
+    }
+}
+
+/// The most output the session still passes through once the shell has
+/// exited: far past what a PTY buffers, which is all the shell itself can have
+/// left there, so only a job that keeps writing after it ever meets the cap.
+const EXIT_DRAIN_MAX: usize = 1024 * 1024;
+
+/// Hand `pass` what the master holds right now, never waiting for more: a
+/// zero-timeout `poll(2)` before every read, so this cannot park whether or
+/// not the master is non-blocking and whatever still holds the slave. Ends at
+/// an empty master, EOF, an error, or [`EXIT_DRAIN_MAX`] bytes.
+fn drain_master(master: libc::c_int, buf: &mut [u8], pass: &mut impl FnMut(&[u8])) {
+    let mut left = EXIT_DRAIN_MAX;
+    while left > 0 {
+        let mut ready = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` owned by this frame; a zero timeout.
+        let n = unsafe { libc::poll(&mut ready, 1, 0) };
+        if n < 0 && eintr() {
+            continue;
+        }
+        if n <= 0 || !poll_must_read(ready.revents) {
+            return;
+        }
+        let want = buf.len().min(left);
+        // SAFETY: reads at most `want` bytes into `buf`, which holds them.
+        let r = unsafe { libc::read(master, buf.as_mut_ptr().cast(), want) };
+        if r < 0 && eintr() {
+            continue;
+        }
+        let Ok(got) = usize::try_from(r) else { return };
+        if got == 0 {
+            return;
+        }
+        pass(&buf[..got]);
+        left -= got;
+    }
+}
+
+/// Test seam: run at the one point of every loop turn between the signal flag
+/// checks and the `poll(2)` that waits, where a flag-only signal was lost.
+#[cfg(test)]
+static BEFORE_POLL: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
 /// returns the shell's exit status (non-exit or a failed wait → 1). Nothing
 /// here models the screen; the PTY is the one thing told the geometry.
+///
+/// The session ends with the shell, and the master's EOF is not that: it
+/// comes when the last holder of the slave lets go, and a job the shell leaves
+/// behind (a `nohup`ed `cmd &`, a `setsid` daemon) can hold it past the
+/// shell's `exit`. Linux does not hang up a PTY session at its leader's exit
+/// at all; macOS revokes the slave then, but a job that opens it again by path
+/// before this loop has read the EOF holds the master open again. So the loop
+/// reaps the shell on SIGCHLD, passes through what the master still holds and
+/// ends; closing the master then hangs up whatever still holds the slave. An
+/// EOF while the shell lives (it closed its terminal) still ends the loop, and
+/// the shell is waited for after it.
 pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let shell_pid = shell.pid;
@@ -152,27 +327,37 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     } else {
         None
     };
-    // Cast through a function pointer to satisfy `fn_to_numeric_cast` while
-    // yielding the `sighandler_t` address.
-    unsafe {
-        libc::signal(
-            libc::SIGWINCH,
-            on_winch as extern "C" fn(libc::c_int) as usize,
-        )
-    };
-    // Until the line above, `SIGWINCH` was at its default — ignored — so a
+    let wake_rd = wake_pipe();
+    catch(libc::SIGWINCH, 0);
+    // A child that stops or continues has not exited.
+    catch(libc::SIGCHLD, libc::SA_NOCLDSTOP);
+    // Until the lines above, `SIGWINCH` was at its default — ignored — so a
     // resize since the spawn read the host's size (containment, the PATH dirs,
     // the fork and exec all ran in between) was dropped. Now that the handler
     // sees every later one, catch up once: when the host's grid is no longer
     // the PTY's, the first turn of the loop applies it. An unmoved grid sends
     // the program nothing, as before.
     if aterm_pty::size(master) != Some(host_winsize()) {
-        GOT_WINCH.store(true, Ordering::Relaxed);
+        GOT_WINCH.store(true, Ordering::Release);
     }
+    // Likewise the shell may have exited before SIGCHLD was caught (a command
+    // that fails at once): the first turn asks.
+    GOT_CHLD.store(true, Ordering::Release);
+    // Without a wake pipe (none could be made) a signal still lands at most
+    // this late; with one, the loop sleeps until something happens.
+    let wait_ms = if wake_rd.is_some() { -1 } else { 100 };
 
     let mut bytes_in: u64 = 0;
     // The first output written through marks a healthy start (`on_first_shell_output`).
     let mut spoke = false;
+    let mut pass = |out: &[u8]| {
+        write_all(libc::STDOUT_FILENO, out);
+        bytes_in += out.len() as u64;
+        if !spoke {
+            spoke = true;
+            crate::first_shell_output();
+        }
+    };
 
     // Input waits HERE, never in `write(2)`. A program that is not reading
     // (busy printing, `sleep`, a stopped job) leaves its tty input queue full,
@@ -199,14 +384,29 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: wake_rd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let mut buf = [0u8; 8192];
+    // The shell's status once the loop has reaped it.
+    let mut reaped: Option<Option<libc::c_int>> = None;
 
     loop {
         // Apply a pending resize before blocking.
-        if GOT_WINCH.swap(false, Ordering::Relaxed) {
+        if GOT_WINCH.swap(false, Ordering::AcqRel) {
             let mut nws = host_winsize_raw();
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut nws) };
+        }
+        // A child exited: if it was the shell, the session is over.
+        if GOT_CHLD.swap(false, Ordering::AcqRel)
+            && let Some(status) = reap_if_exited(shell_pid)
+        {
+            drain_master(master, &mut buf, &mut pass);
+            reaped = Some(status);
+            break;
         }
 
         fds[0].fd = if stdin_open && pending.len() < INPUT_BACKLOG_MAX {
@@ -219,12 +419,25 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         } else {
             libc::POLLIN | libc::POLLOUT
         };
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_POLL.get() {
+            hook();
+        }
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 3, wait_ms) };
         if n < 0 {
             if eintr() {
-                continue; // a signal (e.g. SIGWINCH) — loop and apply it
+                continue; // a signal — loop and apply it
             }
             break;
+        }
+        // The wake pipe's bytes did their work by waking the poll; the flags
+        // say what for. Read after the wake, so a signal from here on leaves
+        // a byte for the next poll.
+        if poll_must_read(fds[2].revents) {
+            let mut sink = [0u8; 64];
+            // SAFETY: reads at most `sink.len()` bytes into it from the
+            // non-blocking wake pipe.
+            unsafe { libc::read(fds[2].fd, sink.as_mut_ptr().cast(), sink.len()) };
         }
 
         // host keystrokes -> the shell.
@@ -253,45 +466,23 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
                 continue;
             }
             if r <= 0 {
-                break; // shell exited / PTY closed
+                break; // the slave closed (or the PTY failed)
             }
-            let out = &buf[..r as usize];
-            write_all(libc::STDOUT_FILENO, out);
-            bytes_in += out.len() as u64;
-            if !spoke {
-                spoke = true;
-                crate::first_shell_output();
-            }
+            pass(&buf[..r as usize]);
         }
     }
 
     if let Some(t) = orig {
         restore(libc::STDIN_FILENO, &t);
     }
-    let mut status = 0;
-    // Reap the shell by its pid, never `waitpid(-1)`: this process may have
-    // other children (a detached `aterm pkg update`, the update checker's
-    // codesign/curl) whose status would be mistaken for the shell's. The pid
-    // is the session leader whether or not it execs the sandbox-exec wrapper.
-    let reaped = unsafe {
-        libc::close(master);
-        loop {
-            let r = libc::waitpid(shell_pid, &mut status, 0);
-            if r < 0 && eintr() {
-                continue;
-            }
-            break r == shell_pid;
-        }
-    };
+    // SAFETY: the session's own master, closed once; it hangs up whatever
+    // still holds the slave.
+    unsafe { libc::close(master) };
+    let status = reaped.unwrap_or_else(|| wait_for(shell_pid));
     if verbose {
         eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through.");
     }
-    // A failed wait has no status to report: treat it like a non-exit.
-    if reaped && libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        1
-    }
+    exit_code(status)
 }
 
 #[cfg(test)]
@@ -701,6 +892,288 @@ mod tests {
             "the program never learned the host's new size: {text:?}"
         );
         assert_eq!(code, 0, "the program saw the resize: {text:?}");
+    }
+
+    /// Run this module's test `name` again in a fresh process of this test
+    /// binary, with `child` set and `stdin` as its stdin, and check that it
+    /// ran and passed. The tests that set [`BEFORE_POLL`] or own this
+    /// process's stdout and signals run there, alone.
+    fn reexec(name: &str, child: &str, stdin: aterm_uds::spawnfd::Stdio) {
+        let name = format!(
+            "{}::{name}",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(child, "1")
+            .stdin(stdin)
+            .output()
+            .expect("re-exec the test binary");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the re-exec failed:\n{text}");
+        assert!(
+            text.contains("1 passed"),
+            "the re-exec ran no test:\n{text}"
+        );
+    }
+
+    /// Poll every 20 ms until `done` holds; a minute is the hang detector.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a minute passed and {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Whether this process's child `pid` has exited, left unreaped.
+    fn has_exited(pid: libc::pid_t) -> bool {
+        // SAFETY: `info` is a zeroed out-parameter owned by this frame.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a non-blocking look at this process's own child that leaves
+        // it unreaped (`WNOWAIT`); `info` is valid.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::try_from(pid).expect("pid"),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: `waitid` filled `info` for a child's exit, or left it zeroed.
+        r == 0 && unsafe { info.si_pid() } == pid
+    }
+
+    /// A resize that lands between the loop's signal check and its `poll(2)`
+    /// reaches the program with nothing else to wake the loop. The seam
+    /// [`BEFORE_POLL`] resizes the host terminal and raises `SIGWINCH` there,
+    /// once, while the program waits silently for the resize and stdin is a
+    /// pipe that stays open and empty. A flag-only handler leaves the resize
+    /// unapplied until the next I/O, here the program giving up its wait after
+    /// a minute, the hang detector.
+    #[test]
+    fn a_resize_between_the_signal_check_and_the_poll_reaches_the_program() {
+        const CHILD: &str = "ATERM_TEST_DRIVER_RESIZE_BEFORE_POLL";
+        static HOST: AtomicI32 = AtomicI32::new(-1);
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os(CHILD).is_none() {
+            let (stdin, held) = std::io::pipe().expect("stdin pipe");
+            reexec(
+                "a_resize_between_the_signal_check_and_the_poll_reaches_the_program",
+                CHILD,
+                stdin.into(),
+            );
+            drop(held);
+            return;
+        }
+        // The host terminal, as in the test above: a PTY whose slave is this
+        // process's stdout.
+        let (host, host_slave) = aterm_pty::open_pty_pair().expect("host pty");
+        aterm_pty::resize(host, 30, 100);
+        // SAFETY: duplicating descriptors this test owns: the harness's stdout
+        // is kept aside for its result line, and the host slave takes its place.
+        let harness_stdout = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(harness_stdout >= 0, "keep the harness's stdout");
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::dup2(host_slave, libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        aterm_pty::close_fd(host_slave);
+        let drained = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = aterm_pty::read(host, &mut buf);
+                if n <= 0 {
+                    return all;
+                }
+                all.extend_from_slice(&buf[..n as usize]);
+                let text = String::from_utf8_lossy(&all);
+                if text
+                    .find("SIZE ")
+                    .is_some_and(|at| text[at..].contains('\n'))
+                {
+                    return all;
+                }
+            }
+        });
+
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        // `READY` with no newline, so reading it leaves the master empty; the
+        // wait's last line is past the trap, so only a resize in time counts.
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'echo SIZE $(stty size); exit 0' WINCH; printf READY; i=0; \
+             while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; \
+             trap '' WINCH; echo SIZE $(stty size) unchanged; exit 3"
+                .into(),
+        ];
+        let shell = aterm_pty::spawn_shell_with_pid(
+            30,
+            100,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        while !String::from_utf8_lossy(&seen).contains("READY") {
+            let n = aterm_pty::read(shell.master, &mut buf);
+            assert!(n > 0, "the program ended before it was up");
+            seen.extend_from_slice(&buf[..n as usize]);
+        }
+        HOST.store(host, Ordering::SeqCst);
+        assert!(
+            BEFORE_POLL
+                .set(|| {
+                    if !FIRED.swap(true, Ordering::SeqCst) {
+                        aterm_pty::resize(HOST.load(Ordering::SeqCst), 40, 120);
+                        // SAFETY: raises a signal at this thread; its handler
+                        // runs before `raise` returns.
+                        unsafe { libc::raise(libc::SIGWINCH) };
+                    }
+                })
+                .is_ok(),
+            "the seam is this process's"
+        );
+        let code = run(shell, false);
+        // SAFETY: duplicating a descriptor this test owns onto stdout.
+        unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
+        let out = drained.join().expect("host drain");
+        let text = String::from_utf8_lossy(&out);
+        assert!(FIRED.load(Ordering::SeqCst), "the seam never ran");
+        assert!(
+            text.contains("SIZE 40 120"),
+            "the resize raised before the poll waited for other I/O: {text:?}"
+        );
+        assert_eq!(code, 0, "the program saw the resize: {text:?}");
+    }
+
+    /// The session ends when the shell exits, though a job it left behind
+    /// still holds the terminal. The job ignores `SIGHUP` (as under `nohup`),
+    /// drops its inherited copies of the terminal and, once the shell is gone,
+    /// opens it again by path. On Linux any such holder keeps the master from
+    /// EOF, since a PTY session is not hung up at its leader's exit; macOS
+    /// revokes the slave then, so here the job must open it again before the
+    /// loop reads the EOF, which the seam [`BEFORE_POLL`] arranges: once the
+    /// job ignores `SIGHUP` it lets the shell exit, waits for that and for the
+    /// job's open, then lets the loop poll. The job holds the terminal until told to let go, at most a
+    /// minute, the hang detector; a session that ends only at the master's EOF
+    /// ends only when that minute is up.
+    #[test]
+    fn the_session_ends_with_the_shell_while_a_job_holds_its_terminal() {
+        const CHILD: &str = "ATERM_TEST_DRIVER_JOB_HOLDS_THE_SLAVE";
+        static SHELL: AtomicI32 = AtomicI32::new(-1);
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os(CHILD).is_none() {
+            reexec(
+                "the_session_ends_with_the_shell_while_a_job_holds_its_terminal",
+                CHILD,
+                aterm_uds::spawnfd::Stdio::null(),
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-driver-job-holds-slave-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command: [std::ffi::OsString; 3] = [
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"t=$(tty); d=$ATERM_TEST_DIR
+            ( trap '' HUP; : >"$d/armed"; exec </dev/null >/dev/null 2>&1
+              i=0; while [ ! -e "$d/go" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+              exec 3<>"$t"; : >"$d/held"
+              i=0; while [ ! -e "$d/release" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+              [ -e "$d/release" ] || : >"$d/held-to-the-end"
+              : >"$d/done" ) &
+            i=0; while [ ! -e "$d/exit" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+            exit 7"#
+                .into(),
+        ];
+        let shell = aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[("ATERM_TEST_DIR".into(), dir.to_string_lossy().into_owned())],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        SHELL.store(shell.pid, Ordering::SeqCst);
+        assert!(
+            DIR.set(dir.clone()).is_ok(),
+            "the scratch dir is this process's"
+        );
+        assert!(
+            BEFORE_POLL
+                .set(|| {
+                    if FIRED.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let dir = DIR.get().expect("scratch dir");
+                    // The shell's exit hangs up the job unless it already
+                    // ignores SIGHUP: a job forked just before the exit can
+                    // be cut before its `trap` (seen under a loaded gate).
+                    wait_until("the job does not ignore SIGHUP yet", || {
+                        dir.join("armed").exists()
+                    });
+                    std::fs::write(dir.join("exit"), "").expect("let the shell exit");
+                    wait_until("the shell has not exited", || {
+                        has_exited(SHELL.load(Ordering::SeqCst))
+                    });
+                    std::fs::write(dir.join("go"), "").expect("let the job open the terminal");
+                    wait_until("the job has not opened the terminal again", || {
+                        dir.join("held").exists()
+                    });
+                })
+                .is_ok(),
+            "the seam is this process's"
+        );
+        let code = run(shell, false);
+        let held_to_the_end = dir.join("held-to-the-end").exists();
+        std::fs::write(dir.join("release"), "").expect("let the job go");
+        wait_until("the job has not finished", || dir.join("done").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(FIRED.load(Ordering::SeqCst), "the seam never ran");
+        assert!(
+            !held_to_the_end,
+            "the session outlived its shell until the job let go of the terminal"
+        );
+        assert_eq!(code, 7, "the session returns the shell's status");
     }
 
     #[test]

@@ -6,8 +6,10 @@
 
 #[cfg(test)]
 use aterm_grapheme::grid_graphemes;
-use aterm_grapheme::grid_graphemes_with;
+use aterm_grapheme::{GraphemeClusters, char_width, grid_graphemes_with};
 use aterm_types::text_shaping::AmbiguousWidth;
+
+use crate::cells::{CellSpan, LineCells};
 
 /// Greek small letter final sigma (U+03C2).
 const FINAL_SIGMA: char = '\u{03C2}';
@@ -172,26 +174,64 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
 /// Precomputed byte-offset-to-column map for a single line.
 ///
 /// Built once per line in O(G) where G is the grapheme count, then enables
-/// O(log G) column lookups via binary search. This replaces the O(G)-per-call
-/// `byte_to_column` pattern that causes O(M × G) total cost when there are
-/// M matches in a line.
+/// O(log R) column lookups via binary search over its R runs. This replaces
+/// the O(G)-per-call `byte_to_column` pattern that causes O(M × G) total cost
+/// when there are M matches in a line.
 ///
 /// Column maps are cached in `SearchIndex` alongside line text so that
 /// repeated searches reuse the precomputed map instead of rebuilding it
 /// for every query (#7373).
-#[derive(Debug)]
+///
+/// # Run-length encoded (ruling 2026-10-11, r15 content-3)
+///
+/// The map is kept for every indexed line, and one entry of three `usize` per
+/// grapheme, in a `Vec` grown by doubling, made a non-ASCII line's map 10-25
+/// times its text: an index of 100,000 rows of CJK held 370 MiB, of
+/// decomposed accents 663 MiB, and one box-drawing glyph in an otherwise ASCII
+/// agent row cost 3.4 KB where the plain row cost 389 B. The graphemes of a
+/// line repeat one shape (every ideograph 3 bytes and 2 columns, every
+/// `e\u{301}` 3 bytes and 1 column), so the map stores RUNS of graphemes
+/// that advance by the same bytes and columns, in an exactly sized slice: a
+/// row of one script is one run, the agent row two. Decided by measurement
+/// against the lazy alternative (build a map per hit line at query time):
+/// runs keep every query's lookups where they were, while a lazy map re-walks
+/// every hit line on every query. Offsets and columns are `u32`; a line past
+/// 4 GiB of text or 4 Gi columns (only a soft-wrapped run of millions of rows
+/// joined into one line could be) saturates there, so its columns past that
+/// point read as the last one instead of wrapping.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ColumnMap {
-    /// `None` when the source text is pure ASCII (byte_offset == column).
-    /// `Some(entries)` for non-ASCII text, one per grapheme sorted by byte
-    /// offset, with a sentinel at the end.
-    entries: Option<Vec<ClusterColumns>>,
-    /// Length of the source text in bytes. Used for ASCII identity mapping
-    /// to clamp lookups at the text boundary.
-    text_len: usize,
+    /// The graphemes, in byte order, as runs of a repeating shape. Empty for
+    /// the identity map (every byte one grapheme one column wide: printable
+    /// ASCII drawn one cell per character).
+    runs: Box<[ClusterRun]>,
+    /// Length of the source text in bytes: the identity map clamps lookups
+    /// here, and a lookup at or past it answers `total`. `u32` like the runs
+    /// (a map is one hash-map entry per indexed line, so its size is paid per
+    /// line).
+    text_len: u32,
+    /// The cursor column after the whole line: where a match running to its
+    /// end ends.
+    total: u32,
+    /// What the columns were measured from, so a policy switch re-measures
+    /// only what the policy decides.
+    source: MapSource,
+}
+
+/// Where a [`ColumnMap`]'s columns came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MapSource {
+    /// The line's text walked by [`grid_graphemes_with`] under this
+    /// `ambiguous_width` policy: a caller that hands the index text alone.
+    Walk(AmbiguousWidth),
+    /// The grid cells the text was read from ([`LineCells`]): the grid
+    /// already drew each character at the width it decided, so no policy
+    /// moves them.
+    Cells,
 }
 
 /// Where one grapheme sits on the grid (see [`aterm_grapheme::GridGrapheme`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClusterColumns {
     /// The grapheme's byte offset.
     offset: usize,
@@ -201,6 +241,123 @@ struct ClusterColumns {
     /// than `start` when the grapheme joins the cell before it (the `ය` of
     /// Sinhala `ක්‍ය`, which the grid draws in `ක`'s cell).
     before: usize,
+}
+
+/// `count` consecutive graphemes of one shape: grapheme `i` of the run starts
+/// at byte `offset + i·bytes` and column `start + i·cols`, and for `i > 0`
+/// the cursor before it is that column too (it opens a cell of its own right
+/// after the one before). Only the first grapheme may fold into the cell
+/// before it (`before > start`) or follow a gap (`before < start`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClusterRun {
+    offset: u32,
+    start: u32,
+    before: u32,
+    count: u32,
+    /// Bytes from one grapheme of the run to the next (unused when
+    /// `count == 1`: the next run's offset bounds a lone grapheme).
+    bytes: u16,
+    /// Columns from one grapheme of the run to the next (unused when
+    /// `count == 1`).
+    cols: u16,
+}
+
+/// A line offset or column as a run stores it (see [`ColumnMap`] on the
+/// 4 GiB saturation).
+fn narrow(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+impl ClusterRun {
+    /// Grapheme `i`'s byte offset, start column and cursor-before column.
+    fn grapheme(self, i: u32) -> ClusterColumns {
+        let offset = (self.offset as usize)
+            .saturating_add((i as usize).saturating_mul(usize::from(self.bytes)));
+        let start = (self.start as usize)
+            .saturating_add((i as usize).saturating_mul(usize::from(self.cols)));
+        let before = if i == 0 { self.before as usize } else { start };
+        ClusterColumns {
+            offset,
+            start,
+            before,
+        }
+    }
+}
+
+/// Collects a line's graphemes, in byte order, into [`ClusterRun`]s.
+struct RunBuilder {
+    runs: Vec<ClusterRun>,
+}
+
+impl RunBuilder {
+    fn new() -> Self {
+        Self { runs: Vec::new() }
+    }
+
+    fn push(&mut self, g: ClusterColumns) {
+        let (offset, start, before) = (narrow(g.offset), narrow(g.start), narrow(g.before));
+        if let Some(run) = self.runs.last_mut()
+            && start == before
+            && run.count < u32::MAX
+        {
+            if run.count == 1 {
+                // The second grapheme fixes the run's shape.
+                if let (Some(bytes), Some(cols)) = (
+                    offset
+                        .checked_sub(run.offset)
+                        .and_then(|b| u16::try_from(b).ok()),
+                    start
+                        .checked_sub(run.start)
+                        .and_then(|c| u16::try_from(c).ok()),
+                ) && bytes > 0
+                {
+                    run.bytes = bytes;
+                    run.cols = cols;
+                    run.count = 2;
+                    return;
+                }
+            } else {
+                let next = run.grapheme(run.count);
+                if next.offset == offset as usize && next.start == start as usize {
+                    run.count = run.count.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        self.runs.push(ClusterRun {
+            offset,
+            start,
+            before,
+            count: 1,
+            bytes: 0,
+            cols: 0,
+        });
+    }
+
+    fn finish(self, text_len: usize, total: usize, source: MapSource) -> ColumnMap {
+        // Every byte one grapheme one column wide from column 0: the identity,
+        // which needs no runs (a control character or a lone wide cell breaks
+        // it, so this is printable ASCII in practice).
+        let (text_len, total) = (narrow(text_len), narrow(total));
+        let identity = text_len > 0
+            && total == text_len
+            && matches!(
+                self.runs.as_slice(),
+                [ClusterRun { offset: 0, start: 0, before: 0, count, bytes: 1, cols: 1 }]
+                    if *count == text_len
+            );
+        let runs = if identity {
+            Box::default()
+        } else {
+            self.runs.into_boxed_slice()
+        };
+        ColumnMap {
+            runs,
+            text_len,
+            total,
+            source,
+        }
+    }
 }
 
 impl ColumnMap {
@@ -215,14 +372,11 @@ impl ColumnMap {
         // either ambiguous-width policy (ASCII holds no ambiguous character).
         // Control characters such as tab/newline/carriage return can have
         // zero display width, so they must use the full grapheme map.
-        if text.is_ascii() && text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
-            return Self {
-                entries: None,
-                text_len: text.len(),
-            };
+        if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+            return Self::identity(text.len(), MapSource::Walk(ambiguous));
         }
 
-        let mut entries = Vec::new();
+        let mut runs = RunBuilder::new();
         let mut before: usize = 0;
         // THE GRID'S OWN WALK, not a second model, and over the whole line:
         // charging each grapheme on its own charged a Devanagari conjunct 2
@@ -230,33 +384,116 @@ impl ColumnMap {
         // the grid folds into the cell before it a cell of its own, so every
         // later column on the row named a cell beside the text.
         for g in grid_graphemes_with(text, ambiguous) {
-            entries.push(ClusterColumns {
+            runs.push(ClusterColumns {
                 offset: g.byte_offset,
                 start: g.start_col,
                 before,
             });
             before = g.end_col;
         }
-        // Sentinel so lookups at text.len() return total width.
-        entries.push(ClusterColumns {
-            offset: text.len(),
-            start: before,
-            before,
-        });
-        Self {
-            entries: Some(entries),
-            text_len: text.len(),
+        runs.finish(text.len(), before, MapSource::Walk(ambiguous))
+    }
+
+    /// Build a column map from line text and the grid cells it was read
+    /// from: each grapheme is drawn in the cell that holds its first byte,
+    /// at the column the grid put that cell.
+    ///
+    /// Graphemes, not cells, are what a match starts on (a match starting
+    /// inside one starts at the next, as [`ColumnMap::new`]'s do), and the
+    /// columns come from the cells:
+    ///
+    /// * a grapheme that starts a cell is drawn from that cell's column, and
+    ///   the cursor before it is where the previous cell ends;
+    /// * one that starts inside a cell was folded into it: a printing
+    ///   character (the `ය` of Sinhala `ක්‍ය`) is drawn in that cell, a
+    ///   zero-width one (a ZWSP stored after a letter) in none, at the
+    ///   column after it;
+    /// * bytes no cell holds (a mark the grid had no cell to store in, text
+    ///   past the row's last cell) are drawn in none, after the cell before
+    ///   them.
+    ///
+    /// Written left to right in one go, a line's cells are what
+    /// [`ColumnMap::new`] walks its text into, and the two maps agree; where
+    /// the grid was written otherwise, only this one names the cells on the
+    /// glass.
+    pub fn with_cells(text: &str, cells: &LineCells) -> Self {
+        // Fast path: every byte read as a one-column cell of its own from
+        // column 0 (a row of printable ASCII, which is every ordinary row) is
+        // the identity, as the cells say.
+        if cells.is_identity(text.len()) {
+            return Self::identity(text.len(), MapSource::Cells);
         }
+        let mut runs = RunBuilder::new();
+        let mut spans = cells
+            .iter()
+            .take_while(|cell| cell.byte < text.len())
+            .peekable();
+        let mut previous: Option<CellSpan> = None;
+        let mut current: Option<CellSpan> = None;
+        for (offset, grapheme) in text.grapheme_indices() {
+            while let Some(cell) = spans.next_if(|cell| cell.byte <= offset) {
+                previous = current.replace(cell);
+            }
+            let (start, before) = match current {
+                // Before any cell.
+                None => (0, 0),
+                Some(cell) if offset == cell.byte => {
+                    (cell.col, previous.map_or(0, |cell| cell.end_col))
+                }
+                Some(cell) if offset < cell.end => {
+                    let folded = grapheme.chars().next().is_some_and(|c| char_width(c) > 0);
+                    if folded {
+                        (cell.col, cell.end_col)
+                    } else {
+                        (cell.end_col, cell.end_col)
+                    }
+                }
+                // Past the cell's text, before the next cell's.
+                Some(cell) => (cell.end_col, cell.end_col),
+            };
+            runs.push(ClusterColumns {
+                offset,
+                start,
+                before,
+            });
+        }
+        // The cells left unread start past every grapheme; the last cell is
+        // the line's end.
+        let last = spans.last().or(current);
+        let total = last.map_or(0, |cell| cell.end_col);
+        runs.finish(text.len(), total, MapSource::Cells)
+    }
+
+    /// The identity map over `len` bytes: every byte one grapheme one column
+    /// wide, which needs no runs.
+    fn identity(len: usize, source: MapSource) -> Self {
+        Self {
+            runs: Box::default(),
+            text_len: narrow(len),
+            total: narrow(len),
+            source,
+        }
+    }
+
+    /// What this map's columns were measured from.
+    #[must_use]
+    pub(crate) fn source(&self) -> MapSource {
+        self.source
     }
 
     /// The columns a match over bytes `start..end` is drawn in, as
     /// `(start_col, end_col)` with `end_col` exclusive.
     ///
-    /// O(1) for ASCII text (identity mapping), O(log G) for non-ASCII. A byte
+    /// O(1) for ASCII text (identity mapping), O(log R) otherwise. A byte
     /// offset inside a grapheme maps to the grapheme boundary after it.
     #[must_use]
     #[inline]
     pub fn span(&self, start: usize, end: usize) -> (usize, usize) {
+        if self.runs.is_empty() {
+            // The identity: byte offset == column, clamped at the line's end.
+            let len = self.text_len as usize;
+            return (start.min(len), end.min(len));
+        }
         (self.start_column(start), self.end_column(end))
     }
 
@@ -266,7 +503,7 @@ impl ColumnMap {
     #[must_use]
     #[inline]
     fn start_column(&self, byte_offset: usize) -> usize {
-        self.lookup(byte_offset, |e| e.start)
+        self.lookup(byte_offset).start
     }
 
     /// The column a match ending at `byte_offset` ends at (exclusive): the
@@ -274,28 +511,66 @@ impl ColumnMap {
     #[must_use]
     #[inline]
     fn end_column(&self, byte_offset: usize) -> usize {
-        self.lookup(byte_offset, |e| e.before)
+        self.lookup(byte_offset).before
     }
 
+    /// The grapheme at `byte_offset`, or the first one after it when the
+    /// offset falls inside one; past the last grapheme, the line's end.
     #[inline]
-    fn lookup(&self, byte_offset: usize, column: fn(&ClusterColumns) -> usize) -> usize {
-        let entries = match self.entries {
-            // ASCII fast path: byte offset == column, clamped to text length.
-            None => return byte_offset.min(self.text_len),
-            Some(ref e) => e,
+    fn lookup(&self, byte_offset: usize) -> ClusterColumns {
+        let (text_len, total) = (self.text_len as usize, self.total as usize);
+        let end = ClusterColumns {
+            offset: text_len,
+            start: total,
+            before: total,
         };
-        // `total` is the past-sentinel column, reused as a provably-dead fallback
-        // for the in-bounds arms so indexing is `get` (panic-free), never `[]`.
-        let total = entries.last().map_or(0, |e| e.before);
-        match entries.binary_search_by_key(&byte_offset, |e| e.offset) {
-            // Exact grapheme boundary — return its column directly.
-            Ok(idx) => entries.get(idx).map_or(total, column),
-            // Between two boundaries — the column of the next grapheme whose
-            // offset >= byte_offset, which is entries[idx] (idx < len, guarded).
-            Err(idx) if idx < entries.len() => entries.get(idx).map_or(total, column),
-            // Past the sentinel — return total width.
-            Err(_) => total,
+        if byte_offset >= text_len {
+            return end;
         }
+        if self.runs.is_empty() {
+            // ASCII fast path: byte offset == column.
+            return ClusterColumns {
+                offset: byte_offset,
+                start: byte_offset,
+                before: byte_offset,
+            };
+        }
+        // The last run starting at or before the offset (the first run starts
+        // at byte 0, so there is one for any offset inside the text).
+        let idx = self
+            .runs
+            .partition_point(|run| run.offset as usize <= byte_offset)
+            .saturating_sub(1);
+        let Some(&run) = self.runs.get(idx) else {
+            return end;
+        };
+        let into = byte_offset.saturating_sub(run.offset as usize);
+        // A divisor the type proves nonzero: a run of more than one grapheme
+        // always has a stride.
+        let (i, inside) = match std::num::NonZeroUsize::new(usize::from(run.bytes)) {
+            Some(bytes) if run.count > 1 => (into / bytes, into % bytes != 0),
+            _ => (0, into != 0),
+        };
+        let i = u32::try_from(i).unwrap_or(u32::MAX);
+        if !inside && i < run.count {
+            return run.grapheme(i);
+        }
+        // Inside grapheme `i`: the next one, in this run or the next.
+        let next = i.saturating_add(1);
+        if next < run.count {
+            return run.grapheme(next);
+        }
+        self.runs
+            .get(idx.saturating_add(1))
+            .map_or(end, |run| run.grapheme(0))
+    }
+
+    /// Heap bytes this map holds (its runs), for the index's accounting tests.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.runs
+            .len()
+            .saturating_mul(std::mem::size_of::<ClusterRun>())
     }
 }
 
@@ -355,9 +630,271 @@ impl LowerByteMap {
 mod tests {
     use aterm_types::text_shaping::AmbiguousWidth;
 
+    use aterm_grapheme::{GridColumns, GridStep, grid_graphemes_with};
+
     use super::{
         ColumnMap, LowerByteMap, byte_to_column, display_columns, map_lower_byte_to_original,
     };
+    use crate::cells::LineCells;
+
+    /// The per-grapheme map the runs encode, built and looked up the way the
+    /// map did before it was run-length encoded (one `(offset, start,
+    /// before)` entry per grapheme plus a sentinel, binary-searched): the
+    /// oracle the encoding must answer identically to.
+    struct ReferenceMap(Vec<(usize, usize, usize)>);
+
+    impl ReferenceMap {
+        fn new(text: &str, ambiguous: AmbiguousWidth) -> Self {
+            let mut entries = Vec::new();
+            let mut before = 0;
+            for g in grid_graphemes_with(text, ambiguous) {
+                entries.push((g.byte_offset, g.start_col, before));
+                before = g.end_col;
+            }
+            entries.push((text.len(), before, before));
+            Self(entries)
+        }
+
+        fn look(&self, offset: usize, pick: fn(&(usize, usize, usize)) -> usize) -> usize {
+            let total = self.0.last().map_or(0, |e| e.2);
+            match self.0.binary_search_by_key(&offset, |e| e.0) {
+                Ok(i) => pick(&self.0[i]),
+                Err(i) if i < self.0.len() => pick(&self.0[i]),
+                Err(_) => total,
+            }
+        }
+
+        fn span(&self, start: usize, end: usize) -> (usize, usize) {
+            (self.look(start, |e| e.1), self.look(end, |e| e.2))
+        }
+    }
+
+    /// Every piece of a line that changes how its graphemes advance: ASCII,
+    /// controls, wide, combining, folding, presentation selectors, flags,
+    /// conjuncts, ambiguous-width symbols.
+    const SHAPES: &[&str] = &[
+        "",
+        "ab",
+        "\t",
+        "日本",
+        "e\u{301}",
+        "\u{301}",
+        "न्दी",
+        "\u{d9a}\u{dca}\u{200d}\u{dba}",
+        "1\u{fe0f}\u{20e3}",
+        "👩🏽‍💻",
+        "\u{1f1e6}\u{1f1e7}",
+        "\u{1f1e6}",
+        "⌚\u{fe0e}",
+        "♥\u{fe0f}",
+        "→─°",
+        "\u{23bf}",
+        "\u{200b}",
+    ];
+
+    /// The run-length encoded map answers every `(start, end)` byte pair
+    /// exactly as the per-grapheme map it replaced, under both
+    /// `ambiguous_width` policies: on every pair and triple of shapes, and on
+    /// long lines where a shape repeats (one run) and then changes.
+    #[test]
+    fn the_runs_answer_as_the_per_grapheme_map_did() {
+        let mut texts: Vec<String> = Vec::new();
+        for a in SHAPES {
+            for b in SHAPES {
+                texts.push(format!("{a}{b}"));
+                for c in SHAPES {
+                    texts.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        for shape in SHAPES {
+            texts.push(format!("{}x{}", shape.repeat(9), shape.repeat(3)));
+        }
+        for ambiguous in [AmbiguousWidth::Single, AmbiguousWidth::Double] {
+            for text in &texts {
+                let map = ColumnMap::new(text, ambiguous);
+                let reference = ReferenceMap::new(text, ambiguous);
+                for start in 0..=text.len() + 1 {
+                    for end in start..=text.len() + 1 {
+                        assert_eq!(
+                            map.span(start, end),
+                            reference.span(start, end),
+                            "{text:?} {ambiguous:?} bytes {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cells a grid writing `text` left to right in one go stores it in,
+    /// as [`GridColumns`] lays them out: a printing character opens a cell,
+    /// a folded or zero-width one joins the cell before it (VS16 widening
+    /// it), and one with no cell before it is stored nowhere.
+    fn written_cells(text: &str, ambiguous: AmbiguousWidth) -> LineCells {
+        let mut grid = GridColumns::with_ambiguous_width(ambiguous);
+        let mut cells = LineCells::new();
+        let mut open: Option<(usize, usize, usize, usize)> = None;
+        for (byte, c) in text.char_indices() {
+            let end = byte + c.len_utf8();
+            match grid.step(c) {
+                GridStep::Opens { col, width } => {
+                    if let Some((start, stop, col, width)) = open.take() {
+                        cells.push(start..stop, col, width);
+                    }
+                    open = Some((byte, end, col, width));
+                }
+                GridStep::Folds { .. } | GridStep::Joins { .. } => {
+                    if let Some(cell) = open.as_mut() {
+                        cell.1 = end;
+                        cell.3 = grid.column() - cell.2;
+                    }
+                }
+            }
+        }
+        if let Some((start, stop, col, width)) = open {
+            cells.push(start..stop, col, width);
+        }
+        cells
+    }
+
+    /// Read from cells laid out as a line written left to right in one go,
+    /// the map answers every byte pair as the walk of the text does: the
+    /// cells only change an answer where the grid did something else. (VS15
+    /// on a wide glyph is left out: the walk keeps the cursor past the
+    /// emptied column with no cell there, where the grid stores an empty
+    /// cell, which its reader reads as a blank.)
+    #[test]
+    fn cells_of_a_line_written_in_one_go_answer_as_the_walk() {
+        let shapes: Vec<&str> = SHAPES
+            .iter()
+            .copied()
+            .filter(|shape| !shape.contains('\u{fe0e}'))
+            .collect();
+        for ambiguous in [AmbiguousWidth::Single, AmbiguousWidth::Double] {
+            for a in &shapes {
+                for b in &shapes {
+                    for c in &shapes {
+                        let text = format!("{a}{b}{c}");
+                        let walked = ColumnMap::new(&text, ambiguous);
+                        let celled = ColumnMap::with_cells(&text, &written_cells(&text, ambiguous));
+                        for start in 0..=text.len() + 1 {
+                            for end in start..=text.len() + 1 {
+                                assert_eq!(
+                                    celled.span(start, end),
+                                    walked.span(start, end),
+                                    "{text:?} {ambiguous:?} bytes {start}..{end}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where the grid kept apart what a walk of the text folds, the cells
+    /// decide: two flag halves in cells 0-1 and 2-3 put `XYZ` in cells 4-6
+    /// (the walk pairs them into one flag and says 2-4); a skin tone in a
+    /// cell of its own after its base does the same; a base in a row's last
+    /// column left narrow by its VS16 keeps the next cell where the grid has
+    /// it.
+    #[test]
+    fn cells_the_grid_kept_apart_are_where_matches_are_drawn() {
+        let flag_halves = "\u{1f1e6}\u{1f1e7}XYZ";
+        let mut cells = LineCells::new();
+        cells.push(0..4, 0, 2);
+        cells.push(4..8, 2, 2);
+        for i in 0..3 {
+            cells.push(8 + i..9 + i, 4 + i, 1);
+        }
+        let map = ColumnMap::with_cells(flag_halves, &cells);
+        assert_eq!(map.span(8, 11), (4, 7));
+        assert_eq!(
+            map.span(0, 4),
+            (0, 4),
+            "the pair is one grapheme, over both cells"
+        );
+        assert_eq!(
+            ColumnMap::new(flag_halves, AmbiguousWidth::Single).span(8, 11),
+            (2, 5),
+            "precondition: the walk pairs the halves"
+        );
+
+        let base_last = "a\u{2714}\u{fe0f}b";
+        let mut cells = LineCells::new();
+        cells.push(0..1, 0, 1);
+        cells.push(1..7, 1, 1);
+        cells.push(7..8, 2, 1);
+        let map = ColumnMap::with_cells(base_last, &cells);
+        assert_eq!(map.span(7, 8), (2, 3));
+        assert_eq!(map.span(0, 8), (0, 3), "the line is three cells");
+    }
+
+    /// A grapheme inside a cell is drawn in it when it prints (the grid
+    /// folded it there) and in no column when it is zero-width, and bytes
+    /// no cell holds are drawn in none: the rules that keep a lone mark, a
+    /// ZWSP or a prepended digit out of the results.
+    #[test]
+    fn graphemes_inside_a_cell_and_bytes_outside_every_cell() {
+        // `ක්‍` and `ය` in one cell at column 2.
+        let yansaya = "x \u{d9a}\u{dca}\u{200d}\u{dba} y";
+        let mut cells = LineCells::new();
+        cells.push(0..1, 0, 1);
+        cells.push(1..2, 1, 1);
+        cells.push(2..14, 2, 1);
+        cells.push(14..15, 3, 1);
+        cells.push(15..16, 4, 1);
+        let map = ColumnMap::with_cells(yansaya, &cells);
+        assert_eq!(map.span(11, 14), (2, 3), "the folded letter is in its cell");
+
+        let zwsp = "a\u{200b}b";
+        let mut cells = LineCells::new();
+        cells.push(0..4, 0, 1);
+        cells.push(4..5, 1, 1);
+        let map = ColumnMap::with_cells(zwsp, &cells);
+        assert_eq!(map.span(1, 4), (1, 1), "a ZWSP is drawn in no column");
+
+        // A mark with no cell to land in, then text past the last cell.
+        let orphans = "\u{301}ab\u{301}";
+        let mut cells = LineCells::new();
+        cells.push(2..3, 0, 1);
+        cells.push(3..4, 1, 1);
+        let map = ColumnMap::with_cells(orphans, &cells);
+        assert_eq!(map.span(0, 2), (0, 0));
+        assert_eq!(map.span(2, 4), (0, 2));
+        assert_eq!(map.span(4, 6), (2, 2));
+    }
+
+    /// A map is one hash-map entry per indexed line, ASCII lines included:
+    /// it stays the 32 bytes the per-grapheme map took.
+    #[test]
+    fn a_map_is_no_larger_than_before() {
+        assert!(std::mem::size_of::<ColumnMap>() <= 32);
+    }
+
+    /// A line of one shape is one run however long it is, and the runs are
+    /// sized exactly: the map of a 100-ideograph row, of 100 decomposed
+    /// accents, or of an ASCII row with one box-drawing glyph holds a few
+    /// dozen bytes, not one 24-byte entry per grapheme with doubling slack.
+    #[test]
+    fn a_line_of_one_shape_is_one_run() {
+        let one = |text: &str| ColumnMap::new(text, AmbiguousWidth::Single).heap_bytes();
+        let run = one("日日");
+        assert!(run > 0);
+        assert_eq!(one(&"日".repeat(100)), run, "CJK");
+        assert_eq!(one(&"e\u{301}".repeat(100)), run, "decomposed accents");
+        assert_eq!(
+            one(&format!("  \u{23bf}  {}", "x".repeat(110))),
+            2 * run,
+            "ASCII ending in the glyph, then ASCII"
+        );
+        assert_eq!(
+            one(&"plain ascii ".repeat(10)),
+            0,
+            "the identity holds nothing"
+        );
+    }
 
     #[test]
     fn width_only_matches_coordinate_map_for_unicode_and_controls() {

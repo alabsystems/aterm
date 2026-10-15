@@ -1751,8 +1751,8 @@ fn the_route_words_are_the_consent_cards_caption() {
         Some(crate::menu::PrivacyPane::FullDiskAccess)
     );
     assert_eq!(
-        privacy_pane(crate::message_reporters::PANE_SPOTLIGHT_SEARCH_PRIVACY),
-        Some(crate::menu::PrivacyPane::SpotlightSearchPrivacy)
+        privacy_pane(crate::message_reporters::PANE_DEVELOPER_TOOLS),
+        Some(crate::menu::PrivacyPane::DeveloperTools)
     );
     assert_eq!(privacy_pane("camera"), None);
 }
@@ -2818,8 +2818,6 @@ pub(crate) fn parked() -> crate::PendingUpdateHandoff {
     crate::PendingUpdateHandoff {
         park_at: Instant::now(),
         proof_ready_at: None,
-        #[cfg(target_os = "macos")]
-        activate_at_commit: false,
         attempt_id: 1,
         nonce: None,
         live: Vec::new(),

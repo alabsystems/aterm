@@ -887,6 +887,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     questions: None,
                     identity: None,
                     agent: None,
+                    supervised: None,
                     held: false,
                 })),
                 focused_path: Vec::new(),
@@ -3535,15 +3536,85 @@ const PARENT_DEATH_READ_FD: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_READ_FD";
 const PARENT_DEATH_WRITE_FD: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_WRITE_FD";
 #[cfg(unix)]
 const PARENT_DEATH_EXPECTED_PID: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_EXPECTED_PID";
+/// The file a watcher leaves when it outlives its watch: see the outer test.
+#[cfg(unix)]
+const PARENT_DEATH_OUTLIVED: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_OUTLIVED";
+/// The file a watcher leaves once it has watched its live parent for
+/// [`PARENT_DEATH_LIVE_LOOK`]: the word its parent goes on.
+#[cfg(unix)]
+const PARENT_DEATH_WATCHED: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_WATCHED";
+/// The file the launcher makes its watcher's stderr, where the fail-stop's
+/// line says which ending the watch took.
+#[cfg(unix)]
+const PARENT_DEATH_SAID: &str = "ATERM_TEST_COMMIT_PARENT_DEATH_SAID";
+/// How long a watcher goes on watching its LIVE parent, once armed, before it
+/// says that it still does ([`PARENT_DEATH_WATCHED`]). NOT A DEADLINE: nothing
+/// has to happen in it, and a busy machine makes the look weaker, never red.
+/// It is twenty-five of the watch's 10 ms ticks, so that the watch reads its
+/// parent's liveness, and reads it ALIVE, before the parent dies; and it is
+/// the watcher's own word because only a process that still runs can give it.
+/// MEASURED 2026-10-13, on what came before:
+///
+/// * no look — the launcher left within 5 ms of the ready marker, and the
+///   watch's first read came after the death: neither a witness that calls a
+///   live parent dead (10 runs of 10) nor a watcher that left right after its
+///   marker (3 runs of 20) failed the test;
+/// * the launcher looking at its watcher for 50 ms (`try_wait`) — a child
+///   that has called `_exit` reads as running until the kernel has made its
+///   exit waitable: with 18 copies at once on a machine at load average 50,
+///   15 runs of 2,160 passed on a watcher that had called `_exit(74)` 42 to
+///   82 ms before its launcher left, the launcher alive throughout. Hence
+///   the word, and a look three times the longest of those lags.
+#[cfg(unix)]
+const PARENT_DEATH_LIVE_LOOK: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Subprocess fixture for `leaked_commit_writer_cannot_hide_parent_death`.
-/// Running normally is a no-op; the outer test selects launcher/watcher mode
-/// through command-local environment, never process-global test mutation.
+/// Subprocess fixture for `leaked_commit_writer_cannot_hide_parent_death` and
+/// `commit_eof_from_a_live_parent_stops_the_watcher_with_74`. Running normally
+/// is a no-op; the outer test selects launcher, watcher or reader mode through
+/// command-local environment, never process-global test mutation.
+///
+/// THE HAND-OVER IS EXPLICIT, AND THE WATCHER CHECKS IT. Until 2026-10-13 the
+/// launcher cleared `FD_CLOEXEC` on its pipe and spawned the watcher with a
+/// bare std `Command`, which hands the pipe over only on a std whose spawn
+/// keeps every unflagged descriptor. Trust's std from seal `62f89f11` on
+/// gives a `Command` child its stdio and nothing else (the SP-1 strip: on
+/// Darwin `POSIX_SPAWN_CLOEXEC_DEFAULT` on its `posix_spawn` path, and every
+/// descriptor above stdio marked close-on-exec on its fork path), so the
+/// watcher wrapped two numbers that were not open, and the production watch
+/// fail-stopped at its first poll (`POLLNVAL`) with the launcher alive. The
+/// outer test then passed all the same, on the exit of a watcher that had
+/// watched nothing — or failed, about once in 280 runs with 18 at once, when
+/// that exit beat the ready marker. MEASURED on such a std (2026-10-13): a
+/// watch whose liveness read cannot see the parent's death (`still_alive`
+/// forced true) passed 5 runs of 5 on that fixture and fails 5 of 5 on this
+/// one.
+///
+/// So the launcher keeps both ends close-on-exec and hands each over with
+/// [`crate::test_alone::hand`]: a `pre_exec` hook that clears the flag on
+/// exactly that number in the forked child, as the fork lane does for a real
+/// successor (`app_update_handoff::fork_lane_child_holds`), which works under
+/// every std. The watcher takes each with [`crate::test_alone::handed`],
+/// which refuses to go on unless the number holds the very pipe end the
+/// launcher named (by `fstat`), and the launcher leaves only on the watcher's
+/// own word that it still watches, its parent alive
+/// ([`PARENT_DEATH_LIVE_LOOK`]).
+///
+/// WHAT THIS FIXTURE'S WATCHER SHOWED ABOUT THE KERNEL (Darwin 25.6.0, arm64,
+/// 2026-10-13; the test binary as it was before this change, under a `dyld`
+/// interposer that handed the pipe over and logged each process's own
+/// `_exit`): as the parent exits, [`read_process_birth`] stops answering for
+/// it BEFORE its child's parent link moves. Of 5,768 watchers that left by
+/// `still_alive() == false`, the 10 that left within 0.85 ms of the
+/// launcher's `_exit` call all still had `getppid()` naming it, as had 6 of
+/// the 22 that left 0.85 to 1.6 ms after it and none of the 5,736 that left
+/// later; and for each of the 2,118 whose last birth read was logged, libproc
+/// had answered `ESRCH`. So `getppid() == parent` beside a false
+/// `still_alive()` is no evidence that the parent was alive: a second read of
+/// its birth record is. `read_process_birth`'s docs stated the opposite order
+/// until then; the protocol leans on neither.
 #[test]
 #[cfg(unix)]
 fn commit_parent_death_helper() {
-    use std::os::fd::FromRawFd as _;
-
     let Ok(mode) = std::env::var(PARENT_DEATH_MODE) else {
         return;
     };
@@ -3554,20 +3625,36 @@ fn commit_parent_death_helper() {
         let ready = std::path::PathBuf::from(
             std::env::var_os(PARENT_DEATH_READY).expect("launcher ready marker"),
         );
+        let watched = std::path::PathBuf::from(
+            std::env::var_os(PARENT_DEATH_WATCHED).expect("launcher watched marker"),
+        );
         let mut raw = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0, "commit pipe");
-        assert!(aterm_pty::set_cloexec(raw[0], false).is_ok());
-        assert!(aterm_pty::set_cloexec(raw[1], false).is_ok());
+        // Close-on-exec in this process, as the outgoing window keeps its own
+        // ends: the hand-over below is then the one way they reach the
+        // watcher, whichever std spawns it.
+        assert!(aterm_pty::set_cloexec(raw[0], true).is_ok());
+        assert!(aterm_pty::set_cloexec(raw[1], true).is_ok());
 
         let mut watcher =
             crate::test_alone::StandIn::helper(module_path!(), "commit_parent_death_helper");
+        // The watcher's stderr goes where the outer test reads it, not into
+        // this launcher's scratch, which goes when this launcher does: the
+        // fail-stop's line there says which ending the watch took.
+        let said = std::fs::File::create(
+            std::env::var_os(PARENT_DEATH_SAID).expect("the watcher's stderr path"),
+        )
+        .expect("the watcher's stderr file");
         watcher
             .command()
             .env(PARENT_DEATH_MODE, "watcher")
             .env(PARENT_DEATH_READY, &ready)
-            .env(PARENT_DEATH_READ_FD, raw[0].to_string())
-            .env(PARENT_DEATH_WRITE_FD, raw[1].to_string())
-            .env(PARENT_DEATH_EXPECTED_PID, std::process::id().to_string());
+            .env(PARENT_DEATH_EXPECTED_PID, std::process::id().to_string())
+            .stderr(said);
+        // THE HAND-OVER: both ends, each at its own number, each named with
+        // what it is so that the watcher can check what arrived.
+        crate::test_alone::hand(watcher.command(), PARENT_DEATH_READ_FD, raw[0]);
+        crate::test_alone::hand(watcher.command(), PARENT_DEATH_WRITE_FD, raw[1]);
         let mut watcher = [watcher.spawn()];
         std::fs::write(&marker, watcher[0].id().to_string()).expect("publish watcher pid");
 
@@ -3580,8 +3667,25 @@ fn commit_parent_death_helper() {
             &mut watcher,
             || ready.exists(),
         );
+        // ARMED IS NOT ENOUGH: IT MUST WATCH A LIVE PARENT WITHOUT STOPPING,
+        // AND STILL BE WATCHING WHEN THAT PARENT GOES. A watcher that ended
+        // while this launcher lived did not end of its parent's death, and
+        // the outer test, which sees only that the watcher is gone, would
+        // take that end for the fail-stop it is about. So this process lives
+        // until the watcher says, some of its watch's ticks on
+        // ([`PARENT_DEATH_LIVE_LOOK`]), that it still runs: ITS word, not a
+        // look at it from here, which a watcher that has called `_exit` passes
+        // for as long as the kernel takes to make that exit waitable. One
+        // that ended instead is reported here, with its status. What happens
+        // after that word is the subject.
+        crate::test_alone::until_or_ended(
+            "the watcher says it still watches its live parent, this launcher — whatever ended \
+             it, it was not its parent's death",
+            &mut watcher,
+            || watched.exists(),
+        );
         // Deliberately do not wait: exiting this launcher is the parent-death
-        // cut. The watcher inherited BOTH pipe ends, so EOF alone cannot help.
+        // cut. The watcher holds BOTH pipe ends, so EOF alone cannot help.
         let [watcher] = watcher;
         watcher.detach();
         aterm_pty::close_fd(raw[0]);
@@ -3589,29 +3693,52 @@ fn commit_parent_death_helper() {
         return;
     }
 
-    assert_eq!(mode, "watcher");
-    let read_fd: i32 = std::env::var(PARENT_DEATH_READ_FD)
-        .expect("read fd")
-        .parse()
-        .expect("numeric read fd");
-    let write_fd: i32 = std::env::var(PARENT_DEATH_WRITE_FD)
-        .expect("write fd")
-        .parse()
-        .expect("numeric write fd");
+    // A WATCHER holds both pipe ends and its parent dies. The other three hold
+    // the read end alone, as a real successor does, and their parent lives: a
+    // READER's closes the writer
+    // (`commit_eof_from_a_live_parent_stops_the_watcher_with_74`), a DEAF one's
+    // writes a Commit once the stand-in's event loop has dropped its receiver
+    // (`a_commit_nobody_can_take_stops_the_watcher_with_74_its_pipe_closed_first`),
+    // and a REFUSER's writes another attempt's Commit
+    // (`a_mismatched_commit_stops_the_successor_with_74`).
+    assert!(
+        matches!(mode.as_str(), "watcher" | "reader" | "deaf" | "refuser"),
+        "a parent-death stand-in is a launcher, a watcher, a reader, a deaf one or a refuser: \
+         {mode}"
+    );
     let expected_parent: libc::pid_t = std::env::var(PARENT_DEATH_EXPECTED_PID)
         .expect("expected parent")
         .parse()
         .expect("numeric parent pid");
-    // SAFETY: the launcher passed distinct owned pipe endpoints solely to
-    // this exec. Holding the writer is the Darwin CLOEXEC-leak regression.
-    let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
-    let _leaked_writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
+    // THE HAND-OVER, CHECKED BEFORE ANYTHING IS ARMED ON IT. `CommitReceiver::raw`
+    // takes any descriptor (production reaches it through
+    // `take_commit_fd_from`, which refuses a number that is not open), and a
+    // watch on a number that is not this pipe stops at once, its parent
+    // alive, for a reason that is not parent death. `handed` refuses each
+    // number unless it holds the very pipe end the launcher named: a watcher
+    // that holds anything else says THE HAND-OVER FAILED and arms nothing.
+    // Holding the writer is the Darwin CLOEXEC-leak regression, and by the
+    // mode, never by what happens to be in the environment: a watcher that
+    // was handed no writer must fail here, not turn into a reader whose
+    // parent's exit is an end of file.
+    let read_fd = crate::test_alone::handed(PARENT_DEATH_READ_FD);
+    let _leaked_writer =
+        (mode == "watcher").then(|| crate::test_alone::handed(PARENT_DEATH_WRITE_FD));
     // Attest through the real admission path: the launcher is still blocked
     // on our readiness marker, so it is a live creator and the birth record
     // captured here is provably its own. That makes this fixture exercise
     // the SAME witness production is admitted with.
     let parent = attest_handoff_parent(expected_parent, None)
         .expect("the launcher fixture is alive and is this process's parent");
+    // Everything of the fixture's own that can fail is done before the ready
+    // marker, except the word that follows it, and the parent waits for both:
+    // a stand-in that ends before that word is its parent's to report, and
+    // one that ends after it has only the watch, and the trace and the panic
+    // under `receive_commit`, to end by.
+    let outlived =
+        std::path::PathBuf::from(std::env::var_os(PARENT_DEATH_OUTLIVED).expect("outlived trace"));
+    let watched =
+        std::path::PathBuf::from(std::env::var_os(PARENT_DEATH_WATCHED).expect("watched marker"));
     let receiver = CommitReceiver::raw(read_fd, true, parent)
         .start_watch()
         .expect("start commit parent watch");
@@ -3620,17 +3747,115 @@ fn commit_parent_death_helper() {
         b"armed",
     )
     .expect("publish watcher readiness");
-    let proof = adoption_proof(
-        "parent-death-regression",
+    // STILL WATCHING, MANY TICKS ON, THE PARENT ALIVE. The watch has run on
+    // its own thread since `start_watch`, so this one is free to let it have
+    // those ticks ([`PARENT_DEATH_LIVE_LOOK`]) and then say that the process
+    // still runs. The parent, which waits for this word, makes its cut on it
+    // and on nothing else; a watch that fail-stopped in those ticks took this
+    // thread with it, and the word is never said.
+    std::thread::sleep(PARENT_DEATH_LIVE_LOOK);
+    // A DEAF stand-in's event loop is gone before its parent writes: the
+    // receiver is dropped, as an App torn down mid-overlap drops it.
+    let receiver = if mode == "deaf" {
+        drop(receiver);
+        None
+    } else {
+        Some(receiver)
+    };
+    std::fs::write(&watched, b"watching").expect("say the watch still runs");
+    // Reached past the answer only when the watch did not end the process
+    // where it must. Nobody reads the exit of an orphan, so the panic below is
+    // seen by no one: the trace is what the outer test reads.
+    let outlived_by = if let Some(receiver) = receiver {
+        let answer = receiver.receive_commit(stand_in_proof("parent-death-regression"));
+        // Only a REFUSER leaves through the event loop's own fail-stop. In the
+        // other modes the watch must end the process before it answers, and a
+        // stand-in that left here would hide that it did not.
+        if mode == "refuser"
+            && let Err(end) = answer
+        {
+            receiver.fail_stop_if_required(end);
+        }
+        format!("receive_commit answered {answer:?}, and the process went on")
+    } else {
+        std::thread::sleep(aterm_spec::wait::MUST_HAPPEN);
+        "the watch outlived its event loop's receiver by a minute".to_string()
+    };
+    std::fs::write(&outlived, outlived_by).expect("leave the outlived trace");
+    panic!("production watcher must fail-stop when no Commit it can take can arrive");
+}
+
+/// The adoption proof a parent-death stand-in waits for under `nonce`:
+/// `parent-death-regression` is its own attempt's, any other another's.
+#[cfg(unix)]
+fn stand_in_proof(nonce: &str) -> AdoptionProof {
+    adoption_proof(
+        nonce,
         1,
         crate::build_info::git_commit(),
         &[1; 32],
         &[2; 32],
         &[],
     )
-    .expect("test proof");
-    let _ = receiver.receive_commit(proof);
-    panic!("production watcher must fail-stop when its direct parent exits");
+    .expect("test proof")
+}
+
+/// A stand-in successor in `mode` (`reader`, `deaf` or `refuser`:
+/// [`commit_parent_death_helper`]) holding the read end of a fresh Commit pipe
+/// alone, its parent this test, and still watching when this returns; and the
+/// write end, which nothing else holds. `stderr` replaces the stand-in's
+/// stderr file. Only from a test that runs [`crate::test_alone::alone`]:
+/// [`crate::test_alone::hand`]'s hook makes the spawn a fork.
+#[cfg(unix)]
+fn watching_stand_in(
+    mode: &str,
+    scratch: &std::path::Path,
+    stderr: Option<std::process::Stdio>,
+) -> (crate::test_alone::Running, std::io::PipeWriter) {
+    use std::os::fd::AsRawFd as _;
+    let ready = scratch.join("reader.ready");
+    let watched = scratch.join("reader.watched");
+    // Both ends close-on-exec from birth (`std::io::pipe`): the hand-over is
+    // the one way the read end reaches the stand-in, and the writer reaches
+    // nobody.
+    let (read, write) = std::io::pipe().expect("commit pipe");
+    let mut reader =
+        crate::test_alone::StandIn::helper(module_path!(), "commit_parent_death_helper");
+    reader
+        .command()
+        .env(PARENT_DEATH_MODE, mode)
+        .env(PARENT_DEATH_READY, &ready)
+        .env(PARENT_DEATH_WATCHED, &watched)
+        .env(PARENT_DEATH_OUTLIVED, scratch.join("reader.outlived"))
+        .env(PARENT_DEATH_EXPECTED_PID, std::process::id().to_string());
+    if let Some(stderr) = stderr {
+        reader.command().stderr(stderr);
+    }
+    crate::test_alone::hand(reader.command(), PARENT_DEATH_READ_FD, read.as_raw_fd());
+    let mut reader = [reader.spawn()];
+    drop(read);
+    crate::test_alone::until_or_ended("the stand-in arms its watch", &mut reader, || {
+        ready.exists()
+    });
+    // Not vacuous: a stand-in that stopped before the cut did not stop of it.
+    // (One that stops in the few milliseconds between its word and the cut,
+    // and with 74, is not told from the cut's effect — but by its line.)
+    crate::test_alone::until_or_ended(
+        "the stand-in says it still watches, the writer open and its parent alive",
+        &mut reader,
+        || watched.exists(),
+    );
+    let [reader] = reader;
+    (reader, write)
+}
+
+/// Whether `stderr` holds the fail-stop's line for `end`
+/// ([`fail_stop_without_commit`]), naming `parent`.
+#[cfg(unix)]
+fn says_fail_stop(stderr: &str, parent: u32, end: NoCommit) -> bool {
+    stderr.contains(&format!(
+        "no Commit from parent {parent}: {end}; this successor fail-stops with 74"
+    ))
 }
 
 #[test]
@@ -3639,16 +3864,25 @@ fn leaked_commit_writer_cannot_hide_parent_death() {
     let scratch = aterm_tempfile::TempDir::new().expect("a parent-death scratch dir");
     let marker = scratch.path().join("watcher.pid");
     let ready = scratch.path().join("watcher.ready");
+    let outlived = scratch.path().join("watcher.outlived");
+    let said = scratch.path().join("watcher.stderr");
     // The launcher, as a stand-in that must run exactly its helper test: it
-    // armed the watcher, and its exit is the parent's death.
+    // armed the watcher, left only on the watcher's word that it still
+    // watched a live parent, and its exit is the parent's death. (The watcher
+    // inherits the names of that word and of the trace from it.)
     let mut launcher =
         crate::test_alone::StandIn::helper(module_path!(), "commit_parent_death_helper");
     launcher
         .command()
         .env(PARENT_DEATH_MODE, "launcher")
         .env(PARENT_DEATH_MARKER, &marker)
-        .env(PARENT_DEATH_READY, &ready);
-    launcher.spawn().passed();
+        .env(PARENT_DEATH_READY, &ready)
+        .env(PARENT_DEATH_WATCHED, scratch.path().join("watcher.watched"))
+        .env(PARENT_DEATH_OUTLIVED, &outlived)
+        .env(PARENT_DEATH_SAID, &said);
+    let launcher = launcher.spawn();
+    let launcher_pid = launcher.id();
+    launcher.passed();
     let watcher: libc::pid_t = std::fs::read_to_string(&marker)
         .expect("watcher pid marker")
         .trim()
@@ -3672,6 +3906,248 @@ fn leaked_commit_writer_cannot_hide_parent_death() {
         unsafe { libc::kill(watcher, libc::SIGKILL) };
         panic!("leaked commit writer hid direct-parent death");
     }
+    // GONE, AND BY WHICH WAY OUT. The watcher is an orphan by now, so its exit
+    // status is nobody's to read and "gone" is all this process can see of
+    // it. What the fixture pins around that: the watcher held the very pipe
+    // (it armed), still ran a quarter of a second later with its parent
+    // alive (it said so, and the launcher left on nothing else), did not
+    // leave through its own code, which writes this trace first, and left
+    // through the fail-stop, which says why before its `_exit`: that its
+    // parent was gone. A signal says nothing, and any other ending (a
+    // hang-up, a failed read) says itself. What remains is a verdict of
+    // "gone" taken between that word and the launcher's own exit (the
+    // launcher reads the word within 5 ms and goes): nothing here tells it
+    // from the true one.
+    // AND A PASS DOES NOT SHOW THAT THE WATCH RAN IN THAT TIME. On a machine
+    // too busy to run the watch's thread for a quarter of a second it read no
+    // liveness before the word, or had its verdict and not yet its `_exit`,
+    // and a witness that calls a live parent dead then passes: the look is
+    // weaker there, never red. Which status the fail-stop leaves with, and
+    // that an end of file stops the watch, is the next test's.
+    assert!(
+        !outlived.exists(),
+        "the watcher outlived its watch: it ended, but not by the fail-stop ({})",
+        std::fs::read_to_string(&outlived).unwrap_or_default()
+    );
+    let said = std::fs::read_to_string(&said).unwrap_or_default();
+    assert!(
+        says_fail_stop(&said, launcher_pid, NoCommit::ParentGone),
+        "the watcher is gone, but not by a fail-stop that says its parent was gone; its \
+         stderr:\n{said}"
+    );
+}
+
+/// THE SAME WATCH FROM ITS OTHER SIDE: END OF FILE FROM A LIVE PARENT, AND THE
+/// STATUS THE FAIL-STOP LEAVES WITH. The test above can show neither: its
+/// watcher holds the writer on purpose, so no end of file reaches it, and it
+/// is an orphan when it stops, so its status is nobody's to read. MEASURED
+/// 2026-10-13: under a watch whose fail-stop leaves with 75, that test passed
+/// 10 runs of 10 and so did every other test of this module; this one fails
+/// 10 of 10. Here the stand-in holds the read end alone, as a real successor
+/// does, and its parent is this test: it stays alive, waits for the
+/// stand-in's word that it still watches, closes the writer with no Commit
+/// written, and reads how its child ended — by the watch's `_exit(74)`.
+///
+/// WHICH `poll` BIT CARRIES THE END OF FILE IS NOT PINNED, and on Darwin
+/// cannot be by a pipe: a watch that ignores `POLLHUP` passes this test too
+/// (measured, Darwin 25.6.0: a closed writer reads as `POLLIN | POLLHUP`, and
+/// the read's end of file stops the watch).
+///
+/// Alone: [`crate::test_alone::hand`]'s hook makes the spawn a fork, and the
+/// writer must have no holder but this test for its close to be an end of
+/// file.
+#[test]
+#[cfg(unix)]
+fn commit_eof_from_a_live_parent_stops_the_watcher_with_74() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let scratch = aterm_tempfile::TempDir::new().expect("a commit-eof scratch dir");
+    let (reader, write) = watching_stand_in("reader", scratch.path(), None);
+    // THE CUT: the last writer goes, and no Commit was written.
+    drop(write);
+    let ran = stopped_with_74(
+        reader,
+        "end of file before a Commit did not stop the watcher",
+    );
+    // The line says the end of file (Darwin: `POLLIN | POLLHUP`, then a read
+    // of nothing) or the hang-up alone, whichever bit carried it.
+    let parent = std::process::id();
+    assert!(
+        says_fail_stop(&ran.stderr, parent, NoCommit::EndOfFile)
+            || says_fail_stop(
+                &ran.stderr,
+                parent,
+                NoCommit::PipeEnded {
+                    revents: libc::POLLHUP
+                }
+            ),
+        "the fail-stop says that the pipe ended with no Commit; its stderr:\n{}",
+        ran.stderr
+    );
+}
+
+/// `stand_in` stops — a hang detector, never a latency budget: a watch that
+/// does not take its ending never ends, its parent alive — and by the
+/// fail-stop's `_exit(74)`; what it ran and wrote, for the caller to read.
+#[cfg(unix)]
+#[track_caller]
+fn stopped_with_74(mut stand_in: crate::test_alone::Running, what: &str) -> crate::test_alone::Ran {
+    let stopped = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(5),
+        || stand_in.exited().then_some(()),
+    );
+    assert!(stopped.is_some(), "{what}");
+    let ran = stand_in.selected();
+    assert_eq!(
+        ran.status.and_then(|status| status.code()),
+        Some(74),
+        "the fail-stop leaves with 74, and by `_exit`: no panic, no answer to its \
+         receiver\nstdout:\n{}\nstderr:\n{}",
+        ran.stdout,
+        ran.stderr
+    );
+    ran
+}
+
+/// THE WATCH'S OTHER EXIT, AND THE READ END CLOSED BEFORE IT SAYS WHY. A whole
+/// Commit reaches a stand-in whose event loop has dropped its receiver: the
+/// watch has nowhere to hand it, and must fail-stop with 74 rather than go on
+/// readerless, saying that the receiver was gone.
+///
+/// And by then the pipe's read end is closed. The stand-in's stderr is a pipe
+/// this test fills before the Commit, so the fail-stop's line blocks until
+/// this test drains it; while it blocks, a second Commit written here fails
+/// with `EPIPE`, which is what sends a real parent down its
+/// `commit_write_failed` rejection with its sessions kept. A watch that kept
+/// the read end open until `_exit` (as it did until 2026-10-14) would take
+/// that write instead, and its parent would `_exit(0)` beside a successor
+/// that leaves too. The failed write also shows this process survives it:
+/// the Rust runtime leaves `SIGPIPE` ignored, as in the window that writes a
+/// real Commit.
+///
+/// Alone, as [`commit_eof_from_a_live_parent_stops_the_watcher_with_74`], and
+/// because its stderr pipe must have no writer but the stand-in and this test.
+#[test]
+#[cfg(unix)]
+fn a_commit_nobody_can_take_stops_the_watcher_with_74_its_pipe_closed_first() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let scratch = aterm_tempfile::TempDir::new().expect("a receiver-gone scratch dir");
+    let (said, said_by_stand_in) = std::io::pipe().expect("the stand-in's stderr pipe");
+    let filler = said_by_stand_in
+        .try_clone()
+        .expect("a writer to fill it with");
+    let (stand_in, mut write) =
+        watching_stand_in("deaf", scratch.path(), Some(said_by_stand_in.into()));
+    // FULL, so the fail-stop's line blocks. The stand-in shares this open
+    // pipe, so it is nonblocking only while it is filled, and the stand-in
+    // writes nothing meanwhile (its watch idles until the Commit).
+    let set_nonblocking = |fd: i32, on: bool| {
+        // SAFETY: flag reads and writes on a descriptor this test holds open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let flags = if on {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    };
+    set_nonblocking(filler.as_raw_fd(), true);
+    loop {
+        match (&filler).write(&[0; 512]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill the stand-in's stderr: {e}"),
+        }
+    }
+    while (&filler).write(&[0]).is_ok() {}
+    set_nonblocking(filler.as_raw_fd(), false);
+    drop(filler);
+    // This test's own writer, nonblocking (nobody else holds it), so a write
+    // the pipe cannot take answers instead of waiting.
+    set_nonblocking(write.as_raw_fd(), true);
+    let commit = stand_in_proof("parent-death-regression").to_commit_wire();
+    write
+        .write_all(&commit)
+        .expect("the Commit the stand-in cannot take");
+    // THE SECOND COMMIT FAILS WHILE THE STAND-IN STILL RUNS. A hang
+    // detector: until the watch has read the first and closed, this one
+    // lands (the stand-in never reads it).
+    let mut stand_in = stand_in;
+    let refused = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(5),
+        || match write.write(&commit) {
+            Ok(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(e) => Some(e),
+        },
+    );
+    let refused = refused.expect(
+        "a Commit written after the watch ended was taken for a minute: the read end stayed \
+         open while the fail-stop said why",
+    );
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::EPIPE),
+        "a Commit with no reader fails with EPIPE: {refused}"
+    );
+    assert!(
+        !stand_in.exited(),
+        "the stand-in is still saying why (its stderr is full) when its read end is already \
+         closed"
+    );
+    // Drained, the line lands and the fail-stop leaves.
+    let drain = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        (&said).read_to_end(&mut text).map(|_| text)
+    });
+    let ran = stopped_with_74(
+        stand_in,
+        "a Commit nobody could take did not stop the watcher",
+    );
+    let text = drain
+        .join()
+        .expect("the drain thread")
+        .expect("the stand-in's stderr");
+    let text = String::from_utf8_lossy(&text).replace('\0', "");
+    assert!(
+        says_fail_stop(&text, std::process::id(), NoCommit::ReceiverGone),
+        "the fail-stop says that the event loop's receiver was gone; its stderr, less the \
+         fill:\n{text}\nstdout:\n{}",
+        ran.stdout
+    );
+}
+
+/// THE EVENT LOOP'S EXIT ([`CommitReceiver::fail_stop_if_required`]): a whole
+/// Commit for another attempt reaches the stand-in. The watch hands it over,
+/// the event loop finds it is not this attempt's, and the successor
+/// fail-stops with 74, saying so.
+///
+/// Alone, as [`commit_eof_from_a_live_parent_stops_the_watcher_with_74`].
+#[test]
+#[cfg(unix)]
+fn a_mismatched_commit_stops_the_successor_with_74() {
+    use std::io::Write as _;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let scratch = aterm_tempfile::TempDir::new().expect("a mismatched-commit scratch dir");
+    let (refuser, mut write) = watching_stand_in("refuser", scratch.path(), None);
+    write
+        .write_all(&stand_in_proof("another-attempt").to_commit_wire())
+        .expect("another attempt's Commit");
+    let ran = stopped_with_74(refuser, "a mismatched Commit did not stop the successor");
+    assert!(
+        says_fail_stop(&ran.stderr, std::process::id(), NoCommit::Mismatched),
+        "the fail-stop says that the Commit was not this attempt's; its stderr:\n{}",
+        ran.stderr
+    );
 }
 
 // ======================================================================
@@ -4827,6 +5303,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 questions: None,
                 identity: None,
                 agent: None,
+                supervised: None,
                 held: false,
             },
         )))
@@ -6115,4 +6592,67 @@ fn the_replacement_proof_term_distinguishes_masters_and_survives_dup() {
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
     }
+}
+
+/// THE PACKED TAB STOPS (R17-HANDOFF-1): every vector a grid can hold packs and
+/// unpacks to itself — the every-8 defaults as their length alone, a cleared
+/// set as an empty bitmap, custom stops, a length that is no multiple of four
+/// and a vector longer than its width — and a packing no window writes is
+/// refused rather than guessed at.
+#[test]
+fn packed_tab_stops_round_trip_and_refuse_what_no_window_writes() {
+    let defaults = default_tab_stops;
+    let mut custom = defaults(203);
+    custom[5] = true;
+    custom[16] = false;
+    custom[202] = true;
+    let mut past_width = defaults(400);
+    past_width[300] = true;
+    for (what, stops) in [
+        ("defaults", defaults(80)),
+        ("wide defaults", defaults(4096)),
+        ("one column", vec![false]),
+        ("cleared", vec![false; 200]),
+        ("custom", custom),
+        ("past the width", past_width),
+        ("every column", vec![true; 4096]),
+    ] {
+        let packed = PackedTabStops::pack(&stops).expect(what);
+        assert_eq!(packed.unpack().as_ref(), Some(&stops), "{what}");
+        let len = stops.len();
+        assert!(
+            packed
+                .hex
+                .as_ref()
+                .is_none_or(|hex| hex.len() <= len.div_ceil(4)),
+            "{what}: a quarter of a byte a column at most"
+        );
+    }
+    assert_eq!(
+        PackedTabStops::pack(&defaults(4096)),
+        Some(PackedTabStops {
+            len: 4096,
+            hex: None
+        }),
+        "the defaults are their length alone"
+    );
+    assert_eq!(
+        PackedTabStops::pack(&[false; 200]).and_then(|p| p.hex),
+        Some(String::new()),
+        "a cleared set is an empty bitmap"
+    );
+    let refused = |len: u16, hex: Option<&str>| {
+        PackedTabStops {
+            len,
+            hex: hex.map(str::to_owned),
+        }
+        .unpack()
+        .is_none()
+    };
+    assert!(refused(0, None), "no columns");
+    assert!(refused(4097, None), "wider than a grid");
+    assert!(refused(8, Some("000")), "a bitmap longer than its length");
+    assert!(refused(8, Some("0g")), "not hex");
+    assert!(refused(5, Some("02")), "a stop past the length");
+    assert!(!refused(5, Some("01")), "the last column's own stop");
 }

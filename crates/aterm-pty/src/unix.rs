@@ -2598,14 +2598,39 @@ pub fn reap_shell(identity: ShellIdentity) {
     // ~2 s budget: poll every 10 ms (200 ticks). A SIGHUP-ignoring holdout is
     // SIGKILLed at ~250 ms, so the common case returns on the first poll and the
     // pathological case is still bounded.
-    reap_shell_scheduled(identity, Some(REAP_KILL_AT), REAP_DEADLINE);
+    reap_shell_scheduled(
+        identity,
+        Some(REAP_KILL_AT),
+        REAP_DEADLINE,
+        InGrace::enter(),
+    );
+}
+
+/// [`reap_shell`] on a thread of its own, what teardown runs after
+/// [`hangup_shell`] so the caller (the UI thread) never waits. Counted by
+/// [`wait_for_reaps`] from this call on, before the thread runs, so a process
+/// that exits right after it still waits for the escalation.
+pub fn reap_shell_in_background(identity: ShellIdentity) {
+    if identity.pid <= 1 {
+        return;
+    }
+    let grace = InGrace::enter();
+    std::thread::spawn(move || {
+        reap_shell_scheduled(identity, Some(REAP_KILL_AT), REAP_DEADLINE, grace);
+    });
 }
 
 /// [`reap_shell`] with its schedule given: `kill_at` is the tick of the
 /// `SIGKILL` escalation (`None`: never — a test's stand-in for a child no
 /// signal can finish), `deadline` the tick it hands a still-unreaped own child
-/// to the straggler reaper.
-fn reap_shell_scheduled(identity: ShellIdentity, kill_at: Option<u32>, deadline: u32) {
+/// to the straggler reaper. `grace` is its place in [`wait_for_reaps`]'s count,
+/// given back once the shell is settled or its SIGKILL has gone out.
+fn reap_shell_scheduled(
+    identity: ShellIdentity,
+    kill_at: Option<u32>,
+    deadline: u32,
+    mut grace: InGrace,
+) {
     let pid = identity.pid;
     if pid <= 1 {
         return;
@@ -2635,6 +2660,9 @@ fn reap_shell_scheduled(identity: ShellIdentity, kill_at: Option<u32>, deadline:
             }
             #[cfg(test)]
             REAP_KILL_TICK.with(|t| t.set(Some(tick)));
+        }
+        if Some(tick) == kill_at {
+            grace.leave();
         }
         #[cfg(test)]
         REAP_POLLS.with(|n| n.set(n.get() + 1));
@@ -2751,6 +2779,60 @@ pub fn reap_in_background(mut child: aterm_uds::spawnfd::Child) {
     if matches!(child.try_wait(), Ok(None)) {
         hand_to_reaper(Straggler::Child(child));
     }
+}
+
+/// How many [`reap_shell`] calls are still inside their grace: neither settled
+/// nor past their SIGKILL. A `const` initializer — nothing lazy.
+static IN_GRACE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// Signalled whenever [`IN_GRACE`] falls.
+static GRACE_LEFT: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One [`reap_shell`]'s place in [`IN_GRACE`], given back once (at the SIGKILL
+/// tick, or when the reap ends first).
+struct InGrace(bool);
+
+impl InGrace {
+    fn enter() -> Self {
+        *IN_GRACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        Self(true)
+    }
+
+    fn leave(&mut self) {
+        if std::mem::take(&mut self.0) {
+            let mut in_grace = IN_GRACE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *in_grace = in_grace.saturating_sub(1);
+            GRACE_LEFT.notify_all();
+        }
+    }
+}
+
+impl Drop for InGrace {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Wait, at most `bound`, until every [`reap_shell`] in flight has settled its
+/// shell or sent its SIGKILL; `true` when they all have.
+///
+/// For a process about to exit. [`reap_shell_in_background`]'s thread dies
+/// with the process, so a shell that ignores the SIGHUP and is still in its
+/// grace when the process exits is never SIGKILLed: re-parented to launchd or
+/// init, it runs on for good. A shell that honours the hang-up
+/// settles at the reap's first polls, so this costs a quit milliseconds; a
+/// holdout costs it the grace (~250 ms).
+pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
+    let in_grace = IN_GRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (in_grace, _) = GRACE_LEFT
+        .wait_timeout_while(in_grace, bound, |n| *n > 0)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *in_grace == 0
 }
 
 /// [`reap_shell`]'s poll period.
@@ -3646,6 +3728,20 @@ pub enum ReadOutcome {
     /// exactly under the heavy-fd load that broke pipe creation. Never produced on the
     /// wake-pipe path (which blocks indefinitely with zero polling).
     Idle,
+    /// The shell's exit watch (`exit_rd`) fired: the session's shell has exited,
+    /// whether or not the master has reached EOF. A job the shell left behind (a
+    /// `cmd &` under bash's default `huponexit`, a `setsid` grandchild) can hold
+    /// the slave open past the shell's exit, and Linux does not hang a PTY up at
+    /// its session leader's exit, so the master may never EOF. The caller passes
+    /// on what the master holds, without waiting for more, and ends the session
+    /// as at EOF; closing the master then hangs up whatever still holds the slave.
+    Exited,
+}
+
+/// Whether a `poll(2)` entry for an exit watch says the process exited: a
+/// pidfd or a kqueue reads readable then (a reaped pidfd also hangs up).
+fn exit_fired(entry: &libc::pollfd) -> bool {
+    entry.revents & (libc::POLLIN | libc::POLLHUP) != 0
 }
 
 /// Timeout (ms) for the wake-pipe-LESS fallback poll in [`read_or_wake`]. ONLY the
@@ -3661,20 +3757,37 @@ const WAKELESS_POLL_TIMEOUT_MS: libc::c_int = 250;
 /// orphaned, different-pgroup child keeps open (setsid / double-fork / `disown`) is no
 /// longer pinned forever.
 ///
+/// `exit_rd` (`-1`: none) is a descriptor `poll(2)` reports readable once the
+/// session's shell has exited (`aterm_uds::exitwatch::exit_fd`): it answers
+/// [`ReadOutcome::Exited`], after a wake and before the master. The session ends
+/// with its shell, not with the slave's last close (the ruling for the terminal
+/// session, docs/AUDIT-pty-render-2026-10-09.md P3). A watch that reports an
+/// error is never read as an exit.
+///
 /// `wake_rd < 0` (no wake pipe could be made — fd exhaustion) does NOT degrade to a bare
 /// blocking `read`: that would re-pin the reader forever on an orphan-held master and
 /// silently re-open MEM-L2 precisely under the heavy-fd load that broke pipe creation.
-/// Instead it polls the master ALONE (allocating no new fd) with a bounded timeout and
-/// returns [`ReadOutcome::Idle`] on expiry, so the caller can honor an fd-free stop flag.
-pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32) -> ReadOutcome {
+/// Instead it polls the master (and the exit watch, allocating no new fd) with a bounded
+/// timeout and returns [`ReadOutcome::Idle`] on expiry, so the caller can honor an fd-free
+/// stop flag.
+pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> ReadOutcome {
+    let exit_watch = libc::pollfd {
+        fd: exit_rd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     if wake_rd < 0 {
-        let mut fds = [libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: `fds` is a valid 1-element pollfd array for the duration of the call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, WAKELESS_POLL_TIMEOUT_MS) };
+        let mut fds = [
+            libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            exit_watch,
+        ];
+        // SAFETY: `fds` is a valid 2-element pollfd array for the duration of the
+        // call; a negative `fd` (no exit watch) is skipped by `poll`.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, WAKELESS_POLL_TIMEOUT_MS) };
         if r < 0 {
             let e = io::Error::last_os_error();
             // EINTR → hand control back so the caller re-checks its stop flag and retries;
@@ -3687,6 +3800,9 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32) -> ReadOutcome {
         }
         if r == 0 {
             return ReadOutcome::Idle; // timed out, master quiet — caller re-checks stop
+        }
+        if exit_fired(&fds[1]) {
+            return ReadOutcome::Exited;
         }
         // POLLHUP/ERR/NVAL fall through to `read`, which surfaces the 0/-1 as Eof.
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -3721,10 +3837,12 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32) -> ReadOutcome {
             events: libc::POLLIN,
             revents: 0,
         },
+        exit_watch,
     ];
     loop {
-        // SAFETY: `fds` is a valid 2-element pollfd array for the duration of the call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        // SAFETY: `fds` is a valid 3-element pollfd array for the duration of the
+        // call; a negative `fd` (no exit watch) is skipped by `poll`.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -3736,6 +3854,12 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32) -> ReadOutcome {
         // Wake takes priority — the owner wants us gone regardless of pending output.
         if fds[1].revents != 0 {
             return ReadOutcome::Wake;
+        }
+        if exit_fired(&fds[2]) {
+            return ReadOutcome::Exited;
+        }
+        if fds[2].revents != 0 {
+            fds[2].fd = -1; // a broken watch: poll without it rather than spin
         }
         // POLLHUP/ERR/NVAL fall through to `read`, which surfaces the 0/-1 as Eof.
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;

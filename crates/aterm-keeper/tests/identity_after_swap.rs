@@ -30,7 +30,7 @@
 //!
 //! No WindowServer: every process is this test binary (bare or in its bundle,
 //! run by `exec`, never by LaunchServices), `nc`, `codesign`, `ditto` or
-//! `launchctl`; stand-ins end by SIGKILL (AGENTS.md rule 6).
+//! `launchctl`; stand-ins end by SIGKILL (AGENTS.md).
 //!
 //! Every test skips, with one line, where macOS's `trustd` does not answer
 //! (`aterm_uds::deadline::trust_service_silent`): the negative controls check

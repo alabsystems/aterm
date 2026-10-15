@@ -491,6 +491,37 @@ impl CellExtra {
         self.complex_char = None;
     }
 
+    /// Whether this entry holds anything besides truecolor fg/bg bytes: a
+    /// combining mark, a cluster string, a link, an underline colour, extended
+    /// flags or an image. Those a cell owns only through its HAS_EXTRAS bit; the
+    /// fg/bg bytes a BCE blank also owns through the RGB marker in its packed
+    /// colours, without the bit (`Cell::bce_blank`).
+    #[must_use]
+    #[inline]
+    pub(crate) fn has_claimable_data(&self) -> bool {
+        self.hyperlink.is_some()
+            || self.complex_char.is_some()
+            || !self.combining.is_empty()
+            || self.image.is_some()
+            || self.underline_color_idx.is_some()
+            || self.flags & !(extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB) != 0
+    }
+
+    /// Drop everything [`Self::has_claimable_data`] counts, keeping the
+    /// truecolor fg/bg bytes. Returns whether the entry still holds data.
+    #[inline]
+    pub(crate) fn retain_overflow_colors(&mut self) -> bool {
+        self.hyperlink = None;
+        self.complex_char = None;
+        self.combining.clear();
+        self.image = None;
+        self.underline_color_idx = None;
+        self.flags &= extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB;
+        // Bytes 0-2 belong to the underline colour just dropped.
+        self.colors[..3].fill(0);
+        self.has_data()
+    }
+
     /// The inline images covering this cell, bottom layer first (draw order).
     #[must_use]
     #[inline]

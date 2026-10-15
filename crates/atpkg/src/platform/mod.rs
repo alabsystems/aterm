@@ -1043,6 +1043,15 @@ fn sh_shim_body(
         s.push_str(&sh_quote_str(value));
         s.push('\n');
     }
+    // Decided here, in the one body every writer and every "already right" check renders.
+    if cfg!(target_os = "macos")
+        && let Some(block) = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::build_cache::shim_block)
+    {
+        s.push_str(&block);
+    }
     let target_q = sh_shim_quote(target);
     if let Some(route) = route {
         let marker = route

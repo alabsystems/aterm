@@ -70,6 +70,50 @@
 //! An `ERR …` response or a connection failure prints to stderr and exits 1. A
 //! server-reported timeout (`OK timeout`, or a `turn` verdict with
 //! `status=timeout`) exits 124.
+//!
+//! # Terminal-safe output
+//!
+//! "Verbatim" above is what a PIPE or a FILE gets: every byte as the server
+//! sent it, so a recording plays, a body hashes and a frame parser counts.
+//! What a TERMINAL gets is rendered: on a stdout or a stderr that is a terminal
+//! (each judged on its own, by `isatty`), every character a terminal acts on
+//! or reorders text around — C0 but `\n` and `\t`, DEL, C1, the bidi marks,
+//! embeddings, overrides and isolates, U+2028/U+2029 — and every byte that is
+//! not UTF-8 is shown as text (`\x1b`, `\r`, `\u{202e}`, `\xff`) by
+//! [`aterm_codec::tty`], the one rendering `aterm drive task --wait` and the
+//! fabric's `render::safe` share. Printable text, non-ASCII included, is
+//! unchanged. The decision is made in two places, each the only door to its
+//! stream: [`StdoutSink`] (every stdout path) and [`stderr_prefixed`] /
+//! [`drain_refusal_tail`] (every stderr line). The pipe and file branch is the
+//! old behaviour, byte for byte.
+//!
+//! Why every byte and not a list of verbs: the client trusts the server to
+//! encode, and the local server does (pct-encoded fields, `visible_char`'d
+//! cells, escaped JSON), but some bytes are another party's by design — a
+//! fabric peer's mail body (round fifteen, OUT-1: it retitled the reader's tab
+//! and drew a forged `trust=human` line over the header) — and through `dial`
+//! the server itself is a remote machine (OUT-3), whose status lines, rows and
+//! bodies are its own. Rulings 2026-10-10, per verb that writes a byte or
+//! Lines payload:
+//!
+//! | verb (framing) | what the payload is | on a terminal |
+//! |---|---|---|
+//! | `inbox get <id>`, `inbox get @<off>` (Bytes) | a fabric peer's message body, raw by contract | rendered: the OUT-1 fix |
+//! | `temporal [<tick>] [trim]` (Bytes) | a past screen's text: what programs printed | rendered (bidi is all it can change) |
+//! | `cast` (Bytes) | an asciicast v2 recording for `asciinema play -` or a file | rendered; the server's JSON escape leaves nothing in an honest one to change |
+//! | `outbox [<max>]` (Bytes, bridge-only) | local posts' bodies, for the bridge's pipe | rendered |
+//! | `subscribe` (Push) | frames; `bytes` frames carry a program's raw output | rendered: raw it would drive the reader's terminal and could overwrite the `sub`/`EVENT` lines being watched; a frame parser reads a pipe, where `BYTES <len>` still counts raw bytes |
+//! | `text`, `screen`, `offscreen`, `search`, `selection`, `blocktext`, `line(s)` (Lines/Status) | screen text: C0/C1 already spaces (`visible_char`), bidi faithful | rendered (a screen's bidi override no longer reorders the reader's line) |
+//! | `blocks`, `timeline`, `history`, `sessions`, `who`, `exits`, `inbox`, `topic`, `trail`, `identities`, `family`, `edges`, `grants`, `flows`, `modes`, `resizes`, `turn`, `kitty`, `appstatus`, `messages`, `chrome`, `controls`, `panes`, `inspect`, `privacy`, `help`, `verbs` (Lines) | rows of pct-encoded or sanitized fields | rendered; the identity on an honest server's rows |
+//! | every `--json` form, `cast frames`, `cast drift`, `video frames` (Lines) | JSON (escaped by `aterm_codec::json`), path and verdict rows | rendered; the identity on an honest server's rows |
+//! | `image read`, `image --bytes` (Lines) | PNGs as base64 | rendered; base64 is ASCII, so the identity |
+//! | every Status verb, every `OK`/`ERR` line and refusal tail | the server's one line (a remote's through `dial`) | rendered: OUT-3 |
+//! | `ls`, `sessions`, `windows`, `instances`, `conn`, `cast drift --file` (client-answered) | rows the client built from servers' fields | rendered; the identity on an honest server's fields |
+//!
+//! Binary meant for a file or a pipe (recordings, images, feeds, JSON) keeps
+//! its bytes where it is meant to go; on a terminal there is no parser to
+//! keep them for, and the rendering is the identity on what an honest server
+//! sends — so one rule covers every verb, and no verb can be forgotten.
 
 use std::collections::HashSet;
 use std::env;
@@ -165,6 +209,16 @@ EXIT CODES:
          the remote, so check there first, as above. Never 0: a pipeline
          must not read an update as \"session over\".
 
+OUTPUT:
+    To a pipe or a file, stdout and stderr carry the server's bytes exactly
+    as it sent them. To a TERMINAL they are shown, never obeyed: every
+    character a terminal acts on or reorders text around (C0 but newline and
+    tab, DEL, C1, the bidi controls, U+2028/U+2029) and every byte that is not
+    UTF-8 prints as text (\\x1b, \\r, \\u{202e}, \\xff), so a body another
+    party wrote (`inbox get`, a `dial`ed remote's reply, a screen's text)
+    cannot retitle the tab, move the cursor or write the clipboard. Redirect
+    (`> file`, `| cat`) for the bytes themselves.
+
 STDIN PAYLOADS (multi-line, whitespace-preserving; each <= 256 KiB):
     feed-bin      read the raw binary payload from STDIN and feed it to the PTY
                   VERBATIM via a length-prefixed frame; print the server's
@@ -222,9 +276,10 @@ CROSS-TERMINAL DRIVING:
 
 PUSH FRAMES (subscribe):
     After the one-shot `OK subscribe <n>` ack (to STDERR) the connection flips
-    PUSH-ONLY and STDOUT carries these frames VERBATIM, each tagged by a compact
-    <local> channel id (NOT the sid). A raw BYTES body may contain newlines, so
-    do NOT parse the stream line-by-line once `bytes` is requested.
+    PUSH-ONLY and STDOUT carries these frames VERBATIM (to a pipe or a file:
+    OUTPUT above), each tagged by a compact <local> channel id (NOT the sid). A
+    raw BYTES body may contain newlines, so do NOT parse the stream
+    line-by-line once `bytes` is requested.
       sub <local> <sid>          one per target, right after the ack: maps the
                                  <local> channel id to its stable sid.
       DELTA <local> seq=<n> screen <nrows>   then <nrows> rows — a FULL screen
@@ -412,7 +467,7 @@ fn completion_script(shell: &str) -> Option<String> {
 fn emit_completions(shell: &str) -> io::Result<ExitCode> {
     let script = completion_script(shell).ok_or_else(unknown_shell_error)?;
     let stdout = stdout_handle();
-    let mut out = StdoutSink(stdout.lock());
+    let mut out = StdoutSink::new(stdout.lock());
     out.write_all(script.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -723,7 +778,7 @@ fn front_door_completions_result(
         )
     })?;
     let stdout = stdout_handle();
-    let mut out = StdoutSink(stdout.lock());
+    let mut out = StdoutSink::new(stdout.lock());
     out.write_all(script.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -2724,7 +2779,7 @@ fn run_discovery(
     let self_sid = env::var(SELF_SID_ENV).ok();
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
-    let mut out = StdoutSink(stdout.lock());
+    let mut out = StdoutSink::new(stdout.lock());
     // With `--sock`/`--pid` the directory is not the question; unscoped
     // discovery classifies it, since "no such directory" and "empty" differ.
     let (mut dir, targets) = if sock.is_some() || pid.is_some() {
@@ -3915,16 +3970,79 @@ fn is_stdout_closed(e: &io::Error) -> bool {
 /// writes through it (`every_stdout_writer_goes_through_the_sink`), so `|
 /// head` ends each the same way. A write that would block is [`Worded`], never
 /// reported as the server's silence ([`no_reply_error`]).
-struct StdoutSink<W>(W);
+///
+/// It is also where stdout is made TERMINAL-SAFE: built by [`StdoutSink::new`],
+/// it renders every byte through [`aterm_codec::tty::SafeStream`] when stdout
+/// is a terminal, and passes every byte as it came otherwise (the crate docs'
+/// *Terminal-safe output*). One sink, so no stdout path can be left out.
+struct StdoutSink<W: Write> {
+    out: W,
+    /// `Some` while the destination is a terminal: the rendering, holding a
+    /// UTF-8 character a write cut until the next write completes it.
+    tty: Option<aterm_codec::tty::SafeStream>,
+}
+
+impl<W: Write> StdoutSink<W> {
+    /// The sink over `out`, a writer onto this process's stdout: rendered for
+    /// a terminal exactly when stdout is one ([`stdout_is_terminal`]).
+    fn new(out: W) -> Self {
+        Self::onto(out, stdout_is_terminal())
+    }
+
+    /// The sink over `out` with its destination's kind given: `terminal`
+    /// renders every byte, else every byte passes as it came. The seam the
+    /// tests drive both branches through.
+    fn onto(out: W, terminal: bool) -> Self {
+        Self {
+            out,
+            tty: terminal.then(aterm_codec::tty::SafeStream::new),
+        }
+    }
+}
 
 impl<W: Write> Write for StdoutSink<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf).map_err(stdout_failure)
+        let Some(tty) = &mut self.tty else {
+            return self.out.write(buf).map_err(stdout_failure);
+        };
+        let mut shown = String::with_capacity(buf.len());
+        tty.push(buf, &mut shown);
+        self.out
+            .write_all(shown.as_bytes())
+            .map_err(stdout_failure)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush().map_err(stdout_failure)
+        self.out.flush().map_err(stdout_failure)
     }
+}
+
+impl<W: Write> Drop for StdoutSink<W> {
+    /// A body that ended inside a UTF-8 character: its held bytes, shown as
+    /// `\xNN` (best effort — the run is ending, and the rows before it are out).
+    fn drop(&mut self) {
+        if let Some(tty) = &mut self.tty {
+            let mut rest = String::new();
+            tty.finish(&mut rest);
+            if !rest.is_empty() {
+                let _ = self.out.write_all(rest.as_bytes());
+                let _ = self.out.flush();
+            }
+        }
+    }
+}
+
+/// Whether this process's stdout is a terminal: what decides
+/// [`StdoutSink::new`].
+fn stdout_is_terminal() -> bool {
+    io::IsTerminal::is_terminal(&stdout_handle())
+}
+
+/// Whether this process's stderr is a terminal: what decides
+/// [`stderr_prefixed`] and [`drain_refusal_tail`].
+fn stderr_is_terminal() -> bool {
+    io::IsTerminal::is_terminal(&io::stderr())
 }
 
 /// A stdout write's failure, marked: broken pipe is [`StdoutClosed`], would-block
@@ -4138,7 +4256,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
 /// stdout, header consumed, one buffered write flushed explicitly.
 fn print_framed_lines(reply: &str) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = StdoutSink(io::BufWriter::new(stdout.lock()));
+    let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
     for line in reply.lines().skip(1) {
         out.write_all(line.as_bytes())?;
         out.write_all(b"\n")?;
@@ -4217,7 +4335,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             // `help_text` already ends in a newline, so write it directly.
             let help = help_text();
             let stdout = stdout_handle();
-            let mut out = StdoutSink(stdout.lock());
+            let mut out = StdoutSink::new(stdout.lock());
             out.write_all(help.as_bytes())?;
             // Drop the guard explicitly so the lexical lock-order census sees it
             // released before any later helper takes stdout.
@@ -4867,8 +4985,8 @@ fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
 /// The follow-up line count from a streaming verb's `OK <count>` header `tail`
 /// (everything after the first space). Only the FIRST whitespace token is the
 /// count: the server may append a free-form marker after it — `cmd_search`
-/// writes `OK <n> incomplete[ capped| rewrapping]` when the list is not
-/// exhaustive (control_query.rs) —
+/// writes `OK <n> incomplete[ capped][ rewrapping][ long-line][ older]` when the
+/// list is not exhaustive (control_query.rs) —
 /// and parsing the whole tail would reject that header and drop every match.
 /// Framing: first token = count, then n lines.
 ///
@@ -4880,19 +4998,45 @@ fn stream_count(tail: &str) -> Option<usize> {
     (count <= MAX_STREAM_LINES).then_some(count)
 }
 
-/// What `search`'s ` incomplete` header marker means, for stderr: the cause
-/// token after it, or the depth cap when there is none. An older server sends a
-/// bare ` incomplete` at the match limit too, so a bare marker at 100000 names
-/// the limit. `None` for a header without the marker.
-fn search_incomplete_note(tail: &str) -> Option<&'static str> {
+/// What `search`'s ` incomplete` header marker means, for stderr: one note per
+/// cause token after it, joined with `; `, or the depth cap when there is none.
+/// The server names every cause that applies (` older` is the depth cap beside
+/// another cause, ruling 2026-10-11), so the note names them all rather than
+/// the first. An older server sends a bare ` incomplete` at the match limit
+/// too, so a bare marker at 100000 names the limit. `None` for a header
+/// without the marker.
+fn search_incomplete_note(tail: &str) -> Option<String> {
+    const DEPTH: &str = "older history not searched (search_history_lines)";
+    const LIMIT: &str = "results stop at 100000 matches";
     let mut words = tail.split_whitespace();
     let count = words.next().and_then(|n| n.parse::<usize>().ok());
-    (words.next() == Some("incomplete")).then(|| match words.next() {
-        Some("capped") => "results stop at 100000 matches",
-        None if count.is_some_and(|n| n >= 100_000) => "results stop at 100000 matches",
-        Some("rewrapping") => "screen only: the history is rewrapping",
-        _ => "older history not searched (search_history_lines)",
-    })
+    if words.next() != Some("incomplete") {
+        return None;
+    }
+    let mut note = String::new();
+    for cause in words {
+        let said = match cause {
+            "capped" => LIMIT,
+            "rewrapping" => "screen only: the history is rewrapping",
+            "long-line" => {
+                "a long line was not searched to its end: the regex ran out of scan budget there"
+            }
+            "older" => DEPTH,
+            _ => continue,
+        };
+        if !note.is_empty() {
+            note.push_str("; ");
+        }
+        note.push_str(said);
+    }
+    if note.is_empty() {
+        note.push_str(if count.is_some_and(|n| n >= 100_000) {
+            LIMIT
+        } else {
+            DEPTH
+        });
+    }
+    Some(note)
 }
 
 /// Upper bound on a peer-supplied `OK <n>` line count (mirrors aterm-agent's
@@ -5171,8 +5315,20 @@ const REFUSAL_TAIL_MAX_LINES: usize = 16;
 /// line. A continuation sent in a later write, or a partial final line, is not
 /// printed.
 fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
+    let terminal = stderr_is_terminal();
     let stderr = io::stderr();
     let mut err = stderr.lock();
+    drain_refusal_tail_into(reader, &mut err, terminal)
+}
+
+/// [`drain_refusal_tail`] into `err`, each line rendered by
+/// [`aterm_codec::tty::safe`] when `terminal` (a refusal is the server's words,
+/// a remote's through `dial`). The seam the tests drive both branches through.
+fn drain_refusal_tail_into<R: Read>(
+    reader: &mut BufReader<R>,
+    err: &mut impl Write,
+    terminal: bool,
+) -> io::Result<()> {
     for _ in 0..REFUSAL_TAIL_MAX_LINES {
         let buffered = reader.buffer();
         // No complete line in hand — including none at all — ends the drain.
@@ -5190,7 +5346,12 @@ fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
         let Ok(text) = std::str::from_utf8(&line) else {
             return Ok(());
         };
-        err.write_all(text.trim_end_matches('\r').as_bytes())?;
+        let text = text.trim_end_matches('\r');
+        if terminal {
+            err.write_all(aterm_codec::tty::safe(text.as_bytes()).as_bytes())?;
+        } else {
+            err.write_all(text.as_bytes())?;
+        }
         err.write_all(b"\n")?;
     }
     Ok(())
@@ -5619,15 +5780,37 @@ fn acknowledge_artifact_reply(
 
 /// Write `"aterm-ctl: <msg>\n"` to stderr (manual `eprintln!`). A broken stderr
 /// propagates the error instead of panicking. A write that would block is
-/// [`Worded`], as [`StdoutSink`]'s is.
+/// [`Worded`], as [`StdoutSink`]'s is. `msg` is often the server's own words
+/// (a status line, an `ERR`, a remote's through `dial`): rendered for a
+/// terminal when stderr is one ([`stderr_prefixed`]).
 fn stderr_line(msg: &str) -> io::Result<()> {
+    stderr_prefixed("aterm-ctl: ", msg).map_err(worded)
+}
+
+/// Write `<prefix><msg>\n` to stderr in one write, rendered for a terminal
+/// when stderr is one ([`prefixed_line`]): every stderr line this crate prints
+/// goes through here ([`stderr_line`], `conn`'s twin).
+fn stderr_prefixed(prefix: &str, msg: &str) -> io::Result<()> {
+    let terminal = stderr_is_terminal();
     let stderr = io::stderr();
     let mut err = stderr.lock();
-    let mut line = Vec::new();
-    line.extend_from_slice(b"aterm-ctl: ");
-    line.extend_from_slice(msg.as_bytes());
+    err.write_all(&prefixed_line(prefix, msg, terminal))
+}
+
+/// `<prefix><msg>\n` as bytes: `msg` rendered by [`aterm_codec::tty::safe`]
+/// when `terminal`, as it came otherwise. The seam the tests drive both
+/// branches through.
+fn prefixed_line(prefix: &str, msg: &str, terminal: bool) -> Vec<u8> {
+    let shown = if terminal {
+        aterm_codec::tty::safe(msg.as_bytes())
+    } else {
+        std::borrow::Cow::Borrowed(msg)
+    };
+    let mut line = Vec::with_capacity(prefix.len() + shown.len() + 1);
+    line.extend_from_slice(prefix.as_bytes());
+    line.extend_from_slice(shown.as_bytes());
     line.push(b'\n');
-    err.write_all(&line).map_err(worded)
+    line
 }
 
 /// The stdout handle. SIGPIPE stays ignored (Rust's startup default), so a
@@ -5646,7 +5829,7 @@ fn stdout_handle() -> io::Stdout {
 /// Print one line to stdout (manual `println!`); errors propagate.
 fn print_stdout_line(line: &str) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = StdoutSink(stdout.lock());
+    let mut out = StdoutSink::new(stdout.lock());
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")
 }
@@ -5661,16 +5844,18 @@ fn streams_payload(verb: &str, request: &str) -> bool {
 }
 
 /// Copy exactly `nbytes` of byte-framed body from `reader` to `out`, verbatim
-/// (a `cast` body feeds `asciinema play -`). Returns the bytes copied; fewer
-/// than `nbytes` means the server hung up mid-body. The `take` never reads past
-/// the body.
+/// (a `cast` body feeds `asciinema play -`; an [`StdoutSink`] `out` renders it
+/// for a terminal, the `inbox get` body above all). Returns the bytes copied;
+/// fewer than `nbytes` means the server hung up mid-body. The `take` never
+/// reads past the body.
 fn copy_body<R: io::Read, W: Write>(reader: &mut R, out: &mut W, nbytes: u64) -> io::Result<u64> {
     io::copy(&mut reader.take(nbytes), out)
 }
 
 /// Stream exactly `count` payload lines from `reader` to stdout, normalizing
-/// line endings while preserving each row's content verbatim. Early EOF is an
-/// error so a guarded artifact reply is never acknowledged while truncated.
+/// line endings while preserving each row's content verbatim (rendered for a
+/// terminal by the [`StdoutSink`]). Early EOF is an error so a guarded artifact
+/// reply is never acknowledged while truncated.
 fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result<()> {
     let stdout = stdout_handle();
     // `io::Stdout` is always a `LineWriter`, which would issue one `write(2)` per
@@ -5678,7 +5863,7 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
     // `flush()` below keeps broken-pipe/ENOSPC errors propagating. The
     // `subscribe` relay (`redial::relay_subscription`) flushes per frame
     // instead.
-    let mut out = StdoutSink(io::BufWriter::new(stdout.lock()));
+    let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
     for _ in 0..count {
         let mut line = String::new();
         if read_bounded_line(reader, &mut line)? == 0 {
@@ -5749,7 +5934,7 @@ fn read_guarded_payload<R: BufRead>(
 
 fn print_guarded_payload(lines: &[String]) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = StdoutSink(stdout.lock());
+    let mut out = StdoutSink::new(stdout.lock());
     for line in lines {
         out.write_all(line.as_bytes())?;
         out.write_all(b"\n")?;
@@ -6023,7 +6208,7 @@ fn exchange_on(
         // 124); an explicit 0 watches forever.
         let watch = deadline.filter(|_| timeout_explicit);
         let stdout = stdout_handle();
-        let mut out = StdoutSink(stdout.lock());
+        let mut out = StdoutSink::new(stdout.lock());
         return redial::relay_subscription(
             redial::FirstLeg {
                 stream: &stream,
@@ -6040,8 +6225,9 @@ fn exchange_on(
     }
 
     if bytes_payload(verb, frame_request) {
-        // `OK <nbytes>` + a byte body (cast/temporal), streamed to stdout through a
-        // bounded `take` copy, byte-exact.
+        // `OK <nbytes>` + a byte body (cast/temporal/inbox get), streamed to stdout
+        // through a bounded `take` copy: byte-exact to a pipe or a file, rendered
+        // for a terminal by the sink (a peer's mail body is its sender's bytes).
         let nbytes = match byte_count(tail) {
             Some(n) => n,
             None => return Err(malformed_header_error(status_line)),
@@ -6059,7 +6245,7 @@ fn exchange_on(
             stderr_line(&msg)?;
         }
         let stdout = stdout_handle();
-        let mut out = StdoutSink(stdout.lock());
+        let mut out = StdoutSink::new(stdout.lock());
         let copied = copy_body(&mut reader, &mut out, nbytes as u64)?;
         if copied < nbytes as u64 {
             // The header promised more than arrived: keep what was written but
@@ -6115,10 +6301,10 @@ fn exchange_on(
             None => return Err(malformed_header_error(status_line)),
         };
         // `search` appends ` incomplete` after the count when the list is not
-        // exhaustive, then the cause unless it is the depth cap; surface it so
-        // callers know which results they did not get.
+        // exhaustive, then every cause unless the depth cap is the only one;
+        // surface them so callers know which results they did not get.
         if let Some(note) = search_incomplete_note(tail) {
-            stderr_line(note)?;
+            stderr_line(&note)?;
         }
         // `turn` carries its verdict after the count (`turn submitted=… status=…
         // seq=…`): stdout stays screen rows, the verdict goes to stderr.

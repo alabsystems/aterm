@@ -747,11 +747,6 @@ pub struct CompanionOwner {
     /// user saw, so the next tick spends it only where those pixels still
     /// are: the same frame, or its own glass beside the new surface.
     resight_frame: Option<PixelFrame>,
-    /// The palette the pending ghost's body was baked with, captured with
-    /// [`Self::resight_frame`]: a ghost on its own glass is drawn in it
-    /// ([`OwnGlass::colors`]), not in the one the arriver samples in the
-    /// other pane.
-    resight_colors: Option<CatColorKey>,
     /// THE OWN GLASSES: the pixel frame of each pane a ghost stands on
     /// beside the focused surface — the pane the focus left
     /// ([`PetBrain::displace_resight`]), and the panes it left before while
@@ -778,13 +773,13 @@ pub struct CompanionOwner {
 const OWN_GLASS_MAX: usize = PET_DEPARTURES_MAX + 1;
 
 /// A ghost's own glass ([`CompanionOwner::own_glass`]): the key its ghosts
-/// carry (`PetDepartureSprite::glass`), the pixel frame they were drawn in
-/// and the palette they were drawn with.
+/// carry (`PetDepartureSprite::glass`) and the pixel frame they were drawn
+/// in. The palette each was drawn with rides the ghost itself
+/// (`PetDepartureSprite::colors`), as on every other glass.
 #[derive(Clone, Copy, Debug)]
 struct OwnGlass {
     key: u32,
     frame: PixelFrame,
-    colors: Option<CatColorKey>,
     /// This frame's host offered it, exactly as drawn: consumed by every
     /// tick.
     offered: bool,
@@ -821,7 +816,6 @@ impl Default for CompanionOwner {
             last_sync: None,
             drawn_frame: None,
             resight_frame: None,
-            resight_colors: None,
             own_glass: [None; OWN_GLASS_MAX],
             glass_key: 0,
             resight_offered: false,
@@ -1086,6 +1080,11 @@ impl CompanionOwner {
         if !focused {
             self.retire_coordinate_space();
         }
+        // The surface this frame's body stands on, keyed as the owner fence
+        // keys it: a ghost born from the body carries it, so an arriver
+        // adopting that ghost resumes its palette only on its own ground
+        // (`PetBrain::spend_crossfade`).
+        self.pet.note_surface((facts.session, facts.alt_screen));
         self.feed_ink(decos, pane);
         // Only the motion POLICY pins the resident; the shed latch and its
         // envelope change its cadence (`Self::tick`), never its motion.
@@ -1239,7 +1238,6 @@ impl CompanionOwner {
                 self.own_glass[free] = Some(OwnGlass {
                     key: self.glass_key,
                     frame: drawn,
-                    colors: self.resight_colors,
                     offered: false,
                 });
             } else {
@@ -1442,19 +1440,9 @@ impl CompanionOwner {
                     rows: glass.rows,
                     ..geom
                 };
-                // In the palette the body was drawn with in its pane, not
-                // the one the arriver samples in this one.
-                let key = t.pet.departures[slot].map_or(0, |d| d.glass);
-                let frame = PetCursorFrame {
-                    colors: self
-                        .own_glass
-                        .iter()
-                        .flatten()
-                        .find(|own| own.key == key)
-                        .and_then(|own| own.colors)
-                        .unwrap_or(colors),
-                    ..frame
-                };
+                // In the palette its body was drawn with in its pane
+                // (`PetDepartureSprite::colors`), not the one the arriver
+                // samples in this one.
                 if let Some(ghost_fp) = decos.pet_own_glass(frame, own, glass.origin, slot, out) {
                     fp ^= ghost_fp.rotate_left(37);
                 }
@@ -1600,7 +1588,6 @@ impl CompanionOwner {
     pub fn resight_coordinate_space(&mut self) {
         if let Some(drawn) = self.drawn_frame.take() {
             self.resight_frame = Some(drawn);
-            self.resight_colors = self.pet.appearance_colors();
         }
         if self.resight_frame.is_some() {
             self.pet.resight_coordinate_space();
@@ -1679,13 +1666,11 @@ impl CompanionOwner {
         self.last_shed_tick = None;
     }
 
-    /// Retire only the pet's frozen contrast sample (a theme or palette
-    /// authority change); behaviour, position and breed handoff continue.
+    /// Retire the pet's frozen contrast samples, its ghosts' included (a
+    /// theme or palette authority change): [`PetBrain::invalidate_colors`].
+    /// Behaviour, position and breed handoff continue.
     pub fn invalidate_colors(&mut self) {
         self.pet.invalidate_colors();
-        for own in self.own_glass.iter_mut().flatten() {
-            own.colors = None;
-        }
     }
 
     /// THE CADENCE LAW: [`PetBrain::needs_frames`] — something is moving —

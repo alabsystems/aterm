@@ -1,0 +1,30 @@
+# claude-code 2.1.296 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a five-hour usage limit Claude Code continued by itself past its reset (`Usage limit reset · continuing automatically`), the stub answering at once: the resumed turn ended before any read saw it busy
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.SctR/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Cooked for 0s · done 3:31 PM
+
+❯ carry on with the task
+  ⎿  You've hit your session limit · resets 3:35pm (America/Los_Angeles)
+     /upgrade to increase your usage limit.
+
+⏺ Usage limit reached · continuing automatically at 3:35pm · esc to cancel
+
+✻ Cooked for 0s · done 3:31 PM
+
+⏺ Usage limit reset · continuing automatically
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Cogitated for 0s · done 3:36 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

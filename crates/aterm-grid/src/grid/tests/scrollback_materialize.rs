@@ -387,11 +387,18 @@ fn materialize_wide_char_at_last_col_does_not_corrupt_rgb() {
 
 /// VS16 presentation width survives materialization: a scrolled-back `❤️Z`
 /// keeps the heart as a 2-column cell, so `Z` stays at column 2.
+///
+/// The line is the one the live grid stores: its VS16 widening set the cell's
+/// `WIDE` bit, which Row-to-Line keeps on both of the unit's chars.
 #[test]
 fn materialize_preserves_vs16_widened_cell() {
     use crate::grid::scroll_materialize::materialize_from_line;
 
-    let attrs: Rle<CellAttrs> = [CellAttrs::DEFAULT; 3].into_iter().collect();
+    let wide = CellAttrs {
+        flags: CellFlags::WIDE.bits(),
+        ..CellAttrs::DEFAULT
+    };
+    let attrs: Rle<CellAttrs> = [wide, wide, CellAttrs::DEFAULT].into_iter().collect();
     let line = Line::with_attrs("\u{2764}\u{FE0F}Z", attrs);
     let row = materialize_from_line(&line, 10);
 
@@ -437,6 +444,31 @@ fn materialize_keeps_vs16_heart_narrow_at_last_column() {
     );
 }
 
+/// A VS16 cell the live grid kept narrow stays narrow in mid row: the writer
+/// had no room to widen it at the last column, and the screen's rewrap moved
+/// it off the edge as it was. The stored `WIDE` bit, clear here, decides, so
+/// the `Z` after it is drawn at the column its stored link names.
+#[test]
+fn materialize_keeps_a_vs16_cell_stored_narrow_narrow_in_mid_row() {
+    use crate::grid::scroll_materialize::materialize_from_line;
+
+    let link: std::sync::Arc<str> = std::sync::Arc::from("https://e.x/");
+    let spans = vec![aterm_scrollback::HyperlinkSpan::new(3, 4, link)];
+    let attrs: Rle<CellAttrs> = [CellAttrs::DEFAULT; 5].into_iter().collect();
+    let line = Line::with_hyperlinks("A\u{2764}\u{FE0F}BZ", attrs, spans);
+    let row = materialize_from_line(&line, 10);
+
+    assert!(
+        !row.cells[1].is_wide(),
+        "the heart stays NARROW, as it was live"
+    );
+    assert_eq!(row.cells[2].char(), 'B', "B stays at col 2 as it was live");
+    assert_eq!(row.cells[3].char(), 'Z', "Z stays at col 3 as it was live");
+    let linked = |col: u16| row.get_extra(col).is_some_and(|e| e.hyperlink().is_some());
+    assert!(linked(3), "Z keeps its link");
+    assert!(!linked(2) && !linked(4), "no other cell takes it");
+}
+
 /// VS15 presentation width survives materialization: a scrolled-back `⌚︎Z`
 /// keeps the watch NARROW (the live VS15 narrowing), so `Z` stays at column 1.
 #[test]
@@ -476,8 +508,13 @@ fn materialize_keeps_unfolded_skin_tone_split() {
     assert!(row.cells[2].is_wide_continuation());
     assert_eq!(row.cells[3].char(), 'Z', "Z stays at col 3 as it was live");
 
-    // And the VS16-widened variant folds into one wide cell, Z at col 2.
-    let attrs: Rle<CellAttrs> = [CellAttrs::DEFAULT; 4].into_iter().collect();
+    // And the VS16-widened variant folds into one wide cell, Z at col 2. The
+    // live widening set the cell's `WIDE` bit, kept on the unit's three chars.
+    let wide = CellAttrs {
+        flags: CellFlags::WIDE.bits(),
+        ..CellAttrs::DEFAULT
+    };
+    let attrs: Rle<CellAttrs> = [wide, wide, wide, CellAttrs::DEFAULT].into_iter().collect();
     let line = Line::with_attrs("\u{261D}\u{FE0F}\u{1F3FD}Z", attrs);
     let row = materialize_from_line(&line, 10);
     assert!(

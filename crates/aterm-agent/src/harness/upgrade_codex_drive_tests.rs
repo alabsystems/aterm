@@ -693,6 +693,7 @@ impl Rig {
             // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
             ask: true,
             several_logins: false,
+            instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
         };
         let lock = embedded.then(|| {
             codex
@@ -1546,6 +1547,7 @@ fn daemon_home(name: &str, last: &str, age_s: u64) -> (ScratchDir, Opts, DaemonS
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     };
     let script = DaemonScript {
         home: home.clone(),
@@ -1732,6 +1734,7 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     };
     let tabs = [LiveTab {
         sid: TAB.to_string(),
@@ -1837,6 +1840,7 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     };
     let k = Found2 {
         exe: root.join("bin/codex"),
@@ -4381,6 +4385,7 @@ fn crashed_snap(
         dialect: shell_dialect(SHELL, &rig.kernel, Vec::new),
         login: None,
         home: None,
+        claude_dir: None,
     }
 }
 
@@ -5090,6 +5095,7 @@ fn prune_opts(dir: &Path) -> Opts {
         aterm_state: None,
         ask: false,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     }
 }
 

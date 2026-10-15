@@ -77,17 +77,41 @@ impl GridStorage {
             .map(ScrollbackStorage::memory_budget)
     }
 
-    /// Whether evicted ring rows are staged for tiered retention (`scroll_up`'s
-    /// reuse path): a store is attached that retains at least one line, or the
+    /// Whether an attached tiered store keeps any line. `false` with no store,
+    /// and with a store whose share of the total is zero: a total limit at or
+    /// below the ring cap re-caps the ring to the total and leaves the store
+    /// nothing (`Grid::set_scrollback_line_limit`). The ring is then the whole
+    /// retention, exactly as on a ring-only grid of that cap.
+    ///
+    /// Every site that gives history a seat asks it: the reflow restore
+    /// (`Grid::restore_reflowed_scrollback`) and the offload re-attach
+    /// (`Grid::reattach_ring_history`) take the ring route when it is `false`,
+    /// and every site where the ring sheds a row asks it through
+    /// [`stages_evicted_rows`](Self::stages_evicted_rows).
+    #[must_use]
+    #[inline]
+    pub(crate) fn store_retains_lines(&self) -> bool {
+        self.scrollback
+            .as_ref()
+            .is_some_and(|sb| sb.line_limit() != Some(0))
+    }
+
+    /// Whether a row leaving the ring is staged in the lazy buffer rather than
+    /// dropped: a store is attached that retains at least one line, or the
     /// store is detached for reflow (staged lines flush on re-attach). With a
-    /// zero-capacity store, rows are discarded directly, as without a store.
+    /// zero-share store, rows are discarded directly, as without a store.
+    ///
+    /// Every site where the ring sheds a row asks this one question: a line
+    /// staged with no store to keep it outlives the newer ring rows that later
+    /// scrolls drop, leaving a hole in the middle of history. Inside a detach
+    /// window (no store attached) the answer is `true` whatever the store's
+    /// share: the re-attach seats what was staged, in the ring when the
+    /// re-attached store keeps nothing.
     #[must_use]
     #[inline]
     pub(crate) fn stages_evicted_rows(&self) -> bool {
-        match &self.scrollback {
-            Some(sb) => sb.line_limit() != Some(0),
-            None => self.scrollback_detached_for_reflow,
-        }
+        self.store_retains_lines()
+            || (self.scrollback.is_none() && self.scrollback_detached_for_reflow)
     }
 
     /// Ring buffer scrollback count (total_lines minus visible).

@@ -43,13 +43,60 @@ use aterm_time::Instant;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WatchId(pub u64);
 
+/// What one scan of one row established. A matcher that could not finish
+/// reading a row (a bounded engine whose scan budget ran out) has learned
+/// nothing about it, and says so rather than guessing either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowVerdict {
+    /// The row matches.
+    Match,
+    /// The row was read to its end and does not match.
+    NoMatch,
+    /// The scan stopped before it could decide: evidence not gathered.
+    Undecided,
+}
+
+impl From<bool> for RowVerdict {
+    /// The verdict of a matcher that always finishes.
+    fn from(matched: bool) -> Self {
+        if matched {
+            RowVerdict::Match
+        } else {
+            RowVerdict::NoMatch
+        }
+    }
+}
+
 /// An opaque, pre-compiled row matcher. The regex implementation lives in
 /// `aterm-observe`; the core evaluates matches but cannot construct one, and
 /// takes no direct `regex` dependency (checked by
 /// `regex_is_not_in_aterm_core_production_deps`).
+///
+/// # Two questions, and an undecided row answers no to both (ruling 2026-10-10)
+///
+/// A predicate waiting for a row to APPEAR asks [`matches`](Self::matches). A
+/// predicate waiting for a row to LEAVE asks [`clears`](Self::clears). An
+/// [`Undecided`](RowVerdict::Undecided) row is neither, so both kinds of wait
+/// keep waiting until a later scan decides it. The matcher used to answer a
+/// bare `bool`, which made "the scan ran out" read as "no match": that is
+/// fail-closed for `await match` and `key if=`, but fail-OPEN for anything that
+/// latches on the absence of a match (`await gone`, `turn … settle=gone:`, the
+/// supervisor's busy-row test). `gone` then latched while the row was still on
+/// the screen. `clears` is the only spelling of absence; `!matches(row)` is not
+/// absence.
 pub trait RowMatch: Send + Sync + std::fmt::Debug {
-    /// Does `row` (one visible row's text) satisfy this matcher?
-    fn matches(&self, row: &str) -> bool;
+    /// What scanning `row` (one visible row's text) established.
+    fn verdict(&self, row: &str) -> RowVerdict;
+
+    /// The scan SHOWED that `row` matches. An undecided row does not.
+    fn matches(&self, row: &str) -> bool {
+        self.verdict(row) == RowVerdict::Match
+    }
+
+    /// The scan SHOWED that `row` does not match. An undecided row does not.
+    fn clears(&self, row: &str) -> bool {
+        self.verdict(row) == RowVerdict::NoMatch
+    }
 }
 
 /// An inclusive range of **visible** row indices to match against, or every
@@ -213,13 +260,23 @@ pub fn first_matching_row(
         .find(|&i| range.contains(i) && source.row_text(i).is_some_and(|t| matcher.matches(&t)))
 }
 
-/// Whether any pre-collected visible row in `range` satisfies `matcher`: the
-/// scan both row predicates share (`RowMatches` latches on `true`, `RowsClear`
-/// on `false`). Stops at the first hit.
+/// Whether any pre-collected visible row in `range` is shown to match
+/// `matcher`: the `RowMatches` scan. Stops at the first hit.
 #[must_use]
 fn any_row_matches(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
     rows.iter().enumerate().any(|(idx, cell)| {
         range.contains(idx) && cell.as_deref().is_some_and(|t| matcher.matches(t))
+    })
+}
+
+/// Whether every pre-collected visible row in `range` is shown NOT to match
+/// `matcher`: the `RowsClear` scan. A row the matcher could not decide keeps
+/// the range from reading clear (see [`RowMatch`]); a row with no text has
+/// nothing to match. Stops at the first row that is not clear.
+#[must_use]
+fn every_row_clear(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
+    rows.iter().enumerate().all(|(idx, cell)| {
+        !range.contains(idx) || cell.as_deref().is_none_or(|t| matcher.clears(t))
     })
 }
 
@@ -517,13 +574,14 @@ impl WatcherSet {
                     matcher,
                     rows: range,
                 } => {
-                    // Inverse verdict: latch when the scan finds no matching row.
-                    // Only on a batch the caller collected rows for, and only when
-                    // the range meets at least one collected row: scanning nothing
-                    // is not evidence of a clear surface.
+                    // Inverse verdict: latch when every row in range is shown
+                    // not to match. Only on a batch the caller collected rows for,
+                    // and only when the range meets at least one collected row:
+                    // scanning nothing is not evidence of a clear surface, and
+                    // neither is a row the matcher could not decide.
                     if (advanced || w.fresh)
                         && range.covers_any(rows.len())
-                        && !any_row_matches(rows, &**matcher, *range)
+                        && every_row_clear(rows, &**matcher, *range)
                     {
                         new_latch = Some(Satisfaction {
                             seq: content_seq,
@@ -767,8 +825,8 @@ mod tests {
         #[derive(Debug)]
         struct Never;
         impl RowMatch for Never {
-            fn matches(&self, _: &str) -> bool {
-                false
+            fn verdict(&self, _: &str) -> RowVerdict {
+                RowVerdict::NoMatch
             }
         }
         // Both row predicates: "a row matches now" and "no row matches now" are
@@ -1045,8 +1103,8 @@ mod tests {
         #[derive(Debug)]
         struct Contains(&'static str);
         impl RowMatch for Contains {
-            fn matches(&self, row: &str) -> bool {
-                row.contains(self.0)
+            fn verdict(&self, row: &str) -> RowVerdict {
+                row.contains(self.0).into()
             }
         }
         let base = t0();
@@ -1081,8 +1139,8 @@ mod tests {
         #[derive(Debug)]
         struct Contains(&'static str);
         impl RowMatch for Contains {
-            fn matches(&self, row: &str) -> bool {
-                row.contains(self.0)
+            fn verdict(&self, row: &str) -> RowVerdict {
+                row.contains(self.0).into()
             }
         }
         let base = t0();
@@ -1113,8 +1171,8 @@ mod tests {
     #[derive(Debug)]
     struct Busy;
     impl RowMatch for Busy {
-        fn matches(&self, row: &str) -> bool {
-            row.contains("esc to interrupt")
+        fn verdict(&self, row: &str) -> RowVerdict {
+            row.contains("esc to interrupt").into()
         }
     }
 
@@ -1256,6 +1314,61 @@ mod tests {
         assert!(!RowRange::All.covers_any(0));
     }
 
+    /// A row the matcher could not decide (a bounded engine out of budget) is
+    /// evidence NOT gathered: it neither fires `RowMatches` nor lets `RowsClear`
+    /// latch, and both answer as soon as a later scan decides the row (ruling
+    /// 2026-10-10). Before the verdict was tri-state, "undecided" read as "no
+    /// match", so `RowsClear` latched while the row was still on screen.
+    #[test]
+    fn an_undecided_row_holds_both_row_predicates_pending() {
+        /// Decides a row only when it is short: a stand-in for a scan budget.
+        #[derive(Debug)]
+        struct Budgeted;
+        impl RowMatch for Budgeted {
+            fn verdict(&self, row: &str) -> RowVerdict {
+                if row.len() > 16 {
+                    RowVerdict::Undecided
+                } else {
+                    row.contains("busy").into()
+                }
+            }
+        }
+        let base = t0();
+        let mut w = WatcherSet::default();
+        let busy = || Arc::new(Budgeted) as Arc<dyn RowMatch>;
+        let shown = w
+            .arm(
+                WatcherSpec::RowMatches {
+                    matcher: busy(),
+                    rows: RowRange::All,
+                },
+                base,
+            )
+            .unwrap();
+        let gone = w
+            .arm(
+                WatcherSpec::RowsClear {
+                    matcher: busy(),
+                    rows: RowRange::All,
+                },
+                base,
+            )
+            .unwrap();
+        let heavy = [Some("done".to_string()), Some(format!("{:>40}", "busy"))];
+        w.observe(1, false, base, &heavy);
+        assert!(w.poll(shown).is_none(), "undecided is not a match");
+        assert!(w.poll(gone).is_none(), "undecided is not clear");
+        // The same row, now short enough to read: it matches.
+        let light = [Some("done".to_string()), Some("busy".to_string())];
+        w.observe(2, false, base, &light);
+        assert_eq!(w.poll(shown).unwrap().seq, 2);
+        assert!(w.poll(gone).is_none(), "a decided match holds `gone`");
+        // It leaves: decided clear on every row, so `gone` latches.
+        let clear = [Some("done".to_string()), Some("❯ ".to_string())];
+        w.observe(3, false, base, &clear);
+        assert_eq!(w.poll(gone).unwrap().seq, 3);
+    }
+
     #[test]
     fn arm_is_bounded_and_fails_closed() {
         let base = t0();
@@ -1301,8 +1414,8 @@ mod tests {
         #[derive(Debug)]
         struct Contains(&'static str);
         impl RowMatch for Contains {
-            fn matches(&self, row: &str) -> bool {
-                row.contains(self.0)
+            fn verdict(&self, row: &str) -> RowVerdict {
+                row.contains(self.0).into()
             }
         }
         let remote = RemoteSurface {
@@ -1329,8 +1442,8 @@ mod tests {
         #[derive(Debug)]
         struct Contains(&'static str);
         impl RowMatch for Contains {
-            fn matches(&self, row: &str) -> bool {
-                row.contains(self.0)
+            fn verdict(&self, row: &str) -> RowVerdict {
+                row.contains(self.0).into()
             }
         }
 

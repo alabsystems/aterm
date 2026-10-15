@@ -218,6 +218,7 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
             // are (`Row::quiet`): `[harness] upgrade_ask` as parsed.
             ask: crate::harness_host::upgrade_ask(),
             several_logins: crate::harness_host::several_logins(),
+            instances: upgrade_drive::Instances::Machine,
         };
         upgrade_drive::ask_for(&opts, &ask.tab, ask.ask(), &ask.to)
     })

@@ -482,7 +482,8 @@ pub struct HostStep {
 /// agent's own background work ([`Session::host_steps_in_background`]), in
 /// order; `NotIdle`, `NotAuthoritative`, `Prompt`, `ActInFlight` and again
 /// `Wall` and `LimitEpisode` are those of an idle point
-/// ([`Session::host_steps_here`]). Reporting only.
+/// ([`Session::host_steps_here`]); `SwitchOpen` and `WakeSettle` are both's,
+/// asked last. Reporting only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guard {
     /// A break is offered only on a busy read.
@@ -516,11 +517,16 @@ pub enum Guard {
     /// closes, and no upgrade notice is typed into its wind-down or hold
     /// ([`crate::supervise::policy::turn_end::TurnEndState::switch_open`]).
     SwitchOpen,
+    /// The Mac woke less than its settle ago (30 s and the session's share
+    /// of 60 s, [`Session::settling`]): the network may not be back, and a
+    /// turn the host types now — the upgrade's notice, a carry-on — would
+    /// meet an API it cannot reach. Offered once the settle has passed.
+    WakeSettle,
 }
 
 impl Guard {
     /// Every guard, in the order [`Self::code`] numbers them.
-    pub const ALL: [Guard; 12] = [
+    pub const ALL: [Guard; 13] = [
         Guard::NotBusy,
         Guard::NoBackgroundWait,
         Guard::Wall,
@@ -533,6 +539,7 @@ impl Guard {
         Guard::NotAuthoritative,
         Guard::Prompt,
         Guard::SwitchOpen,
+        Guard::WakeSettle,
     ];
 
     /// The word the upgrade's record and `--status` carry (`guard=`).
@@ -551,10 +558,11 @@ impl Guard {
             Guard::NotAuthoritative => "not-authoritative",
             Guard::Prompt => "prompt",
             Guard::SwitchOpen => "switch-open",
+            Guard::WakeSettle => "wake-settle",
         }
     }
 
-    /// A small number for an atomic (`1..=12`; `0` is left for none), and
+    /// A small number for an atomic (`1..=13`; `0` is left for none), and
     /// back ([`Self::from_code`]).
     #[must_use]
     pub fn code(self) -> u8 {
@@ -600,11 +608,11 @@ struct ToldWait {
 /// to come ([`Session::due_at`]). Awake, they agree. A Mac's sleep stops the
 /// `Instant` (`CLOCK_UPTIME_RAW` does not count it) and never the wall
 /// clock: a wait set for a weekly reset ends at the reset however long the
-/// Mac slept, whether or not the wait saw it sleep ([`Session::check_slept`]
-/// starts its marks afresh at a new seq, and a repaint at the wake is one).
-/// The audit of 2026-10-09 found three tabs left 11.6-14.1 h past a weekly
-/// reset their `Instant` waits had slept through. A wall clock stepped back
-/// delays the wall time and never the `Instant`.
+/// Mac slept. The audit of 2026-10-09 found three tabs left 11.6-14.1 h past
+/// a weekly reset their `Instant` waits had slept through. A wall clock
+/// stepped back delays the wall time and never the `Instant`. (A due the
+/// sleep carried past is moved to the wake's settle once the session's watch
+/// has seen the sleep, [`Session::woke`]; the wake's settle is a `Due` too.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Due {
     /// The deadline as the `Instant` it was set as.
@@ -624,8 +632,8 @@ const ACCOUNT_NEWS_EVERY: Duration = Duration::from_secs(60);
 /// How far the wall second of a wait's deadline ([`Due::unix_ms`]) may move
 /// from the second it was told as before it is told again
 /// ([`Session::tell_wait`]). The same `Instant` set again after a sleep
-/// names a later wall second (the policy's own pauses are `Instant`s, which
-/// a sleep stops), and that is news; the same `Instant` set again awake moves
+/// names a later wall second (a sleep stops an `Instant`), and that is
+/// news; the same `Instant` set again awake moves
 /// it by the milliseconds between the two clocks' reads, which rounding can
 /// turn into a second, and that is none.
 const WAIT_SKEW_S: u64 = 2;
@@ -1501,6 +1509,12 @@ const MAX_CHANGED_PRESSES: u32 = 5;
 /// The first back-off after `ERR busy …` / `ERR rate`, and the longest.
 const REFUSAL_PAUSE: Duration = Duration::from_millis(250);
 const REFUSAL_PAUSE_MAX: Duration = Duration::from_secs(8);
+/// A refusal not met for this long is NEWS when it comes back
+/// ([`Session::refusal_news`]): one that persists is met at every retry,
+/// seconds apart (the back-off is [`REFUSAL_PAUSE_MAX`] at most, the act
+/// decided again a moment later); one met again after a wait of minutes —
+/// a wall's reset, a back-off's rung — is a new appearance.
+const REFUSAL_QUIET: Duration = Duration::from_secs(10 * 60);
 
 /// How long an outage is ridden out before it ends the loop, unless
 /// `--reconnect-s` says otherwise.
@@ -1567,7 +1581,8 @@ fn box_anchor(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
 }
 
 /// A compiled busy guard's row test ([`Session::busy_up`]): the server's own
-/// `aterm_observe::row_matcher`, whose trait this crate cannot name.
+/// `aterm_observe::row_matcher`, whose trait this crate cannot name. True
+/// while the row is not shown clear of the guard.
 type BusyMatch = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// One wait on the program's busy row leaving (`await gone <guard>`): the
@@ -2616,14 +2631,24 @@ pub struct Session<'a, C: Ctl> {
     /// (its `WaitUntil`), and why — the deadline of the loop's wait for the
     /// screen to move ([`Self::wait_for_next`]), on both clocks ([`Due`]).
     turn_end_due: Option<Due>,
-    /// The two clocks as the last step of the wait left them, and the point
-    /// (its screen's `seq`) they were taken at: the marks of the Mac-slept
-    /// check ([`Self::check_slept`]). They are the POINT's, not one call of
-    /// [`Self::wait_for_next`]'s: a wait that ends on an owed look or a host
-    /// wake and is entered again on the same point still sees the sleep that
-    /// went by between the calls. A new seq starts them afresh. A sleep they
-    /// miss so delays no deadline ([`Due`]); it costs only the wake's settle.
-    clock_marks: Option<(u64, Instant, i64)>,
+    /// The two clocks as the loop last read them — the monotonic one, and the
+    /// wall clock in unix milliseconds: the marks of its sleep watch
+    /// ([`Self::watch_sleep`]). The SESSION's, read after every request and
+    /// at each step of a wait, whatever point shows: a repaint at the wake (a
+    /// new seq) or an edge that decides first sees the sleep all the same.
+    clock_marks: Option<(Instant, i64)>,
+    /// A sleep the watch measured whose wake [`Self::woke`] has not yet
+    /// looked at for a due the sleep carried past ([`Self::check_slept`]): the
+    /// wall clock when it was measured, unix seconds.
+    slept_at: Option<i64>,
+    /// THE WAKE'S SETTLE, placed by the watch where it measured the sleep
+    /// ([`Self::settle_wake`]): until it falls no turn is typed into the agent
+    /// — no act of the turn-end policy's ([`Self::turn_end_execute`]), no step
+    /// of the host's ([`Guard::WakeSettle`]), no accounts probe
+    /// ([`ProbeGate::WakeSettle`]) — and a point the policy acted on is
+    /// decided again then; and whether its `WAITING … the Mac woke` has been
+    /// said.
+    wake_settle: Option<(Due, bool)>,
     /// A restart the host could not make yet, in a row
     /// ([`Self::restart_agent`]): each next try waits longer.
     restart_waits: u32,
@@ -2686,9 +2711,10 @@ pub struct Session<'a, C: Ctl> {
     /// back ([`turn_end_loop::REPRINT_JUMPS_MAX`]).
     reprint_jumps: u32,
     /// The act of the loop's a wall was last read to have ANSWERED (its
-    /// instant, [`TurnEndState::untaken_act`]): that read placed the wall's
-    /// reset on the print, once an act.
-    wall_answered: Option<Instant>,
+    /// instant, [`TurnEndState::untaken_act`]), and the wall's words at that
+    /// read (`turn_end_loop::reset_key`): that read placed the wall's reset on
+    /// the print, once an act and its words.
+    wall_answered: Option<(Instant, String)>,
     /// The wall the loop waits on, kept while the screen
     /// shows only the agent's own background work ([`wall_memory`]).
     wall_memory: Option<wall_memory::WallMemory>,
@@ -2697,6 +2723,20 @@ pub struct Session<'a, C: Ctl> {
     /// at), and the refusal last journaled.
     wall_verdict: Option<wall_confirm::Verdict>,
     wall_refused_said: Option<String>,
+    /// The LIMIT A CANCEL LEFT that the last decision's read took for the
+    /// answer to a turn ([`TurnEndState::left_answer`]), by the screen it was
+    /// read at, and whether a transcript row dated it: what that screen's
+    /// reading and its point read as ([`Self::point_as_decided`]) for the
+    /// loop's books after the decision, and where its reset is placed
+    /// ([`Self::wall_reset_at`]).
+    left_read: Option<wall_confirm::LeftRead>,
+    /// The id (`uuid`) of the transcript row that confirmed the screen's
+    /// usage limit at the last decision's read of a wall: the limit's own
+    /// notice, which a reply must follow for the transcript to say a turn was
+    /// served since it ([`wall_confirm`]'s `served_since_notice`). `None`
+    /// where the last wall read was no limit, or was not confirmed by a
+    /// transcript (none to read, or refused).
+    limit_notice_row: Option<String>,
     /// What the approval policy takes from the supervisor's own process
     /// (the owner's home, uid and `$TMPDIR`; fixed in tests).
     approval_env: ApprovalEnv,
@@ -2763,6 +2803,13 @@ pub struct Session<'a, C: Ctl> {
     /// The back-off after `ERR busy …`/`ERR rate`: doubles to
     /// [`REFUSAL_PAUSE_MAX`], reset by a press the server takes.
     refusal_pause: Duration,
+    /// The refusal the journal last said, by its episode's key (`REFUSED
+    /// <why>`, `HALTED <why>`, its measures dropped), and when it was last
+    /// met: one that persists is retried and said once, again when it
+    /// changes ([`Self::refusal_news`]). Over at the first write the server
+    /// does not refuse ([`Self::call`]), at a hold seen lifted, and once it
+    /// has not been met for [`REFUSAL_QUIET`].
+    refusal_said: Option<(String, Instant)>,
     /// Set by the hosted loop's owner: the loop ends at its next look.
     stop: Option<Arc<AtomicBool>>,
     /// Set by the hosted loop's owner, BEFORE [`Self::stop`], when the stop
@@ -3155,6 +3202,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             turn_end: TurnEndState::default(),
             turn_end_due: None,
             clock_marks: None,
+            slept_at: None,
+            wake_settle: None,
             restart_waits: 0,
             look_at: None,
             survey_retry: SURVEY_RETRY,
@@ -3178,6 +3227,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             wall_memory: None,
             wall_verdict: None,
             wall_refused_said: None,
+            left_read: None,
+            limit_notice_row: None,
             approval_env: ApprovalEnv::of_process(),
             cwd: None,
             footer: None,
@@ -3197,6 +3248,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             tell_own: false,
             read_back: None,
             refusal_pause: REFUSAL_PAUSE,
+            refusal_said: None,
             stop: None,
             handover: None,
             adopted_limit: false,
@@ -3374,6 +3426,26 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.person_hold_wait = Some(wait);
     }
 
+    /// Tests: the wake's settle has passed — it, and the due the Mac's wake
+    /// placed at it ([`Self::woke`]), fall now — with none of it waited out
+    /// in real time.
+    #[cfg(test)]
+    pub(crate) fn pass_wake_settle(&mut self) {
+        let now = Instant::now();
+        let unix_ms = self.unix_ms_of(now);
+        if let Some((settle, _)) = &mut self.wake_settle {
+            settle.at = now;
+            settle.unix_ms = unix_ms;
+        }
+        if self
+            .turn_end_due
+            .as_ref()
+            .is_some_and(|d| d.why == turn_end_loop::WOKE)
+        {
+            self.set_due(now, turn_end_loop::WOKE);
+        }
+    }
+
     /// Tests: a zone table in place of `date`.
     #[cfg(test)]
     pub(crate) fn set_zone_lookup(&mut self, lookup: fn(&str, i64) -> Option<i64>) {
@@ -3524,8 +3596,17 @@ impl<'a, C: Ctl> Session<'a, C> {
             full.push(sid.as_str());
         }
         full.extend_from_slice(args);
-        let r = self.ctl.call(&full).map_err(Fail::Hard)?;
+        let r = self.ctl.call(&full);
+        // A request the Mac slept through: the watch sees it before anything
+        // the answer leads to is decided or stamped.
+        self.watch_sleep();
+        let r = r.map_err(Fail::Hard)?;
         self.note_status(args, &r);
+        // A write the server did not refuse ends the refusal the journal
+        // last said: the next one is news.
+        if claim::is_input(args) && !(r.is_err("halted") || r.is_err("busy") || r.is_err("rate")) {
+            self.refusal_said = None;
+        }
         // A press the server WROTE behind input the worker has not read (a
         // slow read, warned rather than refused): the next look reads
         // `status` before it presses again, as after a refusal
@@ -3604,11 +3685,16 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// row above it is another process's, and would hold a wait armed on it.
     /// The guard is compiled once while it stays the same
     /// ([`Self::busy_match`]); one that does not compile matches nothing.
+    ///
+    /// "Up" is "not shown gone": a row the guard's scan could not decide (its
+    /// budget ran out) counts as up, the same reading `await gone` gives it, so
+    /// the turn is never let go on a busy row nobody read (ruling 2026-10-10 on
+    /// `RowMatch::clears`).
     fn busy_up(&mut self, guard: &str, rows: &[String]) -> bool {
         if self.busy_match.as_ref().is_none_or(|(g, _)| g != guard) {
             self.busy_match = aterm_observe::row_matcher(guard).ok().map(|m| {
-                let matches: BusyMatch = Box::new(move |r: &str| m.matches(r));
-                (guard.to_string(), matches)
+                let up: BusyMatch = Box::new(move |r: &str| !m.clears(r));
+                (guard.to_string(), up)
             });
         }
         self.busy_match
@@ -5160,9 +5246,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 TurnEndAction::Nothing
             };
-            // A limit whose wall the transcript refused is an idle point
-            // ([`Self::refused_limit`]): no episode, no limit's escalation.
-            self.refused_limit(&mut point);
+            // A limit whose wall the transcript refused is an idle point, and
+            // a limit a cancel left that answered a turn is a limit point
+            // ([`Self::point_as_decided`]): its episode, its escalation.
+            self.point_as_decided(&mut point);
             // `--mail`: an idle point waits for the worker's report of this
             // turn first; a folded one reads no report from the screen (the
             // mail IS what was said).
@@ -6184,8 +6271,9 @@ impl<C: Ctl> Session<'_, C> {
     /// transcript ([`Self::transcript_day`]): where it names that same clock
     /// time on an earlier day, that is the reset.
     ///
-    /// `answered`: the wall stands where an act of the loop's went untaken
-    /// past its window ([`TurnEndState::untaken_act`]) — it answered that act,
+    /// `answered`: the wall stands where an act of the loop's went untaken,
+    /// inside its take window or past it ([`TurnEndState::untaken_act`]) — it
+    /// answered that act,
     /// so the limit stood at this read and the print is no earlier than
     /// [`PRINT_LAG_S`] ago, whatever done row stands above the composer: a
     /// long turn's row of hours before still stands when the act drew none of
@@ -6439,16 +6527,12 @@ impl<C: Ctl> Session<'_, C> {
         // A Mac that slept through the wait. `Instant` does not count sleep
         // and the wall clock does: the policy's deadline falls at its wall
         // time all the same ([`Self::due_at`]), and when the wall clock has
-        // run ahead of the monotonic one by more than a minute between two
-        // steps, a deadline the sleep carried past is decided again after the
-        // wake's settle, the sessions of one account spread
-        // ([`Self::woke`]).
-        if self
-            .clock_marks
-            .is_none_or(|(at, _, _)| at != seen.screen.seq)
-        {
-            self.clock_marks = Some((seen.screen.seq, Instant::now(), self.now_unix()));
-        }
+        // run ahead of the monotonic one by more than a minute — between two
+        // reads of the session's watch, whatever point shows — a deadline the
+        // sleep carried past is decided again after the wake's settle, the
+        // sessions of one account spread ([`Self::check_slept`],
+        // [`Self::woke`]). The clocks are read on entering the wait too.
+        self.watch_sleep();
         // The review key of `seen`, built at most once for the whole wait
         // ([`Self::agent_wake`]).
         let mut seen_key: Option<String> = None;
@@ -6528,6 +6612,11 @@ impl<C: Ctl> Session<'_, C> {
                 .and_then(|h| h.wants_at())
                 .filter(|at| *at > now)
                 .map_or(step_cap, |at| step_cap.min(at - now));
+            // …and so does the wake's settle falling: what it withheld (the
+            // host's point) is offered at the top again.
+            let step_cap = self.settling().map_or(step_cap, |at| {
+                step_cap.min(at.saturating_duration_since(now))
+            });
             if now < until {
                 let step = until.saturating_duration_since(now).min(step_cap);
                 if let Some(anchor) = anchor.as_deref()
@@ -6636,18 +6725,51 @@ impl<C: Ctl> Session<'_, C> {
         host.waiting(plan);
     }
 
-    /// One step's look at the clocks ([`Self::wait_for_next`]): the marks
-    /// ([`Self::clock_marks`]) are the monotonic and the wall clock as the last
-    /// step left them. When the wall clock has run ahead of the monotonic one
-    /// by more than a minute ([`slept_through`]) the Mac slept, and the wait is
-    /// decided again ([`Self::woke`]). The marks move to now either way.
+    /// THE SESSION'S SLEEP WATCH: the two clocks read against the marks the
+    /// last read left ([`Self::clock_marks`]). When the wall clock has run
+    /// ahead of the monotonic one by more than a minute ([`slept_through`])
+    /// the Mac slept that long, and the sleep is the session's AT ONCE: the
+    /// policy's pauses and kept resets move by it ([`TurnEndState::slept`])
+    /// before anything is stamped on the wake's side of it, and the wake's
+    /// settle is placed from THIS read ([`Self::settle_wake`]) — whatever
+    /// reaches the loop first after it, nothing typed into the agent goes
+    /// before the settle falls ([`Self::settling`]). A due the sleep carried
+    /// past is moved to the settle at the next place that can say so
+    /// ([`Self::check_slept`]). Read after every request ([`Self::call`]: a
+    /// sleep spans one, whatever answers it — a busy turn's reads among
+    /// them), at each step of a wait, and where a decision takes its `now`.
+    /// The marks move to now either way. A clock stepped BACK is no sleep.
+    fn watch_sleep(&mut self) {
+        let (mono_now, wall_now) = (Instant::now(), self.now_unix_ms());
+        let Some((mono_then, wall_then)) = self.clock_marks.replace((mono_now, wall_now)) else {
+            return;
+        };
+        let mono_ms =
+            i64::try_from(mono_now.duration_since(mono_then).as_millis()).unwrap_or(i64::MAX);
+        let wall_ms = wall_now.saturating_sub(wall_then);
+        if !slept_through(wall_ms.div_euclid(1000), mono_ms.div_euclid(1000)) {
+            return;
+        }
+        let by = u64::try_from(wall_ms.saturating_sub(mono_ms)).unwrap_or(0);
+        self.turn_end.slept(Duration::from_millis(by));
+        let woke_at = wall_now.div_euclid(1000);
+        self.settle_wake(woke_at, mono_now);
+        self.slept_at = Some(woke_at);
+    }
+
+    /// The turn-end policy's `now` for a decision: read after the watch
+    /// ([`Self::watch_sleep`]), so a sleep is the policy's before the decision
+    /// stamps anything on the wake's side of it.
+    fn policy_now(&mut self) -> Instant {
+        self.watch_sleep();
+        Instant::now()
+    }
+
+    /// The watch read ([`Self::watch_sleep`]), and a wake it measured handed
+    /// to [`Self::woke`]: at each step of a wait, before its deadline is read.
     fn check_slept(&mut self, seq: u64, review: &mut dyn Review) {
-        let (mono_now, wall_now) = (Instant::now(), self.now_unix());
-        let (_, mono_then, wall_then) = self.clock_marks.unwrap_or((seq, mono_now, wall_now));
-        let mono_s = i64::try_from(mono_now.duration_since(mono_then).as_secs()).unwrap_or(0);
-        let slept = slept_through(wall_now - wall_then, mono_s);
-        self.clock_marks = Some((seq, mono_now, wall_now));
-        if slept {
+        self.watch_sleep();
+        if let Some(wall_now) = self.slept_at.take() {
             self.woke(seq, wall_now, review);
         }
     }
@@ -6918,7 +7040,13 @@ impl<C: Ctl> Session<'_, C> {
     /// point's own), or `None` where that wait cannot stand for the content
     /// moving: a host without it; an act of the loop's own in flight (a
     /// `/model` answers idle to idle); a point neither idle nor a question; a
-    /// wall (its own deadline wakes it); the point the last such wait woke from,
+    /// wall (its own deadline wakes it), and a usage limit whose notice LEFT
+    /// the screen while the policy waits on the reset it named
+    /// ([`TurnEndState::waits_on_named_reset`]: Esc on the vendor's
+    /// countdown) — its deadline is the reset, hours or days off, and the
+    /// verdict is a sweep's, which a turn shorter than the sweep never moves
+    /// (a person's turn the stub answered at once, measured on 2.1.299: no
+    /// point read until the reset); the point the last such wait woke from,
     /// read again unchanged (the verdict and the reading disagree); a point
     /// the loop's reader does not vouch for
     /// ([`aterm_phase::Reading::phase_authoritative`]), e.g. read before the
@@ -6941,7 +7069,10 @@ impl<C: Ctl> Session<'_, C> {
     /// `seen_key` is the review key of `seen`, built on first need and kept
     /// by the caller for the rest of its wait.
     fn agent_wake(&self, seen: &Turn, seen_key: &mut Option<String>) -> Option<&'static str> {
-        if self.caps.await_agent != Some(true) || self.turn_end.act_in_flight() {
+        if self.caps.await_agent != Some(true)
+            || self.turn_end.act_in_flight()
+            || self.turn_end.waits_on_named_reset()
+        {
             return None;
         }
         if self.footer.is_none()
@@ -7043,6 +7174,10 @@ impl<C: Ctl> Session<'_, C> {
             // closes: no upgrade notice is typed into a wind-down or a hold,
             // as at an idle point ([`Self::host_steps_here`]).
             Some(Guard::SwitchOpen)
+        } else if self.settling().is_some() {
+            // Nor into the wake's settle: a busy read's request is what sees
+            // the sleep there ([`Self::call`]).
+            Some(Guard::WakeSettle)
         } else {
             None
         };
@@ -7121,6 +7256,11 @@ impl<C: Ctl> Session<'_, C> {
             // Codex's save-then-wait switch owns the session until it
             // closes: no upgrade notice is typed into a wind-down or a hold.
             Some(Guard::SwitchOpen)
+        } else if self.settling().is_some() {
+            // The Mac woke inside the settle: the step's turn would meet an
+            // API the network may not reach yet. The wait offers the point
+            // again when the settle falls ([`Self::wait_for_next`]).
+            Some(Guard::WakeSettle)
         } else {
             None
         };

@@ -1,0 +1,28 @@
+# claude-code 2.1.300 · MEASURED 2026-10-14, `aterm ctl text` of a private headless aterm (80x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the worker's own replies (the stub's reply file), after `ctl resize 50 80`: the four hard lines of the 34-column capture redrawn one to a row, then one paragraph opening with the usage limit's words and a ' · ' that Ink word-wraps over four rows at 80 columns (rows up to width - 2 cells); negative controls for the error row's three-row bound
+ ▐▛███▛█   Claude Code v2.1.300
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.n4gC/proj
+
+
+❯ status?
+
+⏺ Usage limit reached · pausing.
+  Done so far: parser, lexer, tests.
+  Next: the migration and the docs.
+  Will resume after the reset.
+
+✻ Sautéed for 0s · done 1:04 PM
+
+❯ what happened?
+
+⏺ Usage limit reached · the next step edits the files named
+  crates/aterm-agent/src/supervise/limit.rs and then
+  crates/aterm-agent/src/supervise/run.rs and also
+  crates/aterm-phase/src/wall.rs.
+
+✻ Brewed for 0s · done 1:04 PM
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

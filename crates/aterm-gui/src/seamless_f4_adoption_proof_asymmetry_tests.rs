@@ -58,6 +58,7 @@ fn realistic_layout() -> RestoreManifest {
                         questions: None,
                         identity: None,
                         agent: None,
+                        supervised: None,
                         held: false,
                     },
                 ))),
@@ -75,6 +76,7 @@ fn realistic_layout() -> RestoreManifest {
                         questions: None,
                         identity: None,
                         agent: None,
+                        supervised: None,
                         held: false,
                     },
                 ))),
@@ -479,6 +481,90 @@ fn a_partial_parser_crosses_the_meta_wire_inside_the_digest() {
         .into_checkpoint(cp.grid.clone(), None);
     assert!(old.parser_ground && old.parser.is_none());
     assert!(screen_digest_refs(vec![(0, &old)]).is_ok());
+}
+
+/// A DCS HEADER CROSSES THE META WIRE BOTH WAYS (round fifteen,
+/// R15-PARSER-P1; ruling 2026-10-10). A session parked inside `ESC P $` (a
+/// DECRQSS whose `qm ESC \` is still queued) carries the header as itself
+/// under the parser key's `exact`, beside the `DcsIgnore` a build before it
+/// wrote for every header: this build's child reads `exact`, the screen digest
+/// is a fixed point over it and covers it, and the adopted engine answers the
+/// query. The same meta as a build before the key reads it — its parser repr
+/// has no `exact`, and serde drops a key it does not know — is that build's
+/// own `DcsIgnore`, which its restore accepts and which swallows the string
+/// as it always did, so the payload never prints; an older producer's meta,
+/// which is exactly that, adopts here the same way.
+#[test]
+fn a_dcs_header_crosses_the_meta_wire_both_ways() {
+    let mut t = aterm_core::terminal::Terminal::new(24, 80);
+    t.process(b"$ query\r\n\x1bP$");
+    let (cp, rung, cause) = carry_for_wire(&t, 0, 0, &mut 0, WireCaps::current());
+    assert_eq!(rung, CarryRung::Full, "{cause:?}");
+    let meta = aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta");
+    let exact = r#","exact":{"state":"DcsIntermediate","intermediates":"24"}"#;
+    assert!(
+        meta.contains(&format!(r#""parser":{{"state":"DcsIgnore"{exact}}}"#)),
+        "{meta}"
+    );
+    let carry = |meta: String| ScreenCarry {
+        schema: ScreenCarry::SCHEMA,
+        meta,
+        grid_file: "unused".to_string(),
+        alt_grid_file: None,
+        repaint: false,
+    };
+    let adopt = |meta: &str| {
+        let rebuilt = parse_checkpoint_meta(&carry(meta.to_string()))
+            .expect("the child parses the meta")
+            .into_checkpoint(cp.grid.clone(), None);
+        let mut adopted = aterm_core::terminal::Terminal::new(24, 80);
+        adopted.restore_checkpoint(&rebuilt);
+        adopted.process(b"qm\x1b\\after");
+        (rebuilt, adopted)
+    };
+
+    let (rebuilt, mut adopted) = adopt(&meta);
+    assert_eq!(rebuilt.parser, cp.parser, "the header crosses intact");
+    let parent = screen_digest(&[(0, cp.clone())]).expect("parent digest");
+    assert_eq!(
+        parent,
+        screen_digest_refs(vec![(0, &rebuilt)]).expect("child digest"),
+        "the screen digest is a fixed point over the carry"
+    );
+    let mut other = cp.clone();
+    if let Some(parser) = other.parser.as_mut() {
+        parser.intermediates = vec![b'+'];
+    }
+    assert_ne!(
+        screen_digest(&[(0, other)]).expect("digest"),
+        parent,
+        "the header is inside the screen digest"
+    );
+    assert!(
+        adopted.take_response().is_some(),
+        "the adopted engine answers the query"
+    );
+    assert_eq!(
+        adopted.row_text(1).as_deref().map(str::trim_end),
+        Some("after")
+    );
+
+    let older = meta.replace(exact, "");
+    assert!(
+        older.contains(r#""parser":{"state":"DcsIgnore"}"#),
+        "{older}"
+    );
+    let (rebuilt, mut adopted) = adopt(&older);
+    assert_eq!(
+        rebuilt.parser.as_ref().map(|parser| parser.state.name()),
+        Some("DcsIgnore")
+    );
+    assert_eq!(adopted.take_response(), None, "the string is swallowed");
+    assert_eq!(
+        adopted.row_text(1).as_deref().map(str::trim_end),
+        Some("after"),
+        "and its payload never prints"
+    );
 }
 
 /// The engine's in-flight output state (round eight of the update audit,

@@ -17,6 +17,28 @@ impl Grid {
     // Character-level operations (within a single row)
     // -------------------------------------------------------------------------
 
+    /// Whether ICH/DCH shift the cursor row's cells only inside
+    /// `[cursor, right_bound)` (the bounded row ops) rather than through the
+    /// row's end: under a DECSLRM margin (`margined`), and wherever
+    /// `right_bound` stops short of the row, as on a DECDWL/DECDHL row, whose
+    /// line is its first half (`effective_cols_for_row`).
+    ///
+    /// The extras, the BCE ring and the orphan sweep already move by
+    /// `right_bound`; the cells must move with them. Ruling 2026-10-11 (r15 C2
+    /// review): on a double-width row the unbounded op shifted the hidden half
+    /// too while the extras stayed in the visible one, so DCH pulled a cell
+    /// out from under its mark and the mark became an orphan a later write
+    /// adopted. The line's cells now end where the line does: DCH brings
+    /// blanks in at its visible edge and ICH drops what it pushes past it, as
+    /// DECDWL, which blanks the hidden half so nothing reappears at DECSWL,
+    /// intends; what DECIC/DECDC (whole-row shifts, cells and extras alike)
+    /// put there stays put with its entries. A bounded shift recomputes `len`
+    /// from the row's content, as under a margin.
+    #[inline]
+    fn shift_is_bounded(&self, right_bound: u16, margined: bool) -> bool {
+        margined || right_bound < self.storage.cols
+    }
+
     /// Insert `count` blank characters at cursor position.
     ///
     /// Shifts existing characters right, discarding those that go past the edge.
@@ -35,10 +57,10 @@ impl Grid {
         // horizontal margins when DECLRMM is active.
         let right_bound = (margins.right.saturating_add(1)).min(effective_cols);
         let fill = self.storage.cursor_template;
-        let is_margined = !margins.is_full(self.storage.cols);
+        let bounded = self.shift_is_bounded(right_bound, !margins.is_full(self.storage.cols));
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if is_margined {
+            if bounded {
                 if let Some(row) = self.row_mut(cursor_row) {
                     row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 }
@@ -48,6 +70,14 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
+            // A pair the insert bisected or pushed off the bound loses its blanked
+            // halves' extras (the head left of the cursor, the continuation the
+            // shift carried right, the head shifted to the bound and the
+            // continuation past it).
+            self.drop_unclaimed_extras(
+                cursor_row,
+                cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
+            );
             // Fill BCE RGB in vacated cells at cursor position after shift.
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             // ICH shifts the row's tail right under any highlight, replacing
@@ -74,10 +104,10 @@ impl Grid {
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
         let margins = self.storage.horizontal_margins();
         let right_bound = (margins.right.saturating_add(1)).min(effective_cols);
-        let is_margined = !margins.is_full(self.storage.cols);
+        let bounded = self.shift_is_bounded(right_bound, !margins.is_full(self.storage.cols));
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
-            if is_margined {
+            if bounded {
                 if let Some(row) = self.row_mut(cursor_row) {
                     row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 }
@@ -87,6 +117,13 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
+            // A pair the delete bisected loses its blanked halves' extras (the head
+            // left of the cursor, the continuation shifted onto it, the
+            // continuation past the bound).
+            self.drop_unclaimed_extras(
+                cursor_row,
+                cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
+            );
             // Fill BCE RGB in vacated cells at end of line after shift.
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
             // DCH shifts the row's tail left under a live highlight; see
@@ -121,10 +158,11 @@ impl Grid {
             effective_cols
         };
         let fill = self.storage.cursor_template;
+        let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
             if let Some(row) = self.row_mut(cursor_row) {
-                if in_margins {
+                if bounded {
                     row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 } else {
                     row.insert_chars_fill(cursor_col, count, fill);
@@ -133,6 +171,14 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
+            // A pair the insert bisected or pushed off the bound loses its blanked
+            // halves' extras (the head left of the cursor, the continuation the
+            // shift carried right, the head shifted to the bound and the
+            // continuation past it).
+            self.drop_unclaimed_extras(
+                cursor_row,
+                cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
+            );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             // The margined ICH replaces content like the unmargined one; see
             // `insert_chars`.
@@ -165,10 +211,11 @@ impl Grid {
             effective_cols
         };
         let fill = self.storage.cursor_template;
+        let bounded = self.shift_is_bounded(right_bound, in_margins);
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
             if let Some(row) = self.row_mut(cursor_row) {
-                if in_margins {
+                if bounded {
                     row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
                 } else {
                     row.delete_chars_fill(cursor_col, count, fill);
@@ -177,6 +224,13 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
+            // A pair the delete bisected loses its blanked halves' extras (the head
+            // left of the cursor, the continuation shifted onto it, the
+            // continuation past the bound).
+            self.drop_unclaimed_extras(
+                cursor_row,
+                cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
+            );
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
             // The margined DCH replaces content like the unmargined one; see
             // `insert_chars`.
@@ -212,6 +266,11 @@ impl Grid {
             self.storage
                 .extras
                 .clear_range(cursor_row, cursor_col, cursor_col + count);
+            // The halves of a pair the erase bisected, outside its span.
+            self.drop_unclaimed_extras(
+                cursor_row,
+                cursor_col.saturating_sub(1)..(cursor_col + count).saturating_add(1),
+            );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             // ECH blanks cells in place like EL, so it gets the same one-row
             // selection damage; see `insert_chars`.
@@ -393,16 +452,12 @@ impl Grid {
                 }
             }
             if let Some(dst) = self.row_mut(dst_row) {
-                for (i, col) in (left_usize..=right_usize).enumerate() {
-                    if let Some(c) = dst.get_mut(row_u16(col)) {
-                        *c = buf[i];
-                    }
-                }
+                dst.overwrite_span(left_usize, &buf);
                 // Wide char fixup at rectangle boundaries. Whole-row rect copy:
                 // no per-cell authoritative signal, so keep the char==' ' spacer
                 // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes bypass len maintenance: blank source cells
+                // The span copy bypasses len maintenance: blank source cells
                 // copied over the dst tail leave len stale-high (phantom trailing
                 // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
@@ -451,6 +506,15 @@ impl Grid {
             cursor_row..cursor_row.saturating_add(n as u16),
             margins.left..margins.right.saturating_add(1),
         );
+
+        // The halves of pairs the rectangle's edges bisected, blanked by
+        // `fixup_wide_boundary`, drop their extras.
+        for row in cursor_row..=region.bottom {
+            self.drop_unclaimed_extras(
+                row,
+                margins.left.saturating_sub(1)..margins.right.saturating_add(2),
+            );
+        }
 
         // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
@@ -620,16 +684,12 @@ impl Grid {
                 }
             }
             if let Some(dst) = self.row_mut(dst_row) {
-                for (i, col) in (left_usize..=right_usize).enumerate() {
-                    if let Some(c) = dst.get_mut(row_u16(col)) {
-                        *c = buf[i];
-                    }
-                }
+                dst.overwrite_span(left_usize, &buf);
                 // Wide char fixup at rectangle boundaries. Whole-row rect copy:
                 // no per-cell authoritative signal, so keep the char==' ' spacer
                 // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes bypass len maintenance: blank source cells
+                // The span copy bypasses len maintenance: blank source cells
                 // copied over the dst tail leave len stale-high (phantom trailing
                 // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
@@ -680,6 +740,15 @@ impl Grid {
             self.fill_bce_rgb_rect(
                 vacated_start..region.bottom.saturating_add(1),
                 margins.left..margins.right.saturating_add(1),
+            );
+        }
+
+        // The halves of pairs the rectangle's edges bisected, blanked by
+        // `fixup_wide_boundary`, drop their extras.
+        for row in cursor_row..=region.bottom {
+            self.drop_unclaimed_extras(
+                row,
+                margins.left.saturating_sub(1)..margins.right.saturating_add(2),
             );
         }
 
@@ -751,6 +820,11 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, cursor_col, cursor_col + count);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                margins.left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
 
         // Confined to the scroll region: selections outside it survive.
@@ -815,6 +889,11 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                margins.left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
 
         // Confined to the scroll region: selections outside it survive.
@@ -859,6 +938,11 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                margins.left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
         // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
@@ -901,6 +985,11 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + count);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                margins.left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
         // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
@@ -948,6 +1037,11 @@ impl Grid {
                 .extras
                 .shift_cols_right(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + 1);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
 
         // Confined to the scroll region: selections outside it survive.
@@ -992,6 +1086,11 @@ impl Grid {
                 .extras
                 .shift_cols_left(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - 1, right_bound);
+            // The halves of pairs the shift or the edge fixup blanked.
+            self.drop_unclaimed_extras(
+                row_idx,
+                left.saturating_sub(1)..right_bound.saturating_add(1),
+            );
         }
 
         // Confined to the scroll region: selections outside it survive.

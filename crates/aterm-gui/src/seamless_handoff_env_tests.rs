@@ -45,7 +45,7 @@
 //! with a hint-folding replay as the caught negative control.
 //!
 //! Not driven, and waived by name in `handoff_env`: the warm prologue itself
-//! (it builds a GPU device — AGENTS.md rule 5), the window's reveal and
+//! (it builds a GPU device — AGENTS.md), the window's reveal and
 //! presents (a window, likewise), the relative shape's `chdir` (driven by
 //! `control_socket_identity`'s own suites) and Prove/Commit (bound by
 //! `NativeUpdateSeamlessHandoffOwnership`'s Tier-1).

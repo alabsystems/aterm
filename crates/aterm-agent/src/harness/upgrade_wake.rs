@@ -421,10 +421,11 @@ impl SidePoll {
 /// Wait at most `limit` for `pid` to exit: `true` once it has (at once when
 /// it already has — a zombie its parent has not reaped yet included), `false`
 /// when it still runs at the end. A push on macOS (`EVFILT_PROC`/`NOTE_EXIT`);
-/// elsewhere `kill(pid, 0)` every 250 ms.
+/// elsewhere `kill(pid, 0)` every 250 ms, a zombie read as exited where the
+/// kernel names one ([`zombie`]).
 #[must_use]
 pub fn wait_exit(pid: u32, limit: Duration) -> bool {
-    let gone = || !super::upgrade_drive::alive(pid);
+    let gone = || !super::upgrade_drive::alive(pid) || zombie(pid);
     #[cfg(target_os = "macos")]
     if let Ok(kq) = kqueue() {
         use std::os::fd::AsRawFd as _;
@@ -473,6 +474,34 @@ pub fn wait_exit(pid: u32, limit: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(250));
     }
     gone()
+}
+
+/// Whether `pid` has exited and waits for its parent to reap it, which
+/// `kill(pid, 0)` still finds (the review of the 2026-10-09 sweep fixes: a
+/// SIGTERMed agent its shell has not reaped yet read as running, and its
+/// exit was never stamped). Linux names it in `/proc/<pid>/stat`, the state
+/// after the command's closing parenthesis (`Z` zombie, `X` dead). macOS
+/// needs none (its exit watch counts a zombie as exited); elsewhere nothing
+/// can say, `false`.
+#[cfg(target_os = "linux")]
+fn zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_exited(&stat))
+}
+
+/// Whether one `/proc/<pid>/stat` line names a process that has exited: its
+/// state, the field after the command's LAST closing parenthesis (a command
+/// may hold one), is `Z` (a zombie) or `X` (dead).
+#[cfg(any(target_os = "linux", test))]
+fn stat_exited(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .is_some_and(|state| matches!(state, 'Z' | 'X'))
+}
+
+/// [`zombie`] where the kernel names none (see there).
+#[cfg(not(target_os = "linux"))]
+fn zombie(_pid: u32) -> bool {
+    false
 }
 
 /// A kqueue of our own, close-on-exec, the trigger's user event registered
@@ -734,6 +763,20 @@ fn watch(kq: &std::os::fd::OwnedFd, dir: &Path) -> std::io::Result<std::fs::File
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// A `/proc/<pid>/stat` line names an exited process by its state after
+    /// the command's LAST `)`: `Z` (a zombie its parent has not reaped) or
+    /// `X` (dead) — the Linux half of [`wait_exit`]'s read ([`zombie`]).
+    /// NEGATIVE CONTROLS: a sleeping or running one, a command that itself
+    /// holds `) Z`, and an empty read.
+    #[test]
+    fn a_proc_stat_line_names_an_exited_process_by_its_state() {
+        assert!(stat_exited("4242 (claude) Z 4100 4242 4100 0 -1"));
+        assert!(stat_exited("4242 (claude) X 4100"));
+        assert!(!stat_exited("4242 (claude) S 4100 4242 4100 0 -1"));
+        assert!(!stat_exited("4242 (a) Z b) R 4100"));
+        assert!(!stat_exited(""));
+    }
 
     /// A wake that must come is waited for this long: a hang detector, never a
     /// latency budget (AGENTS.md).

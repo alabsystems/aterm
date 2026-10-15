@@ -23,10 +23,8 @@
 //! * each supervised agent's `CARGO_TARGET_DIR`, where its environment could
 //!   be read ([`Origin::AgentTargetDir`]);
 //! * each supervised session's working directory and the git worktree root
-//!   above it, and each direct child of `$HOME` — and of the developer root
-//!   `~/Developer` (`atpkg::devroot`), a folder of checkouts like `$HOME`
-//!   itself — and every git worktree of one (`.git/worktrees/*/gitdir`, read —
-//!   no `git` is run): a bounded walk
+//!   above it, and each direct child of `$HOME` and every git worktree of
+//!   one (`.git/worktrees/*/gitdir`, read — no `git` is run): a bounded walk
 //!   two levels down ([`CHECKOUT_DEPTH`]) for directories carrying a build
 //!   tool's marker ([`Origin::Checkout`]) — which finds `crates/target`
 //!   behind a checkout and `wt/m1-target` beside a worktree;
@@ -190,9 +188,8 @@ impl Budget {
 pub struct Roots {
     /// The working directories of the supervised sessions (the verb's own).
     pub cwds: Vec<PathBuf>,
-    /// `$HOME`: its direct children — and those of `~/Developer`, the
-    /// developer root — and their worktrees are walked, and its guarded folders
-    /// are never looked into ([`HOME_SKIP`]).
+    /// `$HOME`: its direct children and their worktrees are walked, and its
+    /// guarded folders are never looked into ([`HOME_SKIP`]).
     pub home: Option<PathBuf>,
     /// The Claude Code directories whose registries and transcripts say
     /// whether a session ended ([`claude_dirs`]): `~/.claude`, each running
@@ -243,7 +240,7 @@ pub fn claude_tmp_root(uid: u32) -> PathBuf {
 /// [`footer::claude_dir_of`]: super::super::footer::claude_dir_of
 #[must_use]
 pub fn claude_dirs(home: Option<&Path>, known: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let own = super::super::footer::claude_dir_of(None, home.and_then(Path::to_str));
+    let own = super::super::footer::claude_dir_of(None, home.and_then(Path::to_str), || None);
     let mut out: Vec<PathBuf> = Vec::new();
     for dir in own.into_iter().chain(known) {
         if dir.is_absolute() && !out.contains(&dir) {
@@ -556,7 +553,7 @@ pub fn claude_census(
         if matches!(exe, Some(Exe::Exited)) {
             continue;
         }
-        let dir = own_dir(&exec, home);
+        let dir = own_dir(&exec, cwd.as_deref(), home);
         // One whose own directory is not read here may be a Claude Code the
         // kernel does not name one (a copy renamed) keeping its registry
         // there: it keeps its project, as one no registry pins does.
@@ -586,11 +583,16 @@ enum OwnDir {
     Unread,
 }
 
-/// [`OwnDir`] of a process exec'd as `exec`.
-fn own_dir(exec: &Exec, home: Option<&Path>) -> OwnDir {
+/// [`OwnDir`] of a process exec'd as `exec`, running in `cwd` (where read):
+/// a relative `CLAUDE_CONFIG_DIR` — set and EMPTY included — names the
+/// directory under it, as Claude Code resolves it
+/// ([`super::super::footer::claude_dir_of`], the one resolver).
+fn own_dir(exec: &Exec, cwd: Option<&Path>, home: Option<&Path>) -> OwnDir {
     let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
-    match super::super::footer::claude_dir_of(exec.config.as_deref(), exec.home.as_deref()) {
-        None if set(&exec.config) || set(&exec.home) => OwnDir::Unread,
+    match super::super::footer::claude_dir_of(exec.config.as_deref(), exec.home.as_deref(), || {
+        cwd.map(Path::to_path_buf)
+    }) {
+        None if exec.config.is_some() || set(&exec.home) => OwnDir::Unread,
         None => OwnDir::Unset,
         Some(dir)
             if checkout::never_looked_at(&dir, home).is_some() && !in_aterm_state(&dir, home) =>
@@ -651,7 +653,7 @@ pub fn running_claude_census(home: Option<&Path>) -> ClaudeCensus {
         if claude
             || exec
                 .as_ref()
-                .is_some_and(|e| own_dir(e, home) == OwnDir::Unread)
+                .is_some_and(|e| own_dir(e, None, home) == OwnDir::Unread)
         {
             cwd = aterm_sysprobe::process_cwd(pid);
             // One that exited since it was listed holds nothing.
@@ -813,6 +815,12 @@ pub enum Origin {
     },
     /// A supervised agent's `CARGO_TARGET_DIR`.
     AgentTargetDir,
+    /// One workspace's build directory in the Rust build cache
+    /// (`atpkg::build_cache`, `<cache><workspace>/.cargo-build`): its
+    /// intermediates, the workspace's `target/` holding its binaries. A gone
+    /// workspace's goes in the daily `aterm pkg machine apply`; here it is
+    /// reclaimed as a checkout's is.
+    BuildCache,
     /// One of x.py's cargo build directories under `<repo>/build/<host>/`.
     Bootstrap {
         /// The x.py checkout.
@@ -902,7 +910,7 @@ pub struct Discovered {
 ///
 /// The roots whose build directories have NO owner that can end are walked
 /// FIRST — the agents' `CARGO_TARGET_DIR`, their working directories,
-/// `$HOME`'s and `~/Developer`'s checkouts — and Claude Code's temp root and the cells cache
+/// `$HOME`'s checkouts — and Claude Code's temp root and the cells cache
 /// after: a build directory any of those names is theirs ([`Origin::merge`]),
 /// and a walk cut short before they are done reaches no owner's at all (each
 /// later walk reads nothing once the budget is spent), so an owner's build
@@ -957,14 +965,6 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
         .and_then(|h| std::fs::canonicalize(h).ok())
         && w.on_device(&home)
     {
-        // The developer root (`atpkg::devroot`, `~/Developer`, a real folder: a link is
-        // never followed) is a folder OF checkouts, as `$HOME` is: each of its children is
-        // a checkout root, never the root itself — whose x.py checkouts' `build/` and
-        // `crates/target` would otherwise sit one level past the walk.
-        let devroot = match atpkg::devroot::root_at(&home) {
-            (root, atpkg::devroot::RootIs::Folder) => Some(root),
-            _ => None,
-        };
         for (name, child, ty) in w.children(&home) {
             let n = name.to_string_lossy();
             if !ty.is_dir() || n.starts_with('.') || HOME_SKIP.contains(&n.as_ref()) {
@@ -973,19 +973,14 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
             if !w.same_device(&child) {
                 continue;
             }
-            if devroot.as_deref() == Some(child.as_path()) {
-                for (name, inner, ty) in w.children(&child) {
-                    if ty.is_dir()
-                        && !name.to_string_lossy().starts_with('.')
-                        && w.same_device(&inner)
-                    {
-                        w.checkout_and_worktrees(&inner);
-                    }
-                }
-                continue;
+            w.checkout(&child);
+            for wt in worktrees(&child) {
+                w.checkout(&wt);
             }
-            w.checkout_and_worktrees(&child);
         }
+    }
+    if let Some(home) = roots.home.as_deref() {
+        w.build_cache(&atpkg::build_cache::cache_root(home));
     }
     if let Some(tmp) = &roots.claude_tmp {
         w.claude_scratch(tmp);
@@ -1271,14 +1266,6 @@ impl Walk {
         }
     }
 
-    /// A checkout root and every git worktree of it ([`worktrees`]).
-    fn checkout_and_worktrees(&mut self, root: &Path) {
-        self.checkout(root);
-        for wt in worktrees(root) {
-            self.checkout(&wt);
-        }
-    }
-
     /// A checkout root: x.py's bootstrap trees, then the marker walk —
     /// never a root on another device, and never one inside an x.py tree's
     /// `build/` (the bootstrap rule's alone).
@@ -1409,6 +1396,29 @@ impl Walk {
                     session_dir,
                 };
                 self.marked_walk(&scratch, SCRATCH_DEPTH, dev, &origin);
+            }
+        }
+    }
+
+    /// The Rust build cache under `$HOME` (`atpkg::build_cache`): every
+    /// marked `.cargo-build` under the mirror of its workspace's path.
+    fn build_cache(&mut self, cache: &Path) {
+        if !std::fs::symlink_metadata(cache).is_ok_and(|m| m.is_dir()) || !self.on_device(cache) {
+            return;
+        }
+        let mut stack = vec![(cache.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for (name, child, ty) in self.children(&dir) {
+                if !ty.is_dir() {
+                    continue;
+                }
+                if name == atpkg::build_cache::LEAF {
+                    if marked(&child) {
+                        self.add(&child, &Origin::BuildCache);
+                    }
+                } else if depth < 64 {
+                    stack.push((child, depth + 1));
+                }
             }
         }
     }
@@ -1574,6 +1584,7 @@ impl Owners {
             Origin::Named
             | Origin::Checkout { .. }
             | Origin::AgentTargetDir
+            | Origin::BuildCache
             | Origin::Bootstrap { .. }
             | Origin::Linked { .. } => Owned::NotOwned,
             Origin::Cell { checkout, key } => {

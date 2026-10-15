@@ -1385,8 +1385,8 @@ fn own_process_group(cmd: &mut Command) {
 /// half laid.
 ///
 /// NOTHING BUT STDIO IS INHERITED. The verb (re)starts the daemon as its own
-/// descendant, a process that lives for days, and a plain spawn hands its child
-/// every descriptor its parent holds without close-on-exec; one survives the
+/// descendant, a process that lives for days. A plain spawn, on a std without
+/// SP-1, hands on every descriptor without close-on-exec; one survives the
 /// exec into the verb and on into the daemon. In the GUI that is Metal's
 /// shader-cache files, open read-write without close-on-exec (measured
 /// 2026-09-27), and anything caught between another thread's `pipe` and its
@@ -4430,6 +4430,7 @@ pub(super) fn snapshot(
         // Claude Code's variables: a Codex has no such login or home.
         login: None,
         home: None,
+        claude_dir: None,
     })
 }
 
@@ -5061,6 +5062,7 @@ pub(super) fn holders(
             aterm_state: None,
             ask: false,
             several_logins: false,
+            instances: crate::harness::upgrade_drive::Instances::Machine,
         },
         found,
         &Live,

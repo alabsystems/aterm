@@ -406,6 +406,8 @@ use aterm_phase::{Phase, Program, Reading, anchor};
 
 use super::super::codex_usage::LimitRead;
 use super::super::config::Approve;
+use super::a_or_an;
+use super::claude_settings::AskRule;
 use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
 use super::guard::row_guard;
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
@@ -853,14 +855,8 @@ pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRo
 }
 
 /// The defaults for `trust_roots` when no config names any
-/// (`SupervisorConfig::default`'s): the owner's projects under the developer root
-/// (`atpkg::devroot`, `~/Developer`), and Claude Code's own scratch folder.
-const DEFAULT_TRUST_ROOTS: &[&str] = &[
-    "~/Developer/aterm*",
-    "~/Developer/ay*",
-    "~/Developer/trust*",
-    "/private/tmp/claude-*",
-];
+/// (`SupervisorConfig::default`'s).
+const DEFAULT_TRUST_ROOTS: &[&str] = &["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"];
 
 /// Everything [`decide`] knows besides the box.
 #[derive(Debug, Clone)]
@@ -958,6 +954,12 @@ pub struct ApprovalCtx {
     /// why it is unreadable. Read by the loop only for a Bash box
     /// ([`shell_unread`]).
     pub shell: Result<ShellStartup, String>,
+    /// The bare-tool ask rules of the agent's own Claude Code settings
+    /// ([`super::claude_settings::bare_asks`]), or why they could not be
+    /// read: what holds a box Claude Code draws no ask reason on
+    /// ([`unvoiced_tools`], [`settings_ask`]). Read by the loop only for such
+    /// a box ([`asks_unread`]).
+    pub owner_asks: Result<Vec<AskRule>, String>,
 }
 
 impl ApprovalCtx {
@@ -967,8 +969,7 @@ impl ApprovalCtx {
     /// Scratch roots: `/private/tmp/claude-<uid>/`, `tmpdir` (a root for literal
     /// paths, when at least two levels deep and holding neither `cwd` nor
     /// `home`), any `/tmp/<x>/` and `/private/tmp/<x>/`, and `<cwd>/target*`.
-    /// Trust roots `~/Developer/aterm*`, `~/Developer/ay*`, `~/Developer/trust*`,
-    /// `/private/tmp/claude-*`
+    /// Trust roots `~/aterm*`, `~/ay*`, `$HOME/trust*`, `/private/tmp/claude-*`
     /// ([`Self::set_trust_roots`] replaces them). Read roots: trust roots plus
     /// `/usr`, `/etc`, `/private/etc`, `/opt/homebrew`,
     /// `/private/tmp/claude-<uid>`. [`default_secrets`], cwd known, not bypass,
@@ -1019,6 +1020,7 @@ impl ApprovalCtx {
             worker: worker_unread(),
             shell_cwds: Vec::new(),
             shell: shell_unread(),
+            owner_asks: asks_unread(),
         };
         ctx.set_trust_roots(&defaults, uid);
         ctx
@@ -1067,6 +1069,20 @@ fn shell_unread() -> Result<ShellStartup, String> {
     #[cfg(not(test))]
     {
         Err("the Bash tool's shell startup was not read".to_string())
+    }
+}
+
+/// [`ApprovalCtx::owner_asks`] before the loop reads the agent's settings:
+/// unknown, so a box an ask rule could have sent unread is held; in this
+/// crate's unit tests no rule.
+fn asks_unread() -> Result<Vec<AskRule>, String> {
+    #[cfg(test)]
+    {
+        Ok(Vec::new())
+    }
+    #[cfg(not(test))]
+    {
+        Err("they were not read".to_string())
     }
 }
 
@@ -1327,14 +1343,19 @@ fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
         };
     }
     // The user's own Claude Code configuration (an ask rule or hook) sends this
-    // box to a person: no level presses it. Built-in safety checks stay the
-    // levels' to answer.
+    // box to a person: no level presses it — read off the box's reason where
+    // Claude Code draws one, else off the agent's own settings (a bare-tool
+    // ask rule for a file tool), else, for an in-project Read, off the missing
+    // folder grant. Built-in safety checks stay the levels' to answer.
     if let Some(review) = reading.prompt.as_ref().and_then(|p| p.owner_review()) {
         return Decision::escalate(format!(
             "the owner's Claude Code settings send this box to a person ({}): {}",
             review.kind.words(),
             review.text
         ));
+    }
+    if let Some(why) = settings_ask(reading, ctx) {
+        return Decision::escalate(why);
     }
     if let Some(why) = forced_read(reading) {
         return Decision::escalate(why);
@@ -1362,6 +1383,76 @@ fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
     }
 }
 
+/// EVERY Claude Code tool a box `p` may be a call of, where Claude Code draws
+/// no ask reason on a box of its kind: a file box. Under `ask: ["Write",
+/// "Edit"]` and `ask: ["Read"]` its Write, Edit and Read boxes are the boxes an
+/// unruled call draws (driven 2026-10-06 on 2.1.292 and 2026-10-09 on 2.1.295;
+/// an ask rule's Read outside the project carries the grant row Claude Code's
+/// own does), so a bare-tool ask rule for one of them, read from the agent's
+/// own settings, is what sends the box to a person ([`settings_ask`]). Each
+/// bare rule is its own tool's (driven 2026-10-09 on 2.1.295 in accept-edits
+/// mode, where an unruled call draws no box: `Edit` drew none for a Write or
+/// a NotebookEdit, `Write` none for an Edit).
+///
+/// A box is no tool's name, so this lists every tool Claude Code draws it
+/// for, and a bare rule for ANY of them holds it (fail-closed: the box
+/// cannot say which drew it). From its file-box builder (2.1.295 and
+/// 2.1.299 bundles): `Create file`, `Write file` and `Overwrite file` are
+/// the Write tool's; `Edit notebook` NotebookEdit's; `Edit file` the Edit
+/// tool's AND the Bash tool's, which previews a `sed -i` as that box with no
+/// reason (`_simulatedSedEdit`: captured under `ask: ["Bash"]`,
+/// `claude-2.1.295-box-bash-sed-edit-ask-rule.txt`, row for row an Edit's);
+/// `Read file` every read-only file tool's (Read, Glob, Grep); and the IDE
+/// diff, which replaces the title of any file-writing box, any of those that
+/// write. Empty for every other kind: Claude Code draws the reason on a Bash,
+/// Fetch or Tool box ([`PromptV2::owner_review`]).
+#[must_use]
+pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
+    let title = p.title.trim_start();
+    match p.kind {
+        PromptKind::Write | PromptKind::Overwrite => &["Write"],
+        PromptKind::Read => &["Read", "Glob", "Grep"],
+        PromptKind::Edit if title.starts_with(anchor("box.edit")) => &["Edit", "Bash"],
+        PromptKind::Edit if title.starts_with(anchor("box.edit_notebook")) => &["NotebookEdit"],
+        PromptKind::Edit => &["Edit", "Write", "NotebookEdit", "Bash"],
+        _ => &[],
+    }
+}
+
+/// Why the owner's own Claude Code settings hold the box `reading` found, at
+/// every level, where Claude Code draws no reason to read it by
+/// ([`unvoiced_tools`]): a BARE-TOOL ask rule along the agent's settings
+/// chain ([`ApprovalCtx::owner_asks`]) for any tool Claude Code draws the box
+/// for — `Write`, `Edit`, `Bash`, `Read`…, with no specifier, so every call
+/// of the tool is the person's and no matcher needs evaluating — or those
+/// settings unread, where no rule can be ruled out. A rule with a specifier (`Edit(src/**)`) is Claude Code's to
+/// match and holds nothing here (`tools/real-claude-lab/README.md`, DECIDED
+/// 2026-10-09). A Codex box is not Claude Code's.
+fn settings_ask(reading: &Reading, ctx: &ApprovalCtx) -> Option<String> {
+    let p = reading.prompt.as_ref()?;
+    let tools = unvoiced_tools(p);
+    if reading.program != Program::Claude || tools.is_empty() {
+        return None;
+    }
+    match &ctx.owner_asks {
+        Ok(rules) => rules
+            .iter()
+            .find(|r| tools.contains(&r.tool.as_str()))
+            .map(|r| {
+                format!(
+                    "the owner's Claude Code settings send this box to a person (an ask rule): \
+                     `{}` in {}",
+                    r.rule, r.source
+                )
+            }),
+        Err(why) => Some(format!(
+            "{} box the agent's Claude Code settings may send to a person, and they are \
+             unknown: {why}",
+            a_or_an(p.kind.name())
+        )),
+    }
+}
+
 /// A Read box Claude Code offers no folder grant for was sent by the owner's
 /// ask rule or hook. Claude Code draws `Yes, allow reading from <dir> during
 /// this session` on every Read box for a folder outside its working set (its
@@ -1379,8 +1470,10 @@ fn decide_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
 /// to press it.
 ///
 /// Its misses: an owner's Read OUTSIDE the working set carries the grant like
-/// Claude Code's own; a Read on another machine (`runs on`), whose grant the
-/// vendor withholds, is left to the proof that it is not local. Its false
+/// Claude Code's own (held where the rule is a bare `Read` the agent's
+/// settings carry, [`settings_ask`]; a hook's, or a rule with a specifier, is
+/// not seen); a Read on another machine (`runs on`), whose grant the vendor
+/// withholds, is left to the proof that it is not local. Its false
 /// holds, rare (none of the 808 Reads in the owner's own transcripts): the
 /// names Claude Code distrusts as Windows names (`x~1.txt`, `paper.aux`,
 /// `file.~1~`, a trailing dot, a `...` component), a folder whose grant text
@@ -1609,7 +1702,7 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     );
     let text = decline_text("this command", TALL_WHY, &fix);
     let subject = format!("a box taller than the screen, its note: {note}");
-    decline(RULE_TALL_BOX, prompt, rows, text, subject).unwrap_or_else(|not| handed_over(Some(not)))
+    decline(RULE_TALL_BOX, prompt, text, subject).unwrap_or_else(|not| handed_over(Some(not)))
 }
 
 /// `Ok` when a box's foot is a permission box's: `Do you want to proceed?`
@@ -1661,7 +1754,10 @@ fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decisio
         PromptKind::Bash => bash(prompt, rows, ctx),
         PromptKind::Read => read_box(prompt, rows, ctx),
         PromptKind::Trust => trust_dialog(prompt, rows, ctx),
-        kind => Decision::escalate(format!("a {} box: no rule approves this kind", kind.name())),
+        kind => Decision::escalate(format!(
+            "{} box: no rule approves this kind",
+            a_or_an(kind.name())
+        )),
     }
 }
 
@@ -1698,11 +1794,11 @@ fn file_path_row(rows: &[String], prompt: &PromptV2, path: &str) -> Option<usize
 /// The one plain one-shot allow of a numbered box, what the safe rules press:
 /// exactly one numbered [`Role::Once`] with a [`Role::Deny`] beside it, never
 /// while an amend input is open ([`amend_input_open`]).
-fn once_choice(prompt: &PromptV2, rows: &[String]) -> Result<Choice, String> {
+fn once_choice(prompt: &PromptV2) -> Result<Choice, String> {
     if prompt.select != Select::Digits {
         return Err("an unnumbered box".to_string());
     }
-    if amend_input_open(prompt, rows) {
+    if amend_input_open(prompt) {
         return Err(OPEN_INPUT.to_string());
     }
     let once: Vec<_> = prompt
@@ -1739,13 +1835,14 @@ const OPEN_INPUT: &str =
 /// Claude Code sends every key but the arrows to that input, so a digit would
 /// be typed into it. A fixed refusal label (the footerless Fetch and network
 /// boxes' `No, and tell Claude … (esc)`, Chrome's `Deny (esc)`) is no input.
-fn amend_input_open(prompt: &PromptV2, rows: &[String]) -> bool {
+fn amend_input_open(prompt: &PromptV2) -> bool {
     let amended = format!("{REFUSAL_LABEL}, ");
     // The keys of the box's own footer, less the vendor's note about
     // background agents (2.1.291), which an agent's box keeps drawn while the
     // input hides `Tab to amend`.
-    let footer_alone = rows
-        .get(prompt.span.1)
+    let footer_alone = prompt
+        .footer
+        .as_deref()
         .is_some_and(|f| aterm_phase::footer_keys(f) == [anchor("prompt.cancel")]);
     footer_alone
         && prompt
@@ -1929,7 +2026,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         if let Err(why) = git_reads_clear(&readings, None, ctx) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
-        return match once_choice(prompt, rows) {
+        return match once_choice(prompt) {
             Ok(choice) => Decision::Approve {
                 rule_id: RULE_RM_BREAKER,
                 choice,
@@ -1958,7 +2055,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if let Err(why) = git_reads_clear(&readings, prompt.runs_on().as_deref(), ctx) {
         return Decision::escalate(why);
     }
-    match once_choice(prompt, rows) {
+    match once_choice(prompt) {
         Ok(choice) => Decision::Approve {
             rule_id: RULE_READ_ONLY,
             choice,
@@ -2179,11 +2276,10 @@ pub fn decline_text(what: &str, why: &str, fix: &str) -> String {
 pub fn decline(
     rule_id: &'static str,
     prompt: &PromptV2,
-    rows: &[String],
     text: String,
     subject: String,
 ) -> Result<Decision, String> {
-    let refusal = refusal_of(prompt, rows, &text)?;
+    let refusal = refusal_of(prompt, &text)?;
     Ok(Decision::Decline {
         rule_id,
         refusal,
@@ -2211,17 +2307,19 @@ fn amended_label(text: &str) -> String {
 
 /// Whether the box's footer offers `Tab to amend` (Claude Code draws it
 /// while the focused option is an allow, or a refusal whose input is shut).
-fn offers_amend(prompt: &PromptV2, rows: &[String]) -> bool {
+fn offers_amend(prompt: &PromptV2) -> bool {
     let hint = anchor("prompt.amend");
-    rows.get(prompt.span.1)
-        .is_some_and(|f| f.trim().split(" · ").any(|h| h == hint))
+    prompt
+        .footer
+        .as_deref()
+        .is_some_and(|f| f.split(" · ").any(|h| h == hint))
 }
 
 /// The option a decline amends: the one [`Role::Deny`] plain `No`
 /// ([`REFUSAL_LABEL`]) on a footer offering `Tab to amend`, or during a decline
 /// the focused refusal whose input is open ([`amend_open_label`]) or holds
 /// `text` ([`amended_label`]).
-fn refusal_of(prompt: &PromptV2, rows: &[String], text: &str) -> Result<usize, String> {
+fn refusal_of(prompt: &PromptV2, text: &str) -> Result<usize, String> {
     let open = amend_open_label();
     let typed = squashed(&amended_label(text));
     let hits: Vec<usize> = prompt
@@ -2242,7 +2340,7 @@ fn refusal_of(prompt: &PromptV2, rows: &[String], text: &str) -> Result<usize, S
             "the box has more than one `No`".to_string()
         });
     };
-    if prompt.options[k].label == REFUSAL_LABEL && !offers_amend(prompt, rows) {
+    if prompt.options[k].label == REFUSAL_LABEL && !offers_amend(prompt) {
         return Err(format!(
             "the box does not offer `{}`",
             anchor("prompt.amend")
@@ -2300,7 +2398,7 @@ pub fn decline_step(
     }
     let guard = guard_of(o.row)?;
     if o.label == REFUSAL_LABEL {
-        if !offers_amend(prompt, rows) {
+        if !offers_amend(prompt) {
             return Err(format!(
                 "the focused `No` is not offered `{}`",
                 anchor("prompt.amend")
@@ -2342,7 +2440,7 @@ fn read_box(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let Some(path_row) = file_path_row(rows, prompt, path) else {
         return Decision::escalate("the Read path's row is not on the screen");
     };
-    let choice = match once_choice(prompt, rows) {
+    let choice = match once_choice(prompt) {
         Ok(c) => c,
         Err(why) => return Decision::escalate(why),
     };
@@ -2863,7 +2961,7 @@ fn answer(
         Ok(pick) => pick,
         Err(why) => return Decision::escalate(format!("{why} (the safe rules: {safe})")),
     };
-    let (choice, label) = match choice_of(p, rows, pick) {
+    let (choice, label) = match choice_of(p, pick) {
         Ok(c) => (c, pick.label.clone()),
         Err(why) => return Decision::escalate(why),
     };
@@ -3193,7 +3291,7 @@ fn model_restore_pick(
     program: Program,
     ctx: &ApprovalCtx,
 ) -> Decision {
-    match restore_pick(p, rows, program, ctx) {
+    match restore_pick(p, program, ctx) {
         Ok((choice, label, why)) => Decision::Approve {
             rule_id: RULE_MODEL_RESTORE_PICK,
             choice,
@@ -3246,7 +3344,6 @@ fn goal_resume_pick(
 
 fn restore_pick(
     p: &PromptV2,
-    rows: &[String],
     program: Program,
     ctx: &ApprovalCtx,
 ) -> Result<(Choice, String, String), String> {
@@ -3279,8 +3376,10 @@ fn restore_pick(
     let find =
         |want: &str, key: fn(&str) -> String| p.options.iter().find(|o| key(&o.label) == key(want));
     let session_key = || {
-        let footer = rows.get(p.span.1).map_or("", |r| r.as_str());
-        if footer.contains(anchor("codex.pick.session")) {
+        if p.footer
+            .as_deref()
+            .is_some_and(|f| f.contains(anchor("codex.pick.session")))
+        {
             Ok(())
         } else {
             Err(format!(
@@ -3446,9 +3545,9 @@ fn allow_once(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
 
 /// How `o` is chosen on `p`: its digit — never while the focus is on an
 /// open amend input ([`amend_input_open`]) — or the focus moved to it.
-fn choice_of(p: &PromptV2, rows: &[String], o: &Opt) -> Result<Choice, String> {
+fn choice_of(p: &PromptV2, o: &Opt) -> Result<Choice, String> {
     match p.select {
-        Select::Digits if amend_input_open(p, rows) => Err(OPEN_INPUT.to_string()),
+        Select::Digits if amend_input_open(p) => Err(OPEN_INPUT.to_string()),
         Select::Digits => {
             o.n.map(Choice::Digit)
                 .ok_or_else(|| format!("the option `{}` has no number", o.label))

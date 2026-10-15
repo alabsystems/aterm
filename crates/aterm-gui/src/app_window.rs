@@ -347,6 +347,17 @@ pub(crate) const WIRE_CLOSE_REFUSED: &str =
 /// so a driver can match every busy refusal, but names the tab.
 pub(crate) const WIRE_TAB_CLOSE_REFUSED: &str = "close refused (a running job in that tab)";
 
+/// What the Quit barriers answer at a Quit edge ([`App::quit_barriers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitBarrier {
+    /// Nothing holds the Quit: the app may exit now.
+    Ready,
+    /// Documents are saving; the Quit stays armed and ends when they land.
+    Saving,
+    /// A barrier refused the Quit, and it is disarmed.
+    Refused,
+}
+
 impl App {
     /// Coalesce a destructive request behind the live overlap handoff and ask its
     /// worker to abort without blocking. `true` is a hard barrier: the caller must
@@ -2726,30 +2737,64 @@ impl App {
                 return;
             }
         }
+        if self.quit_barriers() != QuitBarrier::Ready {
+            return;
+        }
+        let _ = self.video_abort_app_shutdown();
+        el.exit();
+    }
+
+    /// Both Quit barriers, in the order every Quit edge asks them: the native
+    /// reducers, then the documents, whose saves this starts. A Quit left
+    /// [`QuitBarrier::Saving`] keeps its document plan armed, and
+    /// [`Self::escalate_document_shutdown`] ends the quit when the saves land;
+    /// a [`QuitBarrier::Refused`] one has been disarmed.
+    pub(crate) fn quit_barriers(&mut self) -> QuitBarrier {
         match self.prepare_quit_native_shutdown() {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return QuitBarrier::Refused,
             Err(error) => {
                 aterm_log::warn!("quit native close barrier: {error}");
-                return;
+                return QuitBarrier::Refused;
             }
         }
         match self.prepare_quit_document_shutdown() {
-            Ok(true) => {}
+            Ok(true) => QuitBarrier::Ready,
+            Ok(false) if !self.quit_document_shutdown_blocked() => QuitBarrier::Saving,
             Ok(false) => {
-                if self.quit_document_shutdown_blocked() {
-                    self.cancel_failed_quit_document_shutdown();
-                }
-                return;
+                self.cancel_failed_quit_document_shutdown();
+                QuitBarrier::Refused
             }
             Err(error) => {
                 aterm_log::warn!("quit document close barrier: {error}");
                 self.cancel_failed_quit_document_shutdown();
-                return;
+                QuitBarrier::Refused
             }
         }
-        let _ = self.video_abort_app_shutdown();
-        el.exit();
+    }
+
+    /// A Quit whose barriers were ready when it deferred behind an update
+    /// handoff (`DeferredHandoffTeardown::CleanQuitReady`), replayed once the
+    /// rollback has run. The app stayed interactive meanwhile, so a native view
+    /// or a document may hold new unsaved work: both barriers are asked again,
+    /// as at every Quit edge. The native barrier alone cannot see a document's
+    /// edits, since the editor reducer answers `Ready` whatever its document
+    /// holds. `true` means exit now; a Quit left saving ends in
+    /// [`Self::escalate_document_shutdown`] when its saves land.
+    #[cfg(unix)]
+    pub(crate) fn replay_clean_quit_ready(&mut self) -> bool {
+        match self.quit_barriers() {
+            QuitBarrier::Ready => {
+                let _ = crate::menu::complete_current_native_termination();
+                let _ = self.video_abort_app_shutdown();
+                true
+            }
+            QuitBarrier::Saving => false,
+            QuitBarrier::Refused => {
+                let _ = crate::menu::cancel_current_native_termination();
+                false
+            }
+        }
     }
 
     /// The process that started this headless instance is gone
@@ -2799,31 +2844,10 @@ impl App {
             }
         }
 
-        match self.prepare_quit_native_shutdown() {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = crate::menu::cancel_native_termination(generation);
-                return;
-            }
-            Err(error) => {
-                aterm_log::warn!("native terminate app-close barrier: {error}");
-                let _ = crate::menu::cancel_native_termination(generation);
-                return;
-            }
-        }
-
-        match self.prepare_quit_document_shutdown() {
-            Ok(true) => {}
-            Ok(false) => {
-                if self.quit_document_shutdown_blocked() {
-                    self.cancel_failed_quit_document_shutdown();
-                    let _ = crate::menu::cancel_native_termination(generation);
-                }
-                return;
-            }
-            Err(error) => {
-                aterm_log::warn!("native terminate document barrier: {error}");
-                self.cancel_failed_quit_document_shutdown();
+        match self.quit_barriers() {
+            QuitBarrier::Ready => {}
+            QuitBarrier::Saving => return,
+            QuitBarrier::Refused => {
                 let _ = crate::menu::cancel_native_termination(generation);
                 return;
             }

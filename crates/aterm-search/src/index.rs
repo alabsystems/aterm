@@ -17,9 +17,11 @@ use super::iterators::{
 };
 #[cfg(test)]
 use super::types::SearchResult;
-use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
+use super::types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchResults};
+use crate::cells::LineCells;
 use crate::grapheme::{
-    ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_fold_char, lower_fold_into, lower_need,
+    ColumnMap, LowerByteMap, LowerNeed, MapSource, lower_fold, lower_fold_char, lower_fold_into,
+    lower_need,
 };
 use crate::literal::AsciiCaseInsensitiveMatches;
 
@@ -168,6 +170,15 @@ pub struct SearchIndex {
     /// into a memcpy into already-owned memory. Purely a scratch cell — never
     /// read outside the call that fills it, so it carries no state.
     lower_scratch: String,
+    /// The line number posting key 0 stands for.
+    ///
+    /// Posting lists and candidate ranges hold `u32` KEYS, each a line's
+    /// offset from this base, never the line number itself: callers number
+    /// lines by absolute terminal row, which only ever grows and passes
+    /// `u32::MAX` in a long-lived tab (R15 content-1). Every cached line sits
+    /// in `key_base..=key_base + MAX_KEY`; [`make_room_for`](Self::make_room_for)
+    /// keeps it so, moving the base when a line arrives outside the window.
+    key_base: usize,
     /// Total number of indexed lines.
     line_count: usize,
     /// Lowest line number currently present in `lines`.
@@ -205,13 +216,14 @@ pub struct SearchIndex {
     pub(super) ambiguous_width: AmbiguousWidth,
 }
 
-/// Convert a line number to u32 for `SparseBitmap` storage.
-///
-/// Line numbers are bounded by scrollback limits (max ~1M lines) which fits
-/// in u32 (max ~4B). Saturates at `u32::MAX` for defensive safety.
-fn line_as_u32(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
-}
+/// The largest posting key. Keys run `0..=MAX_KEY`, one short of `u32::MAX`,
+/// so `u32::MAX` stays free to be the exclusive end of every candidate range:
+/// no cached line can sit on the bound that is meant to include it.
+const MAX_KEY: u32 = u32::MAX - 1;
+
+/// [`MAX_KEY`] as a distance in lines: the widest span of line numbers one
+/// index holds at once (a window of `MAX_KEY_SPAN + 1` lines).
+const MAX_KEY_SPAN: usize = MAX_KEY as usize;
 
 /// The bloom filter represents the posting dictionary, not each occurrence in
 /// every row. Repeated output and unchanged screen refreshes must not inflate
@@ -417,20 +429,6 @@ impl SearchIndex {
             .map_err(|e| SearchOptionsError::InvalidRegex(e.to_string()))
     }
 
-    /// The error a scan that ran out of budget reports.
-    ///
-    /// It is deliberately the same variant a malformed pattern gets: from the
-    /// caller's side both mean "this pattern cannot be used", both are shown to
-    /// whoever typed it, and every call site already handles it. What it must
-    /// never be is `Ok` with a short list — the matches such a scan found are a
-    /// prefix of the truth, and a prefix presented as the whole is the wrong
-    /// answer this budget exists to prevent.
-    pub(crate) fn regex_scan_budget_exhausted() -> SearchOptionsError {
-        SearchOptionsError::InvalidRegex(format!(
-            "pattern too expensive: exceeds the {REGEX_STEP_LIMIT}-unit per-line scan budget"
-        ))
-    }
-
     /// Take (read and reset) `search_from_line` candidate count.
     #[cfg(test)]
     pub(crate) fn take_search_from_line_candidates() -> usize {
@@ -499,6 +497,7 @@ impl SearchIndex {
             lines: FxHashMap::default(),
             column_maps: FxHashMap::default(),
             lower_scratch: String::new(),
+            key_base: 0,
             line_count: 0,
             first_cached_line: usize::MAX,
             next_line: 0,
@@ -546,7 +545,7 @@ impl SearchIndex {
         // pre-allocations finite. Hints only affect pre-reservation, never
         // observable behavior: the maps grow on demand past the hint exactly
         // as before, and real callers pass line counts far below this bound
-        // (line numbers are bounded by scrollback limits, max ~1M lines).
+        // (the cap above already clamped the hint to `max_cached_lines`).
         const MAX_CAPACITY_HINT: usize = 1 << 20;
         let line_hint = if expected_lines > MAX_CAPACITY_HINT {
             MAX_CAPACITY_HINT
@@ -561,6 +560,7 @@ impl SearchIndex {
             lines: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
             column_maps: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
             lower_scratch: String::new(),
+            key_base: 0,
             line_count: 0,
             first_cached_line: usize::MAX,
             next_line: 0,
@@ -574,16 +574,24 @@ impl SearchIndex {
 
     /// Measure columns under the terminal's `ambiguous_width` policy: with
     /// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`,
-    /// `°`) takes two columns, as the grid draws it. Lines already indexed are
-    /// re-measured, so every match is in the one frame.
+    /// `°`) takes two columns, as the grid draws it. Lines already indexed
+    /// from their text alone are re-measured, so every match is in the one
+    /// frame; a line indexed with its grid cells keeps them, since the grid
+    /// already drew it at the width it chose.
     pub fn set_ambiguous_width(&mut self, ambiguous: AmbiguousWidth) {
         if ambiguous == self.ambiguous_width {
             return;
         }
         self.ambiguous_width = ambiguous;
         for (line, text) in &self.lines {
-            self.column_maps
-                .insert(*line, ColumnMap::new(text, ambiguous));
+            let walked = self
+                .column_maps
+                .get(line)
+                .is_none_or(|map| matches!(map.source(), MapSource::Walk(_)));
+            if walked {
+                self.column_maps
+                    .insert(*line, ColumnMap::new(text, ambiguous));
+            }
         }
     }
 
@@ -597,31 +605,58 @@ impl SearchIndex {
     ///
     /// This overwrites any existing content at that line number.
     pub fn index_line(&mut self, line_num: usize, text: &str) {
-        self.index_line_cow(line_num, Cow::Borrowed(text));
+        self.index_line_cow(line_num, Cow::Borrowed(text), None);
     }
 
     /// Shared borrowed/owned indexing primitive. Owned text moves directly
     /// into the retained line cache instead of being copied a second time.
-    pub(crate) fn index_line_cow(&mut self, line_num: usize, text: Cow<'_, str>) {
+    ///
+    /// `cells` are the grid cells the text was read from, when the caller
+    /// has them: matches are then reported in the cells that hold them
+    /// ([`ColumnMap::with_cells`]); without them the text is walked as the
+    /// grid lays out a line written left to right ([`ColumnMap::new`]).
+    pub(crate) fn index_line_cow(
+        &mut self,
+        line_num: usize,
+        text: Cow<'_, str>,
+        cells: Option<&LineCells>,
+    ) {
         let text_ref = text.as_ref();
+        let ambiguous = self.ambiguous_width;
+        let column_map = || match cells {
+            Some(cells) => ColumnMap::with_cells(text_ref, cells),
+            None => ColumnMap::new(text_ref, ambiguous),
+        };
 
         // An unchanged row already contributes exactly these postings and
         // columns. It must not advance the bloom insertion count, or screen
-        // refreshes would trigger full-history rebuilds.
+        // refreshes would trigger full-history rebuilds. Its cells can still
+        // have moved under the same text (two flag halves written apart, then
+        // a redraw pairs them), so a row read with its cells takes its new
+        // map.
         if self.lines.get(&line_num).is_some_and(|old| old == text_ref) {
+            if cells.is_some() {
+                let column_map = column_map();
+                if self.column_maps.get(&line_num) != Some(&column_map) {
+                    self.column_maps.insert(line_num, column_map);
+                }
+            }
             return;
         }
 
-        let line_u32 = line_as_u32(line_num);
+        if !self.make_room_for(line_num) {
+            return;
+        }
+        let key = self.posting_key(line_num);
         if let Some(old_text) = self.lines.remove(&line_num) {
-            self.reindex_changed_row_postings(line_u32, &old_text, text_ref);
+            self.reindex_changed_row_postings(key, &old_text, text_ref);
         } else {
             for window in text_ref.as_bytes().windows(3) {
                 insert_posting(
                     &mut self.trigrams,
                     &mut self.bloom,
                     [window[0], window[1], window[2]],
-                    line_u32,
+                    key,
                 );
             }
 
@@ -639,7 +674,7 @@ impl SearchIndex {
                                 window[1].to_ascii_lowercase(),
                                 window[2].to_ascii_lowercase(),
                             ],
-                            line_u32,
+                            key,
                         );
                     }
                 }
@@ -650,14 +685,14 @@ impl SearchIndex {
                             &mut self.trigrams,
                             &mut self.bloom,
                             [window[0], window[1], window[2]],
-                            line_u32,
+                            key,
                         );
                     }
                 }
             }
         }
 
-        let column_map = ColumnMap::new(text_ref, self.ambiguous_width);
+        let column_map = column_map();
         self.lines.insert(line_num, text.into_owned());
         self.column_maps.insert(line_num, column_map);
         self.first_cached_line = self.first_cached_line.min(line_num);
@@ -685,6 +720,182 @@ impl SearchIndex {
         let line_num = self.next_line;
         self.index_line(line_num, text);
         line_num
+    }
+
+    /// The posting key of `line`: its offset from
+    /// [`key_base`](Self::key_base).
+    ///
+    /// Saturating at both ends, which makes it exact as a range BOUND as well
+    /// as a key: every cached line's key is in `0..=MAX_KEY`, so a bound below
+    /// the base clamps to 0 and one past the window to `u32::MAX`, on the far
+    /// side of every key either way.
+    #[inline]
+    fn posting_key(&self, line: usize) -> u32 {
+        u32::try_from(line.saturating_sub(self.key_base)).unwrap_or(u32::MAX)
+    }
+
+    /// Candidate lines `first..end`, ascending.
+    fn line_range(&self, first: usize, end: usize) -> CandidateSource {
+        CandidateSource::range(
+            self.key_base,
+            self.posting_key(first)..self.posting_key(end),
+        )
+    }
+
+    /// Candidate lines `first..end`, descending.
+    fn line_range_rev(&self, first: usize, end: usize) -> CandidateSource {
+        CandidateSource::range_rev(
+            self.key_base,
+            self.posting_key(first)..self.posting_key(end),
+        )
+    }
+
+    /// Lines in every list of `postings`, ascending from line `from_line`.
+    fn postings_forward(&self, postings: Vec<&SparseBitmap>, from_line: usize) -> CandidateSource {
+        CandidateSource::from_postings_forward(self.key_base, postings, self.posting_key(from_line))
+    }
+
+    /// Lines in every list of `postings`, descending from below `before_line`.
+    fn postings_backward(
+        &self,
+        postings: Vec<&SparseBitmap>,
+        before_line: usize,
+    ) -> CandidateSource {
+        CandidateSource::from_postings_backward(
+            self.key_base,
+            postings,
+            self.posting_key(before_line),
+        )
+    }
+
+    /// Make `line` keyable before it is indexed: every cached line, and
+    /// `line`, inside one window of `MAX_KEY_SPAN + 1` lines from
+    /// [`key_base`](Self::key_base).
+    ///
+    /// Ruling (R15 content-1, 2026-10-10): the postings stay `u32` and become
+    /// offsets from a per-index base, rather than widening to `u64` and doubling
+    /// the posting memory. Callers number lines by absolute terminal row, which
+    /// passes `u32::MAX` in a long-lived tab; a line number stored as `u32`
+    /// saturated there, every posting and candidate range collapsed onto
+    /// `u32::MAX`, and every literal and regex find reported zero matches,
+    /// complete. A window is what an index holds anyway — the newest
+    /// `max_cached_lines` rows, a hundred thousand by default — so `u32`
+    /// offsets lose nothing.
+    ///
+    /// The fast path, `line` already in the window, is a subtraction and a
+    /// compare. Otherwise the window moves, and re-keying costs `O(1)` per
+    /// posting list ([`SparseBitmap::shift`]):
+    ///
+    /// - going UP (the terminal appended past the window): the base moves to the
+    ///   oldest cached line, leaving the most room for the rows still to come;
+    ///   cached lines more than `MAX_KEY_SPAN` below `line` cannot share its
+    ///   window and are evicted, reported as an eviction is.
+    /// - going DOWN (an older line indexed after newer ones): the base moves as
+    ///   low as the newest line allows, so a run of ever-older lines moves it
+    ///   once, not once per line.
+    ///
+    /// Returns `false` when `line` is older than that lowest base: it is more
+    /// than `MAX_KEY_SPAN` below the newest line, so it cannot be indexed beside
+    /// it. It is dropped, and the index reports results incomplete below the
+    /// window, as for any eviction — the newest lines are the ones an index
+    /// keeps. Neither move happens for a terminal's own windows, which span at
+    /// most the configured depth: the first fires once per 2^32 rows of
+    /// output, and the rest need a caller to index lines 2^32 apart.
+    fn make_room_for(&mut self, line: usize) -> bool {
+        if line
+            .checked_sub(self.key_base)
+            .is_some_and(|offset| offset <= MAX_KEY_SPAN)
+        {
+            return true;
+        }
+        if self.lines.is_empty() {
+            // Nothing is keyed — every posting names a cached line — so the
+            // window can start anywhere: here.
+            debug_assert!(self.trigrams.is_empty());
+            self.key_base = line;
+            return true;
+        }
+        // The newest line the window must hold, and the oldest it can hold
+        // alongside it.
+        let newest = self.line_count.saturating_sub(1).max(line);
+        let floor = newest.saturating_sub(MAX_KEY_SPAN);
+        if line < floor {
+            self.note_window_eviction(floor);
+            return false;
+        }
+        let new_base = if line < self.key_base {
+            // Every cached line is at or above the old base, so above `floor`.
+            floor
+        } else {
+            self.evict_below_window(floor).unwrap_or(line).min(line)
+        };
+        self.rekey(new_base);
+        true
+    }
+
+    /// Re-key every posting list from `key_base` to `new_base`. The caller
+    /// has made sure every cached line is in `new_base..=new_base + MAX_KEY`.
+    fn rekey(&mut self, new_base: usize) {
+        let up = new_base < self.key_base;
+        let by = if up {
+            self.key_base - new_base
+        } else {
+            new_base - self.key_base
+        };
+        // Every key moves by `by` and stays within `0..=MAX_KEY`, so a
+        // non-empty index's shift fits `u32`; an empty one has nothing to move.
+        if let Ok(by) = u32::try_from(by) {
+            for bitmap in self.trigrams.values_mut() {
+                bitmap.shift(up, by);
+            }
+        } else {
+            debug_assert!(self.trigrams.is_empty());
+        }
+        self.key_base = new_base;
+    }
+
+    /// Evict every cached line below `floor` (the moving window's oldest
+    /// line), reporting it as an eviction. Returns the oldest line left.
+    ///
+    /// Scans the whole cache: it runs once per window move, which a terminal
+    /// makes once per 2^32 rows of output.
+    fn evict_below_window(&mut self, floor: usize) -> Option<usize> {
+        let before = self.lines.len();
+        let mut oldest: Option<usize> = None;
+        self.lines.retain(|&line, _| {
+            let keep = line >= floor;
+            if keep {
+                oldest = Some(oldest.map_or(line, |o| o.min(line)));
+            }
+            keep
+        });
+        if self.lines.len() != before {
+            self.column_maps.retain(|&line, _| line >= floor);
+            // Keys are still from the old base here.
+            let watermark = self.posting_key(floor);
+            self.trigrams.retain(|_, bitmap| {
+                bitmap.drop_below(watermark);
+                !bitmap.is_empty()
+            });
+            self.note_window_eviction(floor);
+        }
+        oldest
+    }
+
+    /// Record that lines below `floor` are not in the index because they
+    /// fell outside the key window: results are incomplete below it.
+    fn note_window_eviction(&mut self, floor: usize) {
+        self.first_cached_line = self.first_cached_line.max(floor);
+        self.lowest_retained_line = self.lowest_retained_line.max(floor);
+        self.eviction_occurred = true;
+        if !self.first_eviction_warned {
+            self.first_eviction_warned = true;
+            aterm_log::warn!(
+                "search index spans more than {} lines; results incomplete below line {}",
+                MAX_KEY_SPAN,
+                floor,
+            );
+        }
     }
 
     /// Collect the full trigram set one text contributes to the POSTING maps:
@@ -752,7 +963,7 @@ impl SearchIndex {
     ///
     /// [`index_line`]: Self::index_line
     /// [`lower_need`]: crate::grapheme::lower_need
-    fn reindex_changed_row_postings(&mut self, line_u32: u32, old_text: &str, text: &str) {
+    fn reindex_changed_row_postings(&mut self, key: u32, old_text: &str, text: &str) {
         let old_set = self.posting_trigram_set(old_text);
         let bytes = text.as_bytes();
         let mut new_seen: FxHashSet<[u8; 3]> =
@@ -762,7 +973,7 @@ impl SearchIndex {
         for window in bytes.windows(3) {
             let trigram: [u8; 3] = [window[0], window[1], window[2]];
             if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
+                insert_posting(&mut self.trigrams, &mut self.bloom, trigram, key);
             }
         }
         // Lowered pass, gated by the SHARED classifier (see `index_line`).
@@ -776,7 +987,7 @@ impl SearchIndex {
                         window[2].to_ascii_lowercase(),
                     ];
                     if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
+                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, key);
                     }
                 }
             }
@@ -788,7 +999,7 @@ impl SearchIndex {
                 for window in self.lower_scratch.as_bytes().windows(3) {
                     let trigram: [u8; 3] = [window[0], window[1], window[2]];
                     if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
+                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, key);
                     }
                 }
             }
@@ -800,7 +1011,7 @@ impl SearchIndex {
                 continue;
             }
             if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
-                bitmap.remove(line_u32);
+                bitmap.remove(key);
                 if bitmap.is_empty() {
                     self.trigrams.remove(&trigram);
                 }
@@ -864,7 +1075,7 @@ impl SearchIndex {
         // instead of the O(evicted·len) of one-at-a-time front removals (the
         // sortedvec container's front remove is a tail shift). See
         // SparseBitmap::drop_below and the eviction-identity oracle.
-        let watermark = line_as_u32(self.lowest_retained_line);
+        let watermark = self.posting_key(self.lowest_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
@@ -964,20 +1175,20 @@ impl SearchIndex {
     /// Build a lazy ascending candidate source for a literal query.
     fn literal_candidates_forward(&self, lower_query: &str, from_line: usize) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         }
 
         let first = from_line.max(self.first_cached_line);
         if lower_query.len() < 3 {
-            return CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count));
+            return self.line_range(first, self.line_count);
         }
         if !self.might_contain(lower_query) {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         }
         let Some(postings) = self.posting_lists(lower_query) else {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         };
-        CandidateSource::from_postings_forward(postings, line_as_u32(first))
+        self.postings_forward(postings, first)
     }
 
     /// Build a lazy descending candidate source for a folded literal query.
@@ -987,21 +1198,21 @@ impl SearchIndex {
         before_line: usize,
     ) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         }
 
         let upper = before_line.min(self.line_count);
         if lower_query.len() < 3 {
             let lower = self.first_cached_line.min(upper);
-            return CandidateSource::RangeRev((line_as_u32(lower)..line_as_u32(upper)).rev());
+            return self.line_range_rev(lower, upper);
         }
         if !self.might_contain(lower_query) {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         }
         let Some(postings) = self.posting_lists(lower_query) else {
-            return CandidateSource::Empty;
+            return CandidateSource::empty();
         };
-        CandidateSource::from_postings_backward(postings, line_as_u32(upper))
+        self.postings_backward(postings, upper)
     }
 
     /// Search for a query string.
@@ -1009,8 +1220,10 @@ impl SearchIndex {
     /// Returns line numbers that might contain the query.
     /// Results may include false positives but never false negatives.
     #[cfg(test)]
-    pub fn search(&self, query: &str) -> impl Iterator<Item = u32> + '_ + use<'_> {
+    pub fn search(&self, query: &str) -> impl Iterator<Item = usize> + '_ + use<'_> {
         let bytes = query.as_bytes();
+        let base = self.key_base;
+        let line = move |key: u32| base.saturating_add(key as usize);
 
         if bytes.len() < 3 {
             // Can't use trigram index for short queries
@@ -1018,18 +1231,19 @@ impl SearchIndex {
             // first cached absolute row avoids walking a potentially huge empty
             // numeric prefix after long-running terminal history eviction.
             let first = self.first_cached_line.min(self.line_count);
-            return SearchResult::All(line_as_u32(first)..line_as_u32(self.line_count));
+            return SearchResult::All(self.posting_key(first)..self.posting_key(self.line_count))
+                .map(line);
         }
 
         // Quick bloom filter check
         if !self.might_contain(query) {
-            return SearchResult::None;
+            return SearchResult::None.map(line);
         }
 
         let Some(result) = self.intersect_trigrams(query) else {
-            return SearchResult::None;
+            return SearchResult::None.map(line);
         };
-        SearchResult::Bitmap(Box::new(result.into_iter()))
+        SearchResult::Bitmap(Box::new(result.into_iter())).map(line)
     }
 
     /// Search with match verification and position extraction.
@@ -1090,6 +1304,7 @@ impl SearchIndex {
         self.trigrams.clear();
         self.lines.clear();
         self.column_maps.clear();
+        self.key_base = 0;
         self.line_count = 0;
         self.first_cached_line = usize::MAX;
         self.next_line = 0;
@@ -1119,6 +1334,7 @@ impl SearchIndex {
         self.lines = FxHashMap::default();
         self.column_maps = FxHashMap::default();
         self.lower_scratch = String::new();
+        self.key_base = 0;
         self.line_count = 0;
         self.first_cached_line = usize::MAX;
         self.next_line = 0;
@@ -1210,7 +1426,7 @@ impl SearchIndex {
         // (see evict_oldest_lines): every removed row is < first_retained_line,
         // so trimming each posting list to the watermark drops exactly their
         // entries without an O(rows·len) per-row front-remove.
-        let watermark = line_as_u32(first_retained_line);
+        let watermark = self.posting_key(first_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
@@ -1267,7 +1483,7 @@ impl SearchIndex {
         }
         // One batched posting front-drain, exactly as `retain_history_from`
         // (see there); only the honesty bookkeeping differs.
-        let watermark = line_as_u32(first_retained_line);
+        let watermark = self.posting_key(first_retained_line);
         self.trigrams.retain(|_, bitmap| {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
@@ -1337,7 +1553,7 @@ impl SearchIndex {
     ) -> SearchMatchIterator<'a> {
         let bytes = query.as_bytes();
 
-        let empty = || CandidateSource::Empty;
+        let empty = CandidateSource::empty;
 
         // Empty query returns no matches
         if query.is_empty() {
@@ -1348,7 +1564,7 @@ impl SearchIndex {
             // Can't use trigram index for short queries — use lazy range
             // instead of collecting all line numbers into a Vec (avoids O(n) alloc)
             let first = from_line.max(self.first_cached_line.min(self.line_count));
-            let source = CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count));
+            let source = self.line_range(first, self.line_count);
             return SearchMatchIterator::new(self, query, source);
         }
 
@@ -1364,7 +1580,7 @@ impl SearchIndex {
         // Borrow the smallest posting range and membership-check the remaining
         // lists lazily. No full BTree clone/intersection is built before the
         // first match, even for a one-trigram query present on every line.
-        let source = CandidateSource::from_postings_forward(postings, line_as_u32(from_line));
+        let source = self.postings_forward(postings, from_line);
         SearchMatchIterator::new(self, query, source)
     }
 
@@ -1384,7 +1600,7 @@ impl SearchIndex {
     ) -> SearchMatchReverseIterator<'a> {
         let bytes = query.as_bytes();
 
-        let empty = || CandidateSource::Empty;
+        let empty = CandidateSource::empty;
 
         // Empty query returns no matches
         if query.is_empty() {
@@ -1396,7 +1612,7 @@ impl SearchIndex {
             // instead of collecting all line numbers into a Vec (avoids O(n) alloc)
             let upper = before_line.min(self.line_count);
             let lower = self.first_cached_line.min(upper);
-            let source = CandidateSource::RangeRev((line_as_u32(lower)..line_as_u32(upper)).rev());
+            let source = self.line_range_rev(lower, upper);
             return SearchMatchReverseIterator::new(self, query, source);
         }
 
@@ -1409,7 +1625,7 @@ impl SearchIndex {
             return SearchMatchReverseIterator::new(self, query, empty());
         };
 
-        let source = CandidateSource::from_postings_backward(postings, line_as_u32(before_line));
+        let source = self.postings_backward(postings, before_line);
         SearchMatchReverseIterator::new(self, query, source)
     }
 }
@@ -1446,9 +1662,10 @@ pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 /// thread set is capped by the program size. Mirrors `aterm-observe`.
 pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
-/// Scan budget (work units) for one line, passed to
-/// `aterm_regex::RegexBuilder::step_limit`. About 4.8 ms of matching per line
-/// on the m21 box in release.
+/// Scan budget (work units) for one line of up to a full-width row, passed to
+/// `aterm_regex::RegexBuilder::step_limit` and the floor of every line's
+/// budget ([`regex_line_budget`]). About 4.8 ms of matching on the m21 box in
+/// release.
 ///
 /// [`REGEX_SIZE_LIMIT`] bounds the compiled program; this bounds what running
 /// that program over a line costs, and only the two together bound a query. A
@@ -1456,19 +1673,70 @@ pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 /// constant, so the cost of a pattern is the *product* — and both factors come
 /// from the search box. Measured: the heaviest program the 128 KiB ceiling
 /// still admits needs ~16.7M units (19 ms) to cross one 4,096-column line,
-/// which over a 20,000-line scrollback is minutes per keystroke; this ceiling
-/// refuses it after ~4.2M.
+/// which over a 20,000-line scrollback is minutes per keystroke; this budget
+/// stops it after ~4.2M.
 ///
 /// One budget pays for a whole line: `find_iter` shares it across the search
 /// it runs per match, so a pattern that re-walks the line once per match is
-/// refused here rather than costing a multiple of it. Nothing real comes near
-/// it — the most expensive pattern aterm itself ships (the IPv6 selection rule)
-/// needs ~252,000 units to find every match in a full-width line, sixteen
-/// times below. Exhaustion is reported as
-/// [`SearchOptionsError::InvalidRegex`] rather than as a short result list:
-/// a truncated result set that looks exhaustive is a wrong answer, and a
-/// refusal naming the cause is not. Mirrors `aterm-observe`.
+/// stopped here rather than costing a multiple of it (R3). Nothing real comes
+/// near it — the most expensive pattern aterm itself ships (the IPv6 selection
+/// rule) needs ~252,000 units to find every match in a full-width line,
+/// sixteen times below. A line its scan cannot finish is reported, never
+/// passed off as finished: see [`SearchResults::cut_short_lines`]. Mirrors
+/// `aterm-observe`, whose lines are single grid rows.
 pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;
+
+/// Work units per byte a line longer than a full-width row gets:
+/// [`REGEX_STEP_LIMIT`] spread over the 4,096 columns it was sized for. No
+/// line gets more per byte than a full-width row, so a scrollback's worst case
+/// stays what the same text laid out in full-width rows already cost.
+pub(crate) const REGEX_STEP_PER_BYTE: u64 = REGEX_STEP_LIMIT / 4096;
+
+/// The most one line's scan may cost: 2^26 units, about 77 ms on the m21 box
+/// in release — `aterm-regex`'s own default step limit, which its docs size
+/// for the one search that actually exhausts it. Lines up to 64 KiB get
+/// [`REGEX_STEP_PER_BYTE`] in full; a longer one gets this, which still pays
+/// fifteen units a byte across a 4.3 MB line, where a literal-led pattern
+/// needs one or two.
+pub(crate) const REGEX_LINE_STEP_CEILING: u64 = 1 << 26;
+
+/// The scan budget for one line of `len` bytes:
+/// `REGEX_STEP_PER_BYTE · len`, at least [`REGEX_STEP_LIMIT`] and at most
+/// [`REGEX_LINE_STEP_CEILING`].
+///
+/// Ruling (R15 content-2, 2026-10-10): the budget scales with the line. It
+/// was sized for one grid row, but find joins each soft-wrap run into ONE
+/// line (`join_wrapped_rows` in aterm-gui), of any length: a `cat` of a
+/// minified bundle or a single-line JSON reply makes a multi-megabyte line,
+/// whose scan ran out for every pattern — `needle` from 4.2 MB, `\w+\(` from
+/// under 1 MB — and the refusal took regex search away from the whole
+/// terminal as "bad regex". The floor keeps every row's budget what it was;
+/// the per-byte rate keeps a long line's worst case no worse per byte than a
+/// full-width row's (the R3 sizing); the ceiling keeps the pathological
+/// pattern's cost on any one line bounded in time.
+pub(crate) fn regex_line_budget(len: usize) -> u64 {
+    u64::try_from(len)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(REGEX_STEP_PER_BYTE)
+        .clamp(REGEX_STEP_LIMIT, REGEX_LINE_STEP_CEILING)
+}
+
+/// Every match of `re` on one line, under that line's own budget
+/// ([`regex_line_budget`]): the one regex scan of a line every search path
+/// runs, the batch, point navigation and the budgeted engine alike.
+///
+/// The iterator's [`step_limit_exceeded`](aterm_regex::Matches::step_limit_exceeded)
+/// afterwards says whether the scan reached the end of the line. When it did
+/// not, the matches it yielded are real and in order, and the rest of that
+/// line is unsearched: the caller counts the line in
+/// [`SearchResults::cut_short_lines`] and goes on to the next one, rather than
+/// refusing every other line's matches.
+pub(crate) fn scan_line<'r, 't>(
+    re: &'r aterm_regex::Regex,
+    text: &'t str,
+) -> aterm_regex::Matches<'r, 't> {
+    re.find_iter_with_limit(text, regex_line_budget(text.len()))
+}
 
 /// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward
 /// batch results plus the occurrence-line frame that seeds the next
@@ -1484,7 +1752,7 @@ pub struct NarrowedSearch {
     /// include them). `None` when the walk hit the batch cap: a truncated
     /// frame would break the narrowing subset property, so the caller must
     /// reseed from the engine.
-    pub occurrence_lines: Option<Vec<u32>>,
+    pub occurrence_lines: Option<LineFrame>,
 }
 
 /// Error returned when search options are invalid (e.g., a malformed regex).
@@ -1495,6 +1763,13 @@ pub enum SearchOptionsError {
     InvalidRegex(String),
     /// The regex pattern exceeds the maximum allowed length.
     PatternTooLong,
+    /// A point search (find next / previous) found no match, but its regex
+    /// scan could not finish some line within the line's scan budget, so "no
+    /// match" is not established: the rest of that line may hold one. Nothing
+    /// is wrong with the pattern. Batch searches never return this: they
+    /// report such lines in [`SearchResults::cut_short_lines`] beside the
+    /// matches they did find.
+    ScanCutShort,
 }
 
 // Piece-wise `write_str` + `Display::fmt`, never a runtime-argument
@@ -1511,6 +1786,10 @@ impl std::fmt::Display for SearchOptionsError {
                 std::fmt::Display::fmt(&MAX_REGEX_PATTERN_LEN, f)?;
                 f.write_str(" bytes)")
             }
+            Self::ScanCutShort => f.write_str(
+                "no match found, but a line too long for the regex scan budget \
+                 was not searched to its end",
+            ),
         }
     }
 }
@@ -1538,13 +1817,11 @@ impl SearchIndex {
         )
     }
 
-    /// Search with options while retaining the result-cap edge for `direction`.
-    ///
-    /// Results are always returned in ascending coordinate order. When more than
-    /// [`MAX_SEARCH_MATCHES`] exist, forward search retains the oldest matches and
-    /// backward search retains the newest matches. This lets an interactive
-    /// reverse search start at the true newest occurrence without allocating an
-    /// unbounded intermediate result set.
+    /// [`search_results_opts_direction`](Self::search_results_opts_direction)'s
+    /// matches alone. A matches-only answer cannot say a line was cut short,
+    /// so where one was it refuses with [`SearchOptionsError::ScanCutShort`]
+    /// instead of handing back a list that reads as complete.
+    #[cfg(test)]
     pub fn search_with_positions_opts_direction(
         &self,
         query: &str,
@@ -1552,23 +1829,48 @@ impl SearchIndex {
         is_regex: bool,
         direction: SearchDirection,
     ) -> Result<Vec<SearchMatch>, SearchOptionsError> {
+        let (matches, cut_short) =
+            self.search_matches(query, case_sensitive, is_regex, direction)?;
+        if cut_short > 0 {
+            return Err(SearchOptionsError::ScanCutShort);
+        }
+        Ok(matches)
+    }
+
+    /// One batch query's matches, in ascending coordinate order, and how many
+    /// lines its regex scan could not finish (always 0 for a literal query).
+    ///
+    /// When more than [`MAX_SEARCH_MATCHES`] exist, forward search retains
+    /// the oldest matches and backward search the newest. This lets an
+    /// interactive reverse search start at the true newest occurrence without
+    /// allocating an unbounded intermediate result set.
+    fn search_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        is_regex: bool,
+        direction: SearchDirection,
+    ) -> Result<(Vec<SearchMatch>, usize), SearchOptionsError> {
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         // Fast path: case-sensitive literal → trigram-accelerated search
         if case_sensitive && !is_regex {
-            return Ok(match direction {
-                SearchDirection::Forward => self.search_with_positions(query),
-                SearchDirection::Backward => {
-                    let mut matches: Vec<_> = self
-                        .search_before_line(query, self.line_count)
-                        .take(MAX_SEARCH_MATCHES)
-                        .collect();
-                    matches.reverse();
-                    matches
-                }
-            });
+            return Ok((
+                match direction {
+                    SearchDirection::Forward => self.search_with_positions(query),
+                    SearchDirection::Backward => {
+                        let mut matches: Vec<_> = self
+                            .search_before_line(query, self.line_count)
+                            .take(MAX_SEARCH_MATCHES)
+                            .collect();
+                        matches.reverse();
+                        matches
+                    }
+                },
+                0,
+            ));
         }
 
         if is_regex {
@@ -1576,7 +1878,7 @@ impl SearchIndex {
         }
 
         // Case-insensitive literal search
-        Ok(self.search_case_insensitive(query, direction))
+        Ok((self.search_case_insensitive(query, direction), 0))
     }
 
     /// Search with options, returning matches bundled with the eviction signal.
@@ -1606,7 +1908,11 @@ impl SearchIndex {
 
     /// Search with options and retain the capped edge selected by `direction`.
     ///
-    /// See [`search_with_positions_opts_direction`](Self::search_with_positions_opts_direction).
+    /// Results are always in ascending coordinate order. When more than
+    /// [`MAX_SEARCH_MATCHES`] exist, forward search retains the oldest matches
+    /// and backward search the newest. A regex line the scan could not finish
+    /// within its budget is counted in [`SearchResults::cut_short_lines`],
+    /// which marks the results incomplete; every other line's matches stand.
     pub fn search_results_opts_direction(
         &self,
         query: &str,
@@ -1614,8 +1920,8 @@ impl SearchIndex {
         is_regex: bool,
         direction: SearchDirection,
     ) -> Result<SearchResults, SearchOptionsError> {
-        let matches =
-            self.search_with_positions_opts_direction(query, case_sensitive, is_regex, direction)?;
+        let (matches, cut_short) =
+            self.search_matches(query, case_sensitive, is_regex, direction)?;
         // A full result set indicates the per-query MAX_SEARCH_MATCHES cap was hit
         // (round-8): report it via the same `incomplete` signal used for eviction so
         // callers do not treat a capped result set as exhaustive. (Over-reports when a
@@ -1625,32 +1931,30 @@ impl SearchIndex {
             matches,
             self.results_may_be_incomplete() || capped,
             self.lowest_retained_line(),
-        ))
+        )
+        .with_cut_short_lines(cut_short))
     }
 
-    /// Regex search across all cached lines.
+    /// Regex search across all cached lines: the matches, and how many lines
+    /// the scan could not finish within their budget ([`scan_line`]).
     fn search_regex(
         &self,
         query: &str,
         case_sensitive: bool,
         direction: SearchDirection,
-    ) -> Result<Vec<SearchMatch>, SearchOptionsError> {
+    ) -> Result<(Vec<SearchMatch>, usize), SearchOptionsError> {
         let re = Self::compile_regex(query, case_sensitive)?;
         let mut matches = Vec::new();
+        let mut cut_short = 0usize;
         // Absolute row IDs occupy a bounded retained range. Range-scan it
         // directly instead of allocating and O(n log n)-sorting every hash
         // key for each typed regex character.
         let first = self.first_cached_line.min(self.line_count);
         let mut line_nums = match direction {
-            SearchDirection::Forward => {
-                CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count))
-            }
-            SearchDirection::Backward => {
-                CandidateSource::RangeRev((line_as_u32(first)..line_as_u32(self.line_count)).rev())
-            }
+            SearchDirection::Forward => self.line_range(first, self.line_count),
+            SearchDirection::Backward => self.line_range_rev(first, self.line_count),
         };
-        'lines: while let Some(line_u32) = line_nums.next_candidate() {
-            let line_num = line_u32 as usize;
+        'lines: while let Some(line_num) = line_nums.next_candidate() {
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -1663,9 +1967,10 @@ impl SearchIndex {
                     &fallback
                 }
             };
+            let mut scan = scan_line(&re, text);
             match direction {
                 SearchDirection::Forward => {
-                    for cap in re.find_iter(text) {
+                    for cap in scan.by_ref() {
                         // Skip zero-length matches (e.g. `^`, `\b`, `x*` at
                         // non-matching positions), including byte spans that
                         // resolve to zero display columns.
@@ -1681,14 +1986,16 @@ impl SearchIndex {
                             break 'lines;
                         }
                     }
+                    if scan.step_limit_exceeded() {
+                        cut_short = cut_short.saturating_add(1);
+                    }
                 }
                 SearchDirection::Backward => {
-                    // Regex iterators are forward-only within one line. A
-                    // terminal line is width-bounded, so buffer just this
-                    // line and consume it right-to-left; the global result
-                    // vector remains capped.
+                    // Regex iterators are forward-only within one line, so
+                    // buffer just this line and consume it right-to-left; the
+                    // global result vector remains capped.
                     let mut line_matches = Vec::new();
-                    for cap in re.find_iter(text) {
+                    for cap in scan.by_ref() {
                         if cap.start() == cap.end() {
                             continue;
                         }
@@ -1696,6 +2003,9 @@ impl SearchIndex {
                         if start_col != end_col {
                             line_matches.push(SearchMatch::new(line_num, start_col, end_col));
                         }
+                    }
+                    if scan.step_limit_exceeded() {
+                        cut_short = cut_short.saturating_add(1);
                     }
                     for found in line_matches.into_iter().rev() {
                         matches.push(found);
@@ -1706,20 +2016,13 @@ impl SearchIndex {
                 }
             }
         }
-        // One check for the whole walk: `re` is compiled here and used
-        // nowhere else, so its sticky flag can only have been set by the
-        // lines just scanned. If any line was abandoned mid-scan, the list
-        // below is missing matches — say so instead of returning it.
-        if re.step_limit_exceeded() {
-            return Err(Self::regex_scan_budget_exhausted());
-        }
         // Backward collection is globally newest/rightmost first. One
         // linear reversal restores the ascending order expected by GUI
         // mapping without an O(k log k) result sort.
         if direction == SearchDirection::Backward {
             matches.reverse();
         }
-        Ok(matches)
+        Ok((matches, cut_short))
     }
 
     /// Case-insensitive literal search across all cached lines.
@@ -1745,10 +2048,9 @@ impl SearchIndex {
         match direction {
             SearchDirection::Forward => {
                 let mut candidates = self.literal_candidates_forward(&matcher.lower_query, 0);
-                while let Some(line_u32) = candidates.next_candidate() {
+                while let Some(line_num) = candidates.next_candidate() {
                     #[cfg(test)]
                     count_case_insensitive_candidate_visit();
-                    let line_num = line_u32 as usize;
                     let Some(text) = self.lines.get(&line_num) else {
                         continue;
                     };
@@ -1772,10 +2074,9 @@ impl SearchIndex {
             SearchDirection::Backward => {
                 let mut candidates =
                     self.literal_candidates_backward(&matcher.lower_query, self.line_count);
-                while let Some(line_u32) = candidates.next_candidate() {
+                while let Some(line_num) = candidates.next_candidate() {
                     #[cfg(test)]
                     count_case_insensitive_candidate_visit();
-                    let line_num = line_u32 as usize;
                     let Some(text) = self.lines.get(&line_num) else {
                         continue;
                     };
@@ -1903,7 +2204,7 @@ impl SearchIndex {
         &self,
         query: &str,
         case_sensitive: bool,
-        prev_lines: Option<&[u32]>,
+        prev_lines: Option<&LineFrame>,
     ) -> NarrowedSearch {
         if query.is_empty() {
             // Batch parity: an empty query yields no matches; the honesty pair
@@ -1919,13 +2220,13 @@ impl SearchIndex {
         }
 
         /// Either the engine's candidate machinery or an explicit frame —
-        /// both yield ascending, deduplicated retained line ids.
-        enum Candidates<'a> {
+        /// both yield ascending, deduplicated retained line numbers.
+        enum Candidates<I: Iterator<Item = usize>> {
             Engine(CandidateSource),
-            Frame(std::iter::Copied<std::slice::Iter<'a, u32>>),
+            Frame(I),
         }
-        impl Candidates<'_> {
-            fn next(&mut self) -> Option<u32> {
+        impl<I: Iterator<Item = usize>> Candidates<I> {
+            fn next(&mut self) -> Option<usize> {
                 match self {
                     Candidates::Engine(source) => source.next_candidate(),
                     Candidates::Frame(iter) => iter.next(),
@@ -1935,7 +2236,7 @@ impl SearchIndex {
 
         let mut matcher = (!case_sensitive).then(|| CaseInsensitiveMatcher::new(query));
         let mut candidates = match prev_lines {
-            Some(lines) => Candidates::Frame(lines.iter().copied()),
+            Some(lines) => Candidates::Frame(lines.lines()),
             None => Candidates::Engine(match &matcher {
                 // Case-insensitive seed: exactly `search_case_insensitive`'s
                 // forward candidate construction.
@@ -1945,26 +2246,27 @@ impl SearchIndex {
                 None => {
                     let first = self.first_cached_line.min(self.line_count);
                     if query.len() < 3 {
-                        CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count))
+                        self.line_range(first, self.line_count)
                     } else if !self.might_contain(query) {
-                        CandidateSource::Empty
+                        CandidateSource::empty()
                     } else if let Some(postings) = self.posting_lists(query) {
-                        CandidateSource::from_postings_forward(postings, line_as_u32(first))
+                        self.postings_forward(postings, first)
                     } else {
-                        CandidateSource::Empty
+                        CandidateSource::empty()
                     }
                 }
             }),
         };
 
         let mut matches: Vec<SearchMatch> = Vec::new();
-        let mut occurrence_lines: Vec<u32> = Vec::new();
+        // Offsets from this index's key base: every line it holds is in the
+        // key window, so its key is the frame offset.
+        let mut occurrence_lines = LineFrame::with_base(self.key_base);
         let mut capped = false;
         // ONE preparation of the needle for the whole sweep: the literal
         // verifier runs per match and the occurrence probe per line.
         let searcher = crate::bytesearch::Searcher::new(query.as_bytes());
-        'lines: while let Some(line_u32) = candidates.next() {
-            let line_num = line_u32 as usize;
+        'lines: while let Some(line_num) = candidates.next() {
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -1991,7 +2293,7 @@ impl SearchIndex {
                         if matches.len() >= MAX_SEARCH_MATCHES {
                             // Batch parity: `.take(MAX_SEARCH_MATCHES)` stops
                             // exactly here, mid-line included.
-                            occurrence_lines.push(line_u32);
+                            occurrence_lines.push_offset(self.posting_key(line_num));
                             capped = true;
                             break 'lines;
                         }
@@ -2000,7 +2302,7 @@ impl SearchIndex {
                     // zero-display-width matches still keep the line in the
                     // frame (see `CaseInsensitiveMatcher::has_occurrence`).
                     if line_matched || searcher.find_in(text.as_bytes()).is_some() {
-                        occurrence_lines.push(line_u32);
+                        occurrence_lines.push_offset(self.posting_key(line_num));
                     }
                 }
                 // Case-insensitive: the batch arm's exact visitor + cap.
@@ -2011,7 +2313,7 @@ impl SearchIndex {
                         matches.len() < MAX_SEARCH_MATCHES
                     });
                     if line_matched || matcher.has_occurrence(text) {
-                        occurrence_lines.push(line_u32);
+                        occurrence_lines.push_offset(self.posting_key(line_num));
                     }
                     if !completed {
                         capped = true;
@@ -2049,10 +2351,24 @@ impl SearchIndex {
         inclusive: bool,
     ) -> Result<Option<SearchMatch>, SearchOptionsError> {
         let re = Self::compile_regex(query, case_sensitive)?;
-        let found =
+        let (found, cut_short) =
             self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
-        if re.step_limit_exceeded() {
-            return Err(Self::regex_scan_budget_exhausted());
+        Self::point_answer(found, cut_short)
+    }
+
+    /// A point walk's answer. A match it found stands: it is the nearest one
+    /// in the parts of lines the scan could read, and the batch results have
+    /// already reported the rest of any line it could not finish
+    /// ([`SearchResults::cut_short_lines`]). No match at all stands only when
+    /// every line it read was read to the end; otherwise "no match" is not
+    /// established, and the walk says so ([`SearchOptionsError::ScanCutShort`])
+    /// rather than send the cursor nowhere.
+    fn point_answer(
+        found: Option<SearchMatch>,
+        cut_short: bool,
+    ) -> Result<Option<SearchMatch>, SearchOptionsError> {
+        if found.is_none() && cut_short {
+            return Err(SearchOptionsError::ScanCutShort);
         }
         Ok(found)
     }
@@ -2072,19 +2388,12 @@ impl SearchIndex {
             wrap,
         } = find;
         let re = Self::compile_regex(query, case_sensitive)?;
-        let found =
+        let (found, cut_short) =
             self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
-        // Checked after each pass, before the answer is used: a `None` from
-        // a walk that abandoned a line is not "there is no next match", and
-        // navigating past a match the scan never finished reading would
-        // move the cursor to the wrong place.
-        if re.step_limit_exceeded() {
-            return Err(Self::regex_scan_budget_exhausted());
-        }
         if found.is_some() || !wrap {
-            return Ok(found);
+            return Self::point_answer(found, cut_short);
         }
-        let wrapped = match direction {
+        let (wrapped, wrap_cut_short) = match direction {
             SearchDirection::Forward => self.find_compiled_regex_from(
                 &re,
                 self.first_cached_line.min(self.line_count),
@@ -2100,12 +2409,12 @@ impl SearchIndex {
                 true,
             ),
         };
-        if re.step_limit_exceeded() {
-            return Err(Self::regex_scan_budget_exhausted());
-        }
-        Ok(wrapped)
+        Self::point_answer(wrapped, cut_short || wrap_cut_short)
     }
 
+    /// The nearest regex match from the anchor in `direction`, and whether the
+    /// walk passed a line its scan could not finish ([`scan_line`]) — whose
+    /// unread rest it treats as unsearched, as the batch results do.
     fn find_compiled_regex_from(
         &self,
         re: &aterm_regex::Regex,
@@ -2113,20 +2422,16 @@ impl SearchIndex {
         anchor_col: usize,
         direction: SearchDirection,
         inclusive: bool,
-    ) -> Option<SearchMatch> {
+    ) -> (Option<SearchMatch>, bool) {
+        let mut cut_short = false;
         let lower = self.first_cached_line.min(self.line_count);
         let mut candidates = match direction {
-            SearchDirection::Forward => CandidateSource::Range(
-                line_as_u32(anchor_line.max(lower))..line_as_u32(self.line_count),
-            ),
-            SearchDirection::Backward => CandidateSource::RangeRev(
-                (line_as_u32(lower)
-                    ..line_as_u32(anchor_line.saturating_add(1).min(self.line_count)))
-                    .rev(),
-            ),
+            SearchDirection::Forward => self.line_range(anchor_line.max(lower), self.line_count),
+            SearchDirection::Backward => {
+                self.line_range_rev(lower, anchor_line.saturating_add(1).min(self.line_count))
+            }
         };
-        while let Some(line_u32) = candidates.next_candidate() {
-            let line_num = line_u32 as usize;
+        while let Some(line_num) = candidates.next_candidate() {
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -2138,9 +2443,10 @@ impl SearchIndex {
                     &fallback
                 }
             };
+            let mut scan = scan_line(re, text);
             match direction {
                 SearchDirection::Forward => {
-                    for cap in re.find_iter(text) {
+                    for cap in scan.by_ref() {
                         if cap.start() == cap.end() {
                             continue;
                         }
@@ -2155,13 +2461,17 @@ impl SearchIndex {
                                 start_col > anchor_col
                             };
                         if qualifies {
-                            return Some(SearchMatch::new(line_num, start_col, end_col));
+                            return (
+                                Some(SearchMatch::new(line_num, start_col, end_col)),
+                                cut_short,
+                            );
                         }
                     }
+                    cut_short |= scan.step_limit_exceeded();
                 }
                 SearchDirection::Backward => {
                     let mut found = None;
-                    for cap in re.find_iter(text) {
+                    for cap in scan.by_ref() {
                         if cap.start() == cap.end() {
                             continue;
                         }
@@ -2182,13 +2492,14 @@ impl SearchIndex {
                             found = Some(SearchMatch::new(line_num, start_col, end_col));
                         }
                     }
+                    cut_short |= scan.step_limit_exceeded();
                     if found.is_some() {
-                        return found;
+                        return (found, cut_short);
                     }
                 }
             }
         }
-        None
+        (None, cut_short)
     }
 
     /// Find the next case-insensitive literal match without building a batch.
@@ -2214,10 +2525,9 @@ impl SearchIndex {
             return None;
         }
         let mut candidates = self.literal_candidates_forward(&matcher.lower_query, anchor_line);
-        while let Some(line_u32) = candidates.next_candidate() {
+        while let Some(line_num) = candidates.next_candidate() {
             #[cfg(test)]
             count_case_insensitive_candidate_visit();
-            let line_num = line_u32 as usize;
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -2277,10 +2587,9 @@ impl SearchIndex {
         let exclusive_upper = anchor_line.saturating_add(1);
         let mut candidates =
             self.literal_candidates_backward(&matcher.lower_query, exclusive_upper);
-        while let Some(line_u32) = candidates.next_candidate() {
+        while let Some(line_num) = candidates.next_candidate() {
             #[cfg(test)]
             count_case_insensitive_candidate_visit();
-            let line_num = line_u32 as usize;
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -2359,39 +2668,151 @@ mod regex_scan_budget_tests {
         assert!(!re.step_limit_exceeded());
     }
 
-    /// A pattern too expensive to finish a line is **refused**, not answered
-    /// with a short list. The distinction is the whole point: a truncated
-    /// result set presented as exhaustive is a wrong answer, and search results
-    /// are read by `cmd_search` and by a human deciding what is in their
-    /// scrollback.
+    /// A pattern too expensive to finish a line is never answered with a list
+    /// that reads as complete: a truncated result set presented as exhaustive
+    /// is a wrong answer, and search results are read by `cmd_search` and by a
+    /// human deciding what is in their scrollback. The batch result says WHICH
+    /// lines it could not finish and keeps every other line's matches; the
+    /// matches-only API, which cannot say so, refuses; and point navigation
+    /// that found nothing anywhere refuses rather than report "no match".
     #[test]
-    fn a_pattern_that_cannot_finish_a_line_is_refused_not_truncated() {
-        let index = index_with_a_wide_line();
-        let err = index
-            .search_with_positions_opts(EXPENSIVE, true, true)
-            .expect_err("a scan that could not finish must not return matches");
+    fn a_pattern_that_cannot_finish_a_line_is_reported_never_passed_off() {
+        let mut index = index_with_a_wide_line();
+        index.index_line(3, "a z at the end");
+        let got = index
+            .search_results_opts(EXPENSIVE, true, true)
+            .expect("a line out of budget is reported, not refused");
+        assert_eq!(got.cut_short_lines, 1, "{got:?}");
         assert!(
-            matches!(err, SearchOptionsError::InvalidRegex(ref m) if m.contains("too expensive")),
-            "the refusal must name the cause: {err:?}"
+            got.incomplete,
+            "a cut-short line makes the results incomplete"
+        );
+        assert_eq!(
+            got.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
+            vec![3],
+            "the other lines are still searched"
         );
 
-        // Point navigation refuses the same way, rather than reporting "no next
-        // match" and moving the cursor somewhere wrong.
         let err = index
-            .find_regex_direction(
+            .search_with_positions_opts(EXPENSIVE, true, true)
+            .expect_err("a matches-only answer cannot say a line was cut short");
+        assert_eq!(err, SearchOptionsError::ScanCutShort);
+
+        // Navigation finds the match past the cut-short line, and refuses
+        // only when it has nothing to show.
+        let find = |index: &SearchIndex, anchor: (usize, usize)| {
+            index.find_regex_direction(
                 EXPENSIVE,
                 true,
                 DirectedFind {
-                    anchor: (0, 0),
+                    anchor,
                     direction: SearchDirection::Forward,
                     inclusive: true,
                     wrap: true,
                 },
             )
-            .expect_err("navigation must refuse too");
-        assert!(
-            matches!(err, SearchOptionsError::InvalidRegex(_)),
-            "{err:?}"
+        };
+        assert_eq!(
+            find(&index, (0, 0)).map(|m| m.map(|m| m.line)),
+            Ok(Some(3)),
+            "the walk goes on past the line it could not finish"
+        );
+        let wide_only = index_with_a_wide_line();
+        assert_eq!(
+            find(&wide_only, (0, 0)),
+            Err(SearchOptionsError::ScanCutShort),
+            "no match found, but the wide line's rest is unread: not \"no match\""
+        );
+    }
+
+    /// The budget per line: a row up to full width keeps the R3 budget, a
+    /// longer line gets the same rate per byte, and no line gets more than
+    /// the ceiling — the bound that keeps the pathological pattern's cost on
+    /// one line finite whatever its length.
+    #[test]
+    fn the_line_budget_scales_with_the_line_under_a_ceiling() {
+        assert_eq!(regex_line_budget(0), REGEX_STEP_LIMIT);
+        assert_eq!(regex_line_budget(120), REGEX_STEP_LIMIT);
+        assert_eq!(regex_line_budget(4096), REGEX_STEP_LIMIT);
+        assert_eq!(regex_line_budget(8192), 2 * REGEX_STEP_LIMIT);
+        assert_eq!(regex_line_budget(64 * 1024), REGEX_LINE_STEP_CEILING);
+        assert_eq!(regex_line_budget(4_300_000), REGEX_LINE_STEP_CEILING);
+        assert_eq!(regex_line_budget(usize::MAX), REGEX_LINE_STEP_CEILING);
+        let mut last = 0;
+        for len in (0..200_000).step_by(997) {
+            let budget = regex_line_budget(len);
+            assert!(budget >= last, "monotone at {len}");
+            assert!(
+                budget
+                    <= REGEX_STEP_PER_BYTE
+                        .saturating_mul(len as u64)
+                        .max(REGEX_STEP_LIMIT),
+                "never more per byte than a full-width row at {len}"
+            );
+            last = budget;
+        }
+    }
+
+    /// A minified bundle, a single-line JSON reply: find joins a soft-wrapped
+    /// run into ONE line, and an ordinary pattern over such a line used to be
+    /// refused for the whole terminal ("pattern too expensive", shown as "bad
+    /// regex") — from 4.2 MB for `needle`, under 1 MB for `\w+\(`. Now it
+    /// finds every match there, and in the short lines around it.
+    #[test]
+    fn ordinary_patterns_over_a_long_joined_line_find_their_matches() {
+        let unit = "function a(b){return b+1};var needle_x=[1,2,3];";
+        for (len, pattern, case_sensitive) in [
+            (100_000, "needle", true),
+            (1_000_000, r"\w+\(", true),
+            (1_000_000, "[a-z]+=", true),
+            (4_300_000, "needle", true),
+            (4_300_000, "NEEDLE_X", false),
+        ] {
+            let mut long = unit.repeat(len / unit.len() + 1);
+            long.truncate(len);
+            let units = len / unit.len();
+            let mut index = SearchIndex::new();
+            index.index_line(0, "$ echo needle one");
+            index.index_line(1, &long);
+            index.index_line(2, "$ echo needle after");
+            let got = index
+                .search_results_opts(pattern, case_sensitive, true)
+                .unwrap_or_else(|e| panic!("{len} {pattern:?} must not be refused: {e}"));
+            assert_eq!(got.cut_short_lines, 0, "{len} {pattern:?}");
+            assert!(!got.incomplete, "{len} {pattern:?}");
+            let on_long = got.matches.iter().filter(|m| m.line == 1).count();
+            assert!(
+                on_long >= units,
+                "{len} {pattern:?}: {on_long} of {units}+ on the long line"
+            );
+            let short_lines = [0, 2].map(|line| got.matches.iter().any(|m| m.line == line));
+            assert_eq!(
+                short_lines,
+                [pattern == "needle"; 2],
+                "{len} {pattern:?}: the short lines around it"
+            );
+        }
+    }
+
+    /// The R3 pathological pattern over a line far longer than a row stays
+    /// bounded: its scan stops at the ceiling, the line is counted cut short,
+    /// and the rows after it are still searched.
+    #[test]
+    fn the_pathological_pattern_over_a_long_line_stops_at_the_ceiling() {
+        let long = "x".repeat(4_300_000);
+        assert_eq!(regex_line_budget(long.len()), REGEX_LINE_STEP_CEILING);
+        let mut index = SearchIndex::new();
+        index.index_line(0, "before z");
+        index.index_line(1, &long);
+        index.index_line(2, "after z");
+        let got = index
+            .search_results_opts(EXPENSIVE, true, true)
+            .expect("reported, not refused");
+        assert_eq!(got.cut_short_lines, 1);
+        assert!(got.incomplete);
+        assert_eq!(
+            got.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
+            vec![0, 2]
         );
     }
 
@@ -2418,3 +2839,7 @@ mod regex_scan_budget_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "index_key_window_tests.rs"]
+mod index_key_window_tests;

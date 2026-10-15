@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The BUNDLED TERMINAL FONT STACK (non-macOS).
+//! The BUNDLED TERMINAL FONT STACK (non-macOS), and Iosevka Term (everywhere).
 //!
 //! Owner decision (2026-09-24): the fonts a stock Linux ships are poor and
 //! incomplete — `fc-match monospace` answers DejaVu Sans Mono, and nothing on a
@@ -76,6 +76,30 @@
 //! its comma and, at the default 16 px, a row of `j` keeps a clear pixel row
 //! above the caron of an `Š` on the next row.
 //!
+//! # Iosevka Term, by name, everywhere
+//!
+//! **Iosevka Term** 34.9.0 (SIL OFL 1.1; Regular / Bold / Italic /
+//! BoldItalic; owner request 2026-10-14, "add https://typeof.net/Iosevka/ to
+//! aterm and try it") is compiled in on EVERY platform the stack feature is
+//! on, macOS included ([`IOSEVKA_ACTIVE`]), and is nobody's default and no
+//! chain face: `font_family = "Iosevka Term"` selects it, and an installed
+//! Iosevka Term wins that name as JetBrains Mono's does. The Term cut is the
+//! one for terminals: strictly monospaced, its arrows and geometric shapes one
+//! cell wide. Its cell is narrow — a 0.5 em advance on a 1.25 em line, 8x20
+//! at 16 px where JetBrains Mono is 10x21 — so a window of the same width
+//! holds a quarter more columns.
+//!
+//! What ships is a SUBSET of the official unhinted release (aterm hints with
+//! the autohinter, or CoreText on macOS, so the font's own bytecode would be
+//! dead weight): 5,015 code points — Latin, Greek, Cyrillic, Armenian,
+//! punctuation, arrows, math, Misc Technical, box drawing, blocks, Braille,
+//! legacy computing, Powerline — and HarfBuzz's default layout features
+//! (ligatures, marks, fractions), not Iosevka's stylistic sets and character
+//! variants: about 0.6 MB a face where the whole is 8.4 to 8.9 MB.
+//! `publish/DECISIONS.md` holds the source digests, the command and the
+//! measured sizes. Iosevka declares no Reserved Font Name, so the subset keeps
+//! its name.
+//!
 //! Every face here is `include_bytes!`'d, so the stack needs no I/O and works
 //! identically on a stripped container and a full desktop.
 //!
@@ -105,10 +129,11 @@
 //! Math in the symbol tier) is unchanged by the decision, so on macOS nothing
 //! here would ever be selected by default — and a universal binary would carry
 //! the ~2.8 MB twice. [`ACTIVE`] is therefore `false` there and every function
-//! below answers "no bundled face", reducing each call site exactly to its
-//! pre-stack behaviour.
+//! below answers "no bundled face" but for Iosevka Term's four identities,
+//! reducing each default call site exactly to its pre-stack behaviour.
 
-/// Whether the bundled stack is compiled into this build.
+/// Whether the bundled stack — the defaults and the chain faces — is compiled
+/// into this build. Iosevka Term has its own switch ([`IOSEVKA_ACTIVE`]).
 pub const ACTIVE: bool = cfg!(all(
     feature = "bundled-font-stack",
     not(target_os = "macos")
@@ -144,6 +169,25 @@ pub const CASCADIA_BOLD_ID: &str = "bundled:Cascadia Mono PL Bold";
 pub const CASCADIA_ITALIC_ID: &str = "bundled:Cascadia Mono PL Italic";
 /// The bundled Cascadia Mono PL's BOLD-ITALIC face identity.
 pub const CASCADIA_BOLD_ITALIC_ID: &str = "bundled:Cascadia Mono PL Bold Italic";
+
+/// Whether this build compiles in the Iosevka Term faces: wherever the stack
+/// feature is on, macOS INCLUDED — unlike the rest of the stack it is never a
+/// default and never a chain face, only a family a user names
+/// (`font_family = "Iosevka Term"`), so it means the same face on every
+/// machine ([`IOSEVKA_FAMILY`]).
+pub const IOSEVKA_ACTIVE: bool = cfg!(feature = "bundled-font-stack");
+
+/// Iosevka Term's family name, as a user types it (name ID 1 of all four
+/// faces). Compiled in on every platform ([`IOSEVKA_ACTIVE`]).
+pub const IOSEVKA_FAMILY: &str = "Iosevka Term";
+/// The bundled Iosevka Term's virtual identity (regular face).
+pub const IOSEVKA_ID: &str = "bundled:Iosevka Term";
+/// The bundled Iosevka Term's BOLD face identity.
+pub const IOSEVKA_BOLD_ID: &str = "bundled:Iosevka Term Bold";
+/// The bundled Iosevka Term's ITALIC face identity.
+pub const IOSEVKA_ITALIC_ID: &str = "bundled:Iosevka Term Italic";
+/// The bundled Iosevka Term's BOLD-ITALIC face identity.
+pub const IOSEVKA_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Bold Italic";
 
 /// The bundled PRIMARY's family name, as a user types it: Cascadia Mono PL on
 /// Windows, JetBrains Mono on every other non-macOS target.
@@ -195,24 +239,44 @@ const ALL_IDS: &[&str] = &[
     JETBRAINS_BOLD_ID,
     JETBRAINS_ITALIC_ID,
     JETBRAINS_BOLD_ITALIC_ID,
+    IOSEVKA_ID,
+    IOSEVKA_BOLD_ID,
+    IOSEVKA_ITALIC_ID,
+    IOSEVKA_BOLD_ITALIC_ID,
     DEJAVU_ID,
     NOTO_SYMBOLS2_ID,
     NOTO_MATH_ID,
 ];
 
-#[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+#[cfg(feature = "bundled-font-stack")]
 mod bytes {
+    #[cfg(not(target_os = "macos"))]
     pub(super) static JBM_REGULAR: &[u8] =
         include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
+    #[cfg(not(target_os = "macos"))]
     pub(super) static JBM_BOLD: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Bold.ttf");
+    #[cfg(not(target_os = "macos"))]
     pub(super) static JBM_ITALIC: &[u8] =
         include_bytes!("../assets/bundled/JetBrainsMono-Italic.ttf");
+    #[cfg(not(target_os = "macos"))]
     pub(super) static JBM_BOLD_ITALIC: &[u8] =
         include_bytes!("../assets/bundled/JetBrainsMono-BoldItalic.ttf");
+    #[cfg(not(target_os = "macos"))]
     pub(super) static NOTO_SYMBOLS2: &[u8] =
         include_bytes!("../assets/bundled/NotoSansSymbols2-Regular.ttf");
+    #[cfg(not(target_os = "macos"))]
     pub(super) static NOTO_MATH: &[u8] =
         include_bytes!("../assets/bundled/NotoSansMath-Regular.ttf");
+    // Every platform, macOS included: the opt-in Iosevka Term (a subset,
+    // `IOSEVKA_FAMILY`), selected only by name.
+    pub(super) static IOSEVKA_REGULAR: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-Regular.ttf");
+    pub(super) static IOSEVKA_BOLD: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-Bold.ttf");
+    pub(super) static IOSEVKA_ITALIC: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-Italic.ttf");
+    pub(super) static IOSEVKA_BOLD_ITALIC: &[u8] =
+        include_bytes!("../assets/bundled/IosevkaTerm-BoldItalic.ttf");
     // Windows only: the Windows primary. A Linux binary never selects it, so
     // it does not carry the ~2.4 MB.
     #[cfg(windows)]
@@ -230,8 +294,8 @@ mod bytes {
 }
 
 /// The bytes behind one virtual identity, or `None` for anything that is not a
-/// bundled identity in THIS build.
-#[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+/// bundled identity in THIS build (on macOS: the Iosevka Term faces alone).
+#[cfg(feature = "bundled-font-stack")]
 #[must_use]
 pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
     match id {
@@ -243,19 +307,30 @@ pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
         CASCADIA_ITALIC_ID => Some(bytes::CASCADIA_ITALIC),
         #[cfg(windows)]
         CASCADIA_BOLD_ITALIC_ID => Some(bytes::CASCADIA_BOLD_ITALIC),
+        #[cfg(not(target_os = "macos"))]
         JETBRAINS_ID => Some(bytes::JBM_REGULAR),
+        #[cfg(not(target_os = "macos"))]
         JETBRAINS_BOLD_ID => Some(bytes::JBM_BOLD),
+        #[cfg(not(target_os = "macos"))]
         JETBRAINS_ITALIC_ID => Some(bytes::JBM_ITALIC),
+        #[cfg(not(target_os = "macos"))]
         JETBRAINS_BOLD_ITALIC_ID => Some(bytes::JBM_BOLD_ITALIC),
+        #[cfg(not(target_os = "macos"))]
         DEJAVU_ID => Some(crate::embedded_font()),
+        #[cfg(not(target_os = "macos"))]
         NOTO_SYMBOLS2_ID => Some(bytes::NOTO_SYMBOLS2),
+        #[cfg(not(target_os = "macos"))]
         NOTO_MATH_ID => Some(bytes::NOTO_MATH),
+        IOSEVKA_ID => Some(bytes::IOSEVKA_REGULAR),
+        IOSEVKA_BOLD_ID => Some(bytes::IOSEVKA_BOLD),
+        IOSEVKA_ITALIC_ID => Some(bytes::IOSEVKA_ITALIC),
+        IOSEVKA_BOLD_ITALIC_ID => Some(bytes::IOSEVKA_BOLD_ITALIC),
         _ => None,
     }
 }
 
 /// The bytes behind one virtual identity: none, the stack being compiled out.
-#[cfg(not(all(feature = "bundled-font-stack", not(target_os = "macos"))))]
+#[cfg(not(feature = "bundled-font-stack"))]
 #[must_use]
 pub fn face_for_id(_id: &str) -> Option<&'static [u8]> {
     None
@@ -296,6 +371,10 @@ pub fn face_for_family(family: &str) -> Option<(&'static str, &'static [u8])> {
         "jetbrainsmonobold" => JETBRAINS_BOLD_ID,
         "jetbrainsmonoitalic" => JETBRAINS_ITALIC_ID,
         "jetbrainsmonobolditalic" => JETBRAINS_BOLD_ITALIC_ID,
+        "iosevkaterm" | "iosevkatermregular" => IOSEVKA_ID,
+        "iosevkatermbold" => IOSEVKA_BOLD_ID,
+        "iosevkatermitalic" => IOSEVKA_ITALIC_ID,
+        "iosevkatermbolditalic" => IOSEVKA_BOLD_ITALIC_ID,
         #[cfg(windows)]
         "cascadiamonopl" | "cascadiamonoplregular" => CASCADIA_ID,
         #[cfg(windows)]
@@ -328,14 +407,16 @@ pub fn styled_siblings(primary: &str) -> [Option<&'static [u8]>; 3] {
             CASCADIA_ITALIC_ID,
             CASCADIA_BOLD_ITALIC_ID,
         ],
+        IOSEVKA_ID => [IOSEVKA_BOLD_ID, IOSEVKA_ITALIC_ID, IOSEVKA_BOLD_ITALIC_ID],
         _ => return [None; 3],
     };
     ids.map(face_for_id)
 }
 
 /// The four-face families a bundled PRIMARY can come from, each in
-/// `[regular, bold, italic, bold-italic]` order.
-const PRIMARY_FAMILIES: [[&str; 4]; 2] = [
+/// `[regular, bold, italic, bold-italic]` order: the two defaults, and Iosevka
+/// Term, which only a user's choice makes the primary.
+const PRIMARY_FAMILIES: [[&str; 4]; 3] = [
     [
         CASCADIA_ID,
         CASCADIA_BOLD_ID,
@@ -347,6 +428,12 @@ const PRIMARY_FAMILIES: [[&str; 4]; 2] = [
         JETBRAINS_BOLD_ID,
         JETBRAINS_ITALIC_ID,
         JETBRAINS_BOLD_ITALIC_ID,
+    ],
+    [
+        IOSEVKA_ID,
+        IOSEVKA_BOLD_ID,
+        IOSEVKA_ITALIC_ID,
+        IOSEVKA_BOLD_ITALIC_ID,
     ],
 ];
 
@@ -377,6 +464,9 @@ const PRIMARY_FAMILIES: [[&str; 4]; 2] = [
 ///   where they touch, and the hinted accents overlap the descenders by a
 ///   row at 9 and 14 px — as the hinter's rounding falls.
 /// * JetBrains Mono 2.304: 240 of 1000, inside its 300 descent. No change.
+/// * Iosevka Term 34.9.0 (measured 2026-10-14, all four faces): 256 of 1000,
+///   inside its 285 descent (ascent 965, no lineGap: a 1.25 em line). No
+///   change.
 ///
 /// Only the bundled families, whose bytes this module owns and which were
 /// measured. An installed face — the system's variable Cascadia Mono has the
@@ -543,19 +633,24 @@ pub fn supersedes_system_face(path: &str) -> bool {
 }
 
 /// Families the bundled stack makes selectable by NAME (for `list-fonts`): the
-/// primary, and on Windows JetBrains Mono beside it.
+/// primary, on Windows JetBrains Mono beside it, and Iosevka Term everywhere
+/// (macOS included, where it is the one).
 #[must_use]
 pub fn selectable_families() -> &'static [&'static str] {
-    if !ACTIVE {
+    if !IOSEVKA_ACTIVE {
         return &[];
     }
     #[cfg(windows)]
     {
-        &[CASCADIA_FAMILY, JETBRAINS_FAMILY]
+        &[CASCADIA_FAMILY, JETBRAINS_FAMILY, IOSEVKA_FAMILY]
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        &[JETBRAINS_FAMILY]
+        &[IOSEVKA_FAMILY]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        &[JETBRAINS_FAMILY, IOSEVKA_FAMILY]
     }
 }
 
@@ -608,8 +703,28 @@ mod tests {
                 "{spelling:?}"
             );
         }
+        // Iosevka Term resolves by name, in all four styles, wherever the stack
+        // feature is on — macOS included.
+        for (spelling, id) in [
+            ("Iosevka Term", IOSEVKA_ID),
+            ("iosevka-term", IOSEVKA_ID),
+            ("IosevkaTerm", IOSEVKA_ID),
+            (" IOSEVKA TERM REGULAR ", IOSEVKA_ID),
+            ("Iosevka Term Bold", IOSEVKA_BOLD_ID),
+            ("Iosevka Term Italic", IOSEVKA_ITALIC_ID),
+            ("Iosevka Term Bold Italic", IOSEVKA_BOLD_ITALIC_ID),
+            (IOSEVKA_ID, IOSEVKA_ID),
+        ] {
+            assert_eq!(
+                face_for_family(spelling).map(|(id, _)| id),
+                IOSEVKA_ACTIVE.then_some(id),
+                "{spelling:?}"
+            );
+        }
         // An installed family keeps meaning the installed face — including
-        // `Cascadia Mono`, the system's variable cut, which is not this one.
+        // `Cascadia Mono`, the system's variable cut, which is not this one,
+        // and `Iosevka` (not Term), whose arrows are wide.
+        assert!(face_for_family("Iosevka").is_none());
         assert!(face_for_family("DejaVu Sans Mono").is_none());
         assert!(face_for_family("JetBrains Mono NL").is_none());
         assert!(face_for_family("Cascadia Mono").is_none());
@@ -645,13 +760,19 @@ mod tests {
         assert_eq!(CASCADIA_ACTIVE, ACTIVE && cfg!(windows));
         assert_eq!(face_for_id(CASCADIA_ID).is_some(), CASCADIA_ACTIVE);
         let order = selectable_families();
-        if !ACTIVE {
+        if !IOSEVKA_ACTIVE {
             assert!(order.is_empty());
         } else if cfg!(windows) {
-            assert_eq!(order, [CASCADIA_FAMILY, JETBRAINS_FAMILY]);
+            assert_eq!(order, [CASCADIA_FAMILY, JETBRAINS_FAMILY, IOSEVKA_FAMILY]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(order, [IOSEVKA_FAMILY]);
         } else {
-            assert_eq!(order, [JETBRAINS_FAMILY]);
+            assert_eq!(order, [JETBRAINS_FAMILY, IOSEVKA_FAMILY]);
         }
+        // Iosevka Term is no platform's default and no chain face.
+        assert!(!default_primary_candidates().contains(&IOSEVKA_ID));
+        assert!(!broad_fallback_ids().contains(&IOSEVKA_ID));
+        assert!(!symbol_fallback_ids().contains(&IOSEVKA_ID));
         // The broad tier is DejaVu Sans Mono alone on every platform: JetBrains
         // Mono is selectable on Windows, never a chain face there.
         let broad: &[&str] = if ACTIVE { &[DEJAVU_ID] } else { &[] };
@@ -662,12 +783,19 @@ mod tests {
     /// for each of its four faces, and is a property of the BUNDLED bytes only.
     #[test]
     fn the_letter_floor_is_the_familys_deepest_latin_letter() {
+        let per_em = |id: &str| letter_descent_floor(face_for_id(id).unwrap());
+        if IOSEVKA_ACTIVE {
+            // Iosevka Term: 256 of 1000 (the comma-below letters), inside
+            // its 285 descent — the floor exists and changes nothing.
+            for id in PRIMARY_FAMILIES[2] {
+                assert_eq!(per_em(id), Some(-0.256), "{id}");
+            }
+        }
         if !ACTIVE {
             #[cfg(feature = "embedded-font")]
             assert!(letter_descent_floor(crate::embedded_font()).is_none());
             return;
         }
-        let per_em = |id: &str| letter_descent_floor(face_for_id(id).unwrap());
         // JetBrains Mono: 240 of 1000 (the comma-below letters), inside its
         // 300 descent — the floor exists and changes nothing.
         for id in PRIMARY_FAMILIES[1] {
@@ -695,30 +823,27 @@ mod tests {
     /// italic bit, and by their `name`-table family (name ID 1).
     #[test]
     fn every_bundled_face_parses_and_each_family_is_a_real_monospace_family() {
-        if !ACTIVE {
-            return;
-        }
         let served: Vec<&str> = ALL_IDS
             .iter()
             .copied()
             .filter(|id| face_for_id(id).is_some())
             .collect();
-        let expected_count = if CASCADIA_ACTIVE { 11 } else { 7 };
+        let expected_count = usize::from(ACTIVE) * 7
+            + usize::from(CASCADIA_ACTIVE) * 4
+            + usize::from(IOSEVKA_ACTIVE) * 4;
         assert_eq!(served.len(), expected_count, "{served:?}");
         for id in &served {
             let bytes = face_for_id(id).expect("filtered to served ids");
             let face = ttf_parser::Face::parse(bytes, 0).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(face.number_of_glyphs() > 100, "{id}");
         }
-        let mut families = vec![(
-            JETBRAINS_FAMILY,
-            [
-                JETBRAINS_ID,
-                JETBRAINS_BOLD_ID,
-                JETBRAINS_ITALIC_ID,
-                JETBRAINS_BOLD_ITALIC_ID,
-            ],
-        )];
+        let mut families = Vec::new();
+        if ACTIVE {
+            families.push((JETBRAINS_FAMILY, PRIMARY_FAMILIES[1]));
+        }
+        if IOSEVKA_ACTIVE {
+            families.push((IOSEVKA_FAMILY, PRIMARY_FAMILIES[2]));
+        }
         if CASCADIA_ACTIVE {
             families.push((
                 CASCADIA_FAMILY,
@@ -895,6 +1020,67 @@ mod tests {
             checked += 1;
         }
         eprintln!("{checked} bundled famil(ies) resolved by name");
+    }
+
+    /// IOSEVKA TERM BY NAME, on every platform the stack feature is on —
+    /// macOS included, where nothing else of the stack is compiled in: the
+    /// family name and its identity resolve to the compiled-in faces (an
+    /// installed Iosevka Term would win the name), a renderer built on it
+    /// fills its three styled slots from the family's REAL Bold, Italic and
+    /// Bold Italic faces (no shear, no dilation), `list-fonts` names it, and
+    /// its cell at the 16 px probe is its own: a 0.5 em advance and a 1.25
+    /// em line, 8x20 — two cells narrower than JetBrains Mono's 10, so a
+    /// window holds a quarter more columns. Its private-use glyphs are its
+    /// own: its Powerline points (U+E0A0..E0A3, U+E0B0..E0B3) stand inside
+    /// its line (-285..965 of 1000), so it does not yield them.
+    #[test]
+    fn iosevka_term_is_selectable_by_name_on_every_platform() {
+        if !IOSEVKA_ACTIVE {
+            return;
+        }
+        assert!(selectable_families().contains(&IOSEVKA_FAMILY));
+        assert!(crate::list_fonts().iter().any(|f| f == IOSEVKA_FAMILY));
+        for id in PRIMARY_FAMILIES[2] {
+            assert!(!yields_private_use(face_for_id(id).unwrap()), "{id}");
+        }
+        if crate::resolve_font_family(IOSEVKA_FAMILY).is_some() {
+            eprintln!("SKIP by-name half: {IOSEVKA_FAMILY} is installed on this host");
+            return;
+        }
+        for spelling in [IOSEVKA_FAMILY, IOSEVKA_ID] {
+            assert_eq!(
+                crate::resolve_config_font(spelling).as_deref(),
+                Ok(IOSEVKA_ID)
+            );
+            let mut r =
+                Renderer::from_system_with_family(Some(spelling), 18.0, Theme::default()).unwrap();
+            r.seal_admitted_font_sources();
+            assert_eq!(r.primary_source_path(), Some(IOSEVKA_ID), "{spelling}");
+            assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
+            for (slot, id) in r.styled_faces.iter().zip(&PRIMARY_FAMILIES[2][1..]) {
+                let face = slot.as_ref().expect("slot filled");
+                assert_eq!(&face.bytes[..], face_for_id(id).unwrap(), "{id}");
+            }
+        }
+        let batch = crate::font_catalog::resolve_and_admit(&[
+            IOSEVKA_FAMILY.to_string(),
+            format!("{IOSEVKA_FAMILY} Bold Italic"),
+        ]);
+        let admitted: Vec<_> = batch
+            .entries
+            .iter()
+            .map(|e| e.result.as_ref().map(|a| a.path.clone()).ok())
+            .collect();
+        assert_eq!(
+            admitted,
+            [
+                Some(IOSEVKA_ID.to_string()),
+                Some(IOSEVKA_BOLD_ITALIC_ID.to_string())
+            ]
+        );
+        let info = crate::face_info(IOSEVKA_FAMILY).expect("face_info resolves the bundle");
+        assert_eq!(info.path, IOSEVKA_ID);
+        assert_eq!((info.cell_width, info.cell_height), (8, 20));
     }
 
     /// The LIVE cell of the default face at the default Windows size (16 px):

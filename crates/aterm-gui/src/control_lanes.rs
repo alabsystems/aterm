@@ -30,9 +30,12 @@
 //! * on a WAIT lane ([`WaitLanes`], at most `CONTROL_WAIT_WORKERS` threads, grown
 //!   on demand and kept): serving a request whose time is spent WAITING on an
 //!   event — `await`, `ready`, `wait`, `turn`, a `post` or `inbox get @…` that
-//!   parks on the bridge — or relaying the connection somewhere else (`dial
+//!   parks on the bridge, a paste into another session waiting (bounded) for its
+//!   program to read it — or relaying the connection somewhere else (`dial
 //!   <name>`, a session this instance does not host). A request lane that reads
-//!   such a line hands the connection over and is free again at once.
+//!   such a line hands the connection over and is free again at once. No lane
+//!   waits on a program to WRITE to it: a verb's input never parks its lane
+//!   (`control::background_input`).
 //! * on a request lane SERVING A WAIT no wait lane can take — every one is
 //!   taken. At most `LaneLimits::inline` request lanes do so at once
 //!   (`CONTROL_INLINE_WAITS`, half of them); a wait past that gets the busy reply
@@ -1054,6 +1057,11 @@ impl Lanes {
                 inline = self.take_inline();
                 if inline.is_none() {
                     refuse_wait(&mut reply.bytes);
+                    // A refused frame's body was never read: left in the
+                    // stream, the next turn would serve it as requests under
+                    // this connection's scope. Closed once the busy line is
+                    // out, as a frame refused on its header is.
+                    reply.then_close = announced_body(&line) > 0;
                     may_defer = true;
                     served = true;
                     continue;

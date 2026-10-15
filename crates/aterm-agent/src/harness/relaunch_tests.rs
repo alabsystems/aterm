@@ -3,11 +3,18 @@
 
 use super::*;
 
+/// A cold restore's wait yields the one sweep lock between its checks; a live
+/// relaunch keeps its wait, and so does the upgrade's, which reads an agent
+/// that ended at once early ([`ends_at_once`]) but waits out one still
+/// starting.
 #[test]
 fn a_cold_restore_yields_between_session_checks_but_live_relaunch_keeps_its_wait() {
     assert_eq!(held_wait(CAUSE_HOST), Duration::from_secs(7));
     assert!(held_wait(CAUSE_HOST) > ENDED_AT_ONCE);
     assert_eq!(held_wait(CAUSE_EXIT), HELD_WAIT);
+    assert!(ends_at_once("") && ends_at_once(CAUSE_UPGRADE_FRESH));
+    assert_eq!(held_wait(""), HELD_WAIT);
+    assert_eq!(held_wait(CAUSE_UPGRADE_FRESH), HELD_WAIT);
 }
 
 fn words(list: &[&str]) -> Vec<String> {
@@ -82,7 +89,11 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
 /// about first, so their own exit is never said to them as a limit.
 /// Negative controls: a keystroke older than the grace, `-`, a server that
 /// does not say, an unreadable status, an unnamed turn (this host's own
-/// loop types so) and a `driving:` hand are nobody.
+/// loop types so) and a `driving:` hand are nobody. An exit the explicit
+/// restart made is neither a person's nor a holder's (ruling 20 of
+/// 2026-10-14): carried through a hold, a lease or a named turn, its relaunch
+/// typed once the hand lifts (`WAIT_HAND_LIFTS`); the owner's limit still
+/// holds it.
 #[test]
 fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     let st = |tail: &str| format!("OK schema=1 {tail}");
@@ -148,21 +159,51 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     );
     // An agent that had stopped reading its input, exited by the stall's
     // remedy: a keystroke just before was read by nothing, so it is no
-    // person's exit. A holder still owns it, and the owner's limit still holds.
+    // person's exit. Nor is it a holder's (ruling 20 of 2026-10-14, THE
+    // HOLDER RULE AT THE READ): a hold, a lease or a turn that landed after
+    // the act's program ended is waited out — the host types its relaunch
+    // only once it lifts — never handed the exit, which left the agent a
+    // person asked to restart at its shell. What it waits out is every hand
+    // the relaunch line waits on (`hand_on_tab`, the review of ruling 20):
+    // under an owner-class turn or a `driving:` hand too, which no exit is
+    // left to, an attempt would answer the line's `wait:held`, a counted
+    // miss. Not a person's keystroke, unread input or this process's own
+    // lease: the line's counted waits suit those. The owner's limit still
+    // holds.
     assert_eq!(
         on_exit(true, Some(&typed(1)), 120, true, false),
         OnExit::Relaunch
     );
-    assert_eq!(
-        on_exit(
-            true,
-            Some(&st("hold=1 hand=- human_ms=1")),
-            120,
-            true,
-            false
-        ),
-        OnExit::Held
+    for (held, holder) in [
+        ("hold=1 hand=- human_ms=1", true),
+        ("hold=0 hand=lease:orchestrator human_ms=-", true),
+        ("hold=0 hand=turn:41:s-9f00 human_ms=-", true),
+        ("hold=0 hand=turn:41 human_ms=-", false),
+        ("hold=0 hand=driving:s-9f00 human_ms=-", false),
+    ] {
+        assert_eq!(
+            on_exit(true, Some(&st(held)), 120, true, false),
+            OnExit::Relaunch,
+            "{held}"
+        );
+        assert!(hand_on_tab(&st(held)), "{held}: what the host waits out");
+        assert_eq!(
+            held_by_someone(&st(held)),
+            holder,
+            "{held}: an unasked exit is left to it"
+        );
+    }
+    let ours = format!(
+        "hold=0 hand=lease:{} human_ms=-",
+        super::super::upgrade_drive::hand_name()
     );
+    for free in [
+        "hold=0 hand=- human_ms=1",
+        "hold=0 hand=- human_ms=- input=3",
+        ours.as_str(),
+    ] {
+        assert!(!hand_on_tab(&st(free)), "{free}: no hand that waits");
+    }
     assert_eq!(
         on_exit(false, Some(&typed(1)), 120, true, false),
         OnExit::Limited
@@ -245,7 +286,12 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
     // owed, looked at again uncounted (ruling 13 of 2026-10-08) — never the
     // bare `not-exited` above, which is left.
     assert_eq!(outcome(WAIT_ACT_ENDS), Outcome::Busy);
+    // An asked exit carried through a hand on its tab: looked at again
+    // uncounted until it lifts (ruling 20 of 2026-10-14) — never the line's
+    // own `wait:held` below, a counted miss.
+    assert_eq!(outcome(WAIT_HAND_LIFTS), Outcome::Busy);
     for step in [
+        "wait:held",
         "wait:shell-prompt",
         "wait:resume",
         "failed:no-resume",
@@ -256,33 +302,94 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
     }
 }
 
-/// The relaunched agent reads as ended only once every look for
-/// [`ENDED_AT_ONCE`] found its shell holding the tab, looks taken
-/// [`SHELL_LOOK`] apart. Negative controls: the agent still starting starts
-/// the count over; an unreadable look is no verdict; a look before
-/// [`SHELL_LOOK`] has passed is not taken.
+/// The relaunched agent reads as ended only once its line's command was
+/// SEEN TO RUN and every look for [`ENDED_AT_ONCE`] since found its shell
+/// holding the tab, looks taken [`SHELL_LOOK`] apart. With no block read
+/// (the kernel's witness), the line ran once a look found the shell NOT
+/// holding its terminal; with the block the line was typed into (the
+/// shell's own word, [`line_over`]), once that block is over, and nothing
+/// else counts. NEGATIVE CONTROLS: a shell that held its terminal
+/// throughout — its own hooks before the agent starts — never reads as
+/// ended, however long; nor does a block not over, though the agent held
+/// the terminal; the agent still starting starts the count over; an
+/// unreadable look is no verdict; a look before [`SHELL_LOOK`] has passed is
+/// not taken.
 #[test]
-fn a_shell_that_has_the_tab_back_reads_as_ended_only_after_a_while() {
+fn a_shell_that_has_the_tab_back_reads_as_ended_only_once_its_line_ran() {
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let mut back = ShellBack::default();
     assert!(back.due(at(0)));
     assert!(!back.due(at(400)), "not at the roster's pace");
     assert!(back.due(at(1_000)));
-    assert!(!back.saw(Some(true), at(0)), "held just now");
-    assert!(!back.saw(None, at(3_000)), "an unread look is no verdict");
-    assert!(!back.saw(Some(false), at(4_000)), "the agent holds it");
-    assert!(!back.saw(Some(true), at(5_000)), "the count started over");
-    assert!(!back.saw(None, at(9_000)));
-    assert!(!back.saw(Some(true), at(9_999)));
+    for s in 0..60 {
+        assert!(
+            !back.saw(Some(true), None, at(s * 1_000)),
+            "held throughout: its line never seen to run"
+        );
+    }
+    let t = 60_000;
+    assert!(!back.saw(Some(false), None, at(t)), "the agent holds it");
+    assert!(!back.saw(Some(true), None, at(t + 1_000)), "held just now");
     assert!(
-        back.saw(Some(true), at(10_000)),
+        !back.saw(None, None, at(t + 3_000)),
+        "an unread look is no verdict"
+    );
+    assert!(
+        !back.saw(Some(false), None, at(t + 4_000)),
+        "the agent holds it again"
+    );
+    assert!(
+        !back.saw(Some(true), None, at(t + 5_000)),
+        "the count started over"
+    );
+    assert!(!back.saw(None, None, at(t + 9_000)));
+    assert!(!back.saw(Some(true), None, at(t + 9_999)));
+    assert!(
+        back.saw(Some(true), None, at(t + 10_000)),
         "held five seconds in a row"
     );
     let mut never = ShellBack::default();
     for s in 0..60 {
-        assert!(!never.saw(None, at(s * 1_000)), "never read, never ended");
+        assert!(
+            !never.saw(None, None, at(s * 1_000)),
+            "never read, never ended"
+        );
     }
+    // THE SHELL'S OWN WORD: the line typed into block 7.
+    let mut marked = ShellBack::after(Some(7));
+    assert!(
+        !marked.saw(Some(false), Some(false), at(0)),
+        "the agent runs"
+    );
+    for s in 1..60 {
+        assert!(
+            !marked.saw(Some(true), Some(false), at(s * 1_000)),
+            "held, its block not over: the agent left it no end"
+        );
+    }
+    let t = 60_000;
+    assert!(
+        !marked.saw(Some(true), None, at(t)),
+        "an unread block is no verdict"
+    );
+    assert!(
+        !marked.saw(Some(true), Some(true), at(t + 1_000)),
+        "over just now"
+    );
+    assert!(
+        !marked.saw(Some(true), None, at(t + 3_000)),
+        "unread: the count stands"
+    );
+    assert!(
+        !marked.saw(Some(false), Some(true), at(t + 4_000)),
+        "something else holds the terminal"
+    );
+    assert!(!marked.saw(Some(true), Some(true), at(t + 5_000)));
+    assert!(
+        marked.saw(Some(true), Some(true), at(t + 10_000)),
+        "over, and held five seconds since"
+    );
 }
 
 /// Another actor on the lock is no miss: an upgrade step in another tab can
@@ -371,6 +478,7 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
         home: None,
+        claude_dir: None,
     };
     let known = snap(&["/opt/claude", "--model", "opus"]);
     assert!(resumes_on_exit(&known), "a launch the relaunch carries");
@@ -450,6 +558,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
         dialect: Some(upgrade::Dialect::Zsh),
         login: None,
         home: None,
+        claude_dir: None,
     };
     let record = |session: &str, at: &str| {
         std::fs::write(
@@ -505,7 +614,7 @@ fn a_relaunch_moves_to_a_newer_build_only_while_the_upgrade_is_on() {
     let ran = Path::new("/opt/claude");
     let running = v("2.1.281");
     let pick = |on: bool, running: Option<&Version>, c: &[upgrade::Candidate]| {
-        relaunch_target(on, running, c, None, ran, Some("2.1.281"), 0)
+        relaunch_target(on, running, c, |_| false, ran, Some("2.1.281"))
     };
     let same = (ran.to_path_buf(), "2.1.281".to_string(), "same".to_string());
     assert_eq!(
@@ -909,6 +1018,8 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
         proc_start: "Thu Sep 24 01:02:03 2026".to_string(),
         kind: "interactive".to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     };
     let gone = |record: bool| {
         Some(ExitLook {
@@ -944,7 +1055,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             true
         },
     );
-    assert_eq!(left, ExitRecord::Survived(sf.clone()));
+    assert_eq!(left, ExitRecord::Survived(Box::new(sf.clone())));
     assert_eq!(waits, settle);
     // …or at the settle's last look: still the exit's own removal.
     let mut looks = 0;
@@ -1001,7 +1112,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
     );
     assert_eq!(
         (left, looks),
-        (ExitRecord::Survived(sf.clone()), settle + 1)
+        (ExitRecord::Survived(Box::new(sf.clone())), settle + 1)
     );
     // Cut short, or nothing readable: nothing decided.
     assert_eq!(exit_record(|| gone(true), |_| false), ExitRecord::Unread);
@@ -1009,7 +1120,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
     assert_eq!(
         [
             ExitRecord::Unread.word(),
-            ExitRecord::Survived(sf).word(),
+            ExitRecord::Survived(Box::new(sf)).word(),
             ExitRecord::Removed.word()
         ],
         ["unread", "survived", "removed"]
@@ -1448,6 +1559,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
         dialect: Some(Dialect::Zsh),
         login: None,
         home,
+        claude_dir: None,
     };
     assert!(resumes_on_exit(&snap(None)));
     assert!(resumes_on_exit(&snap(Some(HOME.to_string()))));
@@ -1530,6 +1642,7 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
         dialect: Some(Dialect::Zsh),
         login,
         home: None,
+        claude_dir: None,
     };
     assert!(resumes_on_exit(&snap(None)));
     assert!(resumes_on_exit(&snap(Some(String::new()))));
@@ -1573,6 +1686,7 @@ fn a_label_is_a_login_only_through_the_roster() {
         dialect: None,
         login: login.map(str::to_string),
         home: None,
+        claude_dir: None,
     };
     assert!(runs_under(&on(None), &roster, "main"));
     assert!(runs_under(&on(Some("")), &roster, "main"));
@@ -1618,7 +1732,10 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
         }
     );
     assert!(relaunch_cause(&plain.cause) && ends_its_agent(&plain.cause));
-    assert!(!starts_afresh(&plain.cause) && !ends_at_once(&plain.cause));
+    assert!(!starts_afresh(&plain.cause));
+    // Its line is typed once: a relaunch that ended as it started is said at
+    // once ([`ends_at_once`]).
+    assert!(ends_at_once(&plain.cause));
     // A hand choice, and a model that rides, are asked for as at a memory
     // restart.
     let hand = model_restart(

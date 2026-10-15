@@ -1887,13 +1887,12 @@ impl AtermTerminal {
             }
         }
 
-        // Smart-selection fallback is scroll-correct (display_row_text is
-        // display_offset-aware) and works on any scrollback row.
-        let (sc, ec) = self
-            .term
-            .smart_word_at(row as usize, col as usize, &self.smart)?;
-        let text = self.term.display_row_text(row as usize)?;
-        let matched = slice_by_columns(&text, sc, ec);
+        // Smart-selection fallback: display_offset-aware, so it works on any
+        // scrollback row, and the word's text is read from the cells its
+        // columns name, not sliced out of the row's text by columns.
+        let (matched, sc, ec) =
+            self.term
+                .smart_word_text_at(row as usize, col as usize, &self.smart)?;
         let kind = classify(&matched);
         if kind == 3 {
             // A plain word is not a link.
@@ -2661,16 +2660,6 @@ pub(crate) fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// Slice `text` to the half-open display-column range `[start_col, end_col)`.
-/// No `unicode-width` dep here, so we approximate display width as 1 per char —
-/// correct for the ASCII URLs/paths that dominate link detection.
-fn slice_by_columns(text: &str, start_col: usize, end_col: usize) -> String {
-    text.chars()
-        .skip(start_col)
-        .take(end_col.saturating_sub(start_col))
-        .collect()
 }
 
 /// Classify a matched span: 1=url (scheme or www. host), 2=file_path (absolute,
@@ -4297,6 +4286,39 @@ mod tests {
         assert_eq!(t.cursor_style(), 5, "DECSCUSR 5 → BlinkingBar");
         t.process(b"\x1b[2 q");
         assert_eq!(t.cursor_style(), 2, "DECSCUSR 2 → SteadyBlock");
+    }
+
+    /// A link under the pointer is read from the cells it is drawn in,
+    /// whatever precedes it on the row (r16 selection-stride): after two
+    /// ideographs, or two flag halves drawn into neighbouring cells out of
+    /// order (two cells each, which a walk of the row's text pairs into one
+    /// two-cell flag), the URL's columns are its own and its text is the
+    /// URL. On origin/main the URL's text was sliced out of the row one
+    /// column a character: after the ideographs it read `tps://example.com/a`,
+    /// no link at all, and after the flag halves the link was answered in
+    /// cells 2-22 and not at cell 24.
+    #[test]
+    fn a_link_after_wide_characters_is_read_from_its_cells() {
+        let mut t = AtermTerminal::new(4, 60, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
+            .expect("the bundled face parses");
+        t.process("\u{65e5}\u{672c} https://example.com/a\r\n".as_bytes());
+        t.process("\x1b[2;3H\u{1f1e7}\x1b[2;1H\u{1f1e6}\x1b[2;5Hhttps://example.com/b".as_bytes());
+        for (row, col, url, start, end) in [
+            (0, 5, "https://example.com/a", 5, 26),
+            (0, 25, "https://example.com/a", 5, 26),
+            (1, 4, "https://example.com/b", 4, 25),
+            (1, 24, "https://example.com/b", 4, 25),
+        ] {
+            let hit = t
+                .link_at(row, col)
+                .unwrap_or_else(|| panic!("({row}, {col}) is over a URL"));
+            assert_eq!(
+                (hit.url(), hit.start_col(), hit.end_col(), hit.kind()),
+                (url.to_string(), start, end, 1),
+                "link at ({row}, {col})"
+            );
+        }
+        assert!(t.link_at(1, 2).is_none(), "a flag half is no link");
     }
 
     #[test]

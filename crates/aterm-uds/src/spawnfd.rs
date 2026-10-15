@@ -76,10 +76,11 @@
 //! ## [`spawn`]: the same, with no lanes
 //!
 //! A long-lived helper this process starts and reads (`/usr/bin/log stream`)
-//! would hold, through a plain `Command`, every descriptor this process had
-//! open without close-on-exec at the spawn — including, for its whole life, a
-//! bridge lane caught between `socketpair` and its `F_SETFD`. [`spawn`] is the
-//! lane spawn with no lanes.
+//! would hold, through a plain `Command` on a std without SP-1, every
+//! descriptor this process had open without close-on-exec at the spawn —
+//! including, for its whole life, a bridge lane caught between `socketpair` and
+//! its `F_SETFD`. [`spawn`] is the lane spawn with no lanes, and strips on any
+//! std.
 //!
 //! ## [`InheritStrip`]: for the spawns that must still fork
 //!
@@ -100,17 +101,17 @@
 //! ## [`command`]: every other child, `std::process::Command`'s shape, no fork
 //!
 //! The window starts short-lived helpers too — `osascript`, `open`, `sysctl`,
-//! `lsof`, `codesign`, an atpkg pass behind `taskpolicy` — and a plain
-//! `Command` hands each of them every descriptor this process holds without
-//! close-on-exec at that instant. MEASURED 2026-10-01 (the pair race in this
-//! module's tests): a plain `Command` racing another thread's
-//! `UnixStream::pair()` (Darwin has no `SOCK_CLOEXEC`, so each end is unflagged
-//! until its `F_SETFD`) carried a pair end into 17-27 of 200 children, and
-//! [`command`] into 0 of 400. (That test's control is a raw leaky spawn,
-//! `test_support`: Trust's std hands a `Command` child nothing above stdio
-//! since SP-1.) It is the one way product code
-//! starts a child (`tools/grep_guard.sh` B27, whose allow-list names the
-//! reviewed exceptions).
+//! `lsof`, `codesign`, an atpkg pass behind `taskpolicy` — and on a std
+//! without SP-1 (upstream's) a plain `Command` hands each of them every
+//! descriptor this process holds without close-on-exec at that instant.
+//! MEASURED 2026-10-01 (the pair race in this module's tests): a plain
+//! `Command` racing another thread's `UnixStream::pair()` (Darwin has no
+//! `SOCK_CLOEXEC`, so each end is unflagged until its `F_SETFD`) carried a pair
+//! end into 17-27 of 200 children, and [`command`] into 0 of 400. (That test's
+//! control is a raw leaky spawn, `test_support`: Trust's std hands a `Command`
+//! child nothing above stdio since SP-1.) It is the one way product code
+//! starts a child, and it strips on any std (`tools/grep_guard.sh` B27, whose
+//! allow-list names the reviewed exceptions).
 //!
 //! [`command`] returns this module's [`Command`] — `std`'s shape and `std`'s
 //! rules ([`no_fork`]'s docs list the few places it differs) — which on Darwin
@@ -150,8 +151,8 @@
 //! handed down in the environment — belong to that program, so its child must
 //! hold this process's WHOLE table. A `std::process::Command` no longer
 //! promises that: since Trust's SP-1 (trust 6eb03c9a18) its child holds fds
-//! 0-2 and only what `CommandExt::inherit_fd` names, and the installed seal's
-//! std has no `inherit_fd` or `inherit_all_fds` to opt back in with.
+//! 0-2 and only what `CommandExt::inherit_fd` names, and that and
+//! `inherit_all_fds` are unstable (`trust_process_inherit_fds`), SP-1 std only.
 //! [`transparent`] passes the table through whatever std this binary links: on
 //! Darwin one `posix_spawn` WITHOUT `POSIX_SPAWN_CLOEXEC_DEFAULT`, elsewhere a
 //! fork with no strip, the stdio slots untouched — upstream std's own spawn.
@@ -450,7 +451,8 @@ pub fn spawn_with_two_fds(
 /// `pipe` caught between its creation and its `F_SETFD`). [`spawn_with_two_fds`]
 /// with no lanes: the same exact inheritance, the same `exec` semantics, the
 /// same handle — for a long-lived helper this process starts and reads, which
-/// a plain `Command` would hand every such descriptor for its whole life.
+/// a plain `Command` on a std without SP-1 would hand every such descriptor for
+/// its whole life.
 ///
 /// # Errors
 /// As [`spawn_with_two_fds`].

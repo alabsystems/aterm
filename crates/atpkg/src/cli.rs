@@ -50,7 +50,6 @@ const VERBS: &[&str] = &[
     "relocate",
     "lineage",
     "noindex",
-    "devroot",
     "machine",
     "lease",
     "lane",
@@ -139,15 +138,6 @@ const VERB_USAGE: &[(&str, &str)] = &[
     (
         "noindex",
         "aterm pkg noindex verify <dir>  — measure whether Spotlight indexes <dir>",
-    ),
-    (
-        "devroot",
-        "aterm pkg devroot                          — the checkouts outside ~/Developer, and \
-         what holds each\n\
-         aterm pkg devroot move (--all | <dir>...)  — move them into ~/Developer and repair \
-         what names them\n\
-         aterm pkg devroot verify                   — measure whether Spotlight skips \
-         ~/Developer",
     ),
     (
         "machine",
@@ -243,7 +233,6 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "gc",
             "repair",
             "noindex",
-            "devroot",
             "machine",
         ],
     ),
@@ -650,12 +639,10 @@ fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
         // Read-only and store-free, like `relocate`: the lineage checker reads a toolchain
         // or a staged tree (and `stamp` writes one file INTO a staged tree the packer owns).
         Some("lineage") => return cmd_lineage(&args[1..]),
-        // Not store mutators at the edge: `noindex` writes nothing under `<prefix>`, and
-        // `devroot` takes the store lock itself only for a move that re-lays a dev link, so
-        // a probe or a plan never queues behind, or blocks, an install. `args[1]` is a
-        // subcommand, so each one's own parser owns every `-`-leading token.
+        // Not a store mutator at the edge: `noindex` writes nothing under `<prefix>`, so a
+        // probe never queues behind, or blocks, an install. `args[1]` is a subcommand, so
+        // its own parser owns every `-`-leading token.
         Some("noindex") => return cmd_noindex(&args[1..]),
-        Some("devroot") => return cmd_devroot(&args[1..]),
         // The [machine] settings' own door, run by the window and the session on their
         // own schedule. Writes a per-host preference and records
         // `<prefix>/machine.applied` — no store lock.
@@ -4570,8 +4557,7 @@ fn parse_noindex(rest: &[String]) -> Result<String, ExitCode> {
     match rest {
         [sub, dir] if sub == "verify" && !dir.starts_with('-') => Ok(dir.clone()),
         [sub] if sub == "verify" => Err(refuse(
-            "`verify` names no directory — say which one, e.g. `aterm pkg noindex verify \
-             ~/Developer`",
+            "`verify` names no directory — say which one, e.g. `aterm pkg noindex verify .`",
         )),
         [] => Err(refuse(
             "say what to measure: `aterm pkg noindex verify <dir>`",
@@ -4601,8 +4587,7 @@ fn cmd_noindex(rest: &[String]) -> ExitCode {
 }
 
 /// Measure `path` and print the verdict under `speaker`, announcing the wait first and
-/// naming the real directory when the operand is a symlink — the one spelling both
-/// `noindex verify` and `devroot verify` print.
+/// naming the real directory when the operand is a symlink.
 fn measure_and_say(speaker: &str, path: &std::path::Path) -> crate::noindex::Verdict {
     if crate::noindex::SUPPORTED {
         // Announce the wait BEFORE it happens. Twenty seconds of a silent cursor reads
@@ -4628,196 +4613,6 @@ fn measure_and_say(speaker: &str, path: &std::path::Path) -> crate::noindex::Ver
     let verdict = crate::noindex::verify(path, &crate::noindex::Timing::DEFAULT);
     println!("{speaker}: {}: {verdict}", path.display());
     verdict
-}
-
-/// What `atpkg devroot` was asked to do.
-#[derive(Debug, PartialEq, Eq)]
-enum DevrootJob {
-    /// Bare `devroot`: the plan for `--all`, read-only.
-    Plan,
-    /// `devroot move (--all | <dir>...)`.
-    Move(crate::devroot::Selection),
-    /// `devroot verify`: measure whether Spotlight skips the root.
-    Verify,
-}
-
-/// Parse `devroot`'s argv. `Err(code)` has ALREADY printed the usage error.
-fn parse_devroot(rest: &[String]) -> Result<DevrootJob, ExitCode> {
-    let refuse = |problem: &str| usage_error("devroot", Some(problem));
-    match rest {
-        [] => Ok(DevrootJob::Plan),
-        [sub] if sub == "verify" => Ok(DevrootJob::Verify),
-        [sub, extra, ..] if sub == "verify" => Err(refuse(&format!(
-            "`verify` takes nothing more, not {extra:?}"
-        ))),
-        [sub] if sub == "move" => Err(refuse(
-            "`move` wants --all or the checkouts to move — it never moves anything unasked",
-        )),
-        [sub, flag] if sub == "move" && flag == "--all" => {
-            Ok(DevrootJob::Move(crate::devroot::Selection::All))
-        }
-        [sub, dirs @ ..] if sub == "move" => {
-            if let Some(bad) = dirs.iter().find(|d| d.starts_with('-')) {
-                return Err(refuse(&format!(
-                    "unexpected argument {bad:?} — `move` takes --all OR checkouts, not both"
-                )));
-            }
-            Ok(DevrootJob::Move(crate::devroot::Selection::Named(
-                dirs.iter().map(std::path::PathBuf::from).collect(),
-            )))
-        }
-        [other, ..] => Err(refuse(&format!("unexpected argument {other:?}"))),
-    }
-}
-
-/// `atpkg devroot [move (--all | <dir>...) | verify]` — the developer root, `~/Developer`
-/// ([`crate::devroot`]).
-///
-/// Bare: every checkout under `$HOME` outside the root, where each would go, and what
-/// holds each (exit 0: a report). `move`: refuses the WHOLE run, exit 3, while anything
-/// holds one of the checkouts it names (uncommitted work, a process in it or in another
-/// checkout of its repository, an agent session, a git lock, a destination in the way, a
-/// repository with submodules that would be split), exit 75 when it would re-lay a dev
-/// link while another pass holds the store; else moves them a repository at a time and
-/// repairs what names their old paths; exit 1 when a repair did not land or a checkout no
-/// longer answers `git status`. `verify`: MEASURES whether Spotlight skips the root (0
-/// skipped, 1 indexed, 3 not measured — no root, or one aterm does not open, included).
-fn cmd_devroot(rest: &[String]) -> ExitCode {
-    const SAY: &str = "atpkg devroot";
-    let job = match parse_devroot(rest) {
-        Ok(job) => job,
-        Err(code) => return code,
-    };
-    let Some(home) = aterm_types::dirs::home_dir()
-        .filter(|h| !h.as_os_str().is_empty())
-        .or_else(crate::platform::account_home)
-    else {
-        eprintln!("{SAY}: no home directory (HOME is unset and the account's is unknown)");
-        return ExitCode::from(3);
-    };
-    let (root, root_is) = crate::devroot::root_at(&home);
-    if job == DevrootJob::Verify {
-        match root_is {
-            crate::devroot::RootIs::Missing => {
-                println!(
-                    "{SAY}: {} does not exist yet — nothing to measure",
-                    root.display()
-                );
-                return ExitCode::from(3);
-            }
-            crate::devroot::RootIs::NotOpened(why) => {
-                println!("{SAY}: not measured — {why}");
-                return ExitCode::from(3);
-            }
-            crate::devroot::RootIs::Folder => {}
-        }
-        let verdict = measure_and_say(SAY, &root);
-        if verdict == crate::noindex::Verdict::Indexed {
-            println!(
-                "{SAY}: fix — add {} to {}",
-                root.display(),
-                crate::devroot::SEARCH_PRIVACY
-            );
-        }
-        return verdict_exit(&verdict);
-    }
-    let survey = crate::devroot::survey(&home);
-    let selection = match &job {
-        DevrootJob::Move(selection) => selection.clone(),
-        _ => crate::devroot::Selection::All,
-    };
-    if survey.outside.is_empty() {
-        println!(
-            "{SAY}: every git checkout under {} is in {} — nothing to move",
-            home.display(),
-            root.display()
-        );
-        return ExitCode::SUCCESS;
-    }
-    // The store holds the `aterm pkg link` dev links the move re-lays: read here, and
-    // locked below only when one of them moves.
-    let layout = crate::store::resolve_configured();
-    let recorded = crate::devroot::Recorded::read(layout.as_ref(), &home);
-    let plan = match crate::devroot::plan(
-        &survey,
-        &selection,
-        &crate::devroot::live_holders,
-        &recorded,
-    ) {
-        Ok(plan) => plan,
-        Err(why) => {
-            eprintln!("{SAY}: {why}");
-            return ExitCode::from(2);
-        }
-    };
-    for line in crate::devroot::render_plan(&survey, &plan) {
-        println!("{SAY}: {line}");
-    }
-    let held: std::collections::BTreeSet<&std::path::Path> =
-        plan.blocked.iter().map(|(p, _)| p.as_path()).collect();
-    if job == DevrootJob::Plan {
-        println!(
-            "{SAY}: {} to move, {} held — `aterm pkg devroot move --all` moves them once \
-             nothing holds any",
-            plan.moves.len(),
-            held.len()
-        );
-        return ExitCode::SUCCESS;
-    }
-    if !plan.blocked.is_empty() {
-        println!(
-            "{SAY}: nothing moved — {} of {} checkout(s) held (above); free them and run it \
-             again",
-            held.len(),
-            plan.moves.len()
-        );
-        return ExitCode::from(3);
-    }
-    // A dev link is re-laid in the store, so the run holds the store's one writer lock
-    // the way `aterm pkg link` does — refused before anything moves, never halfway.
-    let _store = match (&layout, plan.relinks.is_empty()) {
-        (Some(layout), false) => match crate::lock::try_lock_store(layout) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                println!(
-                    "{SAY}: nothing moved — the move re-lays dev links in the package store \
-                     ({}), and {e}; run it again when that pass ends",
-                    plan.relinks
-                        .iter()
-                        .map(|r| r.program.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                return ExitCode::from(crate::lock::CONTENDED_EXIT);
-            }
-        },
-        _ => None,
-    };
-    let report = crate::devroot::execute(&survey, &plan, layout.as_ref());
-    for line in &report.done {
-        println!("{SAY}: {line}");
-    }
-    for line in &report.failed {
-        eprintln!("{SAY}: FAILED {line}");
-    }
-    let code = if report.failed.is_empty() {
-        println!(
-            "{SAY}: done — next: add {} to {} once, then `aterm pkg devroot verify`",
-            root.display(),
-            crate::devroot::SEARCH_PRIVACY
-        );
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    };
-    if let Some(sig) = report.held_signal {
-        eprintln!(
-            "{SAY}: an interrupt (signal {sig}) arrived during the move and waited for it to \
-             finish; it ends this run now"
-        );
-        crate::devroot::deliver(sig);
-    }
-    code
 }
 
 /// A measured verdict's exit: 0 excluded (or no Spotlight here), 1 indexed, 3 unmeasured.
@@ -8325,6 +8120,15 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 println!(
                     "{MACHINE_VERDICT_PREFIX}applied — {}",
                     applied.entries.join("; ")
+                );
+            }
+            // The day's housekeeping rides the day's apply (`launch_apply_due`), after its
+            // verdict: Rust build cache folders nobody builds into any more go.
+            let removed = crate::build_cache::reclaim_home();
+            if !removed.is_empty() {
+                println!(
+                    "removed {} unused Rust build cache folder(s)",
+                    removed.len()
                 );
             }
             ExitCode::SUCCESS

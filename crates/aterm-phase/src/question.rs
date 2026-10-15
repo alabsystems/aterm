@@ -23,7 +23,9 @@
 //! its description at column 9); the free-text row `N+1. Type something.`
 //! (`[ ] Type something` in multi-select, whose button row `Next` — `Submit`
 //! on the last question — follows at column 5); a full-width divider; the
-//! chat row `  N+2. Chat about this`; a blank row; the key-hint footer.
+//! chat row `  N+2. Chat about this`; a blank row; the key-hint footer (in a
+//! pane narrower than it, word-wrapped onto the rows under it, which the
+//! reader joins first: `prompt.rs`, "A WRAPPED FOOTER").
 //! The preview form draws its options in a 30-cell column with the preview
 //! pane (`┌─┐│└┘`) to their right on the same rows, a blank row, `Notes:
 //! press n to add notes` at the pane's column, no descriptions, no
@@ -595,6 +597,11 @@ fn cell_width(c: char) -> usize {
             | 0x1F900..=0x1F9FF
             | 0x20000..=0x3FFFD);
     if wide { 2 } else { 1 }
+}
+
+/// `s`'s width in cells, by [`cell_width`].
+pub(crate) fn cells(s: &str) -> usize {
+    s.chars().map(cell_width).sum()
 }
 
 /// `row` split at cell `col`: the characters that start left of it, and

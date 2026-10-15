@@ -83,7 +83,7 @@ const RUN_DISQUALIFY: CellFlags =
 /// path. `char_data` is a BMP codepoint whenever `COMPLEX` is clear, so this
 /// is one mask and one range test.
 #[inline]
-fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
+pub(in crate::grid) fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
     if cell.flags().intersects(RUN_DISQUALIFY) {
         return None;
     }
@@ -943,6 +943,32 @@ impl LazyBuffer {
         )
     }
 
+    /// Drain up to `n` of the NEWEST staged rows (the back of the buffer),
+    /// converting each to a materialized [`Line`], in oldest-to-newest order.
+    /// Never the flood marker, which is the oldest row. `n` is clamped to the
+    /// staged rows.
+    ///
+    /// For a width resize taking back the overflow it staged itself
+    /// (`Grid::restore_reflowed_scrollback`), ahead of which older staged
+    /// output stays where it is.
+    pub(crate) fn drain_back(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
+        let start = self.lines.len() - n.min(self.lines.len());
+        // Weighed before the drain, as in `drain_front`.
+        let (leaving, leaving_links) = self
+            .lines
+            .range(start..)
+            .fold((0, 0), |(bytes, links), line| {
+                (bytes + line.staged_bytes(), links + line.link_bytes())
+            });
+        self.staged_bytes -= leaving;
+        self.link_bytes -= leaving_links;
+        self.linkless_front = self.linkless_front.min(start);
+        let pool = &mut self.pool;
+        self.lines
+            .drain(start..)
+            .map(move |deferred| deferred.into_line_recycled(&mut *pool))
+    }
+
     /// Get a line by index within the lazy buffer (0 = oldest — the flood
     /// marker when a cut is open, the oldest staged row otherwise).
     ///
@@ -1276,6 +1302,13 @@ pub(in crate::grid) struct RowToLineCursorState {
     combining_idx: usize,
     pub(in crate::grid) rgb_fg_idx: usize,
     pub(in crate::grid) rgb_bg_idx: usize,
+}
+
+impl RowToLineCursorState {
+    /// The next combining-mark entry [`next_combining`] would read.
+    pub(in crate::grid) const fn combining_idx(&self) -> usize {
+        self.combining_idx
+    }
 }
 
 impl Grid {

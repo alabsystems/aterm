@@ -250,3 +250,153 @@ fn rows_only_resize_keeps_ring_history_extras() {
         "history extras survive in place (no ring rebuild on a rows-only resize)"
     );
 }
+
+/// Every retained line oldest-first, then the viewport (trailing blanks
+/// trimmed): the transcript a reader of history plus screen sees.
+fn transcript(grid: &Grid) -> Vec<String> {
+    let mut all = crate::grid::test_support::history_trimmed(grid);
+    all.extend((0..grid.rows()).map(|r| {
+        grid.row_text(r)
+            .map(|t| t.trim_end().to_string())
+            .unwrap_or_default()
+    }));
+    all
+}
+
+/// R15-CHUNK-RING-SCROLL (2026-10-11): a rows-only grow that reveals history
+/// raises the ring's capacity (`visible_rows + max_scrollback`) without adding
+/// a row, so a WRAPPED ring (`ring_head != 0`, every allocated row retained)
+/// sits below its cap. The next line feed takes the ring's append arm, which
+/// pushed the new row at the Vec's end, i.e. logically in the middle of the
+/// wrapped ring: the screen rows past it did not move while the extras map
+/// scrolled whole. Every line feed after the grow must scroll every row, on
+/// both grid shapes, and the transcript must stay the write order.
+#[test]
+fn line_feeds_after_a_wrapped_ring_grows_in_rows_scroll_every_row() {
+    for tiered in [false, true] {
+        let mut grid = if tiered {
+            let sb = Scrollback::new(1000, 10_000, 100_000_000);
+            Grid::with_tiered_scrollback(5, 20, 10, sb)
+        } else {
+            Grid::with_scrollback(5, 20, 10)
+        };
+        // 40 lines through a 15-row ring: full, and wrapped.
+        crate::grid::test_support::feed_numbered_lines(&mut grid, 0, 40);
+        grid.resize(8, 20);
+        grid.assert_invariants();
+        assert_eq!(
+            grid.row_text(0).map(|t| t.trim_end().to_string()),
+            Some("L33".to_string()),
+            "tiered={tiered}: precondition: the grow revealed three history lines"
+        );
+        for i in 40..46 {
+            crate::grid::test_support::feed_numbered_lines(&mut grid, i, 1);
+            grid.assert_invariants();
+            let viewport: Vec<String> = transcript(&grid).split_off(grid.scrollback_lines());
+            let want: Vec<String> = (i - 6..=i)
+                .map(|k| format!("L{k}"))
+                .chain([String::new()])
+                .collect();
+            assert_eq!(
+                viewport, want,
+                "tiered={tiered}: the line feed after L{i} scrolled every row"
+            );
+        }
+        let all = transcript(&grid);
+        let want: Vec<String> = (0..46)
+            .map(|k| format!("L{k}"))
+            .chain([String::new()])
+            .collect();
+        assert_eq!(
+            all,
+            want[want.len() - all.len()..],
+            "tiered={tiered}: history then screen is the write order"
+        );
+    }
+}
+
+/// The top-anchored partial region's twin of
+/// `line_feeds_after_a_wrapped_ring_grows_in_rows_scroll_every_row`
+/// (R15-CHUNK-RING-SCROLL, 2026-10-11). A full-width region rooted at row 0
+/// with fixed rows below it (Codex's inline history above its input rows)
+/// archives through the same ring append:
+/// `scroll_top_anchored_region_up_with_history` runs the whole-grid storage
+/// scroll, then shifts the footer back down. After a rows-only grow of a
+/// wrapped ring, a scroll of the region (a line feed at its bottom margin, or
+/// SU of two rows) must move every region row up by the count, blank the
+/// vacated rows, leave the footer in place and archive the displaced top rows
+/// as the newest history, on both grid shapes.
+#[test]
+fn top_anchored_region_scrolls_after_a_wrapped_ring_grows_in_rows() {
+    let screen = |grid: &Grid| -> Vec<String> {
+        (0..grid.rows())
+            .map(|r| {
+                grid.row_text(r)
+                    .map(|t| t.trim_end().to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    for tiered in [false, true] {
+        for count in [1usize, 2] {
+            let ctx = format!("tiered={tiered} count={count}");
+            let mut grid = if tiered {
+                let sb = Scrollback::new(1000, 10_000, 100_000_000);
+                Grid::with_tiered_scrollback(5, 20, 10, sb)
+            } else {
+                Grid::with_scrollback(5, 20, 10)
+            };
+            // 40 lines through a 15-row ring: full, and wrapped. The grow
+            // reveals three history lines, so rows 0..=6 hold L33..L39.
+            crate::grid::test_support::feed_numbered_lines(&mut grid, 0, 40);
+            grid.resize(8, 20);
+            grid.assert_invariants();
+            assert_eq!(screen(&grid)[0], "L33", "{ctx}: precondition");
+            grid.set_cursor(7, 0);
+            for c in "FOOTER".chars() {
+                grid.write_char(c);
+            }
+            grid.set_scroll_region(0, 6);
+            let mut next = 40;
+            for round in 0..3 {
+                let before = screen(&grid);
+                if count == 1 {
+                    grid.set_cursor(6, 0);
+                    grid.line_feed();
+                } else {
+                    grid.scroll_region_up(count);
+                }
+                grid.assert_invariants();
+                let mut want = before[count..7].to_vec();
+                want.extend(vec![String::new(); count]);
+                want.push("FOOTER".to_string());
+                assert_eq!(
+                    screen(&grid),
+                    want,
+                    "{ctx} round {round}: the region scrolled by {count}, the footer stayed"
+                );
+                let history = crate::grid::test_support::history_trimmed(&grid);
+                assert_eq!(
+                    &history[history.len() - count..],
+                    &before[..count],
+                    "{ctx} round {round}: the displaced rows are the newest history"
+                );
+                for row in 7 - count..7 {
+                    grid.set_cursor(crate::row_u16(row), 0);
+                    for c in format!("L{next}").chars() {
+                        grid.write_char(c);
+                    }
+                    next += 1;
+                }
+            }
+            let mut all = crate::grid::test_support::history_trimmed(&grid);
+            all.extend(screen(&grid).into_iter().take(7));
+            let want: Vec<String> = (0..next).map(|k| format!("L{k}")).collect();
+            assert_eq!(
+                all,
+                want[want.len() - all.len()..],
+                "{ctx}: history then the region is the write order"
+            );
+        }
+    }
+}

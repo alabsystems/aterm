@@ -194,18 +194,27 @@ pub fn standing(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Opt
     read(state, tab).filter(|s| !s.stale(now) && s.names(pid, start))
 }
 
-/// TAKE tab `tab`'s stamp when `ours` says it is the one meant: it is moved
-/// aside (one rename), read, and removed — or, not ours, put back unless a
-/// newer stamp landed meanwhile (a hard link, which never replaces one). A
-/// stamp written while this runs is never removed by it.
+/// TAKE tab `tab`'s stamp when `ours` says it is the one meant. It is
+/// JUDGED WHERE IT STANDS (the review of ruling 21, 2026-10-14): a stamp that
+/// is not the taker's is never moved, so a reader of the tab's stamp — the
+/// act's watch reads it on every look (`aterm-gui`'s
+/// `restart_act::Watch::named`) — never finds it missing because another
+/// snapshot's relaunch judged it; moved aside to judge it, it was missing
+/// for that moment, and a watch that looked then let its program go for
+/// good. The one judged ours is moved aside (one rename), read again, and
+/// removed — or, a newer stamp having replaced it between the look and the
+/// rename, that one is put back (a hard link, which never replaces a stamp
+/// written meanwhile). A stamp written while this runs is never removed by
+/// it.
 pub fn take_if(state: &Path, tab: &str, ours: impl FnOnce(&Stamp) -> bool) -> Option<Stamp> {
     let path = path(state, tab)?;
+    let judged = read(state, tab).filter(ours)?;
     let taken = unique(&path, "taken");
     std::fs::rename(&path, &taken).ok()?;
     let stamp = std::fs::read_to_string(&taken)
         .ok()
         .and_then(|text| Stamp::from_json(&text));
-    let mine = stamp.as_ref().is_some_and(ours);
+    let mine = stamp.as_ref() == Some(&judged);
     if !mine {
         let _ = std::fs::hard_link(&taken, &path);
     }

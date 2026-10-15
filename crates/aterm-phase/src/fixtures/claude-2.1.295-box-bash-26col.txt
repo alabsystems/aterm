@@ -1,0 +1,50 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (26x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · an ordinary Bash box (`touch x`, described `Create x`; `--permission-mode default`) raised in a pane resized to 26 columns before the call: the title, tip, options and the footer wrap, `Esc to cancel · Tab to amend` after `Tab to`, its `amend` alone on the row under it at column one
+✻ Cogitated for 0s · done
+  12:20 PM
+
+❯ toolstart
+
+⏺ User declined to answer
+  questions
+  ⎿  · Which storage
+     backend should the
+     cache use? (Disk
+     (Recommended) /
+     Memory)
+     · How long should
+     entries live? (One
+     hour (Recommended) /
+     One day)
+
+✻ Sautéed for 0s · done
+  12:20 PM
+
+❯ toolstart
+
+⏺ Bash(touch x)
+  ⎿  Waiting…
+
+──────────────────────────
+ Bash command
+ Tip: auto mode handles
+ these prompts for you —
+ choose "switch to auto
+ mode" below
+ Create x
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ touch x
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always
+      allow access to
+      /private/tmp/at.swEU
+      /proj from this
+   3. Yes, and switch to
+      auto mode · auto
+      mode handles these
+      prompts for you
+   4. No
+
+ Esc to cancel · Tab to
+ amend

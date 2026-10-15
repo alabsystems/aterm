@@ -16,6 +16,7 @@ use super::Terminal;
 use crate::grid::ResizePolicy;
 use crate::terminal::search_index::tests::{cached_results, legacy_results};
 use aterm_scrollback::Scrollback;
+use std::collections::BTreeSet;
 
 /// The bytes conhost emits after a resize: hide cursor, an optional
 /// `CSI 8 ; rows ; cols t` (on the first resize of a session), `CSI H`, one
@@ -638,15 +639,29 @@ fn fold_state(h: &mut u64, t: &Terminal) {
     }
 }
 
+/// The steps whose line `t` still holds, in history or on screen: each step's
+/// line starts its first row with `step N`, and no other row starts so.
+fn steps_kept(t: &Terminal) -> BTreeSet<u64> {
+    retained_rows(t)
+        .iter()
+        .filter_map(|row| row.strip_prefix("step ")?.split(' ').next()?.parse().ok())
+        .collect()
+}
+
 /// 120 steps of output, an occasional scrollback erase, a reader scrolling back
 /// on a quarter of them, and a resize after each (a third keep the width),
 /// applied synchronously (`native`) or through the offloaded detach/re-attach.
 /// Covers width changes, revealing and blank-appending grows, shrinks and
 /// rows-only resizes under a scrolled-back reader. Returns the digest of every
-/// step.
-fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, u16, u16)) -> u64 {
+/// step, and the steps whose line each step leaves retained (`steps_kept`).
+fn native_script(
+    mut t: Terminal,
+    offload: bool,
+    native: impl Fn(&mut Terminal, u16, u16),
+) -> (u64, Vec<BTreeSet<u64>>) {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut kept = Vec::with_capacity(120);
     for step in 0..120u64 {
         state ^= state << 13;
         state ^= state >> 7;
@@ -680,8 +695,9 @@ fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, 
             native(&mut t, rows, cols);
         }
         fold_state(&mut h, &t);
+        kept.push(steps_kept(&t));
     }
-    h
+    (h, kept)
 }
 
 /// The Native policy is 0.94.0's resize (`fe5d19198`, which digested to
@@ -705,17 +721,78 @@ fn native_script(mut t: Terminal, offload: bool, native: impl Fn(&mut Terminal, 
 /// scrolls) keeps its 46 blanks, where the old code staged two of its rows at
 /// length 0 and 4 and joined them to `  ij`; the counters move by the rows
 /// those blanks take.
+///
+/// Re-captured 2026-10-11 (R15-CHUNK-RING-SCROLL, `TIERED` only; was
+/// `0xaa63_71b5_0ce0_182b`): a scroll after a rows-only grow of a wrapped ring
+/// appends at the ring's logical end (`GridStorage::linearize_ring`). Dumped
+/// step by step against the previous code, the `RING` arm (a 10,000-line ring
+/// that never wraps here) is identical, and the `TIERED` arm (an 8-line ring,
+/// wrapped from the first steps) first differs at step 10: the previous code
+/// spliced a blank row into history there and wrote the next step's line over
+/// the last one (`step 11 abcdefghij`, then step 10's leftover tail), and 63
+/// of the 120 steps retained a transcript missing a step's line. Now 10 do,
+/// all the one line the offloaded width reflow at step 109 drops under a
+/// scrolled-back reader; the synchronous twin of this script keeps every
+/// step's line at every step.
+///
+/// Re-captured 2026-10-11 (the offloaded reflow's lost line, `TIERED` only;
+/// was `0xd968_b590_2d9a_1dd2`): the offloaded width change opens its detach
+/// window before its own resize, so the rows that resize pushes off the
+/// screen past the ring's cap are staged for re-attach, not dropped. Dumped
+/// step by step against the previous code, the `RING` arm is identical and
+/// the `TIERED` arm differs at steps 40-41 and 109-118 only, each by lines the
+/// previous code lost and this one keeps: steps 28-30's at step 40 (a
+/// narrowing after an ED 3 pushed 12 rows into the 8-row ring) and step 102's
+/// at step 109 (10 rows; the reader's scroll there was incidental). No step
+/// loses a line now (`offloaded_native_script_keeps_every_line_the_synchronous_one_keeps`).
+///
+/// Re-captured 2026-10-11 again (the store/ring seam, `TIERED` only; was
+/// `0x0541_a3ca_4677_d9d7`): a logical line straddling the store/ring seam is
+/// handed to the job's ring phase whole under Native too, as under ConPTY.
+/// Dumped step by step against the previous code, the `RING` arm is
+/// identical and the `TIERED` arm moves at 43 steps (14-16, 21-24, 41, 44-45,
+/// 56-67, 79-85, 99-104, 111-118), each by such a line now rewrapped whole
+/// where it left an orphan row (at step 14, `step 5 abcdefghijabcdefgh` over
+/// `ijabcdefghij…` is now `step 5 abcdefghijabcdefghijab` over `cdefghij…`,
+/// the synchronous rewrap); no line is lost or gained. The offloaded run now
+/// equals its synchronous twin, rows and reading position, at 104 of the 120
+/// steps (68 before); the rest differ only after a rows-only grow, which
+/// reveals the history the offloaded width change keeps in the ring and the
+/// synchronous one parks in the store.
 #[test]
 fn native_policy_matches_the_0_94_0_resize() {
     const RING: u64 = 0xb706_f513_99e0_6395;
-    const TIERED: u64 = 0xaa63_71b5_0ce0_182b;
+    const TIERED: u64 = 0x7ff1_ecb9_2c5c_edb9;
     let plain = |t: &mut Terminal, r: u16, c: u16| t.resize(r, c);
     let native = |t: &mut Terminal, r: u16, c: u16| {
         t.resize_with_policy(r, c, ResizePolicy::Native);
     };
-    assert_eq!(native_script(Terminal::new(10, 40), false, plain), RING);
-    assert_eq!(native_script(Terminal::new(10, 40), false, native), RING);
-    assert_eq!(native_script(tiered(10, 40), true, native), TIERED);
+    assert_eq!(native_script(Terminal::new(10, 40), false, plain).0, RING);
+    assert_eq!(native_script(Terminal::new(10, 40), false, native).0, RING);
+    assert_eq!(native_script(tiered(10, 40), true, native).0, TIERED);
+}
+
+/// The offloaded width reflow keeps every line the synchronous one keeps: the
+/// script above run on the tiered terminal both ways, compared step by step.
+/// The two may place a line differently (screen or history, row breaks); a
+/// line the synchronous resize retains and the offloaded one does not is
+/// lost history. Before 2026-10-11 the offloaded run lost step 102's line at
+/// step 109: that narrowing pushed 10 rows off a 13-row screen into an
+/// 8-row ring while the history was with the job.
+#[test]
+fn offloaded_native_script_keeps_every_line_the_synchronous_one_keeps() {
+    let native = |t: &mut Terminal, r: u16, c: u16| {
+        t.resize_with_policy(r, c, ResizePolicy::Native);
+    };
+    let (_, synchronous) = native_script(tiered(10, 40), false, native);
+    let (_, offloaded) = native_script(tiered(10, 40), true, native);
+    for (step, (synchronous, offloaded)) in synchronous.iter().zip(&offloaded).enumerate() {
+        let lost: Vec<_> = synchronous.difference(offloaded).collect();
+        assert!(
+            lost.is_empty(),
+            "step {step}: the offloaded reflow lost the lines of steps {lost:?}"
+        );
+    }
 }
 
 // ---- the round trip, the combined resize, the shrink corner --------------

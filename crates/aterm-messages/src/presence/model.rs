@@ -636,7 +636,7 @@ impl<V: Host> Slot<V> {
     /// free-text value. Returns the point's seq.
     pub fn tell(&mut self, verb: StoryVerb, text: &str, now: Instant) -> u64 {
         self.note(verb, now);
-        self.told = Some((verb, super::sanitize_token(text, 48), now));
+        self.told = Some((verb, super::sanitize_token::<V>(text, 48), now));
         self.story_seq
     }
 

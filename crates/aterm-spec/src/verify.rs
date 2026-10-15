@@ -1813,8 +1813,8 @@ pub fn ty_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 /// Spawn a long-lived `ty` co-process — the `--cases` pool's one door — with
 /// [`ty_output`]'s scratch HOME ([`scratch_ty_env`]), stdin and stdout piped,
 /// built by aterm-uds's `spawnfd::command`: it outlives the call, so it must
-/// inherit its stdio and nothing else (a plain `Command` hands it whatever
-/// another thread holds without close-on-exec at that instant). The caller sends
+/// inherit its stdio and nothing else (a plain `Command`, on a std without SP-1,
+/// hands it whatever another thread holds unflagged at that instant). The caller sends
 /// stderr to a FILE, never a pipe: nobody drains a pipe between cases, and a
 /// `ty` blocked on a full stderr pipe answers nothing.
 ///
@@ -3513,7 +3513,7 @@ impl CasesChild {
     }
 
     /// Kill the child — SIGKILL through `Child::kill`, never a signal that
-    /// writes a crash report (AGENTS.md rule 6), and harmless on one that has
+    /// writes a crash report (AGENTS.md), and harmless on one that has
     /// exited — and describe the failure with its exit status and the tail
     /// of its stderr.
     // Skip: process control and a file read. Verification tooling.

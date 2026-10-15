@@ -284,8 +284,10 @@ pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 ///
 /// 1. Obtain the identity (apps/aterm-win/SIGNING.md walks both lanes).
 /// 2. Sign a build with it while the anchor is still empty and read the
-///    `Issued to:` line `targo --unverified winsign verify` prints back — THAT string, byte for
-///    byte, is the value to commit here.
+///    `signed by` value `targo --unverified winsign verify` prints back: the
+///    leaf's `Issued to:`, which is the last and most indented one in signtool's
+///    chain (the first is the root CA, and pinning that would accept every exe
+///    under the root). THAT string, byte for byte, is the value to commit here.
 /// 3. Commit it. From that commit on, an unsigned or wrongly signed Windows
 ///    exe is refused by the tool, never shipped by accident.
 pub const WINDOWS_SIGNING_PUBLISHER: &str = "";

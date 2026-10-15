@@ -1341,7 +1341,7 @@ pub(crate) fn is_against_right_edge(row: &str, width: usize) -> bool {
     is_hint(row, Some(width)) && crate::text::trim_end(row).chars().count() + 3 >= width
 }
 
-fn is_said(row: &str, width: Option<usize>) -> bool {
+pub(crate) fn is_said(row: &str, width: Option<usize>) -> bool {
     let t = crate::text::trim_start(row);
     !t.is_empty()
         && !is_separator(row)
@@ -1386,7 +1386,8 @@ fn is_said(row: &str, width: Option<usize>) -> bool {
 /// goes on under (a subagent quota, a subagent budget, fast mode's
 /// fallback) or a full context — [`crate::wall::wall`] names that one. The
 /// block's continuation rows are part of the message; `reset` is read from
-/// whichever of its rows says `resets …` / `reset at …` — or, the
+/// whichever of its lines (its rows joined where Ink wrapped them,
+/// [`line_at`]) says `resets …` / `reset at …` — or, the
 /// auto-continue notice, `continuing automatically at <time>` / `continuing
 /// shortly` ([`reset_of`]).
 pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
@@ -1439,14 +1440,19 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
     // composer (a hint against the right edge, a banner) and the footer's
     // notification rows under it — for any wall placement, but not the wall's
     // own row or one its message already holds.
+    //
+    // Each row is read as the line it opens, across the rows Ink wrapped it
+    // onto ([`line_at`]): at 26 columns the countdown's `Continuing` stands
+    // alone on its first row (2.1.299).
     if let Some(frame) = composer_frame(rows) {
-        let above = rows.get(found.row + 1..frame.top).unwrap_or(&[]);
-        let below = &rows[frame.bottom + 1..];
+        let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+        let above = found.row + 1..frame.top;
+        let below = frame.bottom + 1..rows.len();
         if let Some(toast) = above
-            .iter()
-            .chain(below.iter())
-            .map(|r| crate::text::trim(r))
-            .find(|t| says_the_vendor_goes_on(t) && !found.message.contains(t))
+            .map(|i| line_at(rows, i, frame.top, width).1)
+            .chain(below.map(|i| line_at(rows, i, rows.len(), width).1))
+            .map(|line| crate::text::trim(&line).to_string())
+            .find(|t| says_the_vendor_goes_on(t) && !found.message.contains(t.as_str()))
         {
             found.message = format!("{} \u{2014} {toast}", found.message);
         }
@@ -1471,10 +1477,10 @@ fn says_the_vendor_goes_on(row: &str) -> bool {
 
 fn notice_placed(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
     if let Some(frame) = composer_frame(rows) {
-        if let Some(found) = footer_notice(rows, frame.bottom + 1, classify) {
+        let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+        if let Some(found) = footer_notice(rows, frame.bottom + 1, width, classify) {
             return Some(found);
         }
-        let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
         if let Some(found) = banner_notice(rows, frame.top, width, classify) {
             return Some(found);
         }
@@ -1582,15 +1588,32 @@ fn notice_at(
         Block::UnderCall => true,
         Block::Vendors => false,
     };
-    let kind = classify(head)?;
-    let parts: Vec<&str> = std::iter::once(head)
-        .chain(rows[open + 1..=last].iter().map(|r| crate::text::trim(r)))
-        .filter(|p| !p.is_empty())
-        .collect();
-    let reset = parts.iter().find_map(|p| reset_of(p));
+    // The block's lines, each across the rows Ink wrapped it onto
+    // ([`line_at`]): the notice is the first, named whole (at 26 columns
+    // `⎿  You've hit your` stands over `session limit ·`, 2.1.299), and the
+    // reset is whichever line names one, its zone with it (`· resets
+    // 10:25am` over `(America/Los_Angeles)` at 34). The last line runs on
+    // past `last` over a row it wraps onto that the last-said walk passed
+    // over: one that opens with `·` reads as a status row.
+    let width = crate::question::screen_width(rows);
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = open;
+    while i <= last {
+        let (end, line) = line_at(rows, i, rows.len(), width);
+        let text = crate::text::trim(&line);
+        let text = if i == open {
+            text.trim_start_matches('⎿').trim()
+        } else {
+            text
+        };
+        lines.push(text.to_string());
+        i = end + 1;
+    }
+    let kind = classify(&lines[0])?;
+    let reset = lines.iter().find_map(|l| reset_of(l));
     Some(Wall {
         kind,
-        message: parts.join(" "),
+        message: lines.join(" "),
         reset,
         row: open,
         placement: Placement::Gutter,
@@ -1598,12 +1621,127 @@ fn notice_at(
     })
 }
 
-/// How many rows a `<notice> · <remedy>` error row may take, its wrapped
-/// text included ([`error_row_notice`]): those notices are one sentence and a
-/// remedy, and a longer `⏺` block is the worker's own words. An `API Error`
-/// may run longer: the vendor's own messages do (a 529 wraps to three rows at
-/// 80 columns, and a message runs to 1000 characters before the expand hint).
+/// How many rows a `<notice> · <remedy>` error row may take in a pane 80
+/// columns wide or wider, its wrapped text included ([`error_row_notice`]);
+/// in a narrower pane, how many it would take at 80 ([`notice_rows_at_80`]):
+/// those notices are one sentence and a remedy, and a longer `⏺` block is
+/// the worker's own words. An `API Error` may run longer: the vendor's own
+/// messages do (a 529 wraps to three rows at 80 columns, and a message runs
+/// to 1000 characters before the expand hint).
 const ERROR_ROWS: usize = 3;
+
+/// How many columns short of the pane Claude Code draws the text of its OWN
+/// `⏺` rows, its error row and its dotted notices: in a column `columns -
+/// 10` cells wide beside the bullet (2.1.300's `su` and `ig`, read from the
+/// binary; measured on 2.1.299 at 26 and 34 columns, rows of at most `width
+/// - 10` cells). The worker's reply has no such column: its prose runs to
+/// the pane's edge, `width - 2` cells from column two (2.1.300,
+/// `claude-2.1.300-prose-opens-with-limit-words-34col.txt`).
+const NOTICE_MARGIN: usize = 10;
+
+/// The rows the vendor's `⏺` notice on rows `open..=end` would take at 80
+/// columns, read in a pane narrower than that, where the same notice takes
+/// more rows than [`ERROR_ROWS`] counts (`⏺ Usage limit reached ·
+/// continuing automatically at 10:25am · esc to cancel`: four rows at 34
+/// columns, two at 80). `None` in a pane 80 columns or wider, where the rows
+/// themselves are counted, and for a message not drawn in the vendor's
+/// column — a row of it wider than `width - 10` cells ([`NOTICE_MARGIN`]) is
+/// the worker's prose. Each line of it — its rows joined where Ink wrapped
+/// them, a row too full for the next row's first word in that column
+/// ([`crate::wrap::continues`]) — is counted as Ink wraps it in the 70 cells
+/// the column holds at 80 columns ([`crate::wrap::rows_in`]).
+///
+/// THE LIMIT. A hard line break under a row that happens to be that full is
+/// joined, so the worker's prose that fits the vendor's column, every row of
+/// it at most `width - 10` cells, and opens with a wall's words and a ` · `
+/// can still read as the wall in a narrow pane, as such prose of three rows
+/// or fewer does at 80 columns; the supervisor then acts on it only where
+/// the session's transcript confirms it (aterm-agent,
+/// `supervise/wall_confirm.rs`), and where there is none to read, as the
+/// screen reads.
+fn notice_rows_at_80(rows: &[String], open: usize, end: usize) -> Option<usize> {
+    use crate::question::cells;
+    const ROW_AT_80: usize = 80 - NOTICE_MARGIN;
+    let width = crate::question::screen_width(rows);
+    if width >= 80 {
+        return None;
+    }
+    let room = width.saturating_sub(NOTICE_MARGIN);
+    let text = |i: usize| {
+        let t = crate::text::trim(&rows[i]);
+        if i == open {
+            crate::text::trim(t.trim_start_matches(['⏺', '●']))
+        } else {
+            t
+        }
+    };
+    let texts: Vec<&str> = (open..=end).map(text).collect();
+    if texts.iter().any(|t| cells(t) > room) {
+        return None;
+    }
+    let mut count = 0;
+    let mut line = texts[0].to_string();
+    for ((above, row), here) in texts.iter().zip(&rows[open + 1..=end]).zip(&texts[1..]) {
+        if crate::wrap::continues(above, 2, row, room) {
+            line.push(' ');
+        } else {
+            count += crate::wrap::rows_in(&line, ROW_AT_80);
+            line.clear();
+        }
+        line.push_str(here);
+    }
+    Some(count + crate::wrap::rows_in(&line, ROW_AT_80))
+}
+
+/// Whether `row` is a row of the `⏺` message above it: indented two columns,
+/// its text no `⎿` row — the message's text Claude Code wrapped onto it
+/// ([`error_row_notice`], [`line_at`]).
+fn in_message(row: &str) -> bool {
+    row.strip_prefix("  ")
+        .is_some_and(|t| t.starts_with(|c: char| !c.is_whitespace() && c != '⎿'))
+}
+
+/// The last row of the `⏺` message (its paragraph) whose bullet row is
+/// `open`: the rows under it, short of row `until`, that are its own
+/// ([`in_message`]).
+fn message_end(rows: &[String], open: usize, until: usize) -> usize {
+    let until = until.min(rows.len());
+    let mut end = open;
+    while end + 1 < until && in_message(&rows[end + 1]) {
+        end += 1;
+    }
+    end
+}
+
+/// THE LINE ROW `i` OPENS, read across the rows Ink wrapped it onto
+/// ([`crate::wrap`]), none from row `until` on, in a pane `width` cells
+/// wide: its last row and its text, the rows joined with one space (the
+/// first row's indent kept). A `⏺` or `●` row's line is its message — the
+/// rows under it at column two ([`message_end`]), as [`error_row_notice`]
+/// always read it, for no rule of full rows finds where a line of it ends:
+/// Claude Code draws its own notices there in a column ten columns short of
+/// the pane ([`NOTICE_MARGIN`]), never full by the pane's room, and the
+/// worker's prose to the pane's edge, a hard line break under a full row as
+/// often as not; a `⎿` row's text is wrapped at the column it starts at
+/// past the `⎿` (the gutter's text column, [`GUTTER_TEXT_COLUMN`], for a
+/// notice; a column less for a local command's output, `  ⎿ Claude Code
+/// will continue`); any other row's at its own column. A row that is no line's first is read as one all
+/// the same, as a row was before lines were: what each reader looks for
+/// opens a line.
+pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> (usize, String) {
+    let row = rows[i].as_str();
+    let end = if row.starts_with(['⏺', '●']) {
+        message_end(rows, i, until)
+    } else if let Some(after) = crate::text::trim_start(row).strip_prefix('⎿') {
+        let head = crate::text::trim(after);
+        let col = leading_spaces(row) + 1 + leading_spaces(after);
+        crate::wrap::line_end(rows, i, head, col, width, until)
+    } else {
+        let head = crate::text::trim(row);
+        crate::wrap::line_end(rows, i, head, leading_spaces(row), width, until)
+    };
+    (end, crate::wrap::rejoined(&rows[i..=end]))
+}
 
 /// What the vendor adds under a message past 1000 characters.
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
@@ -1629,7 +1767,9 @@ const EXPAND_HINT: &str = "(ctrl+o to expand)";
 /// `⏺` row and the rows indented two columns under it, no `⎿` row, nothing
 /// else), no tool call, and the vendor's own shape — `API Error` at its head,
 /// case and all, or a notice and its remedy joined by ` · ` or ` ∙ ` in at
-/// most [`ERROR_ROWS`] rows — whose text the table ([`classify`]) names. The
+/// most [`ERROR_ROWS`] rows (in a pane narrower than 80 columns, drawn in
+/// the vendor's own column and at most that many at 80,
+/// [`notice_rows_at_80`]) — whose text the table ([`classify`]) names. The
 /// worker's `⏺ Not logged in to gh, so nothing was pushed.` has no remedy
 /// joined on, and its `⏺ The server was overloaded, so I retried` no vendor
 /// head: neither is one. The copies this cannot tell from the vendor's row: a
@@ -1644,13 +1784,9 @@ fn error_row_notice(
     last: usize,
     classify: &dyn Fn(&str) -> Option<WallKind>,
 ) -> Option<Wall> {
-    let wrapped = |row: &String| {
-        row.strip_prefix("  ")
-            .is_some_and(|t| t.starts_with(|c: char| !c.is_whitespace() && c != '⎿'))
-    };
     let mut open = last;
     while !rows[open].starts_with(['⏺', '●']) {
-        if !wrapped(&rows[open]) {
+        if !in_message(&rows[open]) {
             return None;
         }
         open = open.checked_sub(1)?;
@@ -1658,10 +1794,7 @@ fn error_row_notice(
     if is_tool_call(&rows[open]) {
         return None;
     }
-    let mut end = last;
-    while rows.get(end + 1).is_some_and(wrapped) {
-        end += 1;
-    }
+    let end = message_end(rows, open, rows.len());
     let head = rows[open]
         .strip_prefix(['⏺', '●'])
         .map(str::trim)
@@ -1674,7 +1807,9 @@ fn error_row_notice(
     }
     parts.retain(|p| !p.is_empty());
     let text = parts.join(" ");
-    let remedy = end - open < ERROR_ROWS && (text.contains(" · ") || text.contains(" ∙ "));
+    let short = end - open < ERROR_ROWS
+        || notice_rows_at_80(rows, open, end).is_some_and(|n| n <= ERROR_ROWS);
+    let remedy = short && (text.contains(" · ") || text.contains(" ∙ "));
     if !(head.starts_with("API Error") || remedy) {
         return None;
     }
@@ -1904,18 +2039,22 @@ fn is_call_name(name: &str) -> bool {
 /// the first blank row (the agents panel and a workflow's line below it are
 /// the worker's words): an item — the row, a part after a wide gap or after
 /// ` · ` — that opens with a notice `classify` names, up to the next wide gap.
+/// The row is read with the rows Ink wrapped its line onto ([`line_at`]): in
+/// a pane narrower than the usage-limit banner, `⚠ Usage limit reached ·
+/// limit` stands over `resets 10:25am` (34 columns, 2.1.299), and the row
+/// alone names no reset.
 fn footer_notice(
     rows: &[String],
     from: usize,
+    width: usize,
     classify: &dyn Fn(&str) -> Option<WallKind>,
 ) -> Option<Wall> {
-    rows.iter()
-        .enumerate()
-        .skip(from)
-        .take_while(|(_, r)| !crate::text::trim(r).is_empty())
-        .filter(|(_, r)| !crate::text::trim_start(r).starts_with(['◯', '⏺', '●']))
-        .find_map(|(i, row)| {
-            let t = crate::text::trim(row);
+    let until = footer_end(rows, from);
+    (from..until)
+        .filter(|&i| !crate::text::trim_start(&rows[i]).starts_with(['◯', '⏺', '●']))
+        .find_map(|i| {
+            let (_, line) = line_at(rows, i, until, width);
+            let t = crate::text::trim(&line);
             let starts = std::iter::once(0)
                 .chain(t.match_indices("  ").map(|(i, s)| i + s.len()))
                 .chain(t.match_indices(" · ").map(|(i, s)| i + s.len()));
@@ -1936,6 +2075,14 @@ fn footer_notice(
         })
 }
 
+/// One past the footer's last row: the first blank row from row `from` (the
+/// row under the bottom rule) on, or the screen's end.
+pub(crate) fn footer_end(rows: &[String], from: usize) -> usize {
+    (from..rows.len())
+        .find(|&i| crate::text::trim(&rows[i]).is_empty())
+        .unwrap_or(rows.len())
+}
+
 /// A notice on a banner row under the last thing said: the rows after
 /// [`last_said_index`]'s (from the top of the screen when nothing is said)
 /// up to the composer's top rule — the status row's own position included,
@@ -1951,7 +2098,12 @@ fn footer_notice(
 /// right-aligned as the peer's Claude Code drew it (the round-20 review:
 /// such a copy twenty columns in read as the wall). A blank row ends the
 /// gutter's block; a banner under that blank is Claude Code's own. A notice
-/// above a said row is history and is not looked at.
+/// above a said row is history and is not looked at. The banner's text is its
+/// line, read across the rows Ink wrapped it onto ([`line_at`]). Where a
+/// wrapped banner's rest stands on this screen is not measured (2.1.295 and
+/// later draw the usage banner in the footer, [`footer_notice`]): a rest
+/// [`last_said_index`] takes for the last thing said hides the banner above
+/// it.
 fn banner_notice(
     rows: &[String],
     top: usize,
@@ -1967,6 +2119,9 @@ fn banner_notice(
         if !(placed && is_status_row(t) && !is_glyph_row(t)) {
             return None;
         }
+        // Its line, across the rows Ink wrapped it onto ([`line_at`]).
+        let (_, line) = line_at(rows, i, top, width);
+        let t = crate::text::trim(&line);
         classify(t).map(|kind| Wall {
             kind,
             message: t.to_string(),
@@ -1986,7 +2141,7 @@ const GUTTER_TEXT_COLUMN: usize = 5;
 /// the row its continuation rows (indented to the gutter's text,
 /// [`GUTTER_TEXT_COLUMN`] or more) hang from. `None` when `i` is not under
 /// the gutter.
-fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
+pub(crate) fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     loop {
         let t = crate::text::trim_start(&rows[i]);
         if t.starts_with('⎿') {
@@ -2043,16 +2198,19 @@ fn reset_of(message: &str) -> Option<String> {
         .map(|_| "shortly".to_string())
 }
 
-/// The reset text at the start of `rest`, up to a ` · ` or ` ∙ ` separator,
-/// without a closing `.`; `None` when it is no time: a reset text opens with a
-/// digit, a month, a span or `shortly`.
+/// The reset text at the start of `rest`, up to a ` · ` or ` ∙ ` separator
+/// and no further than its time ([`time_words`]), without a closing `.`;
+/// `None` when it is no time: a reset text opens with a digit, a month, a
+/// span or `shortly`.
 fn time_after(rest: &str) -> Option<String> {
     let cut = [" · ", " ∙ "]
         .iter()
         .filter_map(|sep| rest.find(sep))
         .min()
         .unwrap_or(rest.len());
-    let rest = crate::text::trim(&rest[..cut]).trim_end_matches('.').trim();
+    let rest = time_words(crate::text::trim(&rest[..cut]))
+        .trim_end_matches('.')
+        .trim();
     let lower = rest.to_ascii_lowercase();
     let timey = rest.starts_with(|c: char| c.is_ascii_digit())
         || lower.starts_with("in ")
@@ -2063,6 +2221,126 @@ fn time_after(rest: &str) -> Option<String> {
         .iter()
         .any(|m| lower.starts_with(m));
     (!rest.is_empty() && timey).then(|| rest.to_string())
+}
+
+/// The words `text` opens with that are a time — a clock (`10:25am`, `11:05
+/// am`), a date (`Oct 15 at`, `September 19,`, `2027`), a span (`in 2h 30m`,
+/// `in 3 hours`), `shortly` — and the zone in parentheses after them
+/// (`(America/Los_Angeles)`, through its `)`): the reset a notice names ends
+/// there, whatever follows it. A line read across the rows Ink wrapped it
+/// onto can run on into the next line of the notice (`crate::wrap`, THE
+/// LIMITS: `… resets 10:25am (America/Los_Angeles) /upgrade to increase your
+/// usage limit.` at 34 columns), and the transcript's own text has that next
+/// line after a newline. A word that only joins two others (`at`, `on`,
+/// `in`, `of`, `the`, `and`) is the time's only with one after it. A date
+/// or a day after the clock is the time's too (`3pm on Oct 15`, `9am
+/// tomorrow`, `9am Monday`): cut there, the clock alone would read as
+/// today's or tomorrow's (`aterm-agent`'s `limit::parse_reset`, which reads
+/// no such spelling whole, and the reset falls to the backstop as before).
+fn time_words(text: &str) -> &str {
+    let (mut end, mut at) = (0, 0);
+    while let Some(skip) = text[at..].find(|c: char| !c.is_whitespace()) {
+        at += skip;
+        let len = text[at..]
+            .find(char::is_whitespace)
+            .unwrap_or(text.len() - at);
+        let word = &text[at..at + len];
+        if word.starts_with('(') {
+            return text[at..]
+                .find(')')
+                .map_or(text, |close| &text[..at + close + 1]);
+        }
+        let joins = matches!(
+            word.to_ascii_lowercase().as_str(),
+            "at" | "on" | "in" | "of" | "the" | "and"
+        );
+        if !joins && !is_time_word(word) {
+            break;
+        }
+        at += len;
+        if !joins {
+            end = at;
+        }
+    }
+    &text[..end]
+}
+
+/// A word of a reset's time ([`time_words`]) that is a time's own: one with a
+/// digit in it, or a month, a meridian, a span's unit or `shortly` — the
+/// words `aterm-agent`'s `limit::parse_reset` reads — or a day (`today`,
+/// `tomorrow`, a weekday, `noon`, `midnight`), which it does not, a closing
+/// `,` or `.` aside.
+fn is_time_word(word: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "shortly",
+        "am",
+        "pm",
+        "a.m",
+        "p.m",
+        "jan",
+        "january",
+        "feb",
+        "february",
+        "mar",
+        "march",
+        "apr",
+        "april",
+        "may",
+        "jun",
+        "june",
+        "jul",
+        "july",
+        "aug",
+        "august",
+        "sep",
+        "sept",
+        "september",
+        "oct",
+        "october",
+        "nov",
+        "november",
+        "dec",
+        "december",
+        "h",
+        "hr",
+        "hrs",
+        "hour",
+        "hours",
+        "m",
+        "min",
+        "mins",
+        "minute",
+        "minutes",
+        "s",
+        "sec",
+        "secs",
+        "second",
+        "seconds",
+        "today",
+        "tonight",
+        "tomorrow",
+        "noon",
+        "midnight",
+        "mon",
+        "monday",
+        "tue",
+        "tues",
+        "tuesday",
+        "wed",
+        "wednesday",
+        "thu",
+        "thur",
+        "thurs",
+        "thursday",
+        "fri",
+        "friday",
+        "sat",
+        "saturday",
+        "sun",
+        "sunday",
+    ];
+    let w = word.trim_end_matches([',', '.']).to_ascii_lowercase();
+    w.bytes().any(|b| b.is_ascii_digit()) || WORDS.contains(&w.as_str())
 }
 
 /// The byte offset of `needle` (ASCII) in `hay`, ignoring ASCII case.
@@ -4302,6 +4580,82 @@ mod tests {
             reset_of("resets soon, then it resets 4pm (America/Los_Angeles)"),
             Some("4pm (America/Los_Angeles)".to_string())
         );
+    }
+
+    /// A RESET ENDS WHERE ITS TIME DOES ([`time_words`]). A line read across
+    /// the rows Ink wrapped it onto runs on into the notice's next line when
+    /// the row above it was full (at 34 columns `(America/Los_Angeles)` over
+    /// `/upgrade to increase your`, 2.1.299), or into a row under it at the
+    /// same column; the transcript's own text has the next line after a
+    /// newline. The time and its zone are the reset, nothing after them.
+    #[test]
+    fn a_reset_ends_where_its_time_does() {
+        for (said, want) in [
+            (
+                "You've hit your session limit · resets 10:25am (America/Los_Angeles) /upgrade \
+                 to increase your usage limit.",
+                "10:25am (America/Los_Angeles)",
+            ),
+            (
+                "You've hit your session limit · resets 10:25am (America/Los_Angeles)\n/upgrade \
+                 to increase your usage limit.",
+                "10:25am (America/Los_Angeles)",
+            ),
+            (
+                "You've hit your weekly limit · resets Oct 15 at 12:33pm (America/Los_Angeles) \
+                 /upgrade to increase your usage limit.",
+                "Oct 15 at 12:33pm (America/Los_Angeles)",
+            ),
+            (
+                "⚠ Usage limit reached · limit resets 10:25am ⏵⏵ auto mode on (shift+tab to cycle)",
+                "10:25am",
+            ),
+            (
+                "Usage limit reached · resets September 19, 11:05 am and then some",
+                "September 19, 11:05 am",
+            ),
+            (
+                "You've hit your weekly limit · resets in 2h 30m at most",
+                "in 2h 30m",
+            ),
+            (
+                "Usage limit reached · continuing shortly. Hang on",
+                "shortly",
+            ),
+        ] {
+            assert_eq!(reset_of(said).as_deref(), Some(want), "{said}");
+        }
+        // Nothing of a time after the key: no reset.
+        assert_eq!(
+            reset_of("resets /upgrade to increase your usage limit."),
+            None
+        );
+    }
+
+    /// A RESET'S DATE IS NEVER CUT OFF ITS TIME (the review of fix/r15-banner,
+    /// 2026-10-14). The cut at the first word that is no time word
+    /// ([`time_words`]) made `resets at 3pm on Oct 15` the bare `3pm`, which
+    /// `aterm-agent`'s `limit::parse_reset` reads as today's or tomorrow's
+    /// session clock: the date was lost, where main handed over the whole and
+    /// the unread spelling fell to the backstop. No measured Claude Code
+    /// notice is spelled so (its weekly reset is `Oct 15 at 12:33pm`), and
+    /// none of these is cut: each is handed over as main handed it over.
+    #[test]
+    fn a_resets_date_is_never_cut_off_its_time() {
+        for (said, want) in [
+            (
+                "Usage limit reached · resets at 3pm on Oct 15",
+                "3pm on Oct 15",
+            ),
+            (
+                "Usage limit reached · resets 3pm on the 15th",
+                "3pm on the 15th",
+            ),
+            ("Usage limit reached · resets 9am tomorrow", "9am tomorrow"),
+            ("Usage limit reached · resets 9am Monday", "9am Monday"),
+        ] {
+            assert_eq!(reset_of(said).as_deref(), Some(want), "{said}");
+        }
     }
 
     /// A notice split over two rows keeps both, and the reset its first row

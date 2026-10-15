@@ -44,36 +44,44 @@ pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 
 /// A parser's partial state, as data (see the module docs).
 ///
-/// `state` is where the parser stands. The CSI fields (`params`,
+/// `state` is where the parser stands. The parameter fields (`params`,
 /// `subparam_mask`, `current_param`, `param_started`, `last_was_colon`) are
-/// meaningful in `CsiParam` and `CsiIntermediate`; `intermediates` in
-/// `EscapeIntermediate` and the CSI states; `osc`/`osc_overflowed` in
-/// `OscString`; `utf8_tail`/`utf8_expected` in `Ground`; `string_utf8_tail` in
-/// `DcsIgnore` and `SosPmApcString`. Every other field is empty —
-/// [`Parser::carry`] writes it so and [`Parser::restore_carry`] demands it.
+/// meaningful in `CsiParam`, `CsiIntermediate`, `DcsParam` and
+/// `DcsIntermediate`; `intermediates` in `EscapeIntermediate` and those four;
+/// `osc`/`osc_overflowed` in `OscString`; `utf8_tail`/`utf8_expected` in
+/// `Ground`; `string_utf8_tail` in `DcsIgnore` and `SosPmApcString`. Every
+/// other field is empty — [`Parser::carry`] writes it so and
+/// [`Parser::restore_carry`] demands it.
 ///
-/// DCS strings (before their hook) are carried as `DcsIgnore`, and SOS, PM
-/// and APC strings as `SosPmApcString` with no APC consumer: the successor
-/// swallows the rest of the string up to its terminator instead of printing
-/// it (the tail of a sixel or kitty-graphics payload is base64 as text). A
-/// HOOKED DCS string, when the caller asks for one ([`Parser::carry_unhooking`]),
-/// is carried as `SosPmApcString` with no consumer too: that state reads every
-/// byte exactly as `DcsPassthrough` does.
+/// A DCS header (`DcsEntry`, `DcsParam`, `DcsIntermediate`) is carried as
+/// itself, as a CSI is: it holds only its parameters and intermediates, and
+/// the successor hooks the string at its final byte. An ignored DCS
+/// (`DcsIgnore`) is carried as itself, and SOS, PM and APC strings as
+/// `SosPmApcString` with no APC consumer: the successor swallows the rest of
+/// the string up to its terminator instead of printing it (the tail of a
+/// sixel or kitty-graphics payload is base64 as text). A HOOKED DCS string,
+/// when the caller asks for one ([`Parser::carry_unhooking`]), is carried as
+/// `SosPmApcString` with no consumer too: that state reads every byte exactly
+/// as `DcsPassthrough` does.
+///
+/// A carry that crosses to another build takes
+/// [`ParserCarry::for_older_builds`] along beside it: the form a build from
+/// before DCS header carries reads in its place.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParserCarry {
     /// The parser state.
     pub state: State,
-    /// Finalized CSI parameters (at most [`MAX_PARAMS`]).
+    /// Finalized CSI or DCS parameters (at most [`MAX_PARAMS`]).
     pub params: Vec<u16>,
     /// Bit `i` set: `params[i]` followed a colon (a subparameter).
     pub subparam_mask: u32,
-    /// The CSI parameter being accumulated.
+    /// The parameter being accumulated.
     pub current_param: u32,
     /// Whether a digit of `current_param` has been read.
     pub param_started: bool,
-    /// Whether the last CSI separator was a colon.
+    /// Whether the last parameter separator was a colon.
     pub last_was_colon: bool,
-    /// Intermediate (and CSI private-marker) bytes collected so far.
+    /// Intermediate (and private-marker) bytes collected so far.
     pub intermediates: Vec<u8>,
     /// The OSC payload collected so far (at most [`OSC_CARRY_CAP`] bytes).
     pub osc: Vec<u8>,
@@ -101,13 +109,39 @@ impl ParserCarry {
     pub fn is_ground(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The carry a build that predates DCS header carries reads in this one's
+    /// place, or `None` when such a build reads this one as it is.
+    ///
+    /// Until 2026-10-10 a DCS header (`DcsEntry`, `DcsParam`,
+    /// `DcsIntermediate`) was carried as `DcsIgnore` holding nothing, and
+    /// `restore_carry` refused a header: a successor of that vintage handed one
+    /// resumes at Ground and prints the string. The header is now carried as
+    /// itself (round fifteen, R15-PARSER-P1), so a carry that crosses to
+    /// another build (`aterm-core`'s wire form) writes this coarse form beside
+    /// it (ruling 2026-10-10): an older successor reads the `DcsIgnore` it
+    /// wrote itself and swallows the string to its terminator, as it always
+    /// did, and this build and every later one read the exact carry. A newer
+    /// successor handed an older producer's `DcsIgnore` reads it as that
+    /// producer meant it.
+    #[must_use]
+    pub fn for_older_builds(&self) -> Option<ParserCarry> {
+        matches!(
+            self.state,
+            State::DcsEntry | State::DcsParam | State::DcsIntermediate
+        )
+        .then(|| ParserCarry {
+            state: State::DcsIgnore,
+            ..ParserCarry::default()
+        })
+    }
 }
 
 /// Why [`Parser::restore_carry`] refused a carry. The parser is untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarryRefusal {
-    /// The state is not one a carry may name (`DcsEntry`, `DcsParam`,
-    /// `DcsIntermediate`, `DcsPassthrough`).
+    /// The state is not one a carry may name (`DcsPassthrough`, whose string
+    /// lives in the handler it hooked).
     State(State),
     /// More than [`MAX_PARAMS`] parameters.
     Params,
@@ -153,10 +187,10 @@ impl Parser {
     /// `None` only in `DcsPassthrough`: a hooked DCS string's state lives in
     /// the handler it was hooked to, which no carry can reach. Everything else
     /// is carried: a Ground parser (with the head of a split UTF-8 character,
-    /// if one is pending), an escape or CSI sequence with its parameters, an
-    /// OSC string with its payload (or, over [`OSC_CARRY_CAP`], as one to
-    /// discard), and an unhooked DCS or an SOS/PM/APC string as one to ignore
-    /// to its terminator.
+    /// if one is pending), an escape, CSI or DCS header with its parameters
+    /// and intermediates, an OSC string with its payload (or, over
+    /// [`OSC_CARRY_CAP`], as one to discard), and an ignored DCS or an
+    /// SOS/PM/APC string as one to ignore to its terminator.
     #[must_use]
     pub fn carry(&self) -> Option<ParserCarry> {
         let mut carry = ParserCarry {
@@ -171,11 +205,11 @@ impl Parser {
                     carry.utf8_expected = self.utf8_expected;
                 }
             }
-            State::Escape | State::CsiEntry | State::CsiIgnore => {}
+            State::Escape | State::CsiEntry | State::CsiIgnore | State::DcsEntry => {}
             State::EscapeIntermediate => {
                 carry.intermediates = self.intermediates.as_slice().to_vec();
             }
-            State::CsiParam | State::CsiIntermediate => {
+            State::CsiParam | State::CsiIntermediate | State::DcsParam | State::DcsIntermediate => {
                 carry.params = self.params.as_slice().to_vec();
                 carry.subparam_mask = self.subparam_mask;
                 carry.current_param = self.current_param;
@@ -190,11 +224,7 @@ impl Parser {
                     carry.osc.clone_from(&self.osc_data);
                 }
             }
-            State::DcsEntry | State::DcsParam | State::DcsIntermediate | State::DcsIgnore => {
-                carry.state = State::DcsIgnore;
-                carry.string_utf8_tail = self.string_utf8.as_slice().to_vec();
-            }
-            State::SosPmApcString => {
+            State::DcsIgnore | State::SosPmApcString => {
                 carry.string_utf8_tail = self.string_utf8.as_slice().to_vec();
             }
             State::DcsPassthrough => return None,
@@ -246,20 +276,18 @@ impl Parser {
     ///   live parser keeps up to [`MAX_OSC_DATA`], so an OSC 52 clipboard
     ///   write or an OSC 1337 image dispatches here and is dropped by the
     ///   carry (one the live parser already discards past that is not lost);
-    /// * a DCS whose header has not reached its final byte (`DcsEntry`,
-    ///   `DcsParam`, `DcsIntermediate`), which the live parser would hook and
-    ///   the carry turns into `DcsIgnore`;
     /// * an APC string with its consumer started (`apc_start` was sent, e.g. a
     ///   kitty-graphics command), whose consumer the carry cannot reach.
     ///
     /// An SOS or PM string, a `DcsIgnore` and a discarded CSI are swallowed by
-    /// the live parser too, so their carry loses nothing. `false` at Ground and
-    /// for `DcsPassthrough` (which no carry holds at all). A pure read.
+    /// the live parser too, so their carry loses nothing, and a DCS header is
+    /// carried as itself (since 2026-10-10; it was carried as `DcsIgnore`
+    /// before) and hooked by the successor. `false` at Ground and for
+    /// `DcsPassthrough` (which no carry holds at all). A pure read.
     #[must_use]
     pub fn carry_swallows_sequence(&self) -> bool {
         match self.state {
             State::OscString => !self.osc_discard && self.osc_data.len() > OSC_CARRY_CAP,
-            State::DcsEntry | State::DcsParam | State::DcsIntermediate => true,
             State::SosPmApcString => self.apc_active,
             _ => false,
         }
@@ -268,9 +296,8 @@ impl Parser {
     /// Whether the sequence [`Parser::carry_swallows_sequence`] names is a
     /// PICTURE — an APC string with its consumer started (a kitty-graphics
     /// command) or an OSC 1337 payload (an iTerm2 inline image) — whose loss
-    /// a graphics stream's next frame makes good. An OSC 52 clipboard write,
-    /// any other OSC and an unhooked DCS header are not: nothing replaces
-    /// them. A pure read.
+    /// a graphics stream's next frame makes good. An OSC 52 clipboard write
+    /// and any other OSC are not: nothing replaces them. A pure read.
     #[must_use]
     pub fn carry_swallows_picture(&self) -> bool {
         self.carry_swallows_sequence()
@@ -284,15 +311,18 @@ impl Parser {
     /// Install `carry` (see [`Parser::carry`]) after validating it; on `Err`
     /// the parser is untouched.
     ///
-    /// Accepted states: `Ground`, `Escape`, `EscapeIntermediate`, `CsiEntry`,
-    /// `CsiParam`, `CsiIntermediate`, `CsiIgnore`, `OscString`, and the two
+    /// Accepted states: every state but `DcsPassthrough` — `Ground`, `Escape`,
+    /// `EscapeIntermediate`, the four CSI states, the three DCS header states
+    /// (`DcsEntry`, `DcsParam`, `DcsIntermediate`), `OscString`, and the two
     /// ignore states, `DcsIgnore` and `SosPmApcString` (restored with no APC
-    /// consumer). Enforced: at most [`MAX_PARAMS`] parameters, subparameter
-    /// bits only below `params.len()`, at most [`MAX_INTERMEDIATES`]
-    /// intermediates in `0x20..=0x2F` (and the CSI private markers
-    /// `0x3C..=0x3F` in a CSI state), an OSC payload of at most
-    /// [`OSC_CARRY_CAP`] bytes, UTF-8 tails that are prefixes the parser itself
-    /// collects, and every field the state does not use empty.
+    /// consumer). A restored header is a sequence like a restored CSI: the
+    /// program's next byte decides what it dispatches, and no DCS or APC
+    /// consumer is armed by a restore. Enforced: at most [`MAX_PARAMS`]
+    /// parameters, subparameter bits only below `params.len()`, at most
+    /// [`MAX_INTERMEDIATES`] intermediates in `0x20..=0x2F` (and the private
+    /// markers `0x3C..=0x3F` in a CSI or DCS header state), an OSC payload of at
+    /// most [`OSC_CARRY_CAP`] bytes, UTF-8 tails that are prefixes the parser
+    /// itself collects, and every field the state does not use empty.
     ///
     /// C1-control interpretation is this parser's own setting and is kept.
     pub fn restore_carry(&mut self, carry: &ParserCarry) -> Result<(), CarryRefusal> {
@@ -323,31 +353,34 @@ impl Parser {
 
     /// The whole of [`Parser::restore_carry`]'s acceptance predicate.
     fn validate_carry(carry: &ParserCarry) -> Result<(), CarryRefusal> {
-        let csi = matches!(
-            carry.state,
-            State::CsiEntry | State::CsiParam | State::CsiIntermediate | State::CsiIgnore
-        );
-        let accepted = csi
-            || matches!(
-                carry.state,
-                State::Ground
-                    | State::Escape
-                    | State::EscapeIntermediate
-                    | State::OscString
-                    | State::DcsIgnore
-                    | State::SosPmApcString
-            );
-        if !accepted {
+        // A hooked string lives in its handler.
+        if carry.state == State::DcsPassthrough {
             return Err(CarryRefusal::State(carry.state));
         }
+        // A CSI or DCS header: the states that collect the private markers.
+        let header = matches!(
+            carry.state,
+            State::CsiEntry
+                | State::CsiParam
+                | State::CsiIntermediate
+                | State::CsiIgnore
+                | State::DcsEntry
+                | State::DcsParam
+                | State::DcsIntermediate
+        );
+        // The states that hold parameters.
+        let parameters = matches!(
+            carry.state,
+            State::CsiParam | State::CsiIntermediate | State::DcsParam | State::DcsIntermediate
+        );
 
-        // The CSI parameter fields.
+        // The parameter fields.
         let has_params = !carry.params.is_empty()
             || carry.subparam_mask != 0
             || carry.current_param != 0
             || carry.param_started
             || carry.last_was_colon;
-        if has_params && !matches!(carry.state, State::CsiParam | State::CsiIntermediate) {
+        if has_params && !parameters {
             return Err(CarryRefusal::FieldOutsideState);
         }
         if carry.params.len() > MAX_PARAMS {
@@ -362,18 +395,14 @@ impl Parser {
         }
 
         // Intermediates: what the state's Collect actions gather.
-        if !carry.intermediates.is_empty()
-            && !matches!(
-                carry.state,
-                State::EscapeIntermediate | State::CsiParam | State::CsiIntermediate
-            )
-        {
+        let collects = parameters || carry.state == State::EscapeIntermediate;
+        if !carry.intermediates.is_empty() && !collects {
             return Err(CarryRefusal::FieldOutsideState);
         }
         if carry.intermediates.len() > MAX_INTERMEDIATES
             || (carry.state == State::EscapeIntermediate && carry.intermediates.is_empty())
             || !carry.intermediates.iter().all(|&byte| {
-                (0x20..=0x2F).contains(&byte) || (csi && (0x3C..=0x3F).contains(&byte))
+                (0x20..=0x2F).contains(&byte) || (header && (0x3C..=0x3F).contains(&byte))
             })
         {
             return Err(CarryRefusal::Intermediates);

@@ -116,7 +116,10 @@ impl ClassMeta {
     pub fn class(&self) -> ClassPtr {
         // The address came from FFI, so its provenance is already exposed; Rust
         // never dereferences a class pointer, only hands it back to the runtime.
-        ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr))
+        // SAFETY: `class_addr` is private and written only by
+        // `ClassBuilder::register`, from the pair `objc_registerClassPair` just
+        // registered; classes are never disposed, so it is still a class.
+        unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr)) }
     }
 
     /// Byte offset of [`IVAR_NAME`] within an instance.

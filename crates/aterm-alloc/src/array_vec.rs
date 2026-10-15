@@ -175,32 +175,19 @@ impl<T, const N: usize> ArrayVec<T, N> {
     }
 
     /// Clear all elements.
-    // Skip: the same init-tracking class as `pop`; the audited invariant is on
-    // the SAFETY comment below.
+    // Skip: it is `truncate(0)`, the init-tracking class of `pop`; skipped as
+    // before so the parser's verified calls see the same callee.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
-        // Clamp to a provably in-bounds count (identical when `len <= N`
-        // holds) so the subslice carries the bound and the loop has no
-        // per-index obligation.
-        let n = if self.len < N { self.len } else { N };
-        // Zero `len` before any destructor runs: if an element's `Drop` panics,
-        // unwinding runs `Drop for ArrayVec`, which calls this `clear` again;
-        // with the old `len` it would double-drop. The not-yet-dropped tail
-        // leaks instead, which is safe (upstream `arrayvec` does the same).
-        self.len = 0;
-        for slot in &mut self.buf[..n] {
-            // SAFETY: elements `0..n` were initialized when pushed and
-            // `n <= len` as it was on entry, so every slot in the subslice held
-            // a live value; `len` is already 0, so no other path can reach them
-            // and each is dropped exactly once.
-            unsafe {
-                slot.assume_init_drop();
-            }
-        }
+        self.truncate(0);
     }
 
     /// Truncate to the given length.
-    // Skip: same init-tracking class as `pop`/`clear`.
+    ///
+    /// If an element's destructor panics, every other cut element is still
+    /// dropped and the vec is left at `new_len`, as upstream `arrayvec` and std
+    /// `Vec` do.
+    // Skip: same init-tracking class as `pop`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn truncate(&mut self, new_len: usize) {
         if new_len < self.len {
@@ -208,18 +195,14 @@ impl<T, const N: usize> ArrayVec<T, N> {
             // `new_len < len <= N`) so the subslice carries the bound.
             let end = if self.len < N { self.len } else { N };
             let start = if new_len < end { new_len } else { end };
-            // Length first, for the same panic-safety reason as `clear`.
+            // Length first: a panicking destructor unwinds into
+            // `Drop for ArrayVec`, which must see only the kept prefix, or it
+            // would drop the cut slots a second time.
             self.len = new_len;
-            for slot in &mut self.buf[start..end] {
-                // SAFETY: elements `start..end` were initialized when pushed
-                // (`end <= len` as it was on entry), so every slot in the
-                // subslice held a live value; `len` is already `new_len <=
-                // start`, so no other path can reach them and each is dropped
-                // exactly once.
-                unsafe {
-                    slot.assume_init_drop();
-                }
-            }
+            // SAFETY: elements `start..end` were initialized when pushed
+            // (`end <= len` as it was on entry), and `len` is already
+            // `new_len <= start`, so no other path reaches them again.
+            unsafe { crate::drop_initialized(&mut self.buf[start..end]) }
         }
     }
 
@@ -317,16 +300,20 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Retain only elements where the predicate returns true.
     ///
-    /// Panic-safe: if the predicate panics, processed elements are in a valid
-    /// state and are dropped correctly. The predicate takes `&mut T`, as
-    /// upstream `arrayvec`'s does.
+    /// The predicate takes `&mut T`, as upstream `arrayvec`'s does. If it
+    /// panics, the vec keeps every element it had kept plus every element it
+    /// had not yet returned for (the one it panicked on included), in order.
+    /// If a rejected element's destructor panics, that element is gone and the
+    /// vec keeps the kept ones plus every element after it. Either way each
+    /// element is dropped exactly once: std `Vec::retain`'s contract, which
+    /// upstream's `BackshiftOnDrop` mirrors.
     // Skip: the compaction's raw shift is in insert/remove's class, and
     // `F: FnMut` is caller-chosen code.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn retain<F: FnMut(&mut T) -> bool>(&mut self, mut f: F) {
         let original_len = self.len;
-        // Set len to 0 so that if we panic, Drop only drops elements
-        // that we've already moved into the write region.
+        // `len` is 0 while the predicate runs: until the guard settles it, the
+        // vec claims no slot, whatever state the compaction is in.
         self.len = 0;
 
         struct RetainGuard<'a, T, const N: usize> {
@@ -338,24 +325,27 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
         impl<T, const N: usize> Drop for RetainGuard<'_, T, N> {
             fn drop(&mut self) {
-                // 0..write are retained, write..read already processed,
-                // read..original_len not processed: drop them now. Both bounds
-                // are clamped (identical when the invariant holds) so the
-                // subslice carries the proof.
+                // `0..write` are kept, `write..read` are vacated (moved down
+                // or dropped), and `read..original_len` were never decided —
+                // only a panic leaves any: the predicate's, or a rejected
+                // element's destructor's. Keep those, closing the vacated gap
+                // by rotating it past them (ruling 2026-10-10: upstream and
+                // std keep them; this used to drop them all).
+                // Rotating `MaybeUninit` slots moves bytes and runs no user
+                // code. The bounds are clamped (identical when the invariant
+                // `write <= read <= original_len <= N` holds) so the subslice
+                // and the arithmetic carry their proofs.
                 let end = if self.original_len < N {
                     self.original_len
                 } else {
                     N
                 };
-                let start = if self.read < end { self.read } else { end };
-                for slot in &mut self.av.buf[start..end] {
-                    // SAFETY: the element is initialized and unprocessed;
-                    // it is dropped exactly once.
-                    unsafe {
-                        slot.assume_init_drop();
-                    }
+                let read = if self.read < end { self.read } else { end };
+                let write = if self.write < read { self.write } else { read };
+                if read < end {
+                    self.av.buf[write..end].rotate_left(read - write);
                 }
-                self.av.len = self.write;
+                self.av.len = write + (end - read);
             }
         }
 
@@ -370,6 +360,12 @@ impl<T, const N: usize> ArrayVec<T, N> {
             let read = guard.read;
             // SAFETY: element at `read` is initialized (read < original_len)
             let keep = unsafe { f(&mut *guard.av.buf[read].as_mut_ptr()) };
+            // Advance `read` BEFORE the reject arm runs the element's
+            // destructor: if that panics, the slot must already be in the
+            // vacated range `write..read`, which the guard closes over. Left in
+            // the undecided range, the guard would keep a dropped element and
+            // it would be dropped a second time (`panic_drop_parity`'s retain
+            // sweep pins this order).
             guard.read += 1;
             if keep {
                 if guard.write != read {
@@ -381,18 +377,18 @@ impl<T, const N: usize> ArrayVec<T, N> {
                 }
                 guard.write += 1;
             } else {
-                // SAFETY: element is initialized; drop it
+                // SAFETY: the element is initialized, and `read` is already
+                // past it, so whether or not its destructor panics no other
+                // path reaches it again: it is dropped exactly once.
                 unsafe {
                     guard.av.buf[read].assume_init_drop();
                 }
             }
         }
 
-        let final_len = guard.write;
-        // Defuse the guard — all elements processed, set final state.
-        guard.original_len = guard.read; // no unprocessed elements remain
+        // Every element decided (`read == original_len`): the guard settles
+        // `len` to the kept count, the same code a panic takes.
         drop(guard);
-        self.len = final_len;
     }
 
     /// Append every element of `other`, cloning each.
@@ -576,8 +572,9 @@ impl<T: Eq, const N: usize> Eq for ArrayVec<T, N> {}
 
 impl<T, const N: usize> Drop for ArrayVec<T, N> {
     fn drop(&mut self) {
-        // Reuse the (bounds-clamped) clear loop instead of duplicating the slice —
-        // same drop-all-elements behaviour, no separate out-of-bounds obligation.
+        // Reuse `clear` (the bounds-clamped `truncate(0)`) instead of
+        // duplicating the slice — same drop-all-elements behaviour, no
+        // separate out-of-bounds obligation.
         self.clear();
     }
 }
@@ -768,12 +765,14 @@ impl<T: fmt::Debug, const N: usize> fmt::Debug for IntoIter<T, N> {
 /// A draining iterator for [`ArrayVec`], produced by [`ArrayVec::drain`].
 ///
 /// Each element is removed from the vec as it is yielded (`ArrayVec::remove`
-/// shifts the tail down), and `Drop` drains the rest, so the removal happens
-/// whether or not the caller finishes (`wgpu-hal`'s GLES backend relies on
-/// `drain(..)` emptying `resolve_attachments`). No `unsafe`.
+/// shifts the tail down), and `Drop` removes and drops the rest, so the
+/// removal happens whether or not the caller finishes (`wgpu-hal`'s GLES
+/// backend relies on `drain(..)` emptying `resolve_attachments`). No `unsafe`.
 ///
 /// Unlike upstream, forgetting a `Drain` leaves the un-drained elements in the
-/// vec instead of losing them.
+/// vec instead of losing them, and a panicking element destructor during
+/// `Drop` still drops the rest of the range and closes the tail up (std
+/// `Vec::Drain`'s outcome) where upstream leaks both.
 pub struct Drain<'a, T, const N: usize> {
     vec: &'a mut ArrayVec<T, N>,
     /// Index in `vec` of the next element to yield from the FRONT.
@@ -816,9 +815,32 @@ impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {}
 
 impl<T, const N: usize> Drop for Drain<'_, T, N> {
     fn drop(&mut self) {
-        // Removing each remaining element drops it and closes the tail, so an
-        // early-dropped `Drain` leaves the same vec an exhausted one would.
-        while self.next().is_some() {}
+        // The un-yielded part of the range is `start..start + remaining`.
+        // Rotate it to the end of the vec, which closes the tail up behind the
+        // prefix, then cut it off with `truncate`, which lowers `len` first and
+        // drops the cut slots with slice drop glue. So an early-dropped `Drain`
+        // leaves the same vec an exhausted one would, even when one of the
+        // range's destructors panics (ruling 2026-10-10: removing one element
+        // at a time stopped at the panic and left the rest of the range in the
+        // vec). Rotation moves bytes and runs no user code. The bounds are
+        // clamped against the slices' own lengths, and the new length is a
+        // saturating difference (all identical when the invariant
+        // `start + remaining <= len` holds), so the index, the rotation and
+        // the arithmetic carry their proofs.
+        if self.remaining == 0 {
+            return;
+        }
+        let all = self.vec.as_mut_slice();
+        let len = all.len();
+        let start = if self.start < len { self.start } else { len };
+        let range_and_tail = &mut all[start..];
+        let cut = if self.remaining < range_and_tail.len() {
+            self.remaining
+        } else {
+            range_and_tail.len()
+        };
+        range_and_tail.rotate_left(cut);
+        self.vec.truncate(len.saturating_sub(cut));
     }
 }
 

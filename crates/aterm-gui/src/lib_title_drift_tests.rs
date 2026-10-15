@@ -260,11 +260,24 @@ fn contended_quiet_session_honors_deferred_retry_without_hot_spin() {
     app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
     let term = app.pool.get(0).unwrap().term.clone();
     let guard = term.lock().unwrap();
+    // The fold reads at an instant taken BEFORE the contended observation arms
+    // its 4 ms retry, so the arm is still ahead of the fold however long this
+    // thread is descheduled afterwards; the stall below takes that descheduling
+    // on purpose. Folded at a second `Instant::now()` after the arm, as this
+    // test once did, a thread descheduled past the ladder's base saw its own
+    // arm come due, floored it to the fold's `now + 4 ms`, and failed with the
+    // product right. The clock moves a whole millisecond before the arm, so a
+    // rediscovery floored to `now + 4 ms` can never coincide with the arm.
+    let now = Instant::now();
+    std::thread::sleep(Duration::from_millis(1));
     app.retry_title_observations();
     assert!(app.title_summary_tracks_session(0));
+    std::thread::sleep(Duration::from_millis(10));
+    let armed = app.title_summaries.next_retry();
+    assert!(armed.is_some_and(|at| at > now), "{armed:?}");
     assert_eq!(
-        app.next_title_summary_retry(),
-        app.title_summaries.next_retry(),
+        app.next_title_summary_retry_at(now),
+        armed,
         "a known contended session must not be rediscovered at Instant::now"
     );
     drop(guard);

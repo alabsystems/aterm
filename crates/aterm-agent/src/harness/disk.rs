@@ -1587,6 +1587,10 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
             t.path.clone(),
             "an agent's CARGO_TARGET_DIR: deps/ and build/ are `targo clean`'s".to_owned(),
         ),
+        (Origin::BuildCache, _) => (
+            t.path.clone(),
+            "a workspace's Rust build cache: `targo clean` in that workspace".to_owned(),
+        ),
         (Origin::Named | Origin::Checkout { .. }, _) => (
             t.path.clone(),
             "cargo build output: deps/ and build/ are `targo clean`'s".to_owned(),

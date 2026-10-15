@@ -117,6 +117,10 @@ aterm-primer = { workspace = true }
 # opened a visible one (measured 2026-09-30; B28). A dependency-free leaf the one
 # binary links already.
 aterm-uds = { workspace = true }
+# The Developer Tools list's detector (`consent::devtool_grant` over the system TCC.db's
+# row and tccd's answers), for the `devtools:` row both doctors print (`crate::devtools`).
+# A small first-party leaf (aterm-log, aterm-uds, libc) already in the one binary's graph.
+aterm-containment = { workspace = true }
 
 [dev-dependencies]
 # The one trustd probe and skip line, and the ad-hoc signer the tests' fixtures use,

@@ -10,10 +10,12 @@
 //! on a display existing.
 
 // FxHashMap (HashMap<_, _, FxBuildHasher>) for the per-cell glyph caches: the render
-// profile attributed ~10% of rasterize time to SipHash. Keys are local render state
-// (font glyphs / chars), not an untrusted flood vector, so the fast non-DoS hasher is
-// the standard, safe choice here (and matches the engine's grid/core caches).
-use aterm_hash::{FxHashMap, FxHashSet};
+// profile attributed ~10% of rasterize time to SipHash. Their keys are local render
+// state (font glyphs, chars, addresses), not an untrusted flood vector, so the fast
+// unkeyed hasher is the right choice there (and matches the engine's grid/core
+// caches). The two memos keyed by TEXT a pane's program prints, `TwoGenTextCache`
+// and `ShapedRunCache`'s run maps, are `KeyedHashMap`s instead (hashclock-1).
+use aterm_hash::{FxHashMap, FxHashSet, KeyedHashMap};
 use emoji_cluster::ClusterShape;
 
 use aterm_core::grid::LineSize;
@@ -1236,14 +1238,18 @@ enum ShapedHit<'a> {
 /// invalidation clears BOTH generations through [`ShapedRunCache::clear`]
 /// (the existing `.clear()` call sites are unchanged), so a stale-font shaped
 /// run can never outlive a rebuild.
+///
+/// The run maps are [`KeyedHashMap`]s because the runs are text a pane's
+/// program prints; see [`TwoGenTextCache`] for the ruling. The outer map stays
+/// Fx: its key is a [`StyleBits`], at most four values aterm makes.
 #[derive(Default)]
 struct ShapedRunCache {
     /// The current generation: hot runs live here and the steady-state hit path
     /// is a single probe with zero allocation (`Box<str>: Borrow<str>`).
-    cur: FxHashMap<StyleBits, FxHashMap<Box<str>, ShapedRunGlyphs>>,
+    cur: FxHashMap<StyleBits, KeyedHashMap<Box<str>, ShapedRunGlyphs>>,
     /// The previous generation: the last cap-cycle's runs, consulted only on a
     /// `cur` miss and promoted back into `cur` on a hit.
-    prev: FxHashMap<StyleBits, FxHashMap<Box<str>, ShapedRunGlyphs>>,
+    prev: FxHashMap<StyleBits, KeyedHashMap<Box<str>, ShapedRunGlyphs>>,
 }
 
 impl ShapedRunCache {
@@ -1305,10 +1311,24 @@ impl ShapedRunCache {
 /// back from `prev` and never re-resolved. Byte-identical output — each
 /// generation is a pure memo, and `.clear()` (the font-change invalidation)
 /// wipes both.
+///
+/// KEYED HASH (hashclock-1, ruling 2026-10-10). Both generations are
+/// [`KeyedHashMap`]s, not `FxHashMap`s: the keys are text a pane's program
+/// prints, and the cap bounds how many keys there are, not how many share a
+/// bucket. Under the unkeyed Fx, one precomputed set of clusters lands in one
+/// bucket and control tag on every aterm, and each lookup string-compares the
+/// whole chain. A full CPU repaint of a 32x128 screen of 4,096 such clusters
+/// took 16 ms, against 1.9 ms for ordinary clusters; keyed, it takes 1.9 ms.
+/// The price is SipHash on a short key at each lookup. A memo hit went from
+/// about 6.5 ns to 13 ns. On ordinary text (ASCII prose, a screen of emoji
+/// clusters, code under ligatures) the CPU frame cost did not move beyond
+/// run-to-run noise. (Dev profile, this crate at opt-level 2, four
+/// interleaved runs.) `text_caches_spread_a_precomputed_colliding_key_set`
+/// holds the property.
 #[derive(Default)]
 struct TwoGenTextCache<V> {
-    cur: FxHashMap<Box<str>, V>,
-    prev: FxHashMap<Box<str>, V>,
+    cur: KeyedHashMap<Box<str>, V>,
+    prev: KeyedHashMap<Box<str>, V>,
 }
 
 impl<V> TwoGenTextCache<V> {
@@ -2201,11 +2221,10 @@ pub struct Renderer {
     /// -> what rustybuzz shapes it to on the colour face — one glyph id, or a
     /// composited run of several (`None` = not a colour cluster, so fall back to
     /// the base). Keyed by the cluster string so each unique cluster shapes at
-    /// most once. NOTE: this is the one glyph cache keyed by attacker-influenceable
-    /// text (cluster strings from terminal content) under the non-DoS FxHash.
-    /// Accepted: keys are short grapheme clusters, the working set is tiny
-    /// (distinct emoji on screen), and the memory profile is identical to SipHash —
-    /// the standard Alacritty/WezTerm choice.
+    /// most once. Its keys are text from terminal content, which a pane's
+    /// program chooses, so its memo hashes under a per-process secret (see
+    /// [`TwoGenTextCache`]). A non-colour cluster is memoized as `None`, so the
+    /// working set is a whole screen of clusters, not just the emoji on it.
     cluster_shapes: emoji_cluster::ClusterShapes,
     /// Resolve cache for BOLD/ITALIC cells, keyed by character, style, and
     /// scalar presentation. The unstyled hot path keeps using `keys`.
@@ -6324,6 +6343,62 @@ fn resample_mask_area(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) ->
         }
     }
     Some(out)
+}
+
+/// Area-filter a coverage mask SCALED by `scale` (both axes) with its top-left
+/// corner landing at the FRACTIONAL point (`x`, `y`): every destination pixel
+/// takes the coverage of the scaled source pixels by the area they overlap it,
+/// so a glyph keeps its exact place and size to a fraction of a pixel instead
+/// of snapping to whole ones. Returns the raster, its width and height, and
+/// its whole-pixel top-left corner. `None` for malformed dimensions or a scale
+/// that is not positive.
+fn resample_mask_placed(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    scale: f32,
+    x: f32,
+    y: f32,
+) -> Option<(Vec<u8>, usize, usize, i32, i32)> {
+    if sw == 0 || sh == 0 || src.len() != sw.checked_mul(sh)? || scale.is_nan() || scale <= 0.0 {
+        return None;
+    }
+    let (left, top) = (x.floor(), y.floor());
+    let (fx, fy) = (x - left, y - top);
+    let dw = (fx + sw as f32 * scale).ceil().max(1.0) as usize;
+    let dh = (fy + sh as f32 * scale).ceil().max(1.0) as usize;
+    // Per source column (row): the destination columns (rows) its scaled
+    // span overlaps, and by how much.
+    let spans = |n: usize, phase: f32, dn: usize| -> Vec<Vec<(usize, f32)>> {
+        (0..n)
+            .map(|i| {
+                let (a, b) = (phase + i as f32 * scale, phase + (i + 1) as f32 * scale);
+                (a.floor() as usize..(b.ceil() as usize).min(dn))
+                    .filter_map(|d| {
+                        let o = b.min(d as f32 + 1.0) - a.max(d as f32);
+                        (o > 0.0).then_some((d, o))
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let (wx, wy) = (spans(sw, fx, dw), spans(sh, fy, dh));
+    let mut sum = vec![0.0f32; dw * dh];
+    for (sy, rows) in wy.iter().enumerate() {
+        for (sx, cols) in wx.iter().enumerate() {
+            let c = f32::from(src[sy * sw + sx]);
+            if c == 0.0 {
+                continue;
+            }
+            for &(dy, oy) in rows {
+                for &(dx, ox) in cols {
+                    sum[dy * dw + dx] += c * ox * oy;
+                }
+            }
+        }
+    }
+    let out = sum.iter().map(|v| v.round().min(255.0) as u8).collect();
+    Some((out, dw, dh, left as i32, top as i32))
 }
 
 /// Crop a mono coverage raster to its INK — the smallest box holding every
@@ -13695,8 +13770,9 @@ impl Renderer {
 
     /// Rasterize a SCRIPT key ([`StyleBits::SUB`]): the script-free twin's
     /// raster — cached, seated, with every face, weight and fit decision the
-    /// twin made — area-filtered and placed by [`script_drop`], then moved
-    /// sideways by the nudge the key carries ([`sub_nudged`]). One derived
+    /// twin made — scaled and placed by [`script_drop`], moved sideways by
+    /// the nudge the key carries ([`sub_nudged`]), and area-filtered at that
+    /// exact, fractional place ([`resample_mask_placed`]). One derived
     /// raster, so a script cell needs no second trip through the face chain,
     /// and the GPU atlas, which copies this cache's bitmaps, draws the same
     /// pixels in the same place.
@@ -13707,9 +13783,8 @@ impl Renderer {
             ch_or_id: key.ch_or_id & ((1 << SUB_NUDGE_SHIFT) - 1),
             ..key
         };
-        let shift = (f32::from(nudge) * self.cell_w as f32
-            / f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL))
-        .round() as i32;
+        let shift = f32::from(nudge) * self.cell_w as f32
+            / f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL);
         let (baseline, cell_h) = (self.baseline, self.cell_h);
         match self.glyph_image(twin) {
             GlyphImage::Mono {
@@ -13720,14 +13795,14 @@ impl Renderer {
                 advance,
                 bytes,
             } => {
-                let (left, foot, w, h) =
+                let (scale, x, y) =
                     script_drop((*xmin, *ymin, *width, *height), *advance, baseline, cell_h);
-                match resample_mask_area(bytes, *width, *height, w, h) {
-                    Some(bytes) => GlyphImage::Mono {
+                match resample_mask_placed(bytes, *width, *height, scale, x + shift, y) {
+                    Some((bytes, w, h, left, top)) => GlyphImage::Mono {
                         width: w,
                         height: h,
-                        xmin: left + shift,
-                        ymin: foot,
+                        xmin: left,
+                        ymin: baseline - top - h as i32,
                         advance: *advance,
                         bytes,
                     },
@@ -14622,7 +14697,9 @@ impl Renderer {
         // but NOTHING to `self.glyphs`, so it grows independently of the glyph cache
         // and must be capped on its own — otherwise a stream of distinct non-colour
         // clusters accretes unbounded CPU RAM even though `glyphs` stays small. The
-        // composited runs it names go with it (at most `MAX_RUN_GLYPHS` each).
+        // composited runs it names go with it (at most `MAX_RUN_GLYPHS` each). The
+        // cap bounds memory only; what bounds a lookup's cost is the keyed hash
+        // (`TwoGenTextCache`).
         const CLUSTER_CAP: usize = 16_384;
         // A trip waits for the caps, or for twice what the last trip kept if
         // that is more (hysteresis: see below).
@@ -22551,29 +22628,36 @@ pub const SCRIPT_SCALE: f32 = 0.7;
 /// would rise past it ([`script_drop`]) is drawn smaller instead.
 pub const SUB_CEILING: f32 = 0.42;
 
-/// Where a sub-script glyph lands: the box `(xmin, ymin, width, height)` of
-/// a raster placed the renderers' way (left edge `cell_x + xmin`, bottom edge
-/// `cell_y + baseline - ymin`) scaled about the middle of its `advance` and,
-/// vertically, about the cell's FLOOR (its foot stays on the floor, its top
-/// comes down), by [`SCRIPT_SCALE`]. Every sub glyph so stands on ONE line,
-/// the cell's baseline scaled the same way. A glyph so tall that its top
-/// would rise past [`SUB_CEILING`] — an `i` or `j` whose dot stands above the
-/// capitals, a slash, a parenthesis, a fallback symbol filling its cell — is
-/// scaled by less about that line, so it still stands on it beside its
-/// neighbours instead of sinking below them. A pure function of the box and
-/// the cell, so the CPU cache and the GPU atlas — which takes the CPU's
-/// raster — place one glyph.
+/// Where a sub-script glyph lands: the raster `(xmin, ymin, width, height)`
+/// of a glyph placed the renderers' way (left edge `cell_x + xmin`, bottom
+/// edge `cell_y + baseline - ymin`) scaled about the middle of its `advance`
+/// and, vertically, about the cell's FLOOR (its foot stays on the floor, its
+/// top comes down), by [`SCRIPT_SCALE`]. Every sub glyph so stands on ONE
+/// line, the cell's baseline scaled the same way. A glyph so tall that its
+/// top would rise past [`SUB_CEILING`] — an `i` or `j` whose dot stands above
+/// the capitals, a slash, a parenthesis, a fallback symbol filling its cell —
+/// is scaled by less about that line, so it still stands on it beside its
+/// neighbours instead of sinking below them.
+///
+/// Returns the scale and where the scaled raster's top-left corner lands,
+/// EXACTLY — `(scale, x, y)`, `x` from the cell's left and `y` from its top,
+/// in fractional pixels — never rounded: [`resample_mask_placed`] carries the
+/// fraction into the raster, so small letters set a fraction of a cell apart
+/// (the Claude footer's facts) keep an even rhythm and one baseline instead of
+/// each snapping to its own pixel. `y` is never above the ceiling. A pure
+/// function of the box and the cell, so the CPU cache and the GPU atlas —
+/// which takes the CPU's raster — place one glyph.
 #[must_use]
 pub fn script_drop(
-    (xmin, ymin, width, height): (i32, i32, usize, usize),
+    (xmin, ymin, _, height): (i32, i32, usize, usize),
     advance: f32,
     baseline: i32,
     cell_h: usize,
-) -> (i32, i32, usize, usize) {
+) -> (f32, f32, f32) {
     let floor = cell_h as f32;
     let base = baseline as f32;
-    let bottom = base - ymin as f32;
-    let rise = base - (bottom - height as f32);
+    let top = base - ymin as f32 - height as f32;
+    let rise = base - top;
     let ceiling = (floor * SUB_CEILING).ceil();
     // The line every sub glyph stands on.
     let line = floor - (floor - base) * SCRIPT_SCALE;
@@ -22582,15 +22666,10 @@ pub fn script_drop(
     } else {
         SCRIPT_SCALE
     };
-    let new_bottom = (line - (base - bottom) * s).round() as i32;
-    // Rounding never lifts the top past the ceiling.
-    let h = (((height as f32) * s).round() as i32)
-        .min(new_bottom - ceiling as i32)
-        .max(1) as usize;
-    let w = ((width as f32) * s).round().max(1.0) as usize;
     let cx = advance / 2.0;
-    let left = (cx + (xmin as f32 - cx) * s).round() as i32;
-    (left, baseline - new_bottom, w, h)
+    let x = cx + (xmin as f32 - cx) * s;
+    let y = (line - rise * s).max(ceiling);
+    (s, x, y)
 }
 
 /// Horizontally dilate a coverage bitmap by `e` px (synthetic BOLD): each output
@@ -26494,6 +26573,42 @@ impl Rasterizer for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scaled mask lands EXACTLY: its coverage is conserved (the area of
+    /// the scaled box, every pixel counted by the part it covers) and its
+    /// centre moves by exactly the fraction of a pixel it was placed at,
+    /// where a box rounded to whole pixels moves by zero or one.
+    #[test]
+    fn a_placed_mask_keeps_its_coverage_and_its_fraction() {
+        let (sw, sh) = (10, 14);
+        let src = vec![255u8; sw * sh];
+        let centre = |(bytes, w, _, left, _): &(Vec<u8>, usize, usize, i32, i32)| {
+            let (mut sum, mut weight) = (0.0f64, 0.0f64);
+            for (i, &c) in bytes.iter().enumerate() {
+                sum += f64::from(c) * (*left as f64 + (i % w) as f64 + 0.5);
+                weight += f64::from(c);
+            }
+            (sum / weight, weight / 255.0)
+        };
+        let home = resample_mask_placed(&src, sw, sh, 0.7, 3.0, 2.0).expect("placed");
+        let (home_x, home_area) = centre(&home);
+        assert!(
+            (home_area - 0.49 * (sw * sh) as f64).abs() < 0.5,
+            "{home_area}"
+        );
+        for fraction in [0.25f32, 0.5, 0.9375] {
+            let moved =
+                resample_mask_placed(&src, sw, sh, 0.7, 3.0 + fraction, 2.0).expect("placed");
+            let (x, area) = centre(&moved);
+            assert!(
+                (x - home_x - f64::from(fraction)).abs() < 0.02,
+                "{fraction}: {x} vs {home_x}"
+            );
+            assert!((area - home_area).abs() < 0.5, "{fraction}: {area}");
+        }
+        assert!(resample_mask_placed(&src, sw, sh, 0.0, 0.0, 0.0).is_none());
+        assert!(resample_mask_placed(&src, sw, sh + 1, 0.7, 0.0, 0.0).is_none());
+    }
 
     /// MEMORY: two renderers over the SAME primary bytes must share ONE parsed
     /// face, not hold two whole-face outline materialisations.
@@ -33168,6 +33283,98 @@ mod tests {
             both.cur.is_empty() && both.prev.is_empty(),
             "clear() must wipe BOTH generations so no stale-font run survives"
         );
+    }
+
+    /// Low bits of a hash that pick the bucket in a 256-bucket table, the size
+    /// 128 keys grow a fresh map to. A lookup string-compares every resident
+    /// key that shares its bucket and its control tag (the top 7 bits).
+    const FLOOD_BUCKET_BITS: u32 = 8;
+
+    fn probe_class(h: u64) -> (u64, u64) {
+        (h & ((1 << FLOOD_BUCKET_BITS) - 1), h >> 57)
+    }
+
+    /// `'x'` and five tag characters (U+E0020..=U+E007F) spelling `i` in base
+    /// 96: a cell a pane's program can print, which becomes a cluster key.
+    fn flood_key(mut i: u32) -> String {
+        let mut s = String::from("x");
+        for _ in 0..5 {
+            s.extend(char::from_u32(0xE0020 + i % 96));
+            i /= 96;
+        }
+        s
+    }
+
+    /// The most `keys` that share one probe class under `hasher`.
+    fn worst_probe_class(keys: &[String], hasher: &impl std::hash::BuildHasher) -> usize {
+        let mut classes: FxHashMap<(u64, u64), usize> = FxHashMap::default();
+        keys.iter()
+            .map(|k| {
+                let n = classes
+                    .entry(probe_class(hasher.hash_one(k.as_str())))
+                    .or_default();
+                *n += 1;
+                *n
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// hashclock-1 (ruling 2026-10-10): the memos keyed by text a pane's
+    /// program prints hash under a per-process secret. A key set precomputed
+    /// once against the unkeyed Fx, found by plain search as the hunt's probe
+    /// found it, puts all 128 keys in one bucket and control tag, so each
+    /// lookup compared up to 128 strings. Under the cache's own hasher the same
+    /// set must spread like ordinary keys. The bound is no flake: with a random
+    /// key, 9 or more of 128 keys landing in one of 2^15 classes has
+    /// probability below 2^-70. The property is structural, not a timing.
+    #[test]
+    fn text_caches_spread_a_precomputed_colliding_key_set() {
+        use std::hash::BuildHasher as _;
+        let mut flood = Vec::with_capacity(128);
+        let mut i = 0u32;
+        while flood.len() < 128 {
+            let k = flood_key(i);
+            if probe_class(aterm_hash::FxBuildHasher.hash_one(k.as_str())) == (0, 0) {
+                flood.push(k);
+            }
+            i += 1;
+        }
+        // Non-vacuity: against an unkeyed hasher the set is a full chain.
+        assert_eq!(
+            worst_probe_class(&flood, &aterm_hash::FxBuildHasher),
+            flood.len()
+        );
+        let ordinary: Vec<String> = (0..128u32).map(|j| flood_key(j * 7919 + 13)).collect();
+
+        let mut clusters = TwoGenTextCache::default();
+        let mut runs = ShapedRunCache::default();
+        for (n, k) in flood.iter().enumerate() {
+            clusters.insert(k.as_str().into(), n);
+            runs.insert(StyleBits::REGULAR, k.as_str().into(), None);
+        }
+        for (n, k) in flood.iter().enumerate() {
+            assert_eq!(clusters.get(k), Some((&n, false)));
+            assert!(matches!(
+                runs.get(StyleBits::REGULAR, k),
+                Some(ShapedHit::Cur(None))
+            ));
+        }
+        let run_map = &runs.cur[&StyleBits::REGULAR];
+        for (cache, hasher) in [
+            ("TwoGenTextCache", clusters.cur.hasher()),
+            ("ShapedRunCache", run_map.hasher()),
+        ] {
+            let worst = worst_probe_class(&flood, hasher);
+            assert!(
+                worst <= 8,
+                "{cache}: {worst} of {} precomputed keys share one bucket and \
+                 tag (ordinary keys: {}), so a lookup among them compares that \
+                 many strings",
+                flood.len(),
+                worst_probe_class(&ordinary, hasher)
+            );
+        }
     }
 
     /// After ONE runtime-fallback discovery, every candidate the resolver tried

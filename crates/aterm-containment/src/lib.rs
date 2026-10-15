@@ -16,8 +16,8 @@
 //! |------|-------|----------|
 //! | **Master** | Full | Nothing beyond the capability-gated spawn. |
 //! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
-//! | **Safety** | Reduced | Hardened resource limits; no OS sandbox. |
-//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own (no debugger attach), no mach service lookup but the user and group queries (launchd answers by its own policy), writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
+//! | **Safety** | Reduced | Resource limits, no OS sandbox: soft on POSIX (a guardrail the shell's rc or its program can raise), binding on Windows (the Job Object). |
+//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own (no debugger attach), no mach service lookup but the user and group queries (launchd answers by its own policy), writes confined to the temp roots, no read or write of the credential and private-data stores — plus Safety's limits as hard limits, which the program cannot raise. Refuses to start where no OS sandbox exists. |
 //!
 //! Core axiom: all data is code. Any byte crossing a trust boundary is a
 //! potential instruction to an AI agent, so external data is untrusted by
@@ -93,12 +93,13 @@ pub use capability::{FsCapability, NetworkCapability, ProcessCapability};
 // do not read as the crate's own and a destructive repair's entry points are
 // found by reading the consent module.
 pub use consent::{
-    Attribution, ConsentKey, ConsentPosture, DevToolProbe, DevToolProbeLabel, DevToolState,
-    DrClass, FdaProbe, FdaScope, FdaState, Folder, FsConsent, ImageAnchor, PostureInputs,
-    ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome,
-    ResetPlan, ResetStatus, Responsible, ResponsibleApp, ResponsibleError, SpikeEvidence,
-    TccutilPresence, classify_dr, classify_image_anchor, image_anchor, probe_devtool, probe_fda,
-    protected_roots, responsible_app, responsible_pid,
+    Attribution, ConsentKey, ConsentPosture, DevToolGrant, DevToolList, DevToolListLabel,
+    DevToolListing, DevToolProbe, DevToolProbeLabel, DevToolState, DrClass, FdaProbe, FdaScope,
+    FdaState, Folder, FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome,
+    ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
+    ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
+    classify_image_anchor, devtool_grant, image_anchor, probe_devtool, probe_devtool_list,
+    probe_fda, protected_roots, responsible_app, responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use policy::{Capabilities, ContainmentPolicy};

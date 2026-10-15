@@ -71,6 +71,7 @@ pub mod survey;
 mod text;
 pub mod turn;
 pub mod wall;
+mod wrap;
 
 pub use anchors::{ANCHORS, Anchor, AnchorKind, CODEX_ANCHORS, anchor, anchor_text};
 pub use panel::{
@@ -104,6 +105,6 @@ pub use turn::{
     said_tail, status_row_progress, status_row_stall,
 };
 pub use wall::{
-    ApiCause, Placement, Wall, WallKind, classify_wall, login_restored, memory_banner_head,
-    memory_wall, wall,
+    ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, auto_continue_end,
+    classify_wall, left_wall, login_restored, memory_banner_head, memory_wall, since_limit, wall,
 };

@@ -1985,6 +1985,11 @@ def verify_manifest(directory, tag, slug, arch=None, floors=(0, 0, 0), now=None,
             "roster is not signed by the pinned paper master")
     roster = tomllib.loads(roster_bytes.decode("utf-8"))
     require(uint(roster.get("schema"), "roster schema", 0xffffffff) <= 1, "newer roster schema")
+    # Schema 1's key set is closed, as in roster.rs (ruling 2026-10-10): TOML gives a key
+    # written after the [[machine]] tables to the last machine, so an unread key is a
+    # dropped instruction (a `revoked` placed there read as "nothing revoked"). Refuse it.
+    require(set(roster) <= {"schema", "roster_seq", "valid_until", "revoked", "machine"},
+            "unknown roster key")
     seq = uint(roster.get("roster_seq"), "roster sequence")
     require(seq >= floors[2], "roster rollback")
     now = time.time() if now is None else now
@@ -1996,6 +2001,7 @@ def verify_manifest(directory, tag, slug, arch=None, floors=(0, 0, 0), now=None,
     ids, keys = set(), set()
     for machine in machines:
         require(isinstance(machine, dict), "invalid machine")
+        require(set(machine) <= {"id", "pubkey", "added_at", "not_after"}, "unknown machine key")
         identity, key = machine.get("id"), machine.get("pubkey")
         require(isinstance(identity, str) and identity and identity not in ids,
                 "empty or duplicate machine identity")

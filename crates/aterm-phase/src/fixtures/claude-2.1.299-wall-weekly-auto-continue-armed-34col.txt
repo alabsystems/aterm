@@ -1,0 +1,50 @@
+# claude-code 2.1.299 · MEASURED 2026-10-14, `aterm ctl text` of a private headless aterm (34x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · a weekly usage limit (`lab.sh limit TAG seven_day 93600`, --subscriber) at 34 columns, after the harness answered the usage-limit dialog `Wait here, then continue automatically at …` (`limit-wait@v1`): the footer's banner wraps after `limit`, its `resets Oct 15 at …` on the row under it at column two, the countdown under it at column four over three rows
+  (127.0.0.1:58931).
+
+✻ Brewed for 2m 58s · done 10:27
+  AM
+
+❯ carry on with the task
+
+⏺ API Error: Server is
+  temporarily limiting
+  requests (not your usage
+  limit) · This request
+  would exceed your
+  organization's rate
+  limit of 50 requests per
+  minute.
+
+✻ Baked for 3m 15s · done 10:30 AM
+
+❯ Claude Code reported an API
+  error (overloaded). Carry on
+  from where you stopped; if the
+  result of your last step is
+  missing, check whether it ran
+  before you repeat it.
+  ⎿  You've hit your weekly limit
+     · resets Oct 15 at 12:33pm
+     (America/Los_Angeles)
+
+✻ Sautéed for 2m 33s · done 10:33
+  AM
+
+❯ /rate-limit-options
+  ⎿ Claude Code will continue
+    automatically at Oct 15 at
+    12:33pm. Keep this session
+    open; it may still pause for
+    permission prompts. Press esc
+    to cancel the wait.
+
+──────────────────────────────────
+❯
+──────────────────────────────────
+  ⚠ Usage limit reached · limit
+  resets Oct 15 at 12:33pm
+    Continuing automatically at
+    Oct 15 at 12:33pm · esc to
+    cancel
+  ⏵⏵ auto mode on (shift+tab to
+              ◐ medium · /effort

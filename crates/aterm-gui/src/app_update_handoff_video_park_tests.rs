@@ -830,9 +830,8 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 }
 
 /// THE SUCCESSOR TAKES THE FRONT AT THE WRITE, NEVER AT A HELD CLAIM (the
-/// second review of round eight's #18). An aterm window had focus at the
-/// park (`activate_at_commit`), and the Commit's answers took real time (a
-/// `video` reply its client reads 50 ms late), so its claim is held
+/// second review of round eight's #18). The Commit's answers took real time
+/// (a `video` reply its client reads 50 ms late), so its claim is held
 /// through one more input-dispatch fence. The successor used to be
 /// activated at the claim, before that fence: the keys the person typed
 /// through it went to the successor's pre-Commit queue and died with it
@@ -844,12 +843,19 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 /// activated; admitted, it is activated once, in the write (the test's
 /// pipe has no reader, so the write fails as an EPIPE does).
 ///
+/// AND ONLY WHEN AN ATERM WINDOW HAS FOCUS AT THE WRITE (the lifecycle audit
+/// of 2026-10-14, handoff finding 3): focus is read there, not at the park.
+/// The person who switched to another app during the freeze keeps it; the
+/// one who came back to aterm gets the successor in front.
+///
 /// The activation is recorded in place of AppKit's
 /// (`App::handoff_activations`); the successor is a process of the
 /// test's own, killed at the end, and the ids the write marks for it go
 /// to a scratch rendezvous.
 ///
-/// RED before the fix: the claim's pass activated the successor.
+/// RED before the fix: the claim's pass activated the successor. RED with
+/// focus sampled at the park: the successor took the front from the app the
+/// person had moved to, and not for the one who had come back.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_held_claim_activates_the_successor_only_at_its_write() {
@@ -873,7 +879,13 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     let scratch = aterm_tempfile::tempdir().expect("a scratch rendezvous");
     crate::identity_claim::set_rendezvous_override(Some(scratch.path().to_path_buf()));
     let _put_back = Rendezvous;
-    for refused in [false, true] {
+    // (refused, focused at the park, focused at the write)
+    for (refused, at_park, at_write) in [
+        (false, true, true),
+        (true, true, true),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let successor = StandIn(
             aterm_uds::spawnfd::command("/bin/sleep")
                 .arg("60")
@@ -902,6 +914,10 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
+        for ws in app.windows.values_mut() {
+            ws.os_window_for_test = true;
+            ws.focused = at_park;
+        }
         let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
         assert!(
             matches!(parked, ParkAttempt::Parked),
@@ -911,8 +927,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             .pending_update_handoff
             .as_mut()
             .expect("the parked attempt");
-        // An aterm window had focus at the park.
-        pending.activate_at_commit = true;
         pending.commit_drain_started =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         let arbiter = pending.arbiter.clone();
@@ -960,6 +974,10 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
         if refused {
             pending.teardown = crate::DeferredHandoffTeardown::QuitRequested;
         }
+        // The person moved to another app during the fence, or back to aterm.
+        for ws in app.windows.values_mut() {
+            ws.focused = at_write;
+        }
         app.finish_proven_handoff(respin);
         assert_eq!(arbiter.phase(), crate::HandoffAttemptPhase::Rejecting);
         assert!(rejected.try_recv().is_ok(), "the worker is told to reject");
@@ -972,15 +990,16 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             }],
             "the admission refused the quit; otherwise the held pass wrote the Commit"
         );
-        let activated: &[i32] = if refused {
+        let activated: &[i32] = if refused || !at_write {
             &[]
         } else {
             &[i32::try_from(pid).expect("a pid")]
         };
         assert_eq!(
             app.handoff_activations, activated,
-            "activated once, in the write; a held claim the admission refused never \
-             activated the successor its rejection kills"
+            "activated once, in the write, when an aterm window has focus there; a held \
+             claim the admission refused never activated the successor its rejection \
+             kills (focused at the park: {at_park}, at the write: {at_write})"
         );
 
         app.pending_update_handoff = None;

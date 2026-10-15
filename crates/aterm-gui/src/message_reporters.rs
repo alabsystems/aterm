@@ -230,9 +230,9 @@ pub(crate) const KEY_DEBUGGER_ACCESS: &str = "privacy.debugger";
 /// (`messages_host::privacy_pane`).
 pub(crate) const PANE_FULL_DISK_ACCESS: &str = "full-disk-access";
 
-/// The `Intent::OpenSystemPane` pane name of Spotlight's Search Privacy list
-/// (`messages_host::privacy_pane`), where the owner adds `~/Developer`.
-pub(crate) const PANE_SPOTLIGHT_SEARCH_PRIVACY: &str = "spotlight-search-privacy";
+/// The `Intent::OpenSystemPane` pane name of the Developer Tools list
+/// (`messages_host::privacy_pane`), where the owner switches aterm on.
+pub(crate) const PANE_DEVELOPER_TOOLS: &str = "developer-tools";
 
 /// The key of the install-posture row (R21): one per launch.
 #[cfg(any(target_os = "macos", test))]
@@ -4538,33 +4538,43 @@ pub(crate) fn disk_settings_entry(notes: &[String]) -> Entry {
     entry.log_line(format!("disk-settings-off notes={}", notes.len()))
 }
 
-/// The key of the line saying Spotlight indexes the developer root
-/// ([`devroot_indexed_entry`]).
-pub(crate) const DEVROOT_INDEXED_KEY: &str = "devroot.indexed";
+/// The key of the line saying aterm is not on the Developer Tools list
+/// ([`devtools_entry`]).
+pub(crate) const DEVTOOLS_KEY: &str = "privacy.devtools.not-granted";
 
-/// Spotlight indexes `~/Developer`, MEASURED (`atpkg::devroot::spotlight`: the probe
-/// was found): the one fix is the owner's — the Search Privacy list is root-owned
-/// and has no API — and one press opens the pane it is made in.
-pub(crate) fn devroot_indexed_entry() -> Entry {
+/// aterm is not on macOS's Developer Tools list, MEASURED
+/// (`aterm_containment::consent::devtool_grant` over the switch's row and
+/// tccd's answers; owner ruling 2026-10-14): every new program aterm starts
+/// waits for macOS's first-run check, so builds and tests wait. The switch is
+/// the owner's — macOS asks for their password, and aterm never presses it —
+/// and one press opens the pane it is made in. A digest line, never a band
+/// row: dismissing it files it for 30 days, then 90 ([`Resurface::CHOICE`]),
+/// and a reading that finds aterm on the list ends it.
+pub(crate) fn devtools_entry() -> Entry {
     Entry::new(
-        Family::DevRoot,
-        "",
-        "indexed",
-        "Spotlight indexes ~/Developer",
+        Family::Privacy,
+        "devtools",
+        "not-granted",
+        "aterm is not in Developer Tools",
         Why::OnlyYou(Reason::new(
-            "only you can add a folder to Spotlight's Search Privacy list",
+            "only you can add aterm to the Developer Tools list in System Settings",
         )),
         Then::press(
-            Mover::open_system_pane(PANE_SPOTLIGHT_SEARCH_PRIVACY),
-            "Add ~/Developer to Spotlight's Search Privacy",
+            Mover::open_system_pane(PANE_DEVELOPER_TOOLS),
+            "Press + and switch aterm on under Developer Tools",
         ),
     )
+    .severity(Severity::Warn)
     .resurface(Resurface::CHOICE)
-    .more(format!(
-        "{}, then + and ~/Developer",
-        atpkg::devroot::SEARCH_PRIVACY
+    .more(
+        "macOS checks each new program aterm starts before its first run, one at a time, so \
+         builds and tests wait",
+    )
+    .more(crate::menu::privacy_settings_path_words(
+        crate::menu::PrivacyPane::DeveloperTools,
     ))
-    .log_line("devroot-indexed measured=indexed")
+    .more("It applies to the next program aterm starts.")
+    .log_line("devtools not-granted")
 }
 
 /// The live upgrade cannot run (its state folder cannot hold the lock): the

@@ -62,6 +62,13 @@ pub struct SearchResults {
     /// Matches below this line have been evicted. When `incomplete` is false
     /// this is 0 and the full indexed range was searched.
     pub lowest_retained_line: usize,
+    /// How many lines a regex scan could not finish within the line's scan
+    /// budget — a line long enough, for a pattern costly enough, that the scan
+    /// stopped part-way (a soft-wrapped run of megabytes, say). The matches it
+    /// found before it stopped are in `matches`; any after that point on that
+    /// line are missing. Non-zero implies `incomplete`. Always 0 for a literal
+    /// search.
+    pub cut_short_lines: usize,
 }
 
 impl SearchResults {
@@ -72,7 +79,17 @@ impl SearchResults {
             matches,
             incomplete,
             lowest_retained_line,
+            cut_short_lines: 0,
         }
+    }
+
+    /// Record `lines` lines a regex scan could not finish, which makes the
+    /// results incomplete when there are any.
+    #[must_use]
+    pub fn with_cut_short_lines(mut self, lines: usize) -> Self {
+        self.cut_short_lines = lines;
+        self.incomplete |= lines > 0;
+        self
     }
 
     /// True if there are no matches.
@@ -80,6 +97,68 @@ impl SearchResults {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
+    }
+}
+
+/// An ascending, deduplicated set of line numbers, stored as `u32` offsets
+/// from a base line so a frame costs four bytes a line however large the line
+/// numbers are.
+///
+/// Line numbers are absolute terminal rows, which pass `u32::MAX` in a
+/// long-lived tab (R15 content-1), so a frame cannot hold them as `u32`
+/// directly. It carries its own base rather than borrowing an index's: an
+/// index re-keys itself as its window moves, and a frame handed out by one
+/// index state must still name the same lines when it comes back
+/// ([`SearchIndex::search_literal_narrowed`](crate::SearchIndex::search_literal_narrowed)).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineFrame {
+    /// The line offset 0 stands for.
+    base: usize,
+    /// Ascending offsets from `base`.
+    offsets: Vec<u32>,
+}
+
+impl LineFrame {
+    /// An empty frame whose offsets count from `base`.
+    pub(crate) fn with_base(base: usize) -> Self {
+        Self {
+            base,
+            offsets: Vec::new(),
+        }
+    }
+
+    /// Append the line `base + offset`; offsets arrive ascending.
+    pub(crate) fn push_offset(&mut self, offset: u32) {
+        debug_assert!(self.offsets.last().is_none_or(|&last| last < offset));
+        self.offsets.push(offset);
+    }
+
+    /// How many lines the frame holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// True if the frame holds no lines.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// The lines, ascending.
+    pub fn lines(&self) -> impl Iterator<Item = usize> + '_ {
+        let base = self.base;
+        self.offsets
+            .iter()
+            .map(move |&offset| base.saturating_add(offset as usize))
+    }
+
+    /// Whether `line` is in the frame.
+    #[must_use]
+    pub fn contains(&self, line: usize) -> bool {
+        line.checked_sub(self.base)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .is_some_and(|offset| self.offsets.binary_search(&offset).is_ok())
     }
 }
 

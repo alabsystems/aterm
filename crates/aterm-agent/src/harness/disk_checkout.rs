@@ -2,16 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! WHEN A CELLS CACHE'S CHECKOUT IS GONE — ONE RULE, shared as SOURCE by
-//! its two readers: the window's disk watch (`aterm_agent`'s
+//! its readers: the window's disk watch (`aterm_agent`'s
 //! `harness::disk::discover`, which below the floor deletes a gone
-//! checkout's cache whole, unattended) and `xtask gate cells`' own sweep
-//! (`sweep_orphaned_cell_caches`, which includes this file by path — the
-//! same rule with no dependency edge between the two crates). Std only, and
-//! nothing here names either crate.
+//! checkout's cache whole, unattended), `xtask gate cells`' own sweep
+//! (`sweep_orphaned_cell_caches`) and atpkg's Rust build cache sweep
+//! (`build_cache::reclaim`), which include this file by path — the same rule
+//! with no dependency edge between the crates. Std only, and nothing here
+//! names any of them.
 //!
 //! A checkout is GONE only when it is SEEN to be ([`gone`]): its folder is
-//! there without a `Cargo.toml`, or the folder that held it is there
-//! without it. Nothing else is a sight, so nothing else lets a cache go:
+//! there without a `Cargo.toml` (or Trust's `Targo.toml`, [`MANIFESTS`]), or
+//! the folder that held it is there without it. Nothing else is a sight, so
+//! nothing else lets a cache go:
 //!
 //! * a `Cargo.toml` that cannot be read (a folder this process may not
 //!   enter: `EACCES`, a privacy refusal's `EPERM`) is not an absent one;
@@ -27,7 +29,8 @@
 //!   guards ([`HOME_SKIP`]: `~/Desktop`, `~/Documents`, `~/Downloads` …) is
 //!   never looked at either: a `stat` there from the window can put a
 //!   privacy prompt on the owner's screen at a moment nobody asked for
-//!   anything.
+//!   anything. Nor is one reached through a link below `$HOME`, which could
+//!   lead there.
 //!
 //! Reading any error on `Cargo.toml` as "removed" would delete the cells
 //! cache (5-46 GB, a full rebuild) of a checkout behind `chmod 000`, on an
@@ -35,6 +38,9 @@
 //! the folder that held it keeps its cache; that is the safe direction.
 
 use std::path::{Component, Path};
+
+/// The manifests that make a folder a workspace: Cargo's, and Trust's native one.
+pub const MANIFESTS: &[&str] = &["Cargo.toml", "Targo.toml"];
 
 /// Directories of `$HOME` never walked by the disk watch and never looked
 /// into for a checkout ([`gone`]): the system's own trees — and, on macOS,
@@ -112,7 +118,9 @@ pub fn gone(checkout: &Path, home: Option<&Path>) -> Result<String, String> {
 /// [`gone`], every look at the file system through `stat` — the path's
 /// entry, a link not followed at the last component: whether it is a
 /// directory, or the error. Nothing is looked at before the path is known
-/// to lie outside every place never looked into.
+/// to lie outside every place never looked into, and each folder on the way
+/// below `home` is looked at before anything under it, so no link is
+/// followed there.
 ///
 /// # Errors
 ///
@@ -139,11 +147,32 @@ pub fn gone_by(
             what.display()
         )
     };
-    let manifest = checkout.join("Cargo.toml");
-    match stat(&manifest) {
-        Ok(_) => return Err(format!("its checkout {shown} is there")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(unread(&manifest, &e)),
+    let below_home = home
+        .and_then(|h| below(checkout, h))
+        .map_or(0, Iterator::count);
+    let mut way: Vec<&Path> = checkout.ancestors().take(below_home).collect();
+    way.reverse();
+    for folder in way {
+        match stat(folder) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "{} is not a folder (a link is not followed), so its checkout is not \
+                     called gone",
+                    folder.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(unread(folder, &e)),
+        }
+    }
+    for name in MANIFESTS {
+        let manifest = checkout.join(name);
+        match stat(&manifest) {
+            Ok(_) => return Err(format!("its checkout {shown} is there")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(unread(&manifest, &e)),
+        }
     }
     match stat(checkout) {
         Ok(true) => return Ok(format!("its folder {shown} is there without a Cargo.toml")),

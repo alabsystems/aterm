@@ -34,7 +34,7 @@ account = "alabsystems"
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.103.0"
+version = "0.104.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -247,7 +247,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # the Trust lanes). Declaring the union here keeps `unexpected_cfgs` honest in
 # every crate from one place — an undeclared cfg name warns, which `-D warnings`
 # makes an error.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)', 'cfg(trust_seals)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

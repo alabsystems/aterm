@@ -577,7 +577,9 @@ fn successor_reads_fabric_carry(target_build: u64, running_build: u64) -> bool {
 
 /// The hold fence the Commit raises ([`App::fence_hold_serials`]): no `hold` lands
 /// between the Commit's hold-serial read and `_exit`, where a halt answered `OK`
-/// would be lost. Dropping it lifts every fence; a Commit that lands never drops it.
+/// would be lost, and no direct manual reset is answered there
+/// (`fabric::SessionFabric::note_direct_reset`). Dropping it lifts every fence; a
+/// Commit that lands never drops it.
 #[cfg(unix)]
 pub(crate) struct HoldFence(Vec<std::sync::Arc<crate::fabric::SessionFabric>>);
 
@@ -649,7 +651,9 @@ struct HandoffCommitFacts {
     ///
     /// It also requires every session's hold serial to be where the park found it
     /// (`App::hold_serials`): a `hold` answered after the manifest was drawn would
-    /// never reach the successor.
+    /// never reach the successor, and neither would a `reset` run directly on a
+    /// parked session after the carry was taken, which moves the same serial
+    /// (`fabric::SessionFabric::note_direct_reset`).
     exact_activity: bool,
     teardown_allows_commit: bool,
     parent_still_parked: bool,
@@ -661,7 +665,10 @@ struct HandoffCommitFacts {
     input_dispatch_fenced: bool,
     /// Process-local egress is drained to the kernel: no tolerated keystroke is
     /// left in the paste-order FIFO or a wedged-tty sink spill, which would die
-    /// with `_exit`. Asserted directly; below the spec model's abstraction.
+    /// with `_exit`, and no frame is part-way into a master, which `_exit` would
+    /// cut. Read last under the Commit's egress fence, at the write
+    /// (`fence_handoff_egress`). Asserted directly; below the spec model's
+    /// abstraction.
     egress_settled: bool,
     native_safe: bool,
     proof_exact: bool,
@@ -742,9 +749,11 @@ pub(crate) fn commit_layout_topology(
             } => {
                 terminal.cwd = None;
                 terminal.title.clear();
-                // The agent the successor relaunches is not topology; it is
-                // compared on its own (`commit_agent_carry`).
+                // The agent the successor relaunches is not topology, nor the
+                // one it watches (round eighteen); each is compared on its
+                // own (`commit_agent_carry`).
                 terminal.agent = None;
+                terminal.supervised = None;
             }
             // Native/placeholder leaves compare in full. The terminal leaf's user
             // metadata is read under a blocking lock, so it cannot degrade, and
@@ -801,16 +810,34 @@ pub(crate) fn commit_layout_topology(
 /// agent that crashes while the successor boots becomes owed once its exit is
 /// read and settled, a restored relaunch in flight lands, and a tab where a
 /// person starts an agent again is owed no more.
+///
+/// AND THE PROCESS THE SUCCESSOR WATCHES THERE (round eighteen;
+/// `TerminalLeafRestore::supervised`), by its pid and kernel start: one
+/// that changed between the two captures had its exit decided here — a
+/// person's `/exit` left, a crash owed — and the successor, watching the
+/// pending layout's, would decide it again. A re-read of the same process
+/// (its conversation followed) is no change.
 #[cfg(unix)]
-pub(crate) fn commit_agent_carry(
-    layout: &crate::restore::RestoreManifest,
-) -> Vec<(Option<u64>, Option<Box<crate::restore::AgentRestore>>)> {
+pub(crate) fn commit_agent_carry(layout: &crate::restore::RestoreManifest) -> Vec<AgentCarry> {
     layout
         .handed_off_leaves()
         .into_iter()
-        .map(|leaf| (leaf.local_id, leaf.agent))
+        .map(|leaf| {
+            let watched = leaf.supervised.map(|agent| (agent.pid, agent.start));
+            (leaf.local_id, leaf.agent, watched)
+        })
         .collect()
 }
+
+/// One handoff leaf's carry of the supervisor host's agents
+/// ([`commit_agent_carry`]): its session, the relaunch the successor makes
+/// there, and the process it watches there.
+#[cfg(unix)]
+pub(crate) type AgentCarry = (
+    Option<u64>,
+    Option<Box<crate::restore::AgentRestore>>,
+    Option<(u32, String)>,
+);
 
 #[cfg(unix)]
 #[must_use]
@@ -868,7 +895,9 @@ fn handoff_rejection_reason(
     } else if !facts.input_dispatch_fenced {
         "the OS input queue did not dispatch into the masters before Commit".to_string()
     } else if !facts.egress_settled {
-        "tolerated input outlasted the pre-Commit egress-flush budget".to_string()
+        "tolerated input was still on its way to a PTY at Commit (it outlasted the \
+         egress-flush budget, or began after it)"
+            .to_string()
     } else if !facts.parent_still_parked {
         "a parent PTY reader resumed before Commit".to_string()
     } else if let Err(reasons) = native_safety {
@@ -1731,19 +1760,67 @@ fn peek_handoff_masters(live: &[(u64, i32, i32)], hit: impl Fn(libc::c_short) ->
 
 /// Whether every handed-off session's process-local egress has reached the
 /// kernel: no tolerated keystroke is still in the paste-order FIFO or a wedged-tty
-/// sink spill, where `_exit` would destroy it. A master no longer in the pool is
-/// settled (`sessions_alive`/`exact_sessions` reject its death). Live entries use
-/// the sink-local counter; only an orphaned master consults the writer registry.
+/// sink spill, where `_exit` would destroy it, and no frame is still being
+/// written ([`fence_session_egress`]). A master no longer in the pool is settled
+/// (`sessions_alive`/`exact_sessions` reject its death). Live entries use the
+/// sink-local state; only an orphaned master consults the writer registry.
 #[cfg(unix)]
 fn handoff_egress_settled(pool: &crate::SessionPool, live: &[(u64, i32, i32)]) -> bool {
     live.iter().all(|(_, master, _)| {
         if let Some(session) = pool.iter().find(|session| session.master == *master) {
-            !paste_order::is_ordering(&session.ctx.sink)
-                && session.ctx.sink.egress_drained_to_kernel()
+            fence_session_egress(&session.ctx.sink).is_some()
         } else {
             !paste_order::is_master_ordering_for_handoff(*master)
         }
     })
+}
+
+/// One handed-off session's egress, stopped at a frame boundary
+/// ([`aterm_session::sink::SinkWriter::try_fence_egress`]): `None` while a job
+/// waits in its paste-order FIFO, bytes wait in its spill, or a frame is being
+/// written. That last is the blocking write a control verb makes into a session
+/// not in front (`paste-bin`, `feed-bin`, `send`, `paste --stdin`) or a long
+/// query reply, parked on a program that is not reading — during the freeze it
+/// often cannot, its output undrained. `_exit` would cut that frame mid-write: a
+/// bracketed paste left open, so every key after it reads as pasted text.
+///
+/// The drain gate reads it and lets it go; the Commit holds every session's
+/// through its write and `_exit` ([`fence_handoff_egress`]).
+#[cfg(unix)]
+fn fence_session_egress(
+    sink: &aterm_session::sink::SinkWriter,
+) -> Option<aterm_session::sink::EgressFence<'_>> {
+    if paste_order::is_ordering(sink) {
+        return None;
+    }
+    sink.try_fence_egress()
+}
+
+/// The sinks of the handed-off sessions still in the pool.
+#[cfg(unix)]
+fn handoff_sinks(
+    pool: &crate::SessionPool,
+    live: &[(u64, i32, i32)],
+) -> Vec<std::sync::Arc<aterm_session::sink::SinkWriter>> {
+    pool.iter()
+        .filter(|session| live.iter().any(|(_, master, _)| *master == session.master))
+        .map(|session| session.ctx.sink.clone())
+        .collect()
+}
+
+/// THE COMMIT'S EGRESS FENCE: every handed-off session's egress stopped at a
+/// frame boundary ([`fence_session_egress`]), or `None` when one still has
+/// input on its way. Held through the Commit's write, so no frame that begins
+/// after the drain gate's last reading is cut by the `_exit` either: it waits
+/// before its first byte, and goes on if the Commit stands down.
+#[cfg(unix)]
+fn fence_handoff_egress(
+    sinks: &[std::sync::Arc<aterm_session::sink::SinkWriter>],
+) -> Option<Vec<aterm_session::sink::EgressFence<'_>>> {
+    sinks
+        .iter()
+        .map(|sink| fence_session_egress(sink))
+        .collect()
 }
 
 /// The names the artifact a successor must swap in travels under — read and
@@ -4088,8 +4165,8 @@ fn run_prelaunched_handoff(
         &arguments,
         &environment,
         // Never activated at launch: the successor has no window yet. The parent
-        // activates it at Commit when an aterm window had focus at the park
-        // (`PendingUpdateHandoff::activate_at_commit`).
+        // activates it at the Commit's write when an aterm window has focus there
+        // (`App::activate_successor_at_write`).
         false,
     ) {
         Ok(in_flight) => in_flight,
@@ -6227,7 +6304,10 @@ impl App {
         // The hold serials are read first: a hold moving before or after the
         // manifest's own read refuses the Commit (a lossless retry), and none can
         // land after the Commit's comparison, which reads the serials under a fence
-        // (`fence_hold_serials`).
+        // (`fence_hold_serials`). So does a manual reset run directly once the park
+        // has closed its lane, which moves them after it lands on the engine
+        // (`fabric::SessionFabric::note_direct_reset`): read before the carry, a
+        // moved serial means the carry has it.
         let hold_serials = self.hold_serials();
         let manifest = match self.store.try_read() {
             Ok(store) => crate::session_store::SessionHandoff::from_store(&store),
@@ -6454,10 +6534,6 @@ impl App {
             attempt_id,
             park_at,
             proof_ready_at: None,
-            // Sampled at the park: whether the user was looking at aterm when the
-            // screen it will hand over was the one on glass.
-            #[cfg(target_os = "macos")]
-            activate_at_commit: self.any_os_window_focused(),
             nonce: None,
             live: live.clone(),
             // The PROOF identities, in whichever term this attempt's lane can
@@ -7058,8 +7134,9 @@ impl App {
             // - any partial sequence when the successor predates the parser carry
             //   (`WireCaps::carries_parser`);
             // - a carry that only swallows (an over-cap OSC such as OSC 52 or 1337,
-            //   an unhooked DCS header, a started APC such as kitty graphics, a
-            //   hooked sixel string; `Terminal::partial_sequence_swallowed`);
+            //   a started APC such as kitty graphics, a hooked sixel string;
+            //   `Terminal::partial_sequence_swallowed`; a DCS header is carried
+            //   as itself since 2026-10-10 and continues exactly);
             // - when the successor predates the output-state carry
             //   (`WireCaps::carries_output_state`), engine state it would resume
             //   without: an open OSC 8 link or a VT52 `ESC Y` awaiting its address
@@ -7075,9 +7152,8 @@ impl App {
             // unlinked. A swallowed picture (kitty APC chunks, OSC 1337
             // frames, sixel strings) takes the same rule: a graphics stream never
             // pauses at a batch edge, and its next frame replaces the one dropped.
-            // Every other swallowed sequence (an OSC 52 clipboard write, a DCS
-            // header), a DCS query and a VT52 address keep the hard miss on every
-            // lane.
+            // Every other swallowed sequence (an OSC 52 clipboard write), a DCS
+            // query and a VT52 address keep the hard miss on every lane.
             let partial = if caps.carries_parser() {
                 terminal.partial_sequence_uncarried().or_else(|| {
                     terminal.partial_sequence_swallowed().filter(|_| {
@@ -8366,10 +8442,6 @@ impl App {
             attempt_id,
             park_at,
             proof_ready_at: None,
-            // Sampled at the park: whether the user was looking at aterm when the
-            // screen it will hand over was the one on glass.
-            #[cfg(target_os = "macos")]
-            activate_at_commit: self.any_os_window_focused(),
             nonce: Some(nonce),
             live: live.clone(),
             // The PROOF identities, in the device term — see
@@ -8477,9 +8549,11 @@ impl App {
     /// sender makes the worker reject and reap.
     ///
     /// Dispatched keystrokes can also sit in process-local queues (the paste-order
-    /// FIFO, a wedged tty's sink spill) that die with `_exit`, so Commit also waits
-    /// for every handed session's egress to reach the kernel
-    /// (`handoff_egress_settled`); an unflushable spill fails closed (rollback).
+    /// FIFO, a wedged tty's sink spill) that die with `_exit`, and a control verb's
+    /// blocking write can be part-way into a master, which `_exit` would cut; so
+    /// Commit also waits for every handed session's egress to reach the kernel
+    /// (`handoff_egress_settled`), and an unflushable spill or a write that never
+    /// finishes fails closed (rollback).
     ///
     /// No quiet window is waited for: `user_input_recent` reads the machine-wide
     /// HID idle clock, and after the reveal the successor's own keystrokes would
@@ -9016,21 +9090,11 @@ impl App {
             }
             crate::DeferredHandoffTeardown::CleanQuitReady => {
                 // The rollback worker may have taken long enough for a native
-                // view to acquire new unsaved work after the document barrier's
-                // completion. Revalidate at the actual exit edge and surface the
-                // reducer's recovery payload instead of replaying a stale Ready.
-                match self.prepare_quit_native_shutdown() {
-                    Ok(true) => {
-                        let _ = crate::menu::complete_current_native_termination();
-                        el.exit();
-                    }
-                    Ok(false) => {
-                        let _ = crate::menu::cancel_current_native_termination();
-                    }
-                    Err(error) => {
-                        aterm_log::warn!("deferred clean-quit native barrier: {error}");
-                        let _ = crate::menu::cancel_current_native_termination();
-                    }
+                // view or a document to acquire new unsaved work after the
+                // barriers' completion: both are asked again at the actual exit
+                // edge instead of replaying a stale Ready.
+                if self.replay_clean_quit_ready() {
+                    el.exit();
                 }
             }
         }
@@ -9214,8 +9278,9 @@ impl App {
             // reading, never at the claim: a held claim reads it again after its
             // fence, and a refusal there keeps this process running with its
             // rows, which their reporters still restate and end by id. Only the
-            // operator's permit and the write itself can still return (an
-            // EPIPE); the rejection's caller syncs the band after either.
+            // egress fence, the operator's permit and the write itself can
+            // still return (an EPIPE); the rejection's caller syncs the band
+            // after any of them.
             let closed = self.close_uncarried_messages();
             // A HELD CLAIM'S RECORD LANDS TOO (round-seven update audit, finding
             // 53), and so do the endings just closed: what the fence's turns of
@@ -9277,27 +9342,50 @@ impl App {
             // put a dissolution that never happened on record, again at
             // every retry.
             let left_out = arbiter.connections_left_out();
+            #[cfg(test)]
+            if let Some(begin) = self.handoff_before_egress_fence.take() {
+                begin();
+            }
             // Success cannot return: `commit_and_exit` performs the one
             // atomic <=PIPE_BUF write and `_exit(0)` in the same typed
             // operation. EPIPE explicitly transfers Committing back to
             // Rejecting so one reaper can restore the parent. The successor
             // is activated inside the operator's permit, right before the
             // write: a permit refused activated nothing.
-            let commit_result = match operator_quiesce.as_ref() {
-                Some(quiesce) => quiesce.with_commit_permit(|| {
-                    #[cfg(target_os = "macos")]
-                    self.activate_successor_at_write(child_pid);
-                    Self::audit_connections_left_out(left_out);
-                    crate::seamless::commit_and_exit(commit_fd, proof)
-                }),
-                None => {
-                    #[cfg(target_os = "macos")]
-                    self.activate_successor_at_write(child_pid);
-                    Self::audit_connections_left_out(left_out);
-                    Ok(crate::seamless::commit_and_exit(commit_fd, proof))
-                }
+            //
+            // THE EGRESS FENCE IS TAKEN RIGHT BEFORE THE PERMIT AND HELD
+            // THROUGH THE WRITE (`fence_handoff_egress`): a frame a control
+            // verb began writing into a handed-off PTY after the drain gate's
+            // last reading stands the Commit down as unsettled egress
+            // (`Ok(None)`), nothing activated or audited, and no frame can
+            // begin before the `_exit`. With no pending attempt to name the
+            // handed sessions it fences nothing, so it stands down too.
+            let sinks = self
+                .pending_update_handoff
+                .as_ref()
+                .map(|pending| handoff_sinks(&self.pool, &pending.live));
+            let commit_result = match sinks.as_deref().and_then(fence_handoff_egress) {
+                None => Ok(None),
+                Some(_egress) => match operator_quiesce.as_ref() {
+                    Some(quiesce) => quiesce.with_commit_permit(|| {
+                        #[cfg(target_os = "macos")]
+                        self.activate_successor_at_write(child_pid);
+                        Self::audit_connections_left_out(left_out);
+                        Some(crate::seamless::commit_and_exit(commit_fd, proof))
+                    }),
+                    None => {
+                        #[cfg(target_os = "macos")]
+                        self.activate_successor_at_write(child_pid);
+                        Self::audit_connections_left_out(left_out);
+                        Ok(Some(crate::seamless::commit_and_exit(commit_fd, proof)))
+                    }
+                },
             };
-            if commit_result.as_ref().is_ok_and(Result::is_err) && !left_out.is_empty() {
+            if commit_result
+                .as_ref()
+                .is_ok_and(|written| written.as_ref().is_some_and(Result::is_err))
+                && !left_out.is_empty()
+            {
                 aterm_log::warn!(
                     "update apply: the Commit was not written, so the {} connection \
                      drop(s) just audited for it did not happen: this process keeps \
@@ -9312,7 +9400,9 @@ impl App {
                 crate::identity_claim::withdraw_successor_markers(&carried, pid);
             }
             match commit_result {
-                Ok(Err(_)) => commit_write_failed = true,
+                Ok(Some(Err(_))) => commit_write_failed = true,
+                // The egress fence is the last reading of the egress fact.
+                Ok(None) => facts.egress_settled = false,
                 // The permit is the operator's last answer before the
                 // `_exit`, so it re-reads the operator's two facts: a
                 // gate held for a moment is activity here as well.
@@ -9321,7 +9411,7 @@ impl App {
                     (facts.operator_idle, facts.operator_quiesced) =
                         operator_commit_facts(operator_refusal);
                 }
-                Ok(Ok(never)) => match never {},
+                Ok(Some(Ok(never))) => match never {},
             }
             let _ = arbiter.commit_failed_to_rejecting();
         } else if claim {
@@ -9535,7 +9625,8 @@ impl App {
     }
 
     /// THE SUCCESSOR TAKES THE FRONT AT THE COMMIT'S WRITE, and only when an
-    /// aterm window had focus at the park (2026-09-19). Nothing before this
+    /// aterm window has focus there (2026-09-19; read at the write since
+    /// 2026-10-14, at the park before). Nothing before this
     /// asked for it, on either half: LaunchServices' `activates` is false
     /// (`begin_launch(.., false)`), and the successor's own launch posture
     /// asks for nothing (`launch_posture(_, true)`, 2026-09-24) — the fork
@@ -9543,6 +9634,15 @@ impl App {
     /// focus moves — onto the window that is about to be theirs, never onto a
     /// candidate. With no aterm window focused the user is in another app and
     /// keeps it, and the log says that too, so an update's record shows which.
+    ///
+    /// FOCUS IS READ HERE, NOT AT THE PARK (the lifecycle audit of 2026-10-14,
+    /// handoff finding 3). Park to proof is the successor's adopt and paint,
+    /// seconds at worst, and the person may switch apps meanwhile — the frozen
+    /// terminal echoes nothing — or come back to aterm. `WindowEvent::Focused`
+    /// is exempt through the overlap, so the windows' focus is current here.
+    /// A park-time sample took the front back from the app the person had
+    /// moved to, and left one who had come back with no aterm window in front
+    /// once this process exits.
     ///
     /// CALLED INSIDE THE WRITE, after the admission's last reading and the
     /// operator's permit (the review of round eight's #18), never at the
@@ -9567,20 +9667,16 @@ impl App {
         let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) else {
             return;
         };
-        if !self
-            .pending_update_handoff
-            .as_ref()
-            .is_some_and(|pending| pending.activate_at_commit)
-        {
+        if !self.any_os_window_focused() {
             aterm_log::info!(
                 "update apply: not activating the successor at Commit (no aterm \
-                 window had focus at the park; the person keeps the app they are \
+                 window has focus at the write; the person keeps the app they are \
                  in)"
             );
             return;
         }
         // A test records the activation in place of AppKit's: no unit test
-        // reaches WindowServer (AGENTS.md, build coordination rule 5).
+        // reaches WindowServer (AGENTS.md).
         #[cfg(test)]
         let accepted = {
             self.handoff_activations.push(pid);
@@ -9590,7 +9686,7 @@ impl App {
         let accepted = crate::app_launch_successor::activate_running(pid);
         aterm_log::info!(
             "update apply: activating the successor at Commit (an aterm \
-             window had focus at the park): {}",
+             window has focus at the write): {}",
             if accepted {
                 "accepted"
             } else {
@@ -13496,6 +13592,13 @@ mod held_capture_bound_tests {
         );
     }
 }
+
+/// What a control verb does to a parked session before the Commit: a paste in
+/// flight is never cut by the `_exit`, and a reset is never undone by the
+/// successor's restore.
+#[cfg(all(test, unix))]
+#[path = "app_update_handoff_parked_commit_tests.rs"]
+mod parked_commit_tests;
 
 /// Round five, item 16: a `video` take running when an update parks is
 /// answered at the park, never dropped with the connection at Commit.

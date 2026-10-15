@@ -1,0 +1,21 @@
+# claude-code 2.1.295 · MEASURED 2026-10-09, `aterm ctl text` of a private headless aterm (144x50, aterm 0.101.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the usage-limit options dialog Claude Code opens by itself (`/rate-limit-options`) at a five-hour limit with `autoContinueAtUsageLimit: false`: the stub answered 429 with `anthropic-ratelimit-unified-status: rejected`, `-reset` 5 min out and `-representative-claim: five_hour` (`lab.sh limit TAG five_hour 300`); under a full-width `─` rule its title and focused option at column two, the footer at column two, no composer
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.yhp3/proj
+
+
+❯ carry on with the task
+  ⎿  You've hit your session limit · resets 12:23pm (America/Los_Angeles)
+
+✻ Cogitated for 0s · done 12:18 PM
+
+❯ /rate-limit-options
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at 12:23pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc to cancel

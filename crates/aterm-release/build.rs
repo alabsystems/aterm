@@ -235,8 +235,17 @@ fn git_watch_paths(repo: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The checkout this build script RUNS for — cargo's run-time
+/// `CARGO_MANIFEST_DIR`, never `env!`'s compile-time one. Cargo keys a path
+/// package by its path relative to the workspace root, so a build script
+/// compiled in another checkout that shares this target directory is reused
+/// here as it stands: publish/pre-promote builds the commit's cutter in a
+/// throwaway worktree with the clone's `target/`, and the compiled-in path
+/// then named that worktree, removed by the time the cutter was rebuilt in
+/// the clone — every v0.103.0 resume after its publish stamped `unknown`.
 fn workspace_root() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    manifest
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)

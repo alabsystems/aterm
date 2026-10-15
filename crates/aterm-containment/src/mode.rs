@@ -18,12 +18,12 @@ use std::fmt;
 /// - **Master**: full trust, developer mode. No confinement.
 /// - **User**: the default. No confinement; the shell keeps aterm's own
 ///   resource limits.
-/// - **Safety**: hardened resource limits (rlimits; the Job Object on
-///   Windows), no OS sandbox.
+/// - **Safety**: resource limits (soft rlimits, which the shell's rc or its
+///   program can raise; the Job Object on Windows), no OS sandbox.
 /// - **Containment**: hostile agent. The macOS Seatbelt sandbox: no network,
 ///   writes confined to the temp roots, no read or write of the credential and
-///   private-data stores, plus the hardened limits. Refuses to start where no
-///   OS sandbox exists.
+///   private-data stores, plus Safety's limits as hard limits, which the
+///   program cannot raise. Refuses to start where no OS sandbox exists.
 ///
 /// Set only by the launcher (`--containment` / `--sandbox` / `--no-sandbox`);
 /// aterm cannot upgrade its own mode, and it is immutable after
@@ -34,7 +34,7 @@ use std::fmt;
 pub enum ContainmentMode {
     /// Hostile agent — the OS-sandboxed mode; see [`crate::actuator`].
     Containment = 0,
-    /// Hardened resource limits, no OS sandbox.
+    /// Resource limits (soft on POSIX), no OS sandbox.
     Safety = 1,
     /// Normal usage — standard safeguards.
     User = 2,

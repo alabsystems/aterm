@@ -3858,29 +3858,36 @@ mod tests {
     use aterm_render::Theme;
 
     /// The Settings preview resolves a BUNDLED family (the default — `Cascadia
-    /// Mono PL` on Windows, `JetBrains Mono` on Linux — and `JetBrains Mono` on
-    /// Windows too, when none is installed) to its compiled-in bytes. It used
-    /// to hand the resolved `bundled:` identity to the filesystem and report the
-    /// owner's default font as unreadable.
+    /// Mono PL` on Windows, `JetBrains Mono` on Linux — `JetBrains Mono` on
+    /// Windows too, and `Iosevka Term` everywhere, macOS included, when none is
+    /// installed) to its compiled-in bytes. It used to hand the resolved
+    /// `bundled:` identity to the filesystem and report the owner's default
+    /// font as unreadable.
     #[test]
     fn the_settings_preview_resolves_the_bundled_default_family() {
         use aterm_render::bundled;
-        if !bundled::ACTIVE {
-            return;
-        }
-        let mut cases = Vec::new();
-        for (family, id, bold_id) in [
-            (
+        let mut families = Vec::new();
+        if bundled::ACTIVE {
+            families.push((
                 bundled::PRIMARY_FAMILY,
                 bundled::PRIMARY_ID,
                 bundled::PRIMARY_BOLD_ID,
-            ),
-            (
+            ));
+            families.push((
                 bundled::JETBRAINS_FAMILY,
                 bundled::JETBRAINS_ID,
                 bundled::JETBRAINS_BOLD_ID,
-            ),
-        ] {
+            ));
+        }
+        if bundled::IOSEVKA_ACTIVE {
+            families.push((
+                bundled::IOSEVKA_FAMILY,
+                bundled::IOSEVKA_ID,
+                bundled::IOSEVKA_BOLD_ID,
+            ));
+        }
+        let mut cases = Vec::new();
+        for (family, id, bold_id) in families {
             if aterm_render::resolve_font_family(family).is_none() {
                 cases.push((family.to_string(), id));
                 cases.push((format!("{family} Bold"), bold_id));

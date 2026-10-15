@@ -314,6 +314,32 @@ impl GridStorage {
         }
     }
 
+    /// Rotate the ring so its oldest retained row is physical row 0
+    /// (`ring_head == 0`): Vec order is then logical order, and the Vec's end
+    /// is the ring's logical end. Every edit that addresses ring rows by Vec
+    /// position (an append, a drain, a splice at the front) runs this first.
+    /// O(rows) when the ring is wrapped, nothing otherwise.
+    ///
+    /// The append that needs it most is `scroll_up`'s (`grow_scrollback_ring`).
+    /// A wrapped ring (`ring_head != 0`, possible only with every allocated row
+    /// retained) is not necessarily at its cap: a rows-only grow's reveal and
+    /// a ring-only limit raise lift `visible_rows + max_scrollback` without
+    /// adding a row, so the next scroll appends. Pushed at the Vec's end of a
+    /// wrapped ring, the new row landed in the middle of the logical order: the
+    /// screen rows past it did not move while the extras map scrolled whole,
+    /// or with `ring_head >= visible_rows` the screen did not scroll at all and
+    /// each line overwrote the bottom row while blank rows piled into history
+    /// (R15-CHUNK-RING-SCROLL, ruling 2026-10-11: the append linearizes, as
+    /// every other ring append already did, rather than each cap-raising path
+    /// re-deriving the ring's extent).
+    #[inline]
+    pub(crate) fn linearize_ring(&mut self) {
+        if self.ring_head != 0 {
+            self.rows.rotate_left(self.ring_head);
+            self.ring_head = 0;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Content-mutation damage wrappers
     //
@@ -626,14 +652,15 @@ impl GridStorage {
         self.extras_mut().get_or_create(CellCoord::new(row, col))
     }
 
-    /// Get or create extras for a cell whose HAS_EXTRAS flag is already set.
+    /// A fresh extras entry for a cell just written with its HAS_EXTRAS flag
+    /// already set (via `colors.with_extras_flag()` during the write step).
     ///
-    /// Skips the `set_cell_has_extras_flag` ring-buffer lookup. The caller
-    /// MUST have already set the HAS_EXTRAS bit in the cell's PackedColors
-    /// (e.g., via `colors.with_extras_flag()` during the write step).
+    /// Skips the `set_cell_has_extras_flag` ring-buffer lookup, and never
+    /// adopts an entry already keyed to the cell (`CellExtras::fresh`): the
+    /// write is new content.
     #[inline]
     pub(crate) fn cell_extra_mut_preflagged(&mut self, row: u16, col: u16) -> &mut CellExtra {
-        self.extras_mut().get_or_create(CellCoord::new(row, col))
+        self.extras_mut().fresh(CellCoord::new(row, col))
     }
 
     #[inline]
@@ -768,7 +795,7 @@ impl GridStorage {
                 // resurrect stops the application cleared.
                 if !self.tab_defaults_suppressed {
                     for col in old_len..self.tab_stops.len() {
-                        self.tab_stops[col] = col > 0 && col % 8 == 0;
+                        self.tab_stops[col] = crate::is_default_tab_stop(col);
                     }
                 }
             }

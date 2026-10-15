@@ -949,9 +949,9 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     let line = drive::chrome_line(&d, Some(0), 80);
     let v = d.view(0);
     let words = v.words.as_ref().expect("a driven row");
-    let (band, rim) = drive::report(v, 80);
+    let (band, rim) = drive::report::<TestHost>(v, 80);
     assert_eq!(rim, "drive");
-    assert_eq!(band, words.fit(crate::presence::text_cols(80)));
+    assert_eq!(band, words.fit::<TestHost>(crate::presence::text_cols(80)));
     assert!(band.contains("a \"b\" \\c"), "{band}");
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     assert_eq!(
@@ -965,7 +965,7 @@ fn the_status_tail_and_the_chrome_line_are_the_engines_bytes() {
     assert!(line.contains("a \\\"b\\\" \\\\c"), "{line}");
     // The fitted band follows the window's columns (20: the row, with no
     // mail slot since ruling 366, fits 30).
-    assert_ne!(drive::report(d.view(0), 20).0, band);
+    assert_ne!(drive::report::<TestHost>(d.view(0), 20).0, band);
     // A told story on session 2 (window 1's front, window 0's tab): `story`
     // until the human folds it in window 1 — then read, whatever window 0's
     // mark says.
@@ -1044,7 +1044,7 @@ fn a_fold_inside_the_quiet_pays_no_regrid_and_a_returning_want_cancels_it() {
     assert_eq!(d.took("regrid 0"), 1, "no re-grid for the fold");
     assert_eq!(d.view(0).fold_since, Some(d.now));
     // What the human sees is a blank row, and the wire reads the same.
-    assert_eq!(drive::report(d.view(0), 80).0, "");
+    assert_eq!(drive::report::<TestHost>(d.view(0), 80).0, "");
     assert_eq!(
         drive::chrome_line(&d, Some(0), 80),
         "presence rim=none level=quiet band=\"\" sentence=\"\""

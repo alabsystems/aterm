@@ -718,15 +718,15 @@ mod tests {
     }
 
     /// `rows`, a screen of the fullscreen renderer's panel, as the inline
-    /// frame of the 2.1.282 hand-built dialog draws the same box: a `─` rule
-    /// and the box one column in.
+    /// renderer draws the same Dialog (MEASURED on 2.1.295, the wall dialog
+    /// [`LIMIT_OPTIONS_DIALOG`]): a `─` rule and the box two columns in.
     fn inline(rows: &[String]) -> Vec<String> {
         rows.iter()
             .map(|row| {
                 if is_panel_rule(row) {
                     "─".repeat(row.chars().count())
                 } else {
-                    row.strip_prefix("  ").unwrap_or(row).to_string()
+                    row.strip_prefix(' ').unwrap_or(row).to_string()
                 }
             })
             .collect()
@@ -806,8 +806,8 @@ mod tests {
         }
         let focused = boxed(&limit_options_panel(&[STOP, GRANT, WAIT], 1, true));
         assert_eq!(reset_row(&focused).map(|r| r.index), Some(1));
-        let column_one = boxed(&limit_options_dialog(&[STOP, GRANT, WAIT, CREDITS], 0));
-        assert_eq!(reset_row(&column_one).map(|r| r.left), Some(2));
+        let inline_frame = boxed(&limit_options_dialog(&[STOP, GRANT, WAIT, CREDITS], 0));
+        assert_eq!(reset_row(&inline_frame).map(|r| r.left), Some(2));
         for (label, left, day) in [
             ("Use your reset now (1 left, until Dec 31)", 1, "Dec 31"),
             (
@@ -915,7 +915,7 @@ mod tests {
     /// THE CONFIRMATION, READ EXACTLY: the composed box gives its two fenced
     /// rows, the limit it refills, the week, the count and the deadline; the
     /// same at 60 columns, its body wrapped onto a second row; the same in
-    /// the column-one frame; with the cursor on `No, keep it` it is still
+    /// the inline frame; with the cursor on `No, keep it` it is still
     /// exact and says the yes is not focused. NEGATIVE CONTROL: the wall
     /// dialog it replaces, and its own pending state, are not it.
     #[test]

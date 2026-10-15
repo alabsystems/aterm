@@ -140,9 +140,9 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
 pub fn apply(cmd: &mut Command, root: &Path) {
     // Isolated from this process's descriptors as well, before any hook a caller
     // adds: the launch holds its stdio (the lifeline on stdin) and nothing else.
-    // A std child under the pinned seal keeps any descriptor another test thread
-    // had open unflagged at the spawn — a pipe between its `pipe()` and its
-    // `F_SETFD` — and an instance holds it as long as its test runs.
+    // A std child on a std without the SP-1 strip keeps any descriptor another
+    // test thread had open unflagged at the spawn — a pipe between its `pipe()`
+    // and its `F_SETFD` — and an instance holds it as long as its test runs.
     {
         use aterm_uds::spawnfd::InheritNothing as _;
         cmd.inherit_nothing();

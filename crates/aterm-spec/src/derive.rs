@@ -36,8 +36,32 @@
 //!
 //! # The workflow, and what each tier proves
 //!
-//! `AGENTS.md` ("Formal models are AUTHORED") holds the steps; this is what each
-//! step's result means. Every result must say which tier it reached.
+//! For a new or changed bounded state machine:
+//!
+//! 1. **Model** it with `ty_model!` (operators `+ - > <= == && ||`, `if`/`else`;
+//!    name a single action `Step`/`Push`/`Emit`, never `Append`). Register it in
+//!    `xref::model_registry()` and give each invariant a `Buggy` branch that
+//!    breaks it: `tests/non_vacuity_ratchet.rs` sweeps only registered models, and
+//!    a `refines` anchor resolves only a registered machine.
+//! 2. **Tier 0**: `verify::prove_and_catch_scalar(&m, "label")` or
+//!    `verify::check_model_tiered(&m, "label")` in `tests/derived_*.rs`.
+//!    `Err(NotRun)` is reported, never counted a pass.
+//! 3. **Tier 1**: in the crate's `tests/conformance_*.rs`, drive the real code,
+//!    project its state onto the model and check real transitions against it,
+//!    with a negative control. Anchor the real fns with
+//!    `#[cfg_attr(any(test, feature = "spec-anchors"), aterm_spec::refines(…))]`.
+//! 4. **Progress** (it lands, drains, answers): state a `derive::Liveness` with
+//!    named fairness, register it in `xref::liveness_registry`, and discharge it
+//!    with `verify::liveness_proves_and_catches_tiered`; copy
+//!    `native_update_apply_ladder_liveness`.
+//!
+//! Models to copy: `ring_model`, `subscribe_model`, `cursor_model`
+//! (`derive/models_core.rs`); `kernel_model`, `snapshot_model`, `transact_model`
+//! (`derive/models_session.rs`); for a writer/reader pair,
+//! `NativeUpdateFailedMarkSuppression` (`derive/models_update.rs`), whose negative
+//! control replays the bug it was written for.
+//!
+//! What each step's result means (every result says which tier it reached):
 //!
 //! - **Tier 0 — the model.** `ty check` (or the in-process interpreter) explores
 //!   the generated spec exhaustively within its bounds. It proves a property *of

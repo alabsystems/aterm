@@ -445,6 +445,10 @@ impl Grid {
             // Drain lazy buffer: deferred lines reference pre-reflow cell data.
             self.drain_lazy_buffer();
         }
+        // What stays staged past that drain is a detach window's output; the
+        // visible reflow stages its overflow behind it, and the restore below
+        // tells the two apart by this count.
+        let staged_before_reflow = self.storage.lazy_buffer.len();
 
         // The drain just recycled old-width cell bodies; their capacities are
         // sized for `old_cols`, so across a width change they are dead memory or
@@ -473,6 +477,15 @@ impl Grid {
             // linger as orphaned entries.
             if new_cols < old_cols {
                 self.storage.extras.retain_cols_below(new_cols);
+                // `Row::resize` blanks a wide head the cut leaves without its
+                // continuation, and the head's entry (a cluster, a mark, a link)
+                // goes with it, as every operation that blanks a cell drops
+                // what the cell no longer claims (ruling 2026-10-11, r15
+                // chunking review: the alternate-screen resize fuzzer found
+                // a non-BMP emoji's entry left under the blank).
+                for row in 0..self.storage.visible_rows {
+                    self.drop_unclaimed_extras(row, new_cols - 1..new_cols);
+                }
             }
         }
 
@@ -555,7 +568,7 @@ impl Grid {
         // after the visible grid is finalized so adjust_row_count cannot trim it
         // and the new dimensions are in place.
         if let Some(lines) = reflowed_scrollback {
-            self.restore_reflowed_scrollback(lines, new_cols);
+            self.restore_reflowed_scrollback(lines, new_cols, staged_before_reflow);
         }
         // Bottom-anchor the viewport: a width-grow unwrapped content into fewer
         // rows, leaving blank rows under the cursor. Pull the newest history
@@ -792,11 +805,7 @@ impl Grid {
                 super::count_rows_only_resize_migrated_rows(self.storage.rows.len() - target);
             }
             // Linearize ring buffer so pop/drain operate on logical order.
-            let ring_head = self.storage.ring_head;
-            if ring_head != 0 {
-                self.storage.rows.rotate_left(ring_head);
-                self.storage.ring_head = 0;
-            }
+            self.storage.linearize_ring();
             let excess = self.storage.rows.len() - target;
             let scrollback = self
                 .storage
@@ -808,13 +817,12 @@ impl Grid {
             // history rows between tiers (`ResizeShape::pushed`).
             self.storage.last_resize_shape.pushed = row_u16(from_back);
             if from_front > 0 {
-                // Push front rows to lazy scrollback before draining, when tiered
-                // scrollback is attached (as in scroll.rs; without it
-                // drain_lazy_buffer would discard them), or while the store is
+                // Push front rows to lazy scrollback before draining, when a
+                // store that retains lines is attached (as in scroll.rs; without
+                // one drain_lazy_buffer would discard them, after they outlived
+                // the ring rows later scrolls drop), or while the store is
                 // detached for an off-thread reflow (flushed on re-attach).
-                let has_scrollback = self.storage.scrollback.is_some()
-                    || self.storage.scrollback_detached_for_reflow;
-                if has_scrollback {
+                if self.storage.stages_evicted_rows() {
                     let drained_rows: Vec<Row> = self.storage.rows.drain(..from_front).collect();
                     for row in drained_rows {
                         // These scrollback rows' extras were already extracted by
@@ -838,11 +846,9 @@ impl Grid {
             }
             if from_back > 0 {
                 // Push bottom visible rows to lazy scrollback before discarding,
-                // so a height shrink does not lose them. Also stage while
-                // detached for an off-thread reflow (flushed on re-attach).
-                let has_scrollback = self.storage.scrollback.is_some()
-                    || self.storage.scrollback_detached_for_reflow;
-                if has_scrollback {
+                // so a height shrink does not lose them, wherever a store keeps
+                // them or a detached reflow will flush them (as above).
+                if self.storage.stages_evicted_rows() {
                     let start = self.storage.rows.len() - from_back;
                     // Visible rows pushed to scrollback by a height decrease;
                     // their extras are live in self.storage.extras keyed by
@@ -882,11 +888,7 @@ impl Grid {
         self.storage.last_resize_shape.revealed = row_u16(revealed);
 
         if target > self.storage.rows.len() {
-            let ring_head = self.storage.ring_head;
-            if ring_head != 0 {
-                self.storage.rows.rotate_left(ring_head);
-                self.storage.ring_head = 0;
-            }
+            self.storage.linearize_ring();
             let rows_to_add = target - self.storage.rows.len();
             {
                 let rows = &mut self.storage.rows;
@@ -957,10 +959,7 @@ impl Grid {
 
         if target < visible {
             let shrink = visible - target;
-            if self.storage.ring_head != 0 {
-                self.storage.rows.rotate_left(self.storage.ring_head);
-                self.storage.ring_head = 0;
-            }
+            self.storage.linearize_ring();
 
             // 1) TRIM: trailing blank rows below the cursor are not content;
             // archiving them would create blank history that a later grow
@@ -1145,10 +1144,7 @@ impl Grid {
                 // viewport and cursor row where conhost keeps them;
                 // `ring_extras` are untouched because no row changes tier, and
                 // the counter moves with the appended rows, so no key slides.
-                if self.storage.ring_head != 0 {
-                    self.storage.rows.rotate_left(self.storage.ring_head);
-                    self.storage.ring_head = 0;
-                }
+                self.storage.linearize_ring();
                 let rows_to_add = target - visible;
                 let rows = &mut self.storage.rows;
                 let pages = &mut self.storage.pages;
@@ -1198,10 +1194,7 @@ impl Grid {
             if !restored_bottom.is_empty() {
                 // Appended in order after the viewport, as the blank append
                 // below does: the ring must start at its physical row 0.
-                if self.storage.ring_head != 0 {
-                    self.storage.rows.rotate_left(self.storage.ring_head);
-                    self.storage.ring_head = 0;
-                }
+                self.storage.linearize_ring();
                 let base = revealed + visible;
                 let n = restored_bottom.len();
                 let mut pushed = 0;
@@ -1240,10 +1233,7 @@ impl Grid {
             }
             // Any remaining growth needs fresh blank rows at the bottom.
             if target > self.storage.total_lines {
-                if self.storage.ring_head != 0 {
-                    self.storage.rows.rotate_left(self.storage.ring_head);
-                    self.storage.ring_head = 0;
-                }
+                self.storage.linearize_ring();
                 let rows_to_add = target - self.storage.total_lines;
                 let rows = &mut self.storage.rows;
                 let pages = &mut self.storage.pages;
@@ -1328,27 +1318,35 @@ impl Grid {
     /// The inverse of [`Self::extract_row_extras`]: re-attach a revealed ring
     /// row's extracted extras to its viewport row in the live map. Demote and
     /// reveal are pure relabels, so the cells' `is_complex`/RGB-overflow
-    /// markers still point here; only the side-table entries need reseating.
+    /// markers still point here; the side-table entries need reseating, and the
+    /// cells whose links, clusters and marks come back claim them again
+    /// (`cell_extra_mut` sets HAS_EXTRAS): the row may have lost the bit on its
+    /// way into history, and an unclaimed mark is neither drawn nor copied.
     fn inject_scrolled_extras(&mut self, row_idx: u16, e: &ScrolledRowExtras) {
-        let extras = &mut self.storage.extras;
         for span in &e.hyperlinks {
             for col in span.start_col..span.end_col {
-                let cell = extras.get_or_create(CellCoord::new(row_idx, col));
+                let cell = self.storage.cell_extra_mut(row_idx, col);
                 cell.set_hyperlink(Some(span.url.clone()));
                 cell.set_hyperlink_id(span.id.clone());
             }
         }
         for (col, s) in &e.complex_chars {
-            extras
-                .get_or_create(CellCoord::new(row_idx, *col))
+            self.storage
+                .cell_extra_mut(row_idx, *col)
                 .set_complex_char(Some(s.clone()));
         }
         for (col, marks) in &e.combining {
-            let cell = extras.get_or_create(CellCoord::new(row_idx, *col));
+            let cell = self.storage.cell_extra_mut(row_idx, *col);
             for c in marks {
                 cell.add_combining(*c);
             }
         }
+        for (col, packed) in &e.underline_colors {
+            self.storage
+                .cell_extra_mut(row_idx, *col)
+                .set_underline_color_u32(Some(*packed));
+        }
+        let extras = &mut self.storage.extras;
         for (col, rgb) in &e.rgb_fg {
             extras
                 .get_or_create(CellCoord::new(row_idx, *col))
@@ -1358,11 +1356,6 @@ impl Grid {
             extras
                 .get_or_create(CellCoord::new(row_idx, *col))
                 .set_bg_rgb(Some(*rgb));
-        }
-        for (col, packed) in &e.underline_colors {
-            extras
-                .get_or_create(CellCoord::new(row_idx, *col))
-                .set_underline_color_u32(Some(*packed));
         }
     }
 
@@ -1403,6 +1396,11 @@ impl Grid {
     /// Under [`ResizePolicy::ConPty`] the count pushed is the one conhost
     /// demotes (see [`Self::conpty_reflow_demote`]), not the Native minimum
     /// that only brings the cursor on screen.
+    ///
+    /// The lazy buffer is only where the pushed rows wait: they are the newest
+    /// history, and `restore_reflowed_scrollback`, which every width reflow
+    /// runs after this, gives them their seat (a store that retains lines, or
+    /// the ring under its cap) once the older history is back.
     fn finalize_reflow(
         &mut self,
         target_rows: u16,

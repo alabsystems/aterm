@@ -2096,7 +2096,7 @@ pub(crate) enum PackagesRequest {
     /// Application Support.
     UninstallAll,
     /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off
-    /// for this host, cargo build output hidden from Spotlight), applied NOW from
+    /// for this host), applied NOW from
     /// the Security page's "This Mac" card — the verb that keeps them applied (a pass
     /// carries only an edit to the table); a local verb (no store lock, no network) that
     /// works with the package manager switched off. macOS only.

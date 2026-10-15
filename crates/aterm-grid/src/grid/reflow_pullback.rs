@@ -77,11 +77,7 @@ impl Grid {
 
         // Linearize so Vec order == logical order, then address the belt rows
         // at their physical positions just after any (residual) ring history.
-        if self.storage.ring_head != 0 {
-            let ring_head = self.storage.ring_head;
-            self.storage.rows.rotate_left(ring_head);
-            self.storage.ring_head = 0;
-        }
+        self.storage.linearize_ring();
         let hist = self
             .storage
             .total_lines
@@ -257,11 +253,7 @@ impl Grid {
         if n == 0 {
             return;
         }
-        if self.storage.ring_head != 0 {
-            let ring_head = self.storage.ring_head;
-            self.storage.rows.rotate_left(ring_head);
-            self.storage.ring_head = 0;
-        }
+        self.storage.linearize_ring();
         let keep = hist - n;
         self.storage.recycle_rows(keep..hist);
         while self.storage.ring_extras.len() > keep {

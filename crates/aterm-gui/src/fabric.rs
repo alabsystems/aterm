@@ -677,6 +677,8 @@ struct Inbox {
     /// waits ([`apply_hold`]) instead of landing: past that one comparison
     /// nothing reads the serial again, so a halt answered `OK` here would be
     /// lost with this process while the successor runs the session unhalted.
+    /// A direct manual reset waits under it the same way
+    /// ([`SessionFabric::note_direct_reset`]) before it is answered.
     /// Cleared when the attempt stands down; never cleared on a Commit that
     /// lands, because the process that set it is gone.
     hold_fenced: bool,
@@ -715,6 +717,9 @@ struct Inbox {
     /// share an id with one the successor numbers. `None` until a park draws
     /// a manifest. See [`SessionFabric::past_handoff_ceiling`].
     msg_id_ceiling: Option<u64>,
+    /// The session ended — its program exited or its tab closed
+    /// ([`SessionFabric::close`]). Never cleared.
+    closed: bool,
 }
 
 /// One receipt a session owes a sender (R8), HELD HERE — in the one process
@@ -1251,12 +1256,32 @@ pub(crate) struct SessionFabric {
     /// retried, lossless). A counter rather than a comparison of holds, so a
     /// hold set and lifted inside the window still counts as the change it
     /// was.
+    ///
+    /// A manual reset run directly on the engine moves it too
+    /// ([`Self::note_direct_reset`]): on a parked session it lands after the
+    /// carry was taken, the same change-the-successor-would-not-see a hold is.
     hold_serial: std::sync::atomic::AtomicU64,
 }
 
 impl SessionFabric {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The session ended: its program exited or its tab closed. Every waiter
+    /// parked on this endpoint wakes now and answers `ERR exited` (`await
+    /// inbox`; `wait` reads [`Self::closed`]), instead of `OK timeout` at its
+    /// deadline while its lane holds the closed tab's PTY master open.
+    pub(crate) fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    /// Whether [`Self::close`] has run. Not named `closed`: the lock-order census
+    /// resolves a call by its name, and `DeferredReaderGate::closed()` would
+    /// then read as taking this inbox lock.
+    pub(crate) fn endpoint_closed(&self) -> bool {
+        self.lock().closed
     }
 
     /// The delivered rows newer than `after` that `want` asks for, with the
@@ -1572,6 +1597,44 @@ impl SessionFabric {
                 .0;
         }
         Some(inbox)
+    }
+
+    /// A MANUAL RESET THAT RAN DIRECTLY ON THIS SESSION'S ENGINE
+    /// (`manual_reset::run_direct`), outside the byte stream, made known to a
+    /// seamless Commit before it is answered: `true` once it moved
+    /// [`Self::hold_serial`], `false` when a Commit's fence stood for all of
+    /// `fence_wait`, with the serial unmoved (the engine is reset all the same).
+    ///
+    /// On a parked session (the park closes the reset lane) the reset lands
+    /// after the carry the successor restores was taken. The serial is moved
+    /// under the guard [`Self::fence_hold`] takes: a Commit that reads it later
+    /// stands down (a lossless retry; this engine runs on, reset), and while a
+    /// Commit's fence stands — it has read the serial and is on its way to
+    /// `_exit` — this waits ([`Self::wait_unfenced`]), so the update lands with
+    /// the reset unanswered, never answered `OK` and then undone by the
+    /// successor's restore (the review of handoff finding 2).
+    ///
+    /// AFTER THE RESET, NEVER BEFORE: a park reads the serial before it takes
+    /// the carry, so a move it read is a reset already on the engine, in that
+    /// carry. Moved first, a park reading it in the gap before the reset took
+    /// the term lock would carry the engine unreset and match at its Commit.
+    ///
+    /// `fence_wait` is `None` on the main thread (the menu), which raises and
+    /// lifts the fence itself: it moves the serial without waiting, and a
+    /// claim held across the run loop's dispatch reads it again
+    /// (`HoldFence::serials`).
+    pub(crate) fn note_direct_reset(&self, fence_wait: Option<std::time::Duration>) -> bool {
+        let inbox = self.lock();
+        let inbox = match fence_wait {
+            Some(wait) => match self.wait_unfenced(inbox, wait) {
+                Some(inbox) => inbox,
+                None => return false,
+            },
+            None => inbox,
+        };
+        self.hold_serial.fetch_add(1, Ordering::AcqRel);
+        drop(inbox);
+        true
     }
 
     /// [`Self::wait_unfenced`] for a RETIREMENT (`outbox sent`, `deliver …
@@ -5919,6 +5982,10 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
         }
         if watch_hold && guard.hold.is_some() != hold_at_arm {
             return format!("OK inbox hold={}\n", u8::from(guard.hold.is_some()));
+        }
+        // Mail that came first is still answered; after it, the end.
+        if guard.closed {
+            return "ERR exited\n".to_string();
         }
         if crate::control::caller_hung_up() {
             return crate::control::HUNG_UP_REPLY.to_string();

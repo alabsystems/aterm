@@ -241,6 +241,7 @@ mod tests {
             questions: None,
             identity: None,
             agent: None,
+            supervised: None,
             held: false,
         })
     }

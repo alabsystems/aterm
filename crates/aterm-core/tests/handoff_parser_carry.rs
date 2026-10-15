@@ -56,6 +56,11 @@ fn row(t: &Terminal, row: usize) -> String {
     t.row_text(row).unwrap_or_default().trim_end().to_string()
 }
 
+/// Every row's text, top to bottom.
+fn screen(t: &Terminal) -> Vec<String> {
+    (0..usize::from(ROWS)).map(|r| row(t, r)).collect()
+}
+
 #[test]
 fn a_split_sgr_across_the_handoff_applies() {
     let mut successor = handed_over(b"\x1b[38;5;19", b"6mX");
@@ -104,6 +109,67 @@ fn an_unterminated_osc_title_completes_after_the_handoff() {
         let successor = handed_over(head, tail);
         assert_eq!(successor.title(), "vim main.rs", "{head:?} | {tail:?}");
         assert_eq!(row(&successor, 0), "$", "{head:?}: nothing printed as text");
+    }
+}
+
+/// A DCS STRING SPLIT IN ITS HEADER IS READ AFTER THE HANDOFF AS IT WOULD
+/// HAVE BEEN (round fifteen, R15-PARSER-P1). The header was carried as
+/// `DcsIgnore`: the successor swallowed a DECRQSS or XTGETTCAP query whose
+/// header the park split, so the program waiting for the reply got none, and
+/// an 8-bit ST the live engine drops (C1 controls are off) ended the string
+/// there and printed its payload. Now the header rides as itself: split at
+/// every byte up to the final byte, through either restore door, the
+/// successor replies exactly as one engine fed the whole stream does and
+/// draws the same screen, cursor included.
+///
+/// The third stream is a sixel header. With aterm-core's `sixel` feature (on
+/// in any build that links aterm-gui, so in `targo test --workspace`) the
+/// reference draws the image on row 0 and `after` below it; without it the
+/// string is consumed and `after` is row 0. Either way the payload is never
+/// text, and the successor must draw exactly what the reference drew
+/// (2026-10-11, land of round fifteen: the test pinned the no-sixel row and
+/// failed only under the workspace's feature set).
+#[test]
+fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
+    for (stream, query) in [
+        (&b"\x1bP$qm\x1b\\after"[..], true),
+        (b"\x1bP+q544e\x1b\\after", true),
+        (b"\x1bP1;2\x9cq#0~\x1b\\after", false),
+    ] {
+        let mut reference = never_handed_over(stream, b"");
+        let reply = reference.take_response();
+        assert_eq!(reply.is_some(), query, "{stream:?}: the reference reply");
+        let want = screen(&reference);
+        assert!(
+            want.iter().any(|r| r == "after") && !want.concat().contains('#'),
+            "{stream:?}: `after` on a line of its own, the payload never text: {want:?}"
+        );
+        if !cfg!(feature = "sixel") {
+            assert_eq!(row(&reference, 0), "after", "{stream:?}");
+        }
+        let final_byte = stream
+            .iter()
+            .position(|&b| b == b'q')
+            .expect("a final byte");
+        for split in 1..=final_byte {
+            let (head, tail) = stream.split_at(split);
+            for (door, mut successor) in [
+                ("restore_checkpoint", handed_over(head, tail)),
+                ("from_checkpoint", rebuilt_from_carry(head, tail)),
+            ] {
+                assert_eq!(
+                    successor.take_response(),
+                    reply,
+                    "{door} {head:?} | {tail:?}: the reply"
+                );
+                assert_eq!(screen(&successor), want, "{door} {head:?} | {tail:?}");
+                assert_eq!(
+                    successor.cursor(),
+                    reference.cursor(),
+                    "{door} {head:?} | {tail:?}: the cursor"
+                );
+            }
+        }
     }
 }
 

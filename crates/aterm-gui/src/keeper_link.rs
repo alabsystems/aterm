@@ -12,9 +12,10 @@
 //! * REGISTER — a close-on-exec duplicate of every master, fresh or adopted,
 //!   at the end of `spawn_session` ([`register`]);
 //! * META — each registered terminal's Repaint-rung scalar state
-//!   (`seamless::keeper_meta`: no grids, no nonce), sent when its fingerprint
-//!   changes, at most every [`META_POLL`]; DEC 2026 and `?25` are masked out of
-//!   the fingerprint (§11 M9: they churn per frame);
+//!   (`seamless::keeper_meta`: no grids, no nonce, at most 4 KiB at any
+//!   width), sent when its fingerprint changes, at most every [`META_POLL`],
+//!   and tried again each pass until it is sent; DEC 2026 and `?25` are masked
+//!   out of the fingerprint (§11 M9: they churn per frame);
 //! * RELEASE — from `Session::drop` ([`release`]);
 //! * PENDING — the update successor's pid, in both seamless-update lanes,
 //!   written before the grant ([`pending_before_grant`]);
@@ -1062,10 +1063,27 @@ fn start_meta_pump() {
     }
 }
 
-/// One pass of the pump (and, for tests, one step of it).
+/// One pass of the pump (and, for tests, one step of it): each registered
+/// terminal whose fingerprint differs from the one its last SENT META had is
+/// sent its META now.
 #[cfg(unix)]
 pub(crate) fn meta_pass() -> usize {
-    let targets: Vec<(u64, Tracked)> = keeper_state()
+    meta_pass_over(&KEEPER_STATE, crate::seamless::keeper_meta_of)
+}
+
+/// [`meta_pass`] over `state`, building each META with `build` from the
+/// terminal's meta carry. Only the fingerprint and the carry are taken under
+/// the terminal's lock, which the PTY reader waits on; the META is serialized
+/// (and shed to fit, up to 404 µs a call at 4,096 alternate-screen columns in
+/// a debug build) after it is released.
+#[cfg(unix)]
+fn meta_pass_over(
+    state: &Mutex<State>,
+    build: impl Fn(aterm_core::terminal::CheckpointMeta) -> Option<Vec<u8>>,
+) -> usize {
+    let targets: Vec<(u64, Tracked)> = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .tracked
         .iter()
         .map(|(id, t)| (*id, t.clone()))
@@ -1083,16 +1101,23 @@ pub(crate) fn meta_pass() -> usize {
             if last == Some(fingerprint) {
                 continue;
             }
-            (fingerprint, crate::seamless::keeper_meta(&engine))
+            (fingerprint, engine.carry_meta_abandoning_partial())
         };
-        let mut st = keeper_state();
-        let Some(tracked) = st.tracked.get_mut(&id) else {
+        let meta = build(meta);
+        let mut st = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let State { phase, tracked, .. } = &mut *st;
+        let Some(tracked) = tracked.get_mut(&id) else {
             continue;
         };
-        tracked.last = Some(fingerprint);
-        if let (Some(meta), Phase::Live(link)) = (meta, &st.phase)
+        // Recorded only for a META that went (R17-HANDOFF-1, 2026-10-11): one
+        // not built, or that found no link or a full queue, is tried again on
+        // the next pass, not when the modes next move.
+        if let (Some(meta), Phase::Live(link)) = (meta, &*phase)
             && link.enqueue(LinkOp::Meta { rdev, meta })
         {
+            tracked.last = Some(fingerprint);
             sent += 1;
         }
     }
@@ -1494,7 +1519,7 @@ mod tests {
 
     #[cfg(unix)]
     fn end(sh: &aterm_pty::SpawnedShell) {
-        // SIGKILL (AGENTS.md rule 6), then reap.
+        // SIGKILL (AGENTS.md), then reap.
         let identity = aterm_pty::record_spawned_shell(sh.pid);
         let _ = aterm_pty::hangup_shell(&identity, sh.master);
         aterm_pty::reap_shell(identity);
@@ -1689,5 +1714,563 @@ mod tests {
                 .ends_with("later"),
             "no partial CSI swallowed the text"
         );
+    }
+
+    /// A full-screen program's setup, as vim, less, htop and Claude Code send
+    /// it: the alternate screen, DECCKM and the keypad, SGR button mouse,
+    /// bracketed paste, a kitty keyboard push and a scroll region.
+    #[cfg(unix)]
+    const TUI_SETUP: &[u8] =
+        b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[2;40r";
+
+    /// The META a window before round seventeen sent: the sanitized carry as
+    /// the handoff's JSON, each cursor's stops a bool per column.
+    #[cfg(unix)]
+    fn old_form_meta(t: &Terminal) -> Vec<u8> {
+        let mut meta = t.carry_meta_abandoning_partial();
+        meta.shell_integration_nonce = None;
+        meta.parser = None;
+        meta.output_state = aterm_core::terminal::OutputStateRepr::default();
+        aterm_json::to_string(&meta).expect("json").into_bytes()
+    }
+
+    /// `meta` as a window before round seventeen reads it: without the packed
+    /// stops it does not know, each cursor's `tab_stops` the empty list the
+    /// packed form writes. The review of R17-HANDOFF-1 (2026-10-11) fed the
+    /// packed bytes to origin/main's own `recovered_checkpoint` and got what
+    /// this emulation gets.
+    #[cfg(unix)]
+    fn as_an_older_window_reads(meta: &[u8]) -> Vec<u8> {
+        let mut value: aterm_json::Value = aterm_json::from_slice(meta).expect("the META is JSON");
+        for slot in ["cursor", "alt_cursor"] {
+            if let Some(cursor) = value
+                .as_object_mut()
+                .and_then(|object| object.get_mut(slot))
+                .and_then(aterm_json::Value::as_object_mut)
+            {
+                cursor.remove("tab_stops_packed");
+            }
+        }
+        aterm_json::to_string(&value).expect("json").into_bytes()
+    }
+
+    /// The modes [`TUI_SETUP`] sets, read off a recovered checkpoint.
+    #[cfg(unix)]
+    fn assert_tui_modes(cp: &aterm_core::terminal::TerminalCheckpoint, what: &str) {
+        let modes = &cp.modes;
+        assert!(modes.alternate_screen, "{what}: the alt screen");
+        assert!(modes.application_cursor_keys, "{what}: DECCKM");
+        assert!(modes.application_keypad, "{what}: the keypad");
+        assert!(modes.bracketed_paste, "{what}: bracketed paste");
+        assert_eq!(
+            modes.mouse_mode,
+            aterm_core::terminal::MouseMode::ButtonEvent,
+            "{what}: the mouse"
+        );
+        assert_eq!(
+            modes.mouse_encoding,
+            aterm_core::terminal::MouseEncoding::Sgr,
+            "{what}: the mouse encoding"
+        );
+    }
+
+    /// THE META FITS AT ANY WIDTH (round seventeen, R17-HANDOFF-1). Each cursor
+    /// carried its tab stops as a JSON bool per column — two cursors on the
+    /// alternate screen, and a vector a grid never shrinks — so from 119 alt-
+    /// screen columns (330 on the main screen, or any pane once that wide) even
+    /// the bare scalars passed `MAX_META`, `keeper_meta` returned nothing, and
+    /// a crash recovery restored the modes from before the program started.
+    /// A 200- and a 400-column alt-screen session, custom stops included, and
+    /// a pane once 400 columns wide now 100: each META fits and its stops
+    /// round-trip, the one past the width included.
+    #[cfg(unix)]
+    #[test]
+    fn a_wide_alt_screen_meta_fits_and_carries_its_tab_stops() {
+        let recover = |t: &Terminal, what: &str| {
+            let meta = crate::seamless::keeper_meta(t)
+                .unwrap_or_else(|| panic!("{what}: the META was not built"));
+            assert!(
+                meta.len() <= aterm_keeper::wire::MAX_META,
+                "{what}: {}",
+                meta.len()
+            );
+            let mut used = 0;
+            crate::seamless::recovered_checkpoint(&meta, &mut used)
+                .unwrap_or_else(|| panic!("{what}: no checkpoint"))
+        };
+        for cols in [200_u16, 400] {
+            let what = format!("{cols} columns");
+            let mut t = Terminal::new(50, cols);
+            // A stop set at column 5 and the default at 16 cleared, then a stop
+            // near the right edge; then the program.
+            let edge = format!("\x1b[1;{}H\x1bH", cols - 2);
+            t.process(b"\x1b[1;6H\x1bH\x1b[1;17H\x1b[g");
+            t.process(edge.as_bytes());
+            t.process(b"\x1b[H");
+            t.process(TUI_SETUP);
+            let carried = t.carry_meta_abandoning_partial();
+            let alt = carried
+                .alt_cursor
+                .clone()
+                .expect("PRECONDITION: an alt grid");
+            assert!(
+                carried.cursor.tab_stops[5] && !carried.cursor.tab_stops[16],
+                "PRECONDITION: custom stops"
+            );
+            let cp = recover(&t, &what);
+            assert_tui_modes(&cp, &what);
+            assert_eq!(cp.cursor.tab_stops, carried.cursor.tab_stops, "{what}");
+            let alt_cp = cp.alt_cursor.clone().expect("the saved primary's cursor");
+            assert_eq!(alt_cp.tab_stops, alt.tab_stops, "{what}");
+            assert_eq!(
+                (cp.cursor.scroll_top, cp.cursor.scroll_bottom),
+                (1, 39),
+                "{what}: the program's cursor is carried, not reset"
+            );
+            let recovered = Terminal::from_checkpoint(&cp);
+            assert_eq!(recovered.grid().tab_stops(), t.grid().tab_stops(), "{what}");
+            assert_eq!(recovered.kitty_keyboard_flags(), t.kitty_keyboard_flags());
+        }
+
+        // Once 400 columns wide, now 100: the vector keeps 400 stops, and the
+        // custom one at column 300 is found again by a later widen.
+        let mut t = Terminal::new(50, 400);
+        t.process(b"\x1b[1;301H\x1bH\x1b[H");
+        t.resize(50, 100);
+        t.process(TUI_SETUP);
+        assert_eq!(
+            t.grid().tab_stops().len(),
+            400,
+            "PRECONDITION: never shrunk"
+        );
+        let cp = recover(&t, "once 400 columns, now 100");
+        assert_tui_modes(&cp, "once wide");
+        assert_eq!(cp.cursor.tab_stops.len(), 400);
+        assert!(cp.cursor.tab_stops[300], "the stop past the width");
+        let mut recovered = Terminal::from_checkpoint(&cp);
+        recovered.resize(50, 400);
+        assert!(
+            recovered.grid().tab_stops()[300],
+            "a widen finds the stop again"
+        );
+    }
+
+    /// A META IS BUILT FOR EVERY SESSION (R17-HANDOFF-1): with the stops
+    /// packed, a default session's META does not grow with the width; and the
+    /// worst a session can carry — 4,096 columns with a stop at every one, on
+    /// both screens, a long directory and title, a pushed colour table, marks,
+    /// full kitty stacks, both DECSC slots and counters at their widest — sheds
+    /// to the fixed scalars and still fits, its modes and regions intact and
+    /// its stops the every-8 defaults. So does that session with every other
+    /// scalar at its widest too (`widest_scalars`, after the review's finding
+    /// on 2026-10-11 that the worst case left the charsets, the mouse encoding
+    /// and the cursor style narrow).
+    #[cfg(unix)]
+    #[test]
+    fn a_meta_is_built_for_every_session() {
+        let size = |cols: u16| {
+            let mut t = Terminal::new(50, cols);
+            t.process(TUI_SETUP);
+            crate::seamless::keeper_meta(&t)
+                .unwrap_or_else(|| panic!("{cols} columns"))
+                .len()
+        };
+        // From 200 columns the old form does not fit, so these are packed.
+        let sizes = [200, 400, 4096].map(size);
+        let spread =
+            sizes.iter().max().copied().unwrap_or(0) - sizes.iter().min().copied().unwrap_or(0);
+        assert!(spread <= 16, "only the numbers' digits grow: {sizes:?}");
+
+        let cols = aterm_core::grid::MAX_GRID_COLS;
+        let mut t = Terminal::new(50, cols);
+        let mut setup = Vec::new();
+        for col in 1..=cols {
+            setup.extend_from_slice(format!("\x1b[1;{col}H\x1bH").as_bytes());
+        }
+        setup
+            .extend_from_slice(format!("\x1b]7;file://host/{}\x1b\\", "d".repeat(2000)).as_bytes());
+        setup.extend_from_slice(format!("\x1b]2;{}\x07", "t".repeat(2000)).as_bytes());
+        for index in 0..256 {
+            setup.extend_from_slice(format!("\x1b]4;{index};rgb:12/34/56\x1b\\").as_bytes());
+        }
+        setup
+            .extend_from_slice(b"\x1b[#P\x1b[#P\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07\r\n");
+        setup.extend_from_slice(
+            b"\x1b[>1u\x1b[>3u\x1b[>1u\x1b[>3u\x1b[>1u\x1b[>3u\x1b[>1u\x1b[>3u\x1b7",
+        );
+        setup.extend_from_slice(TUI_SETUP);
+        setup.extend_from_slice(b"\x1b[>1u\x1b[>3u\x1b[>1u\x1b[>3u\x1b[>1u\x1b[>3u\x1b[>1u\x1b7");
+        for col in 1..=cols {
+            setup.extend_from_slice(format!("\x1b[1;{col}H\x1bH").as_bytes());
+        }
+        t.process(&setup);
+        let mut carry = t.carry_meta_abandoning_partial();
+        let alt = carry
+            .alt_cursor
+            .as_ref()
+            .expect("PRECONDITION: two cursors");
+        assert!(
+            carry.cursor.tab_stops.iter().all(|stop| *stop)
+                && alt.tab_stops.iter().all(|stop| *stop),
+            "PRECONDITION: a stop at every column of both grids"
+        );
+        assert!(
+            carry.current_working_directory.is_some() && carry.title.is_some(),
+            "PRECONDITION: a directory and a title"
+        );
+        carry.absolute_row_counter = u64::MAX;
+        carry.alt_absolute_row_counter = u64::MAX;
+        carry.style_fg_bits = u32::MAX;
+        carry.style_bg_bits = u32::MAX;
+        carry.style_flag_bits = u16::MAX;
+        carry.style_protected = true;
+        carry.secure_keyboard_entry = true;
+        carry.taskbar_progress = Some(aterm_types::TaskbarProgress::Paused(100));
+        carry.shell_integration_rev = Some("f".repeat(16));
+        let widest = aterm_core::terminal::KittyKeyboardFlags::from_bits(u8::MAX);
+        let kitty = &mut carry.kitty_keyboard;
+        kitty.flags = widest;
+        kitty.main_saved_flags = Some(widest);
+        kitty.alt_saved_flags = Some(widest);
+        kitty.main_stack = [widest; 8];
+        kitty.alt_stack = [widest; 8];
+        for saved in [&mut carry.saved_cursor_main, &mut carry.saved_cursor_alt] {
+            let slot = saved.as_mut().expect("PRECONDITION: both DECSC slots");
+            slot.cursor_row = aterm_core::grid::MAX_GRID_ROWS - 1;
+            slot.cursor_col = cols - 1;
+            slot.style_fg_bits = u32::MAX;
+            slot.style_bg_bits = u32::MAX;
+            slot.style_flag_bits = u16::MAX;
+            slot.underline_color = Some(u32::MAX);
+        }
+        let widest = widest_scalars(carry.clone());
+        let meta = crate::seamless::keeper_meta_of(carry).expect("the worst case is built");
+        assert!(meta.len() <= aterm_keeper::wire::MAX_META, "{}", meta.len());
+        let worst = meta.len();
+        let mut used = 0;
+        let cp = crate::seamless::recovered_checkpoint(&meta, &mut used).expect("a checkpoint");
+        assert_tui_modes(&cp, "the worst case");
+        assert_eq!(
+            (cp.cursor.scroll_top, cp.cursor.scroll_bottom),
+            (1, 39),
+            "the region stays"
+        );
+        let defaults = crate::seamless::default_tab_stops(usize::from(cols));
+        assert_eq!(
+            cp.cursor.tab_stops, defaults,
+            "the custom stops were shed last"
+        );
+        assert_eq!(cp.alt_cursor.map(|alt| alt.tab_stops), Some(defaults));
+
+        // And with every scalar at its widest (`widest_scalars`), past what any
+        // session reaches, it still sheds to a META that fits.
+        let modes = aterm_json::to_string(&widest.modes).expect("json");
+        let charset = aterm_json::to_string(&widest.charset).expect("json");
+        assert!(
+            !modes.contains("true")
+                && modes.contains("SgrPixel")
+                && charset.contains("IsoLatin1Supplemental")
+                && widest.history_lines == u32::MAX
+                && widest.cursor.scroll_bottom == u16::MAX,
+            "PRECONDITION: the widest scalars: {modes} {charset}"
+        );
+        let meta = crate::seamless::keeper_meta_of(widest).expect("the widest is built");
+        assert!(meta.len() <= aterm_keeper::wire::MAX_META, "{}", meta.len());
+        eprintln!(
+            "the worst case: {worst} bytes; with the widest scalars: {} (cap {})",
+            meta.len(),
+            aterm_keeper::wire::MAX_META
+        );
+    }
+
+    /// `meta` with every scalar a shed META keeps at its widest JSON
+    /// (R17-HANDOFF-1's review, 2026-10-11), to bound its size: each bool
+    /// `false` (a byte wider than `true`); each number, and each absent
+    /// optional one, the widest its field takes back unchanged (`u64::MAX`,
+    /// then `u32::MAX`, `u16::MAX`, `null` and `u8::MAX`, tried in that
+    /// order); each enum its longest name; and the widest character sets in
+    /// every slot. The stop vectors are left as they are.
+    #[cfg(unix)]
+    fn widest_scalars(
+        mut meta: aterm_core::terminal::CheckpointMeta,
+    ) -> aterm_core::terminal::CheckpointMeta {
+        use aterm_json::Value;
+        fn nth_scalar<'a>(value: &'a mut Value, n: &mut usize) -> Option<&'a mut Value> {
+            match value {
+                Value::Object(map) => map.values_mut().find_map(|child| nth_scalar(child, n)),
+                Value::Array(items) => items.iter_mut().find_map(|child| nth_scalar(child, n)),
+                scalar if *n == 0 => Some(scalar),
+                _ => {
+                    *n -= 1;
+                    None
+                }
+            }
+        }
+        let takes_back = |value: &Value| {
+            aterm_json::from_value::<aterm_core::terminal::CheckpointMeta>(value.clone())
+                .ok()
+                .and_then(|meta| aterm_json::to_value(&meta).ok())
+                .as_ref()
+                == Some(value)
+        };
+        let main_stops = std::mem::take(&mut meta.cursor.tab_stops);
+        let alt_stops = meta
+            .alt_cursor
+            .as_mut()
+            .map(|alt| std::mem::take(&mut alt.tab_stops));
+        let mut value = aterm_json::to_value(&meta).expect("json");
+        let widest_numbers = [
+            Value::from(u64::MAX),
+            Value::from(u32::MAX),
+            Value::from(u16::MAX),
+            Value::Null,
+            Value::from(u8::MAX),
+        ];
+        let mut index = 0;
+        while let Some(scalar) = nth_scalar(&mut value, &mut index.clone()) {
+            let candidates: &[Value] = match scalar {
+                Value::Bool(_) => &[Value::Bool(false)],
+                Value::Number(_) | Value::Null => &widest_numbers,
+                _ => &[],
+            };
+            for candidate in candidates {
+                let mut trial = value.clone();
+                if let Some(scalar) = nth_scalar(&mut trial, &mut index.clone()) {
+                    *scalar = candidate.clone();
+                }
+                if takes_back(&trial) {
+                    value = trial;
+                    break;
+                }
+            }
+            index += 1;
+        }
+        let mut meta: aterm_core::terminal::CheckpointMeta =
+            aterm_json::from_value(value).expect("every trial taken back");
+        meta.cursor.tab_stops = main_stops;
+        if let (Some(alt), Some(stops)) = (meta.alt_cursor.as_mut(), alt_stops) {
+            alt.tab_stops = stops;
+        }
+        let modes = &mut meta.modes;
+        modes.cursor_style = aterm_types::CursorStyle::BlinkingUnderline;
+        modes.mouse_mode = aterm_core::terminal::MouseMode::ButtonEvent;
+        modes.mouse_encoding = aterm_core::terminal::MouseEncoding::SgrPixel;
+        modes.color_scheme = aterm_types::Appearance::Light;
+        modes.bidi_mode = aterm_types::BiDiMode::Disabled;
+        modes.bidi_direction = aterm_types::ParagraphDirection::AutoRtl;
+        meta.taskbar_progress = Some(aterm_types::TaskbarProgress::Indeterminate);
+        // The longest 94-character name in G0-G3 and the longest 96-character
+        // one in G1-G3, in the live state and both DECSC slots.
+        let mut charset = aterm_types::CharacterSetState::default();
+        for g_set in 0..4 {
+            charset.designate(g_set, aterm_types::CharacterSet::NorwegianDanish);
+            charset.designate_96(g_set, aterm_types::CharacterSet96::IsoLatin1Supplemental);
+        }
+        meta.charset = charset;
+        for saved in [&mut meta.saved_cursor_main, &mut meta.saved_cursor_alt]
+            .into_iter()
+            .flatten()
+        {
+            saved.charset = charset;
+        }
+        meta
+    }
+
+    /// VERSION SKEW, forward: the META a window before round seventeen sent
+    /// (the keeper keeps it across an update, and a crash recovers from it)
+    /// still restores — its bool-per-column stops, its cursor and its modes.
+    #[cfg(unix)]
+    #[test]
+    fn a_meta_an_older_window_sent_still_restores() {
+        let mut t = Terminal::new(50, 80);
+        t.process(b"\x1b[1;6H\x1bH\x1b[H");
+        t.process(TUI_SETUP);
+        let old = old_form_meta(&t);
+        let text = String::from_utf8(old.clone()).expect("utf-8");
+        assert!(
+            text.contains("\"tab_stops\":[false,"),
+            "PRECONDITION: the old form: {text}"
+        );
+        let mut used = 0;
+        let cp = crate::seamless::recovered_checkpoint(&old, &mut used).expect("a checkpoint");
+        assert_tui_modes(&cp, "an old META");
+        let carried = t.carry_meta_abandoning_partial();
+        assert_eq!(cp.cursor.tab_stops, carried.cursor.tab_stops);
+        assert_eq!((cp.cursor.scroll_top, cp.cursor.scroll_bottom), (1, 39));
+        assert!(cp.cursor.tab_stops[5], "the custom stop crosses");
+    }
+
+    /// VERSION SKEW, backward (a rollback, or an older build launched after a
+    /// newer one crashed). A META whose whole carry the old form holds is sent
+    /// in it, byte for byte, so an older window reads it exactly as before. A
+    /// packed one an older window's recovery reads as the handoff's meta, which
+    /// ignores the packed stops it does not know and reads each cursor's
+    /// `tab_stops` as the empty list the new form writes. Its Repaint rung then
+    /// resets each cursor to a blank one at the same position
+    /// (`repaint_checkpoint`'s sanitize), so it keeps every mode and loses only
+    /// the scroll region, margins and custom stops, which a full-screen program
+    /// sets again as it repaints after the size pulse. Where a window before
+    /// round seventeen sent a shed old form instead, that is a trade, not only
+    /// a gain (`where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole`).
+    #[cfg(unix)]
+    #[test]
+    fn an_older_window_reads_a_new_meta_with_its_modes() {
+        let mut narrow = Terminal::new(50, 80);
+        narrow.process(b"\x1b[1;6H\x1bH\x1b[H");
+        narrow.process(TUI_SETUP);
+        assert_eq!(
+            crate::seamless::keeper_meta(&narrow),
+            Some(old_form_meta(&narrow)),
+            "what the old form carries goes in it"
+        );
+
+        let mut t = Terminal::new(50, 200);
+        t.process(TUI_SETUP);
+        let meta = crate::seamless::keeper_meta(&t).expect("fits");
+        assert!(
+            old_form_meta(&t).len() > aterm_keeper::wire::MAX_META
+                && String::from_utf8_lossy(&meta).contains("\"tab_stops_packed\""),
+            "PRECONDITION: the old form does not fit, so this one is packed"
+        );
+        let older = as_an_older_window_reads(&meta);
+        let parsed: aterm_core::terminal::CheckpointMeta =
+            aterm_json::from_slice(&older).expect("an older build parses the new form");
+        assert!(parsed.modes.bracketed_paste);
+        let mut used = 0;
+        let cp = crate::seamless::recovered_checkpoint(&older, &mut used).expect("a checkpoint");
+        assert_tui_modes(&cp, "an older reader");
+        assert_eq!(cp.cursor.tab_stops.len(), 200, "the blank cursor's stops");
+        assert_eq!(
+            (cp.cursor.scroll_top, cp.cursor.scroll_bottom),
+            (0, 49),
+            "the region is the blank cursor's"
+        );
+    }
+
+    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11). Where the whole
+    /// carry does not fit the old form but would without the directory and
+    /// colours (then the title and mark state), a window before round
+    /// seventeen sent it so shed, and every reader lost the directory. This one
+    /// sends the packed form whole. 118 alternate-screen columns and a 60-byte
+    /// directory (the review's case: 4,164 bytes whole, 4,094 shed): a newer
+    /// window recovers the directory AND the program's region. An older window
+    /// keeps every mode and the directory, and loses the region it used to
+    /// keep: the trade `PackedTabStops`' VERSION SKEW records.
+    #[cfg(unix)]
+    #[test]
+    fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
+        let mut t = Terminal::new(50, 118);
+        t.process(format!("\x1b]7;file://host/{}\x1b\\", "d".repeat(60)).as_bytes());
+        t.process(TUI_SETUP);
+        let mut shed = t.carry_meta_abandoning_partial();
+        let dir = shed
+            .current_working_directory
+            .take()
+            .expect("PRECONDITION: a directory");
+        shed.color = aterm_core::terminal::ColorRepr::default();
+        shed.title = None;
+        shed.shell = aterm_core::terminal::ShellRepr::default();
+        shed.shell_integration_nonce = None;
+        shed.parser = None;
+        shed.output_state = aterm_core::terminal::OutputStateRepr::default();
+        let (whole, shed) = (
+            old_form_meta(&t).len(),
+            aterm_json::to_string(&shed).expect("json").len(),
+        );
+        assert!(
+            whole > aterm_keeper::wire::MAX_META && shed <= aterm_keeper::wire::MAX_META,
+            "PRECONDITION: the band, where only a shed old form fits: {whole}, shed {shed}"
+        );
+
+        let meta = crate::seamless::keeper_meta(&t).expect("built");
+        assert!(
+            String::from_utf8_lossy(&meta).contains("\"tab_stops_packed\""),
+            "the band goes packed, not shed"
+        );
+        let mut used = 0;
+        let cp = crate::seamless::recovered_checkpoint(&meta, &mut used).expect("a checkpoint");
+        assert_tui_modes(&cp, "a newer reader");
+        assert_eq!(
+            cp.current_working_directory.as_deref(),
+            Some(dir.as_str()),
+            "a newer reader keeps the directory"
+        );
+        assert_eq!(
+            (cp.cursor.scroll_top, cp.cursor.scroll_bottom),
+            (1, 39),
+            "and the program's region"
+        );
+
+        let cp = crate::seamless::recovered_checkpoint(&as_an_older_window_reads(&meta), &mut used)
+            .expect("a checkpoint");
+        assert_tui_modes(&cp, "an older reader");
+        assert_eq!(
+            cp.current_working_directory.as_deref(),
+            Some(dir.as_str()),
+            "an older reader keeps the directory it used to lose"
+        );
+        assert_eq!(
+            (cp.cursor.scroll_top, cp.cursor.scroll_bottom),
+            (0, 49),
+            "and loses the region it used to keep"
+        );
+    }
+
+    /// A META NOT SENT IS RETRIED (R17-HANDOFF-1): the pump recorded the
+    /// fingerprint of every terminal it looked at, sent or not, so a META that
+    /// could not be built — or found no link, or a full queue — was never
+    /// tried again until the modes moved. It records only what it sent.
+    #[cfg(unix)]
+    #[test]
+    fn a_meta_that_was_not_sent_is_retried() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        term.lock().expect("term").process(b"\x1b[?2004h");
+        let state = Mutex::new(State {
+            phase: Phase::Off,
+            buffered: Vec::new(),
+            tracked: BTreeMap::from([(
+                7,
+                Tracked {
+                    rdev: 1,
+                    term: Arc::downgrade(&term),
+                    last: None,
+                },
+            )]),
+            pump: false,
+        });
+        let last = || state.lock().expect("state").tracked[&7].last;
+
+        assert_eq!(meta_pass_over(&state, |_| None), 0);
+        assert_eq!(last(), None, "a META that was not built is tried again");
+        assert_eq!(meta_pass_over(&state, crate::seamless::keeper_meta_of), 0);
+        assert_eq!(last(), None, "a META no link took is tried again");
+
+        // A link whose keeper is not there yet takes the META into its queue.
+        let link = KeeperLink::start(
+            std::path::PathBuf::from("/nonexistent-aterm-keeper-test/k.sock"),
+            aterm_keeper::identity::Identity::same_uid(),
+            "test".into(),
+        )
+        .expect("link");
+        state.lock().expect("state").phase = Phase::Live(Arc::new(link));
+        assert_eq!(
+            meta_pass_over(&state, crate::seamless::keeper_meta_of),
+            1,
+            "the retry sends it"
+        );
+        let sent = Fingerprint::of(&term.lock().expect("term"));
+        assert_eq!(last(), Some(sent), "what was sent is recorded");
+        assert_eq!(
+            meta_pass_over(&state, |_| panic!(
+                "an unchanged fingerprint builds nothing"
+            )),
+            0
+        );
+        let phase = std::mem::replace(&mut state.lock().expect("state").phase, Phase::Off);
+        if let Phase::Live(link) = phase
+            && let Ok(link) = Arc::try_unwrap(link)
+        {
+            link.shutdown();
+        }
     }
 }

@@ -340,6 +340,29 @@ impl Terminal {
         self.modes.color_scheme
     }
 
+    /// Whether an OSC 52 query the program sends now reaches the host's
+    /// clipboard callback: one is installed, and the gate its handler mints
+    /// with opens (query access authorized, or allowed by the installed
+    /// policy). A host reads the pasteboard for a query before it takes the
+    /// terminal lock, and only for one this answers yes to (aterm-gui's
+    /// `host_io_prefetch`).
+    #[must_use]
+    pub fn clipboard_query_admitted(&self) -> bool {
+        self.clipboard.callback.is_some()
+            && self
+                .clipboard_auth
+                .try_mint_query_capability_with_engine(self.policy.gates())
+                .is_some()
+    }
+
+    /// Whether a Kitty non-direct medium resolver is installed
+    /// ([`Self::set_kitty_file_resolver`]), i.e. whether a `t=f`/`t=t`/`t=s`
+    /// transmission reaches the host at all.
+    #[must_use]
+    pub fn kitty_file_resolver_installed(&self) -> bool {
+        self.kitty_file_resolver.is_some()
+    }
+
     /// Authorize a clipboard access class for parser-origin sequences.
     ///
     /// `Write` covers OSC 52 set/clear and the OSC 1337 `CopyToClipboard` /

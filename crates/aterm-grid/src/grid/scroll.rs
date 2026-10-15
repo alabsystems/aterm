@@ -319,11 +319,19 @@ impl Grid {
         );
     }
 
+    /// The append arm of `scroll_up`: the ring is below its cap, so the rows
+    /// scrolling off are kept and `rows_to_add` fresh rows are pushed as the
+    /// new bottom. The push addresses the ring's logical end as the Vec's end,
+    /// so a wrapped ring is linearized first: a rows-only grow's reveal or a
+    /// ring-only limit raise leaves a full, wrapped ring below a lifted cap
+    /// (`GridStorage::linearize_ring`). Once per such raise: the ring then
+    /// stays linear until it fills again.
     fn grow_scrollback_ring(&mut self, rows_to_add: usize, cols: u16) {
         debug_assert!(
             !self.storage.rows.is_empty(),
             "grow_scrollback_ring: ring buffer has zero rows"
         );
+        self.storage.linearize_ring();
         let ring_sb = self.storage.ring_buffer_scrollback();
         let row_count = self.storage.rows.len();
         for i in 0..rows_to_add {
@@ -1270,16 +1278,12 @@ impl Grid {
                 }
             }
             if let Some(dst) = self.row_mut(dst_row) {
-                for (i, col) in (left_usize..=right_usize).enumerate() {
-                    if let Some(c) = dst.get_mut(row_u16(col)) {
-                        *c = buf[i];
-                    }
-                }
+                dst.overwrite_span(left_usize, &buf);
                 // Wide char fixup at rectangle boundaries. Whole-row rect copy:
                 // no per-cell authoritative signal, so keep the char==' ' spacer
                 // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes bypass len maintenance: blank source cells
+                // The span copy bypasses len maintenance: blank source cells
                 // copied over the dst tail leave len stale-high (phantom trailing
                 // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
@@ -1317,6 +1321,12 @@ impl Grid {
             row_u16(top + region_size - n)..bottom_u16.saturating_add(1),
             left..right.saturating_add(1),
         );
+
+        // The halves of pairs the rectangle's edges bisected, blanked by
+        // `fixup_wide_boundary`, drop their extras.
+        for row in top_u16..=bottom_u16 {
+            self.drop_unclaimed_extras(row, left.saturating_sub(1)..right.saturating_add(2));
+        }
 
         // A margined region scroll moves a rectangle, but the selection lattice
         // is row-granular, so the band is the region's rows (wider than the
@@ -1371,16 +1381,12 @@ impl Grid {
                 }
             }
             if let Some(dst) = self.row_mut(dst_row) {
-                for (i, col) in (left_usize..=right_usize).enumerate() {
-                    if let Some(c) = dst.get_mut(row_u16(col)) {
-                        *c = buf[i];
-                    }
-                }
+                dst.overwrite_span(left_usize, &buf);
                 // Wide char fixup at rectangle boundaries. Whole-row rect copy:
                 // no per-cell authoritative signal, so keep the char==' ' spacer
                 // heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The get_mut writes bypass len maintenance: blank source cells
+                // The span copy bypasses len maintenance: blank source cells
                 // copied over the dst tail leave len stale-high (phantom trailing
                 // spaces). Recompute per modified row (never over-shrinks).
                 dst.recompute_len();
@@ -1414,6 +1420,12 @@ impl Grid {
             .shift_rect_down_by(top_u16, bottom_u16, left, right, row_u16(n));
         // Fill BCE RGB in vacated top-left rect after shift.
         self.fill_bce_rgb_rect(top_u16..row_u16(top + n), left..right.saturating_add(1));
+
+        // The halves of pairs the rectangle's edges bisected, blanked by
+        // `fixup_wide_boundary`, drop their extras.
+        for row in top_u16..=bottom_u16 {
+            self.drop_unclaimed_extras(row, left.saturating_sub(1)..right.saturating_add(2));
+        }
 
         // A margined region scroll moves a rectangle, but the selection lattice
         // is row-granular, so the band is the region's rows (wider than the

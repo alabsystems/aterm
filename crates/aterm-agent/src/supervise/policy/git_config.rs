@@ -244,7 +244,7 @@ fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, St
 
 /// `.` and `..` resolved lexically (git's `-C` and the shell's `cd` resolve
 /// them the same way for a path whose parents are not symlinks).
-fn normalise(p: &Path) -> PathBuf {
+pub(crate) fn normalise(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -347,17 +347,25 @@ impl WorkerEnv {
         self.process.env_var(key)
     }
 
-    /// The worker's Claude Code directory: its `CLAUDE_CONFIG_DIR`, else its
-    /// `$HOME/.claude` ([`crate::harness::footer::claude_dir_of`]) — where its
-    /// session files and transcripts say where its Bash tool stands.
-    #[must_use]
-    pub fn claude_dir(&self) -> Option<PathBuf> {
-        crate::harness::footer::claude_dir_of(self.var("CLAUDE_CONFIG_DIR"), self.var("HOME"))
+    /// The worker's Claude Code directory, for a worker standing in `cwd`, as
+    /// Claude Code resolves it ([`claude_dir_at`], with this account's home
+    /// from the passwd database): where its user settings, session files,
+    /// transcripts and shell snapshots are. `Err` says why it cannot be
+    /// named.
+    pub fn claude_dir(&self, cwd: &Path) -> Result<PathBuf, String> {
+        claude_dir_at(
+            self.var("CLAUDE_CONFIG_DIR"),
+            self.var("HOME"),
+            cwd,
+            atpkg::platform::account_home,
+        )
     }
 
     /// A test's worker: this process's `PATH`, no system configuration, and
     /// `global` (none: empty) as its global one — what the repository alone
-    /// contributes, whatever the developer's own config says.
+    /// contributes, whatever the developer's own config says — and a Claude
+    /// Code directory that is not there, so none of the developer's own
+    /// Claude Code settings are read either.
     #[cfg(test)]
     pub(crate) fn hermetic(global: Option<&Path>) -> Self {
         let global = global.unwrap_or(Path::new("/dev/null"));
@@ -365,6 +373,7 @@ impl WorkerEnv {
             format!("PATH={}", std::env::var("PATH").unwrap_or_default()),
             "GIT_CONFIG_NOSYSTEM=1".to_string(),
             format!("GIT_CONFIG_GLOBAL={}", global.display()),
+            "CLAUDE_CONFIG_DIR=/nonexistent/aterm-hermetic-claude".to_string(),
         ])
     }
 
@@ -446,17 +455,16 @@ impl WorkerEnv {
     /// `Err` naming the file and the variable when Claude Code's settings
     /// would give the worker's Bash tool a variable that changes what a git
     /// read loads or which git runs ([`git_relevant`]) with a value other
-    /// than the worker process's own: an `env` block in the managed settings,
-    /// a `--settings` the worker was launched with (a file, relative to
-    /// `launch`, or inline JSON), the project's `.claude/settings.local.json`
-    /// and `.claude/settings.json` in `launch` (repository content an
-    /// accept-edits worker writes), or the user's `settings.json` in the
-    /// worker's Claude directory. Claude Code applies those to the commands
-    /// its Bash tool runs, not to the process environment this check reads,
-    /// so where one would change a git read the read escalates instead — and
-    /// so it does where a settings file is there but cannot be read whole or
-    /// does not parse ([`read_settings`]), since its `env` could say
-    /// anything. A file that is not there sets nothing.
+    /// than the worker process's own: an `env` block anywhere along the
+    /// worker's settings chain for an agent launched in `launch`
+    /// ([`super::claude_settings::sources`]: the managed documents, a
+    /// `--settings`, the project's files — repository content an accept-edits
+    /// worker writes — and the user's). Claude Code applies those to the
+    /// commands its Bash tool runs, not to the process environment this check
+    /// reads, so where one would change a git read the read escalates instead
+    /// — and so it does where a settings file is there but cannot be read
+    /// whole or does not parse, since its `env` could say anything. A file
+    /// that is not there sets nothing.
     pub fn settings_env(&self, launch: &Path) -> Result<(), String> {
         self.settings_env_where(launch, git_relevant, "a git read")
     }
@@ -472,47 +480,15 @@ impl WorkerEnv {
         relevant: fn(&str) -> bool,
         subject: &str,
     ) -> Result<(), String> {
-        let mut sources: Vec<(String, Result<Option<String>, String>)> = Vec::new();
-        for managed in MANAGED_SETTINGS {
-            sources.push((managed.to_string(), read_settings(Path::new(managed))));
-        }
-        let argv = &self.process.argv;
-        for (i, arg) in argv.iter().enumerate() {
-            let value = match arg.strip_prefix("--settings=") {
-                Some(v) => v,
-                None if arg == "--settings" => match argv.get(i + 1) {
-                    Some(v) => v.as_str(),
-                    None => continue,
-                },
-                None => continue,
-            };
-            if value.trim_start().starts_with('{') {
-                sources.push(("--settings".to_string(), Ok(Some(value.to_string()))));
-            } else {
-                let file = launch.join(value);
-                sources.push((file.display().to_string(), read_settings(&file)));
-            }
-        }
-        let mut files = vec![
-            launch.join(".claude/settings.local.json"),
-            launch.join(".claude/settings.json"),
-        ];
-        files.extend(self.claude_dir().map(|dir| dir.join("settings.json")));
-        for file in files {
-            let text = read_settings(&file);
-            sources.push((file.display().to_string(), text));
-        }
-        for (source, text) in sources {
+        for (source, settings) in super::claude_settings::parsed(self, launch) {
             let unread = |why: &str| {
                 format!(
                     "{subject} whose Bash tool's settings ({source}) {why}: its `env` is unknown"
                 )
             };
-            let Some(text) = text.map_err(|why| unread(&why))? else {
+            let Some(settings) = settings.map_err(|why| unread(&why))? else {
                 continue;
             };
-            let settings =
-                aterm_json::from_str::<Value>(&text).map_err(|_| unread("do not parse"))?;
             let Some(env) = settings.get("env").and_then(Value::as_object) else {
                 continue;
             };
@@ -533,34 +509,31 @@ impl WorkerEnv {
     }
 }
 
-/// Claude Code's managed (system-wide) settings file, where one is read.
-#[cfg(target_os = "macos")]
-const MANAGED_SETTINGS: &[&str] =
-    &["/Library/Application Support/ClaudeCode/managed-settings.json"];
-#[cfg(target_os = "linux")]
-const MANAGED_SETTINGS: &[&str] = &["/etc/claude-code/managed-settings.json"];
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const MANAGED_SETTINGS: &[&str] = &[];
-
-/// The most of a settings file this check reads; a larger one is not read.
-const MAX_SETTINGS_BYTES: u64 = 1 << 20;
-
-/// A settings file's text: `Ok(None)` where there is none, `Err` naming why
-/// where one is there but cannot be read whole — not a regular file (a FIFO
-/// planted there is never opened to block on), larger than
-/// [`MAX_SETTINGS_BYTES`], or unreadable.
-fn read_settings(path: &Path) -> Result<Option<String>, String> {
-    if let Err(e) = std::fs::symlink_metadata(path)
-        && e.kind() == std::io::ErrorKind::NotFound
-    {
-        return Ok(None);
-    }
-    let text = crate::harness::footer::read_small(path, MAX_SETTINGS_BYTES + 1)
-        .ok_or("cannot be read as a regular file")?;
-    if text.len() as u64 > MAX_SETTINGS_BYTES {
-        return Err(format!("are larger than {MAX_SETTINGS_BYTES} bytes"));
-    }
-    Ok(Some(text))
+/// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is
+/// `config_dir` and whose `HOME` is `home`, standing in `cwd`, as Claude Code
+/// (2.1.295, 2.1.299) resolves it: `path.resolve(CLAUDE_CONFIG_DIR ??
+/// join(os.homedir(), ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all
+/// counts, even an empty one (`??`); otherwise `os.homedir()` is the
+/// non-empty `HOME`, else the account's home from the passwd database
+/// (`account_home`: the worker's account is this process's, since
+/// [`atpkg::caller_shell::process_args`] reads only this uid's processes). A
+/// relative result is taken against `cwd`, lexically as `path.resolve` does.
+/// `Err` says what is missing where the account names no home either:
+/// nothing is skipped for want of a directory.
+pub(crate) fn claude_dir_at(
+    config_dir: Option<&str>,
+    home: Option<&str>,
+    cwd: &Path,
+    account_home: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let dir = match (config_dir, home.filter(|h| !h.is_empty())) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(home)) => Path::new(home).join(".claude"),
+        (None, None) => account_home()
+            .ok_or("no CLAUDE_CONFIG_DIR, no HOME, and no home for its account")?
+            .join(".claude"),
+    };
+    Ok(normalise(&cwd.join(dir)))
 }
 
 /// Whether a variable changes which git runs or what a git read loads: `PATH`,

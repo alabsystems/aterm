@@ -640,6 +640,41 @@ pub const ANCHORS: &[Anchor] = &[
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
+    // How that auto-continue ENDED, as the vendor's notice opens
+    // (`wall::auto_continue_end`): it went on — at the reset, or before it
+    // when the usage came back — or it will not go on by itself: Esc on its
+    // countdown (captured on 2.1.296), stopped or turned off, or a reset
+    // that passed with nothing sent.
+    lit(
+        "wall.auto_continue.fired",
+        "Usage limit reset · continuing automatically",
+        "2.1.283",
+    ),
+    lit(
+        "wall.auto_continue.now",
+        "Usage limit available again · continuing now",
+        "2.1.284",
+    ),
+    lit(
+        "wall.auto_continue.cancelled",
+        "Automatic continue cancelled",
+        "2.1.296",
+    ),
+    lit(
+        "wall.auto_continue.stopped",
+        "Automatic continue stopped",
+        "2.1.299",
+    ),
+    lit(
+        "wall.auto_continue.off",
+        "Automatic continue was turned off",
+        "2.1.299",
+    ),
+    lit(
+        "wall.auto_continue.stale",
+        "Usage limit has reset · press enter to continue",
+        "2.1.283",
+    ),
     lit("wall.context", "Context limit reached", "2.1.280"),
     lit("wall.server", "This is a server-side issue", "2.1.280"),
     lit(

@@ -118,6 +118,7 @@ fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
                 Origin::Named => "named",
                 Origin::Checkout { .. } => "checkout",
                 Origin::AgentTargetDir => "agent",
+                Origin::BuildCache => "build-cache",
                 Origin::Bootstrap { .. } => "bootstrap",
                 Origin::ClaudeScratch { .. } => "scratch",
                 Origin::Cell { .. } => "cell",
@@ -341,60 +342,41 @@ fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     }
 }
 
-/// THE DEVELOPER ROOT IS A FOLDER OF CHECKOUTS, as `$HOME` is (`atpkg::devroot`):
-/// once the code lives in `~/Developer`, an idle `~/Developer/trust` still gives its
-/// x.py bootstrap build directory and its `crates/target`, and a worktree of a checkout
-/// there is still walked — each found from the checkout, never from `~/Developer`
-/// itself (which would put the x.py rule and the two-level walk one folder too high).
+/// THE RUST BUILD CACHE under `$HOME` (`atpkg::build_cache`,
+/// `<cache><workspace>/.cargo-build`) is searched: each marked `.cargo-build`,
+/// however deep its workspace's path, is a build directory whose owner cannot
+/// end, so its idle `incremental/` is reclaimed as a checkout's is. NEGATIVE
+/// CONTROLS: an unmarked `.cargo-build`, a marked folder of another name, and a
+/// `.cargo-build` reached through a linked mirror folder are not.
 #[test]
-fn the_developer_roots_checkouts_are_walked_like_homes() {
-    let tmp = Tmp::new("discover-devroot");
+fn the_rust_build_cache_gives_each_workspace_build_directory() {
+    let tmp = Tmp::new("discover-build-cache");
     let home = mkdirs(&tmp.path().join("home"));
-    let trust = mkdirs(&home.join("Developer/trust"));
-    std::fs::write(trust.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
-    let stage1 = lay_target(&trust.join("build/aarch64-apple-darwin/stage1-std"));
-    let crates = lay_target(&trust.join("crates/target"));
-    // A worktree of a checkout in the root, outside it.
-    mkdirs(&trust.join(".git/worktrees/wt1"));
-    let wt1 = mkdirs(&tmp.path().join("elsewhere/wt1"));
-    std::fs::write(wt1.join(".git"), "gitdir: x\n").expect(".git file");
-    std::fs::write(
-        trust.join(".git/worktrees/wt1/gitdir"),
-        format!("{}\n", wt1.join(".git").display()),
-    )
-    .expect("gitdir");
-    let wt1_target = lay_target(&wt1.join("target"));
+    let cache = atpkg::build_cache::cache_root(&home);
+    let one = lay_target(&cache.join("Users/a/proj/.cargo-build"));
+    let two = lay_target(&cache.join("Users/a/proj/nested/ws/.cargo-build"));
+    mkdirs(&cache.join("Users/a/unmarked/.cargo-build/debug"));
+    lay_target(&cache.join("Users/a/other-name"));
+    let elsewhere = lay_target(&tmp.path().join("elsewhere/x/.cargo-build"));
+    std::os::unix::fs::symlink(tmp.path().join("elsewhere"), cache.join("Users/linked"))
+        .expect("link");
 
     let d = discover(&roots_at(&tmp), Budget::SHIPPED);
     assert!(d.notes.is_empty(), "{:?}", d.notes);
-    let origin = |p: &Path| {
-        d.found
-            .iter()
-            .find(|f| f.path == canon(p))
-            .map(|f| f.origin.clone())
-    };
-    assert_eq!(
-        origin(&stage1),
-        Some(Origin::Bootstrap {
-            repo: canon(&trust),
-            slim: false
-        }),
-        "{:?}",
-        d.found
-    );
-    assert_eq!(
-        origin(&crates),
-        Some(Origin::Checkout {
-            root: canon(&trust)
-        }),
-        "{:?}",
-        d.found
-    );
+    let found = kinds(&d);
+    for dir in [&one, &two] {
+        assert!(
+            found.contains(&(canon(dir), "build-cache")),
+            "{}: {found:?}",
+            dir.display()
+        );
+    }
     assert!(
-        matches!(origin(&wt1_target), Some(Origin::Checkout { .. })),
-        "{:?}",
-        d.found
+        !found.iter().any(|(p, _)| *p == canon(&elsewhere)),
+        "{found:?}"
     );
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(!Origin::BuildCache.ownable());
 }
 
 /// THE SESSION'S OWNER: GONE ONLY WHEN NOTHING NAMES IT AND NOTHING OF IT
@@ -720,9 +702,11 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         );
     }
     // FOR REACH, each process's own directory: aterm's identity's (in
-    // `~/Library` on macOS) is read; another place of `~/Library`, one that
-    // climbs out of aterm's by `..`, or one not absolute is not — and none
-    // refuses the census.
+    // `~/Library` on macOS) is read; another place of `~/Library`, or one that
+    // climbs out of aterm's by `..`, is not — and none refuses the census. A
+    // RELATIVE one is under the directory the process runs in, as Claude Code
+    // resolves it (`footer::claude_dir_of`, the one resolver; until round
+    // eighteen it was not read at all).
     let state = aterm_types::dirs::resolve_state_dir(
         None,
         aterm_types::dirs::StatePlatform {
@@ -748,7 +732,10 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         ],
         Some(&home),
     );
-    assert_eq!(reach.map(|r| r.dirs), Ok(vec![identity]));
+    assert_eq!(
+        reach.map(|r| r.dirs),
+        Ok(vec![identity, PathBuf::from("/proj/rel/.claude")])
+    );
     // And the directory ANY process was started with: a Claude Code the
     // kernel does not name one (a copy renamed `cc-work`, started with
     // `CLAUDE_CONFIG_DIR=alt/.claude`) keeps its registry there, which names

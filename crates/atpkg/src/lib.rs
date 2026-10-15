@@ -99,6 +99,7 @@ pub mod activate;
 #[cfg(target_os = "macos")]
 pub mod activation_notice;
 pub mod apply;
+pub mod build_cache;
 pub mod cache;
 /// The shell that typed this command (2026-09-16): the parent process's executable when
 /// it is a shell, else `$SHELL` — what `doctor`/`which` key their in-place remedy on.
@@ -113,10 +114,13 @@ pub(crate) mod clone;
 /// `bin/` shims take through them.
 pub mod compat;
 pub mod config;
+/// Stale copies of aterm beside the installed release (macOS): what `aterm doctor` moves
+/// to the Trash, and the one move the Settings panel's *Move to Trash* makes too.
+pub mod copies;
 pub mod cost;
-/// The developer root, `~/Developer`: where checkouts and worktrees live on an owner's
-/// Mac, which ones do not yet, moving them there, and whether Spotlight skips it.
-pub mod devroot;
+/// The Developer Tools list (macOS): whether macOS holds each new program aterm starts
+/// for its first-run check, and the `devtools:` row both doctors print.
+pub mod devtools;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;

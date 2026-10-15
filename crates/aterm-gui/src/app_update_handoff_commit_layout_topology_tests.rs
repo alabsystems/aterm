@@ -44,6 +44,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 questions: None,
                 identity: None,
                 agent: None,
+                supervised: None,
                 held: false,
             })),
             focused_path: Vec::new(),
@@ -172,6 +173,7 @@ fn a_real_topology_change_still_rejects_the_commit() {
             questions: None,
             identity: None,
             agent: None,
+            supervised: None,
             held: false,
         }));
     assert_ne!(

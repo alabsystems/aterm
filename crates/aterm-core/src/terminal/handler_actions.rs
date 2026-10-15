@@ -85,20 +85,33 @@ impl ActionSink for TerminalHandler<'_> {
     /// 3. Fallback: per-character `write_char`
     fn print_ascii_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         self.note_sync_open_action();
-        let data = data.as_ref();
-        // Blockers that require per-character processing
-        if self.transient.vt52_cursor_state != Vt52CursorState::None {
-            // VT52 cursor addressing consumes characters specially
-            for &byte in data {
-                self.print(byte as char);
-            }
+        let mut data = data.as_ref();
+        // VT52 direct cursor addressing (ESC Y) takes the next two printables
+        // as its row and column. Only those: the rest of the run is text and
+        // goes to the writer it would reach in the next read, or where a read
+        // boundary falls after the address would move the cursor (ruling
+        // 2026-10-10, r15 C5).
+        while self.transient.vt52_cursor_state != Vt52CursorState::None {
+            let Some((&byte, rest)) = data.split_first() else {
+                return;
+            };
+            self.print(byte as char);
+            data = rest;
+        }
+        if data.is_empty() {
             return;
         }
 
         // Per-character fallback: only for conditions that truly require it.
         // Charset translation, insert mode, and no-autowrap need per-char processing
-        // because they change behavior at each character position.
-        if !self.charset.is_ascii_passthrough() || self.modes.insert_mode || !self.modes.auto_wrap {
+        // because they change behavior at each character position. So does a run
+        // starting outside a DECSLRM span: the run writers clamp at the right
+        // margin only from a start inside it (`Grid::cursor_outside_margin_span`).
+        if !self.charset.is_ascii_passthrough()
+            || self.modes.insert_mode
+            || !self.modes.auto_wrap
+            || self.grid.cursor_outside_margin_span()
+        {
             for &byte in data {
                 self.write_char(byte as char);
             }
@@ -119,6 +132,10 @@ impl ActionSink for TerminalHandler<'_> {
         } else {
             self.write_ascii_bulk_fast(data);
         }
+        // A printed glyph that does not fold ends a ZWJ continuation, as it
+        // does in `write_char`: an emoji later written next to the ZWJ's cell
+        // opens its own cell whichever writer printed this run.
+        self.transient.last_combining_was_zwj = false;
         self.grid.damage_selection_output(origin);
         self.stamp_print_anchor();
     }
@@ -128,12 +145,17 @@ impl ActionSink for TerminalHandler<'_> {
     /// Falls back to per-character for complex cases.
     fn print_unicode_bulk(&mut self, chars: &Provenance<[char], Pty>) {
         self.note_sync_open_action();
-        let chars = chars.as_ref();
-        // VT52 cursor addressing consumes characters specially
-        if self.transient.vt52_cursor_state != Vt52CursorState::None {
-            for &c in chars {
-                self.print(c);
-            }
+        let mut chars = chars.as_ref();
+        // VT52 cursor addressing takes the next two characters; the rest of the
+        // run is text (see `print_ascii_bulk`).
+        while self.transient.vt52_cursor_state != Vt52CursorState::None {
+            let Some((&c, rest)) = chars.split_first() else {
+                return;
+            };
+            self.print(c);
+            chars = rest;
+        }
+        if chars.is_empty() {
             return;
         }
 

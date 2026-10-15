@@ -23,6 +23,7 @@
 //! `targo --unverified test -p atpkg --test atpkg_suite -- <file>::`.
 
 mod agent_warm;
+mod build_cache;
 mod hook_reroute_first;
 mod landing_passthrough;
 mod lane_verb;

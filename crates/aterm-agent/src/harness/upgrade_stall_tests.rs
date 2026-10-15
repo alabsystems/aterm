@@ -365,6 +365,8 @@ impl Agent {
             .arg(PARK[0])
             .env(PARK_ENV, "1")
             .env("ATERM_PARENT_SESSION_ID", TAB)
+            // An unset Claude home is its process's own HOME's: the sweep's.
+            .env_remove("HOME")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::null())
             .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -490,13 +492,15 @@ fn a_limited_tab_is_never_typed_into_and_never_given_up_on() {
     assert_eq!(ledger_lines(&opts), 0, "no act on the record");
     drop(agent);
 
-    // Negative control: off the limit, the pending upgrade announces.
+    // Negative control: off the limit, the pending upgrade announces to a
+    // conversation someone asked something.
     let open = scratch("open");
     let (sock, asked) = instance(&open);
     let opts = Opts {
         sock: Some(sock),
         ..drive(&open)
     };
+    file_transcript_in(&opts.home.join(".claude"), "p");
     let agent = Agent::start(&opts, &pending);
     assert_eq!(agent.visit(&opts, shell).step, "announced:1");
     assert_eq!(turns(&asked), 1);
@@ -1619,6 +1623,8 @@ fn agent_file() -> SessionFile {
         proc_start: AGENT_START.to_string(),
         kind: "interactive".to_string(),
         entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
     }
 }
 
@@ -1847,6 +1853,15 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     if f.background_point {
         step = upgrade::break_step(step);
     }
+    // The round's target fails to start (`fails`): the driver's own hold,
+    // asked where it asks it — where the round would move, and wherever it
+    // has asked its agent ([`upgrade::asked_for_a_move`]).
+    if s["fails"] == 1
+        && (upgrade::asked_for_a_move(&st.phase, ready)
+            || matches!(step, Step::Announce | Step::Terminate | Step::Fresh))
+    {
+        step = upgrade::build_hold(step, &st.phase, ready);
+    }
     let reask = step == Step::Announce && st.phase != Phase::Pending;
     if holds == Holds::Refused && !(step == Step::Terminate || reask) {
         return None;
@@ -1900,6 +1915,13 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
                 actions.push("Restart");
                 "adopted".to_string()
             }
+        }
+        // The build's hold of a round that asked its agent: the driver's
+        // stop (`build_held`), its release typed below.
+        Step::Void(upgrade::BUILD_FAILS) => {
+            st.stop(upgrade::BUILD_FAILS, now);
+            actions.push("BuildHold");
+            format!("failed:{}", upgrade::BUILD_FAILS)
         }
         Step::Void(why) => {
             st.void(now);
@@ -1984,20 +2006,25 @@ fn at_a_break(s: &S) -> bool {
 }
 
 /// The upgrade's quiet word, nothing it would do for the agent at this look
-/// (the model's `Look`): its last word ([`After::Finished`]), or a stopped
+/// (the model's `Look`): its last word ([`After::Finished`]), a stopped
 /// round resting before its next (`wait:failed`), which the window looks at
 /// again ([`after`]) but which asks, releases and restarts nothing until the
-/// rest runs out.
+/// rest runs out, or a round held by a build that fails to start
+/// (`wait:build-fails`), which asks and restarts nothing until the build is
+/// proved to start.
 fn quiet(word: &str) -> bool {
-    word == "wait:failed" || after(word, 0) == After::Finished
+    word == "wait:failed"
+        || word == format!("wait:{}", upgrade::BUILD_FAILS)
+        || after(word, 0) == After::Finished
 }
 
 /// The reducer's actions, the environment's aside; `Void` is a person's or
 /// the agent's own work's, `Abandon` a refusal's.
-const REDUCER: [&str; 7] = [
+const REDUCER: [&str; 8] = [
     "Announce",
     "GiveUp",
     "Restart",
+    "BuildHold",
     "Release",
     "DropRelease",
     "Rearm",
@@ -2036,6 +2063,12 @@ fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
         let mut t = s.clone();
         d.actions.iter().all(|a| m.fire(a, &mut t)) && t == d.next
     };
+    // The build's hold comes before whatever holds the look: taken exactly
+    // where the model holds, and landing where the model does.
+    let held = d.actions.first() == Some(&"BuildHold");
+    if holds != Holds::Nothing && (held || m.action_enabled("BuildHold", s)) {
+        return held && m.action_enabled("BuildHold", s) && lands();
+    }
     match holds {
         Holds::Nothing => {
             let want: Vec<&str> = REDUCER
@@ -2128,6 +2161,8 @@ fn defective() -> Vec<(&'static str, Model)> {
                 "UnansweredDirection",
                 "ReadyOverDirection",
                 "IdleOnlyRelease",
+                "HeldAsked",
+                "HeldRelease",
             ]
             .into_iter()
             .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
@@ -2317,9 +2352,9 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
         "a late READY is decided at a break, voided there and (limited) not: \
          {voided_at_breaks} of {breaks}"
     );
-    // The reducer's seven, the held three (`Void`, and the re-ask and give-up
-    // over a READY the agent's work outlived), `Abandon`, and the
-    // conversation's three.
+    // The reducer's eight (the build's hold among them), the held three
+    // (`Void`, and the re-ask and give-up over a READY the agent's work
+    // outlived), `Abandon`, and the conversation's three.
     assert_eq!(
         taken.len(),
         REDUCER.len() + 7,

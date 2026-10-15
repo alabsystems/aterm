@@ -101,9 +101,10 @@ WHAT IT IS
             r#" In the
   default `user` mode (and `master`) the shell keeps your shell's limits. `safety`
   caps open files at a soft 8192 on macOS and Linux and address space at a soft
-  16 GiB on Linux (hard limits untouched), and on Windows puts 16 GiB / 512 active
-  processes / UI restrictions on the shell's Job Object. `containment` adds the
-  macOS sandbox to those caps and refuses to start elsewhere.
+  16 GiB on Linux (hard limits untouched, so your rc can raise them), and on
+  Windows puts 16 GiB / 512 active processes / UI restrictions on the shell's Job
+  Object. `containment` adds the macOS sandbox and sets those caps as hard
+  limits, which the program cannot raise; it refuses to start elsewhere.
   A plain `aterm` session serves no control socket: `aterm ctl` reads and drives
   the window (`aterm --window`, or `aterm --headless`).
   See `aterm help introspection`.
@@ -116,7 +117,10 @@ KEY USAGE
                              `aterm ay`, `aterm ty` (never $PATH — the managed build)
   aterm pkg <args>           the toolchain package manager (see `aterm help pkg`)
   aterm doctor               checks the shell, macOS access, instances and past
-                             crashes; exit 1 only when the shell cannot start."#,
+                             crashes, and fixes what aterm can (stale copies to the
+                             Trash, the Developer Tools pane opened for you;
+                             --read-only fixes nothing); exit 1 only when the shell
+                             cannot start."#,
             aterm_page_shell!(doctor),
             r#"
   aterm show-config | explain-config | list-fonts | show-face | list-themes
@@ -148,11 +152,20 @@ GOTCHAS
     nothing from inside and a contained program's `os_log` is dropped; launchd, which
     needs no lookup, answers a contained caller by its own policy);
     elsewhere `containment` REFUSES to start, naming the gap, rather than run a weaker
-    shell. `safety` is hardened resource caps with no OS sandbox, on every platform.
+    shell. The window brokers nothing for a contained tab: no OSC 52 clipboard, no
+    Kitty file or shared-memory image, no desktop notification, whatever the config
+    allows. A plain `aterm --sandbox` session inside another terminal parses nothing,
+    so that terminal decides the program's escapes by its own policy (an aterm window
+    in `user` mode writes the pasteboard from its OSC 52). `safety` is resource caps
+    with no OS sandbox, on every platform: soft limits on macOS and Linux, which the
+    shell's rc or its program can raise.
   * macOS: `Operation not permitted` on a file macOS treats as private is privacy consent
     (TCC), not a broken tool — and it can arrive with NO dialog at all. `aterm doctor` has a
     `privacy:` row, `aterm ctl privacy` has the whole posture, and `aterm help permissions`
     says what to do about it. Only a human can grant it; aterm cannot.
+  * macOS: builds and tests that stall on new programs are usually macOS checking each
+    one before its first run. `aterm doctor`'s `devtools:` row says whether aterm is on
+    the Developer Tools list, which should end that, and how a human adds it.
   * Rust here means the TRUST toolchain: `targo` (cargo), `trustc` (rustc), `tippy`
     (clippy), `trustfmt`, `trustdoc`. Inside a session the upstream names are REROUTED:
     a bare `cargo build` prints `targo trust build` / `targo --unverified build` with
@@ -242,13 +255,13 @@ WHAT IT IS
   terminal's scrollback — the only channel that reliably reaches its context in EVERY
   project is its global context file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
   ~/.gemini/GEMINI.md, ~/.config/opencode/AGENTS.md). `aterm agents` manages a short,
-  marked block in those files: four `##` sections. The aterm brief — how to DETECT
+  marked block in those files: two `##` sections. The aterm section — how to DETECT
   aterm ($TERM_PROGRAM=aterm / $ATERM_CHILD=1), that `aterm help` prints the agent
-  operating brief, and why CLAUDE*/CODEX_*/... env vars are stripped — tells the agent
-  to ignore it outside aterm. The other three do not tell the agent to ignore them: the
-  Rust note applies in any terminal where the Trust toolchain is installed (it is on
-  PATH in every shell), the inbox note keys on `fabric=`, and the ATERM-TASK-DONE note
-  applies to Claude Code and Codex sessions under an aterm window's harness.
+  operating brief, which CLAUDE*/CODEX_*/... env vars are stripped, the inbox, that the
+  harness's `keep going` is not the person's decision, and the ATERM-TASK-DONE token —
+  tells the agent to ignore it outside aterm. The Rust section
+  applies in any terminal where the Trust toolchain is installed (it is on PATH in
+  every shell).
 
   It ALSO installs the bundled SKILLS: whole files aterm ships and owns, written into
   the agent's own skills or commands directory. Claude Code gets four, under
@@ -544,8 +557,7 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            secrets list — neither on a box that runs on another
                            machine — the trust dialog for the session's own folder
                            under a trust root) or "none"
-  trust_roots [["~/Developer/aterm*", "~/Developer/ay*", "~/Developer/trust*",
-               "/private/tmp/claude-*"]]
+  trust_roots [["~/aterm*", "~/ay*", "$HOME/trust*", "/private/tmp/claude-*"]]
                            the folders whose trust dialog "safe" answers
   rm_breaker_ask [false]   under "safe", an rm circuit breaker on a possibly-empty
                            variable the safe rules cannot prove is approved with
@@ -1331,41 +1343,6 @@ OCCASIONAL (recovery and preference)
                              release the hold (pins gate the coherence-group move)
   aterm pkg gc               reclaim superseded builds and interrupted downloads; it
                              says what it swept and why
-  aterm pkg devroot          where code lives: ~/Developer, the one folder you add to
-                             System Settings ▸ Spotlight ▸ Search Privacy (Apple's one
-                             documented way to keep a folder out of the index; aterm
-                             cannot add it). Lists every git checkout and worktree
-                             under $HOME outside it, where each would go, and what
-                             holds each: uncommitted work, a process working in it or
-                             in another checkout of its repository, a Claude Code,
-                             Codex or Gemini session, a git lock, a destination in the
-                             way, a folder that cannot be renamed into ~/Developer.
-                             Dot-folders, Library and the folders macOS guards with a
-                             consent dialog are never read, and neither is a
-                             ~/Developer that is a link
-  aterm pkg devroot move (--all | <dir>...)
-                             move them into ~/Developer, under the same path they had
-                             under $HOME — never automatic. Refuses the whole run (exit
-                             3) while anything holds one, naming each — a repository
-                             with submodules moves whole or not at all, since their
-                             links are relative. Then, one repository at a time, renames
-                             its checkouts (nothing is copied) and repairs what names
-                             the old paths: `git worktree repair`, the git config values
-                             and alternates of every git directory, submodules' included
-                             (a cut clone's aterm-release.receiptsFrom), Claude Code's
-                             ~/.claude/projects/<path-key> folders (never what is in
-                             them), `aterm pkg link` dev links (exit 75 while another
-                             pass holds the store), and the publication engine's
-                             registry rows; then checks that every checkout of it still
-                             answers `git status` (exit 1 when one does not). A ^C waits
-                             for the run to end. A checkout with an x.py/LLVM build tree
-                             reconfigures after it, and an aterm.toml [packages.links]
-                             row naming a moved checkout is yours to edit (the plan says
-                             both first). One-time per Mac: the verb goes once every
-                             owner Mac reports a clean survey
-  aterm pkg devroot verify   MEASURE whether Spotlight skips ~/Developer (the same probe
-                             as noindex verify): 0 skipped, 1 indexed, 3 not measured
-                             (no ~/Developer, or one that is a link)
   aterm pkg machine          the [machine] settings as the doctor reads them: Universal
                              Control (the cursor roaming to other Macs and iPads)
   aterm pkg machine apply    apply them NOW — what aterm runs once a day at the first
@@ -2965,9 +2942,14 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      thread fell into a sandbox its launch bypassed gets
                      nothing, and one message; a full context `/compact`; a lost
                      login `/login`; a continuation the worker never takes is
-                     acted again on the back-off. Nothing is typed under a box
+                     acted again on the back-off. Every wait and back-off
+                     above counts the time the Mac slept, as the wall clock
+                     does. Nothing is typed under a box
                      or the survey, within `human_grace_s` of a person's
-                     keystroke or of a draft last changing, while another
+                     keystroke or of a draft last changing, in the 30-90 s
+                     after the Mac wakes (the network coming back: the
+                     window's upgrade notice and the `/usage` read wait too;
+                     a box is still answered), while another
                      driver holds a lease or a named turn on it (`hand=`), or
                      — for that grace — on a turn a person stopped with Esc
                      (the survey's `0` waits for it too); in a session with a
@@ -3313,25 +3295,36 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   Editing the authorization database (`security authorizationdb`) rewrites the rule for
   the whole Mac, outside every dialog.
   Privacy & Security ▸ Developer Tools does not help with this dialog: that list governs
-  running software that fails the security policy (see SLOW FIRST RUNS).
+  running software that fails the security policy. It is, though, the list that exempts
+  the programs aterm starts from macOS's per-launch first-run check (syspolicyd and
+  XProtect): the fix for slow first runs of build and test binaries (SLOW FIRST RUNS).
   `sample`, `leaks`, `vmmap`, `heap` and `atos` should not raise this dialog: they read
   task ports by entitlement. A third-party debugger such as gdb asks a different right
   that developer mode leaves alone.
 
 SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A new program that starts but stays silent for seconds or minutes under load is
-  usually macOS checking it before its first run. No dialog appears and macOS refuses
-  nothing. macOS checks one program at a time, so a build or test run that starts many
-  new programs waits in line; a second run of the same program is not checked again.
-  1. `aterm ctl privacy`: read the `devtools` row. `state=unlisted` or `denied` with
-     `not_allowed=` above 0 means macOS checks each new program aterm starts.
-     `unknown` is not `unlisted`.
-  2. Tell your operator. Adding aterm under System Settings ▸ Privacy & Security ▸
-     Developer Tools (+, then switch it on) should end these checks, and with them
-     macOS's first-run malware scan, for everything run in aterm: you, other agents
-     and the tools you download included. That trade is theirs.
-  Let the program finish; do not retry it in a loop. `spctl developer-mode` adds only
-  Terminal; `tccutil`, editing TCC.db and `sudo killall syspolicyd` are not the fix.
+  usually macOS checking it before its first run (syspolicyd, with XProtect): `sample
+  <pid>` shows it parked at `_dyld_start`. No dialog appears and macOS refuses nothing.
+  macOS checks one program at a time, so a build or test run that starts many new
+  programs waits in line, and a timing-bounded test can fail; a second run of the same
+  program is not checked again.
+  1. `aterm doctor`: read the `devtools:` row. It says whether aterm is on System
+     Settings ▸ Privacy & Security ▸ Developer Tools, the list whose apps macOS exempts
+     from this check for every program they start. `warn` means it is not, and macOS
+     checks each new program aterm starts. Or `aterm ctl privacy`: its `devtools` row
+     carries the same verdict as `grant=`; `unknown` is not `unlisted`, and
+     `probe=pending` is not off.
+  2. Tell your operator. `aterm doctor` (and the aterm window, once per version) opens
+     the pane for them; then + ▸ aterm ▸ on, and macOS asks for their password. It
+     applies to the next program aterm starts. If the pane is missing,
+     `spctl developer-mode enable-terminal` makes it appear (it lists only Terminal;
+     aterm still needs its own +). Being listed also ends macOS's first-run malware scan
+     for everything run in aterm: you, other agents and the tools you download included.
+     That trade is theirs.
+  Let the program finish; do not retry it in a loop. Neither `tccutil` nor a TCC.db edit
+  is the fix, and `sudo killall syspolicyd XprotectService` fails: System Integrity
+  Protection refuses it.
 
 GOTCHAS
   * `privacy` briefly waits off the GUI thread for a fresh result. `probe=pending` after
@@ -4909,13 +4902,16 @@ fn agent_page(sid: Option<&str>) -> String {
     // the whole Mac behind what should be an administrator dialog on the owner's
     // screen. The switch is the owner's press in aterm's Settings (ruling O7);
     // the brief is at its line budget, so `await consent kind=debugger` lives
-    // on the page.
+    // on the page. Its last sentence is the other macOS gotcha with "Developer
+    // Tools" in its name, the first-run check that parks a new program at
+    // `_dyld_start` (owner ruling 2026-10-14, design §9.1 O18, which reverses
+    // O16's "no agent-brief line"): one pointer to doctor's row.
     s.push_str(
         "\nDEBUGGER ACCESS (a password dialog, not privacy)\n  \
-         A \"Developer Tools Access\" dialog is a macOS password, not privacy. The `debugger` row of\n  \
-         `aterm ctl privacy` reads it; your operator answers, and a parked call finishes. A retry\n  \
-         or `sudo` answers nothing; `DevToolsSecurity` with no flag ENABLES developer mode\n  \
-         Mac-wide.\n",
+         \"Developer Tools Access\" is a macOS password dialog, not privacy (`aterm ctl privacy`'s\n  \
+         `debugger` row); your operator answers it and a parked call finishes; a retry or `sudo`\n  \
+         does not, and bare `DevToolsSecurity` ENABLES developer mode Mac-wide. A new program\n  \
+         parked at `_dyld_start` is macOS's first-run check: see `aterm doctor`'s `devtools:` row.\n",
     );
     s.push_str(
         "\nENV HYGIENE (why your agent context vars may be missing)\n  \
@@ -4973,7 +4969,7 @@ pub fn in_session() -> Option<String> {
 ///
 /// Nothing wakes an agent for mail; it is typed to, and an agent may run the
 /// verbs itself. Codex is sandboxed from the socket and takes no part. The
-/// primer paragraph (`aterm_primer::FABRIC_NOTE`) points here.
+/// primer's inbox line points here.
 const FABRIC_PAGE: &str = r#"fabric — peer messaging between aterm sessions, humans and hosts
 
 WHAT IT IS
@@ -6881,9 +6877,10 @@ mod tests {
 
     /// The SLOW FIRST RUNS section (debugger design §9.1) sits after DEBUGGER
     /// ACCESS and before GOTCHAS, keeps the page's 90-column wrap, sends the
-    /// reader to the `devtools` row, names the place and the trade, and hands
-    /// out no command that changes the list: no `enable-terminal`, and the
-    /// tools it names it names as not the fix.
+    /// reader to the `devtools` rows (doctor's and `privacy`'s), names the place,
+    /// the owner's press and the trade, and the tools it names as not the fix.
+    /// `enable-terminal` is named only as what makes a missing pane appear (owner
+    /// ruling 2026-10-14).
     #[test]
     fn the_permissions_page_slow_first_runs_section_keeps_the_wrap() {
         let (page, code) = render(Some("permissions"), None);
@@ -6902,17 +6899,21 @@ mod tests {
         }
         for present in [
             "`devtools` row",
+            "`devtools:` row",
             "`unknown` is not `unlisted`",
             "Privacy & Security \u{25b8}",
             "Developer Tools",
+            "`_dyld_start`",
+            "applies to the next program aterm starts",
+            "makes it appear (it lists only Terminal",
             "first-run malware scan",
             "other agents",
             "the tools you download",
-            "are not the fix",
+            "is the fix, and",
         ] {
             assert!(section.contains(present), "missing {present:?}\n{section}");
         }
-        for absent in ["enable-terminal", "tccutil reset", "sudo spctl"] {
+        for absent in ["tccutil reset", "sudo spctl"] {
             assert!(
                 !section.contains(absent),
                 "the section says {absent:?}\n{section}"

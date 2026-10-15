@@ -161,7 +161,20 @@
 //! (`parentUuid: null`). Such a row opens the conversation, and is read so
 //! wherever the file holds it ([`transcript_ends_on`]). Rows are not ordered
 //! by their own `timestamp`s: a clock stepped back would have kept an old
-//! notice "newest" through the step, confirming spoofs of its class.
+//! notice "newest" through the step, confirming spoofs of its class. A
+//! row's stamp is read once, against the loop's own clock: a LIMIT A CANCEL
+//! LEFT that the loop reads as the answer to a turn — its own act, or anyone's
+//! asked since the policy last looked (`TurnEndState::left_answer`) — is
+//! confirmed only by a notice row written since that turn was asked, less
+//! [`LEFT_ANSWER_SLACK_S`]: a conversation `/resume`d meanwhile ends on its
+//! own older cancelled limit, of the same class. Where the screen cannot
+//! tell that notice from the one the policy already saw (the same limit
+//! answering again, the same reset: `LeftAnswer::screen_tells`), that row,
+//! and its stamp, are the only evidence: with no transcript, or a row that
+//! names no time, it is refused with no word (the screen read no wall). A
+//! clock stepped back refuses a real answer there (the continue policy's
+//! next act meets the limit, as before the answer was read); it confirms
+//! nothing.
 //!
 //! LOCAL COMMANDS ARE NO TURNS (measured on 2.1.294, 2026-10-08, each command
 //! opened and left with Esc;
@@ -227,6 +240,7 @@
 use aterm_json::Value;
 use aterm_phase::WallKind;
 
+use super::super::policy::turn_end::LeftAnswer;
 use super::*;
 
 /// The rule an unconfirmed wall's journal line is written under.
@@ -278,6 +292,15 @@ pub(super) struct TranscriptEnd {
     pub(super) last: Entry,
     /// Claude Code closed the turn after it: a `system` row `turn_duration`.
     pub(super) closed: bool,
+    /// The id (`uuid`) of the row the newest entry was read from (`None`: no
+    /// entry, or a row that carries none): a usage limit's notice confirmed
+    /// is remembered by it ([`served_since_notice`]).
+    pub(super) row: Option<String>,
+    /// When that row says it was written (its own `timestamp`, unix
+    /// seconds; `None`: none, or none the parser reads): what tells a limit
+    /// a cancel left in answer to the loop's act from an older one
+    /// ([`Session::judge_wall`]).
+    pub(super) at: Option<i64>,
 }
 
 impl TranscriptEnd {
@@ -323,6 +346,8 @@ pub(super) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
     let mut end = TranscriptEnd {
         last: Entry::Nothing,
         closed: false,
+        row: None,
+        at: None,
     };
     for line in jsonl.lines() {
         let Ok(v) = crate::harness::transcript::conversation(line) else {
@@ -341,12 +366,78 @@ pub(super) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
                 end = TranscriptEnd {
                     last: entry,
                     closed: false,
+                    row: row_id(&v),
+                    at: row_time(&v),
                 };
             }
             None => {}
         }
     }
     end
+}
+
+/// A row's own id (`uuid`).
+fn row_id(v: &Value) -> Option<String> {
+    v.get("uuid").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// When a row says it was written: its own `timestamp`, unix seconds.
+fn row_time(v: &Value) -> Option<i64> {
+    v.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(crate::harness::upgrade_models::parse_utc)
+        .and_then(|t| i64::try_from(t).ok())
+}
+
+/// How much earlier than the loop's own record of its act the notice that
+/// answered it may say it was written: the act is recorded once the server
+/// has taken the turn, and the stub's 429 is written within milliseconds of
+/// the submit (2.1.299: 19 ms after the prompt's own row). An older notice —
+/// the history a `/resume`d conversation ends on — is minutes or days older.
+pub(super) const LEFT_ANSWER_SLACK_S: i64 = 10;
+
+/// A TURN SERVED SINCE THE NOTICE ROW `notice` (its `uuid`), in `jsonl` (a
+/// transcript's tail): that row is in it, and the newest main-chain answer
+/// of the API's after it is a REPLY of the model's — an `assistant` row that
+/// is no notice (`isApiErrorMessage`) and not Claude Code's own
+/// (`<synthetic>`), the API answering a request made after the limit: the
+/// limit lifted. A notice after that reply (the next request met the limit
+/// again) takes it back. Nothing else says so: a prompt (a person's, the
+/// harness's own `[aterm harness] …`) the limit may still answer, and the
+/// rows Claude Code writes itself — a `<task-notification>` when a
+/// background task ends (measured in the lab on 2.1.300, in the same second
+/// as the 429 its wake met), a local command's rows. A tail that does not
+/// hold the row says nothing: ANOTHER conversation's transcript (a person
+/// `/resume`d it: the host hands over the file the process now writes, its
+/// own older limit and replies under it — the review of 2026-10-14), a tail
+/// the turn's output pushed the row out of.
+pub(super) fn served_since_notice(jsonl: &str, notice: &str) -> bool {
+    let mut after = false;
+    let mut served = false;
+    for line in jsonl.lines() {
+        let Ok(v) = crate::harness::transcript::conversation(line) else {
+            continue;
+        };
+        if !after {
+            after = row_id(&v).as_deref() == Some(notice);
+            continue;
+        }
+        let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
+        if flag("isSidechain") || v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let synthetic = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            == Some("<synthetic>");
+        if flag("isApiErrorMessage") {
+            served = false;
+        } else if !synthetic {
+            served = true;
+        }
+    }
+    served
 }
 
 /// A main-chain row as [`transcript_ends_on`] reads it; `None` for a row
@@ -530,8 +621,24 @@ pub(super) struct Refusal {
     /// What makes it the same wall at a later read (its kind, its words,
     /// why): said once while it stands.
     key: String,
-    /// The journal line.
-    line: String,
+    /// The journal line; `None` for a limit a cancel left that only a
+    /// transcript could tell from the notice already seen, and none did: the
+    /// screen read no wall, and there is nothing to say.
+    line: Option<String>,
+}
+
+/// THE LIMIT A CANCEL LEFT that a decision's read took for the answer to a
+/// turn ([`TurnEndState::left_answer`]), by the screen it was read at
+/// ([`Session::left_read`]).
+#[derive(Debug, Clone)]
+pub(super) struct LeftRead {
+    /// The screen it was read at.
+    pub(super) seq: u64,
+    pub(super) answer: LeftAnswer,
+    /// A transcript row written since the turn was asked confirmed it
+    /// ([`Session::judge_wall`]): its print is dated. Where only the screen
+    /// read it, nothing dates its notice ([`Session::wall_reset_at`]).
+    pub(super) dated: bool,
 }
 
 /// The verdict of the last decision's read ([`Check::Decide`]).
@@ -557,7 +664,7 @@ impl<C: Ctl> Session<'_, C> {
     /// leaves the reading with none — a limit's phase `idle`, whose evidence
     /// is then the composer's frame alone, as for any idle screen — and its
     /// refusal kept for its journal line ([`Self::say_wall_refused`]) and the
-    /// point's phase ([`Self::refused_limit`]).
+    /// point's phase ([`Self::point_as_decided`]).
     pub(super) fn confirm_wall(
         &mut self,
         reading: &mut aterm_phase::Reading,
@@ -606,7 +713,32 @@ impl<C: Ctl> Session<'_, C> {
             reading.program == aterm_phase::Program::Claude && w.kind != WallKind::Memory
         })?;
         let host = opts.idle_host.as_ref();
+        // A LIMIT A CANCEL LEFT read as a turn's answer at this screen
+        // ([`Session::left_read`]): when that turn was asked, on the loop's
+        // clock, and whether the screen alone tells its notice from the one
+        // the policy already saw.
+        let left = self
+            .left_read
+            .as_ref()
+            .filter(|l| l.seq == screen.seq)
+            .map(|l| (self.unix_of(l.answer.since), l.answer.screen_tells));
+        let untold = left.is_some_and(|(_, tells)| !tells);
+        // The limit's notice row this wall is confirmed by, if it is: what a
+        // reply must follow for the transcript to say a turn was served
+        // since it, once the notice leaves the screen. A wall the screen did
+        // not read (`untold`, refused) leaves the one kept.
+        let kept = self.limit_notice_row.take();
+        let unsaid = |s: &mut Self| {
+            s.limit_notice_row = kept.clone();
+            Some(Refusal {
+                key: format!("{} left, untold", w.kind.name()),
+                line: None,
+            })
+        };
         let why = match host.and_then(|h| h.transcript_tail()) {
+            // No transcript to tell the notice the screen draws from the one
+            // the policy already saw: no answer.
+            None if untold => return unsaid(self),
             // No transcript: the screen alone decides, but never on a wall
             // read under a tool's call — the whole screen's rows walked
             // (module docs).
@@ -626,22 +758,69 @@ impl<C: Ctl> Session<'_, C> {
                         None => break,
                     }
                 }
-                if confirms(w.kind, &end) {
+                // A LIMIT A CANCEL LEFT, read as the answer to a turn
+                // ([`Session::left_read`]), is that turn's only where its
+                // notice row was written since the turn was asked: a
+                // conversation `/resume`d meanwhile ends on its own older
+                // cancelled limit, whose row confirms its class all the same.
+                // Where the screen cannot tell it from the notice already
+                // seen, a row that names no time says nothing either.
+                let older = left.is_some_and(|(since, tells)| {
+                    end.at
+                        .map_or(!tells, |at| at < since.saturating_sub(LEFT_ANSWER_SLACK_S))
+                });
+                if confirms(w.kind, &end) && !older {
+                    self.limit_notice_row = end.row.filter(|_| class(w.kind) == Class::Limit);
+                    if let Some(l) = self.left_read.as_mut().filter(|l| l.seq == screen.seq) {
+                        l.dated = end.at.is_some();
+                    }
                     return None;
                 }
-                format!("the transcript ends on {}", end.last.word())
+                if untold {
+                    return unsaid(self);
+                }
+                if older {
+                    "the transcript's notice was written before the turn it would answer"
+                        .to_string()
+                } else {
+                    format!("the transcript ends on {}", end.last.word())
+                }
             }
         };
         let words = one_line(&w.message);
         Some(Refusal {
             key: format!("{} {words} {why}", w.kind.name()),
-            line: format!(
+            line: Some(format!(
                 "SKIPPED seq={} rule={RULE_WALL_CONFIRM} unconfirmed wall: {} — {why}: {}",
                 screen.seq,
                 w.kind.name(),
                 clip(&words)
-            ),
+            )),
         })
+    }
+
+    /// A TURN SERVED SINCE A USAGE LIMIT WHOSE NOTICE LEFT, read in the
+    /// session's transcript ([`TurnEndReading::served_in_transcript`]): the
+    /// host's tail of it holds the limit's own notice row — the one that
+    /// confirmed the limit at the last decision's read of it
+    /// (`Session::limit_notice_row`) — and a reply of the model's after it
+    /// ([`served_since_notice`]). Asked by a decision's read alone, at a point
+    /// whose screen draws no limit's notice to order a turn by
+    /// ([`aterm_phase::since_limit`] `None`: the notice scrolled off the
+    /// rows read under a reply). A person's local commands at the limit
+    /// (`/usage`, `/model`, `/login` dismissed) write no reply; the harness's
+    /// own `/usage` probe is one of them. `false` with no transcript to read,
+    /// and with no notice row remembered (a limit the screen alone decided, a
+    /// loop that took the wait up from its predecessor's ledger row): the
+    /// reset is waited out, as for a wall.
+    pub(super) fn served_in_transcript(&self, opts: &SuperviseOpts) -> bool {
+        let Some(notice) = self.limit_notice_row.as_deref() else {
+            return false;
+        };
+        opts.idle_host
+            .as_ref()
+            .and_then(|h| h.transcript_tail())
+            .is_some_and(|tail| served_since_notice(&tail, notice))
     }
 
     /// Whether wall `w`, read from `screen`, stands UNDER A TOOL'S CALL on
@@ -678,15 +857,26 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::confirm_wall`]): a limit whose wall was refused at that
     /// screen is no limit — no episode opens on it, nothing is escalated for
     /// it and the host is not told the session is limited; it is an idle
-    /// point.
-    pub(super) fn refused_limit(&self, turn: &mut Turn) {
-        if self
+    /// point. And the LIMIT A CANCEL LEFT that the decision took for the
+    /// answer to a turn ([`TurnEndState::left_answer`], kept as
+    /// [`Session::left_read`]) and did not refuse is a limit point, as the
+    /// same wall read before the cancel is: its episode opens, the host is
+    /// told the session is limited, the host's own steps wait on it.
+    pub(super) fn point_as_decided(&self, turn: &mut Turn) {
+        let refused = self
             .wall_verdict
             .as_ref()
-            .is_some_and(|v| v.seq == turn.screen.seq && v.refused.is_some())
-            && matches!(turn.phase, Phase::Limited { .. })
-        {
+            .is_some_and(|v| v.seq == turn.screen.seq && v.refused.is_some());
+        if refused && matches!(turn.phase, Phase::Limited { .. }) {
             turn.phase = Phase::Idle;
+        } else if !refused
+            && turn.phase == Phase::Idle
+            && let Some(l) = self.left_read.as_ref().filter(|l| l.seq == turn.screen.seq)
+        {
+            turn.phase = Phase::Limited {
+                message: l.answer.wall.message.clone(),
+                reset: l.answer.wall.reset.clone(),
+            };
         }
     }
 
@@ -697,9 +887,10 @@ impl<C: Ctl> Session<'_, C> {
     /// the agent's live turn ([`Self::wall_refusal_over`]).
     pub(super) fn say_wall_refused(&mut self, review: &mut dyn Review) {
         if let Some(r) = self.wall_verdict.as_ref().and_then(|v| v.refused.as_ref())
+            && let Some(line) = r.line.as_deref()
             && self.wall_refused_said.as_deref() != Some(r.key.as_str())
         {
-            review.note(&r.line);
+            review.note(line);
             self.wall_refused_said = Some(r.key.clone());
         }
     }

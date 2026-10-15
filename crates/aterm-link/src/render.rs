@@ -37,10 +37,12 @@ pub const SCREEN: &str = "screen";
 
 /// Render arbitrary text so it can only ever be ONE line of ordinary characters.
 ///
-/// Escaped, never dropped: `\n`, `\r` and `\t` by name, every other C0 control
-/// and DEL as `\xNN`, every C1 control and every bidi override as `\u{…}` —
-/// an unescaped U+202E would reorder the line and move the trust label with no
-/// control byte at all.
+/// Escaped, never dropped: a backslash doubled, and every character a terminal
+/// acts on or reorders text around in `aterm_codec::tty`'s one spelling —
+/// `\n`, `\r` and `\t` by name, every other C0 control and DEL as `\xNN`,
+/// every C1 control, bidi control and line or paragraph separator as `\u{…}`
+/// — an unescaped U+202E would reorder the line and move the trust label with
+/// no control byte at all, and an unescaped U+2028 is a second line.
 ///
 /// Truncated to `cap` CHARACTERS with a trailing `…`, so a caller cannot make
 /// one record's body the whole screen.
@@ -58,20 +60,11 @@ pub fn safe(text: &str, cap: usize) -> String {
             break;
         }
         match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
             '\\' => out.push_str("\\\\"),
-            // C0 and DEL.
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            // C1, and the bidi controls that reorder without being controls.
-            c if ('\u{80}'..='\u{9f}').contains(&c)
-                || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') =>
-            {
-                out.push_str(&format!("\\u{{{:04x}}}", c as u32));
-            }
+            // C0 (the line break and tab by name), DEL, C1, and the bidi
+            // controls and separators that reorder or break without being
+            // controls.
+            c if aterm_codec::tty::is_active(c) => aterm_codec::tty::push_escape(&mut out, c),
             c => out.push(c),
         }
     }
@@ -103,7 +96,8 @@ mod tests {
     #[test]
     fn every_control_and_every_reordering_character_is_escaped() {
         for c in [
-            '\u{0}', '\u{7}', '\u{1b}', '\u{7f}', '\u{85}', '\u{202e}', '\u{2066}',
+            '\u{0}', '\u{7}', '\u{1b}', '\u{7f}', '\u{85}', '\u{202e}', '\u{2066}', '\u{61c}',
+            '\u{2028}', '\u{2029}',
         ] {
             let got = safe(&format!("a{c}b"), 64);
             assert!(!got.contains(c), "{:04x} survived as {got:?}", c as u32);

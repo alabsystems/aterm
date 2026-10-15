@@ -374,6 +374,10 @@ mod control;
 /// confirmed press — no control verb, config key, environment variable, band
 /// capsule or automatic lane starts it.
 mod debugger_access;
+/// The Developer Tools list, handled by the window (owner ruling 2026-10-14):
+/// read at launch and while the owner is wanted, one digest line, and the pane
+/// opened for the owner once per version. Never a press in System Settings.
+mod devtools_watch;
 mod harness_policy_cell;
 /// The main-thread redraw conformance gate, for the `aterm-redraw-conformance`
 /// binary. Re-exported because a `[[bin]]` is its own crate and everything the gate
@@ -454,6 +458,9 @@ mod harness_host;
 mod harness_netprobe;
 #[cfg(windows)]
 mod hdr_win;
+/// The platform I/O a program's output asks for, done by the PTY reader before
+/// it takes the terminal lock.
+mod host_io_prefetch;
 mod human_input;
 mod hwkey;
 /// One live holder per session id: the machine-exclusive claim an adopted
@@ -5701,7 +5708,7 @@ impl LaunchPosture {
 /// display-free loop (`vendor/winit/src/platform_impl/macos/headless.rs`), which
 /// never creates the `NSApplication` this posture is applied to — building that
 /// object opened the process's WindowServer connection, and with it a TCC
-/// preflight on WindowServer's main thread (AGENTS.md rule 5; see the
+/// preflight on WindowServer's main thread (AGENTS.md; see the
 /// `with_headless` selection in `main_entry`). The rest of this note is the
 /// 2026-09-21 decision as it stood while headless still built the AppKit loop.
 ///
@@ -5739,9 +5746,9 @@ impl LaunchPosture {
 /// EXCEPT THE UPDATE SUCCESSOR (`handoff_candidate`, 2026-09-24) — the open item
 /// docs/RFC-proof-carrying-dsu.md left: a windowed process launched by a
 /// seamless handoff keeps the policy but does NOT ask to activate at launch.
-/// Activation belongs to the parent's Commit (when an aterm window had focus at
-/// the park, `PendingUpdateHandoff::activate_at_commit`) or to the person's
-/// next click, never to a candidate's boot. `handoff_candidate` is
+/// Activation belongs to the parent's Commit (when an aterm window has focus at
+/// its write, `App::activate_successor_at_write`) or to the person's next
+/// click, never to a candidate's boot. `handoff_candidate` is
 /// `handoff_commit.is_some()` where the event loop is built: both overlap
 /// halves were admitted, and a launched successor that cannot claim its
 /// rendezvous exits before any window, so no windowed successor falls outside
@@ -5838,9 +5845,9 @@ mod headless_activation_posture_tests {
     /// activated, handoff or not. A windowed UPDATE SUCCESSOR keeps the
     /// windowed policy (a Dock tile, Cmd-Tab, the bundle's `LSUIElement`) but
     /// never asks to be the active app: the outgoing process activates it at
-    /// Commit when an aterm window had focus at the park
-    /// (`PendingUpdateHandoff::activate_at_commit`), or the person's next click
-    /// does. A COLD windowed launch is exactly what winit would have done alone.
+    /// the Commit's write when an aterm window has focus there
+    /// (`App::activate_successor_at_write`), or the person's next click does.
+    /// A COLD windowed launch is exactly what winit would have done alone.
     /// Each row is the others' control: a posture that ignored the handoff
     /// fails the successor row, one that never activated fails the cold row.
     #[test]
@@ -6750,18 +6757,49 @@ impl Session {
         }
         collected
     }
+
+    /// Whether this session is still the parked predecessor's: adopted before
+    /// the incoming handoff's Commit, which the parent resumes on rollback
+    /// (see [`Drop`]). Lets go of this process's own held writes for the sid.
+    fn predecessor_owns(&self) -> bool {
+        self.handoff_commit
+            .as_ref()
+            .is_some_and(|commit| commit.withdraw(&self.ctx.self_id))
+    }
+
+    /// The pid-addressed half of teardown, the same for a tab's close
+    /// ([`Drop`]) and the final exit ([`SessionPool::hang_up_at_exit`]):
+    /// `hangup_shell` SIGHUPs the shell's group while `shell_identity`
+    /// verifies (else only the terminal's own foreground group), and a
+    /// detached thread runs the bounded, identity-checked `reap_shell`, which
+    /// SIGKILLs a shell that ignored the hang-up (~250 ms; a quit waits for
+    /// that with `aterm_pty::wait_for_reaps`). Nothing for a stub, a child the
+    /// status path already reaped (its pid is free and may name anyone now) or
+    /// a shell the predecessor still owns. Non-blocking, UI-thread-safe.
+    fn hang_up_and_reap(&self, predecessor_owns: bool) {
+        if predecessor_owns || self.child_reaped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _ = aterm_pty::hangup_shell(&self.shell_identity, self.master);
+        // A shell still ours at the reap's deadline goes to aterm-pty's
+        // straggler reaper.
+        aterm_pty::reap_shell_in_background(self.shell_identity);
+    }
 }
 
 impl Drop for Session {
     /// Tear this tab's PTY down without blocking the UI thread (closing the master
     /// there can wedge on the tty lock against the parked reader):
     ///   1. `hangup_shell` SIGHUPs the child's group while `shell_identity` verifies
-    ///      (else only the terminal's own foreground group), so the reader hits EOF.
-    ///   2. A detached thread runs the bounded, identity-checked `reap_shell`.
+    ///      (else only the terminal's own foreground group), so the reader hits EOF,
+    ///      and a detached thread runs the bounded, identity-checked `reap_shell`
+    ///      ([`Session::hang_up_and_reap`]).
+    ///   2. The reader is woken and stopped.
     ///
     /// The master fd closes with the last `Arc<SinkWriter>` clone, never out of band,
     /// so `forkpty` cannot recycle the fd number under a live reader. Final app exit
-    /// skips this (`process::exit(0)`).
+    /// skips this (`process::exit(0)`) and runs step 1 alone
+    /// ([`SessionPool::hang_up_at_exit`]).
     fn drop(&mut self) {
         // (00) The PTY keeper (opt-in): the tab closed, so the keeper's custody copy
         // goes once no other window claims the master (`keeper_link::release`; one
@@ -6772,6 +6810,10 @@ impl Drop for Session {
         // we wrote for it: dropping the `ChildProxy` deregisters one and removes the
         // other.
         drop(self.child_proxy.take());
+        // (0a) The session ended: a control verb parked on it (`await inbox`, `wait`)
+        // answers `ERR exited` now and lets go of its `SessionCtx`, whose sink owns
+        // the master, instead of holding the closed tab's PTY open to its deadline.
+        self.ctx.fabric.close();
         // WHOSE SESSION THIS IS. An adopted session dropped before the incoming
         // handoff's Commit — a carried window that failed to open, a half-built
         // tab — is still the parked parent's, which resumes it on rollback: its
@@ -6780,10 +6822,7 @@ impl Drop for Session {
         // (round eight, findings 20 and 44). This process lets go only of what
         // it holds itself: its own writes for the sid, held until Commit
         // (`shell_rekey::Deferred::withdraw`).
-        let predecessor_owns = self
-            .handoff_commit
-            .as_ref()
-            .is_some_and(|commit| commit.withdraw(&self.ctx.self_id));
+        let predecessor_owns = self.predecessor_owns();
         // (0b) A re-key this session's shell never reached a prompt to take goes
         // with the session (`shell_rekey`); a handoff parent `_exit`s without
         // running this, so a key written for its shell survives for the successor.
@@ -6820,11 +6859,9 @@ impl Drop for Session {
         // meant to hand back. Only pid-addressed signals are skipped: this
         // process's copy of the master still closes with its last clone, and
         // the reader below is still stopped.
-        let already_reaped =
-            self.child_reaped.load(std::sync::atomic::Ordering::Acquire) || predecessor_owns;
-        if !already_reaped {
-            let _ = aterm_pty::hangup_shell(&self.shell_identity, self.master);
-        }
+        //
+        // The reap runs off the UI thread, identity-checked on every tick.
+        self.hang_up_and_reap(predecessor_owns);
         // (1a) Sever input: every writer waiting on this PTY abandons its frame within
         // one recheck period and queued jobs fail, so a child outliving the hang-up
         // cannot pin the master fd, a thread and queued paste text.
@@ -6850,17 +6887,6 @@ impl Drop for Session {
         // (`abort_resize_offload`). `Release` pairs with the worker's `Acquire`.
         self.reflow_cancel
             .store(true, std::sync::atomic::Ordering::Release);
-        let identity = self.shell_identity;
-        // Nothing to reap for a stub/sentinel session, a child the status path
-        // already collected, or a shell the predecessor still owns.
-        if identity.pid <= 1 || already_reaped {
-            return;
-        }
-        // (2) Reap the child off the UI thread, identity-checked on every tick; a shell
-        // still ours at the deadline goes to aterm-pty's straggler reaper.
-        std::thread::spawn(move || {
-            aterm_pty::reap_shell(identity);
-        });
     }
 }
 
@@ -7026,6 +7052,21 @@ impl SessionPool {
     /// Borrow a session by id (None if unknown).
     fn get(&self, id: u64) -> Option<&Session> {
         self.sessions.get(&id).map(|p| &p.session)
+    }
+    /// The final exit's teardown of every session still open, which it never
+    /// drops (`process::exit`): each one's shell is hung up and reaped exactly
+    /// as closing its tab does ([`Session::hang_up_and_reap`]). The master's
+    /// close at exit SIGHUPs only the session leader, so a program that ignores
+    /// it (`aterm -e <server>`, a shell that `exec`s one) would outlive the
+    /// quit, re-parented to launchd. The exit then waits for the reaps
+    /// (`aterm_pty::wait_for_reaps`). A shell the predecessor still owns is
+    /// left for it, as a close leaves it.
+    #[cfg(unix)]
+    fn hang_up_at_exit(&self) {
+        for pooled in self.sessions.values() {
+            let session = &pooled.session;
+            session.hang_up_and_reap(session.predecessor_owns());
+        }
     }
     /// Add a view: another window now displays this session
     /// (`open_active_session_in_new_window`). No-op if unknown.
@@ -8501,6 +8542,11 @@ struct WindowState {
     /// Retained per-pane subtab labels and rasters.
     pane_headers: pane_header::HeaderCache,
     os_window: Option<Arc<Window>>,
+    /// Stands in for `os_window` where only focus is read
+    /// ([`os_window_focused`]): a test's headless window can have keyboard
+    /// focus, which `focused` then tracks as a real `WindowEvent::Focused` does.
+    #[cfg(test)]
+    os_window_for_test: bool,
     present: Option<PresentTarget>,
     /// This window's monitor DPI scale, captured at attach and updated on
     /// `ScaleFactorChanged`; `redraw_window` re-applies its font/pad to the shared
@@ -10575,6 +10621,8 @@ impl WindowState {
         let strip_shadow = (tab_set.len(), tab_set.active_index().unwrap_or(0));
         WindowState {
             os_window: None,
+            #[cfg(test)]
+            os_window_for_test: false,
             present: None,
             scale: 1.0,
             front_content,
@@ -11008,6 +11056,10 @@ fn hands_off_keys(focused: bool, last_keystroke_at: Option<Instant>, now: Instan
 /// alone is not trusted: a logical window is born believing it has focus and
 /// only a real `WindowEvent::Focused` corrects it.
 fn os_window_focused(ws: &WindowState) -> bool {
+    #[cfg(test)]
+    if ws.os_window_for_test {
+        return ws.focused;
+    }
     ws.focused && ws.os_window.is_some()
 }
 
@@ -12172,10 +12224,6 @@ struct PendingUpdateHandoff {
     park_at: std::time::Instant,
     /// When the successor's adoption proof arrived (its first present).
     proof_ready_at: Option<std::time::Instant>,
-    /// Whether an aterm OS window had keyboard focus at the park, which decides
-    /// whether the parent activates the successor at Commit.
-    #[cfg(target_os = "macos")]
-    activate_at_commit: bool,
     /// Set when the main-thread final-admission gate rejected this attempt for an
     /// activity-shaped reason (drift, deferred teardown, a session death, an
     /// undrainable input queue), so the later `Rejected` completion is retry-eligible
@@ -12764,6 +12812,11 @@ struct App {
     /// refused it (the log alone carries them otherwise).
     #[cfg(all(test, unix))]
     handoff_rejections: Vec<String>,
+    /// Run once at the Commit's write, after the admission's last reading and
+    /// before the egress fence (`App::finish_proven_handoff`), for a test to
+    /// begin a frame the drain gate never saw.
+    #[cfg(all(test, unix))]
+    handoff_before_egress_fence: Option<Box<dyn FnOnce() + Send>>,
     /// The successor pids the Commit's write activated, in order, recorded in
     /// place of AppKit's activation (`App::activate_successor_at_write`), for a
     /// test to tell when the successor took the front.
@@ -13072,6 +13125,11 @@ struct App {
     /// each is owed to, until this process's Commit hands them to its host
     /// (`App::hand_carried_restored_agents`, round four plan item 7).
     handoff_restored_agents: Vec<(u64, restore::AgentRestore)>,
+    /// THE AGENTS THE OUTGOING INSTANCE'S HOST SUPERVISED, by the id each
+    /// handoff leaf names (round eighteen;
+    /// `restore::TerminalLeafRestore::supervised`): watched by this
+    /// process's host from its Commit (`App::hand_carried_restored_agents`).
+    handoff_supervised_agents: Vec<(u64, restore::AgentRestore)>,
     /// Maps an attached OS window's winit id back to our synthetic [`WindowId`].
     /// Populated in `resumed` when the OS window is created; an entry exists only
     /// while that window has an `os_window` (never in headless).
@@ -13131,7 +13189,7 @@ struct App {
     /// `app_introspect::read_app_menu_bar` windowed, `app_introspect::no_app_menu_bar`
     /// (`menu (none)`) headless and in unit tests. The AppKit read starts with
     /// `+[NSApplication sharedApplication]`, which in a headless process creates the
-    /// application object and opens its WindowServer connection (AGENTS.md rule 5;
+    /// application object and opens its WindowServer connection (AGENTS.md;
     /// `grep_guard` B9h holds the selection).
     #[cfg(target_os = "macos")]
     app_menu_bar: fn(crate::appkit::MainThread) -> Vec<String>,
@@ -13149,6 +13207,10 @@ struct App {
     /// Why the last *Move to Trash* press did not start — until the next one
     /// does, or a move that was already under way reports.
     claimant_retire_refusal: Option<&'static str>,
+    /// When the window reads the Developer Tools list and what a reading asks
+    /// of it ([`devtools_watch`]). Inert in effect on a headless instance: its
+    /// consent arms read nothing and the wake handler returns first.
+    devtools_watch: devtools_watch::DevToolsWatch,
     /// The owner's debugger-access change (design §3.4, §3.5): the reducer,
     /// the worker's shared result slot, the predecessor's change marker and
     /// the drift watch. Started only by `begin_debugger_access_change`; a
@@ -14755,6 +14817,70 @@ impl App {
             return None;
         }
         self.debugger_change.next_deadline(now)
+    }
+
+    /// A Developer Tools reading completed ([`Wake::DevToolsProbeReady`]): the
+    /// watch's verdict ([`devtools_watch`]). `not_granted` raises the one
+    /// digest line and, once per aterm version, opens the pane for the owner on
+    /// a detached worker (`spctl developer-mode enable-terminal` first when the
+    /// list is empty); `granted` ends the line. Never on a headless instance.
+    fn on_devtools_probe_ready(&mut self) {
+        if !cfg!(target_os = "macos") || self.headless {
+            return;
+        }
+        let row = self.consent.devtools_cached(
+            self.config.privacy_probe_gate(),
+            self.config.privacy_observer_off(),
+        );
+        if row.pending() {
+            return;
+        }
+        let version = aterm_types::version::app_version();
+        let opened = atpkg::devtools::last_opened().is_some_and(|(v, _)| v == version);
+        let step = self.devtools_watch.observe(row.grant(), opened);
+        if self.apply_devtools_step(step) {
+            let facts = atpkg::devtools::Facts {
+                subject: row.subject().map(str::to_string),
+                list: row.list(),
+                log: row.probe(),
+                other_responsible: None,
+            };
+            let spawned = std::thread::Builder::new()
+                .name("aterm-devtools-handover".to_owned())
+                .spawn(move || {
+                    let handled = atpkg::devtools::hand_to_owner(
+                        &facts,
+                        &atpkg::devtools::Reach {
+                            list_terminal: &atpkg::devtools::list_terminal,
+                            open_pane: &atpkg::devtools::open_pane,
+                        },
+                    );
+                    if matches!(handled, atpkg::devtools::Handled::Opened { .. }) {
+                        atpkg::devtools::note_opened(version);
+                    }
+                    aterm_log::info!("devtools: {}", atpkg::devtools::handled_words(&handled));
+                });
+            if let Err(e) = spawned {
+                aterm_log::warn!("devtools: the hand-over could not start: {e}");
+            }
+        }
+    }
+
+    /// Do what one watch step asks of the digest: raise the Developer Tools
+    /// line, or end it. `true` when the step also asks the pane opened for the
+    /// owner (the caller's detached worker does that).
+    fn apply_devtools_step(&mut self, step: devtools_watch::Step) -> bool {
+        match step {
+            devtools_watch::Step::Nothing => false,
+            devtools_watch::Step::Clear => {
+                self.except_clear(crate::message_reporters::DEVTOOLS_KEY);
+                false
+            }
+            devtools_watch::Step::Raise { hand_over } => {
+                self.except(&crate::message_reporters::devtools_entry());
+                hand_over
+            }
+        }
     }
 
     /// A debugger probe completed ([`Wake::DebuggerProbeReady`]): hand its
@@ -17450,6 +17576,8 @@ impl App {
             handoff_reposts: None,
             #[cfg(unix)]
             handoff_rejections: Vec::new(),
+            #[cfg(unix)]
+            handoff_before_egress_fence: None,
             #[cfg(target_os = "macos")]
             handoff_activations: Vec::new(),
             video_rec: None,
@@ -17559,6 +17687,7 @@ impl App {
             crash_journal: crash_journal::Lane::inert(),
             restored_agents: Vec::new(),
             handoff_restored_agents: Vec::new(),
+            handoff_supervised_agents: Vec::new(),
             winit_to_window: HashMap::new(),
             headless: true,
             desk: desk::Desk::Headless,
@@ -17580,6 +17709,7 @@ impl App {
             consent_warmup: consent_warmup::WarmupState::inert(),
             claimant_retire: consent_retire::RetireState::new(true),
             claimant_retire_refusal: None,
+            devtools_watch: devtools_watch::DevToolsWatch::default(),
             debugger_change: debugger_access::DebuggerChangeLane::new(true),
             owner_quiet: native_settings::SharedOwnerQuiet::default(),
             consent_observer: consent_observer::ObserverState::inert(),
@@ -18371,8 +18501,17 @@ impl App {
                 // the probe, so a focus edge spawns nothing by itself.
                 self.consent.invalidate_debugger();
                 // So is the Developer Tools list (the owner coming back from
-                // System Settings): retired, never re-read from here.
+                // System Settings): retired, and read again off this thread
+                // only at the launch's first focus and while aterm is not on
+                // it (`devtools_watch`); the answer arrives on
+                // `Wake::DevToolsProbeReady`.
                 self.consent.invalidate_devtools();
+                if self.devtools_watch.wants_read(Instant::now()) {
+                    let _ = self.consent.devtools(
+                        self.config.privacy_probe_gate(),
+                        self.config.privacy_observer_off(),
+                    );
+                }
             }
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.rearm_present(false);
@@ -19767,11 +19906,11 @@ impl App {
             if std::thread::Builder::new()
                 .name("aterm-handoff-commit".to_string())
                 .spawn(move || {
-                    if !commit.receive_commit(proof) {
+                    if let Err(end) = commit.receive_commit(proof) {
                         // EOF is normally handled by the prearmed parent watcher;
                         // a full mismatched wire reaches this branch. Either is
                         // terminal: never leave a painted candidate readerless.
-                        commit.fail_stop_if_required();
+                        commit.fail_stop_if_required(end);
                         return;
                     }
                     // Commit is irreversible. Activate readers directly,
@@ -21894,15 +22033,8 @@ impl ApplicationHandler<Wake> for App {
                 self.note_session_exit(session);
                 // A stall published on a dead program must not outlive it.
                 self.retire_input_watch(session);
+                // Marks it `Exited` and wakes every verb parked on it.
                 let to_close = self.exit_session_logical(session);
-                // Wake every parked observer (`await`/`ready`/`subscribe`) so it sees
-                // `Exited` and returns; these verbs are fully event-driven.
-                if self.subscribers.any() {
-                    self.subscribers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .notify(session);
-                }
                 // Free the session's self-feed-floor bucket (D3 hygiene) so the
                 // per-session map cannot grow for the process lifetime as sessions
                 // open and close.
@@ -22281,8 +22413,9 @@ impl ApplicationHandler<Wake> for App {
             // republished at the park, equality-gated.
             Wake::DebuggerProbeReady => self.on_debugger_probe_ready(),
             // The answer is in its slot; the park's
-            // `sync_settings_consent_posture` republishes the Security page.
-            Wake::DevToolsProbeReady => {}
+            // `sync_settings_consent_posture` republishes the Security page,
+            // and the watch acts on the verdict.
+            Wake::DevToolsProbeReady => self.on_devtools_probe_ready(),
             // A nudge only: the park re-reads the shared result slot.
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::ConsentProbeReady => {
@@ -26705,8 +26838,8 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
 /// slot between them ([`atpkg::machine::launch_apply_due`]) — the apply used to run
 /// at every window launch. The claim is taken on this thread, never the event loop's.
 /// The child gets the same PATH and spawner pid the passes get, no `--wait-lock` (the
-/// verb takes no store lock — it writes two per-host preferences and nothing else), and
-/// its stdout runs through
+/// verb takes no store lock — it writes two per-host preferences and removes unused Rust
+/// build cache folders), and its stdout runs through
 /// [`read_seed_markers`] so the `machine-settings:` line lands where a pass's would.
 /// Never joined (`consent_warmup.rs` rule): a wedged `defaults` must not hold a launch.
 ///
@@ -29843,7 +29976,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             // dial would, so the parent's watch on a NAMED pid is what
             // has to see the death. Never headless: checking in creates the
             // application object, and with it a WindowServer connection
-            // (AGENTS.md rule 5; B9h).
+            // (AGENTS.md; B9h).
             let checked_in = death.checks_in_first()
                 && !headless
                 && handoff_rendezvous::debug_check_in_with_launch_services();
@@ -30372,8 +30505,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // keeps the real backend, so there is one code path wherever a display exists), and on
     // macOS always. The AppKit backend is `+[NSApplication sharedApplication]`, whose init
     // opens the process's WindowServer connection, and a new connection makes WindowServer
-    // run a synchronous TCC preflight of the binary on its own main thread (AGENTS.md rule
-    // 5; `grep_guard` B9g holds the selection). Asking macOS whether a display exists would
+    // run a synchronous TCC preflight of the binary on its own main thread (AGENTS.md;
+    // `grep_guard` B9g holds the selection). Asking macOS whether a display exists would
     // itself ask WindowServer, so the macOS choice takes no probe.
     let mut builder = EventLoop::<Wake>::with_user_event();
     // The no-glass posture (`launch_posture`) is applied to the AppKit loop's application
@@ -31652,6 +31785,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_reposts: None,
         #[cfg(all(test, unix))]
         handoff_rejections: Vec::new(),
+        #[cfg(all(test, unix))]
+        handoff_before_egress_fence: None,
         #[cfg(all(test, target_os = "macos"))]
         handoff_activations: Vec::new(),
         video_rec: None,
@@ -31786,6 +31921,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         crash_journal,
         restored_agents: Vec::new(),
         handoff_restored_agents: Vec::new(),
+        handoff_supervised_agents: Vec::new(),
         winit_to_window: HashMap::new(),
         headless,
         desk,
@@ -31820,6 +31956,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         consent_warmup: consent_warmup::WarmupState::new(headless),
         claimant_retire: consent_retire::RetireState::new(headless),
         claimant_retire_refusal: None,
+        devtools_watch: devtools_watch::DevToolsWatch::default(),
         debugger_change: debugger_access::DebuggerChangeLane::new(headless),
         owner_quiet: native_settings::SharedOwnerQuiet::default(),
         consent_observer: consent_observer::ObserverState::new(headless),
@@ -32248,10 +32385,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             proxy::remove_own_graph_entry(&dir, &h.sid, &plan.sock_path);
         }
     }
+    // Every shell ends the way closing its tab ends it, a HUP-ignoring one by the
+    // reap's SIGKILL: the sessions still open (Cmd-Q, `invoke Quit`, the lifeline
+    // cut) and those a last-window close dropped just before. After the desk and
+    // the journal, which read the live sessions; the wait ends as each reap
+    // settles or escalates, and its bound only guards a stalled machine.
+    #[cfg(unix)]
+    {
+        app.pool.hang_up_at_exit();
+        let _ = aterm_pty::wait_for_reaps(std::time::Duration::from_secs(1));
+    }
     // Exit immediately instead of dropping `app`: `Session::drop` on the main thread could
     // wedge `close(master)` against a reader parked in `read(master)` on the tty lock. The
     // OS reclaims fds and SIGHUPs children via controlling-tty teardown; `forget` guards
-    // against a future early return.
+    // against a future early return. Each session still open was hung up above, as closing
+    // its tab would (`SessionPool::hang_up_at_exit`).
     //
     // atpkg children are neither killed nor waited for. An installing child notices its
     // parent changed (`atpkg::progress::watch_for_orphaning`) and redirects output to

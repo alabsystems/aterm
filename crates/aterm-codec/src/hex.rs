@@ -15,7 +15,7 @@
 /// Lowercase hex digit for a nibble (the low four bits of `n`; every caller
 /// passes a value already `<= 15`).
 #[inline]
-const fn digit_lower(n: u8) -> char {
+pub(crate) const fn digit_lower(n: u8) -> char {
     match n & 0x0f {
         0 => '0',
         1 => '1',

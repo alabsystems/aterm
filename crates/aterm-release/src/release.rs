@@ -335,7 +335,7 @@ pub struct ReleaseOptions {
     pub linux: LinuxDecl,
     /// `--release-credentials <path>`; default `~/.aterm/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
-    /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/Developer/publication` (`~/publication` until it moves there).
+    /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`.
     pub engine: Option<PathBuf>,
     pub dry_run: bool,
     pub verbose: bool,

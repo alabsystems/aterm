@@ -92,6 +92,7 @@ mod shell_api;
 pub mod scrollback_shared_budget;
 mod search_budgeted;
 mod search_index;
+mod search_rows;
 mod stack_response;
 mod state;
 mod state_accessors;
@@ -152,7 +153,7 @@ pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
 pub use mode_mirror::ModeMirror;
 pub use observe::{
-    RowMatch, RowRange, Satisfaction, SurfaceSource, WatchId, WatcherSet, WatcherSpec,
+    RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource, WatchId, WatcherSet, WatcherSpec,
     first_matching_row,
 };
 // `ClockReading`: the injected-clock seam, so an out-of-crate replay harness can
@@ -161,6 +162,8 @@ pub use processing::{ClockReading, KittyAnimationStep};
 pub use render_cells::{RenderCell, Script, UnderlineStyle};
 pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
+pub use search_rows::history_line_text_cells;
+pub use selection::smart_word_in_cells;
 pub use shell::{Annotation, BlockState, CommandMark, OutputBlock, ShellState, TerminalMark};
 pub use state::{
     CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,

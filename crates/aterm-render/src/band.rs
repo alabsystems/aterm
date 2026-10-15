@@ -211,6 +211,9 @@ pub fn rows(resolved: Vec<Resolved>) -> PaintedBand {
             .map(|k| {
                 let mut out = cell(k.ch, k.fg, k.bg, k.bold, false);
                 out.text_presentation = k.text_presentation;
+                // A wide glyph's right half (the presence row's CJK or emoji
+                // role): the renderer spans the lead cell across it.
+                out.wide = k.continuation;
                 out
             })
             .collect();
@@ -699,6 +702,33 @@ mod tests {
             None,
             BarBase::Blend,
         )
+    }
+
+    /// A resolved cell's CONTINUATION is the render cell's `wide` (round
+    /// fifteen content-6): the presence row paints a CJK role's glyph as its
+    /// lead cell and a continuation, and the renderer draws the lead across
+    /// both (`materialized_cell_span` is 2), where a lone cell would squeeze
+    /// the glyph into one.
+    #[test]
+    fn a_continuation_is_the_render_cells_wide_half() {
+        let c = inks();
+        let k = |ch, continuation| aterm_messages::ink::InkedCell {
+            ch,
+            fg: c.value,
+            bg: c.bar_bg,
+            bold: false,
+            text_presentation: false,
+            continuation,
+        };
+        let (rows, _, _) = rows(vec![Resolved {
+            cells: vec![k('\u{62c5}', false), k(' ', true), k('x', false)],
+            metered: false,
+            raster: None,
+        }]);
+        let wide: Vec<bool> = rows[0].iter().map(|r| r.wide).collect();
+        assert_eq!(wide, [false, true, false]);
+        assert_eq!(crate::materialized_cell_span(&rows[0], 0), 2);
+        assert_eq!(crate::materialized_cell_span(&rows[0], 2), 1);
     }
 
     /// Every `char` the renderer draws as a band icon is the engine's icon of

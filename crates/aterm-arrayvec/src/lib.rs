@@ -83,10 +83,15 @@
 //!   that dominate the wgpu side. The growth is real only for small, weakly
 //!   aligned `T`. No consumer puts an `ArrayVec` in a `#[repr(C)]` type either,
 //!   so this is not an ABI break.
-//! * **`Drain` under `mem::forget`.** Upstream shortens the vector up front and
-//!   restores the tail in `Drop`, so forgetting a `Drain` loses the un-drained
-//!   elements; ours removes as it yields, so forgetting one keeps them. Ours is
-//!   the safer answer and nothing in the graph forgets a `Drain`.
+//! * **`Drain` under `mem::forget` or a panicking destructor.** Upstream
+//!   shortens the vector up front and restores the tail in `Drop`, so
+//!   forgetting a `Drain` loses the un-drained elements, and an element
+//!   destructor that panics in its `Drop` leaks the rest of the range and the
+//!   tail; ours removes as it yields, so forgetting one keeps them, and its
+//!   `Drop` still drops the rest of the range and closes the tail up (std
+//!   `Vec::Drain`'s outcome). Ours is the safer answer in both cases, and
+//!   nothing in the graph forgets a `Drain` or drops elements whose destructor
+//!   panics.
 //! * **`IntoIter` cost.** Ours is O(n²) in element moves rather than O(n),
 //!   because it moves each element out with `remove(0)` instead of an index
 //!   cursor plus a hand-written `Drop`. The largest capacity anywhere in the

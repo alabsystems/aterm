@@ -15,6 +15,20 @@ use crate::grapheme::ColumnMap;
 
 /// Source of candidate line numbers for search iteration.
 ///
+/// It walks posting KEYS — `u32` offsets from the index's key base (see
+/// `SearchIndex::make_room_for`) — and hands back LINE numbers, the key plus
+/// that base, so no caller ever converts between the two. A source is built
+/// against the base the index has when it is built and never outlives the
+/// borrow that froze it.
+pub(super) struct CandidateSource {
+    /// The line number key 0 stands for.
+    base: usize,
+    /// The keys, in the order they are yielded.
+    keys: CandidateKeys,
+}
+
+/// The key walk behind a [`CandidateSource`].
+///
 /// For short queries (< 3 chars), uses a lazy range to avoid O(n) allocation.
 /// For trigram queries, decodes the involved posting lists ONCE (a transient
 /// per-query working set) and drives navigation off the smallest decoded list,
@@ -23,7 +37,7 @@ use crate::grapheme::ColumnMap;
 /// double-ended reverse walk — cheap without a per-probe decode. The driver is
 /// picked by the O(1) compressed count and range-bounded BEFORE the filters are
 /// decoded, so a bound that empties it costs no decode at all.
-pub(super) enum CandidateSource {
+enum CandidateKeys {
     /// Empty source.
     Empty,
     /// Smallest decoded posting list, range-bounded at the navigation cursor,
@@ -44,9 +58,9 @@ pub(super) enum CandidateSource {
         /// must occupy — probed by binary search.
         filters: Vec<Vec<u32>>,
     },
-    /// Lazy ascending range of line numbers (for short-query forward search).
+    /// Lazy ascending range of keys (for short-query forward search).
     Range(Range<u32>),
-    /// Lazy descending range of line numbers (for short-query backward search).
+    /// Lazy descending range of keys (for short-query backward search).
     RangeRev(std::iter::Rev<Range<u32>>),
 }
 
@@ -76,12 +90,41 @@ fn split_smallest_first(
 }
 
 impl CandidateSource {
-    /// Build a lazy ascending intersection from borrowed posting lists.
-    pub(super) fn from_postings_forward(postings: Vec<&SparseBitmap>, from_line: u32) -> Self {
+    /// A source that yields nothing.
+    pub(super) fn empty() -> Self {
+        Self {
+            base: 0,
+            keys: CandidateKeys::Empty,
+        }
+    }
+
+    /// Every key in `keys`, ascending, as lines from `base`.
+    pub(super) fn range(base: usize, keys: Range<u32>) -> Self {
+        Self {
+            base,
+            keys: CandidateKeys::Range(keys),
+        }
+    }
+
+    /// Every key in `keys`, descending, as lines from `base`.
+    pub(super) fn range_rev(base: usize, keys: Range<u32>) -> Self {
+        Self {
+            base,
+            keys: CandidateKeys::RangeRev(keys.rev()),
+        }
+    }
+
+    /// Build a lazy ascending intersection from borrowed posting lists,
+    /// starting at key `from_key`.
+    pub(super) fn from_postings_forward(
+        base: usize,
+        postings: Vec<&SparseBitmap>,
+        from_key: u32,
+    ) -> Self {
         let Some((mut primary, rest)) = split_smallest_first(postings) else {
-            return Self::Empty;
+            return Self::empty();
         };
-        let start = primary.partition_point(|&v| v < from_line);
+        let start = primary.partition_point(|&v| v < from_key);
         primary.drain(..start);
         // Bound the driver BEFORE decoding the filters. The filters are only
         // ever membership-probed by a yielded candidate, so with no candidates
@@ -89,41 +132,52 @@ impl CandidateSource {
         // directed find) their decode is pure waste — hundreds of KB of
         // `Vec<u32>` allocated and dropped untouched for a common trigram over a
         // deep index. An empty `FilteredForward` and `Empty` are
-        // indistinguishable through `next_candidate`, the enum's only method.
+        // indistinguishable through `next_candidate`, the type's only reader.
         if primary.is_empty() {
-            return Self::Empty;
+            return Self::empty();
         }
         let filters: Vec<Vec<u32>> = rest.into_iter().map(SparseBitmap::to_vec).collect();
-        Self::FilteredForward {
-            candidates: primary.into_iter(),
-            filters,
+        Self {
+            base,
+            keys: CandidateKeys::FilteredForward {
+                candidates: primary.into_iter(),
+                filters,
+            },
         }
     }
 
-    /// Build a lazy descending intersection from borrowed posting lists.
-    pub(super) fn from_postings_backward(postings: Vec<&SparseBitmap>, before_line: u32) -> Self {
+    /// Build a lazy descending intersection from borrowed posting lists,
+    /// below key `before_key`.
+    pub(super) fn from_postings_backward(
+        base: usize,
+        postings: Vec<&SparseBitmap>,
+        before_key: u32,
+    ) -> Self {
         let Some((mut primary, rest)) = split_smallest_first(postings) else {
-            return Self::Empty;
+            return Self::empty();
         };
-        let end = primary.partition_point(|&v| v < before_line);
+        let end = primary.partition_point(|&v| v < before_key);
         primary.truncate(end);
         // Bound first, decode second — see `from_postings_forward`.
         if primary.is_empty() {
-            return Self::Empty;
+            return Self::empty();
         }
         let filters: Vec<Vec<u32>> = rest.into_iter().map(SparseBitmap::to_vec).collect();
-        Self::FilteredBackward {
-            candidates: primary.into_iter(),
-            filters,
+        Self {
+            base,
+            keys: CandidateKeys::FilteredBackward {
+                candidates: primary.into_iter(),
+                filters,
+            },
         }
     }
 
     /// Get the next candidate line number.
     #[inline]
-    pub(super) fn next_candidate(&mut self) -> Option<u32> {
-        match self {
-            Self::Empty => None,
-            Self::FilteredForward {
+    pub(super) fn next_candidate(&mut self) -> Option<usize> {
+        let key = match &mut self.keys {
+            CandidateKeys::Empty => None,
+            CandidateKeys::FilteredForward {
                 candidates,
                 filters,
             } => candidates.find(|candidate| {
@@ -131,7 +185,7 @@ impl CandidateSource {
                     .iter()
                     .all(|list| list.binary_search(candidate).is_ok())
             }),
-            Self::FilteredBackward {
+            CandidateKeys::FilteredBackward {
                 candidates,
                 filters,
             } => candidates.rfind(|candidate| {
@@ -139,9 +193,10 @@ impl CandidateSource {
                     .iter()
                     .all(|list| list.binary_search(candidate).is_ok())
             }),
-            Self::Range(range) => range.next(),
-            Self::RangeRev(rev) => rev.next(),
-        }
+            CandidateKeys::Range(range) => range.next(),
+            CandidateKeys::RangeRev(rev) => rev.next(),
+        }?;
+        Some(self.base.saturating_add(key as usize))
     }
 }
 
@@ -247,10 +302,7 @@ impl Iterator for SearchMatchIterator<'_> {
                     return Some(found);
                 }
             }
-            self.current_line = self
-                .candidates
-                .next_candidate()
-                .map(|line_u32| line_u32 as usize);
+            self.current_line = self.candidates.next_candidate();
             self.current_line?;
             self.next_byte = 0;
             #[cfg(test)]
@@ -325,10 +377,7 @@ impl Iterator for SearchMatchReverseIterator<'_> {
                     continue;
                 }
             }
-            self.current_line = self
-                .candidates
-                .next_candidate()
-                .map(|line_u32| line_u32 as usize);
+            self.current_line = self.candidates.next_candidate();
             self.current_line?;
             self.before_byte = usize::MAX;
             #[cfg(test)]

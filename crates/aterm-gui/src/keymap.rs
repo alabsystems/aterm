@@ -290,7 +290,51 @@ pub(crate) fn suppress_direct_send(preedit: &str) -> bool {
     !preedit.is_empty()
 }
 
+/// Whether an input method's committed text (`Ime::Commit`) reaches the PTY as a
+/// paste rather than as typed keys: when it holds a control character, C0, DEL
+/// or C1 (Unicode's `Cc`, so a line break, CR, ESC, TAB or ETX), unless the
+/// whole commit is one C0 or DEL character, which is one key's worth.
+///
+/// RULING (boundaries hunt L2, 2026-10-10, `docs/AUDIT-boundaries-2026-10-09.md`):
+/// fail closed. A commit is text the person did not type key by key: an input
+/// method with clipboard history (fcitx5's Clipboard addon) commits the chosen
+/// entry, which a program's OSC 52 write can plant, and macOS dictation commits a
+/// whole phrase. Typed, its line break submitted the line and its ESC ended a
+/// bracketed paste early, past the multi-line guard and the paste sanitizer. As
+/// a paste (`App::deliver_paste`) it is sanitized, bracketed when the program
+/// asked, and asked about by the guard where the guard's own rule asks
+/// (unbracketed and holding a line break). Dictation's "new line" inside a
+/// phrase goes the same way on purpose: a dictated newline that silently runs a
+/// misheard line is the same hazard, so under bracketed paste it inserts a line
+/// break, and at a bare prompt the guard asks first. Printable commits, the
+/// common case (CJK, accents, emoji), keep the typed-key path byte for byte.
+///
+/// AMENDED 2026-10-10 (lane review): a commit that is exactly one C0 or DEL
+/// character keeps the typed-key path. X11 commits a KEY that way: winit sends
+/// a key event only for `keycode != 0 && !is_composing`, so while an XIM
+/// preedit is open an unfiltered Return arrives as the commit `"\r"`, Tab as
+/// `"\t"` and BackSpace as `"\x08"` (`lookup_utf8`), and Wayland's
+/// `commit_string` is unfiltered too. Pasted, that Return would insert a line
+/// break under bracketed paste instead of running the line, Tab a literal tab
+/// instead of completing, and the sanitizer would drop BackSpace and DEL
+/// outright. One character carries no planted text, and neither threat fits in
+/// one: planted text and its line break need two, `ESC [ 201 ~` six. A lone C1
+/// character still pastes: no key types one.
+#[must_use]
+pub(crate) fn committed_text_is_paste(text: &str) -> bool {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(only), None) => only.is_control() && !only.is_ascii(),
+        _ => text.chars().any(char::is_control),
+    }
+}
+
 /// IME-1: encode committed composition text (`Ime::Commit`) for the PTY.
+///
+/// A person's input method brings only commits holding no control character
+/// here ([`committed_text_is_paste`] sends the rest through the paste path); the
+/// encoder still takes whatever text it is handed (the on-key text fallback, a
+/// controller's typed turn).
 ///
 /// Legacy / non-report-all modes: each character is encoded as a `Character` key
 /// through the engine (NOT a raw `& 0x1f` byte), so committed CJK/dead-key text
@@ -1080,6 +1124,41 @@ mod tests {
         );
         // Empty commit is empty.
         assert!(encode_committed_text("", KeyboardMode::empty()).is_empty());
+    }
+
+    /// The L2 rule itself (ruling 2026-10-10, amended the same day): C0, DEL
+    /// and C1 (Unicode's `Cc`) make a commit a paste, except a commit that is
+    /// one C0 or DEL character, which is the key X11 commits while an XIM
+    /// preedit is open (Return, Tab, BackSpace, Escape, Ctrl+C). Printable
+    /// text, joiners, the no-break space and the Unicode line separator (`Zl`,
+    /// which no shell reads as a line end) are typed text.
+    #[test]
+    fn a_commit_is_a_paste_when_a_control_character_is_not_a_lone_key() {
+        for paste in [
+            "ls\n",
+            "a\u{85}",
+            "\u{9b}",
+            "\u{85}",
+            "\r\n",
+            "\n\n",
+            "\x1b\x1b",
+            "a\t",
+            "\x1b[201~",
+        ] {
+            assert!(
+                committed_text_is_paste(paste),
+                "{paste:?} is a paste: a C1 character, or a control beside more text"
+            );
+        }
+        for key in ["\n", "\r", "\t", "\x08", "\x1b", "\x7f", "\x03", "\0"] {
+            assert!(
+                !committed_text_is_paste(key),
+                "{key:?} alone is one key's worth and stays typed"
+            );
+        }
+        for typed in ["", "日本", "é", "🙂", " ", "\u{200d}", "\u{2028}", "\u{a0}"] {
+            assert!(!committed_text_is_paste(typed), "{typed:?} is typed text");
+        }
     }
 
     /// Under kitty REPORT_ALL_KEYS_AS_ESC + REPORT_ASSOCIATED_TEXT (+ event types,

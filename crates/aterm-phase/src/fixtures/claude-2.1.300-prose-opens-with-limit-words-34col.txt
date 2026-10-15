@@ -1,0 +1,23 @@
+# claude-code 2.1.300 · MEASURED 2026-10-14, `aterm ctl text` of a private headless aterm (34x50, aterm 0.103.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab) · the worker's own reply (the stub's reply file: four hard lines, the first opening with the usage limit's words and a ' · '), at 34 columns: Claude Code wraps a reply's prose to the pane's edge (rows up to width - 2 cells from column two), where its usage and error notices wrap ten columns short; a negative control for the error row's narrow-pane bound
+           Claude Code v2.1.300
+ ▐▛███▛█   Opus 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/tmp/at.n4gC/proj
+
+
+❯ status?
+
+⏺ Usage limit reached · pausing.
+  Done so far: parser, lexer,
+  tests.
+  Next: the migration and the
+  docs.
+  Will resume after the reset.
+
+✻ Sautéed for 0s · done 1:04 PM
+
+──────────────────────────────────
+❯
+──────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to
+              ◐ medium · /effort

@@ -190,6 +190,26 @@ pub struct SessionFile {
     pub kind: String,
     /// `cli` for a session started from a shell.
     pub entrypoint: String,
+    /// THE CLAUDE CODE DIRECTORY THIS RECORD WAS READ FROM (`<dir>/sessions/
+    /// <pid>.json`): where the process keeps every record of its own, its
+    /// conversation's transcript too — the directory its
+    /// `CLAUDE_CONFIG_DIR` named, else `~/.claude`. Set by the harness's
+    /// readers (`upgrade_drive::session_files_in`), which read every Claude
+    /// home an agent in a tab runs under, so whatever a step reads about the
+    /// agent it reads THERE (`upgrade_drive::Records::of_file`). `None` for a
+    /// record parsed from text alone ([`parse_session_file`]), read as the
+    /// user's own `~/.claude`.
+    pub claude_dir: Option<PathBuf>,
+    /// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME THIS RECORD WAS READ UNDER
+    /// (its global config, where the login's model caches are), where the
+    /// directory alone does not name it: a `CLAUDE_CONFIG_DIR` set and EMPTY
+    /// files its records in the directory the process runs in and keeps its
+    /// profile in `$HOME/.claude.json` (`upgrade_drive::profile_apart`). Set
+    /// by the readers that know the home's raw value
+    /// (`upgrade_drive::Records`); `None` for every other home, whose profile
+    /// is read by `claude_dir` (beside the user's `~/.claude`, inside any
+    /// other).
+    pub profile: Option<PathBuf>,
 }
 
 /// Parses a session file, refusing any shape this module was not written for.
@@ -223,6 +243,8 @@ pub fn parse_session_file(text: &str) -> Result<SessionFile, String> {
         proc_start: s("procStart")?,
         kind: s("kind")?,
         entrypoint: s("entrypoint")?,
+        claude_dir: None,
+        profile: None,
     })
 }
 
@@ -4218,12 +4240,72 @@ pub fn clock_held_until(phase: &Phase, until: u64) -> Phase {
 /// Whether a step waiting on `why` leaves the release ([`release_prompt`]) as
 /// the upgrade's next act, if owed: only when the upgrade waits on nothing it
 /// would type or signal (its re-ask window `awaiting-ready`, a stop `failed`,
-/// the owner's hold `skipped`/`deferred`). Any other wait is the notice's or
-/// restart's own gate, and what it waits for goes first: a re-ask supersedes
-/// the release, and a restart's carry-on tells the agent to go on.
+/// the owner's hold `skipped`/`deferred`, a build that fails to start
+/// [`BUILD_FAILS`]). Any other wait is the notice's or restart's own gate,
+/// and what it waits for goes first: a re-ask supersedes the release, and a
+/// restart's carry-on tells the agent to go on. Neither comes while the
+/// build the round moves to fails to start ([`build_hold`]): left to them,
+/// the release a pending round owes (a retarget's, a dropped ride's) was
+/// never typed (the review of round eighteen).
 #[must_use]
 pub fn release_is_next(why: &str) -> bool {
-    matches!(why, "awaiting-ready" | "failed" | "skipped" | "deferred")
+    matches!(
+        why,
+        "awaiting-ready" | "failed" | "skipped" | "deferred" | BUILD_FAILS
+    )
+}
+
+/// The wait of a move onto a build that failed to start — for any
+/// conversation — and is not proved to start since ([`build_hold`];
+/// `upgrade_drive`'s `build_start` keeps what is known of each build).
+pub const BUILD_FAILS: &str = "build-fails";
+
+/// Whether the round has asked its agent, which holds for the move: announced
+/// (its notice stands, the agent winding down or READY), or given up with a
+/// late READY in hand (`ready`, [`GAVE_UP`]: the agent wound down and
+/// answered, and is restarted on it). Any other round has asked nothing that
+/// still holds the agent: pending, a stopped round's release owed or typed.
+#[must_use]
+pub fn asked_for_a_move(phase: &Phase, ready: bool) -> bool {
+    match phase {
+        Phase::Announced { .. } => true,
+        Phase::Failed(why) => why == GAVE_UP && ready,
+        Phase::Pending | Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => false,
+    }
+}
+
+/// THE STEP A BUILD THAT FAILS TO START LEAVES (round eighteen), from the
+/// reducer's `step` at a round in `phase` with the READY the step was taken
+/// on (`ready`). The driver asks it wherever the round's target failed to
+/// start, for any conversation, and is not proved to start since: no agent
+/// is moved onto that build — a notice asks for a move that cannot come, a
+/// restart ends a working agent onto a build that exits at once.
+///
+/// * A round that ASKED ITS AGENT ([`asked_for_a_move`]) is abandoned,
+///   whatever its step: [`Step::Void`] of [`BUILD_FAILS`], which the driver
+///   takes as the round's stop — its markers forgotten, so no READY given to
+///   them restarts the agent later, and the agent owed its release, typed at
+///   once where the notice's gate lets it. Held as a plain wait, the READY of
+///   a round that gave up held its release behind a restart that never came
+///   (`retry_due` holds the re-arm over it), and an announced round's re-ask
+///   never went, so no give-up released its agent either: wound down, or
+///   stopped for the restart, for as long as the build failed (the review of
+///   round eighteen).
+/// * Any other round waits ([`BUILD_FAILS`]) where it would announce or
+///   restart; a release it still owes is the next act there
+///   ([`release_is_next`]). Every other step is its own.
+///
+/// `HarnessUpgradeNeverStrands`' `BuildHold` and its release at a pending
+/// round (`aterm_spec::derive::harness_upgrade_never_strands_model`).
+#[must_use]
+pub fn build_hold(step: Step, phase: &Phase, ready: bool) -> Step {
+    if asked_for_a_move(phase, ready) {
+        return Step::Void(BUILD_FAILS);
+    }
+    match step {
+        Step::Announce | Step::Terminate | Step::Fresh => Step::Wait(BUILD_FAILS),
+        Step::Wait(_) | Step::Void(_) | Step::GiveUp | Step::Rearm => step,
+    }
 }
 
 /// May the release line ([`release_prompt`]) be typed now? Never while a READY

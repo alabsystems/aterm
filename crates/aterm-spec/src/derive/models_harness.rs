@@ -1072,7 +1072,7 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// holding.
 ///
 /// `Look` is DERIVED FROM THE REDUCER'S OWN GUARDS: enabled exactly where neither
-/// `Restart` nor `Release` nor
+/// `Restart` nor `BuildHold` nor `Release` nor
 /// `DropRelease` is — the guards spelled again inside it (the release's
 /// point, typed or dropped, is one term: the two split it by the direction),
 /// which the Tier-0 test checks state by state. The hand-written clauses it
@@ -1138,6 +1138,23 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// `wait:background` is caught — and replays the incident, the pre-fix trace
 /// as the caught negative control.
 ///
+/// A BUILD THAT FAILS TO START (round eighteen, `upgrade::build_hold`;
+/// `fails`, the environment's: a relaunch onto the round's target, for any
+/// conversation, never registered it, and no probe has proved the build to
+/// start since — `BuildFails`, `BuildStarts`). No agent is moved onto it:
+/// no notice (`Announce`, `Supersede`) and no `Restart`. A round that asked
+/// its agent — announced, or given up with a late READY in hand — is
+/// abandoned at once whatever else it would do (`BuildHold`: the stop, the
+/// markers forgotten, the release owed), and a pending round that still owes
+/// a release types it there (`Release` at phase 0), since no notice comes to
+/// supersede it. The last word is said at a pending or announced round too
+/// while the build fails (`wait:build-fails`). Two knobs, each caught alone
+/// by `NeverStranded`: `HeldAsked` (the build's hold only a wait where the
+/// round would move — the branch as reviewed: a gave-up round's late READY
+/// held its release behind a restart that never came, and an announced
+/// round's re-ask never went), `HeldRelease` (the pending round's owed
+/// release left to a notice that never comes).
+///
 /// ONE STATED EXCEPTION, outside the model: an agent found to be no job of a
 /// job-control shell is refused and owed no release
 /// (`upgrade_drive::not_a_job`) — the line is typed under the notice's
@@ -1160,6 +1177,8 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             const ReadyOverDirection = 0;
             const IdleOnlyRelease = 0;
             const Terminal = 0;
+            const HeldAsked = 0;
+            const HeldRelease = 0;
             const MaxAsks = 2;
             var limited = 0;
             var brk = 0;
@@ -1179,6 +1198,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             var dropheld = 0;
             var rest = 0;
             var stalled = 0;
+            var fails = 0;
 
             // The account and the agent, as they please.
             action LimitHits when (limited == 0 && (phase <= 2 || phase == 4)) {
@@ -1232,10 +1252,19 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             action Rests when ((phase == 2 || phase == 4) && rest == 0) {
                 rest = 1;
             }
+            // The round's target fails to start — a relaunch onto it, for any
+            // conversation, never registered — and no probe has proved it to
+            // start since; or one does (or a newer build is the target).
+            action BuildFails when (fails == 0) {
+                fails = 1;
+            }
+            action BuildStarts when (fails == 1) {
+                fails = 0;
+            }
 
             // The upgrade's steps.
             action Announce when (
-                ready == 0 && (limited == 0 || Buggy == 1 || NoF1 == 1) &&
+                ready == 0 && fails == 0 && (limited == 0 || Buggy == 1 || NoF1 == 1) &&
                 (phase == 0 || (phase == 1 && window == 1 && asks <= MaxAsks - 1))
             ) {
                 phase = 1;
@@ -1251,6 +1280,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             }
             action GiveUp when (
                 phase == 1 && window == 1 && asks == MaxAsks && ready == 0 &&
+                (fails == 0 || HeldAsked == 1) &&
                 (limited == 0 || Buggy == 1 || NoF1 == 1)
             ) {
                 phase = 2;
@@ -1259,7 +1289,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             }
             // Never at a break: the restart would end the work that runs.
             action Restart when (
-                ready == 1 && live == 1 && limited == 0 && brk == 0 &&
+                ready == 1 && live == 1 && limited == 0 && brk == 0 && fails == 0 &&
                 (phase == 1 || (phase == 2 && Buggy == 0 && NoF2 == 0))
             ) {
                 phase = 3;
@@ -1278,7 +1308,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // notice supersedes the answer — its READY is no longer the last
             // word after the latest notice.
             action Supersede when (
-                ready == 1 && live == 1 && limited == 0 && phase == 1 &&
+                ready == 1 && live == 1 && limited == 0 && phase == 1 && fails == 0 &&
                 window == 1 && asks <= MaxAsks - 1
             ) {
                 asks = asks + 1;
@@ -1293,6 +1323,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // the answer stands, and the gave-up arm's `Void` releases it.
             action GiveUpOutlived when (
                 ready == 1 && live == 1 && limited == 0 && phase == 1 &&
+                (fails == 0 || HeldAsked == 1) &&
                 window == 1 && asks == MaxAsks
             ) {
                 phase = 2;
@@ -1305,7 +1336,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // idle point, and at a break (`IdleOnlyRelease`: a gave-up one's
             // only at an idle point).
             action Void when (
-                ready == 1 && live == 1 && limited == 0 &&
+                ready == 1 && live == 1 && limited == 0 && (fails == 0 || HeldAsked == 1) &&
                 ((phase == 1 && window == 1) ||
                  (phase == 2 && Buggy == 0 && NoF2 == 0 && (brk == 0 || IdleOnlyRelease == 0)))
             ) {
@@ -1315,6 +1346,21 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 window = if (phase == 1 && Buggy == 0 && NoOwe == 0) { 0 } else { window };
                 // A gave-up round's rest begins again at the void: the release
                 // it owes stands a whole rest before a new round's notice.
+                rest = 0;
+            }
+            // THE BUILD'S HOLD (`upgrade::build_hold`): a round that asked its
+            // agent, its target failing to start, is abandoned at once —
+            // whatever else it would do, at a break or a limit too: the
+            // markers forgotten, the release owed (`HeldAsked`: a wait where
+            // it would move, and nothing else).
+            action BuildHold when (
+                fails == 1 && HeldAsked == 0 &&
+                (phase == 1 || (phase == 2 && ready == 1 && live == 1))
+            ) {
+                phase = 4;
+                ready = 0;
+                live = 0;
+                owed = if NoOwe == 1 { owed } else { 1 };
                 rest = 0;
             }
             // The owner's hold, a refused plan or signal: the round is
@@ -1346,12 +1392,17 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // phase acts on it (`KeepReady` waits behind any), and is typed
             // unless the agent took up direction given after its last answer
             // (`UnansweredDirection`: or was merely given one) — at a break
-            // as at an idle point (`IdleOnlyRelease`: never at a break).
+            // as at an idle point (`IdleOnlyRelease`: never at a break). An
+            // announced round's own window is the build's hold's while the
+            // build fails, and a pending round's, its notice held by the
+            // build, is the release's (`HeldRelease`: never).
             action Release when (
                 owed == 1 && limited == 0 && NoType == 0 &&
                 (brk == 0 || IdleOnlyRelease == 0) &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
-                (phase == 2 || phase == 4 || (phase == 1 && window == 0)) &&
+                (phase == 2 || phase == 4 ||
+                 (phase == 1 && window == 0 && (fails == 0 || HeldAsked == 1)) ||
+                 (phase == 0 && fails == 1 && HeldRelease == 0)) &&
                 directed == 0 && ((UnansweredDirection == 0 && Buggy == 0) || told == 0) &&
                 (rest == 0 || Buggy == 1 || Terminal == 1 || (phase == 2 && ready == 1 && live == 1))
             ) {
@@ -1369,7 +1420,9 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 owed == 1 && NoType == 0 &&
                 (brk == 0 || IdleOnlyRelease == 0) &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
-                (phase == 2 || phase == 4 || (phase == 1 && window == 0 && limited == 0)) &&
+                (phase == 2 || phase == 4 ||
+                 (phase == 1 && window == 0 && limited == 0 && (fails == 0 || HeldAsked == 1)) ||
+                 (phase == 0 && fails == 1 && limited == 0 && HeldRelease == 0)) &&
                 (directed == 1 || ((UnansweredDirection == 1 || Buggy == 1) && told == 1)) &&
                 (rest == 0 || Buggy == 1 || Terminal == 1 || (phase == 2 && ready == 1 && live == 1))
             ) {
@@ -1381,26 +1434,36 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // THE QUIET WORD at a point the agent can read: nothing left the
             // upgrade would do now — no restart (at a break, where none is
             // taken, the drain's void of a gave-up upgrade's READY stands for
-            // it), no release typed or dropped, no new round (`LastWhileOwed`:
-            // a stop's own word said over a release still owed). At a break
+            // it; while the build fails, none at all), no release typed or
+            // dropped, no new round (`LastWhileOwed`: a stop's own word said
+            // over a release still owed), no hold of the build's. At a break
             // it is the word the break repeats; said past a stopped round's
-            // rest, it is a permanent wait (`stalled`).
+            // rest, it is a permanent wait (`stalled`). While the build fails
+            // a pending or announced round says it too (`wait:build-fails`):
+            // no notice and no restart come.
             action Look when (
-                (phase == 2 || phase == 4) && limited == 0 && stuck == 0 &&
+                (phase == 2 || phase == 4 || (fails == 1 && phase <= 1)) &&
+                limited == 0 && stuck == 0 &&
                 (if (
                     ready == 1 && live == 1 && limited == 0 &&
-                    (phase == 1 || (phase == 2 && Buggy == 0 && NoF2 == 0)) &&
-                    (brk == 0 || IdleOnlyRelease == 0)
+                    phase == 2 && Buggy == 0 && NoF2 == 0 &&
+                    (brk == 0 || IdleOnlyRelease == 0) && (fails == 0 || brk == 1)
                 ) { 1 } else { 0 }) +
                 (if (LastWhileOwed == 1 && phase == 4) { 0 } else if (
                     owed == 1 && limited == 0 && NoType == 0 &&
                     (brk == 0 || IdleOnlyRelease == 0) &&
                     (ready == 0 || (phase == 4 && KeepReady == 0)) &&
-                    (phase == 2 || phase == 4 || (phase == 1 && window == 0))
+                    (phase == 2 || phase == 4 ||
+                     (phase == 1 && window == 0 && (fails == 0 || HeldAsked == 1)) ||
+                     (phase == 0 && fails == 1 && HeldRelease == 0))
                 ) { 1 } else { 0 }) +
                 (if (
                     (phase == 2 || phase == 4) && rest == 1 && Buggy == 0 && Terminal == 0 &&
                     (phase == 4 || ready == 0 || live == 0)
+                ) { 1 } else { 0 }) +
+                (if (
+                    fails == 1 && HeldAsked == 0 &&
+                    (phase == 1 || (phase == 2 && ready == 1 && live == 1))
                 ) { 1 } else { 0 }) == 0
             ) {
                 stuck = holding;

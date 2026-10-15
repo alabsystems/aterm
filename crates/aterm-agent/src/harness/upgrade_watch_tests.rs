@@ -26,6 +26,7 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     };
     (dir, opts)
 }

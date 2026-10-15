@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! MEASURING whether Spotlight indexes a directory (§9, storage hygiene): the probe
-//! behind `aterm pkg noindex verify <dir>`, `aterm pkg devroot verify` and the
-//! `spotlight` rows of both doctors ([`crate::devroot`]).
+//! behind `aterm pkg noindex verify <dir>`, run on demand and never by a look of its own.
 //!
-//! Nothing here renames, links or excludes anything. Where code lives is decided by the
-//! developer root ([`crate::devroot`]): `~/Developer`, which the owner adds to the one
-//! exclusion Apple documents — the Search Privacy list in System Settings ▸ Spotlight,
-//! which "keeps listed items from being indexed at all" and which only the owner can
-//! change. This module is how aterm knows whether that gesture took, instead of assuming
-//! it did.
+//! Nothing here renames, links or excludes anything, and nothing asks anyone to move a
+//! folder: it answers one question about one directory, when asked.
 //!
 //! # What the index does, measured
 //!

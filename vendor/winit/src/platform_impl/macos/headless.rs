@@ -7,7 +7,7 @@
 // WHY. The AppKit loop is built on `+[NSApplication sharedApplication]`, and
 // `-[NSApplication init]` opens the process's WindowServer connection, which
 // makes WindowServer run a synchronous TCC preflight of the binary on its main
-// thread (aterm's AGENTS.md rule 5: from a binary in a huge directory that
+// thread (aterm's AGENTS.md: from a binary in a huge directory that
 // preflight outran WindowServer's watchdog). A process with no window has no
 // reason to be a WindowServer client, so this loop never creates the
 // application object.

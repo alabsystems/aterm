@@ -619,10 +619,11 @@ impl Grid {
         self.storage.extras_mut().stack_image(coord, image);
     }
 
-    /// Get or create extras for a cell whose HAS_EXTRAS flag is already set.
+    /// A fresh extras entry for a cell just written with its HAS_EXTRAS flag
+    /// already set in its PackedColors: the write path's handout, which never
+    /// adopts an entry already keyed to the cell (`CellExtras::fresh`).
     ///
     /// Skips the ring-buffer lookup that `cell_extra_mut` does to set the flag.
-    /// The caller MUST have pre-set the HAS_EXTRAS bit in the cell's PackedColors.
     #[inline]
     pub fn cell_extra_mut_preflagged(&mut self, row: u16, col: u16) -> &mut CellExtra {
         self.storage.cell_extra_mut_preflagged(row, col)
@@ -746,6 +747,39 @@ impl Grid {
     #[inline]
     pub fn has_horizontal_margins(&self) -> bool {
         self.storage.has_horizontal_margins
+    }
+
+    /// Whether a run printed from the cursor must go glyph by glyph: DECSLRM
+    /// margins narrower than the row are set and the cursor is outside their
+    /// span.
+    ///
+    /// The run writers (`write_ascii_blast`, `write_ascii_run_styled_packed`,
+    /// `write_ascii_run_with_extras`, `write_cell_run`) derive a row's
+    /// right-margin clamp once, from the column the row's batch starts at, and
+    /// apply it only when that column is inside the span. The per-glyph writer
+    /// re-derives it at every column (`advance_cursor_wrap_slow`), as xterm's
+    /// `dotext` does: a run from left of the left margin wraps at the right
+    /// margin as soon as it enters the span, and a run that wraps from right of
+    /// the span lands on column 0, left of it again. A run that starts inside the
+    /// span keeps one clamp throughout, since its wraps return to the left
+    /// margin, so only these starts are routed to the per-glyph writer.
+    ///
+    /// Ruling 2026-10-10 (r15 C1): route the rare case (DECSLRM is set by
+    /// vttest-style streams; aterm advertises no margins capability) to the
+    /// per-glyph path, as the wide-run batchers already are under margins, rather
+    /// than add a fourth copy of the clamp to the run writers. A pending wrap
+    /// sits at the clamp it was armed against: inside the span it resolves to
+    /// the left margin, outside it to column 0, so the cursor column decides
+    /// both cases.
+    #[must_use]
+    #[inline]
+    pub fn cursor_outside_margin_span(&self) -> bool {
+        if !self.storage.has_horizontal_margins {
+            return false;
+        }
+        let margins = self.storage.horizontal_margins();
+        let col = self.storage.cursor.col;
+        col < margins.left || col > margins.right
     }
 
     /// Set horizontal margins (DECSLRM, VT420+).

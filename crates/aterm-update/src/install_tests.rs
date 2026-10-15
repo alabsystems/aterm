@@ -2968,7 +2968,7 @@ fn a_supersede_waits_while_another_windows_candidate_of_the_activation_runs() {
         &refused,
         Err(crate::SupersedeRefusal::ForNow(why)) if why.contains(&sibling.id().to_string())
     );
-    // A stand-in that must die dies by SIGKILL (AGENTS.md rule 6).
+    // A stand-in that must die dies by SIGKILL (AGENTS.md).
     sibling.kill().unwrap();
     sibling.wait().unwrap();
     assert!(

@@ -38,6 +38,10 @@ fn corpus() -> Vec<String> {
         "cjk 日本語テキスト end".to_owned(),
         // Non-BMP emoji (complex cells), plus a ZWJ family and a skin tone.
         "emoji 🎉 👨‍👩‍👧 👍🏽".to_owned(),
+        // Printable ASCII after a cell ending in a ZWJ opens a cell of its own
+        // (the ASCII bulk path never folds), and the round trip must not join
+        // it (ruling 2026-10-11, r15 search-columns review).
+        "zwj then ascii \u{2764}\u{FE0F}\u{200D}Qa".to_owned(),
         // Presentation selectors: VS16 widens, VS15 narrows.
         "vs ❤\u{FE0F} ⌚\u{FE0E} done".to_owned(),
         // A regional-indicator flag pair (folds into one cell).

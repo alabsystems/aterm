@@ -16,6 +16,7 @@ use aterm_scrollback::Line;
 
 use super::Grid;
 use super::ScrolledRowExtras;
+use super::scroll_materialize::filled_span_cols;
 use crate::Row;
 use crate::StyleTable;
 use crate::{CellCoord, CellExtras};
@@ -32,6 +33,11 @@ use crate::{CellCoord, CellExtras};
 /// `DIRTY`: the state [`Row::clear`] leaves), as its one caller,
 /// `Grid::build_scrollback_row`, allocates it: a second clear of every cell
 /// per rebuilt history row would be pure overhead on each width change.
+///
+/// Links and underline colours come back only on the cells the fill put a
+/// glyph back in ([`filled_span_cols`]): one column cannot hold a wide glyph,
+/// so its rewrapped line rebuilds as an empty row, and the glyph's link must
+/// not outlive it on the empty cell.
 pub(crate) fn fill_row_into(
     row: &mut Row,
     line: &Line,
@@ -44,7 +50,7 @@ pub(crate) fn fill_row_into(
         row.set_wrapped(line.is_wrapped());
         return extras;
     };
-    let deferred = fill_row_cells(row, text, line, cols);
+    let (deferred, filled) = fill_row_cells(row, text, line, cols);
     row.set_wrapped(line.is_wrapped());
     for d in deferred {
         match d {
@@ -60,11 +66,15 @@ pub(crate) fn fill_row_into(
     }
     if let Some(spans) = line.hyperlinks() {
         for span in spans {
+            let held = filled_span_cols(span.start_col, span.end_col, filled);
+            if held.is_empty() {
+                continue;
+            }
             extras
                 .hyperlinks
                 .push(aterm_scrollback::HyperlinkSpan::with_id(
-                    span.start_col,
-                    span.end_col.min(cols),
+                    held.start,
+                    held.end,
                     span.url.clone(),
                     span.id.clone(),
                 ));
@@ -73,7 +83,8 @@ pub(crate) fn fill_row_into(
     // Inline images stay in span form (`ScrolledRowExtras` keeps them
     // coalesced): clipping the end column to the new width is the whole
     // conversion, matching a live footprint at a narrower window, whose tail
-    // tiles clip at the right margin.
+    // tiles clip at the right margin. An image covers blank cells by design,
+    // so the glyph rule of `filled_span_cols` is not its.
     if let Some(spans) = line.images() {
         for span in spans {
             if span.start_col >= cols {
@@ -91,7 +102,7 @@ pub(crate) fn fill_row_into(
     if let Some(spans) = line.underline_colors() {
         let mut budget = cols;
         'ul: for span in spans {
-            for ucol in span.start_col..span.end_col.min(cols) {
+            for ucol in filled_span_cols(span.start_col, span.end_col, filled) {
                 if budget == 0 {
                     break 'ul;
                 }
@@ -121,8 +132,9 @@ impl Grid {
             return;
         };
 
-        // Phase 1: populate row cells, collect deferred extras.
-        let deferred = {
+        // Phase 1: populate row cells, collect deferred extras and how far
+        // the line's cells reach (the bound on every span restored below).
+        let (deferred, filled) = {
             let Some(row) = self.row_mut(row_idx) else {
                 return;
             };
@@ -169,7 +181,7 @@ impl Grid {
             let mut any_hyperlink = false;
             let mut budget = cols;
             'fill: for span in spans {
-                for hcol in span.start_col..span.end_col.min(cols) {
+                for hcol in filled_span_cols(span.start_col, span.end_col, filled) {
                     if budget == 0 {
                         break 'fill;
                     }
@@ -191,7 +203,7 @@ impl Grid {
                 {
                     let mut budget = cols;
                     'flag: for span in spans {
-                        for hcol in span.start_col..span.end_col.min(cols) {
+                        for hcol in filled_span_cols(span.start_col, span.end_col, filled) {
                             if budget == 0 {
                                 break 'flag;
                             }
@@ -217,7 +229,7 @@ impl Grid {
             let mut any_ul = false;
             let mut budget = cols;
             'ul_fill: for span in spans {
-                for ucol in span.start_col..span.end_col.min(cols) {
+                for ucol in filled_span_cols(span.start_col, span.end_col, filled) {
                     if budget == 0 {
                         break 'ul_fill;
                     }
@@ -235,7 +247,7 @@ impl Grid {
             {
                 let mut budget = cols;
                 'ul_flag: for span in spans {
-                    for ucol in span.start_col..span.end_col.min(cols) {
+                    for ucol in filled_span_cols(span.start_col, span.end_col, filled) {
                         if budget == 0 {
                             break 'ul_flag;
                         }
@@ -380,13 +392,15 @@ enum DeferredExtra {
     RgbBg(u16, [u8; 3]),
 }
 
-/// Phase 1: Populate row cells from scrollback Line text, returning deferred extras.
+/// Phase 1: Populate row cells from scrollback Line text, returning deferred
+/// extras and the column the fill reached: the line's cells are the first
+/// `filled`, and none past them holds anything of it ([`filled_span_cols`]).
 ///
 /// Iterates grapheme units (via [`advance_grapheme_unit`]) and classifies each as:
 /// - Simple BMP → normal cell
 /// - BMP + combining marks → normal cell + deferred combining extras
 /// - Non-BMP / ZWJ → complex cell + deferred complex char extras
-fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<DeferredExtra> {
+fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<DeferredExtra>, u16) {
     use super::scroll_materialize::advance_grapheme_unit_wide;
     use crate::{CellFlags, PackedColor};
 
@@ -467,7 +481,7 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<Defe
     // every row (`DeferredLine::new_boxed`) cuts the last cell, which this
     // line never filled (unless a background-coloured erase blanks it since).
     row.set_early_wrap_hole(usize::from(col) + 1 == row.cells_len());
-    deferred
+    (deferred, col)
 }
 
 /// Bundled style for a cell being placed from a scrollback Line.
@@ -764,6 +778,61 @@ mod tests {
                 url(&grid2, c).as_deref(),
                 Some("first"),
                 "overlapping spans must stop after the budget (cols) is spent at col {c}"
+            );
+        }
+    }
+
+    /// A glyph the row cannot hold takes its link and underline colour with it,
+    /// in both fills (`filled_span_cols`): a wide unit in a one-column row (the
+    /// line a one-column rewrap gives it) and a wide unit at the last column.
+    /// The cells before it keep theirs.
+    #[test]
+    fn a_glyph_the_row_cannot_hold_takes_its_link_and_underline_colour() {
+        use aterm_scrollback::{HyperlinkSpan, UnderlineColorSpan};
+        // (text, row width, the span's end, columns that hold a glyph)
+        for (text, cols, end, held) in [("\u{1F680}", 1u16, 2u16, 0u16), ("a\u{4E2D}", 2, 3, 1)] {
+            let mut line = Line::with_hyperlinks(
+                text,
+                Rle::<CellAttrs>::new(),
+                vec![HyperlinkSpan::new(
+                    0,
+                    end,
+                    Arc::from("https://example.com/"),
+                )],
+            );
+            line.set_underline_colors(vec![UnderlineColorSpan::new(0, end, 0x0100_0001)]);
+
+            let mut grid = Grid::new(1, cols);
+            grid.fill_row_from_line(0, &line, cols);
+            for col in 0..cols {
+                let extra = grid.extras().get(CellCoord::new(0, col));
+                let linked = extra.is_some_and(|e| e.hyperlink().is_some());
+                let coloured = extra.is_some_and(|e| e.underline_color_u32().is_some());
+                let claimed = grid.cell(0, col).is_some_and(crate::Cell::has_extras);
+                let holds = col < held;
+                assert_eq!(
+                    (linked, coloured, claimed),
+                    (holds, holds, holds),
+                    "fill_row_from_line {text:?} at {cols} columns, column {col}"
+                );
+            }
+
+            let mut pages = crate::PageStore::new();
+            // SAFETY: `pages` outlives `row`, both dropped at the end of the loop body.
+            let mut row = unsafe { Row::new(cols, &mut pages) };
+            let extras = fill_row_into(&mut row, &line, cols, grid.styles());
+            let links: Vec<_> = extras
+                .hyperlinks
+                .iter()
+                .map(|s| (s.start_col, s.end_col))
+                .collect();
+            let colours: Vec<u16> = extras.underline_colors.iter().map(|&(c, _)| c).collect();
+            let want_links = if held > 0 { vec![(0, held)] } else { vec![] };
+            assert_eq!(links, want_links, "fill_row_into {text:?} links");
+            assert_eq!(
+                colours,
+                (0..held).collect::<Vec<_>>(),
+                "fill_row_into {text:?} underline colours"
             );
         }
     }

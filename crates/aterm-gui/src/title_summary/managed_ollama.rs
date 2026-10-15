@@ -5,12 +5,14 @@
 //! loopback endpoint and a private managed home, launching and attesting the
 //! child, and terminating the process aterm itself spawned.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use super::max_response_bytes;
 use super::model_store::{AttestedManagedModel, attest_managed_model};
-use super::transport::loopback_socket;
 #[cfg(target_os = "macos")]
-use super::transport::{RequestWriteAuthority, build_client};
+use super::transport::build_client;
+use super::transport::loopback_socket;
+#[cfg(any(target_os = "macos", test))]
+use super::transport::{RequestWriteAuthority, provider_answer};
 use super::{EndpointOrigin, Job, TitleSummaryLocality, cancelled_error, job_is_authorized};
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
@@ -872,8 +874,28 @@ fn warm_managed_model(
     }
     let authority = RequestWriteAuthority::for_job(job, authority_epoch.clone());
     let client = build_client(&job.settings, endpoint, Some(process), authority.clone())?;
+    send_warm_up(&client, endpoint, &job.settings.model, authority)?;
+    if !job_is_authorized(job, authority_epoch) {
+        return Err(cancelled_error());
+    }
+    model_attestation.revalidate()
+}
+
+/// The warm-up's exchange over the attested client [`warm_managed_model`]
+/// built: fixed, non-terminal data that makes the daemon load and pin the
+/// verified weights. Its answer is read by [`provider_answer`], so a refused
+/// warm-up (Ollama's 500 when the model failed to load) is a failure, and the
+/// launch stops the daemon instead of keeping one with nothing pinned
+/// (NET-2, 2026-10-10).
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn send_warm_up(
+    client: &aterm_http::Client,
+    endpoint: &str,
+    model: &str,
+    authority: RequestWriteAuthority,
+) -> Result<(), String> {
     let body = aterm_json::json!({
-        "model": job.settings.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": "Reply with READY."},
             {"role": "user", "content": "health check"}
@@ -893,12 +915,9 @@ fn warm_managed_model(
         .header("Content-Type", "application/json")
         .send(&encoded)
         .map_err(|error| format!("managed model warm-up failed: {error}"))?;
-    let _: aterm_json::Value = aterm_json::from_slice(response.body())
-        .map_err(|error| format!("managed model warm-up returned invalid JSON: {error}"))?;
-    if !job_is_authorized(job, authority_epoch) {
-        return Err(cancelled_error());
-    }
-    model_attestation.revalidate()
+    provider_answer(&response)
+        .map(drop)
+        .map_err(|error| format!("managed model warm-up failed: {error}"))
 }
 
 #[derive(Clone)]

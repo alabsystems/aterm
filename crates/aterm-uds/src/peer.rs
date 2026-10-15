@@ -286,7 +286,7 @@ mod tests {
         (&theirs).write_all(b"y").expect("write on the shared end");
         ours.read_exact(&mut byte).expect("this process's write");
         let after = named(&ours);
-        // `Child::kill` is SIGKILL (AGENTS.md rule 6).
+        // `Child::kill` is SIGKILL (AGENTS.md).
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(

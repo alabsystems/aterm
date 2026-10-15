@@ -329,7 +329,7 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
 /// THE PROBE IS A PARAMETER, and that is the whole safety argument. `--diagnose`
 /// is headless-constructible and runs in test binaries, and the FDA probe opens
 /// a file macOS guards; a report that reached for it on its own would put a
-/// consent-gated syscall on a path no guardrail watches (AGENTS.md rule 5, the
+/// consent-gated syscall on a path no guardrail watches (AGENTS.md, the
 /// 2026-08-17 incident). So [`collect`] passes the INERT arm — `None`, which
 /// renders `probe=none full_disk_access=unknown` — and only a windowed `App`,
 /// which has already decided it is running from inside the bundle, ever passes

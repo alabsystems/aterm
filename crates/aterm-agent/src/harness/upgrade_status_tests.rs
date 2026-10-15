@@ -22,6 +22,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
     }
 }
 
@@ -1470,8 +1471,8 @@ fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
     }
     pin_awake_since(now - 86_400);
     let sessions: BTreeSet<String> = [BACK, FRONT].map(str::to_string).into();
-    let in_window = holders(&o.home, &sessions, Some(&tabs));
-    let by_cli = holders(&o.home, &sessions, None);
+    let in_window = holders(&o, &sessions, Some(&tabs));
+    let by_cli = holders(&o, &sessions, None);
     let (cli, vetted) = status_rows(&o, true);
     let mut view = View::default();
     let mut sent: Vec<Row> = Vec::new();
@@ -1479,7 +1480,7 @@ fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
         &o,
         &tabs,
         now,
-        &|s| holders(&o.home, s, Some(&tabs)),
+        &|s| holders(&o, s, Some(&tabs)),
         &mut |rows| sent = rows.to_vec(),
     );
     // SAFETY: `kill` sends one signal to the pid this test's jobs reported;
@@ -2969,7 +2970,7 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &o,
         &tabs,
         now_s(),
-        &|sessions| holders(&o.home, sessions, Some(&tabs)),
+        &|sessions| holders(&o, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
     let current = (sent.clone(), sets(&asked));
@@ -2979,14 +2980,14 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &o,
         &tabs,
         now_s(),
-        &|sessions| holders(&o.home, sessions, Some(&tabs)),
+        &|sessions| holders(&o, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
     let _ = view.refresh_with(
         &o,
         &tabs,
         now_s(),
-        &|sessions| holders(&o.home, sessions, Some(&tabs)),
+        &|sessions| holders(&o, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
     let behind = (sent.clone(), sets(&asked));
@@ -2997,7 +2998,7 @@ fn a_state_whose_session_is_current_or_gone_shows_nothing() {
         &o,
         &tabs,
         now_s(),
-        &|sessions| holders(&o.home, sessions, Some(&tabs)),
+        &|sessions| holders(&o, sessions, Some(&tabs)),
         &mut |rows| sent.push(rows.to_vec()),
     );
     let gone = (sent.clone(), meta(&asked));
@@ -3173,7 +3174,7 @@ fn an_unreached_row_reads_claudes_live_status_never_over_a_recorded_word() {
             &o,
             &tabs,
             now,
-            &|sessions| holders(&o.home, sessions, Some(&tabs)),
+            &|sessions| holders(&o, sessions, Some(&tabs)),
             &mut |rows| sent.push(rows.to_vec()),
         );
         seen.push((vetted, cli, sent));
@@ -3480,12 +3481,9 @@ fn a_codex_upgrade_is_listed_held_and_hurried_like_claudes() {
     assert_eq!(st.request_tab, TAB);
 }
 
-/// [`holders`] as the window's host reads them, for `home` under `tabs`.
-fn host_holders(
-    home: PathBuf,
-    tabs: Vec<LiveTab>,
-) -> impl Fn(&BTreeSet<String>) -> Option<Vec<Holder>> {
-    move |sessions| holders(&home, sessions, Some(&tabs))
+/// [`holders`] as the window's host reads them, for `o` under `tabs`.
+fn host_holders(o: Opts, tabs: Vec<LiveTab>) -> impl Fn(&BTreeSet<String>) -> Option<Vec<Holder>> {
+    move |sessions| holders(&o, sessions, Some(&tabs))
 }
 
 /// A Codex state for [`TAB`] in `phase`, its TUI seen gone at `exited_at`.
@@ -3520,7 +3518,7 @@ fn a_codex_move_that_failed_after_its_exit_stands_with_no_holder() {
     }];
     // The host's own holder read (the process table, this home's Codex TUIs
     // by the roster): the TUI is gone, so it finds none, as in the window.
-    let real = |o: &Opts| host_holders(o.home.clone(), tabs.to_vec());
+    let real = |o: &Opts| host_holders(o.clone(), tabs.to_vec());
     for why in [
         "no-resume-hint",
         "hint-mismatch",
@@ -8995,4 +8993,57 @@ fn a_finished_moves_row_carries_its_relaunch_instant() {
         ..st
     };
     assert_eq!(Row::of("aaa", &older, now).moved_at, 0);
+}
+
+/// A BUILD THAT FAILS TO START IS TOLD ONCE PER BUILD (`upgrade_drive`'s
+/// `build_start`, handoff §4, round eighteen): a round held off a build
+/// that failed to start and is not proved to start since waits
+/// `build-fails`, which the owner's view reads as ONE fault keyed by the
+/// build — its install and version, never the tab — however many agents it
+/// holds back: a record for the developer, never a row, a mark or a stop.
+/// Its words and its class are its own, never "a wait aterm does not
+/// classify". CONTROL: another build is another fault.
+#[test]
+fn a_build_that_fails_to_start_is_one_fault_per_build() {
+    use crate::harness::upgrade_drive::BUILD_FAILS;
+    let held = |tab: &str, to: &str| Row {
+        tab: tab.to_string(),
+        to: to.to_string(),
+        wait: BUILD_FAILS.to_string(),
+        ..pending(3_600)
+    };
+    let fault = |row: &Row| match row.attention(NOW) {
+        Attention::Fault(need) => need,
+        other => panic!("a fault, not {other:?}"),
+    };
+    let here = fault(&held(TAB, "2.1.999"));
+    let there = fault(&held("s-0th3r0th3r0th3r0th3r", "2.1.999"));
+    assert_eq!(here.kind, "build-fails");
+    assert_eq!(here.fingerprint, there.fingerprint, "one per build");
+    assert_ne!(here.fingerprint, fault(&held(TAB, "2.1.998")).fingerprint);
+    assert!(here.why.contains("2.1.999"), "{}", here.why);
+    let row = held(TAB, "2.1.999");
+    assert_eq!(row.interrupt(NOW), None);
+    assert_eq!(row.cause_word(NOW), "build-fails");
+    assert_eq!(
+        wait_words_of(upgrade::Agent::Claude, BUILD_FAILS),
+        Some("its new build fails to start")
+    );
+    // A round the build's hold STOPPED (`upgrade::build_hold`: it had asked
+    // its agent, released since) is the same fact while it rests: the same
+    // one fault, never a stop of its own to tell or an agent down.
+    let stopped = Row {
+        phase: Phase::Failed(BUILD_FAILS.to_string()),
+        wait: "failed".to_string(),
+        streak_why: BUILD_FAILS.to_string(),
+        stop_streak: 1,
+        ..held("s-0th3r0th3r0th3r0th3r", "2.1.999")
+    };
+    assert_eq!(fault(&stopped).fingerprint, here.fingerprint);
+    assert_eq!(stopped.interrupt(NOW), None);
+    assert!(
+        stop_words(upgrade::Agent::Claude, BUILD_FAILS).contains("fails to start"),
+        "{}",
+        stop_words(upgrade::Agent::Claude, BUILD_FAILS)
+    );
 }

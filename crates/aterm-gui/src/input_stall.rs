@@ -4040,6 +4040,7 @@ pub(crate) mod tests {
             dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
             login: None,
             home: None,
+            claude_dir: None,
         };
         assert!(aterm_agent::harness::relaunch::resumes_on_exit(&snap));
         snap

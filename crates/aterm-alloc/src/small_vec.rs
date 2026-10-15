@@ -140,7 +140,11 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Clear all elements.
-    // Skip: the inline arm drops each initialized slot (ArrayVec::clear's
+    ///
+    /// If an element's destructor panics, every other element is still
+    /// dropped and the vec is left empty, inline or spilled alike (the heap
+    /// arm is std `Vec::clear`).
+    // Skip: the inline arm drops each initialized slot (ArrayVec::truncate's
     // init-tracking class).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
@@ -149,18 +153,14 @@ impl<T, const N: usize> SmallVec<T, N> {
                 // Clamp to a provably in-bounds count (identical when `len <= N`)
                 // so the subslice carries the bound.
                 let n = if *len < N { *len } else { N };
-                // Zero `len` before any destructor runs, as `ArrayVec::clear`
+                // Zero `len` before any destructor runs, as `ArrayVec::truncate`
                 // does: a panicking element `Drop` unwinds into
                 // `Drop for SmallVec`, which calls this again.
                 *len = 0;
-                for slot in &mut buf[..n] {
-                    // SAFETY: elements `0..n` were initialized when pushed and
-                    // `n <= len` as it was on entry, so every slot held a live
-                    // value; `len` is already 0, so each is dropped exactly once.
-                    unsafe {
-                        slot.assume_init_drop();
-                    }
-                }
+                // SAFETY: elements `0..n` were initialized when pushed and
+                // `n <= len` as it was on entry; `len` is already 0, so no
+                // other path reaches them again.
+                unsafe { crate::drop_initialized(&mut buf[..n]) }
             }
             SmallVecData::Heap(vec) => vec.clear(),
         }
@@ -413,7 +413,42 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
 /// heap storage delegates to [`alloc::vec::IntoIter`]. The live range is
 /// `start..end`; `next` advances `start`, `next_back` retreats `end`, and
 /// [`Drop`] disposes of the remainder exactly once.
-pub enum IntoIter<T, const N: usize> {
+///
+/// The representation is private, as upstream `smallvec`'s is. `next`,
+/// `next_back` and `Drop` read `buf[start..end]` as initialized, so safe code
+/// that could name the fields could forge an iterator over an uninitialized
+/// buffer or rewind the cursor and move one element out twice. A `pub enum`'s
+/// variant fields are as public as the enum, which is how this type used to
+/// leak that invariant (ruling 2026-10-10: opaque struct, private enum; the
+/// public API is unchanged, since no caller named a variant). Neither form
+/// compiles:
+///
+/// ```compile_fail,E0223
+/// use aterm_alloc::{IntoIter, SmallVec};
+/// let mut sv: SmallVec<String, 4> = SmallVec::new();
+/// sv.push(String::from("moved out twice if the cursor rewinds"));
+/// let mut it = sv.into_iter();
+/// let first = it.next();
+/// if let IntoIter::Inline { start, .. } = &mut it {
+///     *start = 0;
+/// }
+/// ```
+///
+/// ```compile_fail,E0223
+/// use aterm_alloc::IntoIter;
+/// use core::mem::MaybeUninit;
+/// let mut forged: IntoIter<Box<u64>, 2> = IntoIter::Inline {
+///     buf: [const { MaybeUninit::uninit() }; 2],
+///     start: 0,
+///     end: 2,
+/// };
+/// let uninit_box = forged.next();
+/// ```
+pub struct IntoIter<T, const N: usize> {
+    repr: IntoIterRepr<T, N>,
+}
+
+enum IntoIterRepr<T, const N: usize> {
     /// Inline elements drained directly from the moved-out buffer.
     Inline {
         buf: [MaybeUninit<T>; N],
@@ -424,6 +459,15 @@ pub enum IntoIter<T, const N: usize> {
     Heap(alloc::vec::IntoIter<T>),
 }
 
+impl<T, const N: usize> IntoIter<T, N> {
+    /// Whether the iterator drains an inline buffer (so consuming an inline
+    /// `SmallVec` did not allocate).
+    #[cfg(test)]
+    fn is_inline(&self) -> bool {
+        matches!(self.repr, IntoIterRepr::Inline { .. })
+    }
+}
+
 impl<T, const N: usize> Iterator for IntoIter<T, N> {
     type Item = T;
 
@@ -431,8 +475,8 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
     // class (per-slot memory-model producer lane). Same audited len-invariant.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next(&mut self) -> Option<T> {
-        match self {
-            IntoIter::Inline { buf, start, end } => {
+        match &mut self.repr {
+            IntoIterRepr::Inline { buf, start, end } => {
                 // Clamp to a provably in-bounds bound (`*end <= N` by
                 // construction) so the indexed read carries a `< N` proof.
                 let bound = if *end < N { *end } else { N };
@@ -448,7 +492,7 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
                     None
                 }
             }
-            IntoIter::Heap(iter) => iter.next(),
+            IntoIterRepr::Heap(iter) => iter.next(),
         }
     }
 
@@ -456,12 +500,12 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
     // class as its `next` (per-slot memory-model producer lane).
     #[cfg_attr(trust_verify, trust::skip)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            IntoIter::Inline { start, end, .. } => {
+        match &self.repr {
+            IntoIterRepr::Inline { start, end, .. } => {
                 let len = end.saturating_sub(*start);
                 (len, Some(len))
             }
-            IntoIter::Heap(iter) => iter.size_hint(),
+            IntoIterRepr::Heap(iter) => iter.size_hint(),
         }
     }
 }
@@ -471,8 +515,8 @@ impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
     // init/provenance class as `next`/`size_hint`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next_back(&mut self) -> Option<T> {
-        match self {
-            IntoIter::Inline { buf, start, end } => {
+        match &mut self.repr {
+            IntoIterRepr::Inline { buf, start, end } => {
                 // Clamp to a provably in-bounds bound so the indexed read
                 // carries a `< N` proof.
                 let bound = if *end < N { *end } else { N };
@@ -489,7 +533,7 @@ impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
                     None
                 }
             }
-            IntoIter::Heap(iter) => iter.next_back(),
+            IntoIterRepr::Heap(iter) => iter.next_back(),
         }
     }
 }
@@ -503,22 +547,18 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
     // `next`/`next_back`); start..end bounds the live range.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
-        if let IntoIter::Inline { buf, start, end } = self {
+        if let IntoIterRepr::Inline { buf, start, end } = &mut self.repr {
             // Clamp both bounds (`*start <= *end <= N` by construction) so the
             // subslice carries the proof.
             let bound = if *end < N { *end } else { N };
             let s = if *start < bound { *start } else { bound };
-            // Drop each not-yet-yielded element once, advancing `start` before
-            // dropping, so a panicking Drop cannot cause a double drop.
-            for slot in &mut buf[s..bound] {
-                *start = start.saturating_add(1);
-                // SAFETY: the element was initialized and has not been
-                // yielded, and `start` has advanced past it, so it can never
-                // be read or dropped again.
-                unsafe {
-                    slot.assume_init_drop();
-                }
-            }
+            // SAFETY: the elements `s..bound` were initialized and have not
+            // been yielded, and this `Drop` runs once, so nothing reads or
+            // drops them again. A panicking destructor still lets the rest
+            // drop, as the heap arm's `vec::IntoIter` does (ruling
+            // 2026-10-10: upstream smallvec's `for _ in self {}` leaks the
+            // rest; whether the vec had spilled must not change that).
+            unsafe { crate::drop_initialized(&mut buf[s..bound]) }
         }
         // Heap variant: `alloc::vec::IntoIter` drops its own remaining elements.
     }
@@ -541,15 +581,16 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
                 len: 0,
             },
         );
-        match data {
+        let repr = match data {
             SmallVecData::Inline { buf, len } => {
                 // Clamp to a provably in-bounds end so the range the
                 // iterator/Drop walks carries a `<= N` proof.
                 let end = if len < N { len } else { N };
-                IntoIter::Inline { buf, start: 0, end }
+                IntoIterRepr::Inline { buf, start: 0, end }
             }
-            SmallVecData::Heap(vec) => IntoIter::Heap(vec.into_iter()),
-        }
+            SmallVecData::Heap(vec) => IntoIterRepr::Heap(vec.into_iter()),
+        };
+        IntoIter { repr }
     }
 }
 
@@ -762,7 +803,7 @@ mod tests {
         sv.push(30);
         assert!(sv.is_inline());
         let it = sv.into_iter();
-        assert!(matches!(it, IntoIter::Inline { .. }));
+        assert!(it.is_inline());
         let collected: Vec<i32> = it.collect();
         assert_eq!(collected, vec![10, 20, 30]);
     }
@@ -775,7 +816,7 @@ mod tests {
         sv.push(3);
         assert!(!sv.is_inline());
         let it = sv.into_iter();
-        assert!(matches!(it, IntoIter::Heap(_)));
+        assert!(!it.is_inline());
         let collected: Vec<i32> = it.collect();
         assert_eq!(collected, vec![1, 2, 3]);
     }
@@ -918,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_into_iter_inline_panic_in_element_drop_no_double_drop() {
+    fn test_into_iter_inline_panic_in_element_drop_drops_each_once() {
         use std::panic;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -947,8 +988,8 @@ mod tests {
         }));
 
         assert!(result.is_err(), "panicking element drop must unwind");
-        // Elements 0, 1, 2 were dropped before the panic; 3 and 4 leak
-        // (memory-safe) and nothing is dropped twice.
-        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 3);
+        // All five are dropped exactly once: the panic at element 2 neither
+        // stops the drop of 3 and 4 (a leak) nor repeats one (a double drop).
+        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 5);
     }
 }

@@ -47,7 +47,11 @@
 //! `drive::Lay` lays out with): the layout and the writer must agree, or
 //! a right-aligned capsule would be hit one cell off where it is drawn. Every
 //! reporter's words are ASCII plus a few BMP glyphs; a wide-aware writer and
-//! measure move together when one arrives.
+//! measure move together when one arrives — as they did for the presence
+//! row, whose free text (a role in any script) is laid out and painted in the
+//! grid's cells (`aterm_grapheme::str_grid_columns`, injected as
+//! `presence::Host::columns`; a wide glyph is its lead cell and a
+//! continuation, ruling 2026-10-11).
 //!
 //! # Row grammar (§2.2)
 //!
@@ -263,7 +267,7 @@ pub(crate) fn paint_presence_row(
 ) -> Vec<RenderCell> {
     let c = chrome_band::band_colors(theme);
     let p = chrome_band::presence_inks(theme);
-    let cells = aterm_messages::presence::paint_row(words, cols, &c, &p);
+    let cells = aterm_messages::presence::paint_row::<crate::presence::Native>(words, cols, &c, &p);
     let (mut rows, _, _) = aterm_render::band::rows(vec![aterm_messages::ink::Resolved {
         cells,
         metered: false,

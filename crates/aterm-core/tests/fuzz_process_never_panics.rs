@@ -49,6 +49,18 @@ fn check_invariants(term: &Terminal) {
     term.grid().assert_wide_char_consistent();
 }
 
+/// Every extras-map entry on screen is claimed by its cell's HAS_EXTRAS bit
+/// (`Grid::assert_extras_claimed`): an operation that blanks or replaces a cell
+/// drops what the cell carried, or a later write adopts an old combining mark,
+/// skin tone or link. Run by the three process fuzzers and the two
+/// oscillating-resize fuzzers after every step; the resize ones gained it once
+/// a bottom line feed after a rows-only grow scrolled every row again
+/// (R15-CHUNK-RING-SCROLL, 4cb72d84b), the defect it had reported there as
+/// unclaimed entries.
+fn check_extras_claimed(term: &Terminal) {
+    term.grid().assert_extras_claimed();
+}
+
 /// Every cell must be accessible without panic (corruption would index-panic).
 fn walk_all_cells(term: &Terminal) {
     // `Grid::cell(r, c)` is `row(r)` then `get(c)`; resolving the row once
@@ -81,6 +93,7 @@ fn process_arbitrary_bytes_never_panics() {
         }
         term.process(&buf);
         check_invariants(&term);
+        check_extras_claimed(&term);
     }
     walk_all_cells(&term);
 }
@@ -105,12 +118,14 @@ fn process_crafted_escape_sequences_never_panics() {
         }
         term.process(&buf);
         check_invariants(&term);
+        check_extras_claimed(&term);
         // Occasionally resize to exercise reflow against pathological state.
         if next(&mut s).is_multiple_of(64) {
             let r = (1 + next(&mut s) % 60) as u16;
             let c = (1 + next(&mut s) % 160) as u16;
             term.resize(r, c);
             check_invariants(&term);
+            check_extras_claimed(&term);
         }
     }
     walk_all_cells(&term);
@@ -156,6 +171,7 @@ fn process_unicode_edges_never_panics() {
         }
         term.process(&buf);
         check_invariants(&term);
+        check_extras_claimed(&term);
     }
     walk_all_cells(&term);
 }
@@ -298,12 +314,82 @@ fn next_dim_pair(s: &mut u64) -> (u16, u16) {
     }
 }
 
+/// The visible rows' text, top to bottom.
+fn screen_text(term: &Terminal) -> Vec<String> {
+    (0..usize::from(term.rows()))
+        .map(|r| term.row_text(r).unwrap_or_default())
+        .collect()
+}
+
+/// Feed `buf` as `process` would, checking every line feed that lands on the
+/// bottom row of a full-screen scroll region at the live bottom: it scrolls
+/// every visible row up by exactly one and leaves a blank bottom row. The
+/// resize fuzzers' screen-text invariant.
+///
+/// The split is at line feeds only, which these fuzzers never emit inside an
+/// escape sequence or between a base and its combining mark, so the engine
+/// sees the bytes it would see in one `process`.
+///
+/// Why (R15-CHUNK-RING-SCROLL, 2026-10-11): a rows-only grow revealing history
+/// left a wrapped ring below a lifted cap, and the next scroll's ring append
+/// landed mid-ring, so the rows past it stayed put (or the screen did not move
+/// at all and each line overwrote the bottom row) while the extras map
+/// scrolled whole. The chunking lane's `check_extras_claimed` saw that only
+/// where a stranded combining mark landed on a cell that no longer claimed it;
+/// this reads the cells themselves, with or without extras. The two are
+/// complementary: that one checks the extras map against the cells after any
+/// step, this one checks one operation's effect on the cells.
+fn process_checking_bottom_line_feeds(term: &mut Terminal, buf: &[u8]) {
+    let mut rest = buf;
+    while let Some(lf) = rest.iter().position(|&b| b == b'\n') {
+        if lf > 0 {
+            term.process(&rest[..lf]);
+        }
+        rest = &rest[lf + 1..];
+        let rows = term.rows();
+        let region = term.grid().scroll_region();
+        let bottom_of_full_screen = term.cursor().row + 1 == rows
+            && region.top == 0
+            && region.bottom + 1 == rows
+            && !term.grid().has_horizontal_margins()
+            && term.grid().display_offset() == 0;
+        if !bottom_of_full_screen {
+            term.process(b"\n");
+            continue;
+        }
+        let before = screen_text(term);
+        term.process(b"\n");
+        let after = screen_text(term);
+        let n = before.len();
+        if let Some(r) = (0..n - 1).find(|&r| after[r] != before[r + 1]) {
+            panic!(
+                "a line feed at the bottom of the {rows}x{} screen left row {r} = {:?}, \
+                 want the row below it, {:?}",
+                term.cols(),
+                after[r],
+                before[r + 1]
+            );
+        }
+        assert!(
+            after[n - 1].trim().is_empty(),
+            "a line feed at the bottom of the {rows}x{} screen left a non-blank bottom row {:?}",
+            term.cols(),
+            after[n - 1]
+        );
+    }
+    if !rest.is_empty() {
+        term.process(rest);
+    }
+}
+
 #[test]
 fn reflow_wide_char_resize_never_panics() {
     // The gap the other fuzzers leave: WIDE graphemes driven through aggressive
     // resize/reflow oscillation. A wide char straddling a shrunk column boundary
     // is the classic reflow corruption surface; this asserts panic-freedom and
-    // the wide-continuation pairing and line-reconstruction across every resize.
+    // the wide-continuation pairing and line-reconstruction across every resize,
+    // and that every line feed at the bottom scrolls the whole screen
+    // (`process_checking_bottom_line_feeds`).
     let mut s = 0x5EED_1234_ABCD_9001u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -314,13 +400,15 @@ fn reflow_wide_char_resize_never_panics() {
         for _ in 0..chunks {
             emit_reflow_content(&mut s, &mut buf);
         }
-        term.process(&buf);
+        process_checking_bottom_line_feeds(&mut term, &buf);
         walk_visible_cells_strict(&term);
+        check_extras_claimed(&term);
         // Resize ~1/3 of iterations to drive reflow against wide-char state.
         if next(&mut s).is_multiple_of(3) {
             let (r, c) = next_dim_pair(&mut s);
             term.resize(r, c);
             walk_visible_cells_strict(&term);
+            check_extras_claimed(&term);
             probe_lines(&term);
         }
     }
@@ -347,13 +435,48 @@ fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
     term.grid().assert_wide_char_consistent();
 }
 
+/// The alternate screen resizes without rewrap, so a width cut through a wide
+/// pair blanks its head (`Row::resize`). The head's extras go with it: a
+/// linked emoji cut that way leaves no link, mark or cluster on the blank for
+/// `hyperlink_at` (a click target), checkpoint serialization or a later
+/// extras-styled write to read. Replayed from the alternate-screen resize
+/// fuzzer's first `ExtrasClaimed` violation (2026-10-11).
+#[test]
+fn an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras() {
+    for glyph in ["\u{1F680}", "\u{4E2D}\u{301}"] {
+        let mut term = Terminal::new(2, 4);
+        term.process(
+            format!("\x1b[?1049h\x1b]8;;https://example.com/\x1b\\{glyph}\x1b]8;;\x1b\\")
+                .as_bytes(),
+        );
+        assert!(
+            term.hyperlink_at(0, 0).is_some(),
+            "{glyph:?}: linked before"
+        );
+        term.resize(2, 3);
+        term.resize(2, 1);
+        assert!(
+            term.grid().cell(0, 0).is_some_and(|c| !c.has_extras()),
+            "{glyph:?}: the cut blanks the head"
+        );
+        assert_eq!(
+            term.hyperlink_at(0, 0),
+            None,
+            "{glyph:?}: the blank still links the cut glyph's target"
+        );
+        check_extras_claimed(&term);
+    }
+}
+
 #[test]
 fn alt_screen_resize_never_panics() {
     // Resizing while in the alternate screen (vim / htop / less) is a real,
     // common scenario with a distinct buffer + resize path the other fuzzers
     // never enter. Toggle DEC 1049 (alt screen + cursor save/restore) around
     // wide-char content and aggressive resizes; assert panic-freedom + the
-    // structural invariants (via check_invariants) throughout the switches.
+    // structural invariants (via check_invariants) throughout the switches, and
+    // that every line feed at the bottom scrolls the whole screen
+    // (`process_checking_bottom_line_feeds`).
     let mut s = 0xA17E_5C9E_2026_0601u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -373,12 +496,14 @@ fn alt_screen_resize_never_panics() {
         for _ in 0..chunks {
             emit_reflow_content(&mut s, &mut buf);
         }
-        term.process(&buf);
+        process_checking_bottom_line_feeds(&mut term, &buf);
         check_invariants(&term);
+        check_extras_claimed(&term);
         if next(&mut s).is_multiple_of(3) {
             let (r, c) = next_dim_pair(&mut s);
             term.resize(r, c);
             check_invariants(&term);
+            check_extras_claimed(&term);
             probe_lines(&term);
         }
     }

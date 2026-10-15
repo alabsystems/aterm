@@ -73,16 +73,12 @@ impl Grid {
             return Vec::new();
         }
         // Linearize so logical order == Vec order.
-        let ring_head = self.storage.ring_head;
-        if ring_head != 0 {
-            self.storage.rows.rotate_left(ring_head);
-            self.storage.ring_head = 0;
-        }
+        self.storage.linearize_ring();
         let mut lines = Vec::with_capacity(ring_scrollback);
         // Borrow the stored extras instead of cloning them (`ring_extras` and
         // `rows` are disjoint fields), avoiding several allocations per ring row
         // under the `term` lock. One empty default covers the `None` rows, as in
-        // `try_get_history_line`. Declared after the `rotate_left` above so the
+        // `try_get_history_line`. Declared after the `linearize_ring` above so the
         // shared borrows never overlap the `&mut`.
         let no_extras = super::ScrolledRowExtras::default();
         for i in 0..ring_scrollback {
@@ -105,22 +101,47 @@ impl Grid {
     /// (oldest) of the scrollback, ahead of any overflow the visible-grid
     /// reflow produced.
     ///
-    /// Lines go straight into tiered scrollback when attached (`push_line`
-    /// honors its line limit), otherwise they become ring-buffer scrollback
-    /// rows up to `max_scrollback` (older lines beyond the cap are evicted).
-    pub(super) fn restore_reflowed_scrollback(&mut self, mut lines: Vec<Line>, new_cols: u16) {
-        if lines.is_empty() && self.storage.scrollback.is_some() {
-            return;
-        }
-        if let Some(scrollback) = self.storage.scrollback.as_mut() {
+    /// Lines go straight into tiered scrollback when a store that retains lines
+    /// is attached (`push_line` honors its line limit), otherwise they become
+    /// ring-buffer scrollback rows up to `max_scrollback` (older lines beyond
+    /// the cap are evicted).
+    ///
+    /// A store whose share of the total is zero takes the ring route
+    /// (`GridStorage::store_retains_lines`), ruling 2026-10-11: such a grid is
+    /// a ring-only grid of cap = total, so the newest `max_scrollback` lines of
+    /// [old history | the reflow's overflow] become ring rows and the rest go.
+    /// Routed to the store, every line was dropped (a width change wiped the
+    /// history the total allows); and with no old history the early return
+    /// left the overflow staged, where it outlived the ring rows later scrolls
+    /// evicted (a hole in the middle of history, a stale newest line under a
+    /// total of 0). Deciding here, by the invariant that history is a
+    /// contiguous suffix of what was written, rather than in
+    /// `finalize_reflow`: the overflow is the NEWEST history, so dropping it
+    /// there would lose the very lines the cap keeps.
+    ///
+    /// `staged_before` is the lazy buffer's length before the visible reflow
+    /// staged its overflow: everything past it is this resize's own overflow,
+    /// anything before it is older output a detach window staged.
+    pub(super) fn restore_reflowed_scrollback(
+        &mut self,
+        mut lines: Vec<Line>,
+        new_cols: u16,
+        staged_before: usize,
+    ) {
+        if self.storage.store_retains_lines() {
+            if lines.is_empty() {
+                return;
+            }
             // Tiered storage was cleared by take_scrollback_lines and the lazy
             // buffer holds only the visible reflow's overflow, so pushing the
             // older rewrapped history directly, then draining, keeps
             // [old scrollback | reflow overflow] order without staging each
             // Line.
-            for line in lines {
-                if let Err(error) = scrollback.push_line(line) {
-                    aterm_log::warn!("scrollback push_line during reflow failed: {error}");
+            if let Some(scrollback) = self.storage.scrollback.as_mut() {
+                for line in lines {
+                    if let Err(error) = scrollback.push_line(line) {
+                        aterm_log::warn!("scrollback push_line during reflow failed: {error}");
+                    }
                 }
             }
             if self.storage.lazy_buffer.is_empty() {
@@ -131,15 +152,23 @@ impl Grid {
                 self.drain_lazy_buffer();
             }
         } else {
-            // Ring-only grid: the visible reflow's overflow was staged into the
-            // lazy buffer, where with no tiered store the next
-            // `drain_lazy_buffer` would discard it, and readers would meanwhile
-            // see it in the wrong order (it is newer than `lines`). Absorb it
-            // here as the newest tail of the restored history. A detached window
-            // keeps its staged output for re-attach instead.
-            if !self.storage.scrollback_detached_for_reflow && !self.storage.lazy_buffer.is_empty()
-            {
-                lines.extend(self.storage.lazy_buffer.drain_all());
+            // Ring-only grid, a store that keeps nothing, or a detach window:
+            // the visible reflow's overflow was staged into the lazy buffer,
+            // where with no store to keep it the next `drain_lazy_buffer`
+            // would discard it, and readers would meanwhile see it in the
+            // wrong order (it is newer than `lines`). Absorb it here as the
+            // newest tail of the restored history.
+            //
+            // Only this resize's own overflow, and inside a detach window too
+            // (ruling 2026-10-11): the window's older staged output stays
+            // staged ahead of both, for re-attach to flush, and the ring rows
+            // the prepend below cannot hold are staged behind it, so the
+            // history reads [staged | `lines` | overflow]. Left staged, the
+            // overflow read ahead of the `lines` the ring re-took, and a drag
+            // step landing in the window reordered history for good.
+            let overflow = self.storage.lazy_buffer.len().saturating_sub(staged_before);
+            if overflow > 0 {
+                lines.extend(self.storage.lazy_buffer.drain_back(overflow));
             }
             if !lines.is_empty() {
                 self.prepend_ring_scrollback_lines(lines, new_cols);
@@ -162,8 +191,11 @@ impl Grid {
         // overflow cannot spill to it; stage it to the lazy buffer (flushed on
         // re-attach) instead of dropping it. These lines are newer than existing
         // lazy content, so push at the back; the still newer `kept` lines below
-        // become ring scrollback.
-        if skip > 0 && self.storage.scrollback_detached_for_reflow {
+        // become ring scrollback. Staged only where a store will keep them
+        // (`stages_evicted_rows`): a replacement store whose share is zero
+        // keeps nothing, and a line staged for it would outlive the newer ring
+        // rows that later scrolls drop.
+        if skip > 0 && self.storage.stages_evicted_rows() {
             for line in &lines[..skip] {
                 let (row, extras) = self.build_scrollback_row(line, new_cols);
                 self.storage.lazy_buffer.push_row(&row, extras);
@@ -178,11 +210,7 @@ impl Grid {
         }
 
         // Linearize so we can splice scrollback rows at the front (index 0).
-        let ring_head = self.storage.ring_head;
-        if ring_head != 0 {
-            self.storage.rows.rotate_left(ring_head);
-            self.storage.ring_head = 0;
-        }
+        self.storage.linearize_ring();
 
         // Build the scrollback rows at the new width, capturing extras keyed by
         // their ring-scrollback index for ring_extras (front = oldest).
@@ -316,6 +344,41 @@ pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line
         }
         emit_logical_line(run, new_cols, &mut units, &mut out);
     }
+    out
+}
+
+/// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`,
+/// rewrapping only the newest logical lines that fill them.
+///
+/// The rewrap goes logical line by logical line, so a suffix of `lines` that
+/// opens on a logical line's head rewraps to exactly the tail of the whole
+/// rewrap. Walking back from the newest, each logical line is rewrapped until
+/// `rows` rows are in hand; older lines are never rewrapped. For a seat that
+/// holds `rows` and drops the rest (the ring's room, when the re-attached
+/// store keeps nothing: `Grid::reattach_ring_history`).
+// COST: O(rows × new_cols + one logical line): every logical line rewrapped
+// but the oldest one visited yields only kept rows, at most `new_cols` cells
+// each.
+#[must_use]
+pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> Vec<Line> {
+    let mut runs: Vec<Vec<Line>> = Vec::new();
+    let mut produced = 0;
+    let mut end = lines.len();
+    while end > 0 && produced < rows {
+        // The logical line ending at `end` opens at the nearest line that is
+        // not a soft-wrap continuation (an orphaned continuation at the very
+        // front opens one too, as in `reflow_scrollback_lines`).
+        let head = lines[..end]
+            .iter()
+            .rposition(|line| !line.is_wrapped())
+            .unwrap_or(0);
+        let run = reflow_scrollback_lines(&lines[head..end], new_cols);
+        produced += run.len();
+        runs.push(run);
+        end = head;
+    }
+    let mut out: Vec<Line> = runs.into_iter().rev().flatten().collect();
+    out.drain(..out.len().saturating_sub(rows));
     out
 }
 
@@ -510,11 +573,14 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
         }
         let unit_byte_start = byte_idx;
         let unit_char_start = char_idx;
-        // Effective width, replaying the live VS16/VS15 transitions (see
-        // `advance_grapheme_unit_wide`) so reflowed rows keep the live columns
-        // (`❤️` two, `⌚︎` one). No row-edge demotion: reflow runs only on a real
-        // width change, where an edge-pinned VS16 unit regains its 2-cell
-        // presentation at its new position, as a live rewrite would.
+        // Effective width, replaying the live VS15 transitions and taking a
+        // VS16 widening from the stored bit (`stored_unit_is_wide`), so
+        // reflowed rows keep the live columns (`❤️` two, `⌚︎` one) and `col`
+        // stays the column the line's link and underline-colour spans name.
+        // An edge-pinned VS16 unit stays narrow, as the screen's own rewrap
+        // keeps it (ruling 2026-10-11, r16): re-widening it here put every
+        // later unit's span lookup one column off, so a blank took the link of
+        // the glyph after it and the glyph lost its continuation's.
         let unit = super::scroll_materialize::advance_grapheme_unit_wide(text, &mut byte_idx);
         let chars_consumed = unit.chars;
         char_idx += chars_consumed;
@@ -992,6 +1058,42 @@ mod tests {
             crate::test_counters::take_reflow_passthrough_lines(),
             0,
             "no passthrough for multi-row logical lines"
+        );
+    }
+
+    /// `reflow_newest_rows` is the tail of the whole rewrap, for every row
+    /// count up to past the whole output: over runs that narrow and widen, an
+    /// orphaned continuation at the front, wide cells and blank rows. And it
+    /// rewraps only the newest logical lines that fill the rows asked for:
+    /// over single-row lines that pass through, one row asked rewraps one.
+    #[test]
+    fn reflow_newest_rows_is_the_tail_of_the_whole_rewrap() {
+        let mut corpus = vec![styled("orphan tail", true)];
+        for i in 0..12 {
+            corpus.push(styled(&format!("R{i}-ABCDEFGH"), false));
+            corpus.push(styled("IJKLMNOP", true));
+            corpus.push(styled("QR", true));
+            corpus.push(styled("", false));
+            corpus.push(styled("世界世界世", false));
+            corpus.push(styled(&format!("short {i}"), false));
+        }
+        for new_cols in [3u16, 7, 11, 40] {
+            let whole = reflow_scrollback_lines(&corpus, new_cols);
+            for rows in 0..=whole.len() + 2 {
+                let newest = reflow_newest_rows(&corpus, new_cols, rows);
+                assert_semantically_equal(&newest, &whole[whole.len().saturating_sub(rows)..]);
+            }
+        }
+
+        let plain: Vec<Line> = (0..1000).map(|i| styled(&format!("p{i}"), false)).collect();
+        let _ = crate::test_counters::take_reflow_passthrough_lines();
+        let newest = reflow_newest_rows(&plain, 40, 1);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].as_str(), Some("p999"));
+        assert_eq!(
+            crate::test_counters::take_reflow_passthrough_lines(),
+            1,
+            "one row asked of single-row lines rewraps the newest one only"
         );
     }
 }

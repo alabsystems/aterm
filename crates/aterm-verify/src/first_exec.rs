@@ -61,9 +61,9 @@ pub fn warm_first_exec(ctx: &Ctx, r: &mut Report, bin: &Path, flag: &str) {
 /// list an interrupted gate kills, and is killed with its group at the bound.
 /// Its stdout and stderr go nowhere, it starts in `env`'s cwd as every stage
 /// child does, and its environment is ONLY a PATH and a scratch HOME, XDG dirs
-/// and TMPDIR (`env -i`, as AGENTS.md drives a private instance): no `ATERM_*`
-/// session, capability, handoff, fabric or update authority reaches it, and
-/// nothing it resolves is the person's.
+/// and TMPDIR (`env -i`, as `tools/visual-judge/capture.sh` drives a private
+/// instance): no `ATERM_*` session, capability, handoff, fabric or update
+/// authority reaches it, and nothing it resolves is the person's.
 fn warm_within(env: ExecEnv<'_>, bound: Duration, r: &mut Report, bin: &Path, flag: &str) {
     let what = format!("{} {flag}", file_name(bin));
     let tmp = match crate::mktemp_dir("atv-warm") {

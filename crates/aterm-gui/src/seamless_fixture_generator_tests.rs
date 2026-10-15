@@ -357,6 +357,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         // Since v0.95.0: filled only by the crash journal and a system
         // quit's layout, never by the handoff's (`capture_restore_manifest`).
         agent: None,
+        supervised: None,
         // Since v0.100.0: a pane kept open after its command exited.
         held: false,
     }))
@@ -823,8 +824,8 @@ fn fx_capture(
         // `carries_output_state` neither an open link nor a VT52 address is a
         // hazard. A miss over queued output is left for a sequence no carry
         // holds (a hooked DCS) and for one the carry would only swallow
-        // (`partial_sequence_swallowed`: an over-cap OSC, an unhooked DCS
-        // header) that is not a PICTURE (`partial_sequence_swallows_picture`:
+        // (`partial_sequence_swallowed`: an over-cap OSC) that is not a
+        // PICTURE (`partial_sequence_swallows_picture`:
         // a kitty-graphics APC, an OSC 1337 image or a sixel string, whose
         // stream's next frame replaces the one dropped). That is
         // `capture_parked_screens` on the fork lane, which has no free

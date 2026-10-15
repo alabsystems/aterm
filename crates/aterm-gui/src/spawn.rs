@@ -1618,14 +1618,17 @@ pub(crate) fn spawn_session(
             None => {
                 // Daily-driver modes (User, the default, and Master) inherit the
                 // launching shell's limits so programs reserving large address
-                // spaces are not constrained; Safety / Containment keep the
-                // hardened caps (`aterm_sandbox::Limits::inherit`).
+                // spaces are not constrained (`aterm_sandbox::Limits::inherit`);
+                // Safety gets the soft caps, a guardrail its rc can raise, and
+                // Containment the same caps as hard limits, which its program
+                // cannot (`aterm_sandbox::Limits::contained`, ruling 2026-10-10).
                 let limits = {
                     use aterm_containment::ContainmentMode as Cm;
                     match aterm_containment::mode_or_containment() {
                         Cm::Master | Cm::User => daily_driver_limits(),
-                        // Fail-safe to confined for an unrecognized mode.
-                        _ => aterm_sandbox::Limits::shell_default(),
+                        Cm::Safety => aterm_sandbox::Limits::shell_default(),
+                        // Fail-safe to contained for an unrecognized mode.
+                        _ => aterm_sandbox::Limits::contained(),
                     }
                 };
                 // A folder the shell cannot start in becomes the home folder,
@@ -1852,11 +1855,14 @@ pub(crate) fn spawn_session(
         t.set_require_shell_integration_nonce(true);
     }
 
-    configure_clipboard(&term);
-    configure_notifications(&term, &factory.notify_tx, id);
+    // What aterm, unsandboxed, does at this tab's program's request: decided
+    // once, from the mode its shell runs under ([`host_reach`]).
+    let reach = host_reach(aterm_containment::mode_or_containment());
+    configure_clipboard(&term, reach);
+    configure_notifications(&term, reach, &factory.notify_tx, id);
     // Kitty file/shm transfer mediums — only when the user opted in (default off).
     if factory.allow_kitty_file_transfer {
-        configure_kitty_file_transfer(&term);
+        configure_kitty_file_transfer(&term, reach);
     }
 
     // POL-1: this tab's OWN `standard`-profile policy engine, installed BEFORE its
@@ -3694,6 +3700,8 @@ fn attach_reader_inner(
         ui_waiting: session.ctx.ui_waiting.clone(),
         wake_rd,
         stop: session.reader_stop.clone(),
+        #[cfg(unix)]
+        shell_exit: shell_exit_watch(session),
         start_gate,
         read_buf,
         #[cfg(unix)]
@@ -3822,6 +3830,119 @@ mod dsu_quiescence_conformance;
 #[cfg(all(test, unix))]
 #[path = "foreground_handback_conformance.rs"]
 mod foreground_handback_conformance;
+
+/// THE TAB ENDS WITH ITS SHELL (docs/AUDIT-pty-render-2026-10-09.md P3, in the
+/// window's reader). The real reader on a real pseudo-terminal whose slave the
+/// test holds, standing in for the job a shell left behind (`cmd &` and
+/// `exit` under bash's default `huponexit`): the master never reaches EOF,
+/// which on Linux is every such exit, since Linux does not hang a PTY up at
+/// its session leader's exit. The session's shell is a real child; when it
+/// exits, the reader passes on what the master held and posts `Wake::Exit`,
+/// the tab's close. Before, only the master's EOF did, so the tab stayed open
+/// on a dead shell until the job let go. The reader goes on reading after
+/// that report, so a pane `--hold` keeps shows what the job writes later (and
+/// the job never blocks on an unread terminal), and the job's letting go then
+/// ends the reader without a second exit.
+#[cfg(all(test, unix))]
+mod shell_exit_tests {
+    use std::sync::mpsc;
+
+    use super::attach_reader_inner;
+    use crate::{App, Wake, WindowId};
+
+    #[test]
+    fn the_tab_ends_when_its_shell_exits_while_a_job_holds_the_terminal() {
+        let app = App::headless_for_test();
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        let mut shell = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn the shell");
+        let mut session = crate::stub_session(91);
+        session.master = master;
+        session.pid = i32::try_from(shell.id()).expect("pid fits i32");
+        session.shell_identity = aterm_pty::record_spawned_shell(session.pid);
+        let (posted, wakes) = mpsc::channel::<&'static str>();
+        let post = std::sync::Arc::new(move |wake: Wake| {
+            let _ = posted.send(match wake {
+                Wake::Ready { .. } => "ready",
+                Wake::Exit { .. } => "exit",
+                _ => "other",
+            });
+            true
+        });
+        attach_reader_inner(&mut session, WindowId(0), post, &app.session_factory, None)
+            .expect("attach the real reader");
+        let patience = aterm_spec::wait::MUST_HAPPEN;
+        let next = |what: &str| loop {
+            match wakes.recv_timeout(patience) {
+                Ok(w) if w == what => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        };
+        assert!(next("ready"), "the reader's gather started");
+        // The shell's last words, then its exit; the job keeps the slave.
+        // SAFETY: a write of a live buffer to the test-owned slave.
+        let wrote = unsafe { libc::write(slave, b"bye".as_ptr().cast(), 3) };
+        assert_eq!(wrote, 3, "write the shell's last words");
+        drop(shell.stdin.take());
+        // A hang detector: the shell's exit is the event.
+        let exited = next("exit");
+        let _ = shell.wait();
+        let row = |session: &crate::Session| {
+            crate::term_lock(&session.term)
+                .row_text(0)
+                .unwrap_or_default()
+        };
+        let shown = row(&session);
+        // The job writes on after the exit, as into a held pane.
+        // SAFETY: a write of a live buffer to the test-owned slave.
+        let wrote = unsafe { libc::write(slave, b"late".as_ptr().cast(), 4) };
+        assert_eq!(wrote, 4, "write the job's later output");
+        let mut late_shown = row(&session).starts_with("byelate");
+        let until = std::time::Instant::now() + patience;
+        while exited && !late_shown && std::time::Instant::now() < until {
+            std::thread::yield_now();
+            late_shown = row(&session).starts_with("byelate");
+        }
+        // The job lets go: the reader ends on the master's EOF.
+        aterm_pty::close_fd(slave);
+        let reader_ended = session.reader_join.as_ref().is_some_and(|reader| {
+            let until = std::time::Instant::now() + patience;
+            while !reader.is_finished() && std::time::Instant::now() < until {
+                std::thread::yield_now();
+            }
+            reader.is_finished()
+        });
+        // Stop a reader that never ended, then free the master.
+        let _ = super::park_reader(
+            &mut session,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        );
+        let exits_after = wakes.try_iter().filter(|wake| *wake == "exit").count();
+        let master = std::mem::replace(&mut session.master, -1);
+        aterm_pty::close_fd(master);
+        assert!(
+            exited,
+            "the shell exited while a job held its terminal, and the tab stayed open"
+        );
+        assert!(
+            shown.starts_with("bye"),
+            "what the shell wrote before its exit reaches the screen: {shown:?}"
+        );
+        assert!(
+            late_shown,
+            "what the job wrote after the exit reaches the screen: {:?}",
+            row(&session)
+        );
+        assert!(reader_ended, "the job let go, and the reader read on");
+        assert_eq!(exits_after, 0, "the job's letting go is not a second exit");
+    }
+}
 
 #[cfg(test)]
 mod park_reader_tests {
@@ -4197,25 +4318,113 @@ fn route_osc52_query(
     }
 }
 
-/// OSC 52 clipboard for one session: writes authorized (pbcopy / PRIMARY-own on
-/// a dedicated thread, so the blocking platform write never runs under the
-/// Terminal lock); queries denied unless configured. Each tab gets its own
-/// authorization and callback, so a background tab's yank reaches the platform.
-/// Targets are routed by [`route_osc52_write`] and queries by [`route_osc52_query`].
-fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
+/// What aterm, running outside any sandbox, does at one session's program's
+/// request, decided once, at spawn, by [`host_reach`] from the containment
+/// mode its shell runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostReach {
+    /// The platform. OSC 52 set and clear (and the OSC 1337 copies, which take
+    /// the same authority) are authorized, and a query is answered when
+    /// `allow_osc52_query` authorizes it. OSC 9/99/777 reach the desktop
+    /// notifier when `allow_notifications` admits them. Kitty's file,
+    /// temporary-file and shared-memory mediums are read when
+    /// `allow_kitty_file_transfer` opts in.
+    Platform,
+    /// Nothing. No clipboard write or query is authorized, and no clipboard
+    /// transport, notification callback or Kitty medium resolver is
+    /// installed. A grant made later (a config reload's `allow_osc52_query` or
+    /// `allow_notifications`, a policy rule, a carried checkpoint's bits)
+    /// therefore has nothing behind it, and a Kitty file or shared-memory
+    /// transmission is answered as a disabled medium, whatever it names.
+    Refused,
+}
+
+/// What aterm does for the program of a session spawned under `mode`.
+///
+/// RULING 2026-10-10 (P3 of the r13 policy hunt, widened on its review), fail
+/// closed: aterm, unsandboxed, brokers nothing to a session spawned under
+/// `Containment`. The profile refuses the contained program the pasteboard
+/// (`docs/AUDIT-boundaries-2026-10-09.md` L1: the pasteboard hands data to
+/// every other app), every file under the credential and private-data stores,
+/// and every mach service but the user and group queries. aterm is a daemon
+/// outside the sandbox that works for the program, so each of the following
+/// handed the program what its profile refuses:
+///
+/// - OSC 52. The program set the system pasteboard by printing it (a planted
+///   command waiting for the person's next paste into an unsandboxed shell)
+///   and, under `allow_osc52_query`, read it back.
+/// - Kitty `t=f`/`t=t`/`t=s` under `allow_kitty_file_transfer`. aterm read any
+///   path the program named, so an `OK` against `EINVAL` told the program
+///   whether a refused file existed, a raw format told its exact size, and its
+///   bytes were drawn into the tab. A `t=t` also deleted a temporary file as
+///   aterm.
+/// - OSC 9/99/777 under `allow_notifications`. aterm posted the program's
+///   text as a desktop notification: the program speaking outside its tab,
+///   with no sign of which tab wrote it, through a notifier the profile
+///   refuses it.
+///
+/// Decided here, once per session, where each broker is installed, so every
+/// path that reaches one through the engine inherits it; the handlers carry no
+/// second check. What the person does is not brokered at the program's
+/// request and keeps working: a link click, a paste, a drop. The possible
+/// later refinement for the clipboard is a session-scoped scratch clipboard
+/// (`ATERM_DESIGN` §10.1, "OSC 52 → scratch clipboard"): the contained
+/// program's copy kept in its tab, pasted only by the person.
+///
+/// Safety keeps the platform. It has no OS sandbox, so its program can run
+/// `pbcopy`, read the file or post the notification itself. A mode this build
+/// does not know is refused.
+fn host_reach(mode: aterm_containment::ContainmentMode) -> HostReach {
+    use aterm_containment::ContainmentMode as Cm;
+    match mode {
+        Cm::Master | Cm::User | Cm::Safety => HostReach::Platform,
+        _ => HostReach::Refused,
+    }
+}
+
+/// OSC 52 clipboard for one session: what it may reach is `reach`
+/// ([`host_reach`]). Where that is the platform clipboard, writes are
+/// authorized (pbcopy / PRIMARY-own on a dedicated thread, so the blocking
+/// platform write never runs under the Terminal lock) and queries denied unless
+/// configured. Each tab gets its own authorization and callback, so a
+/// background tab's yank reaches the platform. Targets are routed by
+/// [`route_osc52_write`] and queries by [`route_osc52_query`].
+fn configure_clipboard(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
+    install_clipboard(term, reach, deliver_clip_write);
+}
+
+/// The platform write behind [`configure_clipboard`]'s worker thread.
+fn deliver_clip_write(write: ClipWrite) {
+    if let Some(text) = write.clipboard {
+        control::pbcopy(&text);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(text) = write.primary {
+        control::primary_set(&text);
+    }
+}
+
+/// [`configure_clipboard`] with the platform write as a parameter, so a test
+/// can watch what reaches it.
+fn install_clipboard(
+    term: &Arc<Mutex<Terminal>>,
+    reach: HostReach,
+    mut deliver: impl FnMut(ClipWrite) + Send + 'static,
+) {
+    if reach == HostReach::Refused {
+        // No worker, no callback: `deliver` drops here, unused.
+        let mut t = term_lock(term);
+        t.revoke_clipboard_access(ClipboardAccess::Write);
+        t.revoke_clipboard_access(ClipboardAccess::Query);
+        return;
+    }
     let (clip_tx, clip_rx) = clip_mailbox();
     std::thread::spawn(move || {
         // The mailbox keeps at most one pending update while a platform call is
         // blocked. Each selection is last-writer-wins, so a flood collapses to
         // the latest value per destination without retaining every payload.
         while let Some(write) = clip_rx.recv() {
-            if let Some(text) = write.clipboard {
-                control::pbcopy(&text);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(text) = write.primary {
-                control::primary_set(&text);
-            }
+            deliver(write);
         }
     });
     let mut t = term_lock(term);
@@ -4245,9 +4454,13 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
             #[cfg(not(target_os = "linux"))]
             {
                 // Off X11 every target (the 'p' spelling included) folds into
-                // the one pasteboard, mirroring the write fallback above.
+                // the one pasteboard, mirroring the write fallback above. The
+                // pasteboard read can block (a Universal Clipboard fetch, a busy
+                // lazy provider), so it is never done here, under the terminal
+                // lock: the reader did it before the hold that feeds the query
+                // (`host_io_prefetch`), and a query it did not read is unanswered.
                 let _ = &selections;
-                Some(crate::control::pbpaste().unwrap_or_default())
+                crate::host_io_prefetch::take_clipboard_query()
             }
             #[cfg(target_os = "linux")]
             {
@@ -4269,12 +4482,18 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
 /// surfaces. The callbacks run on the reader thread under the Terminal lock, so
 /// they only `try_send` onto the shared bounded channel
 /// (`notify::NOTIFY_QUEUE_CAP`), dropping on `Full`; the notifier and
-/// focus-aware suppression run on `notify`'s delivery thread.
+/// focus-aware suppression run on `notify`'s delivery thread. A session whose
+/// `reach` ([`host_reach`]) is refused gets no callback, so no
+/// `allow_notifications` grant reaches the notifier from it.
 fn configure_notifications(
     term: &Arc<Mutex<Terminal>>,
+    reach: HostReach,
     notify_tx: &std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     id: u64,
 ) {
+    if reach == HostReach::Refused {
+        return;
+    }
     let mut t = term_lock(term);
     // Do not authorize here: `apply_config` set `modes.allow_notifications` from
     // config (default off), and the engine's OSC 9/99/777 handlers check that bit
@@ -4392,11 +4611,14 @@ pub(crate) fn window_op_wake(
 
 /// Maximum bytes a Kitty non-direct medium may supply (matches the engine's
 /// `MAX_KITTY_IMAGE_BYTES`): bounds both a huge file and a huge shm object.
-const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Install the Kitty non-direct-medium resolver for one session (opt-in via
-/// `allow_kitty_file_transfer`). The engine hands us `(medium, path/name)`; we
-/// do the I/O under a fail-closed policy and return the raw image bytes:
+/// `allow_kitty_file_transfer`) whose `reach` ([`host_reach`]) is the platform;
+/// a refused session gets none, so the engine answers its file and
+/// shared-memory transmissions as a disabled medium and touches nothing they
+/// name. The engine hands us `(medium, path/name)`; we do the I/O under a
+/// fail-closed policy and return the raw image bytes:
 /// - `t=f` (file): read a regular file, size-capped.
 /// - `t=t` (temp file): read it, then delete it — only as the protocol allows
 ///   ([`read_kitty_temp_file`]).
@@ -4405,15 +4627,34 @@ const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 ///
 /// Readability is bounded by our uid and size by the cap. The engine never
 /// touches the filesystem or shm itself.
-fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>) {
+///
+/// A file read can block (an evicted iCloud file downloading, a stalled network
+/// volume), and the resolver runs inside `process()`, under the terminal lock:
+/// so the reads are done by the reader before the hold that feeds what names them
+/// ([`crate::host_io_prefetch`], through [`read_kitty_medium`]), and the resolver
+/// only takes what was read. A medium the reader did not read is refused.
+fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
+    if reach == HostReach::Refused {
+        return;
+    }
+    term_lock(term).set_kitty_file_resolver(crate::host_io_prefetch::take_kitty_medium);
+}
+
+/// One Kitty non-direct medium's bytes, read under [`configure_kitty_file_transfer`]'s
+/// policy: `t=f` a regular file, `t=t` a temporary file (deleted as the protocol
+/// allows), `t=s` a shared-memory object. Direct is the engine's own; any future
+/// medium fails closed.
+pub(crate) fn read_kitty_medium(
+    medium: aterm_core::terminal::kitty_graphics::KittyMedium,
+    name: &str,
+) -> Option<Vec<u8>> {
     use aterm_core::terminal::kitty_graphics::KittyMedium;
-    term_lock(term).set_kitty_file_resolver(|medium, name| match medium {
+    match medium {
         KittyMedium::File => read_kitty_file(Path::new(name)),
         KittyMedium::TempFile => read_kitty_temp_file(Path::new(name)),
         KittyMedium::SharedMemory => read_posix_shm(name),
-        // Direct is handled inline by the engine; any future medium fails closed.
         _ => None,
-    });
+    }
 }
 
 /// Read a Kitty `t=f` file: a regular file, at most [`MAX_KITTY_MEDIUM_BYTES`].
@@ -4462,23 +4703,96 @@ const KITTY_TEMP_FILE_MARKER: &str = "tty-graphics-protocol";
 /// a file being `cat`, so without this rule a transmission naming any file
 /// the user can write deletes it.
 fn read_kitty_temp_file(path: &Path) -> Option<Vec<u8>> {
+    read_kitty_temp_file_with(path, || {})
+}
+
+/// [`read_kitty_temp_file`], running `before_unlink` once the entry has been
+/// judged deletable and just before it is unlinked: the window a test swaps a
+/// directory in.
+fn read_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) -> Option<Vec<u8>> {
     let bytes = read_kitty_file(path)?;
-    // Judge the entry really removed, its directory's symlinks and `..`
-    // resolved: both conditions hold of that path, and that entry is deleted.
-    let entry = path
-        .file_name()
-        .zip(
-            path.parent()
-                .and_then(|dir| std::fs::canonicalize(dir).ok()),
-        )
-        .map(|(name, dir)| dir.join(name));
-    if let Some(entry) = entry
-        && entry.to_string_lossy().contains(KITTY_TEMP_FILE_MARKER)
-        && kitty_temp_dirs().iter().any(|tmp| entry.starts_with(tmp))
-    {
-        let _ = std::fs::remove_file(entry); // consume the client's temp file
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        consume_kitty_temp_entry(dir, name, before_unlink); // the client's temp file
     }
     Some(bytes)
+}
+
+/// Whether the protocol lets a `t=t` entry at `entry` (its directory resolved)
+/// be deleted: [`KITTY_TEMP_FILE_MARKER`] in its path, under a
+/// [`kitty_temp_dirs`] directory.
+fn kitty_temp_entry_deletable(entry: &Path) -> bool {
+    entry.to_string_lossy().contains(KITTY_TEMP_FILE_MARKER)
+        && kitty_temp_dirs().iter().any(|tmp| entry.starts_with(tmp))
+}
+
+/// Delete `name` in `dir` if [`kitty_temp_entry_deletable`] allows it,
+/// judging and unlinking in one directory.
+///
+/// RULING 2026-10-10 (P4 of the r13 policy hunt): the directory is resolved
+/// once and held. `dir` is canonicalized (its symlinks and `..` resolved), and
+/// that path is opened component by component from `/`, each relative to the
+/// one before it with `O_DIRECTORY | O_NOFOLLOW`, so a symlink anywhere in it
+/// refuses the open. The rule is judged on the path that was opened, and the
+/// entry is unlinked relative to the held descriptor, never by path; a leaf
+/// that is not a regular file is kept. Until this ruling the entry was judged
+/// on a canonical path string and removed by that string, so its directory
+/// components were resolved again at the unlink: a program able to write the
+/// temporary directories (all a Containment shell can write) could swap a
+/// component for a symlink in between, and aterm, unsandboxed, removed a
+/// same-named file outside them. A swap now either makes the walk refuse or
+/// moves nothing the held descriptor names. Since [`host_reach`] (same date) a
+/// Containment tab gets no Kitty medium at all, so no shipped mode's program
+/// has fewer rights than aterm here; the held directory stays as the rule for
+/// any path aterm deletes on a program's word.
+#[cfg(unix)]
+fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: impl FnOnce()) {
+    use aterm_dirfd::{AtFlags, CWD, FileType, Mode, OFlags, fstat, openat, unlinkat};
+    use std::path::Component;
+
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    let walk = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let Ok(mut held) = openat(CWD, "/", walk, Mode::empty()) else {
+        return;
+    };
+    for component in dir.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => match openat(&held, part, walk, Mode::empty()) {
+                Ok(next) => held = next,
+                Err(_) => return,
+            },
+            _ => return,
+        }
+    }
+    if !kitty_temp_entry_deletable(&dir.join(name)) {
+        return;
+    }
+    let leaf = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let regular = openat(&held, name, leaf, Mode::empty())
+        .and_then(fstat)
+        .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file());
+    if regular {
+        before_unlink();
+        let _ = unlinkat(&held, name, AtFlags::empty());
+    }
+}
+
+/// Off Unix the entry is removed by path. Containment, the one mode whose
+/// program has fewer filesystem rights than aterm, exists only on macOS, so
+/// here nothing on the other side of the race lacks the right to delete the
+/// file itself.
+#[cfg(not(unix))]
+fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: impl FnOnce()) {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    let entry = dir.join(name);
+    if kitty_temp_entry_deletable(&entry) {
+        before_unlink();
+        let _ = std::fs::remove_file(entry);
+    }
 }
 
 /// The known temporary directories a Kitty `t=t` file may be deleted from,
@@ -5042,6 +5356,32 @@ fn spawn_compress_worker(
 #[cfg(unix)]
 const GATHER_RING_BUFFERS: usize = 4;
 
+/// The most output a session passes on between its shell's exit and the
+/// `Wake::Exit` that reports it: far past what a PTY buffers, which is all the
+/// shell itself can have left there, so only a job that keeps writing after it
+/// ever meets the cap (the terminal session's own bound, `aterm-cli`'s
+/// `EXIT_DRAIN_MAX`). The reader goes on reading after the report, until the
+/// session's teardown stops it or the master's EOF ends it.
+#[cfg(unix)]
+const EXIT_DRAIN_MAX: usize = 1024 * 1024;
+
+/// The descriptor the gather polls for the session's shell's exit
+/// (`aterm_uds::exitwatch::exit_fd`): a pidfd on Linux, a kqueue on macOS.
+/// `None` for a stub, a shell already reaped (its pid is free), one whose pid
+/// no longer names it, and where no watch can be made; the session then ends
+/// at the master's EOF alone. The watch is taken on the pid first and the
+/// identity checked after, so a reissued pid is never watched as the shell.
+#[cfg(unix)]
+fn shell_exit_watch(session: &Session) -> Option<std::os::fd::OwnedFd> {
+    let identity = session.shell_identity;
+    if session.child_reaped.load(Ordering::Acquire) {
+        return None;
+    }
+    let pid = u32::try_from(identity.pid).ok().filter(|pid| *pid > 1)?;
+    let watch = aterm_uds::exitwatch::exit_fd(pid)?;
+    identity.verify().then_some(watch)
+}
+
 /// Batch messages from the gather stage to the parse stage (unix pipeline).
 /// `pub(crate)` for [`crate::manual_reset::ResetLane`], which holds a clone of
 /// the sender so a manual reset rides the same channel as the batches.
@@ -5061,6 +5401,11 @@ pub(crate) enum GatherMsg {
     ),
     /// The master EOF'd on its own (shell exited).
     Eof,
+    /// The session's shell exited (its exit watch fired before the master's
+    /// EOF), and what the master held then has been sent: post `Wake::Exit`
+    /// and go on consuming, since a job the shell left behind may still hold
+    /// the terminal. The gather ends later with `Wake`.
+    Exited,
     /// Session teardown (wake pipe / stop flag) — exit quietly.
     Wake,
     /// A manual reset (`crate::manual_reset`): the `reset` verb or Edit ▸ Reset
@@ -5082,6 +5427,9 @@ pub(crate) enum GatherMsg {
 fn spawn_pty_gather(
     master: i32,
     wake_rd: i32,
+    // The shell's exit watch: once it fires, the gather passes on what the
+    // master holds (at most [`EXIT_DRAIN_MAX`]) and ends the session as at EOF.
+    shell_exit: Option<std::os::fd::OwnedFd>,
     id: u64,
     lat_epoch: Instant,
     latest_output_activity_ns: Arc<AtomicU64>,
@@ -5152,6 +5500,15 @@ fn spawn_pty_gather(
             // while `false` only costs syscalls.
             sink.note_master_nonblocking(nonblock);
             let mut buf = first_buf;
+            let mut exit_rd = shell_exit
+                .as_ref()
+                .map_or(-1, std::os::fd::AsRawFd::as_raw_fd);
+            // Once the shell has exited, the output the master may still pass on
+            // before the exit is reported (`ReadOutcome::Exited`).
+            let mut after_exit: Option<usize> = None;
+            // The exit was reported (`GatherMsg::Exited`): the master's EOF is
+            // then the end of a job's output, not a second exit.
+            let mut exit_reported = false;
             loop {
                 // STOP before the next read, never between a read and its hand-off:
                 // bytes already drained from the kernel MUST reach the engine (the
@@ -5161,7 +5518,41 @@ fn spawn_pty_gather(
                     let _ = filled_tx.send(GatherMsg::Wake);
                     break;
                 }
-                match aterm_pty::read_or_wake(master, &mut buf, wake_rd) {
+                let outcome = match after_exit {
+                    None => aterm_pty::read_or_wake(master, &mut buf, wake_rd, exit_rd),
+                    // The shell is gone: what the master holds now, never waiting
+                    // for more. Once it is empty (or the cap is spent) the exit is
+                    // reported, and reading goes on without the watch.
+                    Some(left) => {
+                        let room = left.min(buf.len());
+                        match aterm_pty::drain_more(master, &mut buf[..room], 0) {
+                            0 => {
+                                after_exit = None;
+                                exit_rd = -1;
+                                exit_reported = true;
+                                if filled_tx.send(GatherMsg::Exited).is_err() {
+                                    break; // parse stage gone
+                                }
+                                continue;
+                            }
+                            n => aterm_pty::ReadOutcome::Data(n),
+                        }
+                    }
+                };
+                match outcome {
+                    // The session ends with its shell, not with the slave's last
+                    // close (docs/AUDIT-pty-render-2026-10-09.md P3): a job the
+                    // shell left behind can hold the slave for hours, and Linux
+                    // does not hang a PTY up at its session leader's exit. What
+                    // the master holds goes on, then `Exited` reports the exit:
+                    // the tab's close drops the session, whose wake stops this
+                    // reader and whose master's close hangs up whatever still
+                    // holds the slave. A pane `--hold` keeps goes on showing
+                    // that job's output, and the job never blocks on a full,
+                    // unread terminal.
+                    aterm_pty::ReadOutcome::Exited => {
+                        after_exit = Some(EXIT_DRAIN_MAX);
+                    }
                     aterm_pty::ReadOutcome::Wake => {
                         let _ = filled_tx.send(GatherMsg::Wake);
                         break;
@@ -5174,7 +5565,11 @@ fn spawn_pty_gather(
                         }
                     }
                     aterm_pty::ReadOutcome::Eof => {
-                        let _ = filled_tx.send(GatherMsg::Eof);
+                        let _ = filled_tx.send(if exit_reported {
+                            GatherMsg::Wake
+                        } else {
+                            GatherMsg::Eof
+                        });
                         break;
                     }
                     aterm_pty::ReadOutcome::Data(n) => {
@@ -5223,6 +5618,9 @@ fn spawn_pty_gather(
                             .is_err()
                         {
                             break; // parse stage gone (session torn down)
+                        }
+                        if let Some(left) = after_exit.as_mut() {
+                            *left = left.saturating_sub(filled);
                         }
                         buf = match free_rx.recv() {
                             Ok(b) => b,
@@ -5330,6 +5728,10 @@ struct PtyReaderWiring {
     /// `wake_rd < 0` (pipe creation failed under fd exhaustion): the timed
     /// fallback poll checks it each tick, so the session is still reclaimed.
     stop: Arc<AtomicBool>,
+    /// The shell's exit watch ([`shell_exit_watch`]), moved into the gather and
+    /// closed with it. `None`: the session ends at the master's EOF alone.
+    #[cfg(unix)]
+    shell_exit: Option<std::os::fd::OwnedFd>,
     /// Overlap child preparation gate. `Some` means every reader/helper resource
     /// exists, but this thread must consume zero PTY bytes until parent Commit.
     start_gate: Option<DeferredReaderGate>,
@@ -5379,6 +5781,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         ui_waiting,
         wake_rd,
         stop,
+        #[cfg(unix)]
+        shell_exit,
         start_gate,
         read_buf,
         #[cfg(unix)]
@@ -5431,8 +5835,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         );
         let start_gather = move || {
             spawn_pty_gather(
-                master, wake_rd, id, lat_epoch, activity, stop, start_gate, read_buf, free_rx,
-                filled_tx, in_flight, sink, fg.probe, fg.holder, lane_guard,
+                master, wake_rd, shell_exit, id, lat_epoch, activity, stop, start_gate, read_buf,
+                free_rx, filled_tx, in_flight, sink, fg.probe, fg.holder, lane_guard,
             )
         };
         (
@@ -5509,6 +5913,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             let pending_reset: std::cell::Cell<Option<crate::manual_reset::ManualReset>> =
                 std::cell::Cell::new(None);
             let mut fg_owners = crate::foreground_handback::FgOwners::default();
+            // The platform reads a slice can ask for, done before its hold
+            // (`crate::host_io_prefetch`), and what the session admits of them.
+            let mut prefetch = crate::host_io_prefetch::Prefetch::default();
             let mut ingest = |buf: &[u8],
                               edge: Option<crate::foreground_handback::FgEdge>,
                               holder: i32| {
@@ -5589,7 +5996,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     //     queue behind at most about one chunk;
                     //   * no key in flight (a pure flood): the rest of the burst in
                     //     one hold, fewer round trips against the renderer's per-frame
-                    //     hold; the next hold is fine-sliced again.
+                    //     hold; the next hold is fine-sliced again;
+                    //   * either way, a slice also ends where the memory budget of the
+                    //     platform reads done before its hold runs out
+                    //     (`crate::host_io_prefetch`).
                     // The VT parser is a streaming state machine, so slicing is
                     // byte-identical to one `process()`, and concatenated per-chunk
                     // replies equal the single-call result. Small bursts are one chunk.
@@ -5608,6 +6018,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         };
                         let end =
                             off + ingest_chunk_width(crate::metrics::input_pending, limit - off);
+                        // The pasteboard and Kitty medium reads this slice asks
+                        // for, done here, before its hold: the engine's callbacks
+                        // only take them, so a read that blocks holds this reader,
+                        // never the lock every window's redraw takes. The slice
+                        // ends where their memory budget does; dropped once it is
+                        // fed.
+                        let fetched = prefetch.reads(&term, &bytes[off..end]);
+                        let end = off + fetched.covered();
                         // Liveness is decided before the term lock: the probe is a
                         // `kill(pgid, 0)` plus, for a reaped leader, a member listing
                         // for `e.from`, and one `kill(-pgid, 0)` for any other owner
@@ -5687,6 +6105,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 }
                             }
                             t.process(&bytes[off..end]);
+                            prefetch.held(&t);
                             emitted += end - off;
                             // A mode this slice armed again belongs to its holder too
                             // (`take_evidence_asserted`), so a stale owner hides no death.
@@ -5719,6 +6138,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 spine_mark.record(tx, pre, &t, &bytes[off..end]);
                             }
                         }
+                        drop(fetched);
                         off = end;
                         // Lock handoff: on macOS's unfair mutex a parked UI thread
                         // needs 10-30 µs to wake while this loop re-takes the lock in
@@ -5874,7 +6294,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 // hit EOF (an orphaned child may hold the slave). Exit quietly (no
                 // `Wake::Exit`); dropping this closure releases the reply writer's
                 // `SinkWriter`, which owns and closes the master.
-                let r = match aterm_pty::read_or_wake(master, &mut buf, wake_rd) {
+                let r = match aterm_pty::read_or_wake(master, &mut buf, wake_rd, -1) {
                     aterm_pty::ReadOutcome::Wake => break,
                     aterm_pty::ReadOutcome::Idle => {
                         // Wake-pipe-less fallback (fd exhaustion): honor the fd-free
@@ -5885,7 +6305,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         }
                         continue;
                     }
-                    aterm_pty::ReadOutcome::Eof => {
+                    // `Exited` is never produced here: the child's exit EOFs the read.
+                    aterm_pty::ReadOutcome::Eof | aterm_pty::ReadOutcome::Exited => {
                         // The PTY closed on its OWN (shell/`-e` exited). Route an Exit for THIS
                         // session; the main thread closes only this tab and exits the app only
                         // if it was the last (honoring `--hold`).
@@ -5939,6 +6360,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             window,
                         });
                         break;
+                    }
+                    // The shell exited before the master's EOF: the same exit,
+                    // but what a job it left behind still writes keeps arriving.
+                    Ok(GatherMsg::Exited) => {
+                        let _ = pty_closed_at.set(Instant::now());
+                        let _ = post(Wake::Exit {
+                            session: id,
+                            window,
+                        });
                     }
                     Ok(GatherMsg::Wake) | Err(_) => break,
                     // A manual reset between two batches (`crate::manual_reset`):
@@ -7451,6 +7881,211 @@ mod clipboard_coalesce_tests {
     }
 }
 
+/// What aterm does for a session's program by the containment mode it was
+/// spawned under ([`super::host_reach`], ruling 2026-10-10): its OSC 52 and
+/// its desktop notifications here, its Kitty file mediums in
+/// `kitty_transfer_tests`.
+#[cfg(test)]
+mod host_reach_tests {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel, sync_channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use aterm_containment::ContainmentMode as Cm;
+    use aterm_core::config::TerminalConfig;
+    use aterm_core::terminal::Terminal;
+
+    use super::{
+        ClipWrite, configure_notifications, host_reach, install_clipboard, new_live_terminal,
+        term_lock,
+    };
+
+    /// A wait for a write that must arrive: a hang detector, never a budget.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// OSC 52 sets the clipboard to `planted`.
+    const SET: &[u8] = b"\x1b]52;c;cGxhbnRlZA==\x07";
+
+    /// The configuration that lets OSC 52 read the clipboard back.
+    fn query_allowed() -> TerminalConfig {
+        TerminalConfig {
+            allow_osc52_query: true,
+            ..TerminalConfig::default()
+        }
+    }
+
+    /// A live session built as `spawn_session` builds one under `mode` (the
+    /// engine from its config, then the clipboard, then the standard policy),
+    /// with the platform write replaced by a channel the test reads.
+    fn session(mode: Cm) -> (Arc<Mutex<Terminal>>, Receiver<ClipWrite>) {
+        let term = Arc::new(Mutex::new(new_live_terminal(
+            24,
+            80,
+            Some(&query_allowed()),
+            aterm_types::Appearance::Dark,
+            None,
+        )));
+        let (tx, rx) = channel();
+        install_clipboard(&term, host_reach(mode), move |write| {
+            let _ = tx.send(write);
+        });
+        term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+            aterm_policy::profiles::standard(),
+        ));
+        (term, rx)
+    }
+
+    /// The reply to an OSC 52 query, fed as the PTY reader feeds it, while the
+    /// clipboard (the test build's board, read on this thread) holds
+    /// `owner-secret`.
+    fn query_reply(term: &Arc<Mutex<Terminal>>) -> Option<Vec<u8>> {
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some("owner-secret".into()));
+        crate::host_io_prefetch::feed_as_reader(term, b"\x1b]52;c;?\x07");
+        let reply = term_lock(term).take_response();
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+        reply
+    }
+
+    /// An OSC 52 query's pasteboard read is never made inside `process()`,
+    /// which runs under the terminal lock (2026-10-14): a read that blocks (a
+    /// Universal Clipboard fetch, a busy provider) held the lock every window's
+    /// redraw takes. The reader reads before its hold, and the query is
+    /// answered from that read, in its place among the burst's replies; fed
+    /// with no read made first, as a hold alone feeds it, it reads nothing and
+    /// is unanswered. (Linux answers from aterm's own selection, a read that
+    /// never blocks, so it still reads in the hold.)
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn an_osc52_query_reads_the_pasteboard_before_the_terminal_lock() {
+        let (term, _writes) = session(Cm::User);
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some("owner-secret".into()));
+        term_lock(&term).process(b"\x1b]52;c;?\x07");
+        let in_the_hold = term_lock(&term).take_response();
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+        assert_eq!(
+            in_the_hold, None,
+            "the pasteboard was read under the terminal lock"
+        );
+        // A DA1 asked right after it is answered after it, as the program asked.
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = Some("owner-secret".into()));
+        crate::host_io_prefetch::feed_as_reader(&term, b"\x1b]52;c;?\x07\x1b[c");
+        let reply = term_lock(&term).take_response().unwrap_or_default();
+        crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
+        assert!(
+            reply.starts_with(b"\x1b]52;c;b3duZXItc2VjcmV0\x07\x1b[?"),
+            "{:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// A program in a Containment tab neither sets nor reads the clipboard
+    /// through OSC 52, even after a later grant of the query (a config
+    /// reload); a program in any other mode's tab still does both, which is
+    /// what makes the refusal mean something.
+    #[test]
+    fn a_contained_session_reaches_no_clipboard() {
+        let answer = b"\x1b]52;c;b3duZXItc2VjcmV0\x07".to_vec();
+        for mode in [Cm::User, Cm::Master, Cm::Safety] {
+            let (term, writes) = session(mode);
+            term_lock(&term).process(SET);
+            let write = writes
+                .recv_timeout(HANG)
+                .unwrap_or_else(|e| panic!("{mode}: the OSC 52 write never arrived ({e:?})"));
+            assert_eq!(write.clipboard.as_deref(), Some("planted"), "{mode}");
+            assert_eq!(query_reply(&term), Some(answer.clone()), "{mode}");
+        }
+
+        let (term, writes) = session(Cm::Containment);
+        term_lock(&term).process(SET);
+        // Nothing to deliver to: the refused session dropped the writer unused.
+        match writes.recv_timeout(HANG) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            Ok(write) => panic!(
+                "a contained OSC 52 write reached the clipboard: {:?}",
+                write.clipboard
+            ),
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("the contained session kept a clipboard writer")
+            }
+        }
+        assert!(
+            !term_lock(&term).modes().allow_osc52_set,
+            "a contained session holds no clipboard write authority"
+        );
+        assert_eq!(query_reply(&term), None, "a contained query is answered");
+        // A reload re-applies `allow_osc52_query = true` to every live engine.
+        term_lock(&term).apply_config(&query_allowed());
+        assert_eq!(
+            query_reply(&term),
+            None,
+            "a contained query is answered after a reload"
+        );
+    }
+
+    /// The configuration that admits a program's desktop notifications.
+    fn notifications_allowed() -> TerminalConfig {
+        TerminalConfig {
+            allow_notifications: true,
+            ..TerminalConfig::default()
+        }
+    }
+
+    /// A notification in each of the three spellings: OSC 9, OSC 99 (kitty)
+    /// and OSC 777 (rxvt-unicode).
+    const NOTICES: [&[u8]; 3] = [
+        b"\x1b]9;from the tab\x07",
+        b"\x1b]99;;from the tab\x1b\\",
+        b"\x1b]777;notify;title;from the tab\x07",
+    ];
+
+    /// How many notifications `term`'s program posts by printing [`NOTICES`].
+    /// The callbacks run inside `process` and only `try_send`, so whatever
+    /// was posted is queued when it returns: no wait decides it.
+    fn posted(term: &Arc<Mutex<Terminal>>, notices: &Receiver<super::notify::NotifyMsg>) -> usize {
+        for notice in NOTICES {
+            term_lock(term).process(notice);
+        }
+        notices.try_iter().count()
+    }
+
+    /// A program in a Containment tab posts no desktop notification, even
+    /// with `allow_notifications` on and after a reload re-grants it; a
+    /// program in any other mode's tab posts all three spellings, which is
+    /// what makes the refusal mean something.
+    #[test]
+    fn a_contained_session_posts_no_notification() {
+        for mode in [Cm::User, Cm::Master, Cm::Safety, Cm::Containment] {
+            let term = Arc::new(Mutex::new(new_live_terminal(
+                24,
+                80,
+                Some(&notifications_allowed()),
+                aterm_types::Appearance::Dark,
+                None,
+            )));
+            let (tx, notices) = sync_channel(8);
+            configure_notifications(&term, host_reach(mode), &tx, 1);
+            term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+                aterm_policy::profiles::standard(),
+            ));
+            if mode == Cm::Containment {
+                assert_eq!(
+                    posted(&term, &notices),
+                    0,
+                    "a contained program posted a desktop notification"
+                );
+                term_lock(&term).apply_config(&notifications_allowed());
+                assert_eq!(
+                    posted(&term, &notices),
+                    0,
+                    "a contained program posted a desktop notification after a reload"
+                );
+            } else {
+                assert_eq!(posted(&term, &notices), NOTICES.len(), "{mode}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod output_wake_coalesce_tests {
     use super::{
@@ -8216,7 +8851,7 @@ mod kitty_transfer_tests {
     fn term_with_resolver() -> Arc<Mutex<Terminal>> {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         term_lock(&term).set_cell_pixel_size(10, 20);
-        configure_kitty_file_transfer(&term);
+        configure_kitty_file_transfer(&term, HostReach::Platform);
         term
     }
 
@@ -8232,13 +8867,132 @@ mod kitty_transfer_tests {
 
         let term = term_with_resolver();
         let seq = apc("a=T,f=32,s=10,v=20,t=f", path.to_str().unwrap().as_bytes());
-        term_lock(&term).process(&seq);
+        crate::host_io_prefetch::feed_as_reader(&term, &seq);
         let placed = !term_lock(&term).cell_frame(24, 80).images[0].is_empty();
 
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             placed,
             "t=f must read the real file via the resolver and place the image"
+        );
+    }
+
+    /// A Kitty file medium is never read inside `process()`, which runs under
+    /// the terminal lock (2026-10-14): a read that blocks (an evicted iCloud
+    /// file downloading, a stalled network volume) held the lock every
+    /// window's redraw takes. The reader reads before its hold and the image is
+    /// placed from that read, where the command stood; fed with no read made
+    /// first, as a hold alone feeds it, the file is not read and the image is
+    /// refused.
+    #[test]
+    fn a_file_medium_is_read_before_the_terminal_lock() {
+        let scratch = scratch_in(&std::env::temp_dir(), "lock");
+        let path = cell_file(&scratch.0, "img.rgba");
+        let seq = apc(
+            "a=T,f=32,s=10,v=20,i=7,t=f",
+            path.to_str().unwrap().as_bytes(),
+        );
+
+        let term = term_with_resolver();
+        term_lock(&term).process(&seq);
+        let in_the_hold =
+            String::from_utf8_lossy(&term_lock(&term).take_response().unwrap_or_default())
+                .into_owned();
+        assert!(
+            in_the_hold.contains("EINVAL")
+                && term_lock(&term).cell_frame(24, 80).images[0].is_empty(),
+            "the file was read under the terminal lock: {in_the_hold:?}"
+        );
+
+        let term = term_with_resolver();
+        crate::host_io_prefetch::feed_as_reader(&term, &seq);
+        let reply = String::from_utf8_lossy(&term_lock(&term).take_response().unwrap_or_default())
+            .into_owned();
+        assert!(reply.ends_with(";OK\x1b\\"), "{reply:?}");
+        assert!(!term_lock(&term).cell_frame(24, 80).images[0].is_empty());
+    }
+
+    /// The session's real PTY reader (`attach_reader_inner`, on a real
+    /// pseudo-terminal) reads a Kitty file medium before the hold that feeds
+    /// its command, so the image is placed; and it reads what the session
+    /// admits as its last hold left it, so a resolver installed after the
+    /// reader started is honoured once a hold has seen it. The other tests
+    /// here feed as the reader does; this one is the reader.
+    #[test]
+    #[cfg(unix)]
+    fn the_pty_reader_reads_a_file_medium_before_its_hold() {
+        struct Attached {
+            session: crate::Session,
+            slave: i32,
+        }
+        impl Drop for Attached {
+            fn drop(&mut self) {
+                let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                let _ = park_reader(&mut self.session, deadline);
+                let master = std::mem::replace(&mut self.session.master, -1);
+                aterm_pty::close_fd(self.slave);
+                aterm_pty::close_fd(master);
+            }
+        }
+        let scratch = scratch_in(&std::env::temp_dir(), "reader");
+        let path = cell_file(&scratch.0, "img.rgba");
+        let app = crate::App::headless_for_test();
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        let mut session = crate::stub_session(91);
+        session.master = master;
+        term_lock(&session.term).set_cell_pixel_size(10, 20);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let post = Arc::new(move |wake: crate::Wake| {
+            if matches!(wake, crate::Wake::Ready { .. }) {
+                let _ = ready_tx.send(());
+            }
+            true
+        });
+        attach_reader_inner(
+            &mut session,
+            crate::WindowId(0),
+            post,
+            &app.session_factory,
+            None,
+        )
+        .expect("attach the real reader");
+        let rig = Attached { session, slave };
+        ready_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the reader's gather started");
+        let term = Arc::clone(&rig.session.term);
+        // The program writes `bytes` and ends them with a title, which the
+        // engine applies after them: once it shows, they have all been fed.
+        let output = |bytes: &[u8], title: &str| {
+            let mut out = bytes.to_vec();
+            out.extend_from_slice(format!("\x1b]2;{title}\x07").as_bytes());
+            let mut off = 0;
+            while off < out.len() {
+                // SAFETY: a write of a live buffer to the test-owned slave.
+                let n =
+                    unsafe { libc::write(rig.slave, out[off..].as_ptr().cast(), out.len() - off) };
+                assert!(n > 0, "write the program's output");
+                off += n as usize;
+            }
+            let shown = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(1),
+                || (term_lock(&term).title() == title).then_some(()),
+            );
+            assert!(shown.is_some(), "the reader never fed {title:?}");
+        };
+        let seq = apc(
+            "a=T,f=32,s=10,v=20,i=7,t=f",
+            path.to_str().unwrap().as_bytes(),
+        );
+
+        output(b"", "before");
+        configure_kitty_file_transfer(&term, HostReach::Platform);
+        output(b"", "installed");
+        output(&seq, "sent");
+        assert!(
+            !term_lock(&term).cell_frame(24, 80).images[0].is_empty(),
+            "the reader did not read the file before its hold"
         );
     }
 
@@ -8271,7 +9025,7 @@ mod kitty_transfer_tests {
     fn transmit_temp_file(path: &Path) -> bool {
         let term = term_with_resolver();
         let seq = apc("a=T,f=32,s=10,v=20,t=t", path.to_str().unwrap().as_bytes());
-        term_lock(&term).process(&seq);
+        crate::host_io_prefetch::feed_as_reader(&term, &seq);
         !term_lock(&term).cell_frame(24, 80).images[0].is_empty()
     }
 
@@ -8350,6 +9104,98 @@ mod kitty_transfer_tests {
         assert!(placed, "the file is still read");
     }
 
+    /// The directory a `t=t` entry is judged in is the one it is unlinked
+    /// from (ruling 2026-10-10, P4): a program that swaps the marked directory
+    /// for a symlink after the judgement and before the unlink, as one that
+    /// can write the temporary directories can, does not carry the delete out
+    /// of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_after_the_judgement_moves_no_delete() {
+        const MARKER: &str = "tty-graphics-protocol";
+        let temp_scratch = scratch_in(&std::env::temp_dir(), "swap");
+        // Outside every temporary directory: the build's target directory, as
+        // in the test above.
+        let exe = std::env::current_exe().unwrap();
+        let target = exe.parent().and_then(Path::parent).unwrap();
+        let outside_scratch = scratch_in(target, "swap-kept");
+        let marked = temp_scratch.0.join(MARKER);
+        std::fs::create_dir_all(&marked).unwrap();
+        let sent = cell_file(&marked, "victim.rgba");
+        let victim = cell_file(&outside_scratch.0, "victim.rgba");
+        let held = temp_scratch.0.join("held");
+
+        let mut swapped = false;
+        let read = read_kitty_temp_file_with(&sent, || {
+            std::fs::rename(&marked, &held).unwrap();
+            std::os::unix::fs::symlink(&outside_scratch.0, &marked).unwrap();
+            swapped = true;
+        });
+
+        assert!(read.is_some(), "the file is read");
+        assert!(swapped, "the entry was judged deletable, so the swap ran");
+        assert!(
+            victim.exists(),
+            "the unlink followed the swapped-in symlink out of the temporary directory"
+        );
+        assert!(
+            !held.join("victim.rgba").exists(),
+            "the entry judged is the entry deleted"
+        );
+    }
+
+    /// The reply to an `a=t` transmission of `path` over `medium` (`f`, `t`).
+    fn transmit_reply(term: &Arc<Mutex<Terminal>>, medium: &str, path: &Path) -> String {
+        let control = format!("a=t,f=32,s=10,v=20,i=9,t={medium}");
+        crate::host_io_prefetch::feed_as_reader(
+            term,
+            &apc(&control, path.to_str().unwrap().as_bytes()),
+        );
+        let reply = term_lock(term).take_response().unwrap_or_default();
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    /// A Containment tab with `allow_kitty_file_transfer` on gets no Kitty
+    /// medium resolver (ruling 2026-10-10, [`host_reach`]): aterm reads no
+    /// file and no shared memory its program names, so a file the profile
+    /// refuses the program is neither drawn nor told apart from a missing
+    /// one, and a `t=t` file is not deleted as aterm. A tab of any other mode
+    /// reads the file, tells it apart from a missing one and consumes the
+    /// `t=t` file, which is what makes the refusal mean something.
+    #[test]
+    fn a_contained_session_reads_nothing_its_program_names() {
+        use aterm_containment::ContainmentMode as Cm;
+        let scratch = scratch_in(&std::env::temp_dir(), "reach");
+        let marked = scratch.0.join("tty-graphics-protocol");
+        std::fs::create_dir_all(&marked).unwrap();
+        let missing = scratch.0.join("absent.rgba");
+        for mode in [Cm::User, Cm::Master, Cm::Safety, Cm::Containment] {
+            let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            term_lock(&term).set_cell_pixel_size(10, 20);
+            configure_kitty_file_transfer(&term, host_reach(mode));
+            let file = cell_file(&scratch.0, "present.rgba");
+            let temp = cell_file(&marked, "sent.rgba");
+            let present = transmit_reply(&term, "f", &file);
+            let absent = transmit_reply(&term, "f", &missing);
+            let consumed = transmit_reply(&term, "t", &temp);
+            if mode == Cm::Containment {
+                for reply in [&present, &absent, &consumed] {
+                    assert!(
+                        reply.contains("ENOTSUPPORTED"),
+                        "a contained transmission reached a medium resolver: {reply:?}"
+                    );
+                }
+                assert_eq!(present, absent, "a contained program tells a file exists");
+                assert!(temp.exists(), "a contained t=t deleted a file as aterm");
+            } else {
+                assert!(present.ends_with(";OK\x1b\\"), "{mode}: {present:?}");
+                assert_ne!(present, absent, "{mode}");
+                assert!(consumed.ends_with(";OK\x1b\\"), "{mode}: {consumed:?}");
+                assert!(!temp.exists(), "{mode}: the t=t file is consumed");
+            }
+        }
+    }
+
     #[test]
     fn file_medium_rejects_oversized_file() {
         let dir = std::env::temp_dir().join(format!("aterm-kft-big-{}", std::process::id()));
@@ -8363,7 +9209,7 @@ mod kitty_transfer_tests {
 
         let term = term_with_resolver();
         let seq = apc("a=T,f=32,s=10,v=20,t=f", path.to_str().unwrap().as_bytes());
-        term_lock(&term).process(&seq);
+        crate::host_io_prefetch::feed_as_reader(&term, &seq);
         let placed = !term_lock(&term).cell_frame(24, 80).images[0].is_empty();
 
         let _ = std::fs::remove_dir_all(&dir);

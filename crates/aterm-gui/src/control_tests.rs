@@ -923,6 +923,42 @@ fn video_retention_capacity_is_reserved_and_returned_exactly() {
 /// load 100 (2026-09-30) a `Housekeeping` reaper ran three tests out of 60 s.
 const REAPER_PATIENCE: std::time::Duration = EVENTUALLY;
 
+/// A quarantine a test holds for as long as it looks at it: a day, which no
+/// test run lasts, so the guard IS in quarantine whenever the test reads it,
+/// however late the machine schedules the test thread, and [`end_quarantine`]
+/// ends it when the test says so. A grace of 40 ms, 200 ms or 1 s raced the
+/// reaper instead: a test thread descheduled past the grace between the
+/// failed ACK and its next look found the guard already reaped, and went red
+/// ("transfers the exact guard to quarantine") with the product right — or,
+/// where a test had grown an either/or branch that accepted the guard gone,
+/// passed without looking at the quarantine at all.
+const HELD_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The ticket of the guard this thread put in quarantine last.
+fn last_quarantine_ticket() -> u64 {
+    super::LAST_QUARANTINE_TICKET
+        .with(std::cell::Cell::take)
+        .expect("this thread quarantined a guard")
+}
+
+/// End quarantine `ticket`'s grace now and ring the reaper: the guard goes at
+/// the next sweep, the reaper's or a test's own
+/// (`sweep_artifact_quarantine_for_test`) — the shipping expiry path, only the
+/// deadline moved. Every other test's entry keeps its own.
+fn end_quarantine(ticket: u64) {
+    let quarantine = artifact_reply_quarantine();
+    let mut entries = quarantine
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries
+        .iter_mut()
+        .find(|entry| entry.ticket == ticket)
+        .expect("the quarantine is still held")
+        .until = std::time::Instant::now();
+    quarantine.changed.notify_one();
+}
+
 /// The reaper owes cleanup a later capture waits on, so it never takes the
 /// starvable class. Only a starved host would otherwise notice a revert.
 #[test]
@@ -948,6 +984,7 @@ fn the_quarantine_sweep_never_releases_a_guard_before_its_deadline() {
             prepared: Arc::new(AtomicBool::new(false)),
             fail_prepare: false,
         }),
+        ticket: 0,
     }];
     let early = ArtifactReplyQuarantine::take_expired(
         &mut entries,
@@ -1741,34 +1778,24 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
     client.write_all(b"ACK wrong\n").unwrap();
     client.flush().unwrap();
     let mut reader = BufReader::new(&server);
-    let quarantine = std::time::Duration::from_millis(200);
-    let waited = std::time::Instant::now();
     assert_eq!(
-        await_guarded_reply_close_with_quarantine(&server, &mut reader, pending, quarantine),
+        await_guarded_reply_close_with_quarantine(&server, &mut reader, pending, HELD_QUARANTINE),
         ArtifactAckOutcome::AcknowledgementQuarantined
     );
-    // Read as the wait returns. The guard is quarantined or, on a stalled machine,
-    // already reaped; a guard gone before its quarantine could expire was
-    // released, not quarantined.
+    let ticket = last_quarantine_ticket();
+    // The guard is in quarantine whenever this thread gets to look: its grace
+    // ends only when this test ends it ([`HELD_QUARANTINE`]).
     let quarantined_drive = crate::artifact_transaction_conformance::ArtifactReplyObservation {
         phase: 7,
         ack_failed: true,
         ..Default::default()
     };
     let ack_failed = reply_successor(&model, "AcknowledgeFailed", &written);
-    if crate::control_auth::artifact_lease_registry_for_test(&path).is_some() {
-        let quarantined =
-            observe_capture_reply(&model, &path, &path, &wire, &body, quarantined_drive);
-        assert_eq!(
-            quarantined, ack_failed,
-            "a failed ACK transfers the guard to quarantine"
-        );
-    } else {
-        assert!(
-            waited.elapsed() >= quarantine,
-            "the failed ACK's guard was released before its quarantine could expire"
-        );
-    }
+    let quarantined = observe_capture_reply(&model, &path, &path, &wire, &body, quarantined_drive);
+    assert_eq!(
+        quarantined, ack_failed,
+        "a failed ACK transfers the guard to quarantine"
+    );
     let early_release = project_artifact_reply_with(&model, &ack_failed, |o| {
         o.phase = 11;
         o.guard = false;
@@ -1780,6 +1807,7 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
         &early_release,
         "failed or half-closed clients retain the guard for the full quarantine",
     );
+    end_quarantine(ticket);
     let deadline = std::time::Instant::now() + REAPER_PATIENCE;
     while crate::control_auth::artifact_lease_registry_for_test(&path).is_some() {
         assert!(
@@ -2554,12 +2582,13 @@ fn pre_pipelined_ack_guess_is_failed_and_quarantined() {
             .unwrap()
             .expect("guarded response");
         let mut reader = BufReader::new(&server);
-        await_guarded_reply_close_with_quarantine(
+        let outcome = await_guarded_reply_close_with_quarantine(
             &server,
             &mut reader,
             pending,
-            std::time::Duration::from_secs(1),
-        )
+            HELD_QUARANTINE,
+        );
+        (outcome, last_quarantine_ticket())
     });
 
     let mut reader = BufReader::new(&client);
@@ -2569,14 +2598,13 @@ fn pre_pipelined_ack_guess_is_failed_and_quarantined() {
     let mut challenge = String::new();
     reader.read_line(&mut challenge).unwrap();
     assert!(challenge.starts_with(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX));
-    assert_eq!(
-        worker.join().unwrap(),
-        ArtifactAckOutcome::AcknowledgementQuarantined
-    );
+    let (outcome, ticket) = worker.join().unwrap();
+    assert_eq!(outcome, ArtifactAckOutcome::AcknowledgementQuarantined);
     assert!(
         alive.load(Ordering::Acquire),
         "a pre-challenge guess must retain the exact guard in quarantine"
     );
+    end_quarantine(ticket);
 }
 
 #[test]
@@ -2600,12 +2628,13 @@ fn eager_request_half_close_is_ack_failure_not_peer_ack() {
             .unwrap()
             .expect("guarded response");
         let mut reader = BufReader::new(&server);
-        await_guarded_reply_close_with_quarantine(
+        let outcome = await_guarded_reply_close_with_quarantine(
             &server,
             &mut reader,
             pending,
-            std::time::Duration::from_millis(40),
-        )
+            HELD_QUARANTINE,
+        );
+        (outcome, last_quarantine_ticket())
     });
 
     let mut reader = BufReader::new(&client);
@@ -2615,8 +2644,9 @@ fn eager_request_half_close_is_ack_failure_not_peer_ack() {
     let mut challenge = String::new();
     reader.read_line(&mut challenge).unwrap();
     assert!(challenge.starts_with(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX));
+    let (outcome, ticket) = worker.join().unwrap();
     assert_eq!(
-        worker.join().unwrap(),
+        outcome,
         ArtifactAckOutcome::AcknowledgementQuarantined,
         "request EOF is never accepted as proof the response was consumed"
     );
@@ -2624,6 +2654,7 @@ fn eager_request_half_close_is_ack_failure_not_peer_ack() {
         alive.load(Ordering::Acquire),
         "an abandoned/invalid ACK path transfers the exact guard to quarantine"
     );
+    end_quarantine(ticket);
     let deadline = std::time::Instant::now() + REAPER_PATIENCE;
     while alive.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
         sweep_artifact_quarantine_for_test();
@@ -4195,6 +4226,15 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         // Settles 60 ms and folds the whole recording (`cast drift`).
         "cast drift",
         &format!("@{local_sid} cast drift max_runs=4"),
+        // A paste into another session waits, bounded, for its program to read
+        // it (`background_input`): never a request lane's wait. So does a
+        // `paste-bin` whatever it names: flagless, it takes the same wait when
+        // the caller's own tab is not on screen.
+        &format!("@{local_sid} paste hello"),
+        "@3 paste hello",
+        &format!("@{local_sid} paste-bin 5"),
+        "paste-bin 5",
+        "@. paste-bin 5",
     ] {
         assert!(
             is_wait_request(line, Scope::Owner, &store),
@@ -4224,6 +4264,12 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "status",
         "key enter",
         "send hello",
+        // A flagless paste goes to the App, which never waits on the program;
+        // and a key into another session, which never waits on it.
+        "paste hello",
+        "@. paste hello",
+        &format!("@{local_sid} key enter"),
+        &format!("@{local_sid} send hello"),
         "subscribe @. screen",
         // The bridge's and fleet's watch-everything subscription, a session
         // this instance hosts, and a list: each flips to push here.
@@ -6612,16 +6658,23 @@ fn cloexec_pipe() -> (i32, i32) {
 /// same `Arc`s the registry hands back, so cross-session resolution is real.
 #[cfg(unix)]
 fn pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, std::fs::File) {
+    let (rd, wr) = cloexec_pipe();
+    let rx = unsafe { std::fs::File::from_raw_fd(rd) };
+    // The write end doubles as the "master" for this headless test.
+    (session_on(local_id, wr), rx)
+}
+
+/// [`pipe_session`]'s session, writing to `master`.
+#[cfg(unix)]
+fn session_on(local_id: u64, master: i32) -> crate::session_store::SessionHandle {
     use crate::session_store::{SessionHandle, SessionState};
     use aterm_session::sink::SinkWriter;
     use aterm_session::{EdgeTable, LaunchNonce, SessionId};
-    let (rd, wr) = cloexec_pipe();
-    let rx = unsafe { std::fs::File::from_raw_fd(rd) };
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     let ctx = Arc::new(crate::SessionCtx {
-        sink: Arc::new(SinkWriter::new(wr)),
+        sink: Arc::new(SinkWriter::new(master)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: crate::mode_mirror_of(&term),
         ui_waiting: Arc::default(),
@@ -6650,7 +6703,7 @@ fn pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, std::fs:
         reset_lane: Default::default(),
         update_parked: Default::default(),
     });
-    let handle = SessionHandle {
+    SessionHandle {
         sid,
         nonce,
         local_id,
@@ -6658,11 +6711,10 @@ fn pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, std::fs:
         state: SessionState::Alive,
         title: String::new(),
         term,
-        master: wr, // the write end doubles as the "master" for this headless test
+        master,
         ctx,
         identity: None,
-    };
-    (handle, rx)
+    }
 }
 
 /// Read whatever a pipe has buffered without blocking when empty (sets the read end
@@ -7130,7 +7182,7 @@ fn cross_session_input_reaches_target_sink_not_self() {
     let unlogged_before_feed = crate::unseamed_control_inputs();
     assert_eq!(
         cross_raw_input(&term, ctx, feed_bytes("03").unwrap()),
-        InputOutcome::Ok
+        Ok(InputOutcome::Ok)
     );
     assert_eq!(
         drain_pipe(&target_rx),
@@ -7148,7 +7200,7 @@ fn cross_session_input_reaches_target_sink_not_self() {
     let unlogged_before_send = crate::unseamed_control_inputs();
     assert_eq!(
         cross_raw_input(&term, ctx, send_bytes("ls")),
-        InputOutcome::Ok
+        Ok(InputOutcome::Ok)
     );
     assert_eq!(
         drain_pipe(&target_rx),
@@ -12722,7 +12774,7 @@ fn cross_session_input_reports_a_dead_peer_as_write_failed() {
     kill_peer_in_kernel(h.master, "a cross-session send into a dead peer");
     assert_eq!(
         cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
-        InputOutcome::WriteFailed,
+        Ok(InputOutcome::WriteFailed),
         "raw send into a dead peer is a failed write"
     );
     assert_eq!(
@@ -12767,7 +12819,7 @@ fn a_stranger_holding_the_read_end_cannot_revive_a_kernel_killed_peer() {
     drop(rx);
     assert_eq!(
         cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
-        InputOutcome::Ok,
+        Ok(InputOutcome::Ok),
         "negative control: with a stranger on the read end the peer is NOT dead, \
          the bytes really land, and OK is the honest answer — this is the reading \
          a dropped reader alone can hand a dead-peer test"
@@ -12775,7 +12827,7 @@ fn a_stranger_holding_the_read_end_cannot_revive_a_kernel_killed_peer() {
     kill_peer_in_kernel(h.master, "a pipe-backed session whose reader is duplicated");
     assert_eq!(
         cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
-        InputOutcome::WriteFailed,
+        Ok(InputOutcome::WriteFailed),
         "the kernel-killed peer is dead while the stranger STILL holds its duplicate"
     );
     // SAFETY: this test's own duplicate, closed exactly once.
@@ -12960,6 +13012,217 @@ fn a_reading_stranger_voids_the_mid_write_paste_run() {
         run.reached_kernel,
         "the stranger drained the spill to the kernel"
     );
+}
+
+/// Run `write` on its own thread and return its answer, failing (instead of
+/// hanging the suite) if it has not answered within the hang detector: the
+/// verdict a control lane needs, since a write that parks parks the lane. A
+/// parked writer is left behind on failure; the caller's later peer close
+/// releases it.
+#[cfg(unix)]
+fn answered_without_parking<T: Send + 'static>(
+    what: &str,
+    write: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(write());
+    });
+    rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap_or_else(|_| {
+            panic!("{what}: the write parked its caller on a program that reads nothing")
+        })
+}
+
+/// Control input into a background session whose program reads nothing never
+/// parks the lane that serves it (2026-10-14). These arms wrote through the
+/// blocking egress, which waits for the program to read with no bound: eight
+/// `@<sid> paste`s into one stuck tab took every request lane, and every other
+/// client, `@<sid> signal` (the remedy) included, was answered busy for as long
+/// as the program did not read.
+///
+/// With the pipe full: `send` and `key` are queued behind it, accepted for
+/// delivery, and answered at once; a paste waits for its bytes to reach the
+/// program only up to its bound, then answers that they are queued unread; and
+/// at the session's input cap a write is refused, nothing written, with a reply
+/// that starts `ERR busy` (nothing to retry twice). Each fails, at the hang
+/// detector, against the blocking egress.
+#[test]
+#[cfg(unix)]
+fn background_input_into_a_program_that_reads_nothing_never_parks_the_lane() {
+    let (handle, reader) = pipe_session(76);
+    aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+    handle.ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected pipe fill result: {other:?}"),
+        }
+    }
+    let term = Arc::clone(&handle.term);
+    let ctx = Arc::clone(&handle.ctx);
+
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    let sent = answered_without_parking("send", move || cross_raw_input(&t, &c, send_bytes("ls")));
+    assert_eq!(sent, Ok(InputOutcome::Ok), "accepted for delivery");
+    assert!(
+        ctx.sink.spilled_bytes() >= 2,
+        "the bytes wait in the session's spill, for the program to read"
+    );
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    let key = answered_without_parking("key", move || {
+        cross_input(&t, &c, parse_key("enter"), "ERR\n")
+    });
+    assert_eq!(key, "OK\n");
+
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    let paste = answered_without_parking("paste", move || {
+        background_input(
+            &t,
+            &c,
+            &InputEvent::Paste("pasted".into(), PasteFraming::AtDrain),
+            std::time::Duration::ZERO,
+        )
+    });
+    assert_eq!(
+        paste,
+        Err(PASTE_UNREAD.to_string()),
+        "a paste the program has not read is in doubt, never OK or busy"
+    );
+
+    // A paste whose caller hangs up stops waiting then, whatever its bound.
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    let hung_up = answered_without_parking("paste whose caller hung up", move || {
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let _serving = ServingFd::enter(&server);
+        drop(client);
+        background_input(
+            &t,
+            &c,
+            &InputEvent::Paste("pasted".into(), PasteFraming::AtDrain),
+            std::time::Duration::from_secs(1),
+        )
+    });
+    assert_eq!(hung_up, Err(HUNG_UP_REPLY.to_string()));
+
+    // One frame takes the spill past its cap; the next write is refused whole.
+    let cap = vec![b'x'; aterm_session::sink::SinkWriter::SPILL_CAP];
+    let accepted = ctx
+        .sink
+        .write_frame_interactive_with_receipt(&cap)
+        .expect("the frame that reaches the cap is accepted")
+        .accepted();
+    assert_eq!(accepted, cap.len());
+    let spilled = ctx.sink.spilled_bytes();
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    let refused = answered_without_parking("key at the cap", move || {
+        cross_input(&t, &c, parse_key("enter"), "ERR\n")
+    });
+    assert_eq!(refused, INPUT_QUEUE_FULL);
+    assert!(
+        refused.starts_with("ERR busy"),
+        "a driver's back-off retries it"
+    );
+    assert_eq!(
+        ctx.sink.spilled_bytes(),
+        spilled,
+        "a refused write accepts nothing"
+    );
+    drop(reader);
+}
+
+/// A background paste's `OK` is a kernel receipt, so one whose queued bytes a
+/// discard drops while it waits (`signal`'s, `reset flush`) is never `OK`: the
+/// drain fence reads the emptied spill as drained, and the paste was answered
+/// `OK` though the program never got it. Now it is `ERR write failed`, in doubt.
+///
+/// On a raw pty nobody reads (a discard measures the tty's queue: macOS only),
+/// whose two ends the test leaks, as [`pipe_session`] leaks its write end.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_background_paste_a_discard_drops_is_never_ok() {
+    let (master, _slave) = crate::input_stall::tests::raw_pty_pair();
+    let handle = session_on(78, master);
+    handle.ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected tty fill result: {other:?}"),
+        }
+    }
+    let (term, ctx) = (Arc::clone(&handle.term), Arc::clone(&handle.ctx));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
+    std::thread::spawn(move || {
+        let _ = tx.send(background_input(
+            &t,
+            &c,
+            &InputEvent::Paste("dropped".into(), PasteFraming::AtDrain),
+            aterm_spec::wait::MUST_HAPPEN,
+        ));
+    });
+    let queued = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(1),
+        || (ctx.sink.spilled_bytes() > 0).then_some(()),
+    );
+    assert!(queued.is_some(), "the paste was never queued");
+    assert!(
+        ctx.sink
+            .discard_unread_input(aterm_session::sink::Discard::Flush)
+            .is_some(),
+        "the discard ran"
+    );
+    assert_eq!(
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(Ok(InputOutcome::WriteFailed)),
+        "a paste the discard dropped was answered as delivered"
+    );
+}
+
+/// A wheel writes one report per notch. Cut short at the session's input cap
+/// after its first notch went, it is a failed write (`ERR write failed`), never
+/// `ERR busy … nothing written`: a driver retrying that would scroll the
+/// notches that went twice. Once nothing goes, it is refused busy.
+#[test]
+#[cfg(unix)]
+fn a_wheel_cut_short_at_the_input_cap_is_not_answered_nothing_written() {
+    let (handle, reader) = pipe_session(79);
+    aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+    handle.ctx.sink.note_master_nonblocking(true);
+    loop {
+        match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+            Ok(n) if n > 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("unexpected pipe fill result: {other:?}"),
+        }
+    }
+    let (term, ctx) = (&handle.term, &handle.ctx);
+    // SGR mouse tracking: a wheel notch is a report.
+    term_lock(term).process(b"\x1b[?1000h\x1b[?1006h");
+    let below = vec![b'x'; aterm_session::sink::SinkWriter::SPILL_CAP - 1];
+    let accepted = ctx
+        .sink
+        .write_frame_interactive_with_receipt(&below)
+        .expect("a frame below the cap is accepted")
+        .accepted();
+    assert_eq!(accepted, below.len());
+    let before = ctx.sink.spilled_bytes();
+    assert_eq!(
+        cross_mouse_apply(term, ctx, "wheeldown left 2 4 lines=3"),
+        Err("ERR write failed\n".to_string())
+    );
+    let report = ctx.sink.spilled_bytes() - before;
+    assert!(report > 0, "the first notch went");
+    assert_eq!(
+        cross_mouse_apply(term, ctx, "wheeldown left 2 4 lines=3"),
+        Err(INPUT_QUEUE_FULL.to_string()),
+        "at the cap nothing goes"
+    );
+    assert_eq!(ctx.sink.spilled_bytes() - before, report);
+    drop(reader);
 }
 
 /// The shipping binary-frame parser and native input dispatcher compose through to

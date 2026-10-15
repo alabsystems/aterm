@@ -377,7 +377,7 @@ impl Real {
         let engine = engine.map(Path::to_path_buf).unwrap_or_else(|| {
             std::env::var_os("PUBLICATION_ENGINE")
                 .filter(|v| !v.is_empty())
-                .map_or_else(|| atpkg::devroot::publication_engine(&home), PathBuf::from)
+                .map_or_else(|| home.join("publication"), PathBuf::from)
         });
         // a relative engine names one place, the one it named where the release started
         let engine = std::env::current_dir().map_or_else(
@@ -3541,7 +3541,7 @@ mod tests {
 
     /// `--engine` reaches every child: the cut, the stage and `pub publish`'s
     /// pre-promote (`ship check`) read the one engine ledger the release judged, never
-    /// `~/Developer/publication` by default.
+    /// `~/publication` by default.
     #[test]
     fn the_engine_the_release_judges_is_the_one_every_child_reads() {
         let dir = aterm_tempfile::tempdir().unwrap();

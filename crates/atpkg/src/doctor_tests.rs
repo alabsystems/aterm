@@ -4126,7 +4126,8 @@ fn plist_bundle_version_reads_only_the_string_bound_to_the_key() {
     );
     assert_eq!(plist_bundle_version("<plist/>"), None);
 }
-/// One `doctor` run over `home` with `probes`: whether it was healthy, and its stdout.
+
+/// `run_with` over `probes` at a fixed clock: whether the report is healthy, and its words.
 fn doctor_over(l: &Layout, home: &Path, probes: &Probes) -> (bool, String) {
     let path = std::env::join_paths([l.bin_dir()]).unwrap();
     let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
@@ -4146,108 +4147,63 @@ fn doctor_over(l: &Layout, home: &Path, probes: &Probes) -> (bool, String) {
     (ok, String::from_utf8_lossy(&out).into_owned())
 }
 
-/// THE `devroot` ROW: a checkout under `$HOME` outside `~/Developer` is named with the
-/// verb that moves it — a NOTE while there is no `~/Developer` (a Mac that keeps its code
-/// elsewhere is not unhealthy), a WARNING once there is — advisory either way, so the exit
-/// stays healthy; once it is inside, the row says every checkout is. It says what to do
-/// about Spotlight, never that the root is skipped (the `spotlight:` row measures that).
-/// Dot-folders and `Library` are never read. macOS only: the root is a Spotlight
-/// arrangement.
-#[cfg(target_os = "macos")]
+/// THE `devtools` ROW: aterm not on macOS's Developer Tools list is a WARNING the default
+/// report counts and shortens to the fact and the fix (never a structural problem: the
+/// exit stays healthy); on the list is `ok`; a report that does not read the machine says
+/// nothing.
 #[test]
-fn the_devroot_row_names_checkouts_outside_the_root() {
-    let l = layout("devroot");
+fn the_devtools_row_is_a_counted_warning_with_the_owners_fix() {
+    use aterm_containment::consent::{
+        DevToolList, DevToolListLabel, DevToolListing, DevToolProbe, DevToolProbeLabel,
+    };
+    let l = layout("devtools-row");
     install(&l, "ay", 19);
-    let home = synthetic_home("devroot");
-    std::fs::create_dir_all(home.join("proj/.git")).unwrap();
-    let (ok, out) = doctor_over(&l, &home, &Probes::default());
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("doctor: note — devroot: 1 git checkout outside ~/Developer (~/proj)"),
-        "no ~/Developer yet: a note\n{out}"
-    );
-    std::fs::create_dir_all(home.join("Developer/inside/.git")).unwrap();
-    std::fs::create_dir_all(home.join(".hidden/repo/.git")).unwrap();
-    std::fs::create_dir_all(home.join("Library/repo/.git")).unwrap();
-    let (ok, out) = doctor_over(&l, &home, &Probes::default());
-    assert!(ok, "a checkout outside the root is advisory:\n{out}");
-    assert!(
-        out.contains(
-            "doctor: warn — devroot: 1 git checkout outside ~/Developer (~/proj) — \
-             ~/Developer is the one folder to add to System Settings \u{25b8} Spotlight \
-             \u{25b8} Search Privacy (`spotlight:` measures whether Spotlight skips it); now: \
-             `aterm pkg devroot`"
-        ),
-        "{out}"
-    );
-    assert!(
-        !out.contains("kept out of Spotlight"),
-        "the row never says what only the measurement can:\n{out}"
-    );
-    std::fs::rename(home.join("proj"), home.join("Developer/proj")).unwrap();
-    let (ok, out) = doctor_over(&l, &home, &Probes::default());
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("doctor: ok — devroot: all 2 git checkouts under ~ are in ~/Developer"),
-        "{out}"
-    );
-    assert!(
-        !out.contains("spotlight:"),
-        "a report that does not measure says nothing about Spotlight:\n{out}"
-    );
-    let _ = std::fs::remove_dir_all(&l.prefix);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// THE `spotlight` ROW decides from the MEASURED verdict alone: excluded is `ok`, indexed
-/// is a `warn` whose fix is the one owner action (the Search Privacy list), an
-/// unmeasured answer is a `note` that never claims either — and none of them is a
-/// failure.
-#[test]
-fn the_spotlight_row_decides_from_the_measured_verdict() {
-    use crate::devroot::Spotlight;
-    use crate::noindex::{Unmeasured, Verdict};
-    let l = layout("spotlight-row");
-    install(&l, "ay", 19);
-    let home = synthetic_home("spotlight-row");
-    let with = |s: Spotlight| Probes {
-        spotlight: Some(s),
+    let home = synthetic_home("devtools-row");
+    let with = |listing: DevToolListing| Probes {
+        devtools: Some(crate::devtools::Facts {
+            subject: Some("com.aterm.aterm".to_string()),
+            list: DevToolList {
+                listing,
+                label: DevToolListLabel::Read,
+                modified_at_s: (listing != DevToolListing::Absent).then_some(1),
+                rows: Some(1),
+            },
+            log: DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest),
+            other_responsible: None,
+        }),
         ..Probes::default()
     };
-    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(Verdict::Excluded)));
-    assert!(ok, "{out}");
+    let (ok, out) = doctor_over(&l, &home, &with(DevToolListing::Absent));
     assert!(
-        out.contains("doctor: ok — spotlight: ~/Developer is skipped by Spotlight (measured"),
-        "{out}"
+        ok,
+        "not being on the list is advisory, never structural:\n{out}"
     );
-    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(Verdict::Indexed)));
-    assert!(ok, "an indexed root is advisory, never structural:\n{out}");
     assert!(
         out.contains(
-            "doctor: warn — spotlight: Spotlight indexes ~/Developer (measured: the probe was \
-             found) — fix: add ~/Developer to System Settings \u{25b8} Spotlight \u{25b8} \
-             Search Privacy"
+            "doctor: warn — devtools: aterm (com.aterm.aterm) is not on System Settings \
+             \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} macOS holds every \
+             new program it starts for a first-run check"
         ),
         "{out}"
     );
-    let unknown = Verdict::Unknown(Unmeasured::ControlNeverIndexed { waited_secs: 20 });
-    let (ok, out) = doctor_over(&l, &home, &with(Spotlight::Measured(unknown)));
+    let shown = present(&out, "", "doctor", Detail::Problems).joined();
+    assert!(
+        shown.contains(
+            "doctor: warn \u{2014} devtools: aterm (com.aterm.aterm) is not on System Settings \
+             \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} fix: switch aterm on \
+             under Developer Tools\n"
+        ),
+        "the default report keeps the row whole, fact and fix, counted:\n{shown}"
+    );
+    assert!(shown.contains("thing(s) to look at"), "{shown}");
+    let (ok, out) = doctor_over(&l, &home, &with(DevToolListing::On));
     assert!(ok, "{out}");
     assert!(
-        out.contains("doctor: note — spotlight: unknown — the control was not indexed"),
+        out.contains("doctor: ok — devtools: aterm (com.aterm.aterm) is on System Settings"),
         "{out}"
     );
-    let (_, out) = doctor_over(&l, &home, &with(Spotlight::NoRoot));
-    assert!(
-        out.contains("doctor: note — spotlight: ~/Developer does not exist yet"),
-        "{out}"
-    );
-    let (_, out) = doctor_over(
-        &l,
-        &home,
-        &with(Spotlight::Measured(Verdict::NotApplicable)),
-    );
-    assert!(!out.contains("spotlight:"), "no Spotlight, no row:\n{out}");
+    let (_, out) = doctor_over(&l, &home, &Probes::default());
+    assert!(!out.contains("devtools:"), "no reading, no row:\n{out}");
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -5871,28 +5827,15 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
 /// under the same verdict.
 #[test]
 fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
-    // The longest row a real report carries: the developer root's, with checkouts past
-    // the ones it names.
-    let home = std::path::PathBuf::from("/Users//x");
-    let survey = crate::devroot::Survey {
-        root: crate::devroot::root(&home),
-        root_is: crate::devroot::RootIs::Folder,
-        outside: ["aterm", "aterm-wa-devroot", "trust", "ay", "publication"]
-            .map(|name| crate::devroot::Checkout {
-                path: home.join(name),
-                common: home.join(name).join(".git"),
-                linked: false,
-            })
-            .to_vec(),
-        inside: Vec::new(),
-        home,
-    };
-    let row = crate::devroot::devroot_row(&survey);
-    assert_eq!(row.level, crate::devroot::Level::Warn);
-    let devroot = format!("doctor: warn \u{2014} devroot: {}", row.text);
+    // A long row a real report carries: its fact, a reason past the width, and the next
+    // step at its end.
+    let unreached = "doctor: warn — the signed index has not been reached for 10 day(s): \
+         the last pass failed: could not fetch https://github.com/alabsystems/aterm/releases/\
+         download/index/index.toml (connection timed out after 30 s, retried 3 times) — now: \
+         aterm pkg update";
     assert!(
-        devroot.chars().count() > SHORT_ROW,
-        "the row must be cut: {devroot}"
+        unreached.chars().count() > SHORT_ROW,
+        "the row must be cut: {unreached}"
     );
     let path_row = "doctor: warn — managed bin/ is not on PATH here; a new aterm shell \
          adds it, or add: export PATH=\"$PATH:/Users//someone-with-a-long-name/Library/\
@@ -5918,7 +5861,7 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
          doctor: ok — prefix /p\n\
          doctor: warn — no index update pass has completed yet — run: aterm pkg update\n\
          doctor: note — Trust builds use the ay pinned inside the trust bundle\n\
-         {devroot}\n\
+         {unreached}\n\
          doctor: 12 program(s) active\n\
          doctor: healthy\n"
     );
@@ -5934,8 +5877,8 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     );
     assert_eq!(
         lines[2],
-        "doctor: warn — devroot: 5 git checkouts outside ~/Developer (~/aterm, \
-         ~/aterm-wa-devroot, $HOME/trust, +2 more) — run `aterm pkg devroot`",
+        "doctor: warn — the signed index has not been reached for 10 day(s): the last pass \
+         failed: could not fetch https://github.com/alabsystems… — run aterm pkg update",
         "the fact and its next step survive the cut"
     );
     assert_eq!(
@@ -5955,7 +5898,7 @@ fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
     let all = present(&report, "", "doctor", Detail::Everything).joined();
     assert!(all.starts_with("doctor: working — 12 program(s)"), "{all}");
     assert!(
-        all.contains("doctor: ok — prefix /p") && all.contains(&devroot),
+        all.contains("doctor: ok — prefix /p") && all.contains(unreached),
         "{all}"
     );
     assert!(!all.contains("doctor: healthy"), "{all}");

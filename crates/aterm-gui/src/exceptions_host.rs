@@ -497,14 +497,6 @@ impl App {
                 self.except_clear(message_reporters::DISK_SETTINGS_KEY);
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
             }
-            // The developer root: raised while a measurement finds Spotlight
-            // indexing it, ended by the one that finds it skipped. An unmeasured
-            // look (`None`) leaves the line as the last measurement left it.
-            HostNote::DevRoot { indexed } => match indexed {
-                Some(true) => self.except(&message_reporters::devroot_indexed_entry()),
-                Some(false) => self.except_clear(message_reporters::DEVROOT_INDEXED_KEY),
-                None => {}
-            },
             HostNote::UpgradeCannotRun { sid, step, dir } => {
                 self.host_noted.insert(format!("upgrade:{sid}"));
                 self.except(&message_reporters::upgrade_cannot_run_entry(

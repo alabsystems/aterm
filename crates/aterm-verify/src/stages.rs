@@ -1346,7 +1346,7 @@ fn guard_ran_to_end(name: &str) -> crate::differential::RanToEnd {
 pub const EXPORT_CONTENT_SCRIPT: &str = "export-content-scan.py";
 
 /// The scan's not-run code: no publication engine checkout (`$PUBLICATION_ENGINE`,
-/// else `~/Developer/publication` (`~/publication` until it moves there)) or no `gitleaks`. Read like the Codex lane's `77`
+/// else `~/publication`) or no `gitleaks`. Read like the Codex lane's `77`
 /// ([`export_content_outcome`]).
 pub const EXPORT_CONTENT_NOT_RUN: i32 = 77;
 

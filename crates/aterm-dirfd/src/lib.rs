@@ -14,11 +14,16 @@
 //!
 //! So the contract of this crate is narrow and strict:
 //!
-//! * Every entry point takes a directory descriptor plus ONE name, and issues
-//!   the `*at` syscall for it. No wrapper here ever joins, canonicalizes, walks
-//!   or re-opens a path.
+//! * Every entry point takes a directory descriptor plus a NAME (or the `/` and
+//!   `.` paths `PinnedDir`'s chain opens), and issues the `*at` syscall for it.
+//!   No wrapper here ever joins, canonicalizes, walks or re-opens a path.
+//!   [`Arg`] checks NUL only; it does NOT check that a name is one component,
+//!   so a caller taking a name from elsewhere judges it first (ruling
+//!   2026-10-10, FS-1: see [`Arg`]).
 //! * No entry point follows a symlink on its own initiative; whether links are
-//!   followed is the caller's [`OFlags`]/[`AtFlags`] decision, unchanged.
+//!   followed is the caller's [`OFlags`]/[`AtFlags`] decision, unchanged. Those
+//!   flags govern the FINAL component only: the kernel resolves every earlier
+//!   one, so `"link/"` reaches through the symlink `link`.
 //! * Errors are the raw `errno`, never collapsed into a boolean or an
 //!   `Option` — `remove_file_if_exists` distinguishes `ENOENT` from every other
 //!   failure, and a wrapper that lost that distinction would turn "permission
@@ -113,7 +118,17 @@ fn check(ret: libc::c_int) -> Result<()> {
 // Path arguments
 // ---------------------------------------------------------------------------
 
-/// Anything that can be handed to a `*at` syscall as one name.
+/// A name handed to a `*at` syscall, or one of the `/` and `.` paths
+/// `PinnedDir`'s chain opens (`openat(CWD, "/")`, `openat(leaf, ".")`).
+///
+/// It checks NUL only and does NOT check that a name is one component: any
+/// path passes. Ruling 2026-10-10 (FS-1): `Arg` stays able to carry those
+/// paths, so the one-name rule belongs to the caller. A caller taking a name
+/// from elsewhere judges it on its RAW bytes first (aterm-gui's
+/// `pinned_dir::validate_component`), never through `Path::components()`,
+/// which normalizes a trailing `/`, `/.` and `//` away. `O_NOFOLLOW`,
+/// `unlinkat` and `renameat` govern only the final component, so `"link/"`
+/// reaches through the symlink `link`.
 ///
 /// Implemented once, over `AsRef<OsStr>`, which covers `&str`, `&OsStr`,
 /// `&OsString`, `&Path` and `&PathBuf` — every shape the call sites use.

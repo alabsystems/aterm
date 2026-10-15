@@ -26,16 +26,19 @@
 //! O7). It runs Apple's own tool unprivileged, so macOS should raise its own
 //! administrator dialog (spike D2), which aterm never sees or answers.
 //!
-//! And one TCC service it reads only from `tccd`'s own log: the Privacy &
-//! Security ▸ Developer Tools list ([`DevToolState`], debugger design §9.1),
-//! which decides whether macOS checks each new program run in aterm before its
-//! first start. It never prompts, so only a human changes it, in System
-//! Settings.
+//! And one TCC service it reads twice over: the Privacy & Security ▸
+//! Developer Tools list (debugger design §9.1, O18), which decides whether
+//! macOS checks each new program run in aterm before its first start — from
+//! `tccd`'s own log ([`DevToolState`]: what tccd decided) and from the switch's
+//! row in the system `TCC.db` ([`DevToolListing`]: what the owner set), joined
+//! by [`devtool_grant`]. It never prompts, so only a human changes it, in
+//! System Settings.
 //!
 //! ## What this module deliberately does NOT do
 //!
 //! It never answers a consent dialog, never asks macOS for consent, never
-//! writes to `TCC.db`, and never touches the private write-side TCC SPI. The
+//! writes to a `TCC.db` (it reads one table's Developer Tools rows, read-only:
+//! [`probe_devtool_list`]), and never touches the private write-side TCC SPI. The
 //! only mutation it can describe is the §3.7 denied-state repair
 //! ([`ResetPlan`], [`tccutil_reset_command`]), and that is a pure command
 //! *builder* — it spawns nothing, and the argv it builds names the running
@@ -79,6 +82,10 @@
 //!   Developer Tools answers (`kTCCServiceDeveloperTool`), bounded, behind the
 //!   same gate and in-bundle fence as [`probe_fda`], with a constant argv. It
 //!   opens no `TCC.db` and asks `tccd` nothing.
+//! * [`probe_devtool_list`] — one `open(…, O_RDONLY)` of the SYSTEM `TCC.db`
+//!   (prompt-free as [`probe_fda`]'s), then at most one `/usr/bin/sqlite3
+//!   -readonly` with a constant argv, bounded, behind the same gate and
+//!   in-bundle fence. It writes nothing.
 //!
 //! And one that is not an observation: [`run_devtools_change`] — a fresh
 //! `-status` read (through [`probe_debugger`], so behind the same gate and
@@ -95,7 +102,7 @@
 //! On 2026-08-17 a unit test's first `WindowServer` touch made `tccd`
 //! `readdir` a 1.1-million-entry `target/debug/deps`; `WindowServer` outran its 40 s
 //! watchdog and was killed, taking every GUI session on the machine with it
-//! (`AGENTS.md` rule 5, `tools/grep_guard.sh` B9). The standing rule for the
+//! (`AGENTS.md`, `tools/grep_guard.sh` B9). The standing rule for the
 //! class is that a platform probe a headless-constructible path can reach must
 //! be gated, because a headless process is exactly what a unit test is.
 //!
@@ -438,7 +445,7 @@ where
 pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
     #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe().ok();
+        let exe = fence_exe();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         probe_fda_with(gate, exe.as_deref(), home.as_deref(), imp::open_probe)
     }
@@ -480,6 +487,40 @@ pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
     })
+}
+
+/// The executable the in-bundle fence judges, for [`probe_fda`],
+/// [`probe_debugger`] and [`probe_devtool`]: `std::env::current_exe()` when
+/// that is inside a `.app`, else the kernel's path for this process's image
+/// when that one is, else `current_exe()` again.
+///
+/// On macOS `current_exe()` is the `execve`-time string, so a program started
+/// through a symlink (`~/.local/bin/aterm` →
+/// `/Applications/aterm.app/Contents/MacOS/aterm`, the one name
+/// `tools/install.sh` lays) read as outside the bundle although the code
+/// running is the bundle's, and every probe refused: `aterm doctor` typed at a
+/// shell measured nothing (found 2026-10-14). The kernel's path
+/// (`proc_pidpath`, one syscall on this process's own pid, which reads no
+/// protected location and raises no dialog) names the image macOS attributes.
+/// The exec path still wins whenever it is bundled, so a window whose bundle an
+/// update renamed under it (`aterm.app.rollback`, [`ImageAnchor`]) is judged
+/// exactly as before, and a test binary under `target/` is outside a bundle by
+/// both paths, so the fence holds for it.
+#[must_use]
+pub fn fence_exe() -> Option<PathBuf> {
+    fence_exe_from(std::env::current_exe().ok(), &self_image())
+}
+
+/// [`fence_exe`], pure over the exec-time path and the kernel's answer.
+#[must_use]
+pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBuf> {
+    if exec.as_deref().is_some_and(path_is_in_app_bundle) {
+        return exec;
+    }
+    match image {
+        SelfImage::At(path) if path_is_in_app_bundle(path) => Some(path.clone()),
+        SelfImage::At(_) | SelfImage::NoPath | SelfImage::Unreadable => exec,
+    }
 }
 
 // The image anchor: can macOS still find the code this process's grants are
@@ -3482,7 +3523,7 @@ where
 pub fn probe_debugger(gate: ProbeGate) -> DebuggerProbe {
     #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe().ok();
+        let exe = fence_exe();
         probe_debugger_with(
             gate,
             exe.as_deref(),
@@ -3569,6 +3610,26 @@ pub fn log_store_readable() -> bool {
 /// How far back [`probe_devtool`] reads tccd's answers, in seconds. Must match
 /// the `--last` argument of [`DEVTOOL_LOG_ARGS`] (a test pins the two).
 pub const DEVTOOL_WINDOW_S: u64 = 600;
+
+/// Where a person adds aterm to the Developer Tools list, in words. The one
+/// spelling: the window's *Open Developer Tools…* route says it beside the pane
+/// it opens, and `aterm doctor`'s `devtools:` row prints it as the fix.
+pub const DEVTOOLS_SETTINGS_WORDS: &str =
+    "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools";
+
+/// The Developer Tools list through the modern Settings extension, at its
+/// registered `Privacy_DevTools` anchor (debugger design §9.1 O14). The one
+/// spelling: the window's menu opens it, and `aterm doctor` prints it for
+/// `open`. Opening it only navigates; nothing in aterm adds itself to the list.
+/// The scheme is `x-apple.systempreferences`, with a dot.
+pub const DEVTOOLS_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools";
+
+/// The same pane through its legacy pane id, which System Settings maps to the
+/// extension: the window's second try, and what `aterm doctor`'s `open` prints
+/// and runs (the spelling the owner gave, 2026-10-14). Opening it only navigates.
+pub const DEVTOOLS_SETTINGS_URL_LEGACY: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools";
 
 /// The constant predicate: tccd's Developer Tools answers, for every subject.
 /// The subject is never interpolated here; [`classify_devtool_log`] matches it.
@@ -4142,7 +4203,7 @@ where
 pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
     #[cfg(target_os = "macos")]
     {
-        let exe = std::env::current_exe().ok();
+        let exe = fence_exe();
         probe_devtool_with(
             gate,
             exe.as_deref(),
@@ -4159,6 +4220,485 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
         let _ = (gate, subject);
         unsupported_devtool_probe()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Developer Tools list — the switch, read from the system TCC.db
+// ---------------------------------------------------------------------------
+//
+// Owner ruling 2026-10-14 (debugger design §9.1, O18): "fix this everywhere
+// and it needs to be in aterm and doctor". tccd's log ([`probe_devtool`])
+// answers only after a new program starts, only within its 10-minute window
+// and only to an administrator, so a quiet machine or a standard account reads
+// `unknown` there. The switch the owner flips is a row of the SYSTEM TCC.db
+// ([`SYSTEM_TCC_DB`]): service `kTCCServiceDeveloperTool`, the app's bundle id
+// as `client` (`client_type` 0), `auth_value` 2 for on and 0 for off, and its
+// `last_modified` in unix seconds (schema read off macOS 26.6.2, 2026-10-14).
+//
+// [`probe_devtool_list`] reads it without a prompt and without writing: ONE
+// `open(…, O_RDONLY)` first, the call [`probe_fda`] makes (a responsible app
+// without Full Disk Access gets `EPERM`, and `kTCCServiceSystemPolicyAllFiles`
+// cannot prompt), then ONE bounded `/usr/bin/sqlite3` with a constant argv
+// ([`DEVTOOL_DB_ARGS`]): read-only, no `~/.sqliterc` (`-init /dev/null`), safe
+// mode, no symbolic link, and every client hex-encoded so no app's name can
+// forge a row. The subject is matched here, in Rust, never put into an argv.
+// sqlite opens the file read-only and takes a reader's lock only; the database
+// is in rollback-journal mode (`journal_mode` `delete`), so no `-wal` or
+// `-shm` file is created beside it.
+//
+// The row is the SWITCH, not tccd's decision: it holds the code requirement of
+// the copy that was added, and a copy that does not meet it is not answered
+// as the switch says. So [`devtool_grant`] lets tccd's own answer decide when
+// it is newer than the row's last change, and the switch otherwise.
+
+/// The system TCC database: the switches of Privacy & Security's lists that
+/// belong to the Mac rather than to one account, Developer Tools among them.
+/// Root-owned; a process can open it only while its responsible app holds Full
+/// Disk Access.
+pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
+
+/// The reader, named absolutely: Apple's own `sqlite3`, a platform binary
+/// (macOS does not check it before it starts).
+pub const SQLITE_TOOL: &str = "/usr/bin/sqlite3";
+
+/// The constant query: every Developer Tools row, its client hex-encoded.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DEVTOOL_DB_QUERY: &str = "SELECT hex(client), client_type, auth_value, last_modified \
+                                FROM access WHERE service = 'kTCCServiceDeveloperTool' \
+                                ORDER BY rowid;";
+
+/// The one argv the list probe runs after [`SQLITE_TOOL`]. RUNS NOTHING by
+/// itself. `-init /dev/null` because the shell otherwise reads `~/.sqliterc`,
+/// which could change the output mode or run commands; `-safe` refuses every
+/// command that touches another file; `-bail` exits non-zero on the first
+/// error; one `|`-separated line per row, no header.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DEVTOOL_DB_ARGS: [&str; 13] = [
+    "-init",
+    "/dev/null",
+    "-readonly",
+    "-safe",
+    "-nofollow",
+    "-batch",
+    "-bail",
+    "-noheader",
+    "-list",
+    "-separator",
+    "|",
+    SYSTEM_TCC_DB,
+    DEVTOOL_DB_QUERY,
+];
+
+/// The read measured 10 ms (2026-10-14, load 14). A lock tccd holds makes
+/// sqlite answer `SQLITE_BUSY` at once (no busy timeout is set), so the
+/// ceiling bounds only a wedged process.
+#[cfg(target_os = "macos")]
+const DEVTOOL_DB_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the Developer Tools list holds for the subject. The `list=` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DevToolListing {
+    /// A row with `auth_value` 2: listed, switched on.
+    On,
+    /// A row with `auth_value` 0: listed, switched off.
+    Off,
+    /// The list was read whole and holds no row for the subject.
+    Absent,
+    /// Not read, or read in a shape this classifier does not recognise. Never
+    /// rendered as `absent`.
+    #[default]
+    Unknown,
+}
+
+impl DevToolListing {
+    /// The `list=` token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The list probe's progress or outcome. The `list_probe=` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DevToolListLabel {
+    /// No current result: an asynchronous reader is waiting or refreshing.
+    Pending,
+    /// The database was read whole.
+    Read,
+    /// `open` answered `EPERM`: the responsible app does not hold Full Disk
+    /// Access, so macOS keeps the database closed to it. Nothing was spawned.
+    NoFullDiskAccess,
+    /// `open` failed with another errno. Nothing was spawned.
+    OpenFailed,
+    /// `sqlite3` exited non-zero or by a signal (a schema it does not know, a
+    /// lock, a damaged file).
+    ToolFailed,
+    /// `sqlite3` answered in a shape this classifier does not recognise.
+    FormatUnrecognized,
+    /// `sqlite3` did not finish within its ceiling.
+    TimedOut,
+    /// `sqlite3` could not be started.
+    SpawnFailed,
+    /// Its output was over the cap or not UTF-8, or its exit could not be read.
+    OutputUnreadable,
+    /// Refused: `[privacy] enabled` or `[privacy] check` is off. Nothing ran.
+    RefusedDisabled,
+    /// Refused: `[privacy] observer = false`, under which the window reads
+    /// neither half of the Developer Tools row. Nothing ran.
+    RefusedObserverOff,
+    /// Refused: the running executable is not inside a `.app` bundle (the
+    /// fence [`probe_fda_with`] keeps). Nothing ran.
+    RefusedOutOfBundle,
+    /// Refused: the running executable could not be resolved. Nothing ran.
+    RefusedNoExe,
+    /// Refused: there is no usable bundle identifier to match. Nothing ran.
+    RefusedNoSubject,
+    /// Not macOS: there is no such list here.
+    UnsupportedPlatform,
+}
+
+impl DevToolListLabel {
+    /// The `list_probe=` token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Read => "read",
+            Self::NoFullDiskAccess => "no_full_disk_access",
+            Self::OpenFailed => "open_failed",
+            Self::ToolFailed => "sqlite_failed",
+            Self::FormatUnrecognized => "format_unrecognized",
+            Self::TimedOut => "timed_out",
+            Self::SpawnFailed => "spawn_failed",
+            Self::OutputUnreadable => "output_unreadable",
+            Self::RefusedDisabled => "refused_disabled",
+            Self::RefusedObserverOff => "refused_observer_off",
+            Self::RefusedOutOfBundle => "refused_out_of_bundle",
+            Self::RefusedNoExe => "refused_no_exe",
+            Self::RefusedNoSubject => "refused_no_subject",
+            Self::UnsupportedPlatform => "unsupported_platform",
+        }
+    }
+
+    /// `true` for a deliberate refusal, including an unsupported platform:
+    /// nothing was opened and nothing spawned. [`Self::Pending`] is not one.
+    #[must_use]
+    pub const fn refused(self) -> bool {
+        matches!(
+            self,
+            Self::RefusedDisabled
+                | Self::RefusedObserverOff
+                | Self::RefusedOutOfBundle
+                | Self::RefusedNoExe
+                | Self::RefusedNoSubject
+                | Self::UnsupportedPlatform
+        )
+    }
+}
+
+/// One read of the Developer Tools list for one subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DevToolList {
+    /// The subject's row, classified.
+    pub listing: DevToolListing,
+    /// Why it reads so.
+    pub label: DevToolListLabel,
+    /// The row's `last_modified`, unix seconds: when the switch last changed.
+    /// `None` without a row.
+    pub modified_at_s: Option<i64>,
+    /// How many apps the list holds, the subject's row included. `None` unless
+    /// it was read whole. `Some(0)` is a Mac whose Settings shows no
+    /// Developer Tools pane yet (`spctl developer-mode enable-terminal` adds
+    /// Terminal to the list, and the pane appears with it).
+    pub rows: Option<u32>,
+}
+
+impl DevToolList {
+    /// No current reading.
+    #[must_use]
+    pub const fn pending() -> Self {
+        Self::refused(DevToolListLabel::Pending)
+    }
+
+    /// Nothing learned, for `label`'s reason.
+    #[must_use]
+    pub const fn refused(label: DevToolListLabel) -> Self {
+        Self {
+            listing: DevToolListing::Unknown,
+            label,
+            modified_at_s: None,
+            rows: None,
+        }
+    }
+}
+
+/// The list's answer on a platform with no such list: the whole probe off
+/// macOS, and compiled into every test build so it is tested everywhere.
+#[cfg(any(test, not(target_os = "macos")))]
+#[must_use]
+pub const fn unsupported_devtool_list() -> DevToolList {
+    DevToolList::refused(DevToolListLabel::UnsupportedPlatform)
+}
+
+/// One `sqlite3` row, `HEX(client)|client_type|auth_value|last_modified`, as
+/// `(client, client_type, auth_value, last_modified)`. `None` for any other
+/// shape: four fields, an even run of upper-case hex digits (sqlite's `hex()`),
+/// and three decimal integers. A client that is not UTF-8 decodes lossily; it
+/// cannot equal a subject made of ASCII ([`devtool_subject_is_usable`]).
+fn devtool_db_row(line: &str) -> Option<(String, u32, u32, i64)> {
+    let mut fields = line.split('|');
+    let (hex, kind, auth, modified) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if fields.next().is_some() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let decimal = |text: &str| {
+        (!text.is_empty() && text.len() <= 18 && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse::<i64>().ok())
+            .flatten()
+    };
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
+        .collect::<Option<Vec<u8>>>()?;
+    Some((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        u32::try_from(decimal(kind)?).ok()?,
+        u32::try_from(decimal(auth)?).ok()?,
+        decimal(modified)?,
+    ))
+}
+
+/// Classify one `sqlite3` run for `subject`. Pure.
+///
+/// * A run that did not exit with code 0 maps to its failure label.
+/// * Every line must be a row [`devtool_db_row`] reads; anything else is
+///   [`DevToolListLabel::FormatUnrecognized`] for the WHOLE read.
+/// * The subject's row is the one whose client is exactly `subject` with
+///   `client_type` 0 (a bundle id). None is [`DevToolListing::Absent`]; more
+///   than one, or an `auth_value` other than 2 or 0, is not recognised.
+#[must_use]
+pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
+    let stdout = match run {
+        ToolRun::Exited {
+            code: Some(0),
+            stdout,
+            ..
+        } => stdout,
+        ToolRun::Exited { .. } => return DevToolList::refused(DevToolListLabel::ToolFailed),
+        ToolRun::Absent | ToolRun::SpawnFailed => {
+            return DevToolList::refused(DevToolListLabel::SpawnFailed);
+        }
+        ToolRun::TimedOut => return DevToolList::refused(DevToolListLabel::TimedOut),
+        ToolRun::Unreadable => return DevToolList::refused(DevToolListLabel::OutputUnreadable),
+    };
+    let unrecognized = DevToolList::refused(DevToolListLabel::FormatUnrecognized);
+    let mut ours: Option<(u32, i64)> = None;
+    let mut rows: u32 = 0;
+    for line in stdout.lines() {
+        let Some((client, kind, auth, modified)) = devtool_db_row(line) else {
+            return unrecognized;
+        };
+        rows = rows.saturating_add(1);
+        if kind != 0 || client != subject {
+            continue;
+        }
+        if ours.replace((auth, modified)).is_some() {
+            return unrecognized;
+        }
+    }
+    let Some((auth, modified)) = ours else {
+        return DevToolList {
+            listing: DevToolListing::Absent,
+            label: DevToolListLabel::Read,
+            modified_at_s: None,
+            rows: Some(rows),
+        };
+    };
+    let listing = match auth {
+        2 => DevToolListing::On,
+        0 => DevToolListing::Off,
+        _ => return unrecognized,
+    };
+    DevToolList {
+        listing,
+        label: DevToolListLabel::Read,
+        modified_at_s: Some(modified),
+        rows: Some(rows),
+    }
+}
+
+/// The list probe, with the executable, the `open` and the spawn injected —
+/// the seam every refusal is enforced at, and the one a test uses to prove a
+/// refusal opens and spawns nothing.
+///
+/// Refuses, calling neither closure, when the gate is closed, when there is no
+/// executable, when it is not inside a `.app` ([`probe_fda_with`]'s fence), or
+/// when `subject` is not [`devtool_subject_is_usable`]. Then `open_db` is
+/// called once with [`SYSTEM_TCC_DB`]: `EPERM` is
+/// [`DevToolListLabel::NoFullDiskAccess`] and any other errno
+/// [`DevToolListLabel::OpenFailed`], each without a spawn. Otherwise `spawn`
+/// is called exactly once, with [`SQLITE_TOOL`] and [`DEVTOOL_DB_ARGS`].
+#[cfg(any(target_os = "macos", test))]
+pub fn probe_devtool_list_with<O, S>(
+    gate: ProbeGate,
+    exe: Option<&Path>,
+    subject: &str,
+    open_db: O,
+    spawn: S,
+) -> DevToolList
+where
+    O: FnOnce(&Path) -> ProbeOutcome,
+    S: FnOnce(&str, &[&str]) -> ToolRun,
+{
+    if !gate.permits() {
+        return DevToolList::refused(DevToolListLabel::RefusedDisabled);
+    }
+    let Some(exe) = exe else {
+        return DevToolList::refused(DevToolListLabel::RefusedNoExe);
+    };
+    if !path_is_in_app_bundle(exe) {
+        return DevToolList::refused(DevToolListLabel::RefusedOutOfBundle);
+    }
+    if !devtool_subject_is_usable(subject) {
+        return DevToolList::refused(DevToolListLabel::RefusedNoSubject);
+    }
+    match open_db(Path::new(SYSTEM_TCC_DB)) {
+        ProbeOutcome::Ok => classify_devtool_db(&spawn(SQLITE_TOOL, &DEVTOOL_DB_ARGS), subject),
+        ProbeOutcome::Errno(ERRNO_EPERM) => {
+            DevToolList::refused(DevToolListLabel::NoFullDiskAccess)
+        }
+        ProbeOutcome::Errno(_) => DevToolList::refused(DevToolListLabel::OpenFailed),
+    }
+}
+
+/// Read the Developer Tools list's row for `subject`, the running bundle's
+/// identifier: one `open` of [`SYSTEM_TCC_DB`] and at most one
+/// `/usr/bin/sqlite3`, within a 5 s ceiling and a 1 MiB output cap.
+///
+/// Refuses, opening and spawning nothing, when the gate is off, the running
+/// executable is not inside a `.app` bundle, or `subject` is unusable. Off
+/// macOS it is [`unsupported_devtool_list`].
+#[must_use]
+pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = fence_exe();
+        probe_devtool_list_with(
+            gate,
+            exe.as_deref(),
+            subject,
+            imp::open_probe,
+            |program, args| {
+                let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+                run_bounded_exit(program, &args, DEVTOOL_DB_CEILING, TOOL_OUTPUT_MAX_BYTES)
+            },
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (gate, subject);
+        unsupported_devtool_list()
+    }
+}
+
+/// Whether the app is on the Developer Tools list, all evidence joined. The
+/// `grant=` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DevToolGrant {
+    /// Listed and switched on, or tccd allowed it, with nothing newer saying
+    /// otherwise: macOS should not hold the programs it starts for its
+    /// first-run check.
+    Granted,
+    /// Not listed, switched off, or tccd's newer answer did not allow it.
+    NotGranted,
+    /// Neither the list nor tccd's log could be read. Never reported as fine.
+    #[default]
+    Unknown,
+}
+
+impl DevToolGrant {
+    /// The `grant=` token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::NotGranted => "not_granted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Join the list's row and tccd's newest answer into one verdict. Pure.
+///
+/// * The row is the switch NOW, so an absent row decides `not_granted`
+///   whatever an older answer said (the owner may just have removed aterm).
+/// * A row that is on or off decides unless tccd answered after the row last
+///   changed: then tccd's answer, its effective decision for this identity,
+///   decides (a copy the row's requirement does not match, or a policy).
+/// * Without a read row, tccd's observed answer decides; without either,
+///   `unknown`.
+#[must_use]
+pub fn devtool_grant(list: &DevToolList, log: &DevToolProbe) -> DevToolGrant {
+    let tccd = match (log.label, log.state) {
+        (DevToolProbeLabel::Observed, DevToolState::Allowed) => {
+            Some((log.answered_at_ms, DevToolGrant::Granted))
+        }
+        (DevToolProbeLabel::Observed, DevToolState::Denied | DevToolState::Unlisted) => {
+            Some((log.answered_at_ms, DevToolGrant::NotGranted))
+        }
+        _ => None,
+    };
+    let switch = match (list.label, list.listing) {
+        (DevToolListLabel::Read, DevToolListing::On) => Some(DevToolGrant::Granted),
+        (DevToolListLabel::Read, DevToolListing::Off | DevToolListing::Absent) => {
+            Some(DevToolGrant::NotGranted)
+        }
+        _ => None,
+    };
+    // An absent row has no time of change: it is the switch as of this read.
+    if switch.is_some() && list.listing == DevToolListing::Absent {
+        return DevToolGrant::NotGranted;
+    }
+    match (switch, tccd) {
+        (Some(switch), Some((answered_at_ms, verdict))) => {
+            let changed_ms = list.modified_at_s.map(|s| s.saturating_mul(1_000));
+            match (answered_at_ms, changed_ms) {
+                (Some(at), Some(changed)) if at > changed => verdict,
+                _ => switch,
+            }
+        }
+        (Some(switch), None) => switch,
+        (None, Some((_, verdict))) => verdict,
+        (None, None) => DevToolGrant::Unknown,
+    }
+}
+
+/// `CFBundleIdentifier` of the bundle at `root`, read as `CFBundle` reads it,
+/// or `None`: the bundle or its `Info.plist` lies under a protected root (as
+/// spelled or once resolved), or names no identifier. No `codesign`.
+#[must_use]
+pub fn bundle_id_of(root: &Path, protected: &[PathBuf]) -> Option<String> {
+    let plist = root.join("Contents").join("Info.plist");
+    if !census_may_read(root, protected) || !census_may_read(&plist, protected) {
+        return None;
+    }
+    read_info_plist(&plist).and_then(|info| info.bundle_id)
 }
 
 /// A strict reader for one line of `log show --style ndjson`: one JSON value
@@ -6970,6 +7510,42 @@ mod tests {
             "a bundle under a protected root is not read"
         );
         assert_eq!(list_root(&tmp.path().join("nowhere")), Listing::Missing);
+    }
+
+    /// The fence's executable: the exec path when it is bundled (a window an
+    /// update renamed under it is judged as before), the kernel's image path
+    /// when only that is (a launch through `~/.local/bin/aterm`), and the exec
+    /// path otherwise, so a test binary stays outside the fence.
+    #[test]
+    fn the_fence_judges_the_bundled_image_behind_a_launch_symlink() {
+        let exec = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+        let rolled = PathBuf::from("/Applications/aterm.app.rollback/Contents/MacOS/aterm");
+        let link = PathBuf::from("/Users//a/.local/bin/aterm");
+        let test_bin = PathBuf::from("/Users//a/aterm/target/debug/deps/aterm_cli-abc");
+        let at = |p: &PathBuf| SelfImage::At(p.clone());
+
+        assert_eq!(
+            fence_exe_from(Some(link.clone()), &at(&exec)),
+            Some(exec.clone())
+        );
+        assert_eq!(
+            fence_exe_from(Some(exec.clone()), &at(&rolled)),
+            Some(exec.clone())
+        );
+        assert_eq!(fence_exe_from(None, &at(&exec)), Some(exec.clone()));
+        for image in [at(&test_bin), SelfImage::NoPath, SelfImage::Unreadable] {
+            assert_eq!(
+                fence_exe_from(Some(test_bin.clone()), &image),
+                Some(test_bin.clone())
+            );
+            assert_eq!(
+                fence_exe_from(Some(link.clone()), &image),
+                Some(link.clone())
+            );
+        }
+        assert_eq!(fence_exe_from(None, &SelfImage::Unreadable), None);
+        // This test binary is outside a bundle by both paths: the fence holds.
+        assert!(!fence_exe().is_some_and(|exe| path_is_in_app_bundle(&exe)));
     }
 
     /// The image anchor as a table: every arm, classified from the kernel's
@@ -9806,6 +10382,470 @@ mod tests {
         assert_eq!(DEVTOOL_WINDOW_S, 600);
         assert!(!SpikeEvidence::UNMEASURED.devtool_answer_shapes_measured);
         assert!(!SpikeEvidence::UNMEASURED.devtool_skips_first_run_check);
+    }
+
+    // -- the Developer Tools list's row in the system TCC.db ----------------
+
+    /// `sqlite3`'s line for one row: the client as sqlite's `hex()` spells it.
+    fn db_row(client: &str, kind: u32, auth: u32, modified: i64) -> String {
+        let hex: String = client.bytes().map(|b| format!("{b:02X}")).collect();
+        format!("{hex}|{kind}|{auth}|{modified}")
+    }
+
+    fn db_of(rows: &[String]) -> ToolRun {
+        let mut stdout = rows.join("\n");
+        if !rows.is_empty() {
+            stdout.push('\n');
+        }
+        exited(Some(0), &stdout, "")
+    }
+
+    fn listed(listing: DevToolListing, modified_at_s: Option<i64>) -> DevToolList {
+        listed_of(listing, modified_at_s, 1)
+    }
+
+    fn listed_of(listing: DevToolListing, modified_at_s: Option<i64>, rows: u32) -> DevToolList {
+        DevToolList {
+            listing,
+            label: DevToolListLabel::Read,
+            modified_at_s,
+            rows: Some(rows),
+        }
+    }
+
+    /// The rows captured on 2026-10-14 (macOS 26.6.2), before and after the
+    /// owner pressed + and switched aterm on: Terminal listed off, then both on.
+    #[test]
+    fn the_list_classifier_reads_only_the_subjects_bundle_row() {
+        let unrecognized = DevToolList::refused(DevToolListLabel::FormatUnrecognized);
+        // The captured lines, verbatim.
+        let before = "636F6D2E6170706C652E5465726D696E616C|0|0|1781819370\n";
+        let after = "636F6D2E6170706C652E5465726D696E616C|0|2|1792020639\n\
+                     636F6D2E617465726D2E617465726D|0|2|1792020637\n";
+        assert_eq!(
+            classify_devtool_db(&exited(Some(0), before, ""), ATERM),
+            listed(DevToolListing::Absent, None)
+        );
+        assert_eq!(
+            classify_devtool_db(&exited(Some(0), after, ""), ATERM),
+            listed_of(DevToolListing::On, Some(1_792_020_637), 2)
+        );
+        assert_eq!(
+            classify_devtool_db(&exited(Some(0), before, ""), "com.apple.Terminal"),
+            listed(DevToolListing::Off, Some(1_781_819_370))
+        );
+        for (name, rows, want) in [
+            (
+                "an empty list: no pane yet",
+                vec![],
+                listed_of(DevToolListing::Absent, None, 0),
+            ),
+            (
+                "switched on",
+                vec![db_row(ATERM, 0, 2, 5)],
+                listed(DevToolListing::On, Some(5)),
+            ),
+            (
+                "switched off",
+                vec![db_row(ATERM, 0, 0, 6)],
+                listed(DevToolListing::Off, Some(6)),
+            ),
+            (
+                "another app's row",
+                vec![db_row("com.example.other", 0, 2, 1)],
+                listed(DevToolListing::Absent, None),
+            ),
+            (
+                "a path client spelled as the id is not the bundle's row",
+                vec![db_row(ATERM, 1, 2, 1)],
+                listed(DevToolListing::Absent, None),
+            ),
+            (
+                "a longer id that starts with ours",
+                vec![db_row("com.aterm.aterm.dev", 0, 2, 1)],
+                listed(DevToolListing::Absent, None),
+            ),
+            (
+                "a client that only contains ours",
+                vec![db_row("x|0|2|9\ncom.aterm.aterm", 0, 2, 1)],
+                listed(DevToolListing::Absent, None),
+            ),
+            (
+                "rows are counted whoever they name",
+                vec![db_row("a.b", 0, 0, 1), db_row("/bin/x", 1, 2, 1)],
+                listed_of(DevToolListing::Absent, None, 2),
+            ),
+            (
+                "two rows for the subject",
+                vec![db_row(ATERM, 0, 2, 1), db_row(ATERM, 0, 0, 2)],
+                unrecognized,
+            ),
+            (
+                "an auth value that is neither on nor off",
+                vec![db_row(ATERM, 0, 3, 1)],
+                unrecognized,
+            ),
+            ("unknown", vec![db_row(ATERM, 0, 1, 1)], unrecognized),
+        ] {
+            assert_eq!(classify_devtool_db(&db_of(&rows), ATERM), want, "{name}");
+        }
+        // Any line that is not a row spoils the whole read: a planted line
+        // can force `unknown`, never `on`.
+        let ours = db_row(ATERM, 0, 2, 1);
+        for bad in [
+            "com.aterm.aterm|0|2|1",
+            "636f6d2e617465726d2e617465726d|0|2|1",
+            "636F6D2E617465726D2E617465726D7|0|2|1",
+            "636F6D2E617465726D2E617465726D|0|2",
+            "636F6D2E617465726D2E617465726D|0|2|1|x",
+            "636F6D2E617465726D2E617465726D|0|2|",
+            "636F6D2E617465726D2E617465726D|-1|2|1",
+            "636F6D2E617465726D2E617465726D|0|+2|1",
+            "636F6D2E617465726D2E617465726D|0|2|1.5",
+            "636F6D2E617465726D2E617465726D|0|99999999999999999999|1",
+            "Error: in prepare, no such table: access",
+            "",
+        ] {
+            assert_eq!(
+                classify_devtool_db(&exited(Some(0), &format!("{ours}\n{bad}\n"), ""), ATERM),
+                unrecognized,
+                "{bad:?}"
+            );
+        }
+        for (run, label) in [
+            (
+                exited(Some(1), "", "Error: unable to open database"),
+                DevToolListLabel::ToolFailed,
+            ),
+            (exited(None, &ours, ""), DevToolListLabel::ToolFailed),
+            (ToolRun::Absent, DevToolListLabel::SpawnFailed),
+            (ToolRun::SpawnFailed, DevToolListLabel::SpawnFailed),
+            (ToolRun::TimedOut, DevToolListLabel::TimedOut),
+            (ToolRun::Unreadable, DevToolListLabel::OutputUnreadable),
+        ] {
+            assert_eq!(
+                classify_devtool_db(&run, ATERM),
+                DevToolList::refused(label),
+                "{run:?}"
+            );
+        }
+    }
+
+    /// Every refusal opens and spawns nothing; `EPERM` on the open is the
+    /// responsible app's missing Full Disk Access and spawns nothing either.
+    #[test]
+    fn the_list_probe_refuses_without_opening_or_spawning() {
+        let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
+        let never_open = |_: &Path| -> ProbeOutcome { panic!("a refusal opens nothing") };
+        let never_spawn =
+            |_: &str, _: &[&str]| -> ToolRun { panic!("a refusal must spawn nothing") };
+        let off = ProbeGate {
+            enabled: true,
+            check: false,
+        };
+        let refused = |label| DevToolList::refused(label);
+        assert_eq!(
+            probe_devtool_list_with(off, Some(&bundled), ATERM, never_open, never_spawn),
+            refused(DevToolListLabel::RefusedDisabled)
+        );
+        assert_eq!(
+            probe_devtool_list_with(ProbeGate::on(), None, ATERM, never_open, never_spawn),
+            refused(DevToolListLabel::RefusedNoExe)
+        );
+        assert_eq!(
+            probe_devtool_list_with(
+                ProbeGate::on(),
+                Some(Path::new(
+                    "/private/tmp/x/target/debug/deps/aterm_containment-abc"
+                )),
+                ATERM,
+                never_open,
+                never_spawn
+            ),
+            refused(DevToolListLabel::RefusedOutOfBundle)
+        );
+        assert_eq!(
+            probe_devtool_list_with(
+                ProbeGate::on(),
+                Some(&bundled),
+                "com.aterm.aterm|0|2",
+                never_open,
+                never_spawn
+            ),
+            refused(DevToolListLabel::RefusedNoSubject)
+        );
+        for (errno, label) in [
+            (ERRNO_EPERM, DevToolListLabel::NoFullDiskAccess),
+            (ERRNO_ENOENT, DevToolListLabel::OpenFailed),
+            (13, DevToolListLabel::OpenFailed),
+        ] {
+            assert_eq!(
+                probe_devtool_list_with(
+                    ProbeGate::on(),
+                    Some(&bundled),
+                    ATERM,
+                    |_| ProbeOutcome::Errno(errno),
+                    never_spawn
+                ),
+                refused(label),
+                "errno {errno}"
+            );
+        }
+        for label in [
+            DevToolListLabel::RefusedDisabled,
+            DevToolListLabel::RefusedObserverOff,
+            DevToolListLabel::RefusedOutOfBundle,
+            DevToolListLabel::RefusedNoExe,
+            DevToolListLabel::RefusedNoSubject,
+            DevToolListLabel::UnsupportedPlatform,
+        ] {
+            assert!(label.refused(), "{label:?}");
+        }
+        for label in [
+            DevToolListLabel::Pending,
+            DevToolListLabel::Read,
+            DevToolListLabel::NoFullDiskAccess,
+            DevToolListLabel::OpenFailed,
+        ] {
+            assert!(!label.refused(), "{label:?}");
+        }
+    }
+
+    /// Past the refusals the probe opens the system database once, then runs
+    /// exactly `SQLITE_TOOL` with the constant argv: read-only, no rc file,
+    /// safe mode, and the subject in no argument.
+    #[test]
+    fn the_list_probe_opens_once_and_spawns_only_the_sqlite_argv() {
+        let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
+        let subject = "com.example.subject";
+        let mut opened: Vec<PathBuf> = Vec::new();
+        let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+        let got = probe_devtool_list_with(
+            ProbeGate::on(),
+            Some(&bundled),
+            subject,
+            |db| {
+                opened.push(db.to_path_buf());
+                ProbeOutcome::Ok
+            },
+            |program, args| {
+                seen.push((
+                    program.to_string(),
+                    args.iter().map(|a| (*a).to_string()).collect(),
+                ));
+                db_of(&[db_row(subject, 0, 0, 7)])
+            },
+        );
+        assert_eq!(got, listed(DevToolListing::Off, Some(7)));
+        assert_eq!(opened, vec![p(SYSTEM_TCC_DB)]);
+        assert_eq!(
+            SYSTEM_TCC_DB,
+            "/Library/Application Support/com.apple.TCC/TCC.db"
+        );
+        assert_eq!(seen.len(), 1, "exactly one run");
+        let (program, args) = &seen[0];
+        assert_eq!(program, "/usr/bin/sqlite3");
+        assert_eq!(args, &DEVTOOL_DB_ARGS.map(str::to_string));
+        for flag in ["-readonly", "-safe", "-nofollow", "-bail"] {
+            assert!(args.iter().any(|a| a == flag), "{flag}");
+        }
+        assert_eq!(
+            args.iter().position(|a| a == "-init").map(|i| &args[i + 1]),
+            Some(&"/dev/null".to_string()),
+            "no ~/.sqliterc"
+        );
+        assert!(
+            args.iter().all(|a| !a.contains("example")),
+            "the subject never reaches an argv: {args:?}"
+        );
+        assert!(
+            DEVTOOL_DB_QUERY.contains("hex(client)")
+                && DEVTOOL_DB_QUERY.contains("'kTCCServiceDeveloperTool'")
+                && DEVTOOL_DB_QUERY.starts_with("SELECT "),
+            "a read of the Developer Tools rows only"
+        );
+    }
+
+    /// The real entry point refuses from this test binary: no open of the
+    /// system database, no `sqlite3`.
+    #[test]
+    fn the_real_list_probe_refuses_from_a_test_binary() {
+        let got = probe_devtool_list(ProbeGate::on(), ATERM);
+        assert!(got.label.refused(), "{got:?}");
+        assert_eq!(got.listing, DevToolListing::Unknown);
+        #[cfg(target_os = "macos")]
+        assert_eq!(got.label, DevToolListLabel::RefusedOutOfBundle);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(got.label, DevToolListLabel::UnsupportedPlatform);
+    }
+
+    /// The join, as a table: the switch decides unless tccd answered after it
+    /// last changed; an absent row is the switch now; `unknown` only when
+    /// neither source was read.
+    #[test]
+    fn the_grant_joins_the_switch_and_tccds_answer() {
+        use DevToolGrant::{Granted, NotGranted, Unknown};
+        let tccd = |state, at_ms: i64| DevToolProbe {
+            state,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(3),
+            not_allowed: Some(u32::from(state != DevToolState::Allowed) * 3),
+            answered_at_ms: Some(at_ms),
+        };
+        let quiet = DevToolProbe {
+            requests: Some(0),
+            not_allowed: Some(0),
+            ..DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest)
+        };
+        let no_log = DevToolProbe::refused(DevToolProbeLabel::LogUnavailable);
+        let unread = DevToolList::refused(DevToolListLabel::NoFullDiskAccess);
+        let on_at_100 = listed(DevToolListing::On, Some(100));
+        let off_at_100 = listed(DevToolListing::Off, Some(100));
+        let absent = listed(DevToolListing::Absent, None);
+        for (name, list, log, want) in [
+            ("on, nothing from tccd", on_at_100, quiet, Granted),
+            ("on, tccd unreadable", on_at_100, no_log, Granted),
+            ("off", off_at_100, quiet, NotGranted),
+            ("absent", absent, quiet, NotGranted),
+            // 2026-10-14: switched on at 16:30:37 after 96 unlisted answers.
+            (
+                "on after tccd's last unlisted answer",
+                on_at_100,
+                tccd(DevToolState::Unlisted, 99_000),
+                Granted,
+            ),
+            (
+                "on, but tccd answered unlisted since: another copy's row",
+                on_at_100,
+                tccd(DevToolState::Unlisted, 100_001),
+                NotGranted,
+            ),
+            (
+                "on, tccd allowed since",
+                on_at_100,
+                tccd(DevToolState::Allowed, 100_001),
+                Granted,
+            ),
+            (
+                "off, tccd allowed since (a policy outranks the switch)",
+                off_at_100,
+                tccd(DevToolState::Allowed, 100_001),
+                Granted,
+            ),
+            (
+                "off after tccd's last allowed answer",
+                off_at_100,
+                tccd(DevToolState::Allowed, 99_000),
+                NotGranted,
+            ),
+            (
+                "the same millisecond: the switch",
+                off_at_100,
+                tccd(DevToolState::Allowed, 100_000),
+                NotGranted,
+            ),
+            (
+                "absent though tccd allowed (just removed)",
+                absent,
+                tccd(DevToolState::Allowed, i64::MAX),
+                NotGranted,
+            ),
+            (
+                "unread, tccd unlisted",
+                unread,
+                tccd(DevToolState::Unlisted, 1),
+                NotGranted,
+            ),
+            (
+                "unread, tccd denied",
+                unread,
+                tccd(DevToolState::Denied, 1),
+                NotGranted,
+            ),
+            (
+                "unread, tccd allowed",
+                unread,
+                tccd(DevToolState::Allowed, 1),
+                Granted,
+            ),
+            ("unread, tccd quiet", unread, quiet, Unknown),
+            ("unread, no log", unread, no_log, Unknown),
+            (
+                "a list in an unknown shape",
+                DevToolList::refused(DevToolListLabel::FormatUnrecognized),
+                no_log,
+                Unknown,
+            ),
+            (
+                "pending",
+                DevToolList::pending(),
+                DevToolProbe::pending(),
+                Unknown,
+            ),
+        ] {
+            assert_eq!(devtool_grant(&list, &log), want, "{name}");
+        }
+    }
+
+    /// The wire tokens, pinned: they are the `privacy` row's schema.
+    #[test]
+    fn the_list_and_grant_tokens_are_the_documented_spellings() {
+        for (listing, token) in [
+            (DevToolListing::On, "on"),
+            (DevToolListing::Off, "off"),
+            (DevToolListing::Absent, "absent"),
+            (DevToolListing::Unknown, "unknown"),
+        ] {
+            assert_eq!(listing.as_str(), token);
+        }
+        for (grant, token) in [
+            (DevToolGrant::Granted, "granted"),
+            (DevToolGrant::NotGranted, "not_granted"),
+            (DevToolGrant::Unknown, "unknown"),
+        ] {
+            assert_eq!(grant.as_str(), token);
+        }
+        use DevToolListLabel as L;
+        for (label, token) in [
+            (L::Pending, "pending"),
+            (L::Read, "read"),
+            (L::NoFullDiskAccess, "no_full_disk_access"),
+            (L::OpenFailed, "open_failed"),
+            (L::ToolFailed, "sqlite_failed"),
+            (L::FormatUnrecognized, "format_unrecognized"),
+            (L::TimedOut, "timed_out"),
+            (L::SpawnFailed, "spawn_failed"),
+            (L::OutputUnreadable, "output_unreadable"),
+            (L::RefusedDisabled, "refused_disabled"),
+            (L::RefusedObserverOff, "refused_observer_off"),
+            (L::RefusedOutOfBundle, "refused_out_of_bundle"),
+            (L::RefusedNoExe, "refused_no_exe"),
+            (L::RefusedNoSubject, "refused_no_subject"),
+            (L::UnsupportedPlatform, "unsupported_platform"),
+        ] {
+            assert_eq!(label.as_str(), token);
+        }
+        assert_eq!(DevToolListing::default(), DevToolListing::Unknown);
+        assert_eq!(DevToolGrant::default(), DevToolGrant::Unknown);
+        assert_eq!(unsupported_devtool_list().label, L::UnsupportedPlatform);
+    }
+
+    /// The bundle id is read off the bundle's own `Info.plist`, and not at all
+    /// under a protected root.
+    #[test]
+    fn the_bundle_id_is_read_off_the_bundle_and_never_under_a_protected_root() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("x.app");
+        std::fs::create_dir_all(root.join("Contents")).expect("bundle");
+        std::fs::write(
+            root.join("Contents").join("Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>com.example.x</string></dict></plist>\n",
+        )
+        .expect("plist");
+        assert_eq!(bundle_id_of(&root, &[]), Some("com.example.x".to_string()));
+        assert_eq!(bundle_id_of(&root, &[dir.path().to_path_buf()]), None);
+        assert_eq!(bundle_id_of(&dir.path().join("missing.app"), &[]), None);
     }
 
     /// `run_bounded_exit` keeps apart what `run_bounded` folds into `None`: an

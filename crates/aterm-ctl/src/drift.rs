@@ -326,7 +326,7 @@ fn print_report(report: Result<String, String>) -> io::Result<ExitCode> {
     match report {
         Ok(text) => {
             let stdout = stdout_handle();
-            let mut out = StdoutSink(stdout.lock());
+            let mut out = StdoutSink::new(stdout.lock());
             out.write_all(text.as_bytes())?;
             out.flush()?;
             Ok(ExitCode::SUCCESS)
@@ -622,7 +622,7 @@ fn probe(
             let n = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
             let rows = read_lines(&mut reader, n)?;
             let stdout = stdout_handle();
-            let mut out = StdoutSink(io::BufWriter::new(stdout.lock()));
+            let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
             out.write_all(status.as_bytes())?;
             out.write_all(b"\n")?;
             for row in &rows {

@@ -27,11 +27,33 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+/// Whether `name` is ONE ordinary path component that every backend may hand
+/// a handle-relative call: the rule [`validate_component`] enforces, for the
+/// callers that judge a name before it reaches a [`PinnedDir`].
+pub(crate) fn is_one_component(name: &OsStr) -> bool {
+    validate_component(name).is_ok()
+}
+
+/// Refuse any name that is not one ordinary path component.
+///
+/// Ruling 2026-10-10 (FS-1): decided on the RAW name, never on
+/// `Path::components()`, which normalizes a trailing `/`, `/.` and `//` away.
+/// `"link/"` read as the one component `link`, the raw name went to the `*at`
+/// call, and the kernel resolved the symlink `link` (`O_NOFOLLOW`, `unlinkat`
+/// and `renameat` govern only the final component): `child` opened an outside
+/// directory, `remove_child_tree` emptied and removed one, `rename` moved one
+/// in and `create_child` made one through a dangling link. Refused: the empty
+/// name, `.`, `..`, any separator (`/`, and `\` on Windows) and NUL.
 fn validate_component(name: &OsStr) -> io::Result<()> {
-    let mut components = Path::new(name).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    let bytes = name.as_encoded_bytes();
+    let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.iter().any(|&byte| byte == 0 || separator(byte))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "artifact name must be one ordinary path component",
@@ -155,6 +177,7 @@ fn pinned_chain_open_count() -> usize {
 #[cfg(unix)]
 mod imp {
     use std::io::{Read as _, Write as _};
+    use std::path::Component;
     use std::sync::Arc;
 
     use aterm_dirfd::OwnedFd;
@@ -168,7 +191,7 @@ mod imp {
     use aterm_dirfd::{RenameFlags, renameat_with};
 
     use super::{
-        Component, OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
+        OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
         validate_open_path,
     };
 
@@ -2619,6 +2642,56 @@ mod shared_backend_contract_tests {
         drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// REGRESSION (FS-1, 2026-10-10): "one ordinary component" is decided on
+    /// the raw name. `Path::components()` normalized a trailing `/`, `/.` and
+    /// `//` away, so `"link/"` passed and the `*at` call resolved `link`.
+    #[test]
+    fn one_component_is_decided_on_the_raw_name() {
+        use std::ffi::OsStr;
+        let refused = [
+            "", ".", "..", "a/b", "/a", "./a", "a/..", "link/", "link/.", "link//", "link/./.",
+            "x\0y",
+        ];
+        for name in refused {
+            assert!(
+                super::validate_component(OsStr::new(name)).is_err(),
+                "{name:?} is not one ordinary component"
+            );
+        }
+        #[cfg(windows)]
+        for name in ["a\\b", "link\\", "link\\."] {
+            assert!(
+                super::validate_component(OsStr::new(name)).is_err(),
+                "{name:?} is not one ordinary component"
+            );
+        }
+        // Every name shape production hands a pinned directory still passes.
+        let produced = [
+            "rec-00000000000000000001-001",
+            ".prune-p4242-0123456789abcdef01234567-00000000000000000007",
+            ".instance-prune-p4242-x",
+            ".aterm-write-p4242-00000000000000000003",
+            "p4242-0123456789abcdef01234567",
+            ".instance.lease",
+            "index.json",
+            "index.json.tmp",
+            "frame_0001.png",
+            "snapshot.png",
+            "snapshot.png.txt",
+            "snapshot.png.done",
+            "images",
+            "auto",
+            "video",
+            ".capture-locks",
+        ];
+        for name in produced {
+            assert!(
+                super::validate_component(OsStr::new(name)).is_ok(),
+                "{name:?} is one ordinary component"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2899,6 +2972,58 @@ mod tests {
                 std::process::id(),
                 SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ))
+    }
+
+    /// REGRESSION (FS-1, 2026-10-10): `O_NOFOLLOW`, `unlinkat` and `renameat`
+    /// govern only a name's final component, and the kernel resolves `link` in
+    /// `"link/"`, `"link/."` and `"link//"`. Until the name was judged raw,
+    /// each passed as one component, so a pinned directory reached through a
+    /// symlink it holds: `child` opened the outside directory,
+    /// `remove_child_tree` emptied and removed it, `rename` moved it in and
+    /// `create_child` made one through a dangling link.
+    #[test]
+    fn a_trailing_separator_never_reaches_through_a_symlink() {
+        use std::ffi::OsStr;
+        let root = unique_dir("trailing-separator");
+        let confined = root.join("confined");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&confined).unwrap();
+        std::fs::create_dir_all(outside.join("victim")).unwrap();
+        std::fs::create_dir_all(outside.join("tree")).unwrap();
+        std::fs::write(outside.join("tree").join("keep"), b"outside").unwrap();
+        symlink(&outside, confined.join("link")).unwrap();
+        symlink(outside.join("victim"), confined.join("vlink")).unwrap();
+        symlink(outside.join("tree"), confined.join("tlink")).unwrap();
+        symlink(outside.join("absent"), confined.join("dangle")).unwrap();
+        let pinned = PinnedDir::open(&confined).unwrap();
+
+        let mut escapes = Vec::new();
+        for name in ["link/", "link/.", "link//", "link/./."] {
+            match pinned.child(OsStr::new(name)) {
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                other => escapes.push(format!(
+                    "child({name:?}) was not refused: {:?}",
+                    other.map(|child| child.path().to_path_buf())
+                )),
+            }
+        }
+        let _ = pinned.remove_child_tree(OsStr::new("tlink/"));
+        if !outside.join("tree").join("keep").exists() {
+            escapes.push("remove_child_tree(\"tlink/\") emptied an outside directory".into());
+        }
+        let _ = pinned.rename(OsStr::new("vlink/"), OsStr::new("moved"));
+        if !outside.join("victim").is_dir() {
+            escapes.push("rename(\"vlink/\", ..) moved an outside directory in".into());
+        }
+        let _ = pinned.create_child(OsStr::new("dangle/"));
+        if outside.join("absent").exists() {
+            escapes.push("create_child(\"dangle/\") made a directory outside".into());
+        }
+        // The control: a bare name was always refused, the link never followed.
+        assert!(pinned.child(OsStr::new("link")).is_err());
+        drop(pinned);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(escapes.is_empty(), "{escapes:#?}");
     }
 
     /// REGRESSION: admission charges the caller's canonical path before an

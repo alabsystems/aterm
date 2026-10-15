@@ -405,10 +405,16 @@ impl SmartSelection {
         Self::basic_word_boundaries_with(self.word_separators.as_deref(), text, byte_pos)
     }
 
-    /// Get word boundaries at a column (display-width) position.
+    /// Get word boundaries at a column (display-width) position of `text`
+    /// laid out left to right in one go: converts column→byte by walking the
+    /// text, calls `word_boundaries_at`, and converts the result back.
     ///
-    /// The entry point for UI code in grid columns: converts column→byte, calls
-    /// `word_boundaries_at`, and converts the result back to columns.
+    /// A grid row's text is no measure of its columns: two flag halves drawn
+    /// into neighbouring cells out of order are two cells the walk pairs into
+    /// one, and a VS16 base the grid kept one cell wide in the last column is
+    /// one cell the walk widens. Grid code maps a row through the cells its
+    /// text was read from instead (`aterm_core::terminal::smart_word_in_cells`;
+    /// ruling 2026-10-11, r16 selection-stride).
     ///
     /// A column at or past the end of the text names an empty cell: `None`.
     #[must_use]

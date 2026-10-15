@@ -612,7 +612,7 @@ impl App {
         Some(crate::accesskit_tree::GridMessage {
             message: crate::accesskit_tree::ChromeMessage::PresenceStatus,
             text: words.sentence.clone(),
-            detail: Some(drive::report(&ws.presence, usize::from(ws.cols)).0),
+            detail: Some(drive::report::<presence::Native>(&ws.presence, usize::from(ws.cols)).0),
             progress: None,
             busy: false,
             alarm: false,
@@ -627,7 +627,10 @@ impl App {
     #[cfg(test)]
     pub(crate) fn presence_report(&self, wid: WindowId) -> Option<(String, &'static str)> {
         let ws = self.windows.get(&wid)?;
-        Some(drive::report(&ws.presence, usize::from(ws.cols)))
+        Some(drive::report::<presence::Native>(
+            &ws.presence,
+            usize::from(ws.cols),
+        ))
     }
 
     /// Re-grid one window after its chrome rows moved (per-window twin of
@@ -2365,9 +2368,9 @@ mod tests {
         };
         for (name, s, whole) in rows(now) {
             let w: Words = presence::words(&s, now, 0);
-            assert_eq!(w.fit(160), whole, "{name}, whole");
+            assert_eq!(w.fit::<presence::Native>(160), whole, "{name}, whole");
             for cols in [120usize, 60, 24] {
-                let fitted = w.fit(cols - 2);
+                let fitted = w.fit::<presence::Native>(cols - 2);
                 assert!(
                     fitted.chars().count() <= cols - 2,
                     "{name} at {cols}: {fitted}"
@@ -3114,9 +3117,10 @@ mod tests {
             vec!["\u{2192} 19:30".to_string(), "1h58m".to_string()]
         );
         assert!(
-            a.fit(160).contains("limited \u{2192} 19:30 \u{00b7} 1h59m"),
+            a.fit::<presence::Native>(160)
+                .contains("limited \u{2192} 19:30 \u{00b7} 1h59m"),
             "{}",
-            a.fit(160)
+            a.fit::<presence::Native>(160)
         );
         assert_eq!(a.sentence, "limited, resets 19:30, context 9 percent left");
         // Unplaceable: the reset alone, no figure.
@@ -3138,9 +3142,13 @@ mod tests {
         );
         let w = presence::words(&u, now + Duration::from_secs(120), 0);
         assert_eq!(w.since, vec!["\u{2192} 19:30".to_string()], "{w:?}");
-        assert!(!w.fit(160).contains("2m00s"), "{}", w.fit(160));
+        assert!(
+            !w.fit::<presence::Native>(160).contains("2m00s"),
+            "{}",
+            w.fit::<presence::Native>(160)
+        );
         // The reset outlives the countdown under elision (a stop clause).
-        let narrow = a.fit(40);
+        let narrow = a.fit::<presence::Native>(40);
         assert!(narrow.contains("\u{2192} 19:30"), "{narrow}");
         assert!(!narrow.contains("1h59m"), "{narrow}");
     }
@@ -3166,10 +3174,10 @@ mod tests {
         );
         let w = presence::words(&s, now, 0);
         assert!(
-            w.fit(160)
+            w.fit::<presence::Native>(160)
                 .contains("limited \u{2192} 19:30 \u{00b7} 1d 22h"),
             "design §1 / mock: `limited → 19:30 · 1d 22h`; got `{}`",
-            w.fit(160)
+            w.fit::<presence::Native>(160)
         );
     }
 
@@ -3183,7 +3191,7 @@ mod tests {
             let (mut app, wid, _sid, _ctx) = app_with_stub();
             let now = Instant::now();
             let w = driven_words(now);
-            let whole = w.fit(160);
+            let whole = w.fit::<presence::Native>(160);
             let cols = whole.chars().count() as u16;
             {
                 let ws = app.windows.get_mut(&wid).unwrap();
@@ -3346,6 +3354,61 @@ mod tests {
             row[at].wide, row[at].text_presentation, row[at].emoji_presentation
         );
         assert!(!row[at].wide);
+        // The grid measures the lock two cells; the pin holds it to one, so
+        // nothing after it is a continuation.
+        assert!(row.get(at + 1).is_none_or(|c| !c.wide));
+    }
+
+    /// Round fifteen content-6: a role in CJK reaches the glass in the cells
+    /// the terminal grid gives it — each glyph its lead cell and a `wide`
+    /// continuation, so the renderer draws it across both
+    /// (`materialized_cell_span` 2) rather than squeezing it into one — and a
+    /// combining mark takes no cell; the `chrome` line keeps the words.
+    #[test]
+    fn a_cjk_role_is_painted_two_cells_a_glyph() {
+        let now = Instant::now();
+        let mut s = Slot::new(now);
+        s.absorb(
+            Facts {
+                role: Some("\u{62c5}\u{5f53} cafe\u{301}".into()),
+                agent_seq: 1,
+                agent: agent(AgentPhase::Idle, None),
+                ..Facts::default()
+            },
+            now,
+        );
+        let w = presence::words(&s, now, 0);
+        assert_eq!(w.role, "\u{62c5}\u{5f53} cafe\u{301}");
+        let row = crate::message_band::paint_presence_row(&w, 80, aterm_render::Theme::default());
+        assert_eq!(row.len(), 80);
+        let lead = row
+            .iter()
+            .position(|c| c.ch == '\u{62c5}')
+            .expect("the role is on the row");
+        assert_eq!(
+            row[lead..lead + 4]
+                .iter()
+                .map(|c| (c.ch, c.wide))
+                .collect::<Vec<_>>(),
+            [
+                ('\u{62c5}', false),
+                (' ', true),
+                ('\u{5f53}', false),
+                (' ', true)
+            ]
+        );
+        assert_eq!(aterm_render::materialized_cell_span(&row, lead), 2);
+        assert_eq!(aterm_render::materialized_cell_span(&row, lead + 2), 2);
+        let text: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            text[text.find('c').expect("cafe")..].starts_with("cafe  "),
+            "the mark is drawn in no cell of its own: {text:?}"
+        );
+        assert!(
+            w.fit::<presence::Native>(78)
+                .starts_with("\u{62c5}\u{5f53} cafe\u{301}  "),
+            "the words keep the mark"
+        );
     }
 
     /// The link's recovery reaches the fabric slot: the tick re-reads the facts
@@ -3435,7 +3498,7 @@ mod tests {
             now,
         );
         let w = presence::words(&s, now, 0);
-        let fitted = w.fit(120);
+        let fitted = w.fit::<presence::Native>(120);
         assert!(
             !fitted.contains("\u{2298} hold") && !fitted.contains("\u{25c2} manager"),
             "level={:?} band=`{fitted}` sentence=`{}`",

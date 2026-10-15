@@ -16,8 +16,12 @@
 //! is shown and reads nothing until the test creates `<key log>.release` (a
 //! busy screen the host must be seen to read, held as long as the test needs
 //! and not for a count of seconds; at most [`UNTIL_MAX_TENTHS`], so it never
-//! waits on what waits on it), and one named `*.late` is not drawn at
-//! all: the fake waits [`LATE_S`] first, an agent still starting; a screen
+//! waits on what waits on it), one named `*.gate` the same with no bound of
+//! its own (the test's hang detector is its bound), and one named `*.late` is
+//! not drawn at all: the fake waits [`LATE_S`] first, an agent still
+//! starting. A `*.hold`'s and a `*.late`'s seconds start once
+//! `<key log>.go` exists: at once ([`run_fake`]), or once the host has
+//! attached to the run ([`run_fake_attached`]). A screen
 //! named `*.type` is shown and then ONE bounded read
 //! (`dd bs=4096 count=1`) takes whatever was written to it — a policy text,
 //! one `send`, arrives whole in that one read — logged as `text:<bytes>`. The
@@ -126,7 +130,12 @@ use crate::{headless_boot, launch_isolation};
 use headless_boot::{ctl, ctl_ok, field, log_tail};
 
 /// How long a `*.hold` screen stays up: long enough for the supervisor to
-/// read it settled (its footer is what says bypass).
+/// read it settled (its footer is what says bypass). Counted from the
+/// host's attach where the hold is what the host must read
+/// ([`run_fake_attached`]): counted from the fake's start it raced the attach
+/// itself — 2.5-13.3 s at load 130-200 (2026-09-27/28) — and a host that
+/// attached after the bypass frame had gone handed the box over as `outside a
+/// bypass session`.
 const HOLD_S: u32 = 5;
 /// The most a `*.until` screen stays up when nothing releases it, in tenths of a
 /// second: long enough that the host reads it however late it looks, short enough
@@ -137,7 +146,9 @@ const UNTIL_MAX_TENTHS: u32 = 200;
 /// supervisor's idle window (`aterm_agent::supervise`'s `IDLE_MS`, 2 s), so
 /// its first look settles on the blank screen as an idle point — as it does
 /// on a real Claude Code whose first frame comes seconds after its exec (its
-/// own start-up, a loaded machine).
+/// own start-up, a loaded machine). Counted from the attach
+/// ([`run_fake_attached`]): counted from the fake's start, a host that
+/// attached late never saw the blank screen, and the scene tested nothing.
 const LATE_S: u32 = 3;
 /// How long "nothing typed" is watched for after the escalation showed.
 const QUIET: Duration = Duration::from_secs(3);
@@ -719,19 +730,25 @@ fn write_world(tmp: &Path) {
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
          # as `od -c` spells it; a *.hold screen is shown and nothing read, a\n\
          # *.until one the same until $log.release exists (or for a bound), a\n\
-         # *.late one is a wait with nothing drawn, and after a *.type screen ONE\n\
-         # bounded read takes what was written, logged text:.\n\
+         # *.gate one until it exists, a *.late one is a wait with nothing\n\
+         # drawn, and after a *.type screen ONE bounded read takes what was\n\
+         # written, logged text:. A *.hold's and a *.late's seconds start once\n\
+         # $log.go exists (the test says when: the host has attached).\n\
+         # It first writes a cell and erases it in place, as a real Claude\n\
+         # Code moves the screen as it starts (start_fake says why).\n\
          log=$1; shift\n\
+         printf 'x\\b \\b'\n\
          old=$(stty -g)\n\
          stty -icanon -echo min 1\n\
          for scene in \"$@\"; do\n\
-         \x20 case \"$scene\" in *.late) sleep {LATE_S}; continue ;; esac\n\
+         \x20 case \"$scene\" in *.late) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {LATE_S}; continue ;; esac\n\
          \x20 printf '\\033[2J\\033[H'\n\
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 case \"$scene\" in\n\
-         \x20 *.hold) sleep {HOLD_S}; continue ;;\n\
+         \x20 *.hold) while [ ! -e \"$log.go\" ]; do sleep 0.1; done; sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
+         \x20 *.gate) while [ ! -e \"$log.release\" ]; do sleep 0.1; done; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
          \x20 k=$(dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' ')\n\
@@ -773,6 +790,7 @@ fn write_world(tmp: &Path) {
         ("ask-busy.txt", body(ASK_BUSY)),
         ("web-setup-busy.txt", body(WEB_SETUP_BUSY)),
         ("busy.hold", body(SPINNER)),
+        ("busy.gate", body(SPINNER)),
         (
             "wall.hold",
             body(WALL_SHELL).replace("resets 4pm (America/Los_Angeles)", "resets in 1h"),
@@ -865,9 +883,76 @@ fn write_world(tmp: &Path) {
 }
 
 /// Start the fake on `screens` in the boot session, from `work/` with the
-/// cwd reported as shell integration reports it (OSC 7), and wait until the
-/// server names its program.
+/// cwd reported as shell integration reports it (OSC 7). Its `*.hold` and
+/// `*.late` scenes count their seconds from its start (`<keys>.go` is there
+/// before it runs).
 fn run_fake(inst: &Instance, keys: &str, screens: &[&str]) {
+    std::fs::write(inst.tmp.join(format!("{keys}.go")), b"").expect("start the fake's clock");
+    start_fake(inst, keys, screens);
+}
+
+/// [`run_fake`] for scenes whose seconds are what the HOST must see (a
+/// `*.hold` frame it must read, a `*.late` blank it must settle on): the fake
+/// starts, and once the host has attached to THIS run — its claim
+/// (`meta-change field=supervisor value=aterm-harness…`) on the session's
+/// timeline after the start, an earlier run's claim having been released
+/// first — the scenes' seconds begin (`<keys>.go`). Each is timed from the
+/// attach, never from a start the machine may take seconds to follow with
+/// the attach ([`HOLD_S`], [`LATE_S`]); how long the attach took is printed,
+/// never judged. The earlier claim's end is only this precondition, never the
+/// property, so it is waited for under [`HANG`]: a lapsed lease ends it as
+/// well as a release does. [`RELEASED`] stays where the release itself is
+/// what a test asserts.
+fn run_fake_attached(inst: &Instance, keys: &str, screens: &[&str]) {
+    until(
+        HANG,
+        "the host released any earlier run's claim (or its lease lapsed)",
+        || status(inst),
+        |s| field(s, "supervisor") == Some("-"),
+    );
+    let go = inst.tmp.join(format!("{keys}.go"));
+    let _ = std::fs::remove_file(&go);
+    let mark = timeline_since(inst, 0).last().map_or(0, |e| e.0);
+    let started = Instant::now();
+    start_fake(inst, keys, screens);
+    let deadline = Instant::now() + HANG;
+    loop {
+        let events = timeline_since(inst, mark);
+        if events.iter().any(|e| {
+            e.1 == "meta-change" && e.2.starts_with("field=supervisor value=aterm-harness")
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the host attached to {keys}: not within {HANG:?} (a hang); timeline: {events:?}\n\
+             harness log:\n{}",
+            harness_lines(inst)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!(
+        "measured, not judged: the host attached to {keys} {:?} after its start",
+        started.elapsed()
+    );
+    std::fs::write(&go, b"").expect("start the fake's clock");
+}
+
+/// [`run_fake`] without the clock: the fake's `*.hold` and `*.late` scenes
+/// wait for `<keys>.go`.
+///
+/// WHAT THE FAKE WRITES AT START (`x`, backspace, space, backspace: a cell
+/// written and erased in place, so the rows end as they were), for the reason
+/// `agent_verdict_live_headless.rs`'s silent launch fakes write it (fc6f5c64a).
+/// The status sweep names a foreground group when it CHANGES and once more
+/// 500 ms later (`PROGRAM_NAME_CONFIRM`), then only when the screen moves. A
+/// name read while the shell's child was still between fork and exec (a
+/// loaded machine stretches that past 500 ms) stands at `sh` until something
+/// moves. A run whose first scene is a `*.late` blank under
+/// [`run_fake_attached`] moves nothing until `<keys>.go`, and `<keys>.go`
+/// waits for the host's attach, which waits for `program=claude`: without
+/// the cell, that read held the run at its hang detector.
+fn start_fake(inst: &Instance, keys: &str, screens: &[&str]) {
     let tmp = inst.tmp.display();
     let scenes: Vec<String> = screens.iter().map(|s| format!("{tmp}/sc/{s}")).collect();
     let line = format!(
@@ -1079,7 +1164,7 @@ fn the_host_answers_every_box_by_default() {
     let Some(inst) = boot("d", "") else {
         return;
     };
-    run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+    run_fake_attached(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
     keys_until(&inst, "k1", &["1"], HANG);
     program_is(&inst, "sh", HANG);
 
@@ -1470,14 +1555,12 @@ fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
         ],
     );
     let text = text_read(QuestionPriority::LongTerm);
-    let said = escalated_after(
-        &inst,
-        "k1",
-        "never written twice",
-        &["down", "down", &text],
-        HANG,
-    );
-    assert!(said.contains("did not take the policy text"), "{said}");
+    // The attention is clipped to its reason's cells, so its tail ("never
+    // written twice") is not a needle: every reason a written text is handed
+    // over for names the policy text near its start. What this test holds is
+    // the outcome: the text written once, then handed over, never approved.
+    let said = escalated_after(&inst, "k1", "policy text", &["down", "down", &text], HANG);
+    assert!(said.contains("claude question"), "{said}");
     assert_eq!(
         ledger_rows(&inst, "answer-long-term@v1", "approved"),
         Vec::<String>::new(),
@@ -1600,13 +1683,13 @@ fn the_host_answers_what_the_policy_proves_safe() {
     );
 
     // The session survey, after a screen without it: dismissed with `0`.
-    run_fake(&inst, "k2", &["busy.hold", "survey.txt"]);
+    run_fake_attached(&inst, "k2", &["busy.hold", "survey.txt"]);
     keys_until(&inst, "k2", &["0"], HANG);
     program_is(&inst, "sh", HANG);
 
     // The rm circuit breaker in a bypass session, every operand under a
     // scratch root: `1`.
-    run_fake(&inst, "k3", &["bypass.hold", "rm-scratch.txt"]);
+    run_fake_attached(&inst, "k3", &["bypass.hold", "rm-scratch.txt"]);
     keys_until(&inst, "k3", &["1"], HANG);
     program_is(&inst, "sh", HANG);
     // The host detached with the program: its claim went with it.
@@ -1718,7 +1801,7 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
         return;
     };
     // The same breaker over /usr: escalated, naming the command.
-    run_fake(&inst, "k1", &["start.late", "bypass.hold", "rm-usr.txt"]);
+    run_fake_attached(&inst, "k1", &["start.late", "bypass.hold", "rm-usr.txt"]);
     let text = escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
     // Refused on WHERE it points — the scratch box of the first test was
     // answered under the same bypass start — not on the session's mode.
@@ -1765,15 +1848,19 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
 /// workflow the owner's answer started, because the loop cleared it only at
 /// the next idle point). Under `approve = "none"` (a limit the owner wrote:
 /// every box is his) the owner's own box is escalated; a PERSON answers it
-/// and the worker goes busy for ten seconds. The badge goes while the
-/// worker is still busy. NEGATIVE CONTROL: before the answer the badge
-/// stands and nothing is typed.
+/// and the worker goes busy — and stays busy until this test has seen the
+/// badge go and the server's `busy` verdict (`busy.gate`), so "while the
+/// worker is still busy" is an order of events, not a race against the ten
+/// seconds of busy frames this once held (a clear later than they lasted read
+/// as the regression, and a run whose worker had not rested yet skipped the
+/// check). NEGATIVE CONTROL: before the answer the badge stands and nothing is
+/// typed.
 #[test]
 fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
     let Some(inst) = boot("b", "approve = \"none\"\n") else {
         return;
     };
-    run_fake(&inst, "k1", &["owners-box.txt", "busy.hold", "busy.hold"]);
+    run_fake(&inst, "k1", &["owners-box.txt", "busy.gate"]);
     escalated_and_quiet(&inst, "k1", "aterm-auto-target-x.noindex");
     // The clear and the worker's verdicts are the SERVER's own timeline
     // records, read once the clear has landed — as
@@ -1789,27 +1876,62 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
         || attention(&inst).unwrap_or_default(),
         str::is_empty,
     );
-    let events = timeline_since(&inst, mark);
-    let busy = events
-        .iter()
-        .find(|e| e.1 == "agent-change" && e.2.starts_with("busy "))
-        .unwrap_or_else(|| panic!("the answer never set the worker working: {events:?}"));
+    let busy_at = |events: &[(u64, String, String)]| {
+        events
+            .iter()
+            .position(|e| e.1 == "agent-change" && e.2.starts_with("busy "))
+    };
+    // The server's own `busy` verdict is on the timeline before the worker may
+    // rest. The host clears the badge at ITS first busy read, which need not
+    // wait for the window's sweep to publish one; the busy frame stands until
+    // the release, so that sweep reads it however late it looks — released
+    // first, a sweep that looked only after the fake had exited would read the
+    // shell and publish no `busy` at all.
+    let deadline = Instant::now() + HANG;
+    while busy_at(&timeline_since(&inst, mark)).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the answer never set the worker working: not within {HANG:?} (a hang): {:?}",
+            timeline_since(&inst, mark)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Only now may the worker rest: its busy frame stood until here. Its exit
+    // hands the session back to the shell, which the server publishes as `-`
+    // (`presence::agent_verdict`: a group still being named, then `sh`, is no
+    // agent), the verdict after `busy` this waits for.
+    release_fake(&inst, "k1");
+    let rested_after = |events: &[(u64, String, String)]| {
+        events[busy_at(events)?..]
+            .iter()
+            .find(|e| e.1 == "agent-change" && !e.2.starts_with("busy "))
+            .cloned()
+    };
+    let deadline = Instant::now() + HANG;
+    let (events, rested) = loop {
+        let events = timeline_since(&inst, mark);
+        if let Some(rested) = rested_after(&events) {
+            break (events, rested);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never rested after its release: not within {HANG:?} (a hang): \
+             {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let cleared = events
         .iter()
         .find(|e| e.1 == "meta-change" && e.2 == "field=attention value=-")
         .unwrap_or_else(|| panic!("the badge's clear is not on the timeline: {events:?}"));
     // THE REGRESSION: the badge stood until the worker's next idle point. So
-    // the clear precedes (in the timeline's own record order) the first verdict
-    // after `busy` that is not `busy`, whenever that has come.
-    if let Some(rested) = events
-        .iter()
-        .find(|e| e.1 == "agent-change" && e.0 > busy.0 && !e.2.starts_with("busy "))
-    {
-        assert!(
-            cleared.0 < rested.0,
-            "the badge cleared only when the worker stopped ({rested:?}): {events:?}"
-        );
-    }
+    // the clear precedes (in the timeline's own record order) the first
+    // verdict after `busy` that is not `busy` — which cannot come before this
+    // test released the busy frame, after it had seen the badge go.
+    assert!(
+        cleared.0 < rested.0,
+        "the badge cleared only when the worker stopped ({rested:?}): {events:?}"
+    );
     let journal = ["state", "home"]
         .iter()
         .find_map(|root| find_file(&inst.tmp.join(root), &format!("{}.journal.jsonl", inst.sid)))
@@ -1911,7 +2033,9 @@ const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
 /// Replace the world's fake with one that registers itself as Claude Code
 /// does (`~/.claude/sessions/<pid>.json`: its conversation — the one it was
 /// resumed on, else [`CONVERSATION`] — its kernel start as Claude renders it,
-/// idle), logs its argv to `launches.log`, draws an idle composer — on the
+/// idle) and keeps that conversation's transcript under `projects/` (one
+/// with none is never resumed: Claude Code refuses it, so the relaunch starts
+/// afresh), logs its argv to `launches.log`, draws an idle composer — on the
 /// alternate screen with focus reports on and the cursor on its caret row, as
 /// Claude Code's fullscreen renderer does, so a crash is handed back to a clean
 /// shell prompt — and dies
@@ -1928,7 +2052,9 @@ fn write_relaunch_fake(inst: &Instance) {
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
          start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
-         mkdir -p \"$HOME/.claude/sessions\"\n\
+         mkdir -p \"$HOME/.claude/sessions\" \"$HOME/.claude/projects/-w\"\n\
+         printf '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\\n' \
+         >> \"$HOME/.claude/projects/-w/$sid.jsonl\"\n\
          printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"cwd\":\"%s\",\"version\":\"2.1.281\",\
          \"status\":\"idle\",\"statusUpdatedAt\":%s000,\"procStart\":\"%s\",\
          \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}' \
@@ -2712,6 +2838,27 @@ fn a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent() {
     });
 }
 
+/// What a failed wait on the restart's hand says: the session's status, its
+/// screen, the host's lines, the journal and the processes under the instance
+/// (a stress run saw this test fail twice in ten rounds, once with a bash
+/// `child setpgid` error as the last line on the pane and no status to say
+/// what had run, 2026-10-10).
+#[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
+fn hand_evidence(inst: &Instance) -> String {
+    let look = |args: &[&str]| String::from_utf8_lossy(&ctl(inst, args).stdout).into_owned();
+    let sel = format!("@{}", inst.sid);
+    format!(
+        "status: {}\nscreen:\n{}\nlaunches: {:?}\nharness log:\n{}\njournal:\n{}\n\
+         processes under the instance (pid ppid stat wchan etime command):\n{}",
+        look(&[&sel, "status"]),
+        look(&[&sel, "text"]),
+        launches(inst),
+        harness_lines(inst),
+        journal(inst),
+        headless_boot::process_tree(inst)
+    )
+}
+
 /// One run of [`a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent`]:
 /// the relaunch line typed at `shell`, the orchestrator's prompt sent as a
 /// `turn` or as a raw `send` and `key enter`.
@@ -2733,8 +2880,8 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     let st = upgrade_until(&inst, Instant::now(), || status(&inst), hand_on);
     assert!(
         hand_on(&st),
-        "{shell}: the restart's hand on the tab: {st}\njournal:\n{}",
-        journal(&inst)
+        "{shell}: the restart's hand on the tab: {st}\n{}",
+        hand_evidence(&inst)
     );
 
     // The orchestrator's retry loop: refused while the hand is on the tab —
@@ -2748,14 +2895,22 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
         let out = ctl(&inst, args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !stderr.contains("ERR busy") {
-            assert!(out.status.success(), "{shell}: {args:?}: {out:?}");
+            assert!(
+                out.status.success(),
+                "{shell}: {args:?}: {out:?}\n{}",
+                hand_evidence(&inst)
+            );
             break;
         }
         if stderr.contains("ERR busy lease=aterm-harness@") {
             held += 1;
             let _ = std::fs::remove_file(&gate);
         }
-        assert!(Instant::now() < deadline, "{shell}: never let in");
+        assert!(
+            Instant::now() < deadline,
+            "{shell}: never let in\n{}",
+            hand_evidence(&inst)
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     if turn {

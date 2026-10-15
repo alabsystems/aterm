@@ -525,7 +525,7 @@ fn the_review_tab_is_a_question() {
         assert_eq!(d.width, 180);
         assert_eq!(p.select, Select::Digits);
         assert_eq!(worker_phase(&r), Phase::Prompt);
-        assert!(!crate::prompt::footed(&r, &p));
+        assert_eq!(p.footer, None);
         // Its cancel focused: still the review.
         let mut moved = r.clone();
         moved[submit.row] = "  1. Submit answers".to_string();
@@ -1860,5 +1860,58 @@ fn the_2_1_281_captures_read_whole() {
                 why(&p.question_dialog.expect("its dialog"));
             }
         }
+    }
+}
+
+/// A WRAPPED FOOTER (prompt.rs module header; the real-Claude sweep of
+/// 2026-10-09): in a pane narrower than the footer — 48 columns or fewer for
+/// one question, 59 for tabs — Ink wraps `Enter to select · … · Esc to
+/// cancel` onto the row under it. Read row by row the dialog had no footer
+/// (`… · Esc to` is none) or the wrong one (`Esc to cancel` alone): `idle`,
+/// never answered, never escalated, ten minutes to the dialog canary. Each
+/// MEASURED screen reads whole — its form, the recommended option focused —
+/// and the box runs to the footer's last row. NEGATIVE CONTROLS: the same
+/// rows where the first is not full, or the second sits at another column,
+/// are no wrap and no footer; and the dialog with the composer under it (a
+/// copy in the transcript) is no box.
+#[test]
+fn a_question_whose_footer_wraps_is_read_whole() {
+    let last = |r: &[String]| r.iter().rposition(|x| !x.trim().is_empty()).expect("a row");
+    const ONE: &str = "Enter to select · ↑/↓ to navigate · Esc to cancel";
+    const TABS: &str = "Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
+    for (text, recommended, footer) in [
+        (QUESTION_ONE_44_2_1_295, "nextest (Recommended)", ONE),
+        (QUESTION_ONE_36_2_1_295, "nextest (Recommended)", ONE),
+        (QUESTION_TABS_56_2_1_295, "Disk (Recommended)", TABS),
+    ] {
+        let (r, p, d) = read(text);
+        assert_eq!(worker_phase(&r), Phase::Prompt, "{recommended}");
+        assert!(!p.head_off_screen);
+        let o = &options(&d)[0];
+        assert_eq!(
+            (o.label.as_str(), o.recommended, o.focused),
+            (recommended, Recommended::Label, true)
+        );
+        assert_eq!(p.span.1, last(&r), "the box runs to the footer's last row");
+        assert_eq!(p.footer.as_deref(), Some(footer), "the footer, joined");
+    }
+    let r = screen(QUESTION_ONE_44_2_1_295);
+    let end = last(&r);
+    let mut short = r.clone();
+    short[end - 1] = "Enter to select · Esc to".to_string();
+    let mut moved = r.clone();
+    moved[end] = format!("  {}", r[end]);
+    // A copy in the transcript: the composer under it, drawn the pane's
+    // width, its top rule no wrap of the footer.
+    let mut quoted = r.clone();
+    let rule = "─".repeat(44);
+    quoted.extend([
+        rule.clone(),
+        "❯".to_string(),
+        rule,
+        "  ? for shortcuts".to_string(),
+    ]);
+    for rows in [short, moved, quoted] {
+        assert_eq!(parse_prompt_v2(&rows), None, "{rows:#?}");
     }
 }

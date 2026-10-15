@@ -111,9 +111,9 @@ impl DetachedReaderAim {
 ///
 /// `[store | lazy_lines]` rewrap as one logical sequence back into the store;
 /// `ring_lines` rewrap as a separate sequence (the ring phase) returned to the
-/// ring at re-attach. Under [`ResizePolicy::Native`] a soft-wrapped run
-/// straddling the lazy/ring boundary re-splits at that seam; under
-/// [`ResizePolicy::ConPty`] it is handed to the ring phase whole.
+/// ring at re-attach. A soft-wrapped run straddling the lazy/ring boundary is
+/// handed to the ring phase whole, so it rewraps as the synchronous resize
+/// rewraps it.
 ///
 /// Two ways to run the rewrap, identical results:
 /// * [`reflow`](Self::reflow): one shot, for a worker thread.
@@ -158,11 +158,6 @@ pub struct PendingScrollbackReflow {
     /// Input lines the steps have read so far (every read line is rewrapped
     /// by the step that completes its logical run).
     lines_read: usize,
-    /// The seam policy of the resize that detached this job. Under
-    /// [`ResizePolicy::ConPty`] a logical line straddling the store/ring seam
-    /// rewraps whole (see the Stream phase's exhaustion arm); under `Native`
-    /// it re-splits there.
-    policy: ResizePolicy,
 }
 
 /// Where an incrementally-stepped rewrap currently is. Private: callers only
@@ -430,12 +425,12 @@ impl PendingScrollbackReflow {
                     // Input exhausted: every carried run is complete, unless the
                     // newest continues into the job-carried ring history (its
                     // head left the ring for the store, its tail is still in the
-                    // ring). Under ConPTY that run goes to the ring phase whole;
-                    // rewrapped here it would come back as a head plus an orphan
-                    // tail line.
-                    let straddling = if self.policy == ResizePolicy::ConPty
-                        && self.ring_lines.first().is_some_and(Line::is_wrapped)
-                    {
+                    // ring). That run goes to the ring phase whole: rewrapped
+                    // here it would come back as a head plus an orphan tail
+                    // line, where the synchronous resize rewraps it as one.
+                    // Ruling 2026-10-11: under every policy, not only ConPTY
+                    // (where conhost's repaint first showed the orphan).
+                    let straddling = if self.ring_lines.first().is_some_and(Line::is_wrapped) {
                         let head = carry.iter().rposition(|line| !line.is_wrapped());
                         carry.split_off(head.unwrap_or(0))
                     } else {
@@ -667,6 +662,19 @@ impl Grid {
             .scrollback
             .take()
             .expect("scrollback.is_none() early-returned above");
+        // The window opens with the store out, before the resize below
+        // (ruling 2026-10-11). That resize pushes the screen's top rows into
+        // history, and with the history in the job they land in an empty ring:
+        // inside a window the ones past the ring cap are staged for re-attach
+        // (`prepend_ring_scrollback_lines`), outside one they were dropped as
+        // a ring-only grid drops them, so a narrowing that pushed more rows
+        // than the ring holds lost its oldest ones. Until re-attach, scroll-off
+        // is staged to the lazy buffer too.
+        self.close_reflow_window_cap_run();
+        self.storage.scrollback_detached_for_reflow = true;
+        self.storage.pending_scrollback_settings = Some(pending_settings);
+        // Ruling 238: the window opens with no reader aim.
+        self.storage.detached_reader_aim = None;
         // Lift the ring history into the job too; materializing rows → Lines is
         // the only remaining synchronous ring cost. The ring is left empty, so
         // the resize below rewraps nothing off-screen
@@ -699,20 +707,13 @@ impl Grid {
         // synchronous cost is the visible-grid reflow, O(viewport).
         self.resize_with_policy(new_rows, new_cols, policy);
         // This window's reader-descent baseline. The resize just clamped
-        // `display_offset` against an empty history, so its value says nothing
-        // about the reader; the generation does, because machine motion (that
-        // clamp included) never advances it. Sampled after the resize so the
+        // `display_offset` against the history the job left (none but the
+        // rows the resize pushed), so its value says nothing about the reader;
+        // the generation does, because machine motion (that clamp included)
+        // never advances it. Sampled after the resize so the
         // resize's own clamp is inside the baseline. See the guard in
         // `reattach_reflowed_scrollback`.
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
-
-        // Enter the reflow window after the resize, so the resize runs as the
-        // plain path; until re-attach, scroll-off is staged to the lazy buffer.
-        self.close_reflow_window_cap_run();
-        self.storage.scrollback_detached_for_reflow = true;
-        self.storage.pending_scrollback_settings = Some(pending_settings);
-        // Ruling 238: the window opens with no reader aim.
-        self.storage.detached_reader_aim = None;
 
         let phase = ReflowPhase::start(&store);
         let lines_total = store.line_count() + lazy_lines.len() + ring_lines.len();
@@ -728,7 +729,6 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
-            policy,
         })
     }
 
@@ -871,6 +871,10 @@ impl Grid {
     /// [`reattach_reflowed_scrollback`](Self::reattach_reflowed_scrollback) and
     /// never re-detach. The follow-up job carries no `ring_lines`: the
     /// superseding resize already rewrapped the live ring at the settled width.
+    /// Behind a store that keeps no line the follow-up carries nothing: the
+    /// re-attach put the history back into the ring at the current width
+    /// (`reattach_history_into_ring`), and the pass only lands the deficit
+    /// fill its re-attach owes.
     #[must_use = "a returned job is a re-detached store: drive it and re-attach it (or abort), or history is lost"]
     pub fn reattach_reflowed_scrollback_or_redetach(
         &mut self,
@@ -937,9 +941,6 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
-            // No ring history rides this job, so no run straddles a store/ring
-            // seam inside it and the policy decides nothing here.
-            policy: ResizePolicy::Native,
         })
     }
 
@@ -962,7 +963,16 @@ impl Grid {
     /// With the store at its line limit, lines routed there are subject to its
     /// push-time eviction; the all-to-store case can evict a few lines, bounded
     /// by the ring cap.
+    ///
+    /// A store that keeps no line (`GridStorage::store_retains_lines`: a total
+    /// at or below the ring cap) is no seat at any width, ruling 2026-10-11:
+    /// the ring is the whole retention, as on a ring-only grid of cap = total
+    /// (see [`reattach_history_into_ring`](Self::reattach_history_into_ring)).
     fn reattach_ring_history(&mut self, mut ring_out: Vec<Line>, new_cols: u16) {
+        if !self.storage.store_retains_lines() {
+            self.reattach_history_into_ring(ring_out, new_cols);
+            return;
+        }
         if ring_out.is_empty() {
             return;
         }
@@ -986,14 +996,58 @@ impl Grid {
                     }
                 }
             } else {
-                // No store to route into (unreachable from the normal
-                // re-attach): the ring cap is the retention bound, oldest
-                // evicted.
+                // No store to route into (unreachable: a grid with no store,
+                // like one whose store keeps nothing, took the ring route
+                // above): the ring cap is the retention bound, oldest evicted.
                 drop(ring_out.drain(..skip));
             }
         }
         if !ring_out.is_empty() {
             self.prepend_ring_scrollback_lines(ring_out, new_cols);
+        }
+    }
+
+    /// [`reattach_ring_history`](Self::reattach_ring_history) when the store
+    /// keeps no line: the job's ring history (`lines`, rewrapped at
+    /// `new_cols`) and then the window's staged output go back into the ring,
+    /// the newest first into the room the window's own output left, at the
+    /// grid's current width; the rest goes, as a ring-only grid's cap drops
+    /// it. History stays a contiguous suffix of what was written.
+    ///
+    /// Ruling 2026-10-11. The store route this replaces had the ring history
+    /// pushed into that store, which dropped every line, whenever the job came
+    /// back for a width the grid had left or the window had staged output: a
+    /// drag step during the rewrap (the window's own resize path) lost the
+    /// whole scrollback the total allows. Staged output is taken with it
+    /// because it is newer than the job's lines and older than the ring's:
+    /// seating one without the other would leave a hole.
+    ///
+    /// It can keep more than a ring-only grid of that cap would, never past
+    /// the total and never out of order: where a rows grow inside the window
+    /// pulled ring rows onto the screen, the staged rows fill the room that
+    /// opened, which the ring-only grid had already emptied at its cap.
+    ///
+    /// Rewrapped only when a seat needs it (a width the grid has left, or
+    /// staged rows of whatever width they left at), and then only the newest
+    /// logical lines that fill the room (`reflow_newest_rows`), so the cost
+    /// under the re-attach lock is the ring rebuild's O(room × cols) plus
+    /// materializing the staged rows, which a store that keeps lines pays at
+    /// this same re-attach by draining them into it.
+    fn reattach_history_into_ring(&mut self, mut lines: Vec<Line>, new_cols: u16) {
+        let cols = self.storage.cols;
+        let room = self
+            .storage
+            .max_scrollback
+            .saturating_sub(self.storage.ring_buffer_scrollback());
+        if self.storage.lazy_buffer.is_empty() && new_cols == cols {
+            lines.drain(..lines.len().saturating_sub(room));
+        } else {
+            lines.extend(self.storage.lazy_buffer.drain_all());
+            self.storage.lazy_buffer.release_spine_slack();
+            lines = super::scrollback_reflow::reflow_newest_rows(&lines, cols, room);
+        }
+        if !lines.is_empty() {
+            self.prepend_ring_scrollback_lines(lines, cols);
         }
     }
 
@@ -1998,9 +2052,9 @@ mod tests {
     }
 
     /// Single-row logical lines only (blanks, short/medium ASCII, wide CJK
-    /// under one row). No multi-row runs: a run straddling the store/ring seam
-    /// re-splits differently on the offload and plain paths, and this corpus
-    /// isolates placement/order identity.
+    /// under one row). No multi-row runs: a run straddling a detach window's
+    /// seam (the job's history, then what an in-window resize re-took) still
+    /// re-splits there, and this corpus isolates placement/order identity.
     fn feed_single_row_history(grid: &mut Grid, seed: u64, logical_lines: usize, cols: u16) {
         let mut rng = Rng(seed);
         for i in 0..logical_lines {
@@ -2024,63 +2078,250 @@ mod tests {
         }
     }
 
-    /// With the ring history riding the job, the offloaded round trip produces
-    /// exactly the history sequence the plain synchronous `Grid::resize` does
-    /// (texts, wrap flags, order, count) over deep single-row history and random
-    /// step schedules. Tier placement differs (the plain path migrates ring
-    /// content into the store), so the unified `get_history_line` view is
-    /// compared. Mid-flight the ring history must be in the job.
+    /// One width change for the offloaded-vs-plain differential below: the
+    /// grid's shape and ring, then the drag of `(rows, cols)` steps. The first
+    /// step detaches; the rest land while the job is out, as plain resizes
+    /// inside the detach window (the GUI's superseding drag steps), each after
+    /// `output` more lines (scroll-off a full ring stages for re-attach).
+    /// `fit` caps the corpus so every line is one row at every width, unless
+    /// the drag is `wrapping` (`feed_wrapping_history`, one step only).
+    ///
+    /// A drag with output runs with the reader at the live bottom only: a
+    /// reader scrolled back over window output is restored by offset (see
+    /// "offset identity" in `reattach_reflowed_scrollback`), which the plain
+    /// path's per-batch repin does not share.
+    struct Drag {
+        label: &'static str,
+        wrapping: bool,
+        policy: ResizePolicy,
+        ring: usize,
+        rows: u16,
+        cols: u16,
+        steps: &'static [(u16, u16)],
+        output: usize,
+        fit: u16,
+    }
+
+    const DRAGS: [Drag; 8] = [
+        Drag {
+            wrapping: false,
+            label: "one narrowing step, the ring holds its overflow",
+            policy: ResizePolicy::Native,
+            ring: 32,
+            rows: 10,
+            cols: 40,
+            steps: &[(10, 23)],
+            output: 0,
+            fit: 40,
+        },
+        // The window's steps push the screen's top rows off while the ring
+        // holds the first step's: the history must read them in that order.
+        Drag {
+            wrapping: false,
+            label: "a drag whose later steps land inside the window",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 13,
+            cols: 40,
+            steps: &[(10, 35), (4, 30), (3, 28)],
+            output: 0,
+            fit: 20,
+        },
+        // ... and behind the output the window staged meanwhile.
+        Drag {
+            wrapping: false,
+            label: "a drag with output streaming between its steps",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 13,
+            cols: 40,
+            steps: &[(10, 35), (4, 30), (3, 28)],
+            output: 12,
+            fit: 20,
+        },
+        // One step pushing more rows off the screen than the ring holds: the
+        // rows past the ring are history too.
+        Drag {
+            wrapping: false,
+            label: "one step pushing more rows than the ring holds",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 13,
+            cols: 40,
+            steps: &[(3, 23)],
+            output: 0,
+            fit: 20,
+        },
+        Drag {
+            wrapping: false,
+            label: "the same push under ConPTY",
+            policy: ResizePolicy::ConPty,
+            ring: 8,
+            rows: 13,
+            cols: 40,
+            steps: &[(3, 23)],
+            output: 0,
+            fit: 20,
+        },
+        // Lines that wrap: a run straddling the store/ring seam rewraps whole,
+        // as the plain resize rewraps it.
+        Drag {
+            wrapping: true,
+            label: "one narrowing step over lines that wrap",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 10,
+            cols: 40,
+            steps: &[(10, 23)],
+            output: 0,
+            fit: 40,
+        },
+        Drag {
+            wrapping: true,
+            label: "the same over lines that wrap, under ConPTY",
+            policy: ResizePolicy::ConPty,
+            ring: 8,
+            rows: 10,
+            cols: 40,
+            steps: &[(10, 23)],
+            output: 0,
+            fit: 40,
+        },
+        Drag {
+            wrapping: true,
+            label: "one step over lines that wrap, pushing more rows than the ring holds",
+            policy: ResizePolicy::Native,
+            ring: 8,
+            rows: 13,
+            cols: 40,
+            steps: &[(3, 23)],
+            output: 0,
+            fit: 40,
+        },
+    ];
+
+    /// Logical lines of 0..3 widths of ASCII at `cols`, so most wrap into
+    /// multi-row runs and some straddle the store/ring seam.
+    fn feed_wrapping_history(grid: &mut Grid, seed: u64, logical_lines: usize, cols: u16) {
+        let mut rng = Rng(seed);
+        for i in 0..logical_lines {
+            let len = rng.below(u64::from(cols) * 3) as usize;
+            let mut s = format!("R{i}-");
+            while s.len() < len {
+                s.push((b'a' + rng.below(26) as u8) as char);
+            }
+            logical_line(grid, &s);
+        }
+    }
+
+    /// With the ring history riding the job, the offloaded width change ends
+    /// where the plain synchronous `Grid::resize` does: the same history
+    /// sequence (texts, wrap flags, order, count), the same screen and the
+    /// same reading position, over deep single-row history, random step
+    /// schedules, a reader at the live bottom or scrolled back, and each
+    /// [`Drag`]. Tier placement differs (the plain path migrates ring content
+    /// into the store), so the unified `get_history_line` view is compared.
+    /// Mid-flight the ring history must be in the job.
     #[test]
     fn offload_round_trip_matches_plain_resize_history_sequence() {
-        for seed in [3u64, 11, 0xFEED] {
-            let (rows, cols, new_cols) = (10u16, 40u16, 23u16);
-            let mut offloaded = tiered_grid(rows, cols, 32);
-            let mut plain = tiered_grid(rows, cols, 32);
-            for g in [&mut offloaded, &mut plain] {
-                feed_single_row_history(g, seed, 300, cols);
-            }
-            assert!(
-                offloaded.ring_buffer_scrollback() > 0,
-                "seed {seed}: precondition — ring scrollback exists to ride the job"
-            );
+        let read = |g: &Grid| -> Vec<(String, bool)> {
+            (0..g.scrollback_lines())
+                .map(|i| {
+                    g.get_history_line(i).map_or_else(
+                        || (String::new(), false),
+                        |line| (line.as_str().unwrap_or("").to_string(), line.is_wrapped()),
+                    )
+                })
+                .collect()
+        };
+        let screen = |g: &Grid| -> Vec<String> {
+            (0..g.rows())
+                .map(|r| g.row_text(r).unwrap_or_default())
+                .collect()
+        };
+        for drag in &DRAGS {
+            for seed in [3u64, 11, 0xFEED] {
+                // The reader: at the live bottom, then scrolled back by a
+                // seeded 1..=12 rows.
+                let backs: &[i32] = if drag.output == 0 {
+                    &[0, 1 + (seed % 12) as i32]
+                } else {
+                    &[0]
+                };
+                for &back in backs {
+                    let case = format!("{} / seed {seed} / back {back}", drag.label);
+                    let mut offloaded = tiered_grid(drag.rows, drag.cols, drag.ring);
+                    let mut plain = tiered_grid(drag.rows, drag.cols, drag.ring);
+                    for g in [&mut offloaded, &mut plain] {
+                        if drag.wrapping {
+                            feed_wrapping_history(g, seed, 300, drag.cols);
+                        } else {
+                            feed_single_row_history(g, seed, 300, drag.fit);
+                        }
+                        g.scroll_display(back);
+                    }
+                    assert!(
+                        offloaded.ring_buffer_scrollback() > 0,
+                        "{case}: precondition — ring scrollback exists to ride the job"
+                    );
 
-            let job = offloaded
-                .resize_offloading_scrollback(rows, new_cols)
-                .expect("width change with a tiered store detaches");
-            // Reach guard: the ring history rides the job. The grid's ring is
-            // not asserted empty: the visible-grid shrink may spill fresh
-            // overflow rows into it during the synchronous resize.
-            assert!(
-                !job.ring_lines.is_empty(),
-                "seed {seed}: detach lifts the ring history into the job (RFL-1)"
-            );
-            let mut rng = Rng(seed ^ 0xD1FF);
-            let (done, _steps) = step_with_schedule(job, &mut rng, 29);
-            offloaded.reattach_reflowed_scrollback(done);
-            assert!(
-                offloaded.ring_buffer_scrollback() > 0,
-                "seed {seed}: re-attach returns ring history to the ring"
-            );
-
-            plain.resize(rows, new_cols);
-
-            let read = |g: &Grid| -> Vec<(String, bool)> {
-                (0..g.scrollback_lines())
-                    .map(|i| {
-                        g.get_history_line(i).map_or_else(
-                            || (String::new(), false),
-                            |line| (line.as_str().unwrap_or("").to_string(), line.is_wrapped()),
+                    let (first_rows, first_cols) = drag.steps[0];
+                    let job = offloaded
+                        .resize_offloading_scrollback_with_policy(
+                            first_rows,
+                            first_cols,
+                            drag.policy,
                         )
-                    })
-                    .collect()
-            };
-            assert_eq!(
-                read(&offloaded),
-                read(&plain),
-                "seed {seed}: offloaded history sequence != plain-resize sequence"
-            );
-            offloaded.assert_invariants();
-            plain.assert_invariants();
+                        .expect("width change with a tiered store detaches");
+                    // Reach guard: the ring history rides the job. The grid's
+                    // ring is not asserted empty: the visible-grid shrink may
+                    // spill fresh overflow rows into it during the synchronous
+                    // resize.
+                    assert!(
+                        !job.ring_lines.is_empty(),
+                        "{case}: detach lifts the ring history into the job (RFL-1)"
+                    );
+                    plain.resize_with_policy(first_rows, first_cols, drag.policy);
+                    for (step, &(rows, cols)) in drag.steps[1..].iter().enumerate() {
+                        for g in [&mut offloaded, &mut plain] {
+                            for i in 0..drag.output {
+                                logical_line(g, &format!("O{step}-{i}"));
+                            }
+                        }
+                        assert!(
+                            drag.output == 0 || !offloaded.storage.lazy_buffer.is_empty(),
+                            "{case}: precondition — the window staged its output"
+                        );
+                        offloaded.resize_with_policy(rows, cols, drag.policy);
+                        plain.resize_with_policy(rows, cols, drag.policy);
+                        offloaded.storage.lazy_buffer.assert_running_sums();
+                    }
+                    let mut rng = Rng(seed ^ 0xD1FF);
+                    let mut next = Some(job);
+                    while let Some(job) = next {
+                        let (done, _steps) = step_with_schedule(job, &mut rng, 29);
+                        next = offloaded.reattach_reflowed_scrollback_or_redetach(done);
+                    }
+                    assert!(
+                        offloaded.ring_buffer_scrollback() > 0,
+                        "{case}: re-attach returns ring history to the ring"
+                    );
+
+                    assert_eq!(
+                        read(&offloaded),
+                        read(&plain),
+                        "{case}: offloaded history sequence != plain-resize sequence"
+                    );
+                    assert_eq!(
+                        offloaded.display_offset(),
+                        plain.display_offset(),
+                        "{case}: the reader's place"
+                    );
+                    assert_eq!(screen(&offloaded), screen(&plain), "{case}: the screen");
+                    offloaded.assert_invariants();
+                    plain.assert_invariants();
+                }
+            }
         }
     }
 
@@ -2088,7 +2329,8 @@ mod tests {
     /// into a Vec, rewrap in one pass, `clear()` the store, and push every
     /// output line with the store's limits active. Takes an unstepped job.
     /// `ring_lines` are ignored on both sides (the streaming path routes them to
-    /// `ring_out`).
+    /// `ring_out`), and so is a trailing run that continues into them, which
+    /// the job hands to its ring phase whole.
     fn reference_materialize_all(job: PendingScrollbackReflow) -> ScrollbackStorage {
         let mut store = job.store;
         let mut input: Vec<Line> = Vec::with_capacity(store.line_count() + job.lazy_lines.len());
@@ -2099,6 +2341,10 @@ mod tests {
             });
         }
         input.extend(job.lazy_lines);
+        if job.ring_lines.first().is_some_and(Line::is_wrapped) {
+            let head = input.iter().rposition(|line| !line.is_wrapped());
+            input.truncate(head.unwrap_or(0));
+        }
         let out = super::super::scrollback_reflow::reflow_scrollback_lines(&input, job.new_cols);
         store.clear().expect("reference clear");
         for line in out {
@@ -2363,27 +2609,23 @@ mod tests {
     }
 
     /// A line whose head scrolled past the ring (into lazy staging) while its
-    /// continuation is still the ring's oldest row: a ConPTY job rewraps it
-    /// whole; a Native job re-splits it at the seam.
+    /// continuation is still the ring's oldest row: the job rewraps it whole
+    /// under either policy, leaving the history the synchronous resize leaves.
+    /// Before 2026-10-11 a Native job re-split it at the seam, into
+    /// `0123456789` and an orphan `ABCDE`.
     #[test]
-    fn conpty_job_rewraps_a_line_straddling_the_store_ring_seam_whole() {
-        for (policy, expected) in [
-            (
-                ResizePolicy::ConPty,
-                vec!["0123456789ABCDE", "s0", "s1", "s2"],
-            ),
-            (
-                ResizePolicy::Native,
-                vec!["0123456789", "ABCDE", "s0", "s1", "s2"],
-            ),
-        ] {
+    fn a_job_rewraps_a_line_straddling_the_store_ring_seam_whole() {
+        for policy in [ResizePolicy::ConPty, ResizePolicy::Native] {
             // 3 visible rows over a 4-row ring: the 15-char line (2 rows at
             // 10 columns) and s0..s4 leave 5 history rows, so exactly its head
             // leaves the ring.
             let mut g = tiered_grid(3, 10, 4);
-            logical_line(&mut g, "0123456789ABCDE");
-            for i in 0..5 {
-                logical_line(&mut g, &format!("s{i}"));
+            let mut plain = tiered_grid(3, 10, 4);
+            for g in [&mut g, &mut plain] {
+                logical_line(g, "0123456789ABCDE");
+                for i in 0..5 {
+                    logical_line(g, &format!("s{i}"));
+                }
             }
             assert_eq!(g.storage.ring_buffer_scrollback(), 4, "precondition");
             assert_eq!(g.scrollback_lines(), 5, "precondition: the head left");
@@ -2392,11 +2634,19 @@ mod tests {
                 .resize_offloading_scrollback_with_policy(3, 20, policy)
                 .expect("a width change with a store offloads");
             g.reattach_reflowed_scrollback(pending.reflow());
-            let history: Vec<String> = (0..g.scrollback_lines())
-                .filter_map(|i| g.get_history_line(i).map(|l| l.to_string()))
-                .map(|s| s.trim_end().to_string())
-                .collect();
-            assert_eq!(history, expected, "{policy:?}");
+            plain.resize_with_policy(3, 20, policy);
+            let history = |g: &Grid| -> Vec<String> {
+                (0..g.scrollback_lines())
+                    .filter_map(|i| g.get_history_line(i).map(|l| l.to_string()))
+                    .map(|s| s.trim_end().to_string())
+                    .collect()
+            };
+            assert_eq!(
+                history(&g).first().map(String::as_str),
+                Some("0123456789ABCDE"),
+                "{policy:?}: the straddling line, whole"
+            );
+            assert_eq!(history(&g), history(&plain), "{policy:?}");
             g.assert_invariants();
         }
     }

@@ -32,8 +32,9 @@
 //! * `the_connection_past_the_cap_is_told_busy_and_tabs_still_open`: the
 //!   open-connection cap is a quarter of the descriptor limit. Under launchd's
 //!   default soft `RLIMIT_NOFILE` of 256 (a window started from the Dock), idle
-//!   drivers are opened until a refusal STAYS: it must be the busy line, at
-//!   exactly the cap, and the window must still open tabs. A fixed 1024 let
+//!   drivers are opened up to the cap, each served: the connection past it
+//!   must get the busy line, and keep getting it, and the window must still
+//!   open tabs. A fixed 1024 let
 //!   about 240 idle connections exhaust the descriptors, so clients got a
 //!   dropped connection and new tabs failed. `aterm ctl` at the cap prints the
 //!   busy line both for a sent verb (`status`) and for its own discovery (`ls`).
@@ -46,7 +47,11 @@
 //!   them, and each is served once it goes on, its answer whole.
 //!
 //! Every instance runs under a descriptor limit its test names, so no verdict
-//! depends on the shell the suite was started from.
+//! depends on the shell the suite was started from. And no verdict depends on
+//! how long a refusal lasted: the lanes and the cap are known numbers, so a
+//! busy line below them is a moment, asked again until it clears (a [`HANG`]
+//! detector), and one at them must hold for as long as it is watched
+//! ([`REFUSAL_STAYS`]).
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private explicit control socket, a
 //! config with every automatic lane off (the harness included), `--no-reroute`,
@@ -80,11 +85,12 @@ const INLINE_WAITS: usize = RPC_LANES / 2;
 /// its lanes may take).
 const BUSY: &str = "ERR control server busy; retry";
 
-/// How long a refusal must last to be read as the socket's verdict rather than
-/// a moment: a lane places a connection in milliseconds on an idle machine
-/// and can take a scheduler's seconds on a loaded one, while a cap or a
-/// saturation lasts until a connection closes or a wait ends. Paid only once a
-/// refusal is seen (a probe every 50 ms until it clears).
+/// How long a refusal AT the socket's cap is watched to hold: nothing but the
+/// test can end it (a connection closing), so it holds however long it is
+/// watched. Never what tells a moment from a limit: the limits are known
+/// numbers, and a refusal below them is a moment ([`answered`]) however long a
+/// loaded machine stretches it — a lane places a connection in milliseconds
+/// on an idle machine and can take a scheduler's seconds on a loaded one.
 const REFUSAL_STAYS: Duration = Duration::from_secs(5);
 
 /// How long a wait for something that MUST happen may take before it is read
@@ -396,6 +402,20 @@ fn idle_driver(sock: &Path, token: &str) -> Result<Driver, String> {
     }
 }
 
+/// [`idle_driver`] below the socket's cap: a busy line there is a moment (a
+/// lane still placing an earlier connection), dialled again until served — a
+/// [`HANG`] detector. `Err` with the refusal when a busy line never clears,
+/// or at once when a refusal is not the busy line.
+fn idle_driver_below_cap(sock: &Path, token: &str) -> Result<Driver, String> {
+    aterm_spec::wait::within(HANG, Duration::from_millis(50), || {
+        match idle_driver(sock, token) {
+            Err(again) if again == BUSY => None,
+            answer => Some(answer),
+        }
+    })
+    .unwrap_or_else(|| Err(BUSY.to_string()))
+}
+
 /// Text no row of this idle instance holds, until a test types it into the
 /// session.
 const WAIT_TEXT: &str = "zq-no-row-holds-this-qz";
@@ -449,10 +469,9 @@ fn admitted_wait(sock: &Path, token: &str, wait_ms: u64, reopened: &mut usize) -
     }
 }
 
-/// Whether `reply` — a probe's answer — is a refusal that STAYS: [`BUSY`], and
-/// still busy on every probe for [`REFUSAL_STAYS`]. A lane still handing over
-/// the previous wait answers a later probe; a saturated socket refuses until a
-/// wait ends, one at its cap until a connection closes.
+/// Whether `reply` — a probe's answer at the socket's cap — is a refusal that
+/// STAYS: [`BUSY`], and still busy on every probe for [`REFUSAL_STAYS`].
+/// A socket at its cap refuses until a connection closes.
 ///
 /// `Err` is the socket's answer when the refusal did not stay: the probe that
 /// ended it (a momentary refusal), or `reply` itself when it was no refusal at
@@ -472,17 +491,20 @@ fn refusal_stays(sock: &Path, token: &str, reply: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A fresh client's answer, judged as a verdict: a probe that is not [`BUSY`]
-/// is its answer; a busy one is probed again until it clears, and stays
-/// [`BUSY`] only if the refusal STAYS ([`refusal_stays`]) — a lane still
-/// placing the last connection refuses for a moment, a socket out of request
-/// lanes until something ends.
+/// A fresh client's answer BELOW the socket's limits: a probe that is not
+/// [`BUSY`] is its answer; a busy one is a moment (a lane still placing the
+/// last connection), probed again until it clears. It stays [`BUSY`] only if
+/// it never clears within [`HANG`]: a hang detector, never a latency budget
+/// (judged by a [`REFUSAL_STAYS`] window, a moment a loaded machine stretched
+/// past it read as the socket out of lanes).
 fn answered(sock: &Path, token: &str) -> String {
-    let reply = probe(sock, token);
-    match refusal_stays(sock, token, &reply) {
-        Ok(()) => reply,
-        Err(answer) => answer,
+    let mut reply = probe(sock, token);
+    let deadline = Instant::now() + HANG;
+    while reply == BUSY && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        reply = probe(sock, token);
     }
+    reply
 }
 
 #[test]
@@ -521,6 +543,12 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     let mut waiting = Vec::new();
     for index in 0..WAITING {
         let (wait, reply) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
+        // A busy line here is a lane still placing the wait: a moment.
+        let reply = if reply == BUSY {
+            answered(&sock, &token)
+        } else {
+            reply
+        };
         assert!(
             reply.starts_with("OK"),
             "a fresh client was refused with {IDLE} idle and {} waiting drivers open: \
@@ -531,9 +559,11 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     }
 
     // Twenty-four persistent drivers against eight request lanes: every fresh
-    // client is still answered.
+    // client is still answered (a moment of work is waited out: below the
+    // limits a busy line is a lane still placing a connection, and only one
+    // that never clears within the hang detector is the regression).
     for attempt in 0..20 {
-        let reply = probe(&sock, &token);
+        let reply = answered(&sock, &token);
         assert!(
             reply.starts_with("OK"),
             "fresh client {attempt} was refused with {IDLE} idle and {WAITING} waiting \
@@ -584,9 +614,6 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
 
 #[test]
 fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
-    // Far past any cap the server may derive from launchd's limit.
-    const TRIES: usize = 400;
-
     roomy_test_process();
     let Some(world) = world("c") else {
         eprintln!("SKIP: no scratch base with a short enough socket path");
@@ -599,68 +626,72 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
     let cap = connection_cap(soft_limit);
     let token = token(&sock);
 
-    // Idle drivers, each served once and kept open, until a refusal STAYS. The
-    // busy line is for work too: on a loaded machine every request lane can
-    // still be placing an earlier connection when the next one arrives (one
-    // early refusal at 25 open was measured, its retry served 0.4 ms later).
-    // Such a moment is dialled again and the filling goes on; the cap is a
-    // refusal that holds for [`REFUSAL_STAYS`]. No client can make a moment on
-    // purpose any more: silent peers made one here until a peer's silence
-    // stopped holding a lane (`peers_that_stop_mid_exchange_take_no_lane`).
+    // Idle drivers, each served once and kept open, up to the cap. The busy
+    // line is for work too: on a loaded machine every request lane can still
+    // be placing an earlier connection when the next one arrives (one early
+    // refusal at 25 open was measured, its retry served 0.4 ms later). Below
+    // the cap such a refusal is always a moment — a refused connection never
+    // counted — so it is dialled again until served, and the filling goes on;
+    // a cap below the documented one never lets a retry through, and fails at
+    // [`HANG`] naming where it held. (Read as the cap once it had held for
+    // [`REFUSAL_STAYS`], a moment a loaded machine stretched past it stopped
+    // the filling short of the cap.) No client can make a moment on purpose
+    // any more: silent peers made one here until a peer's silence stopped
+    // holding a lane (`peers_that_stop_mid_exchange_take_no_lane`).
     let mut held: Vec<Driver> = Vec::new();
     let mut cleared = 0;
-    let refusal = 'fill: loop {
-        assert!(
-            held.len() < TRIES,
-            "{TRIES} connections open at soft limit {soft_limit} and none refused"
-        );
-        let reply = match idle_driver(&sock, &token) {
+    while held.len() < cap {
+        let refused = match idle_driver(&sock, &token) {
             Ok(driver) => {
                 held.push(driver);
                 continue;
             }
             Err(refused) => refused,
         };
-        if reply != BUSY {
-            break reply;
-        }
-        let stays = Instant::now() + REFUSAL_STAYS;
-        while Instant::now() < stays {
-            std::thread::sleep(Duration::from_millis(50));
-            match idle_driver(&sock, &token) {
-                Ok(driver) => {
-                    held.push(driver);
-                    cleared += 1;
-                    assert!(
-                        cleared <= 40,
-                        "{cleared} refusals cleared on retry below the cap: \
-                         the lanes are not free of idle connections"
-                    );
-                    continue 'fill;
-                }
-                Err(again) if again == BUSY => {}
-                Err(other) => break 'fill other,
-            }
-        }
-        break reply;
-    };
+        assert_eq!(
+            refused,
+            BUSY,
+            "below the cap ({} of {cap} open, soft descriptor limit {soft_limit}) a refusal \
+             is the busy line, not a process out of descriptors",
+            held.len()
+        );
+        cleared += 1;
+        assert!(
+            cleared <= 40,
+            "{cleared} refusals cleared on retry below the cap: the lanes are not free of \
+             idle connections"
+        );
+        let open = held.len();
+        let driver = idle_driver_below_cap(&sock, &token).unwrap_or_else(|reply| {
+            panic!(
+                "refused at {open} open ({reply:?}): the cap is below a quarter of the soft \
+                 descriptor limit {soft_limit} ({cap}), the lanes are held by idle connections \
+                 ({cleared} momentary refusals cleared before), or the refusal is not the busy \
+                 line"
+            )
+        });
+        held.push(driver);
+    }
     eprintln!(
         "cap: {} open at soft limit {soft_limit}; {cleared} momentary refusals retried",
         held.len()
     );
-    assert_eq!(
-        refusal,
-        BUSY,
-        "the connection past {} open ones (soft descriptor limit {soft_limit}) must get \
-         the busy line, not a process out of descriptors",
-        held.len()
-    );
-    assert_eq!(
-        held.len(),
-        cap,
-        "the socket refuses, and keeps refusing, at a quarter of the soft descriptor \
-         limit {soft_limit} ({cleared} momentary refusals retried)"
-    );
+    // At the cap: the connection past it gets the busy line — not a process
+    // out of descriptors, not a connection served past the cap — and keeps
+    // getting it.
+    let refusal = match idle_driver(&sock, &token) {
+        Ok(_) => panic!(
+            "the connection past {cap} open ones (soft descriptor limit {soft_limit}) was \
+             served: the socket must refuse at a quarter of the limit"
+        ),
+        Err(refused) => refused,
+    };
+    refusal_stays(&sock, &token, &refusal).unwrap_or_else(|reply| {
+        panic!(
+            "the connection past {cap} open ones (soft descriptor limit {soft_limit}) must get \
+             the busy line, and keep getting it: {reply:?}"
+        )
+    });
     for driver in &held {
         bound_reads(driver.stream(), HANG);
     }

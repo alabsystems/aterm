@@ -36,5 +36,11 @@ aterm-tempfile = { workspace = true }
 # in the graph via aterm-types.
 aterm-time = { workspace = true }
 
+# A real terminal for tests/terminal_output.rs: the CLI's stdout or stderr on a pty
+# slave, both ends close-on-exec from birth (`open_pty_pair`), as atpkg-keys'
+# pty fixture does. Workspace crate, already in the workspace graph.
+[target.'cfg(unix)'.dev-dependencies]
+aterm-pty = { workspace = true }
+
 [lints]
 workspace = true

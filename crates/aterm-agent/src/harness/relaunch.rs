@@ -96,6 +96,16 @@
 //! [`St::home`]) — is made there (review of `fix/cold-restore-login-home`,
 //! 2026-10-09: read under the user's home alone, an agent under another home
 //! was never relaunched at all, `ended:no-conversation`, or started afresh).
+//! A RELATIVE home — set and EMPTY included, which Claude Code's `??` keeps
+//! — names a directory under the one the process runs in: the snapshot
+//! resolves it there by the one resolver the live upgrade's sweep uses
+//! ([`Records::of_process`]: under the directory that holds its record, the
+//! one it started in where a worktree has moved it since) and keeps where
+//! it read the record ([`Snapshot::claude_dir`]); a line whose `cd` would
+//! resolve it elsewhere is refused (`refused:home`), as the sweep's is.
+//! Before 2026-10-14 none of these read anything for such an agent: its
+//! crash read as a graceful exit, its restart in place waited
+//! `wait:no-session-record` for good.
 //!
 //! The one line also HEALS THE SHELL it is typed at: a tab whose
 //! shell lost its integration key before the re-key channel existed reads
@@ -122,12 +132,12 @@ use super::upgrade_drive::{
     Client, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM, Screen,
     SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, alive, composer_clear,
     composer_empty, connect, continuation_composer_empty, conversation_live, cwd_of, exe_of,
-    first_word, foreground_shell, held, host_roster, ids, is_our_ancestor, kernel_start,
-    launch_kept, ledger, line_model_of, live_background, load, model_and_mark, native_root,
-    note_stuck, now_s, owned_by_aterm, process_in_tab, record_asked, restart_models, restore,
-    roster, said, save, screen, since, squash, state_dir, supervisor_typed, sweep_lock, table,
-    tail_to_end, take_back_ask, terminate, turn, turn_fenced, type_line, typing_fence, under_hand,
-    unique_tab_for_group,
+    first_word, foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor,
+    kernel_start, launch_kept, ledger, line_model_of, live_background, load, model_and_mark,
+    native_root, note_stuck, now_s, owned_by_aterm, process_in_tab, record_asked, restart_models,
+    restore, roster, said, save, screen, since, squash, state_dir, supervisor_typed, sweep_lock,
+    table, tail_to_end, take_back_ask, terminate, turn, turn_fenced, type_line, typing_fence,
+    under_hand, unique_tab_for_group,
 };
 use crate::supervise::limit::one_line;
 pub use crate::supervise::policy::turn_end::Restart;
@@ -704,6 +714,10 @@ fn relaunch_held(
     // instead, a restart whose signal was refused or whose line never came
     // would keep it, and it would settle FAILED though no relaunch asked it.
     let asked = record_asked(opts, session, &st.model_list);
+    // The command block the line is typed into, read before it is
+    // ([`line_block`]): whether the line's command has run and ended is that
+    // block's to say ([`ShellBack`]).
+    let block = line_block(c, &tab);
     let typed = type_relaunch_line(
         opts,
         &st.agent_records(&opts.home),
@@ -739,6 +753,7 @@ fn relaunch_held(
         }
     }
     st.relaunched(now_s());
+    st.line_block = block;
     // A new line: no process of it is adopted yet ([`St::relaunched_pid`]).
     st.relaunched_pid = 0;
     ledger(opts, &said(r.clone(), "relaunched"), &st.line);
@@ -1147,17 +1162,7 @@ impl InputStart {
 /// [`InputStart`] as the tab answers it. `None` where no such mark reads: no
 /// integration, a block in any other state, or a host that sends no `cmdcol`.
 fn input_start(c: &mut Client, tab: &str) -> Option<InputStart> {
-    let (head, body) = c.request_counted(&format!("@{tab} blocks 1 --json")).ok()?;
-    if !head.starts_with("OK") {
-        return None;
-    }
-    let json = if body.trim().is_empty() {
-        head.strip_prefix("OK ")?
-    } else {
-        &body
-    };
-    let v: Value = aterm_json::from_str(json.trim()).ok()?;
-    let block = v.get("blocks")?.as_array()?.last()?.clone();
+    let block = newest_block(c, tab)?;
     if block.get("state").and_then(Value::as_str) != Some("entering") {
         return None;
     }
@@ -1357,9 +1362,10 @@ fn await_held(
     let fresh = starts_afresh(&st.cause);
     let mut new: Option<SessionFile> = None;
     let mut roster = SessionRosterCache::default();
-    let mut back = ShellBack::default();
+    let mut back = ShellBack::after(st.line_block);
     let mut ended = false;
     let look_back = ends_at_once(&st.cause);
+    let tab = st.tab.clone();
     wait_until(held_wait(&st.cause), || {
         hand.keep(c);
         new = roster.files(&records, Instant::now()).and_then(|files| {
@@ -1376,7 +1382,8 @@ fn await_held(
         });
         let now = Instant::now();
         if look_back && new.is_none() && back.due(now) {
-            ended = back.saw(k.shell_holds_tab(shell), now);
+            let over = back.block.and_then(|block| line_over(c, &tab, block));
+            ended = back.saw(k.shell_holds_tab(shell), over, now);
         }
         new.is_some() || ended
     });
@@ -1428,11 +1435,12 @@ fn await_held(
         }
         Some(sf) => carry_on(opts, r, st, c, session, &sf, Some(hand)),
         // The relaunched agent ended as it started (Claude's `No conversation
-        // found`, a crash at start): its shell has had the tab back for
-        // [`ENDED_AT_ONCE`] and nothing registered the conversation — read
-        // for a restored tab's relaunch only ([`ends_at_once`]). Said now
-        // (day six, D30: the wait went on 90 s at a time for five minutes,
-        // the harness's hand on the tab throughout), with the stale
+        // found`, a crash at start): the line's command was seen to run and
+        // end, its shell has had the tab back for [`ENDED_AT_ONCE`] since,
+        // and nothing registered the conversation ([`ShellBack`]) — read for
+        // a relaunch whose line nothing types again ([`ends_at_once`]).
+        // Said now (day six, D30: the wait went on 90 s at a time for five
+        // minutes, the harness's hand on the tab throughout), with the stale
         // relaunch's word and stop — what it printed is on the tab.
         None if ended => {
             st.stop("no-resume", now_s());
@@ -1557,50 +1565,99 @@ fn held_wait(cause: &str) -> Duration {
     if let Some(wait) = HELD_WAIT_IN_TEST.with(std::cell::Cell::get) {
         return wait;
     }
-    if ends_at_once(cause) {
+    if cause == CAUSE_HOST {
         RESTORED_HELD_WAIT
     } else {
         HELD_WAIT
     }
 }
 
-/// Whether [`await_held`] reads a relaunched agent as ENDED once its shell
-/// has held the tab for [`ENDED_AT_ONCE`] ([`ShellBack`]): only a restored
-/// tab's relaunch, after aterm itself ended ([`CAUSE_HOST`]), whose host
-/// tries it once and says a failure at once (ruling 296 of the messages
-/// design, as amended in review). NOT the live relaunch on exit, nor the
-/// upgrade: the live loop reads `failed:no-resume` as not yet
-/// ([`outcome`]) and each retry after its back-off types the relaunch line
-/// into the tab afresh, so an early verdict there retyped a refusing agent
-/// at about +7 s, +23 s and +90 s where this wait retypes it only past
-/// [`STALE_S`] ("never interrupt an agent that is working"). The others keep
-/// the full wait: an early stop there would first need a no-retype rule for
-/// a `failed:` word in the live loop.
+/// Whether [`await_held`] reads a relaunched agent as ENDED as it started
+/// ([`ShellBack`]: the line's command seen to run and end, its shell holding
+/// the tab for [`ENDED_AT_ONCE`] since): every relaunch whose line nothing
+/// types again, so that a stop is final. A restored tab's ([`CAUSE_HOST`]),
+/// whose host tries it once and says a failure at once (ruling 296 of the
+/// messages design, as amended in review); and a restart that ended its
+/// agent itself ([`ends_its_agent`]: the upgrade's, the restart in place's),
+/// whose line is typed once by the restart or by the carry of its exit, and
+/// whose stopped record that carry answers `refused:` ([`carry_own`]).
+/// Waited out instead, an upgrade's relaunch that Claude refused at once
+/// (`No conversation found`, a crash at start) stood `relaunched` once the
+/// step's wait ended, with nothing left to look at a tab whose loop had
+/// stopped with its agent, and read for half an hour as a start-up screen
+/// waiting on a person — never as the agent that is down (the real-Claude
+/// sweep of 2026-10-09). NOT the live relaunch on exit: its loop reads
+/// `failed:no-resume` as not yet ([`outcome`]) and each retry after its
+/// back-off types the relaunch line into the tab afresh, so an early verdict
+/// there retyped a refusing agent at about +7 s, +23 s and +90 s where this
+/// wait retypes it only past [`STALE_S`] ("never interrupt an agent that is
+/// working"); it keeps the full wait until that loop has a no-retype rule
+/// for a `failed:` word.
 pub(super) fn ends_at_once(cause: &str) -> bool {
-    cause == CAUSE_HOST
+    cause == CAUSE_HOST || ends_its_agent(cause)
 }
 
-/// How long the shell a relaunch line was typed at may hold its terminal with
-/// nothing registered before the relaunched agent is read as ended
-/// ([`ShellBack`]). A shell hands the terminal to what it starts at once.
+/// How long the shell a relaunch line was typed at may hold its terminal,
+/// once the line's command was seen to run, with nothing registered before
+/// the relaunched agent is read as ended ([`ShellBack`]).
 pub(super) const ENDED_AT_ONCE: Duration = Duration::from_secs(5);
 
 /// How often [`await_held`] asks whether the shell has the tab back: a `ps`
 /// each time, so not at the roster's pace.
 const SHELL_LOOK: Duration = Duration::from_secs(1);
 
-/// Tracks whether the relaunched agent ended as it started: the shell the line
-/// was typed at has held its terminal for [`ENDED_AT_ONCE`] in a row. Anything
-/// else holding it restarts the count; an unreadable look leaves it unchanged.
+/// Tracks whether the relaunched agent ended as it started: THE LINE'S
+/// COMMAND WAS SEEN TO RUN, and the shell the line was typed at has held its
+/// terminal for [`ENDED_AT_ONCE`] in a row since. A look that finds the line
+/// not run yet, or anything else holding the terminal, restarts the count;
+/// an unreadable look leaves it unchanged.
+///
+/// A SHELL THAT HOLDS ITS TERMINAL IS NO PROOF ON ITS OWN (the review of the
+/// 2026-10-09 sweep fixes): a shell does its own work between reading the
+/// line and starting what it names — a `preexec` built on `$(…)`, a direnv
+/// on the line's `cd` — and holds its terminal all the while (zsh runs even
+/// an external command of a hook in its own group, measured 2026-10-09).
+/// Read as ended after five seconds of that, the upgrade's relaunch was
+/// stopped `failed:no-resume` and the owner told to resume by hand while the
+/// Claude Code the line started came up on the very conversation. So the
+/// line must be seen to RUN, by the best witness the tab has:
+///
+/// 1. THE SHELL'S OWN WORD, where its integration marks command blocks
+///    ([`St::line_block`], read before the line was typed: [`line_block`]):
+///    the block the line was typed into has finished, or a newer one began
+///    ([`line_over`]). Its `133;D` comes from the shell's next prompt, after
+///    the command and every hook of it, so nothing a shell does before the
+///    agent starts reads as its end. With that witness nothing else counts.
+/// 2. THE KERNEL'S, where no block was read: a look found the shell NOT
+///    holding its terminal since the line (a job-control shell hands its
+///    terminal to the job it starts, and only to that). A command that ends
+///    between two looks ([`SHELL_LOOK`]) is not seen; the full wait, then
+///    the stale bound ([`STALE_S`]), says it then.
 #[derive(Debug, Default)]
 pub(super) struct ShellBack {
-    /// Since when every read look found the shell holding its terminal.
+    /// Since when every read look found the line run and the shell holding
+    /// its terminal.
     since: Option<Instant>,
     /// The last look, for [`SHELL_LOOK`].
     looked: Option<Instant>,
+    /// The command block the line was typed into ([`St::line_block`]):
+    /// whether the line ran is its word alone.
+    block: Option<u64>,
+    /// With no block to read: a look found the shell not holding its
+    /// terminal (the line's job held it).
+    left: bool,
 }
 
 impl ShellBack {
+    /// The tracker for a line typed into the command block `block`
+    /// ([`St::line_block`]; `None`: none read).
+    pub(super) fn after(block: Option<u64>) -> Self {
+        Self {
+            block,
+            ..Self::default()
+        }
+    }
+
     /// Whether a look is due at `now` ([`SHELL_LOOK`] since the last).
     pub(super) fn due(&mut self, now: Instant) -> bool {
         let due = self
@@ -1612,21 +1669,79 @@ impl ShellBack {
         due
     }
 
-    /// One look at `now` ([`Kernel::shell_holds_tab`]): whether the shell
-    /// has now held its terminal for [`ENDED_AT_ONCE`].
-    pub(super) fn saw(&mut self, holds: Option<bool>, now: Instant) -> bool {
-        match holds {
-            Some(true) => {
-                let since = *self.since.get_or_insert(now);
-                now.saturating_duration_since(since) >= ended_at_once()
-            }
+    /// One look at `now`: whether the shell holds its terminal
+    /// ([`Kernel::shell_holds_tab`]) and, where the line's block is known,
+    /// whether it is over ([`line_over`], `None`: unread). Whether the line
+    /// has now been seen to run and the shell has held its terminal for
+    /// [`ENDED_AT_ONCE`] since.
+    pub(super) fn saw(&mut self, holds: Option<bool>, over: Option<bool>, now: Instant) -> bool {
+        let ran = match holds {
+            None => return false,
             Some(false) => {
+                self.left = true;
                 self.since = None;
-                false
+                return false;
             }
-            None => false,
+            Some(true) if self.block.is_some() => match over {
+                None => return false,
+                Some(over) => over,
+            },
+            Some(true) => self.left,
+        };
+        if !ran {
+            self.since = None;
+            return false;
         }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= ended_at_once()
     }
+}
+
+/// THE COMMAND BLOCK A RELAUNCH LINE IS TYPED INTO ([`St::line_block`]): the
+/// tab's newest block while it is the prompt the shell waits at (`prompt` or
+/// `entering`, `blocks 1 --json`), read right before the line is typed.
+/// `None` where the tab's shell marks no blocks, or its newest is not a
+/// prompt (a command still runs, or its marks are behind).
+fn line_block(c: &mut Client, tab: &str) -> Option<u64> {
+    let newest = newest_block(c, tab)?;
+    let state = newest.get("state").and_then(Value::as_str)?;
+    matches!(state, "prompt" | "entering")
+        .then(|| newest.get("id").and_then(Value::as_u64))
+        .flatten()
+}
+
+/// Whether the command the relaunch line ran in block `block` is OVER, by the
+/// shell's own marks (`blocks 1 --json`): that block is `complete` (its
+/// `133;D`), or a newer one began (the shell's next prompt — ids only rise in
+/// a terminal). `Some(false)` while it is still the newest and not complete
+/// (the shell's hooks, or the agent, still run); `None` when nothing can be
+/// read, or the newest block is older than it (the tab's blocks were reset).
+fn line_over(c: &mut Client, tab: &str, block: u64) -> Option<bool> {
+    let newest = newest_block(c, tab)?;
+    let id = newest.get("id").and_then(Value::as_u64)?;
+    match id.cmp(&block) {
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Equal => {
+            Some(newest.get("state").and_then(Value::as_str) == Some("complete"))
+        }
+        std::cmp::Ordering::Less => None,
+    }
+}
+
+/// The tab's newest shell-integration command block (`blocks 1 --json`), or
+/// `None`: no reply, none marked, or one that cannot be read.
+fn newest_block(c: &mut Client, tab: &str) -> Option<Value> {
+    let (head, body) = c.request_counted(&format!("@{tab} blocks 1 --json")).ok()?;
+    if !head.starts_with("OK") {
+        return None;
+    }
+    let json = if body.trim().is_empty() {
+        head.strip_prefix("OK ")?
+    } else {
+        &body
+    };
+    let v: Value = aterm_json::from_str(json.trim()).ok()?;
+    v.get("blocks")?.as_array()?.last().cloned()
 }
 
 /// How long the harness's hand waits for a relaunched agent to come up idle
@@ -2446,7 +2561,7 @@ pub(super) fn restart_as(
     r.pid = snap.pid;
     // Claude's own record of this process names the conversation, the build
     // and whether it is idle — kept under the Claude home it runs under.
-    let records = Records::of(&opts.home, snap.home.as_deref());
+    let records = Records::of_snapshot(&opts.home, &snap);
     let Some(sf) = records
         .session_file(snap.pid)
         .filter(|sf| squash(&sf.proc_start) == snap.start)
@@ -2526,17 +2641,21 @@ pub(super) fn restart_as(
         model_list,
         fallback_from,
         login: login.clone(),
-        // Where the relaunched process files its record: the same home.
-        home: snap.home.clone(),
         ..St::default()
     };
+    // Where the relaunched process files its record: the same home, the
+    // directory its records are in, with the profile it keeps apart
+    // ([`St::keep_home`]).
+    st.keep_home(&records, &opts.home);
     // On its own program: the owner's hold and how long the session has been
     // behind are the upgrade's still ([`St::kept_by_restart`], round eight,
     // #24).
     if let Some(prior) = prior.as_ref() {
         prior.kept_by_restart(&tab, &mut st);
     }
-    let Plan { shell, line, .. } = match plan(opts, &launch, snap.shell, &t) {
+    let planned = home_carried(&opts.home, snap.home.as_deref(), &sf.cwd, &records)
+        .and_then(|()| plan(opts, &launch, snap.shell, &t));
+    let Plan { shell, line, .. } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
@@ -2670,6 +2789,19 @@ pub struct Snapshot {
     /// records is made under it ([`Records`]): its process's record and its
     /// conversation's transcript are there. A Codex's is always `None`.
     pub home: Option<String>,
+    /// WHERE ITS RECORDS ARE: the Claude Code directory `home` names, as the
+    /// snapshot read it ([`Records::of_process`], the one resolver: a
+    /// relative `CLAUDE_CONFIG_DIR` — set and empty included — resolved
+    /// against the directory that holds its record, the one the process runs
+    /// in or the one it started in, where Claude Code filed it), the
+    /// directory its record was read from. Every read of the agent's records
+    /// is made here ([`Records::of_snapshot`]), and a relaunch line whose
+    /// `cd` would resolve `home` elsewhere is refused
+    /// ([`super::upgrade_drive::home_carried`], `refused:home`). `None`: not
+    /// read — a relative home whose working directory could not be read, a
+    /// Codex, a snapshot a reopened layout gave back (read from its `home`
+    /// and its `cwd` then, where its relaunch starts it).
+    pub claude_dir: Option<PathBuf>,
 }
 
 /// What a Codex TUI's relaunch on exit needs beside the [`Snapshot`] (whose
@@ -2850,6 +2982,14 @@ pub fn launched(
 /// # Errors
 /// The word naming the first fact that could not be read or did not hold.
 pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
+    snapshot_with(opts, &Live)
+}
+
+/// [`snapshot`] with the agent's job and terminal read from `k`
+/// ([`Kernel`]): the seam a test reads a stand-in agent through (its
+/// process, its exec environment, its working directory and its records
+/// read live).
+pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'static str> {
     let tab = opts.only_sid.as_deref().ok_or("no-tab")?;
     let mut c = connect(opts, tab).map_err(|_| "no-socket")?;
     let tabs = host_roster(&mut c).ok_or("roster")?;
@@ -2864,11 +3004,11 @@ pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
     // A job-control shell starts each job in a group of its own, led by the
     // job's first process: the agent, or the twin that execs it in place.
     let pid = u32::try_from(group).map_err(|_| "no-foreground")?;
-    let shell = match Live.job(pid) {
+    let shell = match k.job(pid) {
         Some((Job::NoJobControl, _)) => return Err("not-a-shell-job"),
         job => foreground_shell(job)?,
     };
-    let owner = Live.terminal(pid);
+    let owner = k.terminal(pid);
     if !owner
         .as_ref()
         .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
@@ -2895,9 +3035,19 @@ pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
         return super::upgrade_drive::codex_snapshot(opts, tab, pid, start, shell, &args);
     }
     // Claude's record of this process, under the Claude home its own exec
-    // environment names ([`Records`]): `~/.claude` names none of an agent
-    // started under another.
-    let file = Records::of(&opts.home, args.env_var(accounts::HOME_ENV))
+    // environment names: `~/.claude` names none of an agent started under
+    // another, and a relative one (empty included) is where it resolves from
+    // the directory that holds its record — the one it runs in, or the one
+    // it was started in, where it filed it before a worktree moved it
+    // ([`Records::of_process`]).
+    let records = Records::of_process(
+        &opts.home,
+        super::upgrade_drive::HomeVars::of(&args),
+        pid,
+        || aterm_sysprobe::process_cwd(pid),
+        args.env_var("PWD"),
+    );
+    let file = records
         .session_file(pid)
         .filter(|sf| squash(&sf.proc_start) == start);
     let (program, argv) = launched(
@@ -2931,8 +3081,10 @@ pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
         // gave its argv: what the vendor's runtime was started with, which
         // is what chose its keychain item (the accounts design, §1).
         login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
-        // The same read: the home it was started under.
+        // The same read: the home it was started under, and where it keeps
+        // its records under it.
         home: args.env_var(accounts::HOME_ENV).map(str::to_owned),
+        claude_dir: records.dir().map(Path::to_path_buf),
     })
 }
 
@@ -2966,7 +3118,7 @@ pub fn foreground(snap: &Snapshot, fg: i64) -> Foreground {
 /// Follow the snapshot's agent while it runs: its conversation, build and
 /// directory as Claude's record of that process names them now (`/clear` and
 /// `/resume` move the conversation). One small file read, under the Claude
-/// home the agent runs under ([`Snapshot::home`], [`Records`]; `home` is the
+/// home the agent runs under ([`Records::of_snapshot`]; `home` is the
 /// user's). Returns whether anything moved.
 pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
     // A Codex keeps no record of its process to follow: its snapshot is
@@ -2974,7 +3126,7 @@ pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
     if snap.codex.is_some() {
         return false;
     }
-    let Some(sf) = Records::of(home, snap.home.as_deref())
+    let Some(sf) = Records::of_snapshot(home, snap)
         .session_file(snap.pid)
         .filter(|sf| squash(&sf.proc_start) == snap.start)
     else {
@@ -2998,25 +3150,25 @@ pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
 /// session may move to ([`upgrade::choose_target`] over `candidates`, so a
 /// crash is also an upgrade), else the program it ran (`same`). Configuration
 /// only takes power away: with the switch off, a crash never moves the
-/// session onto another build. NOR DOES THE OWNER'S WORD (`hold`, the hold
-/// the conversation's upgrade record carries for the tab,
-/// [`St::owners_hold`]; round eight, #24): a build the owner skipped, or any
-/// while their `Not today` stands, is no relaunch target at `now` — a crash
-/// moved the session straight onto the build the owner had refused. A build
-/// newer than a skipped one is ("until a NEWER build is the target").
+/// session onto another build. NOR DOES A BUILD THE CONVERSATION'S UPGRADE
+/// RECORD HOLDS IT OFF (`held`, [`St::holds_off`]): the owner's word (round
+/// eight, #24) — a build the owner skipped, or any while their `Not today`
+/// stands, is no relaunch target, where a crash moved the session straight
+/// onto the build the owner had refused; a build newer than a skipped one
+/// is ("until a NEWER build is the target") — and a build that failed to
+/// start for the conversation, while its stop's rest stands.
 pub(super) fn relaunch_target(
     upgrade: bool,
     running: Option<&Version>,
     candidates: &[upgrade::Candidate],
-    hold: Option<&upgrade::Request>,
+    held: impl Fn(&upgrade::Candidate) -> bool,
     program: &Path,
     version: Option<&str>,
-    now: u64,
 ) -> (PathBuf, String, String) {
     let target = running
         .filter(|_| upgrade)
         .and_then(|v| upgrade::choose_target(v, candidates))
-        .filter(|t| !hold.is_some_and(|word| word.holds_build(&t.version.to_string(), now)));
+        .filter(|t| !held(t));
     match target {
         Some(t) => (t.exe, t.version.to_string(), t.source.as_str().to_string()),
         None => (
@@ -3042,8 +3194,10 @@ pub enum ExitRecord {
     /// attempt reads the record itself.
     Unread,
     /// The record survived the exit — a crash — as it was read then: it
-    /// names the conversation as the agent last held it.
-    Survived(SessionFile),
+    /// names the conversation as the agent last held it. Boxed: the record
+    /// (where it was read included, `SessionFile::claude_dir`) dwarfs the
+    /// other variants.
+    Survived(Box<SessionFile>),
     /// The exit removed it: graceful, someone's decision (or no conversation
     /// was ever registered). For a Codex: its shell says it exited cleanly or
     /// by someone's signal.
@@ -3075,6 +3229,26 @@ impl ExitRecord {
             Self::Removed => "removed",
             Self::Crashed => "crashed",
         }
+    }
+}
+
+/// THE EXIT IS ITS LAUNCH'S OWN END, by what it left as it was seen
+/// ([`exit_record`]): an exit no relaunch on exit brings back, whatever
+/// `[harness] relaunch` says — a one-shot run (`one-shot`), or a graceful
+/// exit (`graceful-exit`: Claude removed its record as it ended, a Codex's
+/// shell says it ended by itself or by someone's signal), someone's
+/// decision. `None` for an exit a relaunch on exit would bring back, or would
+/// read again at its attempt ([`ExitRecord::Unread`]). [`after_exit`] ends an
+/// exit nobody asked for by the same words; what the host's limit asks
+/// before it says what the limit took away.
+#[must_use]
+pub fn launch_ended(snap: &Snapshot, left: &ExitRecord) -> Option<&'static str> {
+    if upgrade::one_shot(&snap.argv) {
+        Some("one-shot")
+    } else if *left == ExitRecord::Removed {
+        Some("graceful-exit")
+    } else {
+        None
     }
 }
 
@@ -3111,12 +3285,12 @@ pub const EXIT_GONE: Duration = Duration::from_secs(2);
 
 /// [`ExitLook`] of `snap`'s agent, live: `running` is read first, since a
 /// graceful exit removes its record before the process ends. Its record is
-/// read under the Claude home it ran under ([`Snapshot::home`],
-/// [`Records`]; `home` is the user's).
+/// read under the Claude home it ran under ([`Records::of_snapshot`];
+/// `home` is the user's).
 #[must_use]
 pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
     let running = alive(snap.pid) && kernel_start(snap.pid).as_deref() == Some(snap.start.as_str());
-    let record = Records::of(home, snap.home.as_deref())
+    let record = Records::of_snapshot(home, snap)
         .session_file(snap.pid)
         .filter(|sf| squash(&sf.proc_start) == snap.start);
     ExitLook {
@@ -3165,7 +3339,7 @@ pub fn exit_record(
         } else {
             match now.record {
                 None => return ExitRecord::Removed,
-                Some(sf) if waited >= EXIT_SETTLE => return ExitRecord::Survived(sf),
+                Some(sf) if waited >= EXIT_SETTLE => return ExitRecord::Survived(Box::new(sf)),
                 Some(_) => {}
             }
         }
@@ -3287,12 +3461,12 @@ fn after_exit_as(
     }
     // Claude's own records of the agent — its process's and its
     // conversation's — are under the Claude home it ran under.
-    let records = Records::of(&opts.home, snap.home.as_deref());
+    let records = Records::of_snapshot(&opts.home, snap);
     // Claude's record as read at the exit, when it survived (it names the
     // conversation the agent last held), else the snapshot's. Only an exit
     // nothing could read then is read now.
     let survivor = match left {
-        ExitRecord::Survived(sf) => Some(sf.clone()),
+        ExitRecord::Survived(sf) => Some(SessionFile::clone(sf)),
         ExitRecord::Removed => None,
         // (`Crashed` is a Codex's word; a Claude Code look never says it.)
         ExitRecord::Unread | ExitRecord::Crashed => records
@@ -3411,18 +3585,28 @@ fn after_exit_as(
     } else {
         Vec::new()
     };
-    // The conversation's upgrade record: the owner's hold on the move, kept
-    // by the relaunch's target and by its record (round eight, #24).
+    // The conversation's upgrade record: what holds the conversation off a
+    // build — the owner's word (round eight, #24), a build that failed to
+    // start for it while its rest stands — kept by the relaunch's target and
+    // by its record.
     let prior = load(opts, &session);
-    let hold = prior.as_ref().and_then(|st| st.owners_hold(&snap.tab));
+    let now = now_s();
+    // And a build that failed to start, for any conversation, not proved to
+    // start since ([`super::upgrade_drive::build_starts`]): the agent comes
+    // back on the program it ran.
+    let held = |t: &upgrade::Candidate| {
+        prior
+            .as_ref()
+            .is_some_and(|st| st.holds_off(&snap.tab, t, now))
+            || super::upgrade_drive::build_starts(opts, &r, t, now, false).is_err()
+    };
     let (exe, to, source) = relaunch_target(
         upgrade,
         running.as_ref(),
         &candidates,
-        hold.as_ref(),
+        held,
         &snap.program,
         version.as_deref(),
-        now_s(),
     );
     r.to = format!("{to}({source})");
     // A conversation with no message cannot be resumed: start afresh with the
@@ -3476,16 +3660,23 @@ fn after_exit_as(
         model_list: riding.clone().unwrap_or_default(),
         fallback_from: exit_fallback(opts, &session, riding.as_deref(), hand.as_deref()),
         login: snap.login.clone(),
-        // Where the relaunched process files its record: the same home.
-        home: snap.home.clone(),
         ..St::default()
     };
+    // Where the relaunched process files its record: the same home, the
+    // directory its records are in, with the profile it keeps apart
+    // ([`St::keep_home`]).
+    st.keep_home(&records, &opts.home);
     // Kept on its own program, the session is as far behind as before, and
-    // the owner's hold still stands ([`St::kept_by_restart`]).
-    if st.source == SAME_PROGRAM
-        && let Some(prior) = prior.as_ref()
-    {
-        prior.kept_by_restart(&snap.tab, &mut st);
+    // the owner's hold and a failed start's stop still stand
+    // ([`St::kept_by_restart`]); moved onto a build that failed to start for
+    // the conversation, its rest run out, a stop there again repeats
+    // ([`St::retried_by`]).
+    if let Some(prior) = prior.as_ref() {
+        if st.source == SAME_PROGRAM {
+            prior.kept_by_restart(&snap.tab, &mut st);
+        } else {
+            prior.retried_by(&mut st);
+        }
     }
     if resume {
         // The model the agent last ran and where its transcript ended: the
@@ -3495,7 +3686,9 @@ fn after_exit_as(
             .map(|p| tail_to_end(&p, TAIL_BYTES));
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
     }
-    let Plan { shell, line, .. } = match plan(opts, &launch, snap.shell, &table()) {
+    let planned = home_carried(&opts.home, snap.home.as_deref(), &cwd, &records)
+        .and_then(|()| plan(opts, &launch, snap.shell, &table()));
+    let Plan { shell, line, .. } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
@@ -3754,7 +3947,8 @@ pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
 /// `refused:<why>` once it can never land ([`carry_own`]), or is
 /// no longer to be found (`refused:no-restart-in-flight`) — the one case a
 /// person is asked about, never the graceful exit the restart's own SIGTERM
-/// made of it.
+/// made of it — or `told:<why>` where the move's own row asks them
+/// ([`told_by_its_row`]).
 #[must_use]
 pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
@@ -3836,7 +4030,45 @@ pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
 /// of the old agent's exit says `adopted` and writes nothing, never going
 /// back through [`await_new`] for a process already found (which, past
 /// [`STALE_S`], would stop the record `no-resume`).
-fn carry_own(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
+///
+/// ITS UPGRADE'S OWN ROW ASKS FOR IT ([`told_by_its_row`]): a refusal of a
+/// record the owner's view lists, stopped after its agent was seen gone, is
+/// `told:<why>`.
+fn carry_own(opts: &Opts, r: Report, st: St, session: &str, tab: &str) -> Report {
+    told_by_its_row(opts, carry_own_step(opts, r, st, session, tab), session)
+}
+
+/// THE MOVE'S OWN ROW ASKS THE OWNER, NOT THE HOST (the review of the
+/// 2026-10-09 sweep fixes): a carry refused (`refused:<why>`) because the
+/// restart's record — an upgrade's, which the owner's view lists
+/// ([`St::is_upgrade`]) — stopped after its agent was seen gone answers
+/// `told:<why>`. That row raises `agent-down` with the one remedy
+/// (`upgrade_status::Row::agent_down`: the conversation's resume, or a
+/// plain `claude` for a restart that started its agent afresh), so the
+/// host says nothing of its own over it ([`outcome`]: a `Cannot`, its word
+/// the row's). Said by the host too, it was a second report in other words
+/// (`aterm refused it`, of an agent that ended as it started), and a tab
+/// mark telling `claude --resume` of the old conversation — for a fresh
+/// restart, the one with no transcript, which Claude refuses. A restart in
+/// place's record (a model, memory or account move) is listed in no row:
+/// its refusal stays the host's to say.
+fn told_by_its_row(opts: &Opts, r: Report, session: &str) -> Report {
+    let Some(why) = r.step.strip_prefix("refused:") else {
+        return r;
+    };
+    let raised = load(opts, session).is_some_and(|st| {
+        st.is_upgrade() && st.exited_at != 0 && matches!(st.phase, upgrade::Phase::Failed(_))
+    });
+    if raised {
+        let told = format!("told:{why}");
+        said(r, told)
+    } else {
+        r
+    }
+}
+
+/// [`carry_own`]'s step, before [`told_by_its_row`] reads its refusal.
+fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
     let refused = |r: Report, why: &str| {
         said(
             r,
@@ -3987,6 +4219,19 @@ pub fn resume(opts: &Opts) -> Report {
 /// that described the agent any more.
 pub const WAIT_ACT_ENDS: &str = "wait:not-exited:act-ends";
 
+/// THE HOST'S WORD FOR AN EXIT THE EXPLICIT RESTART MADE, CARRIED THROUGH A
+/// HAND THAT WAITS (ruling 20 of 2026-10-14, `aterm-gui`'s `on_agent_left`):
+/// an exit the act's stamp names, read while a hold or any hand the relaunch
+/// line waits on holds the tab ([`hand_on_tab`]), is the act's still
+/// ([`on_exit`] answers [`OnExit::Relaunch`] for it), and its relaunch is
+/// typed only once that hand lifts. Until then no relaunch is attempted —
+/// the host answers this word in its place, and rings nobody — and it is
+/// looked at again after [`BUSY`], uncounted and unsaid ([`Outcome::Busy`]):
+/// a hand is not a relaunch that keeps failing, and a hold of minutes must
+/// not climb the back-off to ten (the relaunch line's own `wait:held`, a
+/// counted miss, is what an attempt under it would have answered).
+pub const WAIT_HAND_LIFTS: &str = "wait:held:act-carried";
+
 /// What one relaunch step came to, for the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -4002,8 +4247,9 @@ pub enum Outcome {
     NotYet(String),
     /// Another aterm actor holds the upgrade state — or the explicit
     /// restart's act still holds the end of the program its standing stamp
-    /// names ([`WAIT_ACT_ENDS`]): no miss; the host looks again after
-    /// [`BUSY`] without moving the back-off or attention.
+    /// names ([`WAIT_ACT_ENDS`]), or another hand holds the tab its end is
+    /// carried through ([`WAIT_HAND_LIFTS`]): no miss; the host looks again
+    /// after [`BUSY`] without moving the back-off or attention.
     Busy,
     /// Never, and why: an interactive conversation that cannot come back (an
     /// uncarryable launch, a gone shell); a person is asked (keyed attention).
@@ -4027,10 +4273,15 @@ pub fn outcome(step: &str) -> Outcome {
         Outcome::Left("not-exited".to_string())
     } else if let Some(why) = step.strip_prefix("ended:") {
         Outcome::Left(why.to_string())
-    } else if let Some(why) = step.strip_prefix("refused:") {
+    } else if let Some(why) = step
+        .strip_prefix("refused:")
+        .or_else(|| step.strip_prefix("told:"))
+    {
         // `refused:shell-gone` included: the one word a gone shell gives.
+        // `told:` is a restart that can never land whose own row asks the
+        // owner ([`told_by_its_row`]): said there, as the host reads it.
         Outcome::Cannot(why.to_string())
-    } else if step == "busy:another-sweep" || step == WAIT_ACT_ENDS {
+    } else if matches!(step, "busy:another-sweep" | WAIT_ACT_ENDS | WAIT_HAND_LIFTS) {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {
         // The state directory cannot hold the lock at all: no later try
@@ -4048,7 +4299,11 @@ pub enum OnExit {
     /// exit is theirs and the tab is left to them.
     PersonAsked,
     /// The session is held: halted (`hold=1`), a drive lease, or a turn a named
-    /// driver typed ([`held_by_someone`]). The exit is the holder's.
+    /// driver typed ([`held_by_someone`]). The exit is the holder's — save
+    /// one the explicit restart made, which is carried through any hand its
+    /// relaunch line waits on (ruling 20 of 2026-10-14, [`hand_on_tab`],
+    /// [`WAIT_HAND_LIFTS`]). (The host also answers it for an exit another
+    /// supervisor's claim holds, `aterm-gui`'s `claimed_by_another`.)
     Held,
     /// Nobody owns the exit but `[harness] relaunch = false`; said once on the
     /// session's attention.
@@ -4066,10 +4321,14 @@ pub enum OnExit {
 /// session's `status` reply (`None`: unreadable, read as nobody); `grace_s` is
 /// `[harness] human_grace_s`; `asked`: the explicit restart ended it (its
 /// stamp names the process: the stall's remedy, or a person's own
-/// `restart`), so a keystroke just before was no `/exit`; `restarted`: the harness's own
-/// restart ended it ([`restarted`]), asked first because that exit is the
-/// restart's whoever is at the tab ([`OnExit::Restarted`]). A person or holder
-/// owns any other exit before the configuration limit is asked.
+/// `restart`), so a keystroke just before was no `/exit`, and a hold, a lease
+/// or a turn on the tab is waited out, never handed the exit (ruling 20 of
+/// 2026-10-14: the host types its relaunch only once that hand lifts,
+/// [`hand_on_tab`], [`WAIT_HAND_LIFTS`], as the harness's own restart's
+/// relaunch line waits on `held`); `restarted`: the harness's own restart ended it
+/// ([`restarted`]), asked first because that exit is the restart's whoever is
+/// at the tab ([`OnExit::Restarted`]). A person or holder owns any other exit
+/// before the configuration limit is asked, which holds an asked exit too.
 #[must_use]
 pub fn on_exit(
     allowed: bool,
@@ -4082,7 +4341,7 @@ pub fn on_exit(
         OnExit::Restarted
     } else if !asked && status.is_some_and(|s| person_present(s, grace_s)) {
         OnExit::PersonAsked
-    } else if status.is_some_and(held_by_someone) {
+    } else if !asked && status.is_some_and(held_by_someone) {
         OnExit::Held
     } else if !allowed {
         OnExit::Limited
@@ -4095,10 +4354,32 @@ pub fn on_exit(
 /// belongs to: `hold=1`, a drive lease (`hand=lease:…`), or a named driver's
 /// turn (`hand=turn:<id>:<driver>`). An unnamed turn is an owner-class caller's
 /// (this host's loop), and a `driving:` hand concerns sessions it drives.
-/// [`super::upgrade_drive`]'s `held` is stricter.
+/// [`super::upgrade_drive`]'s `held` is stricter: its halt and hands are
+/// [`hand_on_tab`]'s, which an asked exit is carried through.
 #[must_use]
 pub fn held_by_someone(status: &str) -> bool {
     status.split_whitespace().any(|t| t == "hold=1") || driver_hand(status)
+}
+
+/// THE HANDS THE RELAUNCH LINE WAITS ON, from one `status` reply: a halt
+/// (`hold=1`), or any hand on the tab but this process's own — another
+/// driver's lease, a turn (a named driver's or an owner-class caller's), a
+/// `driving:` hand. The relaunch line's look at the tab
+/// ([`super::upgrade_drive::held_by_status`]) holds on each, and on a
+/// person's keystroke and unread input besides, which are short: its counted
+/// waits suit them, its first pause looking again sooner than [`BUSY`]. An
+/// exit the explicit restart made is CARRIED through these (ruling 20 of
+/// 2026-10-14 and its review, [`WAIT_HAND_LIFTS`]): no attempt while one
+/// stands, so a turn or a lease of minutes does not climb the back-off as a
+/// relaunch that keeps failing does. Wider than [`held_by_someone`], which
+/// names the hands an unasked exit is LEFT to.
+#[must_use]
+pub fn hand_on_tab(status: &str) -> bool {
+    status.split_whitespace().any(|t| {
+        t == "hold=1"
+            || t.strip_prefix("hand=")
+                .is_some_and(|hand| hand != "-" && !super::upgrade_drive::our_hand(hand))
+    })
 }
 
 /// Whether one `status` reply names another driver's hand: a drive lease
@@ -4135,9 +4416,10 @@ pub const BACKOFF: [Duration; 4] = [
     Duration::from_secs(600),
 ];
 
-/// The look again after a step found another actor on the upgrade state, or
-/// the explicit restart's act still holding its stamped program's end
-/// ([`Outcome::Busy`], [`WAIT_ACT_ENDS`]). A retry only while that actor
+/// The look again after a step found another actor on the upgrade state, the
+/// explicit restart's act still holding its stamped program's end, or another
+/// hand on the tab an asked exit is carried through ([`Outcome::Busy`],
+/// [`WAIT_ACT_ENDS`], [`WAIT_HAND_LIFTS`]). A retry only while that actor
 /// holds it, never counted.
 pub const BUSY: Duration = Duration::from_secs(10);
 

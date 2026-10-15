@@ -6,8 +6,8 @@
 //!
 //! ## Design
 //!
-//! A Row is a contiguous array of cells with a length tracking the last
-//! non-empty cell (for efficient iteration and rendering).
+//! A Row is a contiguous array of cells with a length: one past the last cell
+//! output wrote, printed blanks included (see [`Row::len`]).
 //!
 //! Lines can be soft-wrapped (automatic) or hard-wrapped (explicit newline).
 //!
@@ -43,8 +43,8 @@ fn is_wrap_hole_blank(cell: &Cell) -> bool {
 pub struct Row {
     /// Cell storage.
     cells: PageSlice<Cell>,
-    /// Index of the last non-empty cell + 1 (for efficient iteration).
-    /// If 0, the row is entirely empty.
+    /// One past the last cell output wrote (see [`Row::len`]). If 0, the row
+    /// holds nothing written.
     len: u16,
     /// Row flags.
     flags: RowFlags,
@@ -202,7 +202,12 @@ impl Row {
         self.cells.page_id()
     }
 
-    /// Get the length (last non-empty cell + 1).
+    /// One past the last cell output wrote on the row: a printed glyph, a
+    /// printed blank included, or a mark attached to a cell. Every writer keeps
+    /// this one rule (`Row::settle_len_after_write`), so the render frame, copy,
+    /// search, history and rewrap see the same line whichever writer printed it
+    /// and wherever the reads were cut. Erasing shrinks it to the last cell that
+    /// still holds content; a cell at or past it was never written.
     #[must_use]
     #[inline]
     pub fn len(&self) -> u16 {
@@ -412,10 +417,9 @@ impl Row {
         }
 
         let old_len = self.len as usize;
-        let had_wide = self.flags.contains(RowFlags::HAS_WIDE_CHARS);
-        if had_wide {
-            self.fixup_wide_chars_in_range(start_col, count);
-        }
+        // The gate keeps the ASCII path free of the cold call.
+        let end_half_blanked = self.flags.contains(RowFlags::HAS_WIDE_CHARS)
+            && self.fixup_wide_chars_in_range(start_col, count);
         let end = start
             .saturating_add(usize::from(count))
             .min(self.cells.len());
@@ -425,14 +429,11 @@ impl Row {
         }
         // `fixup_wide_chars_in_range` can clear a wide continuation at `end`,
         // one past the returned slice, when the last covered cell is a WIDE
-        // head. Bulk callers only grow len via update_len(), so if that orphan
-        // was the tail content len would stay stale-high (a phantom trailing
-        // space in row_text/search/scrollback). Tighten here; the caller's
-        // update_len() still grows len for what it writes. Gated on had_wide so
-        // the ASCII path stays branch-free; recalculate_len_up_to never
-        // over-shrinks.
-        if had_wide && old_len > 0 && self.cells[old_len - 1].is_empty() {
-            self.recalculate_len_up_to(old_len);
+        // head. When that orphan was the row's last cell, `len` ends at the
+        // span (`settle_len_after_write`'s rule); the caller's update_len()
+        // grows len for what it writes.
+        if end_half_blanked && end + 1 == old_len {
+            self.len = u16_from_usize(end);
         }
         Some(&mut self.cells[start..end])
     }
@@ -446,6 +447,39 @@ impl Row {
         if end_col > self.len {
             self.len = end_col.min(self.cols());
         }
+    }
+
+    /// Overwrite the cells from column `left` with `cells` (clipped to the
+    /// row), as a rectangle copy does, keeping the row's hints as [`Self::set`]
+    /// does: `HAS_WIDE_CHARS` when a copied cell is a wide head, `HAS_STYLE_ID`
+    /// when one uses a style id. `len` is left to the caller, which recomputes
+    /// it after its boundary fixup.
+    ///
+    /// Ruling 2026-10-11 (r15 chunking review): the margined scrolls and IL/DL
+    /// copied cells in through [`Self::get_mut`], which keeps no hint, so a
+    /// row that received a wide pair that way read as narrow-only and the bulk
+    /// writers, whose wide fixups the hint gates, overwrote the head without
+    /// blanking its continuation; the per-glyph writer always fixes up, so the
+    /// stale continuation depended on how the PTY read was cut. This is the
+    /// one span copy they share.
+    #[inline]
+    pub(crate) fn overwrite_span(&mut self, left: usize, cells: &[Cell]) {
+        let Some(dst) = self.cells.get_mut(left..) else {
+            return;
+        };
+        let n = cells.len().min(dst.len());
+        dst[..n].copy_from_slice(&cells[..n]);
+        let mut hints = RowFlags::DIRTY;
+        for cell in &cells[..n] {
+            let flags = cell.flags();
+            if flags.contains(super::CellFlags::WIDE) {
+                hints |= RowFlags::HAS_WIDE_CHARS;
+            }
+            if flags.contains(super::CellFlags::USES_STYLE_ID) {
+                hints |= RowFlags::HAS_STYLE_ID;
+            }
+        }
+        self.flags |= hints;
     }
 
     /// Set a cell at the given column.
@@ -494,15 +528,13 @@ impl Row {
     /// The wide-run counterpart of the rule [`Row::cells_mut_with_fixup`]
     /// applies for narrow bulk writes; the wide lanes call
     /// `fixup_wide_chars_in_range` directly.
-    pub fn settle_len_after_wide_run(&mut self, end_col: u16) {
+    pub fn settle_len_after_wide_run(&mut self, end_col: u16, end_half_blanked: bool) {
         // The run's unchecked writes skip `note_write_through`; a run that
         // reached the last cell wrote over any early-wrap hole there.
         self.note_write_through(usize::from(end_col));
-        self.update_len(end_col);
-        let len = self.len as usize;
-        if len > 0 && self.cells.get(len - 1).is_some_and(Cell::is_empty) {
-            self.recalculate_len_up_to(len);
-        }
+        // The fixup and the unchecked writes leave `len` as it was.
+        let old_len = usize::from(self.len);
+        self.settle_len_after_write(old_len, usize::from(end_col), end_half_blanked);
     }
 
     fn recalculate_len_up_to(&mut self, end: usize) {

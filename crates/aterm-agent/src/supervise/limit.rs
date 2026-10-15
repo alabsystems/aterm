@@ -150,6 +150,35 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     })
 }
 
+/// A LIMIT NOTICE'S RESET AS ITS CLOCK SAYS IT — the date it names, the hour
+/// and the minute — what tells one limit's notice from another's: the one a
+/// supervisor waits on from an older one a `/resume`d conversation redraws
+/// (`policy/turn_end.rs`'s fold of [`aterm_phase::SinceLimit`]). The zone is
+/// left out (a notice row cut at its wrap drops it), and so is a span (`in
+/// 3h` counts from a print nobody kept): a reset that names no clock tells
+/// no limit apart, and [`Self::of`] reads `None` for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetClock {
+    date: Option<(u32, u32)>,
+    hour: u32,
+    minute: u32,
+}
+
+impl ResetClock {
+    /// The clock a notice's reset text (`10:38am (America/Los_Angeles)`,
+    /// `Oct 20 at 9am`, the auto-continue's `continuing automatically at
+    /// 10:38am`) names; `None` for none, a span or `shortly`.
+    #[must_use]
+    pub fn of(reset: Option<&str>) -> Option<Self> {
+        match parse_reset(reset?)? {
+            ResetSpec::At {
+                date, hour, minute, ..
+            } => Some(Self { date, hour, minute }),
+            ResetSpec::In(_) => None,
+        }
+    }
+}
+
 /// Whether the notice says Claude Code goes on by itself — `continuing
 /// automatically at …` / `continuing shortly` — so that the worker read
 /// BUSY after it is the continuation, and the episode is over then, the
@@ -379,6 +408,26 @@ pub const PRINT_LAG_S: i64 = 60;
 /// try (the wall answers and the notice printed again is placed on the
 /// loop's own watching). Five minutes, and the done row's minute.
 pub const CLOCK_SLACK_S: i64 = 6 * 60;
+
+/// A RESET NOTHING DATED, kept within a session window: a bare clock time
+/// placed at `at` more than [`SESSION_AHEAD_MAX`] after `now` is the day
+/// before's, PASSED; anything else is `at`. For a limit a cancel left that
+/// only the screen read as a turn's answer (`Session::wall_reset_at`): a
+/// conversation `/resume`d meanwhile ends on its own older cancelled limit,
+/// which draws the same, and its clock already past, placed on the print of
+/// the act it was taken to answer, is tomorrow's — a day's wait on a
+/// session that may be free, where a wrong "passed" costs one try the limit
+/// answers with a notice the loop places as it arrives.
+#[must_use]
+pub fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
+    if matches!(spec, ResetSpec::At { date: None, .. })
+        && at.saturating_sub(now) > SESSION_AHEAD_MAX
+    {
+        at - 86_400
+    } else {
+        at
+    }
+}
 
 /// Whether a wall's notice names a SESSION window (`session limit`,
 /// `5-hour limit`): five hours at most, so the session rule places its bare

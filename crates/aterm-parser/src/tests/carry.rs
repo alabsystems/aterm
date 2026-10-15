@@ -285,14 +285,14 @@ fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
     }
 }
 
-/// An unhooked DCS, and an SOS/PM/APC string, are carried as strings to
+/// An ignored DCS, and an SOS/PM/APC string, are carried as strings to
 /// IGNORE: the rest of the payload is swallowed up to its terminator (never
 /// printed, never handed to a consumer the successor did not start), and the
 /// text after it prints.
 #[test]
 fn string_payloads_are_swallowed_to_their_terminator() {
     for (head, tail) in [
-        (&b"\x1bP1$"[..], &b"qm\x1b\\after"[..]),
+        (&b"\x1bP1:"[..], &b"qm\x1b\\after"[..]),
         (
             &b"\x1b_Gf=100,a=T;iVBORw0KGgo"[..],
             &b"AAAANSUhEUg\x1b\\after"[..],
@@ -386,28 +386,49 @@ fn restore_carry_refuses_every_invalid_carry() {
             CarryRefusal::State(State::DcsPassthrough),
         ),
         (
-            "DcsEntry",
+            "parameters in DcsEntry",
             ParserCarry {
                 state: State::DcsEntry,
+                params: vec![1],
                 ..ParserCarry::default()
             },
-            CarryRefusal::State(State::DcsEntry),
+            CarryRefusal::FieldOutsideState,
         ),
         (
-            "DcsParam",
+            "intermediates in DcsEntry",
+            ParserCarry {
+                state: State::DcsEntry,
+                intermediates: vec![b'$'],
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
+            "too many params in DcsParam",
             ParserCarry {
                 state: State::DcsParam,
+                params: vec![1; MAX_PARAMS + 1],
                 ..ParserCarry::default()
             },
-            CarryRefusal::State(State::DcsParam),
+            CarryRefusal::Params,
         ),
         (
-            "DcsIntermediate",
+            "a final byte among DcsIntermediate's intermediates",
             ParserCarry {
                 state: State::DcsIntermediate,
+                intermediates: vec![b'$', b'q'],
                 ..ParserCarry::default()
             },
-            CarryRefusal::State(State::DcsIntermediate),
+            CarryRefusal::Intermediates,
+        ),
+        (
+            "a string's UTF-8 head in a DCS header",
+            ParserCarry {
+                state: State::DcsParam,
+                string_utf8_tail: vec![0xE6],
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
         ),
         (
             "too many params",
@@ -946,15 +967,15 @@ fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
         State::CsiParam,
         State::CsiIntermediate,
         State::CsiIgnore,
+        State::DcsEntry,
+        State::DcsParam,
+        State::DcsIntermediate,
         State::DcsIgnore,
         State::OscString,
         State::SosPmApcString,
     ];
     assert_eq!(accepted, carried, "the states a carry restores");
     for refusal in [
-        CarryRefusal::State(State::DcsEntry),
-        CarryRefusal::State(State::DcsParam),
-        CarryRefusal::State(State::DcsIntermediate),
         CarryRefusal::State(State::DcsPassthrough),
         CarryRefusal::Params,
         CarryRefusal::SubparamMask,
@@ -969,7 +990,9 @@ fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
 }
 
 /// What a restored carry may install, whoever wrote it: a state inside the
-/// invariant that names no hookable DCS state, arms no DCS or APC consumer,
+/// invariant that is not a hooked DCS string (a DCS header is a sequence like
+/// a CSI: the program's next byte decides what it dispatches), arms no DCS or
+/// APC consumer,
 /// keeps subparameter bits below the parameters, holds a UTF-8 tail only at
 /// `Ground` and still incomplete, and a string's UTF-8 head only in a
 /// string — and the invariant still holds after every possible next byte.
@@ -978,12 +1001,10 @@ fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
 /// UTF-8, so only the fast path could have written or can finish one.
 fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
     parser.assert_invariants();
-    assert!(
-        !matches!(
-            parser.state(),
-            State::DcsEntry | State::DcsParam | State::DcsIntermediate | State::DcsPassthrough
-        ),
-        "{at}: a hookable DCS state"
+    assert_ne!(
+        parser.state(),
+        State::DcsPassthrough,
+        "{at}: a hooked DCS string"
     );
     assert!(
         !parser.dcs_active && !parser.apc_active,
@@ -1032,12 +1053,12 @@ fn state_names_round_trip() {
 }
 
 /// THE CARRIES THAT ONLY SWALLOW:
-/// an OSC over the carry's cap, an unhooked DCS header and an APC string with
-/// its consumer started are carried as sequences to ignore to their
-/// terminator, where this parser would have delivered them —
-/// `carry_swallows_sequence` names exactly those. What this parser swallows
-/// itself (an SOS or PM string, `DcsIgnore`, an OSC past its own cap) and
-/// every sequence the carry continues are not named.
+/// an OSC over the carry's cap and an APC string with its consumer started
+/// are carried as sequences to ignore to their terminator, where this parser
+/// would have delivered them — `carry_swallows_sequence` names exactly those.
+/// What this parser swallows itself (an SOS or PM string, `DcsIgnore`, an OSC
+/// past its own cap) and every sequence the carry continues (a DCS header
+/// among them, since 2026-10-10) are not named.
 #[test]
 fn carry_swallows_sequence_names_the_lossy_carries_only() {
     let at = |bytes: &[u8]| {
@@ -1053,9 +1074,9 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
     for (bytes, swallowed, picture) in [
         (&big_osc[..], true, false),
         (&big_image[..], true, true),
-        (&b"\x1bP1;2"[..], true, false),
-        (&b"\x1bP"[..], true, false),
-        (&b"\x1bP1$"[..], true, false),
+        (&b"\x1bP1;2"[..], false, false),
+        (&b"\x1bP"[..], false, false),
+        (&b"\x1bP1$"[..], false, false),
         (&b"\x1b_Ga=T,f=100;"[..], true, true),
         (&b"\x1b]1337;File=inline=1:AAAA"[..], false, false),
         (&b"\x1b]0;a short title"[..], false, false),
@@ -1108,5 +1129,188 @@ fn a_string_carry_continues_a_split_utf8_character() {
                 );
             }
         }
+    }
+}
+
+/// A DCS HEADER IS CARRIED AS ITSELF (round fifteen, R15-PARSER-P1). A header
+/// that had not reached its final byte (`DcsEntry`, `DcsParam`,
+/// `DcsIntermediate`) was carried as `DcsIgnore`, which reads the next bytes
+/// differently from the live parser, beyond losing the string: with C1
+/// controls off a `0x9C` ended it and the payload printed (`ESC P` then
+/// `0x9C q#0~~payload ESC \` printed `q#0~~payload`), and a GR byte or a C1
+/// control the live parser leaves the header on kept it, swallowing the real
+/// output after it up to the next ESC. Now the header rides with its
+/// parameters and intermediates, and the successor reads EVERY tail as the
+/// live parser does: from a header in each state, every one- and two-byte
+/// tail (65,792 of them) and the longer ones the finding measured, C1 off and
+/// on, through the byte path and the fast path, end in the same sink — the
+/// hook, its parameters and the payload included — and the same parser.
+#[test]
+fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
+    let heads: [(&[u8], State); 4] = [
+        (b"\x1bP", State::DcsEntry),
+        (b"\x1bP1;2", State::DcsParam),
+        (b"\x1bP?1", State::DcsParam),
+        (b"\x1bP>1;2 $", State::DcsIntermediate),
+    ];
+    let mut tails: Vec<Vec<u8>> = (0..=u8::MAX).map(|b| vec![b]).collect();
+    for a in 0..=u8::MAX {
+        for b in 0..=u8::MAX {
+            tails.push(vec![a, b]);
+        }
+    }
+    for tail in [
+        &b"\x9cq#0~~payload\x1b\\after"[..],
+        "\u{e9} real output line 1\r\nline 2\r\n\x1b[0mprompt$ ".as_bytes(),
+        "\u{276f} ls\r\nfile\r\n\x1b[0m".as_bytes(),
+        b"\x85text\x1b[0m",
+        b"q#0;2;0;0;0#0!10~-\x1b\\after",
+        b"qm\x1b\\after",
+        b"q544e\x9cafter",
+    ] {
+        tails.push(tail.to_vec());
+    }
+    for c1 in [false, true] {
+        for fast in [false, true] {
+            let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
+                if fast {
+                    parser.advance_fast(bytes, sink);
+                } else {
+                    parser.advance(bytes, sink);
+                }
+            };
+            for (head, state) in heads {
+                let at = format!("c1={c1} fast={fast} {:?}", String::from_utf8_lossy(head));
+                let mut live = parser_c1(c1);
+                feed(&mut live, head, &mut RecordingSink::default());
+                assert_eq!(live.state(), state, "{at}");
+                let carry = live.carry().expect("a header is carried");
+                assert_eq!(carry.state, state, "{at}: carried as itself");
+                assert!(!live.carry_swallows_sequence(), "{at}: nothing is lost");
+                let mut successor = parser_c1(c1);
+                successor.restore_carry(&carry).expect("restores");
+                assert_eq!(successor.carry(), Some(carry), "{at}: a fixed point");
+                for tail in &tails {
+                    let (mut live, mut carried) = (live.clone(), successor.clone());
+                    let (mut live_sink, mut carried_sink) =
+                        (RecordingSink::default(), RecordingSink::default());
+                    feed(&mut live, tail, &mut live_sink);
+                    feed(&mut carried, tail, &mut carried_sink);
+                    if carried_sink != live_sink
+                        || carried.state() != live.state()
+                        || carried.carry() != live.carry()
+                    {
+                        panic!(
+                            "{at} tail={tail:02x?}\n  live:    {live_sink:?} {:?}\n  carried: {carried_sink:?} {:?}",
+                            live.state(),
+                            carried.state()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// EVERY SPLIT OF A STREAM OF DCS STRINGS CONTINUES EXACTLY: a sixel with
+/// parameters, a DECRQSS and an XTGETTCAP query, a private-marker string, a
+/// header holding GR bytes and an ignored one. Split at every byte, the
+/// prefix to one parser, its carry to a fresh one and the rest to that: the
+/// sink is the sink of one parser fed the whole stream, C1 controls off and
+/// on, byte path and fast path. A split inside a hooked string has no carry
+/// (`a_hooked_dcs_is_not_carried`) and is skipped; one inside every header
+/// state is met.
+#[test]
+fn every_split_of_a_dcs_stream_continues_exactly() {
+    const DCS_STREAM: &[u8] = b"a\x1bP0;1;0q#0;2;0;0;0#0!10~-\x1b\\b\x1bP$qm\x1b\\c\
+\x1bP+q544e\x9cd\x1bP>|x\x1b\\e\x1bP1\xc3\xa9;2$\xa0qm\x1b\\f\x1bP1:ignored\x1b\\g";
+    for c1 in [false, true] {
+        for fast in [false, true] {
+            let feed = |parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink| {
+                if fast {
+                    parser.advance_fast(bytes, sink);
+                } else {
+                    parser.advance(bytes, sink);
+                }
+            };
+            let mut whole = RecordingSink::default();
+            feed(&mut parser_c1(c1), DCS_STREAM, &mut whole);
+            assert_eq!(whole.dcs_hooks.len(), 5, "c1={c1} fast={fast}: {whole:?}");
+            let mut met = Vec::new();
+            for split in 0..=DCS_STREAM.len() {
+                let (head, tail) = DCS_STREAM.split_at(split);
+                let mut sink = RecordingSink::default();
+                let mut outgoing = parser_c1(c1);
+                feed(&mut outgoing, head, &mut sink);
+                let Some(carry) = outgoing.carry() else {
+                    assert_eq!(outgoing.state(), State::DcsPassthrough);
+                    continue;
+                };
+                if !met.contains(&carry.state) {
+                    met.push(carry.state);
+                }
+                let mut successor = parser_c1(c1);
+                successor.restore_carry(&carry).expect("restores");
+                feed(&mut successor, tail, &mut sink);
+                assert_eq!(
+                    sink,
+                    whole,
+                    "c1={c1} fast={fast} split {split} ({:?} | {:?})",
+                    String::from_utf8_lossy(head),
+                    String::from_utf8_lossy(tail)
+                );
+            }
+            for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {
+                assert!(
+                    met.contains(&state),
+                    "c1={c1} fast={fast}: no split in {state:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A BUILD BEFORE DCS HEADER CARRIES READS A HEADER AS IT ALWAYS DID: the
+/// coarse form a header carry crosses beside ([`ParserCarry::for_older_builds`])
+/// is the `DcsIgnore` holding nothing that such a build wrote for every
+/// header, which that build's `restore_carry` accepted, and it swallows the
+/// string to its terminator. Every other carry such a build reads as it is.
+#[test]
+fn a_header_carry_has_the_older_builds_form_beside_it() {
+    for head in [&b"\x1bP"[..], b"\x1bP1;2", b"\x1bP>1;2 $"] {
+        let mut outgoing = Parser::new();
+        outgoing.advance_fast(head, &mut RecordingSink::default());
+        let older = outgoing
+            .carry()
+            .expect("carried")
+            .for_older_builds()
+            .expect("a header has an older form");
+        assert_eq!(
+            older,
+            ParserCarry {
+                state: State::DcsIgnore,
+                ..ParserCarry::default()
+            },
+            "{head:?}"
+        );
+        let mut successor = Parser::new();
+        successor.restore_carry(&older).expect("restores");
+        let mut sink = RecordingSink::default();
+        successor.advance_fast(b"q#0;2;0;0;0#0!10~-\x1b\\after", &mut sink);
+        assert_eq!(sink.prints.iter().collect::<String>(), "after", "{head:?}");
+        assert!(sink.dcs_hooks.is_empty(), "{head:?}");
+    }
+    for bytes in [
+        &b""[..],
+        b"\x1b[38;5;19",
+        b"\x1b]0;a title",
+        b"\x1bP1:x",
+        b"\x1b_Ga=T",
+        b"\xe6\xbc",
+    ] {
+        let mut parser = Parser::new();
+        parser.advance_fast(bytes, &mut RecordingSink::default());
+        let carry = parser.carry().expect("carried");
+        assert_eq!(carry.for_older_builds(), None, "{bytes:?}");
     }
 }

@@ -50,6 +50,9 @@ embedded-symbols = []
 # assets/bundled/*.LICENSE.txt. Compiled in on NON-macOS targets only: the macOS
 # default (SF Mono + CoreText system coverage) is unchanged by that decision, and
 # a universal binary would carry the ~2.8MB twice for faces it never selects.
+# The one exception is Iosevka Term 34.9.0 (a ~2.3MB subset of its four faces,
+# OFL-1.1; owner request 2026-10-14), compiled in on EVERY target, macOS
+# included: no default anywhere, a family a user selects by name.
 # DEFAULT-ON; --no-default-features drops it (and reverts to the system chain).
 bundled-font-stack = ["embedded-font"]
 
@@ -69,10 +72,11 @@ aterm-types = { workspace = true }
 # input, the one composition the native window and the web module share.
 # `aterm-time` is its only dependency — clockless, wasm-clean.
 aterm-messages = { workspace = true }
-# Fast non-DoS hasher (FxHash) for the per-cell glyph caches — the render profile
+# Fast unkeyed hasher (FxHash) for the per-cell glyph caches — the render profile
 # showed ~10% of rasterize time in SipHash. Glyph-cache keys are local render state
-# (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the standard,
-# safe choice (matches the engine's grid/core caches, which already use it).
+# (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the right
+# choice there (matches the engine's grid/core caches, which already use it). The
+# memos keyed by text a pane's program prints use its `KeyedHashMap` instead.
 aterm-hash = { workspace = true }
 # First-party PNG (crates/aterm-png), which retired `png` and the flate2/
 # miniz_oxide/fdeflate/simd-adler32/crc32fast/adler2 compression stack behind

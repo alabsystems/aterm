@@ -70,8 +70,11 @@ impl Cell {
     /// Whether the grid folds printing character `c` into this cell rather
     /// than open a new one, in `write_char`'s order: a skin-tone modifier onto
     /// a wide `Emoji_Modifier_Base`, a flag's second regional indicator onto
-    /// its first, and any non-ASCII character after a stored ZWJ. Printable
-    /// ASCII takes the bulk path (`print_ascii_bulk`), which never folds.
+    /// its first, and any non-ASCII character after a stored ZWJ. The grid
+    /// folds printable ASCII after a ZWJ on no path (UAX #29 GB11 joins a ZWJ
+    /// only to Extended_Pictographic, and no ASCII character is one): neither
+    /// the run writer (`print_ascii_bulk`) nor `write_char` under IRM, DECAWM
+    /// off or a national charset.
     fn folds(&self, c: char) -> bool {
         (is_skin_tone_modifier(c) && self.wide && is_emoji_modifier_base(self.base))
             || (is_regional_indicator(c) && is_regional_indicator(self.base) && self.ris < 2)

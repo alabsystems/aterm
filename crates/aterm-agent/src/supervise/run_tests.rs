@@ -2836,6 +2836,30 @@ fn busy_screen() -> Vec<String> {
     r.extend(composer("  esc to interrupt"));
     r
 }
+
+/// A busy row the guard's scan could not read is still UP (ruling 2026-10-10):
+/// the server's matcher calls a row that exhausts its step budget undecided,
+/// and `busy_up` reads "not shown gone" as up, as `await gone` does. It used
+/// to read the refusal as "no match", and the loop went on as if the busy row
+/// had left. Controls: a readable match is up, a readable clear row is not.
+#[test]
+fn a_busy_row_the_guard_could_not_read_is_still_up() {
+    let mut m = Mock::new(true, Vec::new());
+    let mut s = session(&mut m, None);
+    let guard = "(?:x?){1020}z";
+    let unread = format!("{}z", "x".repeat(4000));
+    assert!(s.busy_up(guard, &[unread]), "an unread row is not gone");
+    assert!(
+        s.busy_up(guard, &["xxxz".to_string()]),
+        "a read match is up"
+    );
+    assert!(
+        !s.busy_up(guard, &["Done.".to_string()]),
+        "a read clear row is down"
+    );
+    assert!(s.busy_up("esc to interrupt", &busy_screen()));
+    assert!(!s.busy_up("esc to interrupt", &idle_screen()));
+}
 fn idle_screen() -> Vec<String> {
     let mut r = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
     r.extend(composer("  ? for shortcuts"));
@@ -9018,7 +9042,7 @@ fn a_headerless_box_under_a_tall_transcript_is_named_by_its_own_first_row() {
     // subject of a headerless box is its question row, found from the
     // box's own first row down, never a transcript row above it.
     let text = "claude other: Do you trust the files in this folder? \
-                (a other box: no rule approves this kind)";
+                (an other box: no rule approves this kind)";
     assert!(!text.contains("transcript row"));
     assert_eq!(
         box_acts(&m),

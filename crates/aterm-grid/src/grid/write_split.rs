@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use super::StyleId;
-use super::write::stale_extras_cols;
+use super::write::StaleExtras;
 use super::{Cell, CellFlags, Grid, PackedColors};
 
 impl Grid {
@@ -29,13 +29,12 @@ impl Grid {
     pub fn write_char_at_cursor_packed(&mut self, c: char, colors: PackedColors, flags: CellFlags) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        // Drop a stale extras-map entry before overwriting, so a later
+        // Drop a stale extras-map entry before overwriting (and the entry of a
+        // wide half the overwrite orphans), so a later
         // `cell_extra_mut_preflagged` here cannot resurrect old data (an old
         // hyperlink) via `get_or_create`.
-        let scan_stale = !self.storage.extras.is_empty();
-        let mut stale = (false, false);
+        let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
         if let Some(row) = self.row_mut(cursor_row) {
-            stale.0 = scan_stale && row.get(cursor_col).is_some_and(Cell::has_extras);
             row.write_char_packed(cursor_col, c, colors, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
@@ -164,10 +163,13 @@ impl Grid {
         // as these `colors` (`handler_sgr`); the `bg_is_rgb` guard keeps a
         // caller that desynchronizes the two from seeding the ring behind an
         // indexed marker.
-        if let Some(bce) = bce
-            && fill.colors().bg_is_rgb()
-        {
-            self.fill_bce_rgb_range(row, bce.start, bce.end);
+        if let Some(bce) = bce {
+            // The blanked tail and orphan drop the extras they carried (a mark on
+            // the last column's glyph), or a write there would adopt them.
+            self.drop_unclaimed_extras(row, bce.clone());
+            if fill.colors().bg_is_rgb() {
+                self.fill_bce_rgb_range(row, bce.start, bce.end);
+            }
         }
         self.storage.mark_content_row(row);
     }
@@ -222,19 +224,7 @@ impl Grid {
     /// Slow path for `advance_cursor_wrap`: handles DECDWL and DECLRMM margins.
     #[inline(never)]
     fn advance_cursor_wrap_slow(&mut self) {
-        let max_col = if self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if !margins.is_full(self.storage.cols)
-                && self.storage.cursor.col >= margins.left
-                && self.storage.cursor.col <= margins.right
-            {
-                margins.right
-            } else {
-                self.storage.max_col_for_row(self.storage.cursor.row)
-            }
-        } else {
-            self.storage.max_col_for_row(self.storage.cursor.row)
-        };
+        let max_col = self.last_print_col(self.storage.cursor.row, self.storage.cursor.col);
 
         if self.storage.cursor.col < max_col {
             self.storage.cursor.col += 1;
@@ -243,23 +233,35 @@ impl Grid {
         }
     }
 
+    /// The last column a glyph printed at `col` of `row` reaches before its
+    /// deferred wrap: the row's last column (the half-width one on a DECDWL or
+    /// DECDHL row), or the DECSLRM right margin when `col` is inside the margin
+    /// span, whichever comes first. The one answer for the per-glyph writers;
+    /// the run writers derive the same clamp per row
+    /// (`effective_cols.min(right + 1)`).
+    ///
+    /// Ruling 2026-10-10 (r15 C1): capped by the row's own last column. The
+    /// per-glyph writers took the bare right margin inside the span, so on a
+    /// double-width row under DECSLRM a glyph-by-glyph run (one routed there
+    /// from outside the span, or under IRM) ran the cursor past the row's half
+    /// width, where the run writers stopped at it.
+    #[inline]
+    pub(super) fn last_print_col(&self, row: u16, col: u16) -> u16 {
+        let max_col = self.storage.max_col_for_row(row);
+        if self.storage.has_horizontal_margins {
+            let margins = self.storage.horizontal_margins();
+            if col >= margins.left && col <= margins.right {
+                return margins.right.min(max_col);
+            }
+        }
+        max_col
+    }
+
     /// Get effective columns clamped by DECLRMM right margin.
     #[inline]
     fn margin_clamped_ecols(&self, row: u16) -> u16 {
-        let ecols = self.storage.effective_cols_for_row(row);
-        if self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if !margins.is_full(self.storage.cols)
-                && self.storage.cursor.col >= margins.left
-                && self.storage.cursor.col <= margins.right
-            {
-                ecols.min(margins.right.saturating_add(1))
-            } else {
-                ecols
-            }
-        } else {
-            ecols
-        }
+        self.last_print_col(row, self.storage.cursor.col)
+            .saturating_add(1)
     }
 
     /// Advance cursor by 2 columns (for wide char) without wrapping,
@@ -471,13 +473,12 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
 
-        // Drop a stale extras-map entry before overwriting.
-        let scan_stale = !self.storage.extras.is_empty();
-        let mut stale = (false, false);
+        // Drop a stale extras-map entry before overwriting (and the entry of a
+        // wide half the overwrite orphans).
+        let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
 
         // Write character — single row_mut call
         if let Some(row) = self.storage.row_mut(cursor_row) {
-            stale.0 = scan_stale && row.get(cursor_col).is_some_and(Cell::has_extras);
             row.write_char_packed(cursor_col, c, colors, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
@@ -494,19 +495,7 @@ impl Grid {
         {
             self.storage.cursor.col = cursor_col + 1;
         } else {
-            let max_col = if self.storage.has_horizontal_margins {
-                let margins = self.storage.horizontal_margins();
-                if !margins.is_full(self.storage.cols)
-                    && cursor_col >= margins.left
-                    && cursor_col <= margins.right
-                {
-                    margins.right
-                } else {
-                    self.storage.max_col_for_row(cursor_row)
-                }
-            } else {
-                self.storage.max_col_for_row(cursor_row)
-            };
+            let max_col = self.last_print_col(cursor_row, cursor_col);
             if cursor_col < max_col {
                 self.storage.cursor.col = cursor_col + 1;
             } else {
@@ -582,13 +571,13 @@ impl Grid {
             }
 
             // Single row_mut call for all chars on this line
-            let mut stale = Vec::new();
+            let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
                 // Capture stale-extras columns (both wide halves) before the
                 // overwrite clobbers the HAS_EXTRAS flags.
                 let end_col_run = cursor_col + (to_write as u16) * 2;
                 if scan_stale {
-                    stale = stale_extras_cols(row, cursor_col, end_col_run);
+                    stale = StaleExtras::probe(row, cursor_col, end_col_run);
                 }
                 // Bounds-check once for the whole run, then write unchecked (as
                 // `write_emoji_run_autowrap` does): the run already settled the
@@ -601,7 +590,8 @@ impl Grid {
                     // there by CUP), and the cell just past the run being the
                     // continuation of a wide base at `end_col_run - 1`. Interior
                     // glyphs land only on cells this run wrote. Clean both edges.
-                    row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked =
+                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for i in 0..to_write {
                         let col = cursor_col + (i as u16) * 2;
                         // SAFETY: (a) `col + 1 < cells.len()` because
@@ -621,7 +611,7 @@ impl Grid {
                     // add a phantom trailing space to `row_text`, search and
                     // scrollback
                     // (`wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail`).
-                    row.settle_len_after_wide_run(end_col_run);
+                    row.settle_len_after_wide_run(end_col_run, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for i in 0..to_write {
@@ -630,9 +620,7 @@ impl Grid {
                     }
                 }
             }
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Row-level damage — once per row, not per char
             self.storage.mark_content_row(cursor_row);
@@ -723,12 +711,12 @@ impl Grid {
             let end_col = cursor_col + (to_write as u16) * 2;
 
             // Single row_mut call for all chars on this line
-            let mut stale = Vec::new();
+            let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
                 // Capture stale-extras columns (both wide halves) before the
                 // overwrite clobbers the HAS_EXTRAS flags.
                 if scan_stale {
-                    stale = stale_extras_cols(row, cursor_col, end_col);
+                    stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
                 // Bounds check once for the entire run, then use no-fixup writes.
                 // Sequential emoji writes at even columns can't conflict.
@@ -739,7 +727,8 @@ impl Grid {
                     // cell just past the run can be the continuation of a wide base
                     // at end_col-1. Clean both edges once (a no-op on rows without
                     // wide chars).
-                    row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked =
+                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for j in 0..to_write {
                         let col = cursor_col + (j as u16) * 2;
                         // SAFETY: (a) `col + 1 < cells.len()` because
@@ -758,7 +747,7 @@ impl Grid {
                     // clear the row's last content, and a stale-high `len` would
                     // add a phantom trailing space to `row_text`, search and
                     // scrollback.
-                    row.settle_len_after_wide_run(end_col);
+                    row.settle_len_after_wide_run(end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for j in 0..to_write {
@@ -767,9 +756,7 @@ impl Grid {
                     }
                 }
             }
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Store complex char codepoints in ring buffer — batched, ring_row hoisted
             self.storage.extras_mut().set_complex_char_wide_run(
@@ -859,19 +846,20 @@ impl Grid {
             let end_col = cursor_col + (to_write as u16) * 2;
             let slice = &chars[pos..pos + to_write];
 
-            let mut stale = Vec::new();
+            let mut stale = StaleExtras::NONE;
             if let Some(row) = self.storage.row_mut(cursor_row) {
                 // Capture stale-extras columns (both wide halves) before the
                 // overwrite clobbers the HAS_EXTRAS flags.
                 if scan_stale {
-                    stale = stale_extras_cols(row, cursor_col, end_col);
+                    stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
                 if (end_col as usize) <= row.cells_len() {
                     // As in write_emoji_run_autowrap: clean any orphaned wide half
                     // at the run's leading edge (cursor on a continuation) or just
                     // past its trailing edge before the unchecked writes (a no-op
                     // on rows without wide chars).
-                    row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked =
+                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for (j, &c) in slice.iter().enumerate() {
                         let col = cursor_col + (j as u16) * 2;
                         let fl = if (c as u32) > 0xFFFF {
@@ -895,7 +883,7 @@ impl Grid {
                     // clear the row's last content, and a stale-high `len` would
                     // add a phantom trailing space to `row_text`, search and
                     // scrollback.
-                    row.settle_len_after_wide_run(end_col);
+                    row.settle_len_after_wide_run(end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for (j, &c) in slice.iter().enumerate() {
@@ -909,9 +897,7 @@ impl Grid {
                     }
                 }
             }
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Ring buffer writes — batched with hoisted ring_row for non-BMP chars
             self.storage.extras_mut().set_mixed_wide_ring(
@@ -976,6 +962,9 @@ impl Grid {
     /// damage marking per line instead of per character.
     ///
     /// REQUIRES: all bytes 0x20..=0x7E, insert mode OFF, auto-wrap ON
+    /// REQUIRES: the cursor is not outside a DECSLRM span
+    /// (`Grid::cursor_outside_margin_span`): the right-margin clamp is derived
+    /// once per row from the column the row's batch starts at
     /// ENSURES: result <= ascii.len(), self.storage.cursor.row < self.storage.visible_rows
     #[allow(clippy::too_many_arguments)]
     #[inline]
@@ -1054,9 +1043,9 @@ impl Grid {
             // HAS_EXTRAS flags; remove them before Phase 2 creates fresh entries
             // so old extras never merge into the new cells.
             let stale = if scan_stale {
-                stale_extras_cols(row, cursor_col, cursor_col + to_write_u16)
+                StaleExtras::probe(row, cursor_col, cursor_col + to_write_u16)
             } else {
-                Vec::new()
+                StaleExtras::NONE
             };
 
             // Phase 1: Write styled cells directly to row (bulk)
@@ -1072,9 +1061,7 @@ impl Grid {
             row.update_len(cursor_col + to_write_u16);
             // row borrow drops here
 
-            if !stale.is_empty() {
-                self.remove_stale_extras(cursor_row, stale);
-            }
+            self.remove_stale_extras(cursor_row, stale);
 
             // Phase 2: Apply extras to written range (batched)
             {

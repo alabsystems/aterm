@@ -119,9 +119,7 @@ fn extras_survive_the_round_trip_through_ring_history() {
     write_lines(&mut grid, &["f0", "f1", "tail 🚀", "link", "bottom"]);
     let url: Arc<str> = Arc::from("https://example.com/round-trip");
     for col in 0..4u16 {
-        grid.extras_mut()
-            .get_or_create(CellCoord::new(3, col))
-            .set_hyperlink(Some(url.clone()));
+        grid.cell_extra_mut(3, col).set_hyperlink(Some(url.clone()));
     }
     // Cursor sits on the bottom row, so the shrink demotes the top rows —
     // f0/f1 — and a deeper shrink would take the emoji and link rows too.

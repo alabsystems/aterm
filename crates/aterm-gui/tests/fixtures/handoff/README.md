@@ -805,15 +805,15 @@ release adds a value a real session would carry.
 ### By hand
 
 For a release whose cut did not write them (one cut by an older cutter), run
-the release's own generator at its tag, in a worktree under `~/Developer`
-(AGENTS.md), never in the shared checkout:
+the release's own generator at its tag, in a worktree of its own, never in the
+shared checkout:
 
 ```sh
-git worktree add --detach ~/Developer/aterm-vX.Y.0.noindex vX.Y.0
-git -C ~/Developer/aterm-vX.Y.0.noindex submodule update --init vendor/astream
-git worktree add -b test/handoff-fixtures-vXY0 ~/Developer/aterm-wt-fxXY0 origin/main
-cd ~/Developer/aterm-vX.Y.0.noindex
-OUT=~/Developer/aterm-wt-fxXY0/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0
+git worktree add --detach ~/aterm-vX.Y.0.noindex vX.Y.0
+git -C ~/aterm-vX.Y.0.noindex submodule update --init vendor/astream
+git worktree add -b test/handoff-fixtures-vXY0 ~/aterm-wt-fxXY0 origin/main
+cd ~/aterm-vX.Y.0.noindex
+OUT=~/aterm-wt-fxXY0/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0
 ATERM_BUILD_GIT_COMMIT=$(git rev-parse --short=12 'vX.Y.0^{commit}') \
 ATERM_BUILD_GIT_COMMIT_FULL=$(git rev-parse 'vX.Y.0^{commit}') \
 SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
